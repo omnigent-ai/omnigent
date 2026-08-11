@@ -192,6 +192,8 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.template: str | None = None
         self.secrets: list[str] | None = None
         self.env: list[str] | None = None
+        self.region: str | None = None
+        self.ttl: str | None = None
         self.endpoint: str | None = None
         self.home_dir: str | None = None
         self.registry: dict[str, object] | None = None
@@ -369,6 +371,31 @@ def install_fake_daytona_launcher(
         return fake
 
     monkeypatch.setattr(daytona_mod, "DaytonaSandboxLauncher", _ctor)
+
+
+def install_fake_blaxel_launcher(
+    monkeypatch: Any,
+    fake: FakeSandboxLauncher,
+) -> None:
+    """Substitute the fake for ``BlaxelSandboxLauncher``."""
+    import omnigent.onboarding.sandboxes.blaxel as blaxel_mod
+
+    def _ctor(
+        *,
+        image: str | None = None,
+        env: list[str] | None = None,
+        region: str | None = None,
+        memory_mb: int | None = None,
+        ttl: str | None = None,
+    ) -> FakeSandboxLauncher:
+        fake.image = image
+        fake.env = env
+        fake.region = region
+        fake.memory_mb = memory_mb
+        fake.ttl = ttl
+        return fake
+
+    monkeypatch.setattr(blaxel_mod, "BlaxelSandboxLauncher", _ctor)
 
 
 def install_fake_boxlite_launcher(

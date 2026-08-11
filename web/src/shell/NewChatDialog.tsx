@@ -69,7 +69,7 @@ import {
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { attachmentKey } from "@/lib/attachments";
+import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
@@ -1299,7 +1299,7 @@ export function AgentHarnessPicker({
                     <DropdownMenuSub>
                       <DropdownMenuSubTrigger
                         data-testid="new-chat-landing-harness-more"
-                        className="items-center"
+                        className="cursor-pointer items-center"
                       >
                         <span className="flex-1">More</span>
                       </DropdownMenuSubTrigger>
@@ -1338,7 +1338,7 @@ export function AgentHarnessPicker({
                 <DropdownMenuSub>
                   <DropdownMenuSubTrigger
                     data-testid="new-chat-landing-custom-agents"
-                    className="items-center"
+                    className="cursor-pointer items-center"
                   >
                     <span className="flex-1">Custom agents</span>
                   </DropdownMenuSubTrigger>
@@ -1636,7 +1636,7 @@ function HarnessConfigModal({
                   disabled={smartRoutingOn}
                 >
                   <SelectTrigger
-                    className="w-full"
+                    className="w-full cursor-pointer"
                     data-testid="new-chat-landing-config-effort"
                     aria-label="Reasoning effort"
                   >
@@ -1771,7 +1771,7 @@ function HarnessConfigModal({
             <ConfigRow label="Agent Harness" description="Underlying coding harness">
               <Select value={draftHarness ?? brainDefault} onValueChange={setDraftHarness}>
                 <SelectTrigger
-                  className="w-full"
+                  className="w-full cursor-pointer"
                   data-testid="new-chat-landing-config-harness"
                   aria-label="Agent Harness"
                 >
@@ -1948,9 +1948,21 @@ export function NewChatLandingScreen() {
   // composer (paperclip + paste); carried to ChatPage via the pending
   // initial prompt and sent with the auto-dispatched first turn.
   const [files, setFiles] = useState<File[]>(() => landingDraft?.files ?? []);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const addFiles = (incoming: File[]) => setFiles((prev) => [...prev, ...incoming]);
-  const removeFile = (index: number) => setFiles((prev) => prev.filter((_, i) => i !== index));
+  // Reject unsupported types (only images, PDF, and text/code) and oversized
+  // files here, before the session exists. Without this the upload only fails
+  // after the session is created and navigated into, where the first turn's
+  // 415 strands the typed message in a session the user never wanted.
+  const addFiles = (incoming: File[]) => {
+    const { accepted, errors } = validateAttachments(incoming);
+    if (accepted.length > 0) setFiles((prev) => [...prev, ...accepted]);
+    setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
+  };
+  const removeFile = (index: number) => {
+    setFiles((prev) => prev.filter((_, i) => i !== index));
+    setAttachmentError(null);
+  };
 
   // Drag-and-drop onto the composer — same behavior as the in-session
   // composer (drop files anywhere on the box; an inset ring + overlay
@@ -3840,7 +3852,7 @@ export function NewChatLandingScreen() {
   const workspaceChip = (
     <button
       type="button"
-      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+      className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
       data-testid="new-chat-landing-workspace-chip"
     >
       <FolderIcon className="ui-icon" />
@@ -3848,6 +3860,7 @@ export function NewChatLandingScreen() {
           tight so a long working-directory path truncates instead of pushing
           the chip row onto a second line. */}
       <span className="hidden max-w-40 truncate text-sm sm:block">{workspaceLabel}</span>
+      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
     </button>
   );
 
@@ -3932,6 +3945,10 @@ export function NewChatLandingScreen() {
               value={message}
               onChange={(e) => {
                 setMessage(e.target.value);
+                // A rejected attachment is never added, so there's no chip to
+                // remove and nothing else would ever clear this. Left sticky it
+                // reads as a blocker on a composer the user can actually submit.
+                if (attachmentError !== null) setAttachmentError(null);
                 // Recompute the active "@"-mention from the caret each keystroke
                 // (native terminal agents with a workspace — ``mentionEnabled``).
                 setMention(
@@ -4120,6 +4137,15 @@ export function NewChatLandingScreen() {
                     </button>
                   </span>
                 ))}
+              </div>
+            )}
+            {/* Rejected-attachment feedback: unsupported type or too large */}
+            {attachmentError !== null && (
+              <div
+                className="px-4 pb-2 text-xs text-destructive whitespace-pre-wrap"
+                data-testid="new-chat-landing-attachment-error"
+              >
+                {attachmentError}
               </div>
             )}
             {/* No own bg — the pill paints the surface. An explicit bg-card
@@ -4323,7 +4349,7 @@ export function NewChatLandingScreen() {
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+                    className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                     data-testid="new-chat-landing-host-chip"
                   >
                     {selectedHost?.status === "online" && !sandboxSelected ? (
@@ -4337,6 +4363,7 @@ export function NewChatLandingScreen() {
                       <MonitorIcon className="ui-icon" />
                     )}
                     <span className="hidden max-w-32 truncate text-sm sm:block">{hostLabel}</span>
+                    <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" className="min-w-52">
@@ -4496,13 +4523,14 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                       data-testid="new-chat-landing-repo-chip"
                     >
                       <GitBranchIcon className="ui-icon" />
                       <span className="hidden max-w-40 truncate text-sm sm:block">
                         {sandboxRepoLabel}
                       </span>
+                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
                   <PopoverContent align="start" className="w-96 p-3">
@@ -4603,13 +4631,14 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                       data-testid="new-chat-landing-branch-chip"
                     >
                       <GitBranchIcon className="ui-icon" />
                       <span className="hidden max-w-32 truncate text-sm sm:block">
                         {worktreeLabel}
                       </span>
+                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
                   <PopoverContent

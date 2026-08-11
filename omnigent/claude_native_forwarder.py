@@ -226,6 +226,12 @@ _SUBAGENT_IDLE_QUIESCENCE_S = 5.0
 # ``agent-<id>.jsonl`` transcript.
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
 _DEFAULT_POLL_INTERVAL_S = 0.25
+# Hard ceiling on one poll iteration of the forward loop. A silently stalled
+# await anywhere in the pipeline used to stop mirroring, status and the busy
+# signal forever; the deadline cancels the stall (the traceback names it) and
+# the loop resumes. Generous vs the 0.25s poll so a legitimately slow batch
+# (large backlog, slow posts) never trips it.
+_FORWARD_LOOP_STALL_DEADLINE_S = 300.0
 _POST_TIMEOUT_S = 10.0
 _MAX_SEEN_SOURCE_IDS = 2000
 _CURSOR_FINGERPRINT_BYTES = 256
@@ -642,10 +648,17 @@ class _ForwardDedupeState:
         from ``posted_cost`` because it advances mid-turn (with in-flight
         sub-agent spend) while ``S`` stays frozen. ``None`` until first
         post.
+    :param recorded_token_usage: Last token counters recorded on a
+        ``claude_native.usage`` span as ``gen_ai.usage.*``. Deduped
+        separately from ``usage`` because that snapshot also moves on
+        context/cache churn: re-recording an unchanged figure would
+        multiply-count it in any backend that sums usage across spans.
+        ``None`` until the first recording.
     """
 
     usage: dict[str, float] | None = None
     context_window: int | None = None
+    recorded_token_usage: dict[str, int] | None = None
     observed_model: str | None = None
     posted_model: str | None = None
     # Last DISPLAY cost (USD) POSTed as ``cumulative_cost_usd`` — the
@@ -938,214 +951,228 @@ async def forward_claude_transcript_to_session(
     ) as client:
         while True:
             try:
-                current_session_id = read_active_session_id(bridge_dir) or session_id
-                if hook_state is None:
-                    hook_state = await _ensure_hook_state(
-                        bridge_dir,
-                        start_at_end=start_at_end,
-                        session_id=current_session_id,
-                    )
-                rotation = await _maybe_rotate_session_on_clear(
-                    client=client,
-                    session_id=current_session_id,
-                    bridge_dir=bridge_dir,
-                    state=hook_state,
-                )
-                if rotation is not None:
-                    # Tell the superseded (old) conversation it was cleared:
-                    # persist a notice linking to the rotated-to session and
-                    # emit a live redirect event. Use the loop's ``session_id``
-                    # (the session being forwarded BEFORE this poll), NOT
-                    # ``current_session_id``: when the hook rotated the bridge's
-                    # active session synchronously, ``current_session_id`` already
-                    # reads the NEW id, whereas ``session_id`` is not reassigned
-                    # to ``rotation`` until below. The call is fully best-effort
-                    # (swallows its own errors) so the state reset below always
-                    # runs.
-                    await _post_clear_supersession(
-                        client,
-                        old_session_id=session_id,
-                        new_session_id=rotation,
-                        agent_name=agent_name,
-                    )
-                    session_id = rotation
-                    state = None
-                    hook_state = None
-                    # After a /clear or /fork the parent now resolves
-                    # to a new ``<session_uuid>/subagents/`` directory
-                    # on disk, so old sub-agent entries are dead. Drop
-                    # them; the watcher will rediscover any new ones
-                    # under the rotated session's dir.
-                    subagent_state = SubagentForwardState(subagents={})
-                    await _write_subagent_forward_state_async(bridge_dir, subagent_state)
-                    item_retries = _PostRetryTracker()
-                    status_retries = _PostRetryTracker()
-                    subagent_start_retries = _PostRetryTracker()
-                    subagent_item_retries = _PostRetryTracker()
-                    subagent_status_retries = _PostRetryTracker()
-                    external_session_id_mirrored = False
-                    task_subjects = {}
-                    task_statuses = {}
-                    task_order = []
-                    # A rotated session is a fresh dedupe context — reseed
-                    # so the new session's first model observation doesn't
-                    # post against the prior session's baseline.
-                    dedupe = _ForwardDedupeState()
-                    # The rotated session resolves to a new transcript +
-                    # subagents/ dir, so prior cost entries are dead; drop
-                    # them so cost is recomputed fresh for the new session.
-                    cost_cache = {}
-                    await asyncio.sleep(poll_interval_s)
-                    continue
-                rotation = await _maybe_rotate_session_on_fork(
-                    client=client,
-                    session_id=current_session_id,
-                    bridge_dir=bridge_dir,
-                    state=hook_state,
-                )
-                if rotation is not None:
-                    session_id = rotation
-                    state = None
-                    hook_state = None
-                    # After a /clear or /fork the parent now resolves
-                    # to a new ``<session_uuid>/subagents/`` directory
-                    # on disk, so old sub-agent entries are dead. Drop
-                    # them; the watcher will rediscover any new ones
-                    # under the rotated session's dir.
-                    subagent_state = SubagentForwardState(subagents={})
-                    await _write_subagent_forward_state_async(bridge_dir, subagent_state)
-                    item_retries = _PostRetryTracker()
-                    status_retries = _PostRetryTracker()
-                    subagent_start_retries = _PostRetryTracker()
-                    subagent_item_retries = _PostRetryTracker()
-                    subagent_status_retries = _PostRetryTracker()
-                    external_session_id_mirrored = False
-                    task_subjects = {}
-                    task_statuses = {}
-                    task_order = []
-                    # A rotated session is a fresh dedupe context — reseed
-                    # so the new session's first model observation doesn't
-                    # post against the prior session's baseline.
-                    dedupe = _ForwardDedupeState()
-                    # The rotated session resolves to a new transcript +
-                    # subagents/ dir, so prior cost entries are dead; drop
-                    # them so cost is recomputed fresh for the new session.
-                    cost_cache = {}
-                    await asyncio.sleep(poll_interval_s)
-                    continue
-                if not external_session_id_mirrored:
-                    external_session_id_mirrored = await _maybe_mirror_external_session_id(
-                        client=client,
-                        session_id=current_session_id,
-                        bridge_dir=bridge_dir,
-                    )
-                transcript_path = read_transcript_path(bridge_dir)
-                if transcript_path is not None:
-                    state = await _ensure_state_for_transcript(
-                        bridge_dir=bridge_dir,
-                        state=state,
-                        transcript_path=transcript_path,
-                        start_at_end=start_at_end,
-                        session_id=current_session_id,
-                        start_at_offset=start_at_offset,
-                    )
-                    # Forward streamed deltas BEFORE the transcript items so a
-                    # message's live chunks (incl. its ``final`` chunk) always
-                    # precede its own authoritative ``output_item.done``. If
-                    # items led, a message's final chunk — written to the
-                    # deltas file moments before the transcript record flushed
-                    # — would land just AFTER its done event and re-create the
-                    # already-finalized preview on the client (duplicate bubble
-                    # + a stale trailing preview). See the web reconciler.
-                    # Within-poll order can't cover the cross-poll race
-                    # (transcript flushed, hook delta write not yet);
-                    # ``delta_ordering`` closes it by holding the assistant
-                    # item until its deltas byte-match or a timeout expires.
-                    delta_state = await _forward_available_deltas(
-                        client=client,
-                        session_id=current_session_id,
-                        bridge_dir=bridge_dir,
-                        state=delta_state,
-                        seen_keys=seen_delta_keys,
-                        ordering=delta_ordering,
-                    )
-                    # Mint a pending token for any PreCompact that first
-                    # became visible THIS poll, before the transcript items
-                    # phase (which consumes the isCompactSummary completion
-                    # record) runs — else a PreCompact + summary landing in
-                    # the same poll would lose the boundary. Cursor-keyed, so
-                    # the main hook phase below does not re-mint.
-                    await _prescan_precompact_edges(bridge_dir, hook_state)
-                    state = await _forward_available_items(
-                        client=client,
-                        session_id=current_session_id,
-                        bridge_dir=bridge_dir,
-                        agent_name=agent_name,
-                        state=state,
-                        retry_tracker=item_retries,
-                        skip_user_messages=skip_user_messages,
-                        dedupe=dedupe,
-                        ordering=delta_ordering,
-                    )
-                    hook_state = await _forward_available_status_events(
+                async with asyncio.timeout(_FORWARD_LOOP_STALL_DEADLINE_S):
+                    current_session_id = read_active_session_id(bridge_dir) or session_id
+                    if hook_state is None:
+                        hook_state = await _ensure_hook_state(
+                            bridge_dir,
+                            start_at_end=start_at_end,
+                            session_id=current_session_id,
+                        )
+                    rotation = await _maybe_rotate_session_on_clear(
                         client=client,
                         session_id=current_session_id,
                         bridge_dir=bridge_dir,
                         state=hook_state,
-                        retry_tracker=status_retries,
-                        dedupe=dedupe,
-                        task_subjects=task_subjects,
-                        task_statuses=task_statuses,
-                        task_order=task_order,
-                        # The turn-end edges (Stop→idle / StopFailure→failed)
-                        # carry the turn's response id so ap-web can CLOSE the
-                        # streaming ``activeResponse`` opened by the turn-start
-                        # ``running`` edge (_forward_available_items). The
-                        # transcript forwarder ran just above, so
-                        # ``state.current_response_id`` is the active turn's id
-                        # (the user-message reset only fires on the next turn).
-                        response_id=state.current_response_id,
                     )
-                    subagent_state = await _forward_available_subagents(
-                        client=client,
-                        parent_session_id=current_session_id,
-                        bridge_dir=bridge_dir,
-                        transcript_path=transcript_path,
-                        state=subagent_state,
-                        agent_name=agent_name,
-                        start_retry_tracker=subagent_start_retries,
-                        item_retry_tracker=subagent_item_retries,
-                        status_retry_tracker=subagent_status_retries,
-                    )
-                    # Reconcile + POST cumulative cost AFTER sub-agents are
-                    # forwarded so the estimate sees this poll's sub-agent
-                    # transcript growth. This is what lets the parent's
-                    # cost-budget policy block a sub-agent's tool calls
-                    # mid-turn (the statusLine total alone lags until the
-                    # sub-agent finishes).
-                    await _forward_session_cost(
+                    if rotation is not None:
+                        # Tell the superseded (old) conversation it was cleared:
+                        # persist a notice linking to the rotated-to session and
+                        # emit a live redirect event. Use the loop's ``session_id``
+                        # (the session being forwarded BEFORE this poll), NOT
+                        # ``current_session_id``: when the hook rotated the bridge's
+                        # active session synchronously, ``current_session_id`` already
+                        # reads the NEW id, whereas ``session_id`` is not reassigned
+                        # to ``rotation`` until below. The call is fully best-effort
+                        # (swallows its own errors) so the state reset below always
+                        # runs.
+                        await _post_clear_supersession(
+                            client,
+                            old_session_id=session_id,
+                            new_session_id=rotation,
+                            agent_name=agent_name,
+                        )
+                        session_id = rotation
+                        state = None
+                        hook_state = None
+                        # After a /clear or /fork the parent now resolves
+                        # to a new ``<session_uuid>/subagents/`` directory
+                        # on disk, so old sub-agent entries are dead. Drop
+                        # them; the watcher will rediscover any new ones
+                        # under the rotated session's dir.
+                        subagent_state = SubagentForwardState(subagents={})
+                        await _write_subagent_forward_state_async(bridge_dir, subagent_state)
+                        item_retries = _PostRetryTracker()
+                        status_retries = _PostRetryTracker()
+                        subagent_start_retries = _PostRetryTracker()
+                        subagent_item_retries = _PostRetryTracker()
+                        subagent_status_retries = _PostRetryTracker()
+                        external_session_id_mirrored = False
+                        task_subjects = {}
+                        task_statuses = {}
+                        task_order = []
+                        # A rotated session is a fresh dedupe context — reseed
+                        # so the new session's first model observation doesn't
+                        # post against the prior session's baseline.
+                        dedupe = _ForwardDedupeState()
+                        # The rotated session resolves to a new transcript +
+                        # subagents/ dir, so prior cost entries are dead; drop
+                        # them so cost is recomputed fresh for the new session.
+                        cost_cache = {}
+                        await asyncio.sleep(poll_interval_s)
+                        continue
+                    rotation = await _maybe_rotate_session_on_fork(
                         client=client,
                         session_id=current_session_id,
                         bridge_dir=bridge_dir,
-                        parent_transcript_path=transcript_path,
-                        subagent_state=subagent_state,
-                        dedupe=dedupe,
-                        cost_cache=cost_cache,
+                        state=hook_state,
                     )
-                    # Mirror the live statusLine model EVERY poll (not just
-                    # when a turn produced new transcript items, which
-                    # _forward_available_items early-returns without). This
-                    # propagates an in-pane /model switch to model_override
-                    # before the user's next message, so model-gated policies
-                    # (cost-budget hard cap) no longer lag a switch by one turn.
-                    await _forward_model_from_status(
-                        client=client,
-                        session_id=current_session_id,
-                        bridge_dir=bridge_dir,
-                        dedupe=dedupe,
-                    )
+                    if rotation is not None:
+                        session_id = rotation
+                        state = None
+                        hook_state = None
+                        # After a /clear or /fork the parent now resolves
+                        # to a new ``<session_uuid>/subagents/`` directory
+                        # on disk, so old sub-agent entries are dead. Drop
+                        # them; the watcher will rediscover any new ones
+                        # under the rotated session's dir.
+                        subagent_state = SubagentForwardState(subagents={})
+                        await _write_subagent_forward_state_async(bridge_dir, subagent_state)
+                        item_retries = _PostRetryTracker()
+                        status_retries = _PostRetryTracker()
+                        subagent_start_retries = _PostRetryTracker()
+                        subagent_item_retries = _PostRetryTracker()
+                        subagent_status_retries = _PostRetryTracker()
+                        external_session_id_mirrored = False
+                        task_subjects = {}
+                        task_statuses = {}
+                        task_order = []
+                        # A rotated session is a fresh dedupe context — reseed
+                        # so the new session's first model observation doesn't
+                        # post against the prior session's baseline.
+                        dedupe = _ForwardDedupeState()
+                        # The rotated session resolves to a new transcript +
+                        # subagents/ dir, so prior cost entries are dead; drop
+                        # them so cost is recomputed fresh for the new session.
+                        cost_cache = {}
+                        await asyncio.sleep(poll_interval_s)
+                        continue
+                    if not external_session_id_mirrored:
+                        external_session_id_mirrored = await _maybe_mirror_external_session_id(
+                            client=client,
+                            session_id=current_session_id,
+                            bridge_dir=bridge_dir,
+                        )
+                    transcript_path = read_transcript_path(bridge_dir)
+                    if transcript_path is not None:
+                        state = await _ensure_state_for_transcript(
+                            bridge_dir=bridge_dir,
+                            state=state,
+                            transcript_path=transcript_path,
+                            start_at_end=start_at_end,
+                            session_id=current_session_id,
+                            start_at_offset=start_at_offset,
+                        )
+                        # Forward streamed deltas BEFORE the transcript items so a
+                        # message's live chunks (incl. its ``final`` chunk) always
+                        # precede its own authoritative ``output_item.done``. If
+                        # items led, a message's final chunk — written to the
+                        # deltas file moments before the transcript record flushed
+                        # — would land just AFTER its done event and re-create the
+                        # already-finalized preview on the client (duplicate bubble
+                        # + a stale trailing preview). See the web reconciler.
+                        # Within-poll order can't cover the cross-poll race
+                        # (transcript flushed, hook delta write not yet);
+                        # ``delta_ordering`` closes it by holding the assistant
+                        # item until its deltas byte-match or a timeout expires.
+                        delta_state = await _forward_available_deltas(
+                            client=client,
+                            session_id=current_session_id,
+                            bridge_dir=bridge_dir,
+                            state=delta_state,
+                            seen_keys=seen_delta_keys,
+                            ordering=delta_ordering,
+                        )
+                        # Mint a pending token for any PreCompact that first
+                        # became visible THIS poll, before the transcript items
+                        # phase (which consumes the isCompactSummary completion
+                        # record) runs — else a PreCompact + summary landing in
+                        # the same poll would lose the boundary. Cursor-keyed, so
+                        # the main hook phase below does not re-mint.
+                        await _prescan_precompact_edges(bridge_dir, hook_state)
+                        state = await _forward_available_items(
+                            client=client,
+                            session_id=current_session_id,
+                            bridge_dir=bridge_dir,
+                            agent_name=agent_name,
+                            state=state,
+                            retry_tracker=item_retries,
+                            skip_user_messages=skip_user_messages,
+                            dedupe=dedupe,
+                            ordering=delta_ordering,
+                        )
+                        hook_state = await _forward_available_status_events(
+                            client=client,
+                            session_id=current_session_id,
+                            bridge_dir=bridge_dir,
+                            state=hook_state,
+                            retry_tracker=status_retries,
+                            dedupe=dedupe,
+                            task_subjects=task_subjects,
+                            task_statuses=task_statuses,
+                            task_order=task_order,
+                            # The turn-end edges (Stop→idle / StopFailure→failed)
+                            # carry the turn's response id so ap-web can CLOSE the
+                            # streaming ``activeResponse`` opened by the turn-start
+                            # ``running`` edge (_forward_available_items). The
+                            # transcript forwarder ran just above, so
+                            # ``state.current_response_id`` is the active turn's id
+                            # (the user-message reset only fires on the next turn).
+                            response_id=state.current_response_id,
+                        )
+                        subagent_state = await _forward_available_subagents(
+                            client=client,
+                            parent_session_id=current_session_id,
+                            bridge_dir=bridge_dir,
+                            transcript_path=transcript_path,
+                            state=subagent_state,
+                            agent_name=agent_name,
+                            start_retry_tracker=subagent_start_retries,
+                            item_retry_tracker=subagent_item_retries,
+                            status_retry_tracker=subagent_status_retries,
+                        )
+                        # Reconcile + POST cumulative cost AFTER sub-agents are
+                        # forwarded so the estimate sees this poll's sub-agent
+                        # transcript growth. This is what lets the parent's
+                        # cost-budget policy block a sub-agent's tool calls
+                        # mid-turn (the statusLine total alone lags until the
+                        # sub-agent finishes).
+                        await _forward_session_cost(
+                            client=client,
+                            session_id=current_session_id,
+                            bridge_dir=bridge_dir,
+                            parent_transcript_path=transcript_path,
+                            subagent_state=subagent_state,
+                            dedupe=dedupe,
+                            cost_cache=cost_cache,
+                        )
+                        # Mirror the live statusLine model EVERY poll (not just
+                        # when a turn produced new transcript items, which
+                        # _forward_available_items early-returns without). This
+                        # propagates an in-pane /model switch to model_override
+                        # before the user's next message, so model-gated policies
+                        # (cost-budget hard cap) no longer lag a switch by one turn.
+                        await _forward_model_from_status(
+                            client=client,
+                            session_id=current_session_id,
+                            bridge_dir=bridge_dir,
+                            dedupe=dedupe,
+                        )
             except asyncio.CancelledError:
                 raise
+            except TimeoutError:
+                # The deadline cancelled a stalled await mid-iteration; the
+                # traceback names it. Cursor state advances only after
+                # successful posts, so resuming retries the interrupted step.
+                _logger.warning(
+                    "Claude transcript forwarder iteration exceeded %.0fs; "
+                    "cancelled the stalled await and resuming; session=%s "
+                    "bridge_dir=%s",
+                    _FORWARD_LOOP_STALL_DEADLINE_S,
+                    session_id,
+                    bridge_dir,
+                    exc_info=True,
+                )
             except Exception:
                 _logger.exception(
                     "Claude transcript forwarder loop failed; session=%s bridge_dir=%s",
@@ -3735,6 +3762,16 @@ async def _forward_available_items(
     window_changed = (
         resolved_context_window is not None and resolved_context_window != dedupe.context_window
     )
+    # OTel token usage is sourced from the transcript, NOT from ``posted_usage``.
+    # ``posted_usage`` prefers the statusLine gauge, which is re-read every poll
+    # and moves while a message is still streaming, so recording it would emit
+    # several spans per API call and a summing backend would multiply-count the
+    # same prompt. ``result.latest_usage`` is the last COMPLETE assistant
+    # record's ``message.usage`` — one final figure per API call — and the
+    # dedupe keeps each one to a single span, so summing matches what the
+    # provider actually charged for.
+    token_usage = _gen_ai_usage_tokens(result.latest_usage)
+    record_token_usage = token_usage if token_usage != dedupe.recorded_token_usage else None
     if usage_changed or window_changed:
         try:
             await _post_external_session_usage(
@@ -3742,11 +3779,14 @@ async def _forward_available_items(
                 session_id=session_id,
                 usage=posted_usage,
                 context_window=resolved_context_window,
+                token_usage=record_token_usage,
             )
             if usage_changed:
                 dedupe.usage = posted_usage
             if window_changed:
                 dedupe.context_window = resolved_context_window
+            if record_token_usage is not None:
+                dedupe.recorded_token_usage = record_token_usage
         except httpx.HTTPError as exc:
             _logger.warning(
                 "Failed to forward Claude transcript usage; session=%s bridge_dir=%s "
@@ -4278,6 +4318,7 @@ async def _post_external_session_usage(
     session_id: str,
     usage: Mapping[str, float | str] | None,
     context_window: int | None = None,
+    token_usage: dict[str, int] | None = None,
 ) -> None:
     """
     Post one ``external_session_usage`` event to the Sessions API.
@@ -4292,6 +4333,11 @@ async def _post_external_session_usage(
         cost with the active model for per-model attribution.
     :param context_window: Resolved window in tokens, or ``None`` to
         leave the server's persisted value untouched.
+    :param token_usage: One API call's final token counters to record on the
+        span as ``gen_ai.usage.*``, e.g. ``{"input_tokens": 1523,
+        "output_tokens": 847}``. ``None`` records no token attributes. Pass
+        only counts not already recorded — a backend that sums usage across
+        spans double-counts a repeated figure.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     payload: dict[str, object] = {}
@@ -4301,11 +4347,62 @@ async def _post_external_session_usage(
         payload["context_window"] = context_window
     if not payload:
         return
-    resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={"type": "external_session_usage", "data": payload},
-    )
-    resp.raise_for_status()
+    from omnigent.runtime import telemetry
+
+    # A native Claude turn runs to completion in the terminal, so the
+    # harness executor's TurnComplete carries no usage and the agent span
+    # closes without any ``gen_ai.usage.*``. This forwarder is the only
+    # place that sees the real token counts, so stamp them here — under
+    # session_scope, which is what makes per-session token totals queryable
+    # in MLflow / any OTel backend.
+    with (
+        telemetry.session_scope(session_id),
+        telemetry.span("claude_native.usage") as usage_span,
+    ):
+        if token_usage is not None:
+            telemetry.record_llm_usage(usage_span, token_usage)
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "external_session_usage", "data": payload},
+        )
+        resp.raise_for_status()
+
+
+# Usage keys that carry token counts, in the spelling ``record_llm_usage``
+# expects. ``context_tokens`` is deliberately absent: it is a derived
+# input+cache total for the context-window gauge, not a GenAI usage counter.
+_GEN_AI_TOKEN_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
+def _gen_ai_usage_tokens(usage: Mapping[str, float | str] | None) -> dict[str, int] | None:
+    """
+    Extract the token counters from a usage payload for OTel recording.
+
+    Non-token entries (``context_tokens``, cost floats, the ``model``
+    tag) are dropped, so a cost-only post records no token attributes
+    rather than inventing zeros.
+
+    :param usage: Usage payload posted to the Sessions API, or ``None``.
+    :returns: Token counts keyed for
+        :func:`omnigent.runtime.telemetry.record_llm_usage`, e.g.
+        ``{"input_tokens": 1523, "output_tokens": 847}``. ``None`` when the
+        payload carries no input/output counts.
+    """
+    if usage is None:
+        return None
+    tokens = {
+        key: int(value)
+        for key, value in usage.items()
+        if key in _GEN_AI_TOKEN_KEYS and isinstance(value, (int, float))
+    }
+    if "input_tokens" not in tokens and "output_tokens" not in tokens:
+        return None
+    return tokens
 
 
 def _model_alias_for(model: str | None) -> str | None:

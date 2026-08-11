@@ -32,7 +32,8 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         provider: modal          # lakebox|modal|daytona|boxlite|cwsandbox|islo|e2b|openshell
+         # lakebox|modal|daytona|blaxel|boxlite|cwsandbox|islo|e2b|openshell|kubernetes
+         provider: modal
          server_url: https://omnigent.example.com
          host_config:             # optional; provider-agnostic. Verbatim
                                   # in-sandbox ~/.omnigent/config.yaml content,
@@ -69,6 +70,12 @@ stores into ``create_app``):
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES whose
                                              # values are injected as
                                              # sandbox env
+         blaxel:                  # optional block (provider: blaxel)
+           image: blaxel/omnigent-host:TAG  # optional fixed tag override
+           env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES
+           region: us-was-1       # optional
+           memory_mb: 4096        # optional; default: 4096
+           ttl: 24h               # optional; default maximum age: 24h
          islo:                    # optional block (provider: islo)
            image: docker.io/me/omnigent-host:latest  # default: official image
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
@@ -87,21 +94,26 @@ stores into ``create_app``):
                                              # as sandbox env
            cluster: my-gateway              # optional OpenShell gateway name
 
-   The image defaults to the official prebaked host image
-   (``ghcr.io/omnigent-ai/omnigent-host:latest``; see
-   :data:`omnigent.onboarding.sandboxes.base.DEFAULT_HOST_IMAGE` and
-   the per-provider env overrides), so ``provider`` + ``server_url``
-   is a complete config. Provider credentials are NOT in this file
+   Most providers default to a public prebaked host image, so
+   ``provider`` + ``server_url`` is a complete config. Registry-backed
+   providers use ``ghcr.io/omnigent-ai/omnigent-host:latest`` (see
+   :data:`omnigent.onboarding.sandboxes.base.DEFAULT_HOST_IMAGE`); Blaxel uses
+   ``blaxel/omnigent-host:latest``, which adds its required ``sandbox-api``.
+   Both defaults remain overridable. Use a private immutable Blaxel image when
+   a production rollout must stay on fixed image contents.
+   Provider credentials are NOT in this file
    (12-factor): the Modal launcher reads ``MODAL_TOKEN_ID`` /
    ``MODAL_TOKEN_SECRET`` (or ``~/.modal.toml``) and the Daytona
    launcher reads ``DAYTONA_API_KEY`` (plus optional
    ``DAYTONA_API_URL`` / ``DAYTONA_TARGET``), and the Islo launcher
    reads ``ISLO_API_KEY`` (plus optional ``ISLO_BASE_URL``) from the
-   server process environment. The OpenShell launcher needs no API key:
+   server process environment. The Blaxel launcher reads ``BL_WORKSPACE``
+   and ``BL_API_KEY`` or the local ``bl login`` profile. The OpenShell
+   launcher needs no API key:
    it connects to the gateway made active with ``openshell gateway
    select`` (``$OPENSHELL_GATEWAY`` / ``~/.config/openshell/active_gateway``,
    or ``sandbox.openshell.cluster``), so the server process needs
-   OpenShell gateway access. ``modal``, ``daytona``, ``cwsandbox``,
+   OpenShell gateway access. ``modal``, ``daytona``, ``blaxel``, ``cwsandbox``,
    ``islo``, and ``openshell`` have managed-launch support; ``lakebox``
    parses but rejects at launch.
 
@@ -158,6 +170,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "lakebox",
         "modal",
         "daytona",
+        "blaxel",
         "boxlite",
         "cwsandbox",
         "islo",
@@ -167,7 +180,17 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
     }
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell", "kubernetes"}
+    {
+        "modal",
+        "daytona",
+        "blaxel",
+        "boxlite",
+        "cwsandbox",
+        "islo",
+        "e2b",
+        "openshell",
+        "kubernetes",
+    }
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -194,6 +217,12 @@ MODAL_MANAGED_TOKEN_TTL_S = 25 * 3600
 # session past 7 days going through the dead-host relaunch path) mints
 # a fresh token.
 DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# The blaxel launch-token TTL is NOT a constant: Blaxel reaps a sandbox at its
+# configured max age (sandbox.blaxel.ttl, 24h by default), so the TTL is derived
+# from that age at parse time via blaxel.managed_token_ttl_s(). It always sits
+# above the age, so a live sandbox can re-authenticate its tunnel across
+# reconnects while a token leaked from a reaped sandbox cannot.
 
 # Launch-token lifetime for the YAML boxlite path. Boxlite boxes have no
 # platform lifetime cap and persist across restarts, so the bound is policy,
@@ -845,6 +874,30 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             _parse_daytona_image(raw), _parse_daytona_env(raw)
         )
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
+    elif provider == "blaxel":
+        from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s
+
+        section = _parse_provider_section(raw, "blaxel")
+        if section is not None:
+            _reject_unknown_keys(
+                section,
+                {"image", "env", "region", "memory_mb", "ttl"},
+                "sandbox.blaxel",
+            )
+        blaxel_ttl = _parse_provider_string(raw, "blaxel", "ttl")
+        launcher_factory = _blaxel_launcher_factory(
+            image=_parse_blaxel_image(raw),
+            env=_parse_provider_env(raw, "blaxel"),
+            region=_parse_provider_string(raw, "blaxel", "region"),
+            memory_mb=_parse_provider_positive_int(raw, "blaxel", "memory_mb"),
+            ttl=blaxel_ttl,
+        )
+        # Derived from sandbox.blaxel.ttl so the token always outlives the
+        # sandbox age at which Blaxel reaps the host.
+        try:
+            token_ttl_s = managed_token_ttl_s(blaxel_ttl)
+        except ValueError as exc:
+            raise ValueError(f"server config 'sandbox.blaxel.ttl' is invalid: {exc}") from exc
     elif provider == "boxlite":
         section = _boxlite_section(raw)
         _reject_unknown_keys(
@@ -1051,6 +1104,48 @@ def _daytona_launcher_factory(
         return DaytonaSandboxLauncher(image=image, env=env)
 
     return _build
+
+
+def _blaxel_launcher_factory(
+    *,
+    image: str | None,
+    env: list[str] | None,
+    region: str | None,
+    memory_mb: int | None,
+    ttl: str | None,
+) -> Callable[[], SandboxHostLauncher]:
+    """Build the launcher factory for the YAML ``provider: blaxel`` path."""
+
+    def _build() -> SandboxHostLauncher:
+        """Construct the Blaxel launcher; the optional SDK remains lazy."""
+        from omnigent.onboarding.sandboxes.blaxel import BlaxelSandboxLauncher
+
+        return BlaxelSandboxLauncher(
+            image=image,
+            env=env,
+            region=region,
+            memory_mb=memory_mb,
+            ttl=ttl,
+        )
+
+    return _build
+
+
+def _parse_blaxel_image(raw: dict[str, object]) -> str | None:
+    """Extract an optional Blaxel image override for the public default."""
+    section = _parse_provider_section(raw, "blaxel")
+    if section is None:
+        return None
+    image = section.get("image")
+    if image is None:
+        return None
+    if not isinstance(image, str) or not image.strip():
+        raise ValueError(
+            "server config 'sandbox.blaxel.image' must be a non-empty Blaxel image id, "
+            "e.g. 'blaxel/omnigent-host:<tag>' (or omit it to use the "
+            "public image or OMNIGENT_BLAXEL_HOST_IMAGE override)"
+        )
+    return image.strip()
 
 
 def _parse_daytona_image(raw: dict[str, object]) -> str | None:

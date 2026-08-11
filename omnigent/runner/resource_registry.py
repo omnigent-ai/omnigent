@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -35,6 +36,7 @@ from omnigent.entities.session_resources import (
     terminal_resource_id,
     terminal_resource_view,
 )
+from omnigent.inner.sandbox import contained_realpath, containment_prefix
 
 if TYPE_CHECKING:
     from omnigent.claude_native_status_file import SessionStatusPoller
@@ -248,14 +250,54 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
+# Allowlist rather than a denylist: a denylist only stops the separators it
+# thought to enumerate, and the previous one let a backslash through — a real
+# separator on a Windows host.
+_UNSAFE_SESSION_ID_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
 def _sanitize_session_id(session_id: str) -> str:
     """Sanitize a session id for safe use as a filesystem path component.
 
+    Real ids are ``uuid4().hex``, so this is a no-op for them. It exists so a
+    malformed or hostile id can never become a separator or a parent
+    reference.
+
+    Note the allowlist deliberately keeps ``.`` (ids may carry one), which
+    means it does NOT by itself stop ``.`` or ``..`` — those are handled
+    explicitly below. An allowlist that merely permits dots is not enough.
+
     :param session_id: Raw session/conversation identifier,
         e.g. ``"conv_abc123"`` or ``"user/session"``.
-    :returns: Sanitized string safe for directory names.
+    :returns: A single path component: never empty, never a traversal.
     """
-    return session_id.replace("/", "_").replace("..", "_")
+    safe = _UNSAFE_SESSION_ID_CHARS.sub("_", session_id)
+    # "", ".", "..", "..." — empty or pure traversal once used as a component.
+    if set(safe) <= {"."}:
+        return "_" * max(len(safe), 1)
+    return safe
+
+
+def _contained_session_dir(root: str | Path, session_id: str) -> str:
+    """Join *session_id* under *root* and prove the result stayed there.
+
+    :func:`_sanitize_session_id` already reduces the id to one safe component.
+    This asserts the property that actually matters — the joined path really
+    is inside the runner workspace — instead of trusting that reduction. The
+    two are independent, so a gap in either alone is not enough to escape.
+
+    :param root: Runner workspace root, e.g. ``"/var/omnigent/sessions"``.
+    :param session_id: Raw session/conversation identifier.
+    :returns: Absolute path to the session directory.
+    :raises ValueError: If the joined path escapes *root*.
+    """
+    prefix = containment_prefix(os.path.realpath(str(root)))
+    contained = contained_realpath(
+        os.path.join(str(root), _sanitize_session_id(session_id)), prefix
+    )
+    if contained is None:
+        raise ValueError(f"session id {session_id!r} escapes the runner workspace root {root!r}")
+    return contained
 
 
 def _session_workspace(session_id: str) -> str:
@@ -264,12 +306,13 @@ def _session_workspace(session_id: str) -> str:
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :returns: Absolute path to the session workspace directory.
+    :raises ValueError: If the session id escapes the workspace root.
     """
     root = os.environ.get(
         "OMNIGENT_RUNNER_OS_ENV_ROOT",
         _DEFAULT_WORKSPACE_ROOT,
     )
-    return os.path.join(root, _sanitize_session_id(session_id), "workspace")
+    return os.path.join(_contained_session_dir(root, session_id), "workspace")
 
 
 class SessionResourceRegistry:
@@ -713,7 +756,7 @@ class SessionResourceRegistry:
         if self._runner_workspace is not None:
             if self._per_session_workspace:
                 # Isolate sessions under the shared workspace.
-                default_cwd = str(self._runner_workspace / _sanitize_session_id(session_id))
+                default_cwd = _contained_session_dir(self._runner_workspace, session_id)
                 os.makedirs(default_cwd, mode=0o700, exist_ok=True)
                 os.chmod(default_cwd, 0o700)  # ensure mode even if pre-existing
             else:
@@ -812,7 +855,7 @@ class SessionResourceRegistry:
         # don't share a cwd.
         if self._runner_workspace is not None:
             if self._per_session_workspace:
-                default_cwd = str(self._runner_workspace / _sanitize_session_id(session_id))
+                default_cwd = _contained_session_dir(self._runner_workspace, session_id)
             else:
                 default_cwd = str(self._runner_workspace)
             return str(Path(default_cwd).resolve())

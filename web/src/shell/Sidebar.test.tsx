@@ -552,6 +552,20 @@ describe("Sidebar session list", () => {
     expect(within(headerActions).queryByTestId("inbox-button")).toBeNull();
   });
 
+  it("omits the desktop server picker outside the Electron shell", async () => {
+    // The picker is Electron-only: it self-hides when the native bridge
+    // reports no connected server (a plain browser tab, as in tests), leaving
+    // the sidebar ending with the session list exactly as before.
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    // Anchor on something that DOES render, so a silently-empty sidebar can't
+    // make this assertion pass for the wrong reason.
+    expect(await screen.findByTestId("settings-button")).toBeInTheDocument();
+    expect(screen.queryByTestId("sidebar-server-picker")).toBeNull();
+    expect(screen.queryByTestId("sidebar-server-picker-row")).toBeNull();
+  });
+
   it("renders Inbox as its own primary navigation row", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();

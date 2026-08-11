@@ -209,7 +209,6 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
 // is the path. Global so all markers in a message are found / stripped.
 const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
-
 /** Server-info as consumers see it: the probe's result, or "loading". */
 type ServerInfoValue = ServerInfo | "loading";
 
@@ -1080,8 +1079,12 @@ export function ChatPage() {
         kind: activeSession?.kind,
       }
     : livenessRowFromSession(activeSession);
+  // Host-switch launch marker; see the store field. Keeps this surface's
+  // liveness in step with AppShell's, which drives the startup spinner.
+  const runnerLaunchedAt = useChatStore((s) => s.runnerLaunchedAt);
   const liveness = useSessionLiveness(urlConvId ?? undefined, livenessRow, {
     turnActive: status === "streaming",
+    launchedAt: runnerLaunchedAt,
   });
 
   // Browser tab title: "● Title" while the main session is working so
@@ -1336,7 +1339,9 @@ interface SessionLayoutProps {
 function SessionLayout({ mainAgent }: SessionLayoutProps) {
   return (
     <div className="flex min-h-0 flex-1 overflow-hidden">
-      <div className="flex min-w-0 flex-1 flex-col">{mainAgent}</div>
+      {/* `relative`: positions MainAgentSurface's persistent terminal
+          overlay (absolute inset-0) against the main column. */}
+      <div className="relative flex min-w-0 flex-1 flex-col">{mainAgent}</div>
     </div>
   );
 }
@@ -1540,6 +1545,71 @@ export function shouldShowTerminalSurface(
 }
 
 /**
+ * Whether the terminal surface should be MOUNTED (kept alive), as opposed
+ * to shown. Broader than {@link shouldShowTerminalSurface}: once a
+ * terminal is reachable, the surface mounts hidden behind the chat view
+ * so the WS attach pre-warms in the background and survives Chat/Terminal
+ * flips — making both the first open and every return near-instant. With
+ * no reachable terminal the surface still mounts while the view is open
+ * (it owns the "No terminals available" / reconnect states), but a hidden
+ * mount would just dial a dead runner, so it stays unmounted.
+ */
+export function shouldMountTerminalSurface(
+  conversationId: string | null,
+  terminalFirst:
+    | {
+        isTerminalFirst: boolean;
+        view: "chat" | "terminal";
+        terminalsAvailable: boolean;
+      }
+    | null
+    | undefined,
+): boolean {
+  if (!conversationId || terminalFirst?.isTerminalFirst !== true) return false;
+  return terminalFirst.view === "terminal" || terminalFirst.terminalsAvailable;
+}
+
+/**
+ * One recently-viewed terminal-first session whose terminal surface stays
+ * mounted (hidden) after navigating away, so switching back re-reveals a
+ * live attach instead of re-dialing. ``readOnly`` is snapshotted from the
+ * session's own permission level while it was active — the current
+ * session's permissions must never leak onto a warm background surface.
+ */
+export interface WarmTerminalEntry {
+  conversationId: string;
+  readOnly: boolean;
+}
+
+/**
+ * How many sessions' terminal surfaces stay warm at once (the active one
+ * included). Each warm surface holds a WebSocket + a runner-side
+ * ``tmux attach``, a WebGL context (browsers cap those per page; losing
+ * one falls back to xterm's DOM renderer), and keeps parsing any output
+ * its TUI streams while hidden — so the cache is bounded rather than
+ * unbounded, but sized to cover a working set of sessions, not just a
+ * pair. Idle shells cost ~nothing in the background; the practical
+ * ceiling is many simultaneously *busy* TUIs.
+ */
+export const MAX_WARM_TERMINAL_SURFACES = 8;
+
+/**
+ * LRU update for the warm terminal-surface cache: move (or insert)
+ * *conversationId* at the most-recent end with the given *readOnly*
+ * snapshot, evicting the least-recent entry past
+ * {@link MAX_WARM_TERMINAL_SURFACES}. Pure — exported for direct unit
+ * testing.
+ */
+export function updateWarmTerminalSurfaces(
+  prev: WarmTerminalEntry[],
+  conversationId: string,
+  readOnly: boolean,
+): WarmTerminalEntry[] {
+  const rest = prev.filter((e) => e.conversationId !== conversationId);
+  return [...rest, { conversationId, readOnly }].slice(-MAX_WARM_TERMINAL_SURFACES);
+}
+
+/**
  * The conversation scroll surface + composer — the content of the
  * "Main Agent" tab (and also the standalone view on `/`).
  *
@@ -1605,8 +1675,9 @@ function MainAgentSurface({
   const showTerminal = shouldShowTerminalSurface(conversationId, terminalFirst, runnerOnline);
 
   // All hook calls below must run on every render regardless of
-  // `showTerminal` — Rules of Hooks. The early return for the terminal
-  // branch lives below, after every hook has run.
+  // `showTerminal` — Rules of Hooks. The single return at the bottom
+  // renders the persistent terminal overlay and, when the terminal view
+  // is closed, the chat surface beside it.
 
   // Single nav instance shared by hotkey + buttons (see useUserMessageNav).
   // System-message bubbles (`[System: ...]` notifications rendered via
@@ -1822,40 +1893,85 @@ function MainAgentSurface({
   // spinner suppresses it (that bubble owns the slot with its own animation).
   const showWorkingIndicator = shouldShowWorkingIndicator(showsWorking, bubbles);
 
-  if (showTerminal && conversationId) {
+  // Persistent terminal surfaces for terminal-first sessions. Each is
+  // mounted from the moment its terminal is reachable — not just when the
+  // view is open — and kept mounted as a visibility-toggled overlay, so
+  // the attach (WS dial through the host tunnel + a forked `tmux attach`
+  // + full repaint) pre-warms in the background and survives both
+  // Chat/Terminal flips AND session switches: a small LRU keeps the last
+  // few sessions' surfaces alive after navigating away, so coming back is
+  // near-instant instead of re-dialing from scratch. `invisible` (not
+  // display:none) keeps a hidden overlay's layout size, so FitAddon
+  // geometry stays correct and no resize churn hits tmux; hidden elements
+  // don't paint, hit-test, or take focus. The chat surface still unmounts
+  // while the terminal is shown — a heavy transcript shouldn't render
+  // behind a live terminal.
+  const mountTerminal = shouldMountTerminalSurface(conversationId, terminalFirst);
+  // Non-owners attach read-only: a shared PTY can't attribute input
+  // per-user, so only the owner may type. They drive the agent via the
+  // composer instead. Server enforces this too.
+  const terminalReadOnly = !isOwnerLevel(permissionLevel);
+  const [warmTerminals, setWarmTerminals] = useState<WarmTerminalEntry[]>([]);
+  useEffect(() => {
+    if (!mountTerminal || !conversationId) return;
+    setWarmTerminals((prev) => updateWarmTerminalSurfaces(prev, conversationId, terminalReadOnly));
+  }, [mountTerminal, conversationId, terminalReadOnly]);
+  // Render from a derived list that already includes the active session,
+  // so a fresh session's surface mounts in the same commit (the effect
+  // above persists it one commit later) and its readOnly snapshot tracks
+  // a late permission hydrate while it is the active session.
+  const renderedTerminals =
+    mountTerminal && conversationId
+      ? updateWarmTerminalSurfaces(warmTerminals, conversationId, terminalReadOnly)
+      : warmTerminals;
+  const terminalSurfaces = renderedTerminals.map((entry) => {
+    const isActive = mountTerminal && entry.conversationId === conversationId;
+    const isShown = isActive && showTerminal;
     return (
-      <>
+      <div
+        key={entry.conversationId}
+        className={cn("absolute inset-0 flex flex-col", !isShown && "invisible")}
+        aria-hidden={!isShown}
+      >
         <MainTerminalView
-          conversationId={conversationId}
-          initialTerminalKey={terminalFirst?.terminalViewKey}
-          onSurfaceElement={setTerminalSurfaceEl}
-          // Non-owners attach read-only: a shared PTY can't attribute
-          // input per-user, so only the owner may type. They drive the
-          // agent via the composer instead. Server enforces this too.
-          readOnly={!isOwnerLevel(permissionLevel)}
+          conversationId={entry.conversationId}
+          initialTerminalKey={isActive ? terminalFirst?.terminalViewKey : null}
+          visible={isShown}
+          onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
+          readOnly={entry.readOnly}
         />
-        <ConnectionIndicator
-          liveness={liveness}
-          onShowReconnectHelp={onShowReconnectHelp}
-          surfaceFrontmost={surfaceFrontmost}
-        />
-      </>
+        {isShown && (
+          <ConnectionIndicator
+            liveness={liveness}
+            onShowReconnectHelp={onShowReconnectHelp}
+            surfaceFrontmost={surfaceFrontmost}
+          />
+        )}
+      </div>
     );
-  }
+  });
 
+  // Single return so both surfaces keep stable fragment positions across
+  // view flips — an early return would change the tree shape and remount
+  // the terminal overlays, disposing the live attaches they exist to
+  // preserve. The chat surface still unmounts entirely while the
+  // terminal is shown (a heavy transcript shouldn't render behind it).
   return (
     <>
-      {/* Wrapper div gives us a ref to scope the SelectionPopup to the
+      {terminalSurfaces}
+      {!showTerminal && (
+        <>
+          {/* Wrapper div gives us a ref to scope the SelectionPopup to the
           conversation area without requiring Conversation to forward refs. */}
-      <div
-        ref={setConversationEl}
-        className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
-      >
-        {/* chat-scroll-fade masks the viewport's top edge so scrolling
+          <div
+            ref={setConversationEl}
+            className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
+          >
+            {/* chat-scroll-fade masks the viewport's top edge so scrolling
             content dissolves into the canvas before reaching the
             ChatHeader overlay's controls (geometry in index.css). */}
-        <Conversation className="chat-scroll-fade flex-1">
-          {/* Override ConversationContent's default spacing so the thread keeps
+            <Conversation className="chat-scroll-fade flex-1">
+              {/* Override ConversationContent's default spacing so the thread keeps
               16px side gutters and consecutive agent turns read as one thread.
               The left inset grows *continuously* as the conversation area
               narrows: the centered column slides left with the area until its
@@ -1867,60 +1983,60 @@ function MainAgentSurface({
               ramp (1rem→1.5rem as the area crosses ~54rem) matches where the
               48rem column's auto-margins shrink past the clearance. md+ only:
               the rail is hidden on mobile, which keeps the plain 1rem gutter. */}
-          {/* Native scroll anchoring holds position across a history prepend —
+              {/* Native scroll anchoring holds position across a history prepend —
               the browser does it off the main thread, so it can't interrupt an
               in-flight scroll the way an imperative scrollTop write does. */}
-          <ConversationContent
-            scrollClassName="transcript-hide-native-scrollbar"
-            className={cn(
-              "chat-conversation-content mx-auto w-full gap-4 px-4 pt-20 pb-6",
-              "md:pl-[clamp(1rem,(54rem-100cqi)*0.5+1rem,1.5rem)]",
-              CHAT_COLUMN_WIDTH,
-            )}
-          >
-            {/* Scroll helpers — must live inside StickToBottom to access context. */}
-            <ScrollToBottomOnSend nonce={sendScrollNonce} />
-            <PreserveScrollDistanceOnResize />
-            <ConversationScrollRefBridge onScroller={setScroller} />
-            <HistoryAutoLoader scrollElement={scroller?.el ?? null} />
-            {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
-              // Cold launch: a centered spinner instead of the "ready to
-              // type" empty state (the create-then-send path uses the
-              // "row" variant). Two launch shapes land here: a
-              // terminal-first spin-up (gate on isTerminalFirst too —
-              // terminalStartingUp is set for non-terminal-first sessions
-              // as well) and a managed-sandbox launch, whose stage text
-              // renders in the same spot for ANY session type.
-              (terminalFirst?.isTerminalFirst && terminalFirst.terminalStartingUp) ||
-              sandboxLaunching ? (
-                <RunnerStartingIndicator variant="hero" />
-              ) : (
-                <ConversationEmptyState>
-                  <div className="space-y-1.5">
-                    <h3 className="text-2xl font-medium tracking-[-0.02em]">
-                      What should we work on?
-                    </h3>
-                    <p className="text-muted-foreground text-ui">
-                      {agentsError
-                        ? `Failed to load agents: ${agentsError instanceof Error ? agentsError.message : String(agentsError)}`
-                        : "Send a message to get started."}
-                    </p>
-                  </div>
-                </ConversationEmptyState>
-              )
-            ) : (
-              <>
-                {/* Older pages prepend here while their request is in flight. */}
-                {loadingMoreHistory && <HistoryLoadingIndicator />}
-                {streamBubbles.map((bubble, bubbleIndex) => (
-                  <BubbleView
-                    key={bubbleKey(bubble)}
-                    bubble={bubble}
-                    isLastAssistant={bubbleIndex === lastAssistantIndex}
-                    showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
-                  />
-                ))}
-                {/* Pending elicitation cards, floated to the bottom of the
+              <ConversationContent
+                scrollClassName="transcript-hide-native-scrollbar"
+                className={cn(
+                  "chat-conversation-content mx-auto w-full gap-4 px-4 pt-20 pb-6",
+                  "md:pl-[clamp(1rem,(54rem-100cqi)*0.5+1rem,1.5rem)]",
+                  CHAT_COLUMN_WIDTH,
+                )}
+              >
+                {/* Scroll helpers — must live inside StickToBottom to access context. */}
+                <ScrollToBottomOnSend nonce={sendScrollNonce} />
+                <PreserveScrollDistanceOnResize />
+                <ConversationScrollRefBridge onScroller={setScroller} />
+                <HistoryAutoLoader scrollElement={scroller?.el ?? null} />
+                {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
+                  // Cold launch: a centered spinner instead of the "ready to
+                  // type" empty state (the create-then-send path uses the
+                  // "row" variant). Two launch shapes land here: a
+                  // terminal-first spin-up (gate on isTerminalFirst too —
+                  // terminalStartingUp is set for non-terminal-first sessions
+                  // as well) and a managed-sandbox launch, whose stage text
+                  // renders in the same spot for ANY session type.
+                  (terminalFirst?.isTerminalFirst && terminalFirst.terminalStartingUp) ||
+                  sandboxLaunching ? (
+                    <RunnerStartingIndicator variant="hero" />
+                  ) : (
+                    <ConversationEmptyState>
+                      <div className="space-y-1.5">
+                        <h3 className="text-2xl font-medium tracking-[-0.02em]">
+                          What should we work on?
+                        </h3>
+                        <p className="text-muted-foreground text-ui">
+                          {agentsError
+                            ? `Failed to load agents: ${agentsError instanceof Error ? agentsError.message : String(agentsError)}`
+                            : "Send a message to get started."}
+                        </p>
+                      </div>
+                    </ConversationEmptyState>
+                  )
+                ) : (
+                  <>
+                    {/* Older pages prepend here while their request is in flight. */}
+                    {loadingMoreHistory && <HistoryLoadingIndicator />}
+                    {streamBubbles.map((bubble, bubbleIndex) => (
+                      <BubbleView
+                        key={bubbleKey(bubble)}
+                        bubble={bubble}
+                        isLastAssistant={bubbleIndex === lastAssistantIndex}
+                        showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
+                      />
+                    ))}
+                    {/* Pending elicitation cards, floated to the bottom of the
                     chat so an outstanding question stays in view (stick-to-
                     bottom) no matter how much text the agent streamed after
                     it. Wrapped in an assistant Message so each matches an
@@ -1929,143 +2045,145 @@ function MainAgentSurface({
                     the composer. Rendered ABOVE the Working… indicator so the
                     card sits closest to the prompt and the shimmer stays the
                     last thing in the flow. */}
-                {pendingElicitations.map((item) => (
-                  <Message
-                    key={item.elicitationId}
-                    from="assistant"
-                    className="max-w-full"
-                    data-testid="bottom-elicitation"
-                  >
-                    <MessageContent className="w-full">
-                      <ElicitationCard item={item} />
-                    </MessageContent>
-                  </Message>
-                ))}
-                {/* Working… shimmer, lit for the whole busy turn so the user
+                    {pendingElicitations.map((item) => (
+                      <Message
+                        key={item.elicitationId}
+                        from="assistant"
+                        className="max-w-full"
+                        data-testid="bottom-elicitation"
+                      >
+                        <MessageContent className="w-full">
+                          <ElicitationCard item={item} />
+                        </MessageContent>
+                      </Message>
+                    ))}
+                    {/* Working… shimmer, lit for the whole busy turn so the user
                     always sees the session is still going. Suppressed when the
                     last bubble is a compaction spinner — that bubble already
                     owns the "in-progress" slot. aria-hidden: the pinned pill
                     owns the single aria-live region (see WorkingStatusPin). */}
-                {showWorkingIndicator && <WorkingIndicator />}
-                {/* Terminal-first spin-up cue beneath the just-sent first
+                    {showWorkingIndicator && <WorkingIndicator />}
+                    {/* Terminal-first spin-up cue beneath the just-sent first
                     message: the prompt bubble renders immediately (no
                     runner-online send gate), but `showWorkingIndicator` stays
                     suppressed while the runner is offline, so without this the
                     user's message sits with no sign anything is happening.
                     Self-gates to null off the spin-up window; rendered only
                     when not already showing Working… so the two never stack. */}
-                {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
-                {/* MCP-server startup band (codex-native): renders while the
+                    {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
+                    {/* MCP-server startup band (codex-native): renders while the
                     harness boots its MCP servers and, after startup settles,
                     when servers failed or were cancelled. Independent of the
                     Working… shimmer — it is strictly more specific about why
                     the turn hasn't produced output yet. */}
-                <McpStartupIndicator />
-              </>
-            )}
-            {/* Frames the initially loaded turn at the top of the viewport and
+                    <McpStartupIndicator />
+                  </>
+                )}
+                {/* Frames the initially loaded turn at the top of the viewport and
                 keeps the pane scrollable so older history stays reachable.
                 Always mounted — including for an empty new conversation — so
                 a fast first send cannot become the captured initial anchor.
                 Last child so it measures everything above it. */}
-            <LatestTurnSpacer scrollElement={scroller?.el ?? null} />
-          </ConversationContent>
-          <ConversationScrollButton />
-          {/* Outside ConversationContent so it's pinned to the viewport, not the scroll. See WorkingStatusPin.
+                <LatestTurnSpacer scrollElement={scroller?.el ?? null} />
+              </ConversationContent>
+              <ConversationScrollButton />
+              {/* Outside ConversationContent so it's pinned to the viewport, not the scroll. See WorkingStatusPin.
               Suppressed in a sub-agent session: the composer's "Chatting with sub-agent …" tray owns this slot. */}
-          <WorkingStatusPin show={showWorkingIndicator} suppress={subAgentLabel != null} />
-          <UserMessageNavConnected
-            goPrev={nav.goPrev}
-            goNext={nav.goNext}
-            canPrev={nav.canPrev}
-            canNext={nav.canNext}
-            hidden={userMessageIds.length === 0}
-          />
-        </Conversation>
-        {/* Constant-height scrollbar. Sibling of Conversation for the same
+              <WorkingStatusPin show={showWorkingIndicator} suppress={subAgentLabel != null} />
+              <UserMessageNavConnected
+                goPrev={nav.goPrev}
+                goNext={nav.goNext}
+                canPrev={nav.canPrev}
+                canNext={nav.canNext}
+                hidden={userMessageIds.length === 0}
+              />
+            </Conversation>
+            {/* Constant-height scrollbar. Sibling of Conversation for the same
             reason as JumpToTopButton — outside the chat-scroll-fade mask, which
             would otherwise dissolve it against the header. */}
-        <TranscriptScrollbar scroller={scroller} />
-        {/* Hover the top edge to reveal a pill that loads all older history and
+            <TranscriptScrollbar scroller={scroller} />
+            {/* Hover the top edge to reveal a pill that loads all older history and
             scrolls to the first message. Rendered here (a wrapper sibling of
             Conversation) rather than inside it so it escapes the chat-scroll-fade
             mask and can sit right at the fade border. */}
-        <JumpToTopButton
-          containerEl={containerEl}
-          scroller={scroller}
-          hasMoreHistory={hasMoreHistory}
-        />
-        {/* Left-edge minimap: one tick per turn, scrolls independently, pages
+            <JumpToTopButton
+              containerEl={containerEl}
+              scroller={scroller}
+              hasMoreHistory={hasMoreHistory}
+            />
+            {/* Left-edge minimap: one tick per turn, scrolls independently, pages
             in older history on scroll-up. Sibling of Conversation for the same
             reason as JumpToTopButton — it escapes the chat-scroll-fade mask.
             Desktop-only: not mounted on mobile where the rail is hidden. */}
-        {!isMobileViewport && (
-          <TurnRail
-            turns={turns}
-            scroller={scroller}
-            hasMoreHistory={hasMoreHistory}
-            loadingMoreHistory={loadingMoreHistory}
+            {!isMobileViewport && (
+              <TurnRail
+                turns={turns}
+                scroller={scroller}
+                hasMoreHistory={hasMoreHistory}
+                loadingMoreHistory={loadingMoreHistory}
+              />
+            )}
+          </div>
+          {/* Floating reply button — scoped to the conversation container. */}
+          <SelectionPopup
+            containerRef={conversationRef}
+            onReply={(text) =>
+              setReplyQuotes((prev) => [
+                ...prev,
+                { id: `reply-quote-${nextReplyQuoteId.current++}`, text },
+              ])
+            }
           />
-        )}
-      </div>
-      {/* Floating reply button — scoped to the conversation container. */}
-      <SelectionPopup
-        containerRef={conversationRef}
-        onReply={(text) =>
-          setReplyQuotes((prev) => [
-            ...prev,
-            { id: `reply-quote-${nextReplyQuoteId.current++}`, text },
-          ])
-        }
-      />
 
-      <Composer
-        disabled={disabled}
-        status={status}
-        isWorking={isWorking}
-        onSend={handleSend}
-        onSendSlashCommand={handleSendSlashCommand}
-        onStop={onStop}
-        agents={agents}
-        selectedAgentId={selectedAgentId}
-        permissionLevel={permissionLevel}
-        readOnlyReason={readOnlyReason}
-        replyQuotes={replyQuotes}
-        onRemoveQuote={(i) => setReplyQuotes((prev) => prev.filter((_, idx) => idx !== i))}
-        onClearAllQuotes={() => setReplyQuotes([])}
-        effortLevels={effortLevels}
-        showEffort={showEffort}
-        showModels={showModels}
-        modelPickerKind={modelPickerKind}
-        codexModelOptions={codexModelOptions}
-        showCodexPlanMode={showCodexPlanMode}
-        showGoalControl={showGoalControl}
-        showClaudeGoalControl={showClaudeGoalControl}
-        showPollyCodexGoalControl={showPollyCodexGoalControl}
-        isTerminalFirst={isTerminalFirst}
-        isNativeWrapper={isNativeWrapper}
-        reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
-        sandboxAsleepHint={liveness.kind === "host_asleep"}
-        unreachable={
-          !sandboxLaunching &&
-          (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
-        }
-        onShowReconnectHelp={onShowReconnectHelp}
-        costRoutingEligible={costRoutingEligible}
-        subagentRoutingEligible={subagentRoutingEligible}
-        subAgentLabel={subAgentLabel}
-        wrapperLabel={wrapperLabel}
-        onGrowthChange={publishComposerGrowth}
-      />
+          <Composer
+            disabled={disabled}
+            status={status}
+            isWorking={isWorking}
+            onSend={handleSend}
+            onSendSlashCommand={handleSendSlashCommand}
+            onStop={onStop}
+            agents={agents}
+            selectedAgentId={selectedAgentId}
+            permissionLevel={permissionLevel}
+            readOnlyReason={readOnlyReason}
+            replyQuotes={replyQuotes}
+            onRemoveQuote={(i) => setReplyQuotes((prev) => prev.filter((_, idx) => idx !== i))}
+            onClearAllQuotes={() => setReplyQuotes([])}
+            effortLevels={effortLevels}
+            showEffort={showEffort}
+            showModels={showModels}
+            modelPickerKind={modelPickerKind}
+            codexModelOptions={codexModelOptions}
+            showCodexPlanMode={showCodexPlanMode}
+            showGoalControl={showGoalControl}
+            showClaudeGoalControl={showClaudeGoalControl}
+            showPollyCodexGoalControl={showPollyCodexGoalControl}
+            isTerminalFirst={isTerminalFirst}
+            isNativeWrapper={isNativeWrapper}
+            reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
+            sandboxAsleepHint={liveness.kind === "host_asleep"}
+            unreachable={
+              !sandboxLaunching &&
+              (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
+            }
+            onShowReconnectHelp={onShowReconnectHelp}
+            costRoutingEligible={costRoutingEligible}
+            subagentRoutingEligible={subagentRoutingEligible}
+            subAgentLabel={subAgentLabel}
+            wrapperLabel={wrapperLabel}
+            onGrowthChange={publishComposerGrowth}
+          />
 
-      {/* Chat/Terminal toggle for terminal-first sessions, reconnect-or-
+          {/* Chat/Terminal toggle for terminal-first sessions, reconnect-or-
           fork banner when unreachable, nothing otherwise. Sits below the
           composer so its position is consistent with the terminal view. */}
-      <ConnectionIndicator
-        liveness={liveness}
-        onShowReconnectHelp={onShowReconnectHelp}
-        surfaceFrontmost={surfaceFrontmost}
-      />
+          <ConnectionIndicator
+            liveness={liveness}
+            onShowReconnectHelp={onShowReconnectHelp}
+            surfaceFrontmost={surfaceFrontmost}
+          />
+        </>
+      )}
     </>
   );
 }
@@ -4287,6 +4405,13 @@ export function Composer({
   // "Attach to agent" button). Drained into ``mentionedItems`` below, then
   // cleared from the store so they aren't re-applied.
   const pendingComposerAttachments = useChatStore((s) => s.pendingComposerAttachments);
+  // Text + attachments handed back by a send that failed before the server
+  // took ownership. Drained below so the message can be retried.
+  const failedSendDraft = useChatStore((s) => s.failedSendDraft);
+  // The conversation whose draft the composer's value/files currently hold.
+  // Trails `conversationId` by one commit across a session switch; see the
+  // draft-restore effect.
+  const [settledConversationId, setSettledConversationId] = useState<string | null>(null);
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
@@ -4425,6 +4550,11 @@ export function Composer({
     setValue(restored?.text ?? "");
     setFiles(restored?.files ?? []);
     dirtyRef.current = false;
+    // Publish which conversation the composer's text now belongs to. The
+    // failed-send restore below reads value/files through refs, which still
+    // hold the OUTGOING conversation's text during this commit — it waits for
+    // this to settle rather than mistaking that for "the user is typing".
+    setSettledConversationId(conversationId ?? null);
     if (!isMobileRef.current) textareaRef.current?.focus();
 
     return () => {
@@ -4616,6 +4746,35 @@ export function Composer({
     return () => useChatStore.getState().clearPendingComposerAttachments();
     // setMentionedItems is a stable useState setter (from useMentionBrowser).
   }, [pendingComposerAttachments, setMentionedItems]);
+
+  // Restore the text (and attachments) of a send that failed, so the user can
+  // fix and resend instead of retyping. The composer is empty in the normal
+  // case — `submit` clears it optimistically — so only fill it when the user
+  // hasn't already started something new; their in-progress text wins. Files
+  // are re-validated on the way in: when the upload itself was what failed
+  // (a 415 on an unsupported type), re-arming the same file would only fail
+  // again, so it's dropped with the same inline reason a fresh attach gives.
+  useEffect(() => {
+    if (failedSendDraft === null) return;
+    if (failedSendDraft.conversationId !== conversationId) return;
+    // Wait for the draft-restore effect to settle this conversation's text
+    // into value/files. Reading the refs mid-switch would see the PREVIOUS
+    // conversation's draft and wrongly conclude the user is mid-sentence,
+    // dropping the failed message on the way back to the session it failed in.
+    if (settledConversationId !== conversationId) return;
+    useChatStore.setState({ failedSendDraft: null });
+    // The user started something new while the send was in flight — their
+    // in-progress text wins over a clobbering restore.
+    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) return;
+    setValue(failedSendDraft.text);
+    dirtyRef.current = true;
+    if (failedSendDraft.files.length > 0) {
+      const { accepted, errors } = validateAttachments(failedSendDraft.files);
+      setFiles(accepted);
+      setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
+    }
+    if (!isMobileRef.current) textareaRef.current?.focus();
+  }, [failedSendDraft, conversationId, settledConversationId]);
 
   /**
    * Execute a slash command by name + optional argument string.
@@ -5202,6 +5361,10 @@ export function Composer({
               setValue(e.target.value);
               dirtyRef.current = true;
               if (commandError !== null) setCommandError(null);
+              // A rejected attachment is never added, so there's no chip to
+              // remove and nothing else would ever clear this. Left sticky it
+              // reads as a blocker on a composer the user can actually submit.
+              if (attachmentError !== null) setAttachmentError(null);
               // Recompute the active "@"-mention from the caret on every
               // keystroke (native coding-agent sessions — ``mentionEnabled``).
               setMention(

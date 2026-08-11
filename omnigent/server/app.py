@@ -155,7 +155,17 @@ _API_ONLY_LANDING_HTML = Path(__file__).parent / "static" / "api_only_landing.ht
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
-_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1"})
+_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1", ".well-known"})
+
+# Envelope version of GET /.well-known/omnigent.json (see the route for the
+# full contract). Bump ONLY for a change a client cannot absorb by ignoring
+# what it doesn't recognize: a removed/renamed field, or a changed meaning for
+# an existing one. Adding a new field is invisible to older clients and must
+# NOT bump this — they read the fields they know and skip the rest.
+#
+# Clients gate on `>=`, never `==`: a newer server must keep working with an
+# older desktop shell.
+WELL_KNOWN_MANIFEST_VERSION = 1
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
@@ -1691,6 +1701,67 @@ def create_app(
         """
         return {"version": _server_version()}
 
+    @app.get("/.well-known/omnigent.json")
+    async def well_known_manifest() -> dict[str, object]:
+        """Version manifest for NON-BROWSER clients — chiefly the desktop shell.
+
+        The desktop shell ships and updates on its own cadence, so any
+        installed build can meet any server version. The shell is the side
+        that must adapt (the user may not update it for months), and to adapt
+        it first has to know what it is talking to. This endpoint is that
+        answer, fetched BEFORE the SPA loads — unlike ``/v1/info``, which the
+        SPA reads after boot and which is therefore useless to the shell when
+        deciding how to open a window in the first place.
+
+        Contract, in the order a client should apply it:
+
+        1. ``manifest_version`` (int) versions this ENVELOPE. Clients gate on
+           ``>=``, never ``==``, so a newer server keeps working with an older
+           shell. See :data:`WELL_KNOWN_MANIFEST_VERSION` for when it bumps —
+           adding a field never does.
+        2. ``server_version`` (str) is the installed omnigent package version,
+           the same value as ``/api/version`` and ``/v1/info.server_version``.
+           Informational: for display and bug reports, NOT for gating. Gate on
+           the fields below, which state capability directly rather than making
+           every client hardcode "which release added X".
+        3. ``min_desktop_version`` (str | null) is the oldest desktop build this
+           server still supports. Null means no floor — the overwhelmingly
+           common case, and what every shipped shell must treat as "fine".
+           A server sets it only to signal a genuinely breaking change.
+        4. Everything else is additive detail an older client may ignore
+           wholesale. ``ui`` describes where server-driven chrome lives, so a
+           shell can place its own window furniture without guessing from the
+           version number: ``server_picker`` is ``"sidebar"`` on builds that
+           dock the picker at the sidebar's bottom (it was ``"titlebar"``,
+           centered in the macOS title-bar strip, before this).
+
+        Unknown fields MUST be ignored, and a missing manifest (404 — every
+        server older than this route) MUST be treated as the pre-manifest
+        baseline, not an error: the shell falls back to its current behavior.
+        That is what makes an old shell + new server and a new shell + old
+        server both work.
+
+        Authentication: intentionally UNAUTHED, like ``/v1/info``. A client
+        must be able to read this before it holds a session cookie — the whole
+        point is to consult it before loading the app. It exposes only the
+        version already public via ``/api/version`` plus coarse UI-shape
+        strings, so there is nothing here to leak.
+
+        Served under ``/.well-known/`` (RFC 8615) so it sits at a fixed,
+        guessable path that never collides with an SPA client route.
+
+        :returns: The manifest described above.
+        """
+        return {
+            "manifest_version": WELL_KNOWN_MANIFEST_VERSION,
+            "server_version": _server_version(),
+            # No floor today: every desktop build in the wild works against
+            # this server. Kept present-but-null so clients can rely on the
+            # key existing and exercise the "no floor" path from day one.
+            "min_desktop_version": None,
+            "ui": {"server_picker": "sidebar"},
+        }
+
     @app.get("/v1/info")
     async def info() -> dict[str, bool | str | list[str] | dict[str, bool] | None]:
         """Runtime capabilities probe for the SPA + CLI.
@@ -2066,47 +2137,44 @@ def create_app(
         )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
-    async def _on_runner_disconnect(runner_id: str) -> None:
-        """Mark the turns *this* runner interrupted as offline.
 
-        Filters by ``runner_id`` against ``conversation_store`` so a
-        disconnect on one runner does not flip every cached session
-        (e.g. sessions owned by other runners on the same server, or
-        sessions left in the module-level cache by earlier tests on
-        the same xdist worker) to ``"failed"``.
-        :func:`_mark_runner_sessions_offline` then narrows that set to
-        the sessions actually mid-turn and stamps the disconnect cause
-        on them, so idle sub-agents keep their finished state and the
-        interrupted ones read as a recoverable disconnect.
+    # Pending per-runner grace timers: a disconnect schedules the
+    # failed-marking after RUNNER_DISCONNECT_GRACE_S instead of doing it
+    # immediately, so transient tunnel drops (ingress recycles,
+    # sleep-wake reconnects) that re-register within the grace never
+    # flap their sessions to failed.
+    _disconnect_grace_tasks: dict[str, asyncio.Task[None]] = {}
+
+    def _cancel_disconnect_grace(runner_id: str) -> None:
+        """Cancel and forget the pending disconnect-grace timer, if any."""
+        pending = _disconnect_grace_tasks.pop(runner_id, None)
+        if pending is not None and not pending.done():
+            pending.cancel()
+
+    async def _mark_disconnected_runner_failed(runner_id: str) -> None:
+        """Reconcile a dropped runner's sessions once the grace expires.
+
+        A runner that re-registered inside the grace makes this a no-op
+        via the live-tunnel re-check (the same newest-wins rule the
+        immediate path used); one still gone hands its bound sessions to
+        :func:`_mark_runner_sessions_offline`, which fails only the
+        interrupted turns and stamps the disconnect cause.
 
         :param runner_id: The disconnected runner's id.
         """
-        from omnigent.server.routes.sessions import _mark_runner_sessions_offline
+        from omnigent.server.routes.sessions import (
+            RUNNER_DISCONNECT_GRACE_S,
+            _mark_runner_sessions_offline,
+        )
         from omnigent.server.schemas import ErrorDetail
 
-        # Newest-wins guard: a superseded tunnel's teardown fires this
-        # hook after a fresh tunnel for the same ``runner_id`` already
-        # registered (``TunnelRegistry.register`` retires the old
-        # session, whose helper tasks then error out and run this
-        # teardown). Marking the runner's sessions ``failed`` here would
-        # clobber the live tunnel's recovery: reconnect-recovery
-        # (``_on_runner_connect`` -> ``_publish_runner_recovered_status``)
-        # may have just cleared a stale ``runner_disconnected`` failure,
-        # and this stale disconnect would silently re-fail the session.
-        # If a live tunnel is registered for this runner, the runner is
-        # NOT offline, so skip. Mirrors the registry's own
-        # generation-guarded ``deregister``.
+        await asyncio.sleep(RUNNER_DISCONNECT_GRACE_S)
         if tunnel_registry.get(runner_id) is not None:
             _logger.info(
-                "Runner %s disconnect superseded by a live tunnel; skipping offline-marking",
+                "Runner %s reconnected within the disconnect grace; skipping offline-marking",
                 runner_id,
             )
             return
-        runner_session_initializer.invalidate_runner(runner_id)
-        # Graceful disconnect: clear the persisted liveness stamp so other
-        # replicas flip offline immediately rather than after the TTL.
-        session_live_state.clear_runner_liveness(runner_id)
-
         # Direct by-runner lookup: read-after-write consistent (the
         # listing path may be served from an eventually-consistent
         # search index in alternate store backends) and
@@ -2131,6 +2199,66 @@ def create_app(
             conversation_store,
         )
 
+    async def _on_runner_disconnect(runner_id: str) -> None:
+        """Schedule offline-marking for the turns *this* runner interrupted.
+
+        Filters by ``runner_id`` against ``conversation_store`` so a
+        disconnect on one runner does not flip every cached session
+        (e.g. sessions owned by other runners on the same server, or
+        sessions left in the module-level cache by earlier tests on
+        the same xdist worker) to ``"failed"``.
+        :func:`_mark_runner_sessions_offline` then narrows that set to
+        the sessions actually mid-turn and stamps the disconnect cause
+        on them, so idle sub-agents keep their finished state and the
+        interrupted ones read as a recoverable disconnect.
+
+        The user-visible failed flip waits out a reconnect grace
+        (``RUNNER_DISCONNECT_GRACE_S``): transient drops re-register
+        well inside it and the timer's live-tunnel re-check turns them
+        into no-ops, so routine recycles never flap sessions to failed.
+        Runner invalidation and liveness clearing stay immediate so
+        reconnect re-initialization still happens.
+
+        :param runner_id: The disconnected runner's id.
+        """
+        # Newest-wins guard: a superseded tunnel's teardown fires this
+        # hook after a fresh tunnel for the same ``runner_id`` already
+        # registered (``TunnelRegistry.register`` retires the old
+        # session, whose helper tasks then error out and run this
+        # teardown). Marking the runner's sessions ``failed`` here would
+        # clobber the live tunnel's recovery: reconnect-recovery
+        # (``_on_runner_connect`` -> ``_publish_runner_recovered_status``)
+        # may have just cleared a stale ``runner_disconnected`` failure,
+        # and this stale disconnect would silently re-fail the session.
+        # If a live tunnel is registered for this runner, the runner is
+        # NOT offline, so skip. Mirrors the registry's own
+        # generation-guarded ``deregister``.
+        if tunnel_registry.get(runner_id) is not None:
+            _logger.info(
+                "Runner %s disconnect superseded by a live tunnel; skipping offline-marking",
+                runner_id,
+            )
+            return
+        runner_session_initializer.invalidate_runner(runner_id)
+        # Graceful disconnect: clear the persisted liveness stamp so other
+        # replicas flip offline immediately rather than after the TTL.
+        session_live_state.clear_runner_liveness(runner_id)
+
+        # Replace any pending timer so a rapid drop-reconnect-drop gives
+        # each outage a full grace window.
+        _cancel_disconnect_grace(runner_id)
+        task = asyncio.create_task(
+            _mark_disconnected_runner_failed(runner_id),
+            name=f"runner-disconnect-grace-{runner_id}",
+        )
+        _disconnect_grace_tasks[runner_id] = task
+
+        def _clear_grace_slot(t: asyncio.Task[None]) -> None:
+            if _disconnect_grace_tasks.get(runner_id) is t:
+                _disconnect_grace_tasks.pop(runner_id, None)
+
+        task.add_done_callback(_clear_grace_slot)
+
     async def _on_runner_exited(runner_id: str, error: str) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.
 
@@ -2152,6 +2280,10 @@ def create_app(
         from omnigent.server.routes.sessions import _mark_runner_sessions_offline
         from omnigent.server.schemas import ErrorDetail
 
+        # The crash report is authoritative and carries the richer cause;
+        # cancel any pending disconnect-grace timer so it can't re-run the
+        # disconnect reconciliation on top of it.
+        _cancel_disconnect_grace(runner_id)
         affected = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )

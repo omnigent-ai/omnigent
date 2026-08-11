@@ -252,7 +252,12 @@ export function ChatHeader({
                   cancelPeek();
                   onOpenSidebar(false);
                 }}
-                className="text-muted-foreground hover:text-foreground"
+                // chat-header-sidebar-toggle is hidden on the macOS shell, where
+                // the title-bar cluster carries an always-present toggle (with
+                // the same dwell-to-peek) and this would be a second, offset
+                // copy of it. Kept everywhere else, where it is the ONLY way to
+                // reopen a collapsed sidebar.
+                className="chat-header-sidebar-toggle text-muted-foreground hover:text-foreground"
                 onPointerEnter={onPeekSidebar}
                 onPointerLeave={cancelPeek}
               >

@@ -18,6 +18,7 @@ from omnigent.process_logging import (
     LOG_TTY_FD_ENV_VAR,
     PROCESS_LOG_FILE_ENV_VAR,
     TerminalLogFormatter,
+    _unlink_if_empty,
     child_logging_popen_kwargs,
     configure_process_logging,
     current_process_log_path,
@@ -239,6 +240,62 @@ def test_configure_process_logging_publishes_its_log_path(
     )
     try:
         assert current_process_log_path() == log_path
+    finally:
+        logger = logging.getLogger(logger_name)
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+
+
+def test_unlink_if_empty_sweeps_only_empty_files(tmp_path: Path) -> None:
+    """The exit sweep removes an empty log, keeps a written one, tolerates absence."""
+    empty = tmp_path / "empty.log"
+    empty.touch()
+    written = tmp_path / "written.log"
+    written.write_text("one line\n")
+
+    _unlink_if_empty(empty)
+    _unlink_if_empty(written)
+    _unlink_if_empty(tmp_path / "missing.log")
+
+    assert not empty.exists()
+    assert written.exists()
+
+
+def test_configure_registers_the_empty_log_sweep_for_self_allocated_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Only a self-allocated log path gets the exit sweep.
+
+    A crash before the first record used to leave a fresh empty log
+    behind on every start (dozens a day for crash-at-birth hosts). A
+    parent-published (env) or explicit ``log_path`` is the caller's to
+    manage, so no hook is registered for those.
+    """
+    registered: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        "omnigent.process_logging.atexit.register",
+        lambda fn, *args: registered.append((fn, *args)),
+    )
+    monkeypatch.setattr("omnigent.process_logging._current_process_log_path", None)
+    monkeypatch.delenv(PROCESS_LOG_FILE_ENV_VAR, raising=False)
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+    logger_name = "omnigent.test_empty_log_sweep"
+
+    path = configure_process_logging("host", logger_names=(logger_name,), root=False)
+    try:
+        assert registered == [(_unlink_if_empty, path)]
+
+        registered.clear()
+        explicit = configure_process_logging(
+            "host",
+            log_path=tmp_path / "explicit.log",
+            logger_names=(logger_name,),
+            root=False,
+        )
+        assert registered == []
+        assert explicit == tmp_path / "explicit.log"
     finally:
         logger = logging.getLogger(logger_name)
         for handler in list(logger.handlers):

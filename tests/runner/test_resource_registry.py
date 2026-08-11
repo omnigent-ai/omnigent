@@ -22,6 +22,8 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
     TerminalExitEvent,
     TerminalLifecycle,
+    _sanitize_session_id,
+    _session_workspace,
     _terminal_exit_diagnostics,
     _trim_terminal_exit_output,
 )
@@ -1398,3 +1400,52 @@ async def test_blocked_reason_rides_pane_edges(tmp_path: Path) -> None:
     poller.emit("running", None)
     await asyncio.sleep(0)
     assert edges == [("running", "permission prompt"), ("running", None)]
+
+
+@pytest.mark.parametrize(
+    "raw,expected,why",
+    [
+        ("conv_abc123", "conv_abc123", "an ordinary id is untouched"),
+        ("a" * 32, "a" * 32, "a uuid4().hex id is untouched"),
+        ("a/b", "a_b", "a POSIX separator cannot survive"),
+        ("a\\b", "a_b", "a Windows separator cannot survive either"),
+        ("../..", ".._..", "separators go, leaving no traversal component"),
+        ("..", "__", "a bare parent reference never survives"),
+        (".", "_", "a bare self reference never survives"),
+        ("", "_", "an empty id still yields a usable component"),
+        ("a\x00b", "a_b", "a NUL cannot reach os.path.join"),
+        ("a b", "a_b", "whitespace is normalized rather than quoted downstream"),
+    ],
+)
+def test_sanitize_session_id_yields_one_safe_component(raw: str, expected: str, why: str) -> None:
+    """``_sanitize_session_id`` must return a single, non-traversing path component.
+
+    The id reaches the filesystem as a directory name under the runner
+    workspace, so anything that could act as a separator or a parent reference
+    has to be neutralized here. Uses an allowlist: the previous denylist
+    stopped ``/`` and ``..`` but let a backslash through.
+    """
+    got = _sanitize_session_id(raw)
+
+    assert got == expected, why
+    # The invariants that actually matter, restated independently of the
+    # table above so a wrong `expected` cannot make this vacuous.
+    assert got, "must never be empty — it becomes a path component"
+    assert "/" not in got and "\\" not in got, "must be a single component"
+    assert set(got) != {"."}, "must not be '.' or '..'"
+
+
+def test_sanitize_session_id_keeps_traversal_out_of_the_workspace_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A hostile id cannot walk the session workspace out of the runner root.
+
+    The unit test above pins the component; this pins the property callers
+    actually depend on — that the joined path stays under the root.
+    """
+    monkeypatch.setenv("OMNIGENT_RUNNER_OS_ENV_ROOT", str(tmp_path))
+
+    resolved = Path(_session_workspace("../../../../etc")).resolve()
+
+    assert resolved.is_relative_to(tmp_path.resolve()), f"escaped the root: {resolved}"

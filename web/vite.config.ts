@@ -100,6 +100,16 @@ function createProxyConfig(target: string, useAuth: boolean): Record<string, Pro
       changeOrigin: true,
       configure,
     },
+    // The server's version manifest (/.well-known/omnigent.json), which the
+    // desktop shell reads to learn what it's talking to. Without this the dev
+    // server answers with the SPA's index.html, and the shell — which rightly
+    // refuses to parse HTML as a manifest — sees every dev server as
+    // "pre-manifest", making the capability invisible in local development.
+    "/.well-known": {
+      target: origin,
+      changeOrigin: true,
+      configure,
+    },
   };
 }
 

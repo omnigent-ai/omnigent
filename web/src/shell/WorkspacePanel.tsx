@@ -34,6 +34,7 @@ import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
+import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
 import type { ChangedSort } from "./FlatFileList";
@@ -210,6 +211,9 @@ function NewTabMenu({
           ("Reconnecting…" + spinner, and the sub-trigger's chevron) — the
           default min-w-32 tracks the 32px "+" trigger and clips it. */}
       <DropdownMenuContent align="start" className="min-w-44">
+        {/* Hide the native browser view while this menu is open so it doesn't
+            paint over the dropdown (#3980). Only this rail menu needs it. */}
+        <SuppressBrowserView />
         <DropdownMenuLabel>Open new</DropdownMenuLabel>
         {multipleShells ? (
           <DropdownMenuSub>
@@ -680,6 +684,7 @@ export function WorkspacePanel({
       // same flush/bordered styling — only the width changes. The resize
       // handle is suppressed in that state — there's no neighbor to resize
       // against.
+      data-maximized={maximized || undefined}
       className={cn(
         "@container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
         maximized ? "md:absolute md:inset-0" : "md:shrink-0",

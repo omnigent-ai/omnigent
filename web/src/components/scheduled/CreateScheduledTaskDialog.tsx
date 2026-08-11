@@ -2,7 +2,7 @@
 // host, and workspace pickers where the backend can persist those fields.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Loader2Icon, TriangleAlertIcon } from "lucide-react";
+import { TriangleAlertIcon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -545,10 +545,10 @@ export function CreateScheduledTaskDialog({
           </Button>
           <Button
             onClick={handleSubmit}
+            loading={mutationPending}
             disabled={!canSubmit}
             data-testid="create-scheduled-task-submit"
           >
-            {mutationPending && <Loader2Icon className="mr-1 size-4 animate-spin" />}
             {isEdit ? "Save changes" : "Create task"}
           </Button>
         </DialogFooter>

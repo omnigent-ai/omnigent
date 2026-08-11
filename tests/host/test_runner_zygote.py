@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -23,9 +24,12 @@ from omnigent.host.runner_zygote import (
     ZygoteRunnerProc,
     ZygoteUnavailable,
 )
+from omnigent.runner import _zygote
 from omnigent.runner._zygote import (
     _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR,
     _ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR,
+    _disk_build_stamp,
+    _ZygoteServer,
 )
 
 # The zygote is POSIX-only: these tests exercise os.fork() and pass_fds, which
@@ -434,6 +438,95 @@ def test_fork_harness_argv_round_trips_to_child(manager: ZygoteManager, tmp_path
     reply = _control_exchange(manager, {"cmd": "fork_harness", "argv": argv, "env": env})
     assert _wait_harness_exit(manager, reply["pid"]) == 0
     assert f"harness_argv={' '.join(argv)}" in log.read_text()
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        pytest.param(
+            'BUILD_TIME_EPOCH = 1754848860\nCOMMIT_SHA = "b703a28b"\n',
+            (1754848860.0, "b703a28b"),
+            id="generated",
+        ),
+        pytest.param(None, None, id="missing"),
+        pytest.param("BUILD_TIME_EPOCH = (\n", None, id="half-written"),
+        pytest.param('COMMIT_SHA = "b703a28b"\n', None, id="field-missing"),
+    ],
+)
+def test_disk_build_stamp_reads_the_on_disk_file(tmp_path, content, expected) -> None:
+    """``_disk_build_stamp`` parses the generated file; any failure reads as unknown.
+
+    :param tmp_path: Directory standing in for the installed package dir.
+    :param content: ``_build_info.py`` body, or ``None`` to leave it absent.
+    :param expected: The stamp the probe must return.
+    """
+    if content is not None:
+        (tmp_path / "_build_info.py").write_text(content)
+    assert _disk_build_stamp(package_dir=tmp_path) == expected
+
+
+def _dispatch_fork_harness(
+    server: _ZygoteServer, conn: socket.socket, peer: socket.socket
+) -> dict:
+    """Dispatch one in-process ``fork_harness`` request and return the reply.
+
+    :param server: The server under test.
+    :param conn: The socket end handed to the dispatcher.
+    :param peer: The other end, read for the reply.
+    :returns: The decoded reply.
+    """
+    request = {"cmd": "fork_harness", "argv": [], "env": {}}
+    server._dispatch(conn, json.dumps(request).encode("utf-8"))
+    return json.loads(peer.recv(65536).decode("utf-8"))
+
+
+def test_fork_harness_refused_after_in_place_upgrade(monkeypatch) -> None:
+    """A disk stamp differing from the boot stamp refuses the harness fork.
+
+    A forked child would import the harness module from the NEW on-disk files
+    against the OLD pre-imported graph — e.g. ``from omnigent.inner.executor
+    import describe_exception`` failing because the in-memory module predates
+    the symbol. The refusal makes the runner fall back to a direct exec, which
+    runs the new code coherently.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    daemon, daemon_peer = socket.socketpair()
+    conn, peer = socket.socketpair()
+    server = _ZygoteServer(daemon, graph_stamp=(1000.0, "oldsha"))
+    monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (2000.0, "newsha"))
+    monkeypatch.setattr(os, "fork", lambda: pytest.fail("must not fork a mixed-version harness"))
+    try:
+        reply = _dispatch_fork_harness(server, conn, peer)
+        assert "upgraded on disk" in reply["error"]
+        assert server._live == set()
+    finally:
+        server._sel.close()
+        for sock in (daemon, daemon_peer, conn, peer):
+            sock.close()
+
+
+def test_fork_harness_proceeds_while_disk_stamp_matches(monkeypatch) -> None:
+    """An unchanged disk stamp forks exactly as before the gate existed.
+
+    ``os.fork`` is faked to a pid so the assertion is purely about the gate
+    letting the request through to the fork path.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    daemon, daemon_peer = socket.socketpair()
+    conn, peer = socket.socketpair()
+    server = _ZygoteServer(daemon, graph_stamp=(1000.0, "sha"))
+    monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (1000.0, "sha"))
+    monkeypatch.setattr(os, "fork", lambda: 4242)
+    try:
+        reply = _dispatch_fork_harness(server, conn, peer)
+        assert reply == {"pid": 4242}
+        assert 4242 in server._live
+    finally:
+        server._sel.close()
+        for sock in (daemon, daemon_peer, conn, peer):
+            sock.close()
 
 
 def test_zygote_still_serves_daemon_after_harness_fork(manager: ZygoteManager, tmp_path) -> None:
