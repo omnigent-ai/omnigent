@@ -1936,9 +1936,41 @@ def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
             continue
         if isinstance(base_url, str):
             return base_url
-    # A cli-config entry pins only a provider *name*; its table lives in the
-    # user's ~/.codex/config.toml, which this process does not read.
-    return None
+    # A cli-config entry pins only a provider *name*; its table (with the
+    # base_url) lives in the user's shared ~/.codex/config.toml. Read that
+    # file to resolve the base URL a cli-config launch actually routes through.
+    return _cli_config_provider_base_url(codex_session_meta_model_provider(launch))
+
+
+def _cli_config_provider_base_url(provider_name: str) -> str | None:
+    """Base URL a cli-config provider name resolves to in the user's codex config.
+
+    A ``cli-config`` launch pins only a ``model_provider`` name; the provider
+    table lives in the user's shared ``config.toml``, which the launch never
+    inlines. Read it here so the gateway-inference probe can see the URL.
+
+    Only genuine cli-config provider names are looked up: ``"openai"`` is
+    Codex's own login (no pinned AIGW) and ``"omnigent_databricks"`` is the
+    profile branch's generated id, so both return ``None``.
+
+    :param provider_name: Provider id from
+        :func:`codex_session_meta_model_provider`.
+    :returns: The provider table's ``base_url``, or ``None`` when it cannot be
+        read.
+    """
+    import tomllib
+
+    from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+
+    if provider_name in ("openai", "omnigent_databricks"):
+        return None
+    config_path = _codex_home_config_source_from_env() / "config.toml"
+    try:
+        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        base_url = data["model_providers"][provider_name]["base_url"]
+    except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError):
+        return None
+    return base_url if isinstance(base_url, str) else None
 
 
 def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCodexLaunch | None:
