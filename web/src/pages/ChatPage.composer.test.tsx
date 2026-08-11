@@ -1761,6 +1761,179 @@ describe("Composer — queued-message flush gating", () => {
   });
 });
 
+// Empty-composer Enter steers this conversation's FIFO head. Keep the agent
+// busy to prevent idle draining, and isolate drafts with a dedicated id.
+describe("Composer — Enter steers queued head", () => {
+  const CONV = "conv_enter_steer";
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    useChatStore.setState({
+      queuedMessages: [],
+      blocks: [],
+      status: "idle",
+      sessionStatus: "idle",
+    });
+  });
+
+  function busyQueuedState(
+    queuedMessages: QueuedMessage[],
+    send: (text: string, agentId: string, files?: File[]) => Promise<void>,
+  ) {
+    useChatStore.setState({
+      conversationId: CONV,
+      boundAgentId: "agent_xyz",
+      status: "streaming",
+      sessionStatus: "running",
+      send,
+      queuedMessages,
+      blocks: [],
+      skills: [],
+    });
+  }
+
+  it("Enter on an empty composer steers this conversation's queue head", () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    busyQueuedState(
+      [
+        { queueId: "other_1", text: "other conv", conversationId: "conv_other" },
+        { queueId: "q_1", text: "first", conversationId: CONV },
+        { queueId: "q_2", text: "second", conversationId: CONV },
+      ],
+      sendSpy,
+    );
+    const onSend = vi.fn();
+    render(
+      <Composer {...composerProps({ onSend, status: "streaming", isWorking: true })} />,
+    );
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["first", "agent_xyz"]);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.queueId)).toEqual([
+      "other_1",
+      "q_2",
+    ]);
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("repeated Enter drains successive heads (FIFO within the conversation)", () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    busyQueuedState(
+      [
+        { queueId: "q_1", text: "first", conversationId: CONV },
+        { queueId: "q_2", text: "second", conversationId: CONV },
+      ],
+      sendSpy,
+    );
+    render(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+    const ta = textarea();
+
+    fireEvent.keyDown(ta, { key: "Enter" });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(sendSpy.mock.calls.map((c) => c[0])).toEqual(["first", "second"]);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("does not steer when the composer has a draft", () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    busyQueuedState([{ queueId: "q_1", text: "queued", conversationId: CONV }], sendSpy);
+    const onSend = vi.fn();
+    render(
+      <Composer {...composerProps({ onSend, status: "streaming", isWorking: true })} />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "new follow-up" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(onSend).toHaveBeenCalledWith("new follow-up", undefined);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.queueId)).toEqual(["q_1"]);
+  });
+
+  it("does not steer when empty and nothing is queued for this conversation", () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    busyQueuedState(
+      [{ queueId: "other_1", text: "other", conversationId: "conv_other" }],
+      sendSpy,
+    );
+    const onSend = vi.fn();
+    render(
+      <Composer {...composerProps({ onSend, status: "streaming", isWorking: true })} />,
+    );
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(onSend).not.toHaveBeenCalled();
+    expect(useChatStore.getState().queuedMessages.map((m) => m.queueId)).toEqual(["other_1"]);
+  });
+
+  it("does not steer while a pending elicitation locks the composer", () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    busyQueuedState([{ queueId: "q_1", text: "queued", conversationId: CONV }], sendSpy);
+    useChatStore.setState({
+      blocks: [
+        {
+          type: "elicitation",
+          ctx: {
+            agent: null,
+            depth: 0,
+            turn: 0,
+            timestamp: 0,
+            responseId: "resp_1",
+            itemId: null,
+          },
+          elicitationId: "elic_1",
+          targetSessionId: null,
+          message: "Allow shell command?",
+          phase: "tool_call",
+          policyName: "ask-before-shell",
+          contentPreview: "{}",
+          requestedSchema: {},
+          url: null,
+          status: "pending",
+          response: null,
+        },
+      ],
+    });
+    render(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(useChatStore.getState().queuedMessages.map((m) => m.queueId)).toEqual(["q_1"]);
+  });
+
+  it("does not steer when Enter confirms active IME composition on an empty composer", () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    busyQueuedState([{ queueId: "q_1", text: "queued", conversationId: CONV }], sendSpy);
+    render(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+    const ta = textarea();
+    fireEvent.compositionStart(ta);
+
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(useChatStore.getState().queuedMessages.map((m) => m.queueId)).toEqual(["q_1"]);
+  });
+
+  it("Shift+Enter on an empty composer does not steer", () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    busyQueuedState([{ queueId: "q_1", text: "queued", conversationId: CONV }], sendSpy);
+    render(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+
+    fireEvent.keyDown(textarea(), { key: "Enter", shiftKey: true });
+
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(useChatStore.getState().queuedMessages.map((m) => m.queueId)).toEqual(["q_1"]);
+  });
+});
+
 describe("Composer config gear", () => {
   beforeEach(() => {
     useChatStore.setState({

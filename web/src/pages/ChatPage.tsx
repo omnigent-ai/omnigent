@@ -5477,6 +5477,15 @@ export function Composer({
       // ``mentionListingPending``); swallow Enter so the in-progress "@dir/"
       // token isn't sent as a chat message. The menu reopens when entries land.
       if (mentionListingPending) return;
+      // Empty composer + a queued head for this conversation: steer that head
+      // (same store path as the strip's Steer button). Repeated Enter drains
+      // successive heads FIFO; once empty, further presses stay no-ops.
+      if (!hasDraft) {
+        if (disabled || hasPendingElicitation) return;
+        const head = queuedMessages.find((m) => m.conversationId === conversationId);
+        if (head !== undefined) steerMessage(head.queueId);
+        return;
+      }
       submit();
       return;
     }
