@@ -1425,9 +1425,9 @@ describe("NewChatLandingScreen", () => {
 
     openAgentConfig("a2");
     openSelect("new-chat-landing-config-model");
-    expect(screen.getAllByText("Default (databricks-gpt-5-5)").length).toBeGreaterThan(0);
-    expect(screen.getByText("databricks-gpt-5-6")).toBeTruthy();
-    fireEvent.click(screen.getByText("databricks-gpt-5-6"));
+    expect(screen.getAllByText("Default (databricks-gpt-5.5)").length).toBeGreaterThan(0);
+    expect(screen.getByText("databricks-gpt-5.6")).toBeTruthy();
+    fireEvent.click(screen.getByText("databricks-gpt-5.6"));
     saveConfig();
 
     // The Codex model is remembered under codex-native only; Claude Code's
@@ -1435,13 +1435,13 @@ describe("NewChatLandingScreen", () => {
     openAgentConfig("a1");
     expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("Default");
     expect(screen.getByTestId("new-chat-landing-config-model").textContent).not.toContain(
-      "databricks-gpt-5-6",
+      "databricks-gpt-5.6",
     );
     saveConfig();
 
     openAgentConfig("a2");
     expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
-      "databricks-gpt-5-6",
+      "databricks-gpt-5.6",
     );
     saveConfig();
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
@@ -3448,7 +3448,7 @@ describe("NewChatLandingScreen smart routing", () => {
         expect(screen.queryByRole("option", { name: "Smart Routing" })).toBeNull();
         expect(
           screen.getByRole("option", {
-            name: agentId === "a2" ? "databricks-gpt-5-6" : "Opus 4.8",
+            name: agentId === "a2" ? "databricks-gpt-5.6" : "Opus 4.8",
           }),
         ).toBeTruthy();
       }

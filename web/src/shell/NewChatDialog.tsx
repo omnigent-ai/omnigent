@@ -192,7 +192,7 @@ import {
 import { OttoEyes } from "@/components/OttoEyes";
 import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
-import type { CostControlMode } from "@/components/CostRoutingControl";
+import { formatModelDisplayName, type CostControlMode } from "@/components/CostRoutingControl";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
@@ -376,7 +376,7 @@ const CODEX_NATIVE_BYPASS_APPROVAL_OPTION = {
 };
 
 function displayModelId(option: Pick<NativeModelOption, "id">): string {
-  return option.id;
+  return formatModelDisplayName(option.id);
 }
 
 function displayModelName(option: Pick<NativeModelOption, "id" | "displayName">): string {
@@ -2745,15 +2745,16 @@ export function NewChatLandingScreen() {
           ? CODEX_NATIVE_BYPASS_APPROVAL_OPTION.label
           : (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ??
             approvalMode);
+      const selectedCodexModel = codexModelOptions.find((m) => m.id === pickedModel);
       const modelRows =
         routingOn || !isCodex
           ? routingRow
           : [
               {
                 label: "Model",
-                value:
-                  codexModelOptions.find((m) => m.id === pickedModel)?.id ??
-                  defaultModelLabel(codexModelOptions, displayModelId),
+                value: selectedCodexModel
+                  ? displayModelId(selectedCodexModel)
+                  : defaultModelLabel(codexModelOptions, displayModelId),
               },
             ];
       return [...modelRows, { label: "Approval", value: approvalValue }];
