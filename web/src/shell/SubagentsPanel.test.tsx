@@ -1524,6 +1524,7 @@ describe("SubagentsPanel", () => {
           id: "conv_routed",
           tool: "researcher",
           routed_model: "databricks-claude-sonnet-5",
+          reasoning_effort: "high",
         }),
         childInfo({ id: "conv_plain", tool: "researcher" }),
       ],
@@ -1533,8 +1534,12 @@ describe("SubagentsPanel", () => {
 
     const routed = childRow(container, "conv_routed");
     expect(within(routed).getByTestId("subagent-routed-model").textContent).toBe("sonnet");
+    expect(within(routed).getByTestId("subagent-reasoning-effort").textContent).toBe("high");
     expect(
       within(childRow(container, "conv_plain")).queryByTestId("subagent-routed-model"),
+    ).toBeNull();
+    expect(
+      within(childRow(container, "conv_plain")).queryByTestId("subagent-reasoning-effort"),
     ).toBeNull();
   });
 

@@ -3576,7 +3576,8 @@ async def test_sys_session_send_model_lands_in_child_create_body(
     model: str,
 ) -> None:
     """
-    A per-dispatch ``model`` reaches the child create as ``model_override``.
+    Per-dispatch ``model`` and ``reasoning_effort`` reach the child create
+    as session overrides.
 
     The server persists ``model_override`` on the child row, where the
     native launch paths read it as ``--model`` and the SDK harness path
@@ -3625,6 +3626,7 @@ async def test_sys_session_send_model_lands_in_child_create_body(
                         "args": {
                             "input": "fix the auth bug",
                             "model": model,
+                            "reasoning_effort": "high",
                         },
                     }
                 ),
@@ -3643,6 +3645,7 @@ async def test_sys_session_send_model_lands_in_child_create_body(
     # server persists and the harness launch consumes.
     assert len(create_bodies) == 1, "fresh named send must create exactly one child"
     assert create_bodies[0]["model_override"] == model
+    assert create_bodies[0]["reasoning_effort"] == "high"
     assert create_bodies[0]["sub_agent_name"] == "worker"
 
 

@@ -89,6 +89,7 @@ def _seed_child(
     parent_id: str,
     title: str,
     agent_id: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> Conversation:
     """
     Create a child sub-agent conversation.
@@ -107,12 +108,18 @@ def _seed_child(
         the ``agent_id`` field in the summary).
     :returns: The created child :class:`Conversation`.
     """
-    return conv_store.create_conversation(
+    child = conv_store.create_conversation(
         kind="sub_agent",
         title=title,
         parent_conversation_id=parent_id,
         agent_id=agent_id,
     )
+    if reasoning_effort is not None:
+        child = conv_store.update_conversation(
+            child.id,
+            reasoning_effort=reasoning_effort,
+        )
+    return child
 
 
 # ── 404 ──────────────────────────────────────────────────
@@ -181,6 +188,7 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
         parent_id=session["id"],
         title="researcher:auth",
         agent_id=session["agent_id"],
+        reasoning_effort="high",
     )
 
     resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
@@ -204,6 +212,7 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
 
     # agent_id comes from the conversation row (tasks table removed).
     assert row["agent_id"] == session["agent_id"]
+    assert row["reasoning_effort"] == "high"
     # agent_name and task fields are None (no tasks table).
     assert row["agent_name"] is None
     assert row["current_task_id"] is None

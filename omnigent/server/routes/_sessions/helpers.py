@@ -9148,6 +9148,7 @@ def _child_session_summary_from_conversation(
         # two fields contradict each other. The decision is joined through a
         # conversation label rather than a new column.
         routed_model=conv.model_override if routing_decision_id is not None else None,
+        reasoning_effort=conv.reasoning_effort,
         routing_decision_id=routing_decision_id,
     )
 
