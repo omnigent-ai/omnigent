@@ -1818,12 +1818,9 @@ function MainAgentSurface({
     conversationRef.current = el;
     setContainerEl(el);
   }, []);
-  // How far the composer has grown past its resting height. The composer keeps
-  // that growth out of the flex column, so the wrapper's box never moves —
-  // this only lifts the overlays pinned to its bottom edge (the scroll-to-
-  // bottom button, the Working… tab, the message nav) clear of the taller
-  // card. Written straight to the DOM: a re-render per line of typing would
-  // re-render the whole transcript for a purely visual offset.
+  // Kept out of the flex column so growth moves neither the wrapper nor thread.
+  // The CSS variable lifts overlays and extends the transcript's scroll range
+  // without re-rendering the transcript on every keystroke.
   const publishComposerGrowth = useCallback((px: number) => {
     conversationRef.current?.style.setProperty("--composer-growth", `${px}px`);
   }, []);

@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
 import { ArrowDownIcon, DownloadIcon } from "lucide-react";
-import type { ComponentProps, ReactNode } from "react";
+import type { ComponentProps, ReactNode, RefObject } from "react";
 import { createContext, useCallback, useMemo } from "react";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 
@@ -55,9 +55,43 @@ export const Conversation = ({ className, children, ...props }: ConversationProp
 
 export type ConversationContentProps = ComponentProps<typeof StickToBottom.Content>;
 
-export const ConversationContent = ({ className, ...props }: ConversationContentProps) => (
-  <StickToBottom.Content className={cn("flex flex-col gap-8 px-6 py-4", className)} {...props} />
-);
+/** Extend transcript scroll range without resizing StickToBottom's content. */
+export const ConversationContent = ({
+  className,
+  children,
+  scrollClassName,
+  ...props
+}: ConversationContentProps) => {
+  // scrollRef/contentRef exist at runtime but aren't in the library's public types.
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef: RefObject<HTMLElement | null>;
+    contentRef: RefObject<HTMLElement | null>;
+  };
+  return (
+    <div
+      ref={ctx.scrollRef}
+      style={{
+        height: "100%",
+        width: "100%",
+        scrollbarGutter: "stable both-edges",
+      }}
+      className={scrollClassName}
+    >
+      <div
+        ref={ctx.contentRef}
+        className={cn("flex flex-col gap-8 px-6 py-4", className)}
+        {...props}
+      >
+        {typeof children === "function" ? children(ctx) : children}
+      </div>
+      <div
+        aria-hidden
+        data-testid="composer-growth-scroll-extent"
+        style={{ height: "var(--composer-growth, 0px)", flexShrink: 0 }}
+      />
+    </div>
+  );
+};
 
 export type ConversationEmptyStateProps = ComponentProps<"div"> & {
   title?: string;

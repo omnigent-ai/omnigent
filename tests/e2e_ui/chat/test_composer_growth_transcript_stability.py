@@ -16,12 +16,16 @@ scrollbar (drawn from ``clientHeight``/``scrollHeight``) and the turn rail
 (centered on the same box) still jittered. The composer now floats its extra
 rows over the transcript instead, so that box never changes.
 
+The floated growth does extend ``scrollHeight`` via a post-content spacer driven
+by ``--composer-growth`` (so the covered tail stays reachable). ``clientHeight``
+and ``scrollTop`` must still hold still — only the reachable range grows.
+
 Layout regressions like these are invisible below the browser — jsdom has no
 layout, so ``scrollHeight``/``clientHeight`` are 0 there and neither the clamp
 nor the viewport arithmetic happens at all. The assertions pin what has to hold
-at once: the messages, the scroll geometry, and the rail ticks all stay exactly
-where they were, and the transcript stays stuck to the bottom so a streaming
-reply still follows.
+at once: the messages, the scroll offset, and the rail ticks all stay exactly
+where they were, and the transcript stays stuck to the pre-growth bottom so a
+streaming reply still follows (with growth-sized room below to scroll into).
 """
 
 from __future__ import annotations
@@ -39,21 +43,26 @@ _TEXT_SECTION = '[data-testid="assistant-text-section"]'
 #
 # ``distanceFromBottom`` is 0-or-1 while the transcript is stuck to the bottom
 # (use-stick-to-bottom parks it one pixel short of the maximum) and grows once
-# a clamp has knocked it loose. ``viewport`` is the scroll geometry the native
-# scrollbar is drawn from — any change there moves the thumb, which reads as
-# jitter next to a composer that's only supposed to be growing. ``railTicks``
-# is the left-edge turn minimap, centered on the same box.
+# a clamp has knocked it loose — or, after composer growth, by the spacer that
+# extends scrollHeight without moving scrollTop. ``viewport`` is the scroll
+# geometry the native scrollbar is drawn from — ``clientHeight`` and
+# ``scrollTop`` must not move when the composer grows; ``scrollHeight`` may.
+# ``railTicks`` is the left-edge turn minimap, centered on the same box.
 _PROBE = """() => {
     const ta = document.querySelector('textarea[aria-label="Message the agent"]');
     const scroller = ta.closest('form').parentElement.querySelector('[role="log"] > div');
     const rail = document.querySelector('.turn-rail-fade');
+    const extent = document.querySelector('[data-testid="composer-growth-scroll-extent"]');
     return {
         messageTops: [...document.querySelectorAll('[data-testid="assistant-text-section"]')]
             .map((section) => Math.round(section.getBoundingClientRect().top)),
         composerHeight: Math.round(ta.getBoundingClientRect().height),
         distanceFromBottom: Math.round(
             scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop),
-        viewport: [scroller.clientHeight, scroller.scrollHeight, Math.round(scroller.scrollTop)],
+        clientHeight: scroller.clientHeight,
+        scrollHeight: scroller.scrollHeight,
+        scrollTop: Math.round(scroller.scrollTop),
+        composerGrowthPx: extent ? Math.round(extent.getBoundingClientRect().height) : 0,
         railTicks: rail
             ? [...rail.querySelectorAll('button')]
                   .map((tick) => Math.round(tick.getBoundingClientRect().top))
@@ -116,18 +125,30 @@ def test_composer_growth_does_not_shift_transcript(
     baseline = _settled_geometry(page)
     assert baseline["distanceFromBottom"] <= 1, baseline
     assert baseline["railTicks"], baseline
+    assert baseline["composerGrowthPx"] == 0, baseline
 
     def assert_transcript_idle(state: dict, label: str) -> None:
-        """Everything but the composer itself is byte-identical to baseline."""
-        for key in ("messageTops", "viewport", "railTicks"):
-            assert state[key] == baseline[key], (label, key, baseline[key], state[key])
-        assert state["distanceFromBottom"] <= 1, (label, state)
+        """Messages, offset, and rail stay put; only scroll extent may grow."""
+        assert state["messageTops"] == baseline["messageTops"], (label, baseline, state)
+        assert state["railTicks"] == baseline["railTicks"], (label, baseline, state)
+        assert state["clientHeight"] == baseline["clientHeight"], (label, baseline, state)
+        assert state["scrollTop"] == baseline["scrollTop"], (label, baseline, state)
+        growth = state["composerGrowthPx"]
+        assert state["scrollHeight"] == baseline["scrollHeight"] + growth, (
+            label,
+            baseline,
+            state,
+        )
+        # Still parked on the pre-growth bottom (stick-to-bottom parks ~1px
+        # short), with the growth-sized spacer as newly reachable room below.
+        assert abs(state["distanceFromBottom"] - growth) <= 1, (label, baseline, state)
 
     # Grow: three Shift+Enter newlines, one line taller each.
     for _ in range(3):
         composer.press("Shift+Enter")
     grown = _settled_geometry(page)
     assert grown["composerHeight"] > baseline["composerHeight"], grown
+    assert grown["composerGrowthPx"] > 0, grown
     assert_transcript_idle(grown, "after newlines")
 
     # Type into the now-multi-line composer: the height doesn't change, but the
