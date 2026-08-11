@@ -481,13 +481,18 @@ def register_events_routes(
                     conversation_store,
                     agent_store,
                 )
-                # Terminal ``response.completed`` is what unblocks live-tail
-                # consumers (the headless ``-p`` client) and settles the web
-                # bubble. No ``session.status`` pair rides along: the agent
-                # never ran, so publishing running→idle would report a turn
-                # that did not happen — and a client seeing that phantom idle
-                # mid-turn had to second-guess it back to running.
+                # Terminal ``response.completed`` renders the sentinel; the
+                # trailing ``idle`` ends the turn. A request-phase deny/refuse
+                # IS a turn boundary — the client optimistically went "working"
+                # on send — but the message never reached a harness, so nothing
+                # downstream (harness / interrupt / status file) emits the
+                # turn-end. This ``idle`` is that signal; clients that settle a
+                # turn only on a ``session.status`` edge (the REPL, the headless
+                # ``-p`` client) hang without it. No leading ``running``: the
+                # turn never dispatched, and a phantom ``running`` would fold a
+                # concurrent live bubble mid-stream.
                 _publish_input_deny_terminal(session_id, conv, reason)
+                _publish_status(session_id, "idle")
                 # Return the same shape the client expects from POST
                 # /events so postEvent doesn't throw on an unexpected
                 # response body. queued=False signals the event was
@@ -515,9 +520,11 @@ def register_events_routes(
                     conversation_store,
                     agent_store,
                 )
-                # Terminal response.completed, no status pair (see the message
-                # branch above).
+                # Terminal response.completed + trailing ``idle`` turn-end (see
+                # the message branch above for why the idle is required and the
+                # leading running is not).
                 _publish_input_deny_terminal(session_id, conv, reason)
+                _publish_status(session_id, "idle")
                 return {"queued": False, "denied": True, "reason": reason}
         elif (
             body.type == "message"
