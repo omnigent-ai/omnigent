@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from omnigent.server.routes.sessions import _resolve_compaction_llm_config
+from omnigent.server.routes._sessions.helpers import _resolve_compaction_llm_config
 from omnigent.spec.types import LLMConfig
 
 
