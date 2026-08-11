@@ -317,7 +317,8 @@ def test_codex_gateway_backed_for_config_default_provider(
     _stub_codex_dismissed(monkeypatch, False)
     _write_codex_config(
         tmp_path,
-        f'model_provider = "Databricks"\n[model_providers.Databricks]\nbase_url = "{_GATEWAY_CODEX_URL}"\n',
+        f'model_provider = "Databricks"\n'
+        f'[model_providers.Databricks]\nbase_url = "{_GATEWAY_CODEX_URL}"\n',
     )
     _stub_codex(
         monkeypatch,
@@ -335,7 +336,8 @@ def test_codex_not_gateway_backed_for_config_default_when_dismissed(
     _stub_codex_dismissed(monkeypatch, True)
     _write_codex_config(
         tmp_path,
-        f'model_provider = "Databricks"\n[model_providers.Databricks]\nbase_url = "{_GATEWAY_CODEX_URL}"\n',
+        f'model_provider = "Databricks"\n'
+        f'[model_providers.Databricks]\nbase_url = "{_GATEWAY_CODEX_URL}"\n',
     )
     _stub_codex(
         monkeypatch,
@@ -353,7 +355,8 @@ def test_codex_not_gateway_backed_for_explicit_openai_ignores_config_default(
     _stub_codex_dismissed(monkeypatch, False)
     _write_codex_config(
         tmp_path,
-        f'model_provider = "Databricks"\n[model_providers.Databricks]\nbase_url = "{_GATEWAY_CODEX_URL}"\n',
+        f'model_provider = "Databricks"\n'
+        f'[model_providers.Databricks]\nbase_url = "{_GATEWAY_CODEX_URL}"\n',
     )
     _stub_codex(
         monkeypatch,
