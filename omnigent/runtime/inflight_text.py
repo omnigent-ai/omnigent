@@ -30,8 +30,8 @@ Native providers have the same gap for the message currently streaming:
 the in-flight message streams as ``output_text.delta`` events carrying a
 per-message ``message_id`` and is not yet in the store. Those are
 tracked separately (see :data:`_native_inflight`), keyed by
-``message_id`` and dropped per-message when the message's
-``response.output_item.done`` commits, then replayed by
+``message_id`` and reconciled against recent
+``response.output_item.done`` messages, then replayed by
 :func:`snapshot_for` as message-scoped deltas so the reconnecting client
 rebuilds the same in-flight preview.
 
@@ -42,11 +42,8 @@ The index is populated automatically by
 chokepoint, same as :mod:`omnigent.runtime.pending_elicitations`):
 it captures the turn's :class:`ResponseObject` from
 ``response.created`` / ``response.in_progress`` and accumulates
-``response.output_text.delta`` text, then clears it when the turn
-ends — on a terminal ``response.*`` event, on a terminal
-``session.status`` (``idle``/``failed``, which catches Stop / delete /
-setup-failure / policy-deny turn-ends that emit no ``response.*``), and
-via :func:`discard` from the relay's teardown (runner death / rebind).
+``response.output_text.delta`` text. Response-scoped text clears when
+the turn ends; native text reconciles per message and clears on teardown.
 :func:`snapshot_for` is read by the ``/stream`` route via
 ``subscribe``'s ``pre_ready_snapshot`` hook and replays the
 streamed-so-far text as a ``response.created`` +
@@ -85,9 +82,8 @@ BOTH the snapshot and the queue and render twice.
 from __future__ import annotations
 
 import copy
-import hashlib
 import threading
-import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -157,144 +153,39 @@ class _NativeMessage:
     Unlike the response-scoped :class:`_InFlightTurn` (which blobs an
     in-process agent's whole turn under one ``response_id``), native
     providers stream text per assistant message keyed by a vendor
-    ``message_id`` and emits no ``response.created``. Each message's
+    ``message_id`` and emit no ``response.created``. Each message's
     chunks are tracked separately so :func:`snapshot_for` can replay
     them as message-scoped ``response.output_text.delta`` events (still
     carrying ``message_id``), letting a reconnecting client rebuild the
     same per-message in-flight previews it would have streamed live.
 
-    :param parts: Accumulated delta strings in arrival (index) order,
-        e.g. ``["Let me ", "check that."]``.
+    :param text: Aggregate delta text, e.g. ``"Let me check that."``.
     :param last_index: Highest chunk ``index`` accumulated so far, e.g.
-        ``4``. Replayed so the client's live tail (deltas published
-        after reconnect, at higher indices) appends without duplicating
-        the replayed prefix.
-    :param final_seen: Whether the message's ``final: true`` chunk has
-        arrived. For providers that emit final chunks, only once it has
-        is ``"".join(parts)`` the COMPLETE message text and thus safe to
-        byte-compare against a committed ``output_item.done`` text
-        (before that it is a prefix). Codex-native does not emit final
-        chunks, so it is retired only by a byte-equal committed item.
-        See :func:`record_publish`.
+        ``4``. Used to reject repeated chunks and included in reconnect
+        replay events for wire-shape fidelity.
+    :param forwarded: Whether any text for this message has reached live
+        subscribers. A prefix suppressed behind a committed message is
+        forwarded as one aggregate if it later diverges.
+    :param final_seen: Whether the provider marked the stream complete.
+    :param claimed: Whether a committed item currently covers this
+        aggregate. Claimed messages are excluded from reconnect snapshots.
     """
 
-    parts: list[str] = field(default_factory=list)
+    text: str = ""
     last_index: int = -1
+    forwarded: bool = False
     final_seen: bool = False
+    claimed: bool = False
 
 
-# Per-conversation, insertion-ordered mapping of message_id → its
-# in-flight streamed text, for native message-scoped streaming.
-# A message is added on its first ``output_text.delta`` and dropped when
-# its authoritative ``response.output_item.done`` commits — matched to the
-# committed item by BYTE-EQUAL text (``"".join(parts) == committed text``),
-# NOT by position. The done event carries no message_id (its id is an AP id
-# derived from the transcript uuid, a different namespace than the delta's
-# message_id), and the prior FIFO "drop the oldest" guess was wrong for the
-# common single-chunk message whose only (``final``) chunk is POSTed AFTER
-# its committed item — at commit time that message isn't tracked yet, so
-# FIFO popped the wrong entry (or none) and never retired the real id. The
-# probe confirmed the streamed text equals the transcript text byte-for-
-# byte, so content is a reliable join key. So the index only ever holds
-# messages NOT yet in the conversation store, and replay can't double-
-# render a committed message. NOT cleared on ``session.status: idle``
-# (claude-native goes idle mid-turn while parked on a permission prompt,
-# with text that hasn't committed — see the session.status branch); the
-# per-message ``output_item.done`` and :func:`discard` (relay teardown)
-# are the eviction paths.
+# Per-conversation, insertion-ordered mapping of message_id to streamed text.
+# Native done items carry no message_id, so they reconcile by text content.
 _native_inflight: dict[str, dict[str, _NativeMessage]] = {}
 
-# Per-conversation, insertion-ordered set of message_ids whose message has
-# committed — dropped from ``_native_inflight`` and barred from re-entry.
-# The forwarder tails the deltas file separately from the transcript, so a
-# message's last chunk can be POSTed just AFTER its committed item. Without
-# this guard that late ``output_text.delta`` would re-create the just-
-# dropped entry; since native providers can end turns with ``session.status:
-# idle`` (no terminal ``response.*`` that would clear the index), the
-# resurrected entry then lingers and :func:`snapshot_for` replays it on the
-# next reconnect as a stale duplicate. It also drives the LIVE drop:
-# :func:`record_publish` returns a "suppress" verdict for any delta whose
-# message_id is retired, and :func:`omnigent.runtime.session_stream.publish`
-# withholds it from the live fan-out (mirrors the web client's
-# ``retiredLiveMessages`` in web ``chatStore.ts``). Insertion-ordered +
-# bounded so a long-lived session can't grow it without limit (vendor
-# message_ids are unique, so an evicted-then-revived id is not a real
-# concern — the race window is a single forwarder poll).
-_native_retired: dict[str, dict[str, None]] = {}
-
-# Per-conversation multiset of committed-message text fingerprints awaiting
-# their deltas, keyed by HASH → list of monotonic buffered-at timestamps
-# (one per occurrence). Populated when an ``output_item.done`` commits but
-# NO in-flight message yet matches its text — i.e. the deltas raced behind
-# the commit (the single-chunk case). When a message's ``final`` chunk later
-# arrives and ``sha256("".join(parts))`` matches a NON-EXPIRED buffered
-# fingerprint, that message is the committed one: it is retired and its
-# (duplicate) chunk suppressed from the live stream. A multiset (a timestamp
-# list per hash) lets two messages with identical content be reconciled by
-# count — we only need to retire one message per committed text, and
-# identical text renders identically regardless of which physical message it
-# was. The per-occurrence timestamp drives the TTL (see
-# :data:`_NATIVE_COMMITTED_TTL_S`): native providers may emit no terminal
-# ``response.*`` to clear this buffer, so a fingerprint that never matches
-# (a multi-text-block mismatch, or a delta dropped by the best-effort
-# forwarder) would otherwise persist for the whole session and could
-# mis-suppress a later identical-text message ("OK"/"Done." repeats). Drained
-# on match; cleared wholesale on turn-end / teardown alongside the other
-# native state.
-_native_committed: dict[str, dict[str, list[float]]] = {}
-
-# Cap on retired message_ids tracked per conversation. Far larger than the
-# one-or-two-message race window; bounds memory on a long session.
-_MAX_NATIVE_RETIRED_PER_CONV = 256
-
-# Cap on distinct committed-text fingerprints buffered per conversation.
-# These normally drain within one forwarder poll (the matching delta lands
-# right after); the cap is a backstop against a message whose deltas never
-# arrive (e.g. a multi-text-block message — see :func:`record_publish`) so
-# the buffer can't grow unbounded mid-turn. Oldest fingerprint evicted
-# first; an evicted entry just means a late chunk for it won't be
-# suppressed (a possible — not guaranteed — duplicate), never a crash.
-_MAX_NATIVE_COMMITTED_PER_CONV = 256
-
-# How long a buffered committed-text fingerprint stays a valid suppression
-# match. The real commit→delta race is ~1 forwarder poll (~0.25s); this sits
-# far above that so the legitimate single-chunk race is always covered, yet
-# bounds how long an unmatched fingerprint can mis-suppress a later
-# identical-text message to a few seconds rather than the whole session
-# (claude-native never emits a terminal ``response.*`` to clear it). Failure
-# direction is safe: an expired fingerprint is simply not matched, so the
-# delta is delivered (a possible transient duplicate) rather than a real
-# message being hidden.
-_NATIVE_COMMITTED_TTL_S = 10.0
-
-
-def _monotonic() -> float:
-    """
-    Monotonic clock reading for the committed-fingerprint TTL.
-
-    Thin indirection so tests can drive the TTL deterministically without
-    patching the process-global ``time.monotonic`` (which would leak across
-    tasks / pytest-xdist workers — see the project's no-global-singleton-
-    patch test rule). Patch THIS helper instead.
-
-    :returns: Seconds from an unspecified monotonic epoch.
-    """
-    return time.monotonic()
-
-
-def _text_fingerprint(text: str) -> str:
-    """
-    Return a stable content fingerprint for committed/streamed text.
-
-    Used as the byte-equal join key between a claude-native message's
-    streamed deltas and its committed ``output_item.done`` text. SHA-256
-    of the UTF-8 bytes: collision-free for this purpose and cheaper to
-    hold/compare than the raw (possibly multi-KB) message text.
-
-    :param text: The full message text, e.g. ``"Here is the answer."``.
-    :returns: Hex digest, e.g. ``"a1b2c3..."``.
-    """
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+# Only the latest few committed messages can race their deltas. A count
+# window avoids clocks, expiry, hashing, and unbounded stale state.
+_RECENT_NATIVE_MESSAGES = 3
+_native_recent_committed: dict[str, deque[str]] = {}
 
 
 def _committed_message_text(item: dict[str, Any]) -> str | None:
@@ -327,152 +218,26 @@ def _committed_message_text(item: dict[str, Any]) -> str | None:
     return "".join(parts)
 
 
-def _retire_native_message(conversation_id: str, message_id: str) -> None:
-    """
-    Drop an in-flight native message and bar its id from re-entry.
-
-    Caller MUST hold :data:`_lock`. Removes ``message_id`` from
-    :data:`_native_inflight` (so :func:`snapshot_for` stops replaying its
-    preview) and records it in :data:`_native_retired` (so a late trailing
-    chunk for it is dropped from the index AND withheld from the live
-    stream). Bounded; oldest retired id evicted first.
-
-    :param conversation_id: Conversation/session id, e.g. ``"conv_abc"``.
-    :param message_id: Vendor message id to retire, e.g. ``"m1"``.
-    """
+def _drop_native_message(conversation_id: str, message_id: str) -> None:
+    """Drop one native aggregate. Caller must hold :data:`_lock`."""
     messages = _native_inflight.get(conversation_id)
     if messages is not None:
         messages.pop(message_id, None)
         if not messages:
             _native_inflight.pop(conversation_id, None)
-    retired = _native_retired.setdefault(conversation_id, {})
-    retired[message_id] = None
-    while len(retired) > _MAX_NATIVE_RETIRED_PER_CONV:
-        del retired[next(iter(retired))]
 
 
-def _is_codex_message_id(message_id: str) -> bool:
-    """
-    Return whether a native stream id came from Codex.
-
-    Codex forwarder ids are constructed as
-    ``"codex:<thread>:<turn>:<item_type>:<item_id>"``. Unlike
-    Claude's message-display hook, Codex does not emit a ``final:
-    true`` chunk; its ``item/completed`` event is the completion
-    signal. The commit path can therefore retire a Codex preview when
-    its accumulated text byte-matches the committed item even though
-    ``final_seen`` is false.
-
-    :param message_id: Vendor message id, e.g.
-        ``"codex:thread_123:turn_123:agentMessage:item_1"``.
-    :returns: ``True`` for Codex-native message ids.
-    """
-    return message_id.startswith("codex:")
+def _consume_recent_native_text(conversation_id: str, text: str) -> None:
+    """Consume one recent committed-text occurrence. Caller holds the lock."""
+    recent = _native_recent_committed.get(conversation_id)
+    if recent is None:
+        return
+    recent.remove(text)
+    if not recent:
+        _native_recent_committed.pop(conversation_id, None)
 
 
-def _match_committed_native_message(conversation_id: str, fingerprint: str) -> str | None:
-    """
-    Return the in-flight native message id whose COMPLETE text matches.
-
-    Caller MUST hold :data:`_lock`. For Claude-native, only messages
-    whose ``final`` chunk has arrived are candidates — before that
-    ``"".join(parts)`` is just a prefix and could never equal the
-    committed text. Codex-native is the exception: it does not emit
-    ``final: true`` chunks, but its completed item arrives after the
-    forwarder flushes all deltas for that item, so a byte-equal Codex
-    preview is complete enough to retire. First match wins (insertion
-    order); two messages with identical text are interchangeable for
-    retirement, since identical content renders identically regardless
-    of which physical message committed.
-
-    :param conversation_id: Conversation/session id, e.g. ``"conv_abc"``.
-    :param fingerprint: Committed text fingerprint to match against,
-        from :func:`_text_fingerprint`.
-    :returns: The matching message id, or ``None`` if none is complete
-        and byte-equal yet.
-    """
-    messages = _native_inflight.get(conversation_id)
-    if not messages:
-        return None
-    for message_id, message in messages.items():
-        can_match = message.final_seen or _is_codex_message_id(message_id)
-        if can_match and _text_fingerprint("".join(message.parts)) == fingerprint:
-            return message_id
-    return None
-
-
-def _consume_committed_fingerprint(conversation_id: str, parts: list[str]) -> bool:
-    """
-    Pop one NON-EXPIRED buffered fingerprint matching ``parts``, if present.
-
-    Caller MUST hold :data:`_lock`. Returns ``True`` when the joined text's
-    fingerprint was buffered in :data:`_native_committed` within the last
-    :data:`_NATIVE_COMMITTED_TTL_S` seconds — i.e. this message's
-    ``output_item.done`` committed BEFORE its deltas arrived (the single-
-    chunk race), so the message just completed is the committed one. Removes
-    one fresh occurrence (popping the conversation when it empties).
-
-    Expired occurrences are evicted as a side effect: a fingerprint older
-    than the TTL belongs to an earlier, unrelated commit that never matched
-    (a multi-text-block mismatch, or a delta the best-effort forwarder
-    dropped). It must NOT suppress this independent message, so it is
-    discarded and ``False`` is returned if nothing fresh remains — see
-    :data:`_native_committed`.
-
-    :param conversation_id: Conversation/session id, e.g. ``"conv_abc"``.
-    :param parts: The message's accumulated, now-complete delta strings.
-    :returns: ``True`` if a fresh buffered fingerprint matched and was
-        consumed; ``False`` if none was buffered or all were expired.
-    """
-    committed = _native_committed.get(conversation_id)
-    if not committed:
-        return False
-    fingerprint = _text_fingerprint("".join(parts))
-    timestamps = committed.get(fingerprint)
-    if not timestamps:
-        return False
-    # Drop occurrences that have outlived the commit→delta race window;
-    # keep only those still within the TTL as valid suppression matches.
-    cutoff = _monotonic() - _NATIVE_COMMITTED_TTL_S
-    fresh = [ts for ts in timestamps if ts >= cutoff]
-    matched = bool(fresh)
-    if matched:
-        # Consume one fresh occurrence (oldest of the fresh).
-        fresh.pop(0)
-    if fresh:
-        committed[fingerprint] = fresh
-    else:
-        del committed[fingerprint]
-    if not committed:
-        _native_committed.pop(conversation_id, None)
-    return matched
-
-
-def _buffer_committed_fingerprint(conversation_id: str, fingerprint: str) -> None:
-    """
-    Buffer a committed-message fingerprint awaiting its (late) deltas.
-
-    Caller MUST hold :data:`_lock`. Used when an ``output_item.done``
-    commits but no in-flight message matches its text yet (the deltas
-    raced behind the commit — the single-chunk case). The message's
-    ``final`` chunk consumes it via :func:`_consume_committed_fingerprint`
-    (if it arrives within :data:`_NATIVE_COMMITTED_TTL_S`). Stamped with the
-    monotonic time so the TTL can later distinguish this commit's racing
-    delta from an identical-text message a future turn. Bounded; oldest
-    fingerprint evicted first (an evicted entry just means a late chunk for
-    it won't be suppressed, never a crash).
-
-    :param conversation_id: Conversation/session id, e.g. ``"conv_abc"``.
-    :param fingerprint: Committed text fingerprint, from
-        :func:`_text_fingerprint`.
-    """
-    committed = _native_committed.setdefault(conversation_id, {})
-    committed.setdefault(fingerprint, []).append(_monotonic())
-    while len(committed) > _MAX_NATIVE_COMMITTED_PER_CONV:
-        del committed[next(iter(committed))]
-
-
-def record_publish(conversation_id: str, event: dict[str, Any]) -> bool:
+def record_publish(conversation_id: str, event: dict[str, Any]) -> dict[str, Any] | None:
     """
     Update the index from an SSE event on the publish path.
 
@@ -488,22 +253,14 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> bool:
       the delta to the current (response-scoped) turn's accumulated text.
     * ``response.output_text.delta`` WITH a ``message_id`` (native
       message-scoped streaming) — append to that message's own buffer in
-      :data:`_native_inflight`, ordered/de-duped by ``index``. A delta
-      whose message_id is already retired is dropped (returns ``True`` so
-      the publisher withholds it from the live stream). When the chunk is
-      ``final`` and the message's now-complete text matches a buffered
-      committed fingerprint (:data:`_native_committed`), the message
-      committed BEFORE its deltas arrived: retire it and return ``True``
-      so this duplicate chunk is suppressed live too. Codex-native does
-      not emit ``final: true`` chunks, so its already-streamed preview is
-      retired when the committed item itself byte-matches the preview.
+      :data:`_native_inflight`, ordered/de-duped by ``index``. Suppress the
+      running aggregate while it is a prefix of a recent committed message.
+      On divergence, forward the whole aggregate once, then resume sending
+      incremental deltas.
     * ``response.output_item.done`` for a ``message`` item — it just
-      committed to the conversation store, so the matching in-flight
-      preview must stop replaying. Find that preview by BYTE-EQUAL text
-      (its ``final``-complete deltas equal the committed text) and retire
-      it; if no in-flight message matches yet (its deltas raced behind
-      this commit), buffer the committed text fingerprint so the delta
-      branch retires the message when its ``final`` chunk lands.
+      committed to the conversation store. Drop an equal aggregate or claim
+      a matching prefix so it no longer appears in reconnect snapshots, then
+      remember the committed text for late deltas.
     * a terminal turn event (see :data:`_TERMINAL_EVENT_TYPES`) — drop
       both the response-scoped and native entries; the turn's text is now
       either persisted (``completed``) or discarded.
@@ -528,22 +285,18 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> bool:
         ``event["type"]`` to dispatch, the nested ``event["response"]``
         object for lifecycle events, and ``event["delta"]`` for text
         deltas.
-    :returns: ``True`` when the event must be WITHHELD from the live
-        fan-out — a claude-native ``output_text.delta`` for an already-
-        committed message (a duplicate trailing chunk). The caller
-        (:func:`omnigent.runtime.session_stream.publish`) must skip
-        broadcasting it. ``False`` for every other event (the normal
-        case): record-keeping only, broadcast as usual.
+    :returns: The event to broadcast, which may carry a rewritten aggregate
+        delta, or ``None`` when the event should be suppressed.
     """
     event_type = event.get("type")
 
     if event_type == "response.created" or event_type == "response.in_progress":
         response = event.get("response")
         if not isinstance(response, dict):
-            return False
+            return event
         response_id = response.get("id")
         if not isinstance(response_id, str) or not response_id:
-            return False
+            return event
         with _lock:
             entry = _inflight.get(conversation_id)
             if entry is None or entry.response_id != response_id:
@@ -558,79 +311,67 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> bool:
                 # status flip from "queued" to "in_progress") without
                 # discarding text already accumulated this turn.
                 entry.response = response
-        return False
+        return event
 
     if event_type == "response.output_text.delta":
         delta = event.get("delta")
         if not isinstance(delta, str):
-            return False
+            return event
         message_id = event.get("message_id")
         if isinstance(message_id, str) and message_id:
-            # Terminal-observed (claude-native) message-scoped streaming:
-            # track per message_id, NOT in the response-scoped blob (it
-            # has no response.created and interleaves multiple messages
-            # per turn). ``index`` orders chunks and de-dupes a replay.
-            #
-            # An EMPTY delta is NOT dropped on this path: a finalize marker
-            # (``delta="", final=true`` — pi-native's end-of-message signal,
-            # see the extension's ``finalizeStreamingMessage``) carries no
-            # text but IS the completion signal that flips ``final_seen``,
-            # which in turn gates the byte-equal retire on
-            # ``output_item.done``. The old ``not delta`` guard dropped that
-            # marker before ``final_seen`` could be set, so pi-native
-            # messages were NEVER retired — ``snapshot_for`` then replayed
-            # the committed message on every reconnect/cold-load and it
-            # double-rendered beside the snapshot's persisted copy.
             index = event.get("index")
             final = bool(event.get("final"))
             with _lock:
-                # A chunk for an already-committed message (its
-                # ``output_item.done`` retired it) arrived late. Drop it:
-                # accumulating would resurrect the dropped entry and replay
-                # on reconnect, and returning True withholds it from the
-                # live fan-out too — see :data:`_native_retired`.
-                if message_id in _native_retired.get(conversation_id, {}):
-                    return True
                 messages = _native_inflight.setdefault(conversation_id, {})
                 message = messages.get(message_id)
                 if message is None:
-                    if not delta and not final:
-                        # An empty, non-final delta for an untracked message
-                        # carries neither text nor a completion signal —
-                        # don't create an empty entry (``snapshot_for`` would
-                        # skip its blank text anyway; this just keeps the
-                        # index from holding inert keys).
+                    if not delta:
                         if not messages:
                             _native_inflight.pop(conversation_id, None)
-                        return False
+                        return None
                     message = _NativeMessage()
                     messages[message_id] = message
                 if isinstance(index, int) and not isinstance(index, bool):
                     if index <= message.last_index:
-                        return False
+                        return None
                     message.last_index = index
-                # Only real text advances the buffer; the finalize marker's
-                # empty string is a signal, not content.
                 if delta:
-                    message.parts.append(delta)
+                    message.text += delta
                 if final:
                     message.final_seen = True
-                    # The message's text is now complete. If its committed
-                    # ``output_item.done`` already arrived (deltas raced
-                    # behind it — the single-chunk case), a fingerprint is
-                    # buffered: this is that committed message. Retire it
-                    # and suppress THIS (duplicate) chunk from the live
-                    # stream. Otherwise leave it in-flight; the commit will
-                    # match it by content when it lands.
-                    if _consume_committed_fingerprint(conversation_id, message.parts):
-                        _retire_native_message(conversation_id, message_id)
-                        return True
-            return False
+                if not delta:
+                    if message.claimed and final:
+                        aggregate = message.text
+                        recent = _native_recent_committed.get(conversation_id)
+                        if aggregate in (recent or ()):
+                            _drop_native_message(conversation_id, message_id)
+                            _consume_recent_native_text(conversation_id, aggregate)
+                    return None
+
+                aggregate = message.text
+                recent = _native_recent_committed.get(conversation_id)
+                matched = next(
+                    (text for text in reversed(recent or ()) if text.startswith(aggregate)),
+                    None,
+                )
+                if matched is not None:
+                    message.claimed = True
+                    if matched == aggregate and message.final_seen:
+                        _drop_native_message(conversation_id, message_id)
+                        _consume_recent_native_text(conversation_id, matched)
+                    return None
+
+                recovered = message.claimed or not message.forwarded
+                message.claimed = False
+                message.forwarded = True
+                if recovered:
+                    return {**event, "delta": aggregate}
+            return event
         if not delta:
             # Response-scoped (in-process) path: an empty delta carries no
             # text and, lacking a ``message_id``, no message-scoped
             # completion signal — there is nothing to accumulate.
-            return False
+            return event
         with _lock:
             entry = _inflight.get(conversation_id)
             if entry is None:
@@ -642,45 +383,49 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> bool:
                 entry = _InFlightTurn()
                 _inflight[conversation_id] = entry
             entry.parts.append(delta)
-        return False
+        return event
 
     if event_type == "response.output_item.done":
-        # An assistant message just committed to the conversation store, so
-        # its in-flight preview must stop replaying (it would double-render
-        # alongside the cold-load snapshot's persisted copy). Match it to
-        # the right preview by BYTE-EQUAL text, NOT by position: the done
-        # event carries no message_id, and the old FIFO "drop the oldest"
-        # guess was wrong for the common single-chunk message whose only
-        # (``final``) chunk is POSTed AFTER its commit — at this point that
-        # message isn't tracked yet, so FIFO popped the wrong entry (or
-        # none). The probe confirmed streamed text == transcript text
-        # byte-for-byte, so content is the reliable join key. Non-message
-        # items (tool calls) and in-process turns leave the index alone.
         item = event.get("item")
         if isinstance(item, dict) and item.get("type") == "message":
             text = _committed_message_text(item)
             if text is not None:
-                fingerprint = _text_fingerprint(text)
                 with _lock:
-                    matched_id = _match_committed_native_message(conversation_id, fingerprint)
-                    if matched_id is not None:
-                        # Deltas (incl. ``final``) already arrived: retire
-                        # the message whose complete text equals this commit.
-                        _retire_native_message(conversation_id, matched_id)
+                    messages = _native_inflight.get(conversation_id, {})
+                    exact_id = next(
+                        (
+                            message_id
+                            for message_id, message in messages.items()
+                            if message.text == text
+                        ),
+                        None,
+                    )
+                    if exact_id is not None:
+                        _drop_native_message(conversation_id, exact_id)
                     else:
-                        # Deltas raced behind this commit (or never arrive):
-                        # remember the fingerprint so the message's ``final``
-                        # chunk retires + suppresses it when it lands.
-                        _buffer_committed_fingerprint(conversation_id, fingerprint)
-        return False
+                        claimed = next(
+                            (
+                                message
+                                for message in messages.values()
+                                if message.text and text.startswith(message.text)
+                            ),
+                            None,
+                        )
+                        if claimed is not None:
+                            claimed.claimed = True
+                            claimed.forwarded = False
+                    recent = _native_recent_committed.setdefault(
+                        conversation_id, deque(maxlen=_RECENT_NATIVE_MESSAGES)
+                    )
+                    recent.append(text)
+        return event
 
     if event_type in _TERMINAL_EVENT_TYPES:
         with _lock:
             _inflight.pop(conversation_id, None)
             _native_inflight.pop(conversation_id, None)
-            _native_retired.pop(conversation_id, None)
-            _native_committed.pop(conversation_id, None)
-        return False
+            _native_recent_committed.pop(conversation_id, None)
+        return event
 
     if event_type == "session.status":
         status = event.get("status")
@@ -698,9 +443,9 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> bool:
                 # process agents instead emit ``waiting`` for a parked
                 # elicitation, so their ``idle`` always means turn-over.)
                 _inflight.pop(conversation_id, None)
-        return False
+        return event
 
-    return False
+    return event
 
 
 def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
@@ -720,13 +465,11 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
     * a single ``response.output_text.delta`` carrying the joined
       streamed-so-far text.
 
-    For claude-native (message-scoped) streaming it instead replays one
+    For native message-scoped streaming it instead replays one
     ``response.output_text.delta`` per in-flight message, each carrying
-    its ``message_id`` and highest ``index``, so the client rebuilds the
-    same per-message previews and the live tail appends without
-    duplication. Committed messages are already dropped from the index
-    (on their ``output_item.done``), so this never double-renders content
-    the cold-load snapshot already supplies.
+    its ``message_id`` and highest ``index``, matching the live event
+    shape. Aggregates covered by a committed item are omitted, so this
+    never double-renders content the cold-load snapshot supplies.
 
     Returns an empty list when there is no in-flight text at all.
 
@@ -742,15 +485,16 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
         Empty when the turn has streamed no text yet.
     """
     with _lock:
-        # Claude-native message-scoped replay: one delta per in-flight
-        # message, carrying its message_id + highest index so the client
-        # rebuilds the same per-message preview and its live tail (deltas
-        # published after reconnect, at higher indices) appends cleanly.
+        # Native message-scoped replay: one delta per in-flight
+        # message, carrying its message_id + highest observed index to
+        # preserve the live event's wire shape.
         native_messages = _native_inflight.get(conversation_id)
         if native_messages:
             native_events: list[dict[str, Any]] = []
             for message_id, message in native_messages.items():
-                text = "".join(message.parts)
+                if message.claimed:
+                    continue
+                text = message.text
                 if not text:
                     continue
                 native_events.append(
@@ -807,8 +551,7 @@ def discard(conversation_id: str) -> None:
     with _lock:
         _inflight.pop(conversation_id, None)
         _native_inflight.pop(conversation_id, None)
-        _native_retired.pop(conversation_id, None)
-        _native_committed.pop(conversation_id, None)
+        _native_recent_committed.pop(conversation_id, None)
 
 
 def reset_text(conversation_id: str) -> None:
@@ -842,5 +585,4 @@ def reset_for_tests() -> None:
     with _lock:
         _inflight.clear()
         _native_inflight.clear()
-        _native_retired.clear()
-        _native_committed.clear()
+        _native_recent_committed.clear()

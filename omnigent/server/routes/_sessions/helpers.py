@@ -2517,7 +2517,7 @@ def _publish_external_output_text_delta(session_id: str, body: SessionEventInput
     the integration posts ``external_conversation_item``.
 
     The optional ``message_id`` / ``index`` / ``final`` fields are
-    carried through when present (claude-native live streaming) and
+    carried through when present (native live streaming) and
     omitted otherwise — ``exclude_none`` keeps the wire shape identical
     to in-process task streaming for callers that don't set them.
 

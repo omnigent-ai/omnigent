@@ -2856,9 +2856,8 @@ function nextReconnectDelay(failedOpens: number): number {
  *   the drop.
  * - Native live previews (`live:<message_id>` provisional blocks): the
  *   replay is one CUMULATIVE delta per in-flight message (the joined
- *   text so far at its highest index), and the fresh pump has no
- *   high-water index for the old preview — appending the replay to a
- *   surviving copy would double the text. A message that committed
+ *   text so far). Appending that replay to a surviving preview would
+ *   double the text. A message that committed
  *   during the gap is excluded from the replay entirely; its preview
  *   must vanish too, or it would double-render beside the committed
  *   item the reconnect backfill splices in. So previews are dropped
@@ -3560,7 +3559,7 @@ function isLiveProvisionalBlock(b: AnyBlock): boolean {
  *
  * Shaped like a finalized `text_done` so the existing renderer draws it
  * as assistant text, and keyed with a synthetic `live:<messageId>` id
- * that drives in-place replacement when the authoritative item lands.
+ * so it can be removed when the authoritative item lands.
  *
  * `responseId` is the LIVE TURN's id whenever one is streaming, so the
  * preview groups into that turn's bubble (`walkBubbles` groups by
@@ -3601,34 +3600,18 @@ function makeLiveTextBlock(itemId: string, text: string, responseId: string): Te
  *
  * The streamed text lives in `blocks` (not a separate lane) as a
  * provisional `text_done` block keyed `live:<messageId>`, inserted at the
- * position the first chunk arrived. Keeping it in `blocks` means a later
- * committed block (a tool card, an elicitation) renders BELOW it in
- * arrival order — see `walkBubbles`. When the authoritative `text_done`
- * arrives it replaces this block in place (`pumpStreamEvents`),
- * preserving that position.
+ * position the first chunk arrived. The authoritative `text_done` removes
+ * this provisional block before following the normal committed-item path.
  *
- * Chunks for a message arrive in `index` order (the forwarder tails the
- * deltas file sequentially and dedupes by `(message_id, index)`), so each
- * new chunk's text is appended; a chunk at or below the high-water index
- * is ignored, making a duplicate/replayed chunk a no-op.
+ * The server reconciles and deduplicates chunks, so each received delta is
+ * appended directly.
  *
  * :param set: store setter.
  * :param messageId: vendor's stable per-message id.
- * :param index: 0-based chunk order within the message.
  * :param delta: incremental text for this chunk, e.g. ``"Hello "``.
- * :param lastIndex: per-message high-water index, mutated in place.
  * :returns: nothing; mutates `blocks` in the store.
  */
-function applyLiveDelta(
-  set: Setter,
-  messageId: string,
-  index: number,
-  delta: string,
-  lastIndex: Map<string, number>,
-): void {
-  const prev = lastIndex.get(messageId);
-  if (prev !== undefined && index <= prev) return;
-  lastIndex.set(messageId, index);
+function applyLiveDelta(set: Setter, messageId: string, delta: string): void {
   const itemId = LIVE_ITEM_PREFIX + messageId;
   set((s) => {
     const at = s.blocks.findIndex((b) => b.ctx.itemId === itemId);
@@ -3669,7 +3652,7 @@ function applyLiveToolOutputDelta(set: Setter, callId: string, delta: string): v
 /**
  * Wrap a parsed event stream, diverting terminal-observed live deltas.
  *
- * A `text_delta` carrying a `messageId` is claude-native live streaming:
+ * A `text_delta` carrying a `messageId` is native live streaming:
  * it is folded into its provisional preview block in `blocks` (see
  * `applyLiveDelta`) and NOT yielded downstream, because the `BlockStream`
  * reducer's response-scoped text path would otherwise emit a stray bubble
@@ -3677,20 +3660,11 @@ function applyLiveToolOutputDelta(set: Setter, callId: string, delta: string): v
  * as a separate committed item). Every other event passes through
  * untouched.
  *
- * Deltas whose `messageId` has been retired (its preview already
- * superseded by the authoritative `text_done`) are dropped: a message's
- * trailing chunk can arrive just after its done event, and replaying it
- * would re-create a finalized message's preview as a duplicate, stale
- * bubble. See the `text_done` branch of `pumpStreamEvents`.
- *
  * :param events: upstream parsed events (already session-tapped).
  * :param id: the conversation this pump is bound to; a late delta from a
  *     switched-away stream is dropped rather than mutating state.
- * :param retired: message ids whose preview has been finalized; their
- *     late deltas are ignored. Shared with the pump loop, which adds to
- *     it when it replaces a preview.
- * :param lastIndex: per-message high-water chunk index, shared with
- *     `applyLiveDelta` for duplicate suppression.
+ * :param ignored: message ids suppressed because their scheduled-wake
+ *     deltas arrived before the new turn was named.
  * :param set: store setter.
  * :param get: store getter.
  * :returns: events with native live deltas removed.
@@ -3698,25 +3672,24 @@ function applyLiveToolOutputDelta(set: Setter, callId: string, delta: string): v
 async function* tapLiveDeltas(
   events: AsyncIterable<StreamEvent>,
   id: string,
-  retired: Set<string>,
-  lastIndex: Map<string, number>,
+  ignored: Set<string>,
   set: Setter,
   get: Getter,
 ): AsyncIterable<StreamEvent> {
   for await (const ev of events) {
     if (ev.type === "text_delta" && ev.messageId !== undefined) {
-      if (get().conversationId === id && !retired.has(ev.messageId)) {
+      if (get().conversationId === id && !ignored.has(ev.messageId)) {
         // A scheduled wake streams its first deltas ahead of the batch
         // that names the new turn. They must not preview into the
         // PREVIOUS turn's bubble (anonymous blocks glue to the trailing
         // group — killing its fold and inflating its worked-for span):
-        // retire the message so its text renders only via the
+        // ignore the rest of the message so its text renders only via the
         // authoritative item, which lands in the new turn's bubble.
         if (isStaleCompletedResponse(get())) {
-          retired.add(ev.messageId);
+          ignored.add(ev.messageId);
           continue;
         }
-        applyLiveDelta(set, ev.messageId, ev.index ?? 0, ev.delta, lastIndex);
+        applyLiveDelta(set, ev.messageId, ev.delta);
       }
       continue;
     }
@@ -3730,19 +3703,6 @@ async function* tapLiveDeltas(
   }
 }
 
-/**
- * Reopen a turn that a stray terminal status edge finalized too early.
- *
- * Deltas only ever flow mid-turn (a reconnect replay is a replay OF a
- * mid-turn state), so a delta arriving while `activeResponse` reads
- * `completed` proves the turn is still live — the finalize came from a
- * response-id-less edge that wasn't about this turn (e.g. the server's
- * policy-deny short-circuit publishing running→idle for a denied
- * out-of-band input). Flip it back to `streaming` so the bubble's
- * process trace stays expanded; the turn's own real terminal edge
- * re-finalizes it. `failed` / `cancelled` are user-visible verdicts and
- * are never revived.
- */
 /**
  * Attribute the trailing run of turn-id-less blocks to a just-started turn.
  *
@@ -3830,21 +3790,10 @@ export async function pumpStreamEvents(
   // to the BlockStream reducer. The reducer is intentionally pure
   // (block factory) — session-scoped state lives on the store, not in
   // the reducer's internal state. See migration plan §5.3.
-  // Message ids whose live preview has been finalized by its
-  // authoritative `text_done`. Lives for the whole connection (a new
-  // session rebinds a fresh pump) so a message's trailing chunk that
-  // arrives after its done event can't re-create the preview.
-  const retiredLiveMessages = new Set<string>();
-  // Per-message high-water chunk index, for delta duplicate suppression.
-  const liveLastIndex = new Map<string, number>();
-  const events = tapLiveDeltas(
-    tapSessionEvents(rawEvents, id),
-    id,
-    retiredLiveMessages,
-    liveLastIndex,
-    set,
-    get,
-  );
+  // A scheduled wake can stream before its new turn id arrives. Ignore the
+  // rest of that message so it cannot attach to the completed prior turn.
+  const ignoredWakeMessages = new Set<string>();
+  const events = tapLiveDeltas(tapSessionEvents(rawEvents, id), id, ignoredWakeMessages, set, get);
 
   // Blocks awaiting their coalesced flush; `seenItemIds` dedupes against
   // both committed and still-buffered blocks. Lives for the whole stream
@@ -3921,8 +3870,8 @@ export async function pumpStreamEvents(
       // authoritative item while its `live:*` preview was still on
       // screen, the dedup alone would drop the event and strand the
       // preview as a trailing duplicate of the assistant text. Remove
-      // the oldest preview and retire its message id, then fall through
-      // so the dedup skips the event as before.
+      // the oldest preview, then fall through so the dedup skips the
+      // event as before.
       if (
         block.type === "text_done" &&
         block.ctx.itemId &&
@@ -3932,8 +3881,6 @@ export async function pumpStreamEvents(
       ) {
         const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
         if (provIdx !== -1) {
-          const provItemId = get().blocks[provIdx]!.ctx.itemId!;
-          retiredLiveMessages.add(provItemId.slice(LIVE_ITEM_PREFIX.length));
           flush();
           set((s) => {
             const at = s.blocks.findIndex(isLiveProvisionalBlock);
@@ -4017,28 +3964,18 @@ export async function pumpStreamEvents(
       if (block.type === "text_done" && get().isNativeTerminalSession) {
         const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
         if (provIdx !== -1) {
-          // The authoritative final text for the oldest in-flight message
-          // just arrived. Replace that provisional preview IN PLACE so the
-          // committed text keeps the position it streamed into — above any
-          // tool/elicitation card that arrived after it. FIFO: claude-
-          // native finishes one message before the next begins, and
-          // `message_id` is absent from the transcript, so the oldest open
-          // preview is the one this item finalizes. Retire its id so a
-          // trailing chunk arriving after this event can't re-create it.
-          const provItemId = get().blocks[provIdx]!.ctx.itemId!;
-          retiredLiveMessages.add(provItemId.slice(LIVE_ITEM_PREFIX.length));
-          // Commit any buffered reducer blocks first (preserve their order),
-          // then splice the authoritative text into the preview's slot.
+          // The done item has no message id. Native messages are sequential,
+          // so remove the oldest preview and let the committed item follow
+          // the normal reducer path.
           flush();
           set((s) => {
             const at = s.blocks.findIndex(isLiveProvisionalBlock);
-            if (at === -1) return { blocks: [...s.blocks, block] };
+            if (at === -1) return {};
             const next = s.blocks.slice();
-            next[at] = block;
+            next.splice(at, 1);
             return { blocks: next };
           });
-          paintedFirstContent = true;
-          continue;
+          paintedFirstContent = false;
         }
       }
 

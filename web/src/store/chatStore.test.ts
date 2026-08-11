@@ -7482,8 +7482,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const previews = livePreviews();
     // Exactly one preview holding exactly the replayed text.
     // "Hello worHello world!" = the pre-fix bug: the pre-drop preview
-    // survived the reconnect and the fresh pump (whose high-water index
-    // map starts empty) appended the cumulative replay onto it.
+    // survived the reconnect and the fresh pump appended the cumulative
+    // replay onto it.
     expect(previews.map((b) => b.fullText)).toEqual(["Hello world!"]);
     expect(previews[0]!.ctx.itemId).toBe("live:m1");
 
@@ -7508,8 +7508,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync();
     expect(livePreviews().map((b) => b.fullText)).toEqual(["Hello world!"]);
 
-    // The message commits while the socket is dead: the server retires
-    // it from the replay index (no replay on the next connection) and
+    // The message commits while the socket is dead: the server removes
+    // it from reconnect replay (no replay on the next connection) and
     // it lands in the items store instead.
     seedSessionItems("conv_native_commit", [assistantMessage("resp_n", "Hello world!")]);
     sinks[0]!.error();
@@ -7740,7 +7740,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     controller.abort();
   });
 
-  it("replaces the provisional in place with the authoritative item", async () => {
+  it("drops the provisional before processing the authoritative item", async () => {
     useChatStore.setState({
       conversationId: "conv_live2",
       blocks: [],
@@ -7757,7 +7757,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     await tick();
 
     // The provisional is gone and the authoritative text_done (real item
-    // id) is the only assistant text — no duplicate. If the replacement
+    // id) is the only assistant text — no duplicate. If the cleanup
     // regressed, both live:m1 and ci_1 would render.
     expect(provisional()).toBeUndefined();
     const dones = useChatStore
@@ -7770,7 +7770,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     controller.abort();
   });
 
-  it("retires the provisional preview when the authoritative item was already committed", async () => {
+  it("removes the provisional preview when the authoritative item was already committed", async () => {
     // Race: a snapshot merge (reconnect/rebind) inserts the real
     // assistant item into `blocks` while its `live:*` preview is still
     // on screen. When the authoritative output_item.done then arrives on
@@ -7812,7 +7812,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     sink.push(messageDone("ci_1", "resp_l", "Hello world"));
     await tick();
 
-    // Exactly one rendering: the committed item. The preview is retired.
+    // Exactly one rendering: the committed item. The preview is removed.
     expect(provisional()).toBeUndefined();
     const dones = useChatStore
       .getState()
@@ -7864,7 +7864,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     sink.push(messageDone("msg_real", "pi-turn-0", "PONG"));
     await tick();
 
-    // The provisional preview must be retired and replaced — exactly one
+    // The provisional preview must be removed — exactly one
     // assistant text bubble, not the preview AND the authoritative item.
     expect(provisional()).toBeUndefined();
     const dones = useChatStore
@@ -7942,9 +7942,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     controller.abort();
   });
 
-  it("keeps streamed text ABOVE an elicitation that arrives mid-stream", async () => {
-    // The user-reported bug: text streams, then a tool-permission card
-    // arrives and must render BELOW the text that preceded it (not above).
+  it("removes the preview and handles its done item in normal arrival order", async () => {
     useChatStore.setState({
       conversationId: "conv_live3",
       blocks: [],
@@ -7969,21 +7967,20 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     // Streamed text precedes the elicitation in block (== render) order.
     expect(previewIdx).toBeLessThan(elicitIdx);
 
-    // When the authoritative item commits, it replaces the preview IN
-    // PLACE — so the committed text STAYS above the elicitation rather
-    // than appending after it (where the slow transcript item would land).
+    // The committed item follows the normal reducer path after the preview
+    // is removed, so its position reflects the done event's arrival.
     sink.push(messageDone("ci_1", "resp_l", "Let me check that."));
     await tick();
     const textIdx = idxOf((b) => b.ctx.itemId === "ci_1");
     const elicitIdx2 = idxOf((b) => b.type === "elicitation");
     expect(textIdx).toBeGreaterThanOrEqual(0);
-    expect(textIdx).toBeLessThan(elicitIdx2);
+    expect(textIdx).toBeGreaterThan(elicitIdx2);
     expect(provisional()).toBeUndefined();
 
     controller.abort();
   });
 
-  it("replaces each message's preview in place across a multi-message turn", async () => {
+  it("reconciles each preview independently across a multi-message turn", async () => {
     useChatStore.setState({
       conversationId: "conv_live4",
       blocks: [],
@@ -8002,7 +7999,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     sink.push(nativeDelta("m2", 0, "second", false));
     await tick();
 
-    // m2 is the only in-flight preview (FIFO replacement took m1, not m2).
+    // m2 is the only in-flight preview (FIFO cleanup took m1, not m2).
     expect(provisional()?.ctx.itemId).toBe("live:m2");
     expect(provisional()?.fullText).toBe("second");
     const dones = useChatStore
@@ -8036,60 +8033,6 @@ describe("chatStore — live delta streaming (claude-native)", () => {
 
     // The dangling preview is dropped — no forever-streaming bubble.
     expect(provisional()).toBeUndefined();
-
-    controller.abort();
-  });
-
-  it("appends in-order chunks and ignores a duplicate index", async () => {
-    useChatStore.setState({
-      conversationId: "conv_live6",
-      blocks: [],
-      isNativeTerminalSession: true,
-    });
-    const { sink, controller } = startPump("conv_live6");
-
-    sink.push(sse("response.created", { id: "resp_l", status: "in_progress", output: [] }));
-    sink.push(nativeDelta("m1", 0, "Hello ", false));
-    sink.push(nativeDelta("m1", 1, "world", true));
-    // A replayed chunk at an already-applied index is a no-op.
-    sink.push(nativeDelta("m1", 1, "world", true));
-    await tick();
-
-    expect(provisional()?.fullText).toBe("Hello world");
-
-    controller.abort();
-  });
-
-  it("drops a trailing chunk that arrives after the message was finalized", async () => {
-    // Regression: the forwarder can emit a message's last chunk just
-    // AFTER its authoritative text_done (the chunk was written to the
-    // deltas file moments before the transcript flushed). Replaying it
-    // would re-create the finalized message's preview as a duplicate,
-    // stale bubble that also sits below any later elicitation card.
-    useChatStore.setState({
-      conversationId: "conv_live7",
-      blocks: [],
-      isNativeTerminalSession: true,
-    });
-    const { sink, controller } = startPump("conv_live7");
-
-    sink.push(sse("response.created", { id: "resp_l", status: "in_progress", output: [] }));
-    sink.push(nativeDelta("m1", 0, "Hello ", false));
-    await tick();
-    // The authoritative final text commits and replaces + retires m1.
-    sink.push(messageDone("ci_1", "resp_l", "Hello world"));
-    await tick();
-    expect(provisional()).toBeUndefined();
-
-    // The trailing chunk for the already-finalized m1 arrives late.
-    sink.push(nativeDelta("m1", 1, "world", true));
-    await tick();
-
-    // It is dropped: no re-created provisional (which would duplicate the
-    // committed text and linger below later cards).
-    expect(provisional()).toBeUndefined();
-    const dones = useChatStore.getState().blocks.filter((b) => b.type === "text_done");
-    expect(dones).toHaveLength(1);
 
     controller.abort();
   });
@@ -8805,11 +8748,9 @@ describe("chatStore — policy deny renders once", () => {
 
   it("keeps the deny visible on a native-terminal session", async () => {
     // Same server sequence as the non-native case, but on a native-terminal
-    // session the committed `text_done` reconciles via a DIFFERENT branch:
-    // it replaces the `live:` provisional IN PLACE (and retires the live
-    // message id) rather than appending and letting the terminal sweep drop
-    // the provisional. Both paths must yield exactly one durable, itemId-keyed
-    // deny block.
+    // session the committed `text_done` first removes the `live:` provisional,
+    // then follows the normal committed-item path. Both paths must yield
+    // exactly one durable, itemId-keyed deny block.
     const sentinel = "[Denied by policy: over budget]";
     useChatStore.setState({
       conversationId: "conv_deny3",

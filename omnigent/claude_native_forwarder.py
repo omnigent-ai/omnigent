@@ -11,7 +11,7 @@ import os
 import tempfile
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -67,151 +67,6 @@ _MAX_PERSISTED_COMPACTION_SEQS = 16
 # file is reset and the reader restarts from 0. Generous because one
 # prose answer can be hundreds of chunks.
 _MAX_SEEN_DELTA_KEYS = 5000
-
-# Max time an assistant ``message`` item is held waiting for its
-# streamed deltas to forward first. The transcript and deltas file have
-# independent writers, so a short reply's record can hit disk a poll
-# BEFORE its deltas — inverting the deltas-before-done order and
-# rendering the message twice. ~8 polls at 0.25s: well past the one-poll
-# race, short enough that an unmatched item (dropped deltas, or a
-# multi-block message that never byte-equals the whole-message stream)
-# posts with barely noticeable delay — and has no preview to duplicate.
-_ASSISTANT_ITEM_DELTA_HOLD_S = 2.0
-
-# Cap on the delta-ordering bookkeeping. Entries are consumed on match /
-# never revisited after post, so this is a backstop against pathological
-# sessions, not a working-set size.
-_MAX_DELTA_ORDERING_ENTRIES = 256
-
-
-@dataclass
-class _ForwardedDeltaText:
-    """
-    Forwarded streamed-text accumulation for one assistant message.
-
-    :param parts: Forwarded delta strings in arrival order, e.g.
-        ``["Hello ", "world"]``.
-    :param final: Whether the ``final: true`` chunk has forwarded — only
-        then is ``"".join(parts)`` the complete text, safe to byte-compare
-        against a transcript item.
-    """
-
-    parts: list[str] = field(default_factory=list)
-    final: bool = False
-
-
-@dataclass
-class _DeltaOrderingState:
-    """
-    Cross-poll state enforcing deltas-before-done item ordering.
-
-    Filled by :func:`_forward_available_deltas` (forwarded chunk text per
-    ``message_id``) and consumed by :func:`_hold_assistant_item_for_deltas`,
-    which matches an assistant ``message`` item to its forwarded stream by
-    byte-equal text (the transcript carries no ``message_id``).
-
-    :param texts: ``message_id`` → forwarded delta text state. Popped
-        when an item matches it.
-    :param held_since: ``source_id`` → monotonic time first held. Kept
-        after the timeout releases the item so a failed post's retry
-        isn't re-held; bounded.
-    """
-
-    texts: dict[str, _ForwardedDeltaText] = field(default_factory=dict)
-    held_since: dict[str, float] = field(default_factory=dict)
-
-
-def _hold_monotonic() -> float:
-    """
-    Monotonic clock for the assistant-item hold timeout.
-
-    Indirection so tests patch THIS, not the process-global
-    ``time.monotonic`` (see the no-global-singleton-patch test rule).
-
-    :returns: Seconds from an unspecified monotonic epoch.
-    """
-    return time.monotonic()
-
-
-def _item_output_text(data: dict[str, object]) -> str | None:
-    """
-    Join the ``output_text`` blocks of a message item's content.
-
-    :param data: Item payload, e.g. ``{"role": "assistant", "content":
-        [{"type": "output_text", "text": "Hi"}]}``.
-    :returns: The joined text, or ``None`` when the item carries none.
-    """
-    content = data.get("content")
-    if not isinstance(content, list):
-        return None
-    parts: list[str] = []
-    for block in content:
-        if isinstance(block, dict) and block.get("type") == "output_text":
-            text = block.get("text")
-            if isinstance(text, str):
-                parts.append(text)
-    if not parts:
-        return None
-    return "".join(parts)
-
-
-def _hold_assistant_item_for_deltas(
-    item: ClaudeTranscriptItem,
-    ordering: _DeltaOrderingState | None,
-    bridge_dir: Path,
-) -> bool:
-    """
-    Decide whether to defer an assistant message item to a later poll.
-
-    Enforces deltas-before-done: an assistant ``message`` item posts only
-    once a complete (``final``-seen) forwarded stream byte-equals its
-    text, or after :data:`_ASSISTANT_ITEM_DELTA_HOLD_S`. Holding returns
-    ``True`` and the caller stops the batch here (cursor unadvanced) so
-    later items can't overtake it. Items that can't have a preview — tool
-    calls, user/text-less messages, no-deltas-file sessions — never hold.
-    The timeout is safe: a message whose deltas never arrive has no live
-    preview, so a late post renders once, like any non-streamed message.
-
-    :param item: The transcript item about to be posted.
-    :param ordering: Shared ordering state, or ``None`` to disable
-        holding (parsing-only test paths).
-    :param bridge_dir: Native Claude bridge directory (for the
-        deltas-file existence check).
-    :returns: ``True`` to hold the item (and the rest of the batch)
-        until the next poll; ``False`` to post it now.
-    """
-    if ordering is None:
-        return False
-    if item.item_type != "message" or item.data.get("role") != "assistant":
-        return False
-    text = _item_output_text(item.data)
-    if not text:
-        return False
-    if not (bridge_dir / MESSAGE_DELTAS_FILE).exists():
-        return False
-    for message_id, entry in ordering.texts.items():
-        if entry.final and "".join(entry.parts) == text:
-            # Deltas fully forwarded — consume the stream (a later
-            # identical-text message matches its own) and post.
-            ordering.texts.pop(message_id)
-            ordering.held_since.pop(item.source_id, None)
-            return False
-    now = _hold_monotonic()
-    first_held = ordering.held_since.setdefault(item.source_id, now)
-    while len(ordering.held_since) > _MAX_DELTA_ORDERING_ENTRIES:
-        del ordering.held_since[next(iter(ordering.held_since))]
-    if now - first_held >= _ASSISTANT_ITEM_DELTA_HOLD_S:
-        # Timestamp kept: a failed post's retry next poll is released
-        # immediately by the elapsed check, not re-held for a full timeout.
-        _logger.debug(
-            "Posting assistant transcript item without matching forwarded "
-            "deltas after %.1fs hold; source_id=%s",
-            _ASSISTANT_ITEM_DELTA_HOLD_S,
-            item.source_id,
-        )
-        return False
-    return True
-
 
 # Seconds of transcript inactivity after which we publish ``idle`` for
 # a sub-agent. The transcript is the only signal we have for sub-agent
@@ -679,9 +534,9 @@ class _ForwardDedupeState:
     # Turn-settle latch driving the scheduled-wake boundary. The Stop edge
     # records the ended turn's id as PENDING; it activates (moves to
     # ``settled_response_id``) only once a fully-consumed transcript batch
-    # carries no assistant output for it — the turn's final message can be
-    # delta-held across polls and forward AFTER its Stop edge, and latching
-    # immediately would mis-read that tail as a scheduled wake. Assistant
+    # carries no assistant output for it — transcript items can surface after
+    # the Stop edge, and latching immediately would mis-read that tail as a
+    # scheduled wake. Assistant
     # output inheriting the ACTIVE settled id gets a fresh turn id plus a
     # ``[System: scheduled prompt fired]`` marker (see the bridge parser).
     pending_settled_response_id: str | None = None
@@ -914,13 +769,6 @@ async def forward_claude_transcript_to_session(
     # prevents re-reads on the normal path.
     delta_state = _read_delta_forward_state(bridge_dir)
     seen_delta_keys: dict[tuple[str, int], None] = {}
-    # Deltas-before-done ordering across the two independent tails: the
-    # deltas forwarder records each message's forwarded text, the items
-    # forwarder holds an assistant item until its text matches a complete
-    # forwarded stream (or a short timeout). Per-process like
-    # ``seen_delta_keys``; survives /clear and /fork (message_ids belong
-    # to the long-lived Claude process).
-    delta_ordering = _DeltaOrderingState()
     item_retries = _PostRetryTracker()
     status_retries = _PostRetryTracker()
     subagent_start_retries = _PostRetryTracker()
@@ -1063,25 +911,14 @@ async def forward_claude_transcript_to_session(
                             session_id=current_session_id,
                             start_at_offset=start_at_offset,
                         )
-                        # Forward streamed deltas BEFORE the transcript items so a
-                        # message's live chunks (incl. its ``final`` chunk) always
-                        # precede its own authoritative ``output_item.done``. If
-                        # items led, a message's final chunk — written to the
-                        # deltas file moments before the transcript record flushed
-                        # — would land just AFTER its done event and re-create the
-                        # already-finalized preview on the client (duplicate bubble
-                        # + a stale trailing preview). See the web reconciler.
-                        # Within-poll order can't cover the cross-poll race
-                        # (transcript flushed, hook delta write not yet);
-                        # ``delta_ordering`` closes it by holding the assistant
-                        # item until its deltas byte-match or a timeout expires.
+                        # Read deltas first for the lowest-latency preview. The
+                        # runtime reconciler handles either delta/item order.
                         delta_state = await _forward_available_deltas(
                             client=client,
                             session_id=current_session_id,
                             bridge_dir=bridge_dir,
                             state=delta_state,
                             seen_keys=seen_delta_keys,
-                            ordering=delta_ordering,
                         )
                         # Mint a pending token for any PreCompact that first
                         # became visible THIS poll, before the transcript items
@@ -1099,7 +936,6 @@ async def forward_claude_transcript_to_session(
                             retry_tracker=item_retries,
                             skip_user_messages=skip_user_messages,
                             dedupe=dedupe,
-                            ordering=delta_ordering,
                         )
                         hook_state = await _forward_available_status_events(
                             client=client,
@@ -3209,9 +3045,8 @@ def _promote_pending_settle(
     """
     Activate a pending turn settle once the transcript is quiescent.
 
-    The turn's final assistant message can be delta-held across polls and
-    forward AFTER its ``Stop`` edge posted — and a late tool result can
-    surface in a batch EARLIER than that held tail. Promote only when a
+    The turn's final assistant message can surface after its ``Stop`` edge,
+    and a late tool result can appear in the same tail. Promote only when a
     batch carries no item at all for the pending turn: any activity
     means its tail may still be in flight, and promoting then would
     mis-mark the tail as a scheduled wake.
@@ -3411,7 +3246,6 @@ async def _forward_available_items(
     retry_tracker: _PostRetryTracker,
     skip_user_messages: bool = False,
     dedupe: _ForwardDedupeState,
-    ordering: _DeltaOrderingState | None = None,
 ) -> TranscriptForwardState:
     """
     Forward currently available transcript items after ``state``.
@@ -3425,11 +3259,6 @@ async def _forward_available_items(
         transcript item posts.
     :param dedupe: Last usage / context-window / model values POSTed;
         mutated in place to suppress duplicate ``external_*`` events.
-    :param ordering: Delta-ordering state shared with
-        :func:`_forward_available_deltas`. An assistant ``message`` item
-        whose deltas haven't fully forwarded is held (batch stops, cursor
-        unadvanced) until they have or a timeout expires — see
-        :func:`_hold_assistant_item_for_deltas`. ``None`` disables holding.
     :returns: The updated transcript cursor state. On post failure it
         is the last durable cursor so retries don't re-post successful
         items.
@@ -3520,11 +3349,6 @@ async def _forward_available_items(
             seen_source_ids.append(item.source_id)
             seen.add(item.source_id)
             continue
-        # Deltas-before-done: defer an assistant message whose deltas
-        # haven't forwarded yet. Stop the batch here (cursor before this
-        # item) so later items can't overtake it.
-        if _hold_assistant_item_for_deltas(item, ordering, bridge_dir):
-            return updated
         retry_key = f"item:{item.source_id}"
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return updated
@@ -4171,7 +3995,6 @@ async def _forward_available_deltas(
     bridge_dir: Path,
     state: DeltaForwardState,
     seen_keys: dict[tuple[str, int], None],
-    ordering: _DeltaOrderingState | None = None,
 ) -> DeltaForwardState:
     """
     Forward newly appended assistant-text deltas to the active session.
@@ -4192,11 +4015,6 @@ async def _forward_available_deltas(
     :param seen_keys: In-memory ``(message_id, index)`` dedupe ring,
         mutated in place. Guards the rare file-truncation rewind where
         the reader restarts from offset ``0``.
-    :param ordering: Delta-ordering state, mutated in place: each
-        forwarded chunk's text accumulates under its ``message_id`` for
-        :func:`_hold_assistant_item_for_deltas` to byte-match. Accumulated
-        on read, not POST success — a dropped chunk should let the item
-        post, not wait on text that never completes. ``None`` disables it.
     :returns: The updated delta cursor state (offset advanced past the
         records just read).
     """
@@ -4222,13 +4040,6 @@ async def _forward_available_deltas(
         # limit.
         while len(seen_keys) > _MAX_SEEN_DELTA_KEYS:
             del seen_keys[next(iter(seen_keys))]
-        if ordering is not None:
-            entry = ordering.texts.setdefault(delta.message_id, _ForwardedDeltaText())
-            entry.parts.append(delta.delta)
-            if delta.final:
-                entry.final = True
-            while len(ordering.texts) > _MAX_DELTA_ORDERING_ENTRIES:
-                del ordering.texts[next(iter(ordering.texts))]
         try:
             await _post_external_output_text_delta(client, session_id=session_id, delta=delta)
         except httpx.HTTPError as exc:
