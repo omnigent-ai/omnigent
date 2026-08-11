@@ -68,6 +68,31 @@ _ELICITATION_DECISION_ALLOWLIST = (
     "content",
 )
 
+# Cross-vendor review: session.failed's ``error_message`` upstream sources
+# include str(exception), subprocess/provider stderr, and a runner-forwarded,
+# structurally-unvalidated ``error`` dict (any harness/provider process can
+# put arbitrary text there) — free-form text that can incidentally embed
+# secrets, tokens, credentials, or internal paths. Denylisting by dict KEY
+# (see ``_redact_denylist``) cannot sanitize an arbitrary secret embedded in
+# a VALUE, and this payload is HMAC-signed and delivered to an external
+# manager webhook. So the delivered ``reason.message`` is NEVER the raw
+# error_message text — only one of these fixed, safe, allowlisted strings,
+# selected by the (short, enum-like, low-risk) error_code. An unrecognized
+# code falls back to the fully generic message below; the raw text is only
+# ever logged server-side (see record_session_failed), never persisted into
+# the outbox payload this map feeds.
+_SAFE_FAILURE_MESSAGES: dict[str, str] = {
+    "runner_disconnected": "The runner disconnected unexpectedly.",
+    "runner_failed_to_start": "The runner failed to start.",
+    "runner_error": "The runner reported an error.",
+    "runner_rejected_event": "The runner rejected an event for this turn.",
+    "harness_not_configured": ("The agent's harness is not configured on the selected host."),
+    "codex_turn_error": "The turn failed on the harness side.",
+    "codex_reauth_required": "Re-authentication is required for this session.",
+    "unknown": "The session turn failed.",
+}
+_DEFAULT_SAFE_FAILURE_MESSAGE = "The session turn failed."
+
 _store: SessionLifecycleStore | None = None
 
 
@@ -158,22 +183,39 @@ def record_session_failed(
     Durably record a ``session.failed`` event.
 
     Bound to any ``_publish_status`` edge into ``failed`` (not swallowed by
-    the sticky failed->idle guard). ``error_code``/``error_message`` are the
-    same ``ErrorDetail`` fields already passed to ``_publish_status``,
-    passed through the denylist redaction filter plus a length clamp — see
-    ``docs/architecture/2026-08-10-durable-session-lifecycle-push.md`` §3.2.
+    the sticky failed->idle guard). ``error_code`` is the same
+    ``ErrorDetail.code`` already passed to ``_publish_status``, truncated
+    and denylist-redacted defensively. ``error_message`` is NEVER persisted
+    into the delivered payload verbatim — it is free-form text (str(exception),
+    subprocess/provider stderr, a runner-forwarded and structurally-
+    unvalidated ``error`` dict) that can incidentally embed secrets, and this
+    event is HMAC-signed and delivered to an external manager webhook. The
+    delivered ``reason.message`` is always one of the fixed, safe strings in
+    :data:`_SAFE_FAILURE_MESSAGES`, selected by ``error_code`` — see that
+    map's own docstring. ``error_message`` is only ever logged server-side,
+    never returned, never persisted.
 
     :param workspace_id: Tenant partition key.
     :param session_id: The session that just failed.
     :param response_id: The turn's response id (transition key source).
-    :param error_code: ``ErrorDetail.code`` verbatim.
-    :param error_message: ``ErrorDetail.message`` verbatim (redacted here).
+    :param error_code: ``ErrorDetail.code`` verbatim — a short, enum-like
+        classifier, selects the safe delivered message.
+    :param error_message: ``ErrorDetail.message`` verbatim — free-form,
+        untrusted diagnostic text. Logged server-side only; never delivered.
     """
     if _store is None:
         return
     transition_key = f"turn:{response_id}:failed"
-    reason = _redact_denylist({"code": error_code, "message": error_message})
-    reason["message"] = _truncate(str(reason["message"]))
+    safe_message = _SAFE_FAILURE_MESSAGES.get(error_code, _DEFAULT_SAFE_FAILURE_MESSAGE)
+    if error_message:
+        _logger.info(
+            "session.failed diagnostic detail (server-side only, never delivered "
+            "externally): session_id=%s error_code=%s detail=%s",
+            session_id,
+            error_code,
+            _truncate(error_message),
+        )
+    reason = _redact_denylist({"code": _truncate(str(error_code)), "message": safe_message})
     payload = {"response_id": response_id, "reason": reason}
     now = now_epoch()
     _store.record_lifecycle_event(

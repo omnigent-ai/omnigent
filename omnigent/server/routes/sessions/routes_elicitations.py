@@ -192,13 +192,16 @@ def register_elicitations_routes(
             # the runner is very likely still alive and about to
             # reconnect. Consult the grace-pending marker FIRST — durable
             # (SessionConnectivity.runner_disconnect_grace_deadline, written
-            # by the replica holding the tunnel at the same moment it
-            # clears runner_last_seen; see
-            # session_live_state.set_runner_disconnect_grace), so this
-            # check is correct regardless of which replica this decision
-            # request landed on — before falling back to the cross-replica
-            # freshness signal, which is only meaningful once the grace has
-            # genuinely elapsed with no reconnect.
+            # by the replica holding the tunnel ATOMICALLY alongside
+            # clearing runner_last_seen — one UPDATE, one commit; see
+            # session_live_state.mark_runner_disconnected — so a reader
+            # here can never observe a state where the runner looks both
+            # non-live and non-graced while it's actually just
+            # disconnecting), so this check is correct regardless of which
+            # replica this decision request landed on — before falling
+            # back to the cross-replica freshness signal, which is only
+            # meaningful once the grace has genuinely elapsed with no
+            # reconnect.
             runner_in_disconnect_grace = (
                 conn is not None
                 and conn.runner_id is not None

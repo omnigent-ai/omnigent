@@ -294,6 +294,11 @@ def clear_runner_liveness(runner_id: str) -> None:
     freshness TTL. An ungraceful death (host / replica crash) never
     reaches this — the TTL self-corrects it.
 
+    Not used by the disconnect path — that calls :func:`mark_runner_disconnected`
+    instead so the liveness-clear and the grace-deadline-set land in one
+    atomic write (see that function's docstring). Kept for any caller that
+    only ever needs to clear liveness with no grace deadline involved.
+
     :param runner_id: The disconnected runner's id.
     """
     if _store is None:
@@ -301,18 +306,46 @@ def clear_runner_liveness(runner_id: str) -> None:
     _submit("runner_liveness_clear", _store.clear_runner_liveness, runner_id)
 
 
+def mark_runner_disconnected(runner_id: str, grace_deadline: float) -> None:
+    """
+    Atomically clear liveness and stamp the reconnect-grace deadline
+    (OMN-104 §5.4) in ONE durable write.
+
+    Cross-vendor review: calling :func:`clear_runner_liveness` and
+    :func:`set_runner_disconnect_grace` as two SEPARATE writes left a real
+    window between their commits where another replica's read observed
+    BOTH fields absent/stale simultaneously — the runner looking neither
+    live nor grace-pending — and could falsely 410 a manager decision for a
+    runner genuinely still within its reconnect grace. This function is the
+    disconnect path's ONLY entry point for these two fields; it submits a
+    single combined store write
+    (:meth:`ConversationStore.mark_runner_disconnected`), which is one
+    ``UPDATE`` / one commit, so there is no third, in-between state a reader
+    can ever observe.
+
+    :param runner_id: The disconnected runner's id.
+    :param grace_deadline: Epoch seconds the reconnect grace expires at.
+    """
+    if _store is None:
+        return
+    _submit(
+        "runner_disconnected_mark",
+        _store.mark_runner_disconnected,
+        runner_id,
+        int(grace_deadline),
+    )
+
+
 def set_runner_disconnect_grace(runner_id: str, grace_deadline: float) -> None:
     """
     Durably stamp the post-disconnect reconnect-grace deadline (OMN-104 §5.4).
 
-    Called alongside :func:`clear_runner_liveness` from the SAME disconnect
-    handler, so a manager decision request landing on a DIFFERENT replica
-    than the one holding the tunnel can still see "this runner disconnected
-    and is still within its reconnect grace" instead of falling through to
-    the now-cleared ``runner_last_seen`` freshness check and misclassifying
-    a runner that is about to reconnect as dead — the same class of bug
-    BLOCKING #1 (round 1) fixed for the single-replica case, exposed one
-    layer further out for a multi-replica deployment.
+    Not used by the disconnect path — that calls
+    :func:`mark_runner_disconnected` instead so the liveness-clear and the
+    grace-deadline-set land in one atomic write (see that function's
+    docstring for why the two-write version was a real truthfulness bug).
+    Kept for any caller that only ever needs to set the grace deadline with
+    no accompanying liveness-clear.
 
     :param runner_id: The disconnected runner's id.
     :param grace_deadline: Epoch seconds the grace expires at.

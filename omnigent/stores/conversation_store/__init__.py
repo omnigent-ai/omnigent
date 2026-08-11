@@ -1213,6 +1213,31 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def mark_runner_disconnected(self, runner_id: str, grace_deadline: int) -> None:
+        """
+        Atomically clear liveness and set the reconnect-grace deadline for
+        every session bound to a runner, in ONE transaction/commit.
+
+        Cross-vendor review: :meth:`clear_runner_liveness` and
+        :meth:`set_runner_disconnect_grace` used to be called as two
+        SEPARATE store writes on disconnect. Because each is its own
+        transaction, there was a real (if narrow) window between the two
+        commits where another replica's read observed BOTH
+        ``runner_last_seen`` cleared AND ``runner_disconnect_grace_deadline``
+        still absent (or a stale, already-expired value) simultaneously —
+        the runner would look neither live nor grace-pending, and a manager
+        decision landing in that exact window would be falsely 410'd even
+        though the runner is genuinely still within its reconnect grace.
+        A single ``UPDATE`` setting both columns is atomic per row under any
+        transactional isolation level a reader could observe — there is no
+        third, in-between state to read. Must NOT bump ``updated_at``.
+
+        :param runner_id: The disconnecting runner's id.
+        :param grace_deadline: Epoch seconds the reconnect grace expires at.
+        """
+        ...
+
+    @abstractmethod
     def set_runner_disconnect_grace(self, runner_id: str, grace_deadline: int) -> None:
         """
         Stamp the post-disconnect reconnect-grace deadline (OMN-104 §5.4)

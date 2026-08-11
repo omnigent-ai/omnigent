@@ -173,6 +173,14 @@ _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
+# OMN-104 §5.4 case (b), cross-vendor review P1: how often each replica
+# sweeps its OWN locally-connected runners for decided-but-undelivered
+# elicitations (see _redelivery_sweep_loop). Faster than
+# RUNNER_DISCONNECT_GRACE_S (10.0s) so a decision recorded on a different
+# replica than the one holding the tunnel is delivered promptly even
+# though the runner never disconnects/reconnects to trigger the other
+# delivery path.
+_REDELIVERY_SWEEP_INTERVAL_S: float = 5.0
 # polly's and debby's multi-file bundles are packaged under
 # omnigent.resources.examples (see pyproject package-data), so they resolve
 # in both a repo checkout and an installed wheel. The presence check in each
@@ -1087,6 +1095,14 @@ def create_app(
         manager_webhook_dispatcher_task = asyncio.create_task(
             run_dispatcher(session_lifecycle_store, lease_owner=_dispatcher_lease_owner)
         )
+        # Cross-replica decided-elicitation redelivery sweep (OMN-104 §5.4
+        # case (b), cross-vendor review P1): always started, one per
+        # replica, same unconditional-task pattern as the dispatcher above
+        # — see _redelivery_sweep_loop's own docstring for why this exists
+        # (a runner that never disconnects from the replica holding its
+        # tunnel would otherwise never see a decision recorded on a
+        # different replica).
+        redelivery_sweep_task = asyncio.create_task(_redelivery_sweep_loop())
         metrics_publish_task = asyncio.create_task(
             publish_server_metrics_periodically(
                 server_metrics,
@@ -1162,6 +1178,9 @@ def create_app(
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
+            redelivery_sweep_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await redelivery_sweep_task
             await cancel_dispatcher(manager_webhook_dispatcher_task)
             # Stop in-flight background managed-sandbox launches so a
             # slow provision doesn't outlive the ASGI shutdown (the
@@ -2120,16 +2139,19 @@ def create_app(
     # flap their sessions to failed.
     _disconnect_grace_tasks: dict[str, asyncio.Task[None]] = {}
     # OMN-104 §5.4: the grace-pending marker is durable
-    # (omnigent_conversation_metadata.runner_disconnect_grace_deadline via
-    # session_live_state.set_runner_disconnect_grace/clear_runner_disconnect_grace),
-    # not per-process state — a manager decision can land on ANY server
-    # replica, not just the one holding this runner's tunnel.
-    # session_live_state.clear_runner_liveness() nulls runner_last_seen
-    # IMMEDIATELY on disconnect (not after the grace), on that SAME durable
-    # row — so a decision arriving mid-grace on a different replica would
-    # otherwise see stale liveness with no local grace entry to consult and
-    # be misclassified as "runner dead" (410) even though the runner is
-    # very likely about to reconnect. The decision endpoint reads this via
+    # (omnigent_conversation_metadata.runner_disconnect_grace_deadline,
+    # written atomically alongside runner_last_seen's clear by
+    # session_live_state.mark_runner_disconnected — see its docstring for
+    # why this must be one write, not two — and cleared via
+    # session_live_state.clear_runner_disconnect_grace), not per-process
+    # state — a manager decision can land on ANY server replica, not just
+    # the one holding this runner's tunnel. runner_last_seen is cleared
+    # IMMEDIATELY on disconnect (not after the grace), in that SAME atomic
+    # write — so a decision arriving mid-grace on a different replica sees
+    # a consistent snapshot (liveness cleared AND grace set together, never
+    # one without the other) rather than being misclassified as "runner
+    # dead" (410) even though the runner is very likely about to reconnect.
+    # The decision endpoint reads this via
     # SessionConnectivity.runner_disconnect_grace_deadline (cross-replica,
     # like runner_last_seen itself), not app.state.
 
@@ -2240,24 +2262,26 @@ def create_app(
             )
             return
         runner_session_initializer.invalidate_runner(runner_id)
-        # Graceful disconnect: clear the persisted liveness stamp so other
-        # replicas flip offline immediately rather than after the TTL.
-        session_live_state.clear_runner_liveness(runner_id)
 
         # Replace any pending timer so a rapid drop-reconnect-drop gives
         # each outage a full grace window.
         _cancel_disconnect_grace(runner_id)
         from omnigent.server.routes.sessions import RUNNER_DISCONNECT_GRACE_S
 
-        # OMN-104 §5.4: mark this runner as grace-pending (not confirmed
-        # dead) for the same duration the failed-marking timer waits, so a
-        # decision arriving in this window — on ANY replica, not just this
-        # one — is classified as "pending redelivery", not "runner dead".
-        # Durable (see session_live_state.set_runner_disconnect_grace),
-        # written alongside clear_runner_liveness above; consumed via
+        # Graceful disconnect: clear the persisted liveness stamp (so other
+        # replicas flip offline immediately rather than after the TTL) AND
+        # mark this runner grace-pending (not confirmed dead, for the same
+        # duration the failed-marking timer below waits, so a decision
+        # arriving in this window — on ANY replica, not just this one — is
+        # classified as "pending redelivery", not "runner dead") in ONE
+        # atomic write. Cross-vendor review: doing these as two separate
+        # writes left a window where another replica's read could observe
+        # the runner as neither live nor grace-pending and falsely 410 a
+        # decision — see session_live_state.mark_runner_disconnected's
+        # docstring. Consumed via
         # SessionConnectivity.runner_disconnect_grace_deadline in
         # routes_elicitations.py.
-        session_live_state.set_runner_disconnect_grace(
+        session_live_state.mark_runner_disconnected(
             runner_id, time.time() + RUNNER_DISCONNECT_GRACE_S
         )
         task = asyncio.create_task(
@@ -2312,6 +2336,129 @@ def create_app(
             conversation_store,
             fail_idle_top_level=True,
         )
+
+    async def _redeliver_decided_undelivered(
+        conv_id: str, routed_client: httpx.AsyncClient
+    ) -> None:
+        """Redeliver decided-but-undelivered elicitation verdicts for one session.
+
+        OMN-104 §5.4 case (b): a durable ``session_elicitations`` row plus
+        this delivery is what makes the manager's earlier decision-endpoint
+        response ("recorded, pending redelivery") eventually true — reuses
+        the runner's existing approval-POST contract rather than inventing
+        a second delivery mechanism. Called from two places: on this
+        replica's own tunnel reconnect (:func:`_on_runner_connect`, the
+        original OMN-104 mechanism), and from :func:`_redelivery_sweep_loop`
+        for a runner that never disconnected from THIS replica at all — the
+        cross-vendor review P1 finding that a decision landing on a
+        different replica than the one continuously holding the tunnel
+        would otherwise never be delivered, since no reconnect event would
+        ever fire to trigger this.
+
+        :param conv_id: Session/conversation id whose elicitations to
+            check, e.g. ``"conv_abc123"``.
+        :param routed_client: HTTP client already resolved to this
+            session's bound (and, by construction of both call sites,
+            locally live) runner.
+        """
+        for undelivered in session_lifecycle_store.list_decided_undelivered(conv_id):
+            try:
+                decision_payload = (
+                    json.loads(undelivered.decision_payload)
+                    if undelivered.decision_payload
+                    else {}
+                )
+                response = await routed_client.post(
+                    f"/v1/sessions/{conv_id}/events",
+                    json={
+                        "type": _APPROVAL_TYPE,
+                        "data": {"elicitation_id": undelivered.id, **decision_payload},
+                    },
+                    timeout=10.0,
+                )
+                # Truthful consumption is EITHER of two independent
+                # signals (see helpers.py's _forward_approval_to_runner,
+                # same contract): the runner's own
+                # pending_approvals.resolve() header (the policy/cost-ASK
+                # path), or a bare 2xx (the harness-native ctx.elicit()
+                # path — the runner unconditionally also forwards this
+                # event to the harness subprocess, whose own
+                # _resolve_elicitation 404s for any id that isn't a
+                # genuine _in_flight match, so a 2xx here is itself
+                # already truthful, not merely "reached the runner").
+                # session.resumed must only ever reflect a verdict the
+                # runner actually consumed via one of these two paths.
+                if response.headers.get(_PENDING_APPROVAL_RESOLVED_HEADER) == "true" or (
+                    200 <= response.status_code < 300
+                ):
+                    session_outbox.record_elicitation_resumed(
+                        workspace_id=undelivered.workspace_id,
+                        elicitation_id=undelivered.id,
+                    )
+                else:
+                    _logger.warning(
+                        "Redelivery for elicitation %s not truthfully consumed by runner "
+                        "(status=%s)",
+                        undelivered.id,
+                        response.status_code,
+                    )
+            except (httpx.HTTPError, ConnectionError):
+                _logger.exception(
+                    "Redelivery failed for elicitation %s",
+                    undelivered.id,
+                )
+
+    async def _redelivery_sweep_loop() -> None:
+        """Periodically redeliver decided elicitations for locally-connected runners.
+
+        Cross-vendor review P1: ``_on_runner_connect`` only redelivers on
+        an actual reconnect event. If the runner stays continuously
+        connected to replica A the whole time a decision is durably
+        recorded on replica B, no reconnect ever fires on replica A and
+        the decision is otherwise permanently stuck — ``pending_redelivery``
+        was a promise the codebase had no mechanism to keep. This sweep
+        makes it true: every replica periodically checks the runner ids
+        its OWN tunnel registry currently holds live (a purely local,
+        in-memory, cheap read — no cross-replica discovery needed, since
+        this loop only ever acts on runners genuinely connected HERE) and
+        redelivers anything decided-but-undelivered for their bound
+        sessions, regardless of which replica recorded the decision.
+
+        One per replica, unconditionally started (same pattern as
+        ``manager_webhook_dispatcher_task``) — safe under multi-replica
+        because each replica only ever touches the sessions bound to
+        runners live on ITS OWN registry; two replicas never race to
+        redeliver the same session's elicitation (only one of them can
+        have that runner's tunnel at a time, by the tunnel registry's own
+        newest-wins invariant), and ``record_elicitation_resumed`` is
+        idempotent regardless.
+
+        Cost is O(locally-connected runners × sessions bound to each) per
+        sweep tick — acceptable at the interval below for the scale this
+        mechanism targets (a handful of sessions per runner); a
+        cross-store JOIN to make this a single targeted query would need
+        the session-lifecycle store and the conversation store to share a
+        database, which OMN-104's design deliberately does not assume.
+        """
+        while True:
+            try:
+                await asyncio.sleep(_REDELIVERY_SWEEP_INTERVAL_S)
+                for runner_id in tunnel_registry.online_runner_ids():
+                    convs = await asyncio.to_thread(
+                        conversation_store.list_conversations_by_runner_id, runner_id
+                    )
+                    for conv in convs:
+                        if not session_lifecycle_store.list_decided_undelivered(conv.id):
+                            continue
+                        try:
+                            routed = runner_router.client_for_session_resources(conv.id)
+                        except OmnigentError:
+                            continue
+                        await _redeliver_decided_undelivered(conv.id, routed.client)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _logger.exception("Redelivery sweep tick failed; will retry next interval")
 
     async def _on_runner_connect(runner_id: str) -> None:
         """Re-assign sessions and restart SSE relays on reconnect.
@@ -2405,53 +2552,11 @@ def create_app(
             # hook is what makes the manager's earlier decision-endpoint
             # response ("recorded, pending redelivery") eventually true —
             # reuses the runner's existing approval-POST contract rather
-            # than inventing a second delivery mechanism.
-            for undelivered in session_lifecycle_store.list_decided_undelivered(conv.id):
-                try:
-                    decision_payload = (
-                        json.loads(undelivered.decision_payload)
-                        if undelivered.decision_payload
-                        else {}
-                    )
-                    response = await routed.client.post(
-                        f"/v1/sessions/{conv.id}/events",
-                        json={
-                            "type": _APPROVAL_TYPE,
-                            "data": {"elicitation_id": undelivered.id, **decision_payload},
-                        },
-                        timeout=10.0,
-                    )
-                    # Truthful consumption is EITHER of two independent
-                    # signals (see helpers.py's _forward_approval_to_runner,
-                    # same contract): the runner's own
-                    # pending_approvals.resolve() header (the policy/cost-ASK
-                    # path), or a bare 2xx (the harness-native ctx.elicit()
-                    # path — the runner unconditionally also forwards this
-                    # event to the harness subprocess, whose own
-                    # _resolve_elicitation 404s for any id that isn't a
-                    # genuine _in_flight match, so a 2xx here is itself
-                    # already truthful, not merely "reached the runner").
-                    # session.resumed must only ever reflect a verdict the
-                    # runner actually consumed via one of these two paths.
-                    if response.headers.get(_PENDING_APPROVAL_RESOLVED_HEADER) == "true" or (
-                        200 <= response.status_code < 300
-                    ):
-                        session_outbox.record_elicitation_resumed(
-                            workspace_id=undelivered.workspace_id,
-                            elicitation_id=undelivered.id,
-                        )
-                    else:
-                        _logger.warning(
-                            "Reconnect redelivery for elicitation %s not truthfully "
-                            "consumed by runner (status=%s)",
-                            undelivered.id,
-                            response.status_code,
-                        )
-                except (httpx.HTTPError, ConnectionError):
-                    _logger.exception(
-                        "Reconnect redelivery failed for elicitation %s",
-                        undelivered.id,
-                    )
+            # than inventing a second delivery mechanism. Shared with
+            # _redelivery_sweep_loop, which covers the case where the
+            # runner never disconnects from THIS replica at all — see that
+            # function's docstring.
+            await _redeliver_decided_undelivered(conv.id, routed.client)
             # The session's terminal exists as of the handshake above, so its
             # model catalogs are answerable now. Warming them here is what
             # keeps the first routed message off the runner round trip. The

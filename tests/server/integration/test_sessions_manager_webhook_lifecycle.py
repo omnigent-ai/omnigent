@@ -135,6 +135,12 @@ async def test_session_failed_fires_and_is_not_swallowed_by_sticky_guard(
     ``session.failed`` outbox row carrying the failure reason. (The sticky
     failed->idle guard in ``_publish_status`` only swallows a TRAILING
     idle after failed — it must not swallow the failed transition itself.)
+
+    Cross-vendor review: the delivered ``reason.message`` is a fixed, safe
+    string selected by ``error_code`` (here ``codex_turn_error``, from this
+    route's own classification of a failed ``external_session_status``
+    with ``output`` set) — never the raw ``output`` text verbatim. See
+    ``session_outbox.record_session_failed``'s docstring.
     """
     agent = await create_test_agent(client, "test-omn104-failed-not-swallowed")
     session_id = await _create_session(client, agent["id"])
@@ -152,7 +158,9 @@ async def test_session_failed_fires_and_is_not_swallowed_by_sticky_guard(
     deliveries, _ = store.list_deliveries(session_id, limit=100)
     failed = [d for d in deliveries if d.event_type == "session.failed"]
     assert len(failed) == 1, deliveries
-    assert "the turn errored out" in failed[0].payload
+    assert "the turn errored out" not in failed[0].payload
+    assert '"code": "codex_turn_error"' in failed[0].payload
+    assert '"message": "The turn failed on the harness side."' in failed[0].payload
     assert '"response_id": "resp_fail_1"' in failed[0].payload
 
 

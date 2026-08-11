@@ -82,6 +82,14 @@ def test_record_session_completed_noop_when_unconfigured() -> None:
 
 
 def test_record_session_failed_writes_row(store: SqlAlchemySessionLifecycleStore) -> None:
+    """
+    Cross-vendor review: the delivered ``reason.message`` is a fixed, safe
+    string selected by ``error_code`` — never a passthrough of
+    ``error_message`` (see :data:`session_outbox._SAFE_FAILURE_MESSAGES`
+    and :func:`session_outbox.record_session_failed`'s docstring). Free-form
+    diagnostic text like ``error_message`` here can incidentally embed
+    secrets and this payload is HMAC-signed and delivered externally.
+    """
     session_outbox.record_session_failed(
         workspace_id=0,
         session_id=SESSION_ID,
@@ -94,12 +102,37 @@ def test_record_session_failed_writes_row(store: SqlAlchemySessionLifecycleStore
     payload = json.loads(row.payload)
     assert payload["response_id"] == "resp1"
     assert payload["reason"]["code"] == "runner_error"
-    assert payload["reason"]["message"] == "turn setup failed"
+    assert payload["reason"]["message"] == "The runner reported an error."
+    assert "turn setup failed" not in row.payload
 
 
-def test_record_session_failed_truncates_long_message(
+def test_record_session_failed_unrecognized_code_falls_back_to_generic_message(
     store: SqlAlchemySessionLifecycleStore,
 ) -> None:
+    """An ``error_code`` with no entry in the safe-message map still never
+    leaks ``error_message`` — it falls back to the fully generic message,
+    not an unsafe default."""
+    session_outbox.record_session_failed(
+        workspace_id=0,
+        session_id=SESSION_ID,
+        response_id="resp1",
+        error_code="some_unmapped_future_code",
+        error_message="anything at all, even secret-shaped text",
+    )
+    row = _outbox_row_for(store, SESSION_ID, "session.failed")
+    payload = json.loads(row.payload)
+    assert payload["reason"]["code"] == "some_unmapped_future_code"
+    assert payload["reason"]["message"] == session_outbox._DEFAULT_SAFE_FAILURE_MESSAGE
+    assert "anything at all" not in row.payload
+
+
+def test_record_session_failed_message_length_never_depends_on_error_message(
+    store: SqlAlchemySessionLifecycleStore,
+) -> None:
+    """The delivered message is a fixed short safe string regardless of how
+    long (or short) ``error_message`` is — proving the fix genuinely
+    decouples the delivered payload from the raw diagnostic text's size,
+    not just its content."""
     long_message = "x" * (LABEL_VALUE_MAX_LEN + 500)
     session_outbox.record_session_failed(
         workspace_id=0,
@@ -111,37 +144,70 @@ def test_record_session_failed_truncates_long_message(
     row = _outbox_row_for(store, SESSION_ID, "session.failed")
     payload = json.loads(row.payload)
     message = payload["reason"]["message"]
-    assert len(message) == LABEL_VALUE_MAX_LEN
-    assert message.endswith("…")
+    assert message == "The runner reported an error."
     assert message != long_message
+    assert "x" * 100 not in row.payload
 
 
-def test_record_session_failed_denylist_is_key_based_not_value_based(
+def test_record_session_failed_never_leaks_secret_shaped_error_message(
     store: SqlAlchemySessionLifecycleStore,
 ) -> None:
-    """``_redact_denylist`` redacts by DICT KEY, not by scanning the value's
-    contents. Neither "code" nor "message" matches
-    ``_REDACT_KEY_SUBSTRINGS`` (token/secret/password/authorization/
-    credential/api_key/apikey), so a message that happens to CONTAIN a
-    denylisted word (e.g. "secret") passes through unredacted — this is
-    real, current behavior: the denylist here is a defensive
-    belt-and-suspenders pass on the {"code","message"} dict's own keys, not
-    the primary protection (that's the allowlist for awaiting_decision/
-    resumed payloads, tested below). Only the length clamp actually bounds
-    this path.
     """
+    Cross-vendor review P1: a message that DELIBERATELY embeds
+    secret-shaped strings (a fake API key, a bearer token, a DB connection
+    string) — the exact shape of a provider error, subprocess stderr, or a
+    runner-forwarded, structurally-unvalidated ``error`` dict — must NEVER
+    reach the persisted outbox row (and therefore never the HMAC-signed,
+    externally-delivered webhook payload). ``_redact_denylist`` alone
+    (KEY-based, not value-based) could never catch this; the fix is that
+    ``error_message`` is simply never used to build the delivered message
+    at all.
+    """
+    fake_api_key = "sk-live-abc123FAKEKEYdeadbeefCAFEBABE"
+    fake_bearer_token = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.FAKE.TOKEN"
+    fake_db_conn_string = (
+        "postgresql://admin:SuperSecretPassw0rd@internal-db.example.com:5432/prod"
+    )
+    malicious_message = (
+        f"provider error: api_key={fake_api_key} "
+        f"auth_header={fake_bearer_token} "
+        f"connection_failed to {fake_db_conn_string}"
+    )
     session_outbox.record_session_failed(
         workspace_id=0,
         session_id=SESSION_ID,
         response_id="resp1",
         error_code="runner_error",
-        error_message="leaked the secret token abc123",
+        error_message=malicious_message,
     )
     row = _outbox_row_for(store, SESSION_ID, "session.failed")
     payload = json.loads(row.payload)
-    # Confirms the real (key-based, not value-based) behavior.
-    assert payload["reason"]["message"] == "leaked the secret token abc123"
+    assert payload["reason"]["message"] == "The runner reported an error."
     assert payload["reason"]["code"] == "runner_error"
+    # None of the embedded secrets, nor any fragment of the raw message,
+    # appear anywhere in the persisted (and therefore delivered) row.
+    assert fake_api_key not in row.payload
+    assert fake_bearer_token not in row.payload
+    assert fake_db_conn_string not in row.payload
+    assert "SuperSecretPassw0rd" not in row.payload
+    assert malicious_message not in row.payload
+
+
+def test_record_session_failed_denylist_is_key_based_not_value_based(
+    store: SqlAlchemySessionLifecycleStore,
+) -> None:
+    """``_redact_denylist`` itself still redacts by DICT KEY, not by
+    scanning value contents — this is documented, narrow, defensive
+    belt-and-suspenders behavior on the ``{"code","message"}`` dict's own
+    keys. It is NOT what protects ``session.failed`` from leaking secrets
+    (that's the allowlisted safe-message map tested above); confirming
+    this narrower fact separately so a future denylist change doesn't
+    silently assume it does more than it does.
+    """
+    from omnigent.server.session_outbox import _redact_denylist
+
+    result = _redact_denylist({"code": "runner_error", "message": "leaked the secret token"})
+    assert result == {"code": "runner_error", "message": "leaked the secret token"}
 
 
 def test_record_session_failed_noop_when_unconfigured() -> None:

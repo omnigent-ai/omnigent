@@ -2894,6 +2894,28 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .values(runner_last_seen=None)
             )
 
+    def mark_runner_disconnected(self, runner_id: str, grace_deadline: int) -> None:
+        """
+        Atomically clear ``runner_last_seen`` and stamp
+        ``runner_disconnect_grace_deadline`` for sessions bound to a runner,
+        in one ``UPDATE`` / one commit. See the abstract method for why this
+        must be one write, not two.
+
+        :param runner_id: The disconnecting runner's id.
+        :param grace_deadline: Epoch seconds the reconnect grace expires at.
+        """
+        from sqlalchemy import update
+
+        with self._session("mark_runner_disconnected") as session:
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.runner_id == runner_id,
+                )
+                .values(runner_last_seen=None, runner_disconnect_grace_deadline=grace_deadline)
+            )
+
     def set_runner_disconnect_grace(self, runner_id: str, grace_deadline: int) -> None:
         """
         Stamp ``runner_disconnect_grace_deadline`` for sessions bound to a runner.
