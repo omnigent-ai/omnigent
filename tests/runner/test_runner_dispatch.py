@@ -7297,7 +7297,13 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         output = await execute_tool(
             tool_name="sys_session_create",
             arguments=json.dumps(
-                {"config_path": "helper.yaml", "title": "auth", "message": "start"}
+                {
+                    "config_path": "helper.yaml",
+                    "title": "auth",
+                    "message": "start",
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "high",
+                }
             ),
             server_client=server_client,
             conversation_id="conv_caller",
@@ -7310,7 +7316,12 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         f"expected exactly one create POST, got {len(create_requests)}"
     )
     parts = _parse_multipart_create(create_requests[0])
-    assert parts["metadata"] == {"parent_session_id": "conv_caller", "title": "auth"}
+    assert parts["metadata"] == {
+        "parent_session_id": "conv_caller",
+        "title": "auth",
+        "model_override": "gpt-5.6-luna",
+        "reasoning_effort": "high",
+    }
 
     # The uploaded bundle is a gzipped tar holding the authored config
     # verbatim — proves the local file traversed materialize → tar.
