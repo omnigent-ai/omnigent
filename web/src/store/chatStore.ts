@@ -4832,14 +4832,24 @@ export function handleSessionEvent(event: StreamEvent): void {
           // as below (named entry, then FIFO head), minus the append.
           const cleared = event.clearedPendingId;
           const at = cleared ? s.pendingUserMessages.findIndex((p) => p.tempId === cleared) : -1;
-          const dropAt = at >= 0 ? at : s.pendingUserMessages.length > 0 ? 0 : -1;
-          if (dropAt < 0) return {};
-          return {
-            pendingUserMessages: [
-              ...s.pendingUserMessages.slice(0, dropAt),
-              ...s.pendingUserMessages.slice(dropAt + 1),
-            ],
-          };
+          if (at >= 0) {
+            return {
+              pendingUserMessages: [
+                ...s.pendingUserMessages.slice(0, at),
+                ...s.pendingUserMessages.slice(at + 1),
+              ],
+            };
+          }
+          // FIFO-head fallback — same marker guard as the promote path
+          // below. A mirrored system marker (the vendor CLI's own
+          // `[Request interrupted by user]` record) is synthesized by the
+          // CLI, owns no pending entry, and arrives with clearedPendingId
+          // unset; dropping the head would steal a real queued message's
+          // bubble. Hold the head back for a marker.
+          const eventContent = userContentFromEvent(event);
+          if (eventContent !== null && isSystemUserContent(eventContent)) return {};
+          if (s.pendingUserMessages.length === 0) return {};
+          return { pendingUserMessages: s.pendingUserMessages.slice(1) };
         }
 
         // 1. Drop by id when the server names the drained entry.

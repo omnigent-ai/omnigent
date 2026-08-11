@@ -4295,6 +4295,55 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
+    it("holds the pending head back when the committed item is a mirrored interrupt marker", () => {
+      // Claude's own `[Request interrupted by user]` record owns no
+      // pending entry and arrives with clearedPendingId unset. A snapshot
+      // merge can commit it into `blocks` before its consumed event, so it
+      // lands on the committed-item branch. A genuine queued message sits
+      // at the pending head — dropping it here (the FIFO fallback without a
+      // marker guard) would make the user's in-flight bubble vanish. The
+      // marker must not steal that slot, matching the promote path below.
+      const committedMarker: AnyBlock = {
+        type: "user_message",
+        ctx: {
+          agent: null,
+          depth: 0,
+          turn: 0,
+          timestamp: 0,
+          responseId: "resp_1",
+          itemId: "msg_interrupt",
+        },
+        content: [{ type: "input_text", text: "[Request interrupted by user]" }],
+      } as unknown as AnyBlock;
+      useChatStore.setState({
+        blocks: [committedMarker],
+        pendingUserMessages: [
+          { tempId: "pend_real", content: [{ type: "input_text", text: "still sending" }] },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_interrupt",
+        itemType: "message",
+        // No clearedPendingId — the server never drains a pending entry for
+        // the CLI's synthetic interrupt record.
+        data: {
+          role: "user",
+          content: [{ type: "input_text", text: "[Request interrupted by user]" }],
+        },
+      });
+
+      const state = useChatStore.getState();
+      // The real message's optimistic bubble survives.
+      expect(state.pendingUserMessages).toEqual([
+        { tempId: "pend_real", content: [{ type: "input_text", text: "still sending" }] },
+      ]);
+      // No second copy appended — the committed marker stands alone.
+      expect(state.blocks).toHaveLength(1);
+      expect(state.blocks[0]).toBe(committedMarker);
+    });
+
     it("threads the event's createdBy onto the promoted committed block", () => {
       // Multi-user attribution: the consumed event carries the human
       // author; the promoted block's ctx.createdBy must reflect it so
