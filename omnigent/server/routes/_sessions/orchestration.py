@@ -1868,7 +1868,31 @@ async def _resolve_elicitation_durably(
         if owned_by_this_session
         else None
     )
-    outcome = await _resolve_elicitation(session_id, data, runner_router, conversation_store)
+    # Forward the PERSISTED WINNING verdict, not this call's own `data`.
+    # record_decision is idempotent per elicitation_id (see the store's
+    # row-locked read-then-write): whichever call actually wrote first
+    # "wins", and every later call for the same id — including THIS one,
+    # if it lost a race against a conflicting concurrent verdict — gets
+    # back a row already carrying the winner's decision_payload, not its
+    # own. Forwarding the raw request `data` here instead would let a
+    # losing racing callback make the live runner/harness consume ITS
+    # verdict while the durable ledger correctly kept the actual winner's
+    # — a truthfulness split between the live action and the source of
+    # record. Only forward raw `data` when there's no durable row to defer
+    # to at all (decision_record is None: untracked/cross-session id),
+    # preserving the exact pre-OMN-104 no-op contract for that case.
+    if decision_record is not None:
+        winning_decision = (
+            json.loads(decision_record.decision_payload)
+            if decision_record.decision_payload
+            else {}
+        )
+        forward_data = {"elicitation_id": elicitation_id, **winning_decision}
+    else:
+        forward_data = data
+    outcome = await _resolve_elicitation(
+        session_id, forward_data, runner_router, conversation_store
+    )
     if decision_record is None:
         # No durable OMN-104 ledger row for this id — either the feature
         # isn't wired, or (the common case for these shared entry points)
