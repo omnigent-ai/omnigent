@@ -3623,7 +3623,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
           </MessageContent>
         </div>
-        <div className="mt-0.5 flex items-center gap-2 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+        <div className="mt-0.5 flex items-center justify-end gap-2 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
           {(() => {
             const ts = formatBubbleTimestamp(bubble.createdAtS);
             return ts ? (
