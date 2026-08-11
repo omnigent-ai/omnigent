@@ -279,8 +279,16 @@ def test_copilot_install_command_prefers_uv(monkeypatch: pytest.MonkeyPatch) -> 
     """With ``uv`` on PATH, the install runs ``uv pip install`` — no index URL."""
     monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
     monkeypatch.setattr(extra_install.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(extra_install.sys, "executable", "/opt/venv/bin/python")
     cmd = copilot_install_command()
-    assert cmd == ["uv", "pip", "install", "omnigent[copilot]"]
+    assert cmd == [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        "/opt/venv/bin/python",
+        "omnigent[copilot]",
+    ]
     assert not any("index" in part or "://" in part for part in cmd)
 
 

@@ -198,8 +198,16 @@ def test_cursor_install_command_prefers_uv(monkeypatch: pytest.MonkeyPatch) -> N
     """With ``uv`` on PATH, the install runs ``uv pip install`` — no index URL."""
     monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
     monkeypatch.setattr(extra_install.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(extra_install.sys, "executable", "/opt/venv/bin/python")
     cmd = cursor_install_command()
-    assert cmd == ["uv", "pip", "install", "omnigent[cursor]"]
+    assert cmd == [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        "/opt/venv/bin/python",
+        "omnigent[cursor]",
+    ]
     assert not any("index" in part or "://" in part for part in cmd)
 
 
