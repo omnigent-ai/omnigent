@@ -465,40 +465,47 @@ def test_disk_build_stamp_reads_the_on_disk_file(tmp_path, content, expected) ->
     assert _disk_build_stamp(package_dir=tmp_path) == expected
 
 
-def _dispatch_fork_harness(
-    server: _ZygoteServer, conn: socket.socket, peer: socket.socket
+def _dispatch_fork(
+    server: _ZygoteServer, conn: socket.socket, peer: socket.socket, cmd: str
 ) -> dict:
-    """Dispatch one in-process ``fork_harness`` request and return the reply.
+    """Dispatch one in-process fork request and return the reply.
 
     :param server: The server under test.
     :param conn: The socket end handed to the dispatcher.
     :param peer: The other end, read for the reply.
+    :param cmd: ``"fork"`` (runner) or ``"fork_harness"``.
     :returns: The decoded reply.
     """
-    request = {"cmd": "fork_harness", "argv": [], "env": {}}
+    request = {"cmd": cmd, "argv": [], "env": {}}
     server._dispatch(conn, json.dumps(request).encode("utf-8"))
     return json.loads(peer.recv(65536).decode("utf-8"))
 
 
-def test_fork_harness_refused_after_in_place_upgrade(monkeypatch) -> None:
-    """A disk stamp differing from the boot stamp refuses the harness fork.
+@pytest.mark.parametrize(("cmd", "kind"), [("fork", "runner"), ("fork_harness", "harness")])
+def test_fork_refused_after_in_place_upgrade(monkeypatch, cmd, kind) -> None:
+    """A disk stamp differing from the boot stamp refuses the fork.
 
-    A forked child would import the harness module from the NEW on-disk files
-    against the OLD pre-imported graph — e.g. ``from omnigent.inner.executor
-    import describe_exception`` failing because the in-memory module predates
-    the symbol. The refusal makes the runner fall back to a direct exec, which
-    runs the new code coherently.
+    The child resolves its lazily-imported modules from the NEW on-disk files
+    against the OLD pre-imported graph. Both observed failures are this: a
+    harness missing ``describe_exception`` from an in-memory
+    ``omnigent.inner.executor`` that predates it, and a runner whose
+    ``create_app`` cannot import ``omnigent.cli_auth`` from the swapped-out
+    package directory. Refusing makes the caller fall back to a fresh
+    interpreter, which runs the new code coherently.
 
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param cmd: The fork command under test.
+    :param kind: Child kind the error message must name.
     """
     daemon, daemon_peer = socket.socketpair()
     conn, peer = socket.socketpair()
     server = _ZygoteServer(daemon, graph_stamp=(1000.0, "oldsha"))
     monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (2000.0, "newsha"))
-    monkeypatch.setattr(os, "fork", lambda: pytest.fail("must not fork a mixed-version harness"))
+    monkeypatch.setattr(os, "fork", lambda: pytest.fail(f"must not fork a mixed-version {kind}"))
     try:
-        reply = _dispatch_fork_harness(server, conn, peer)
+        reply = _dispatch_fork(server, conn, peer, cmd)
         assert "upgraded on disk" in reply["error"]
+        assert kind in reply["error"]
         assert server._live == set()
     finally:
         server._sel.close()
@@ -506,13 +513,15 @@ def test_fork_harness_refused_after_in_place_upgrade(monkeypatch) -> None:
             sock.close()
 
 
-def test_fork_harness_proceeds_while_disk_stamp_matches(monkeypatch) -> None:
+@pytest.mark.parametrize("cmd", ["fork", "fork_harness"])
+def test_fork_proceeds_while_disk_stamp_matches(monkeypatch, cmd) -> None:
     """An unchanged disk stamp forks exactly as before the gate existed.
 
     ``os.fork`` is faked to a pid so the assertion is purely about the gate
     letting the request through to the fork path.
 
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param cmd: The fork command under test.
     """
     daemon, daemon_peer = socket.socketpair()
     conn, peer = socket.socketpair()
@@ -520,7 +529,7 @@ def test_fork_harness_proceeds_while_disk_stamp_matches(monkeypatch) -> None:
     monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (1000.0, "sha"))
     monkeypatch.setattr(os, "fork", lambda: 4242)
     try:
-        reply = _dispatch_fork_harness(server, conn, peer)
+        reply = _dispatch_fork(server, conn, peer, cmd)
         assert reply == {"pid": 4242}
         assert 4242 in server._live
     finally:

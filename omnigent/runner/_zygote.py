@@ -300,10 +300,10 @@ class _ZygoteServer:
     :param control_sock: The daemon control socket (role ``"daemon"``).
     :param graph_stamp: The on-disk build stamp captured when the zygote
         imported its graph, or ``None`` when unknown (unbuilt checkout).
-        Harness forks are refused once the on-disk stamp no longer matches:
-        the child would import the lazily-loaded harness modules from the
-        *new* files against the *old* pre-imported graph, breaking on any
-        cross-version import (e.g. a name added to a preloaded module).
+        Both runner and harness forks are refused once the on-disk stamp no
+        longer matches: the child would resolve its lazily-imported modules
+        from the *new* files against the *old* pre-imported graph, breaking
+        on any cross-version import.
     """
 
     def __init__(
@@ -489,12 +489,42 @@ class _ZygoteServer:
             with contextlib.suppress(OSError):
                 sock.close()
 
+    def _refuse_if_upgraded(self, conn: socket.socket, kind: str) -> bool:
+        """Answer with an error when the package changed under this zygote.
+
+        A forked child inherits the graph imported at boot but resolves every
+        lazily-imported module from disk. Once an in-place upgrade rewrites the
+        package, those two disagree — the child either misses a name its old
+        in-memory modules gained, or fails to import a module the swapped-out
+        directory no longer offers. Both callers' fallbacks re-launch through a
+        fresh interpreter, which reads everything from disk coherently.
+
+        :param conn: The socket to answer on.
+        :param kind: Child being forked (``"runner"`` / ``"harness"``), named
+            in the error so operator logs say which launch fell back.
+        :returns: ``True`` when the request was refused (caller must return).
+        """
+        if self._graph_stamp is None or _disk_build_stamp() == self._graph_stamp:
+            return False
+        _send(
+            conn,
+            {
+                "error": (
+                    "omnigent was upgraded on disk after the zygote imported its "
+                    f"graph; refusing to fork a mixed-version {kind}"
+                )
+            },
+        )
+        return True
+
     def _handle_fork(self, conn: socket.socket, request: dict[str, Any]) -> None:
         """Fork a runner, giving it its own control socket back to the zygote.
 
         :param conn: The daemon socket to answer on.
         :param request: The ``fork`` request (``env`` + optional ``log_path``).
         """
+        if self._refuse_if_upgraded(conn, "runner"):
+            return
         try:
             z_end, r_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         except OSError as exc:
@@ -530,22 +560,7 @@ class _ZygoteServer:
         :param conn: The runner socket to answer on.
         :param request: The ``fork_harness`` request (``argv`` + ``env``).
         """
-        if self._graph_stamp is not None and _disk_build_stamp() != self._graph_stamp:
-            # An in-place upgrade rewrote the package after this zygote
-            # imported its graph. A forked child would import the harness
-            # module from the new files against the old in-memory graph —
-            # a mixed-version process that fails on any new cross-module
-            # import. Refuse; the runner falls back to a direct exec, which
-            # runs the new code coherently.
-            _send(
-                conn,
-                {
-                    "error": (
-                        "omnigent was upgraded on disk after the zygote imported "
-                        "its graph; refusing to fork a mixed-version harness"
-                    )
-                },
-            )
+        if self._refuse_if_upgraded(conn, "harness"):
             return
         try:
             pid = os.fork()

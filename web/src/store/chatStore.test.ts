@@ -4217,6 +4217,84 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
+    it("clears the pending echo without re-appending when the committed item already rendered", () => {
+      // Native-terminal race: the forwarder-mirrored user item reached
+      // `blocks` (via the stream or a snapshot merge) BEFORE this
+      // consumed event. Pre-fix, the handler bailed on the committed-item
+      // guard without dropping the optimistic bubble, stranding a
+      // duplicate user bubble at the transcript tail forever.
+      const committed: AnyBlock = {
+        type: "user_message",
+        ctx: {
+          agent: null,
+          depth: 0,
+          turn: 0,
+          timestamp: 0,
+          responseId: "resp_1",
+          itemId: "msg_already_committed",
+        },
+        content: [{ type: "input_text", text: "hello" }],
+      } as unknown as AnyBlock;
+      useChatStore.setState({
+        blocks: [committed],
+        pendingUserMessages: [
+          { tempId: "pend_1", content: [{ type: "input_text", text: "hello" }], posted: true },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_already_committed",
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "hello" }] },
+      });
+
+      const state = useChatStore.getState();
+      // No second copy appended — the committed block stands alone.
+      expect(state.blocks).toHaveLength(1);
+      expect(state.blocks[0]).toBe(committed);
+      // And the optimistic echo is acked away, not stranded.
+      expect(state.pendingUserMessages).toEqual([]);
+    });
+
+    it("drops the exact named pending entry when the committed item already rendered", () => {
+      // Same race, but the server names the drained entry via
+      // clearedPendingId — the precise match must win over FIFO.
+      const committed: AnyBlock = {
+        type: "user_message",
+        ctx: {
+          agent: null,
+          depth: 0,
+          turn: 0,
+          timestamp: 0,
+          responseId: "resp_1",
+          itemId: "msg_committed_2",
+        },
+        content: [{ type: "input_text", text: "second" }],
+      } as unknown as AnyBlock;
+      useChatStore.setState({
+        blocks: [committed],
+        pendingUserMessages: [
+          { tempId: "pend_a", content: [{ type: "input_text", text: "first" }] },
+          { tempId: "pend_b", content: [{ type: "input_text", text: "second" }] },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_committed_2",
+        itemType: "message",
+        clearedPendingId: "pend_b",
+        data: { role: "user", content: [{ type: "input_text", text: "second" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.blocks).toHaveLength(1);
+      expect(state.pendingUserMessages).toEqual([
+        { tempId: "pend_a", content: [{ type: "input_text", text: "first" }] },
+      ]);
+    });
+
     it("threads the event's createdBy onto the promoted committed block", () => {
       // Multi-user attribution: the consumed event carries the human
       // author; the promoted block's ctx.createdBy must reflect it so
@@ -7719,6 +7797,59 @@ describe("chatStore — live delta streaming (claude-native)", () => {
       .blocks.filter((b): b is Extract<AnyBlock, { type: "text_done" }> => b.type === "text_done");
     expect(dones).toHaveLength(1);
     expect(dones[0]!.ctx.itemId).toBe("ci_1");
+    expect(dones[0]!.fullText).toBe("Hello world");
+
+    controller.abort();
+  });
+
+  it("retires the provisional preview when the authoritative item was already committed", async () => {
+    // Race: a snapshot merge (reconnect/rebind) inserts the real
+    // assistant item into `blocks` while its `live:*` preview is still
+    // on screen. When the authoritative output_item.done then arrives on
+    // the stream, the generic item-id dedup skips it — pre-fix, the
+    // replacement path never ran and BOTH the real item and the preview
+    // stayed rendered (duplicate assistant text, preview at the tail).
+    useChatStore.setState({
+      conversationId: "conv_live3",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller } = startPump("conv_live3");
+
+    sink.push(sse("response.created", { id: "resp_l", status: "in_progress", output: [] }));
+    sink.push(nativeDelta("m1", 0, "Hello world", true));
+    await tick();
+    expect(provisional()?.ctx.itemId).toBe("live:m1");
+
+    // Snapshot merge lands the committed copy while the preview renders.
+    useChatStore.setState((s) => ({
+      blocks: [
+        ...s.blocks,
+        {
+          type: "text_done",
+          ctx: {
+            agent: null,
+            depth: 0,
+            turn: 0,
+            timestamp: 0,
+            responseId: "resp_l",
+            itemId: "ci_1",
+          },
+          fullText: "Hello world",
+          hasCodeBlocks: false,
+        },
+      ],
+    }));
+
+    sink.push(messageDone("ci_1", "resp_l", "Hello world"));
+    await tick();
+
+    // Exactly one rendering: the committed item. The preview is retired.
+    expect(provisional()).toBeUndefined();
+    const dones = useChatStore
+      .getState()
+      .blocks.filter((b): b is Extract<AnyBlock, { type: "text_done" }> => b.type === "text_done");
+    expect(dones.map((b) => b.ctx.itemId)).toEqual(["ci_1"]);
     expect(dones[0]!.fullText).toBe("Hello world");
 
     controller.abort();

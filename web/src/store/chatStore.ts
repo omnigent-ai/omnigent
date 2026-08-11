@@ -3936,6 +3936,35 @@ export async function pumpStreamEvents(
         continue;
       }
 
+      // Native preview cleanup must run before the generic dedup below:
+      // when a snapshot merge (reconnect/rebind) inserted this
+      // authoritative item while its `live:*` preview was still on
+      // screen, the dedup alone would drop the event and strand the
+      // preview as a trailing duplicate of the assistant text. Remove
+      // the oldest preview and retire its message id, then fall through
+      // so the dedup skips the event as before.
+      if (
+        block.type === "text_done" &&
+        block.ctx.itemId &&
+        get().isNativeTerminalSession &&
+        (seenItemIds.has(block.ctx.itemId) ||
+          get().blocks.some((b) => b.ctx.itemId === block.ctx.itemId))
+      ) {
+        const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
+        if (provIdx !== -1) {
+          const provItemId = get().blocks[provIdx]!.ctx.itemId!;
+          retiredLiveMessages.add(provItemId.slice(LIVE_ITEM_PREFIX.length));
+          flush();
+          set((s) => {
+            const at = s.blocks.findIndex(isLiveProvisionalBlock);
+            if (at === -1) return {};
+            const next = s.blocks.slice();
+            next.splice(at, 1);
+            return { blocks: next };
+          });
+        }
+      }
+
       // Stream → snapshot dedup: skip if this itemId is already committed
       // or sitting unflushed in the buffer, so the renderer sees one copy.
       if (block.ctx.itemId) {
@@ -4794,7 +4823,24 @@ export function handleSessionEvent(event: StreamEvent): void {
       //      committed bubble (TUI-typed message, marker, or another
       //      client).
       useChatStore.setState((s) => {
-        if (hasCommittedItem(s.blocks, event.itemId)) return {};
+        if (hasCommittedItem(s.blocks, event.itemId)) {
+          // The committed copy is already in `blocks` — the forwarder-
+          // mirrored item beat this event through the stream, or a
+          // snapshot merge inserted it. Still ack the optimistic
+          // bubble: returning without dropping it strands a duplicate
+          // user bubble at the transcript tail. Same precision order
+          // as below (named entry, then FIFO head), minus the append.
+          const cleared = event.clearedPendingId;
+          const at = cleared ? s.pendingUserMessages.findIndex((p) => p.tempId === cleared) : -1;
+          const dropAt = at >= 0 ? at : s.pendingUserMessages.length > 0 ? 0 : -1;
+          if (dropAt < 0) return {};
+          return {
+            pendingUserMessages: [
+              ...s.pendingUserMessages.slice(0, dropAt),
+              ...s.pendingUserMessages.slice(dropAt + 1),
+            ],
+          };
+        }
 
         // 1. Drop by id when the server names the drained entry.
         const cleared = event.clearedPendingId;
