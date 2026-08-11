@@ -86,11 +86,10 @@ export function findPmRangeForComment(
  *
  * When the text cannot be found verbatim in the raw file (e.g. multi-line
  * selections, table cells, or code blocks whose markdown syntax the parser
- * strips), falls back to proportionally scaled indices so the button is never
- * blocked.  The anchor_content from the PM doc is still used for re-locating
- * the highlight later via findPmRangeForComment.
+ * strips), returns null. Persisting proportionally scaled indices would mix
+ * rendered anchor text with an unrelated raw-source range.
  *
- * Returns null only when the selection contains no text.
+ * Returns null when the selection contains no text or has no exact raw match.
  */
 export function computeSelectionData(
   from: number,
@@ -114,15 +113,7 @@ export function computeSelectionData(
     idx = rawContent.indexOf(anchor_content);
   }
 
-  // Fall back to proportional indices when the anchor text isn't found
-  // verbatim (multi-line, table, code block selections).
-  if (idx === -1) {
-    return {
-      start_index: hint,
-      end_index: hint + anchor_content.length,
-      anchor_content,
-    };
-  }
+  if (idx === -1) return null;
 
   return {
     start_index: idx,
