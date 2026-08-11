@@ -42,6 +42,10 @@ _SELECTABLE_TEXT = "Welcome to the editor."
 # include the ``## `` prefix when selecting text from a heading node.
 _HEADING_TEXT = "Editor Section Heading"
 
+# Selecting this whole rendered paragraph produces text that does not exist
+# verbatim in the raw Markdown because the emphasis markers sit in the middle.
+_FORMATTED_PARAGRAPH_TEXT = "This paragraph has formatted words inside."
+
 # Full markdown body — a heading followed by the selectable paragraph.
 _MARKDOWN_CONTENT = f"""\
 # Editor Comment Test
@@ -49,6 +53,8 @@ _MARKDOWN_CONTENT = f"""\
 ## {_HEADING_TEXT}
 
 {_SELECTABLE_TEXT}
+
+This paragraph has **formatted words** inside.
 
 This is another paragraph with some text.
 """
@@ -323,3 +329,41 @@ def test_heading_text_anchor_content_excludes_prefix(
         f"stored start_index={stored_idx} is more than 200 chars from "
         f"raw markdown position {raw_idx} for anchor {anchor!r}"
     )
+
+
+def test_inexact_rendered_selection_cannot_create_comment(
+    page: Page,
+    seeded_markdown_session: tuple[str, str, str],
+) -> None:
+    """Do not offer comment creation when rendered text has no exact raw range.
+
+    The paragraph renders without the Markdown emphasis markers, so its full
+    rendered text does not occur verbatim in the raw source. Persisting an
+    approximate range would silently anchor the comment to different text.
+    """
+    base_url, session_id, _ = seeded_markdown_session
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+
+    file_button = page.get_by_role(
+        "button", name=re.compile(re.escape(_MARKDOWN_FILE_PATH))
+    ).filter(has_text=_MARKDOWN_FILE_PATH)
+    expect(file_button).to_be_visible(timeout=30_000)
+    file_button.click()
+
+    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
+    editor_content = file_viewer.locator("[contenteditable='true']")
+    expect(editor_content).to_be_visible(timeout=10_000)
+
+    formatted_paragraph = editor_content.get_by_text(
+        _FORMATTED_PARAGRAPH_TEXT,
+        exact=True,
+    )
+    expect(formatted_paragraph).to_be_visible()
+    formatted_paragraph.select_text()
+
+    add_comment_btn = page.get_by_role(
+        "button",
+        name=re.compile("Add comment", re.IGNORECASE),
+    )
+    expect(add_comment_btn).not_to_be_visible()
