@@ -289,7 +289,8 @@ export function AppShell() {
   // Skips the first persist run so mount can't write default state over the
   // values the restore effect is about to apply.
   const workspacePersistHydrated = useRef(false);
-  const [filesPanelShowHidden, setFilesPanelShowHidden] = useState(false);
+  // Hidden (dot-prefixed) files are shown by default; the eye toggle hides them.
+  const [filesPanelShowHidden, setFilesPanelShowHidden] = useState(true);
   // Lifted so the Changes list order and the FileViewer prev/next order
   // share one source of truth (otherwise the "X/N" index won't match the
   // list position). Default "recent" mirrors the prior FilesPanel default.
@@ -764,7 +765,7 @@ export function AppShell() {
     setSubagentsPanelOpen(false);
     setShellsPanelOpen(false);
     setTodosPanelOpen(false);
-    setFilesPanelShowHidden(false);
+    setFilesPanelShowHidden(true);
     if (!conversationId) {
       // No session → no rail; false (not the open default) so rail-gated
       // effects stay quiet on non-session routes.

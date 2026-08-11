@@ -308,6 +308,23 @@ describe("FilesPanel working folder header role", () => {
   });
 });
 
+describe("FilesPanel hidden-files toggle icon", () => {
+  // The eye reflects the current state, not the pending action: a plain eye
+  // means hidden files are visible, a slashed eye means they are filtered out.
+  it("shows a plain eye while hidden files are visible", () => {
+    renderPanel({ conversationId: "conv_eye_on", files: [], showHidden: true });
+    const toggle = screen.getByRole("button", { name: "Hide hidden files" });
+    expect(toggle.querySelector(".lucide-eye")).not.toBeNull();
+    expect(toggle.querySelector(".lucide-eye-off")).toBeNull();
+  });
+
+  it("shows a slashed eye while hidden files are filtered out", () => {
+    renderPanel({ conversationId: "conv_eye_off", files: [], showHidden: false });
+    const toggle = screen.getByRole("button", { name: "Show hidden files" });
+    expect(toggle.querySelector(".lucide-eye-off")).not.toBeNull();
+  });
+});
+
 describe("FilesPanel scope (fixed by the caller's Files/Changes tab)", () => {
   it("does not enable the root filesystem listing while showing Changed files", () => {
     renderPanel({

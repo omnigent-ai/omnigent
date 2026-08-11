@@ -85,11 +85,17 @@ vi.mock("./FilesPanel", () => ({
   FilesPanel: ({
     onFileSelect,
     flatView,
+    showHidden,
   }: {
     onFileSelect: (path: string) => void;
     flatView: boolean;
+    showHidden: boolean;
   }) => (
-    <div data-testid="files-panel" data-flat-view={String(flatView)}>
+    <div
+      data-testid="files-panel"
+      data-flat-view={String(flatView)}
+      data-show-hidden={String(showHidden)}
+    >
       <button
         type="button"
         aria-label="files: select README.md"
@@ -2019,6 +2025,39 @@ describe("FilesPanel visibility", () => {
 
     expect(screen.queryByTestId("files-panel")).toBeNull();
     expect(screen.queryByTestId("files-panel-drawer")).toBeNull();
+  });
+
+  it("shows hidden files by default, on load and after a session switch", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_abc", permission_level: null },
+      { id: "conv_xyz", permission_level: null },
+    ]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_abc"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route path="c/:conversationId" element={<SessionNavButton to="/c/conv_xyz" />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-show-hidden", "true");
+
+    // The conversation-switch reset must land on the same default, otherwise
+    // dotfiles would disappear the moment the user moves between sessions.
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-show-hidden", "true");
   });
 });
 

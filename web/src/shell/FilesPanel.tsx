@@ -114,7 +114,9 @@ function HiddenFilesToggle({
             )}
             onClick={onToggle}
           >
-            {showHidden ? <EyeOffIcon className={iconSize} /> : <EyeIcon className={iconSize} />}
+            {/* The icon shows the current state, not the action: a plain eye
+                means hidden files are visible, a slashed eye means they are not. */}
+            {showHidden ? <EyeIcon className={iconSize} /> : <EyeOffIcon className={iconSize} />}
           </button>
         </TooltipTrigger>
         <TooltipContent side="bottom">{tooltipLabel}</TooltipContent>
