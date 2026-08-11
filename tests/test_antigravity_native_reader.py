@@ -1693,6 +1693,83 @@ async def test_stream_done_closes_the_live_block_with_a_final_delta(
 
 
 @pytest.mark.asyncio
+async def test_a_transient_shrink_does_not_duplicate_text_or_strand_the_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A rewrite that shrinks and then RE-GROWS still streams the answer exactly.
+
+    The prefix tracker is the reader's record of what it already put on the wire,
+    and the closing delta computes its suffix from it. Re-anchoring it on a frame
+    that emitted NOTHING breaks that: the tracker moves to text the server never
+    received, so the next real delta is cut from the wrong offset and repeats the
+    overlap — the live block renders duplicated text, and the joined deltas no
+    longer equal the committed message, which is one of the server's two
+    retirement conditions, so the preview is replayed to every later subscriber.
+
+    Companion to the shrink-to-a-non-prefix case below: that one the producer
+    cannot fully close (published deltas cannot be unsent), this one it can — the
+    text re-grows past what was sent, so tracking sent-so-far is exactly enough.
+    """
+    from omnigent.runtime import inflight_text
+
+    full = "The plan is complete."
+    frames = [
+        _frame([_generating_planner("The plan is ")]),
+        # Moderation momentarily replaces the partial with a SHORTER one, then
+        # the answer grows past it again.
+        _frame([_generating_planner("The plan ")]),
+        _frame([_generating_planner(full)]),
+        _frame([_done_planner(full)]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    streamed = "".join(cast(str, d["delta"]) for d in sink.deltas())
+    assert streamed == full, (
+        f"the streamed text must equal the committed answer, not repeat an "
+        f"overlap; got {streamed!r}"
+    )
+
+    inflight_text.reset_for_tests()
+    conv = "conv_transient_shrink"
+    for event_type, data in sink.posts:
+        if event_type == "external_output_text_delta":
+            inflight_text.record_publish(conv, {"type": "response.output_text.delta", **data})
+        elif event_type == "external_conversation_item":
+            item = cast(dict[str, Any], data.get("item_data") or {})
+            if item.get("role") == "assistant":
+                inflight_text.record_publish(
+                    conv,
+                    {
+                        "type": "response.output_item.done",
+                        "item": {
+                            "id": "ap_1",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": item.get("content"),
+                        },
+                    },
+                )
+
+    leftover = [
+        s
+        for s in inflight_text.snapshot_for(conv)
+        if s.get("type") == "response.output_text.delta"
+    ]
+    assert leftover == [], f"stale text would be replayed to the next subscriber: {leftover}"
+
+
+@pytest.mark.asyncio
 async def test_a_shrinking_rewrite_mid_stream_still_closes_the_live_block(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3059,14 +3136,105 @@ def test_turn_close_true_for_error_planner() -> None:
     assert reader._is_turn_close_step(error_planner) is True
 
 
-def test_turn_close_true_for_done_planner_no_text_no_tools() -> None:
-    """A DONE planner with neither text nor tool calls is a degenerate close."""
+@pytest.mark.asyncio
+async def test_a_streamed_tool_turn_stays_running_until_the_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """
+    REGRESSION: the spinner must not clear when agy dispatches a tool.
+
+    The whole streamed turn, in the live order: the user's prompt, the planner
+    that dispatches a tool, the tool's result, then the answering planner. IDLE
+    belongs at the END of that sequence — one edge, after the answer.
+
+    The predicate test below pins the cause; this pins the symptom the user
+    actually saw, which is what the suite was missing: the dispatching planner
+    fired IDLE, so the session showed idle while its tools kept running, and
+    RUNNING could not re-open (it is gated on USER_INPUT).
+    """
+    sink = _PostSink()
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(
+            [
+                _frame([_load("user_input")]),
+                _frame([_load("stream_planner_tool_call")]),
+                _frame([_load("stream_run_command_done")]),
+                _frame([_load("stream_planner_text_done")]),
+            ]
+        ),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    assert sink.statuses() == ["running", "idle"], (
+        f"the turn must open once and close once; got {sink.statuses()}"
+    )
+    # WHERE the idle edge lands is the whole point — the count alone is
+    # identical whether it fires at dispatch or after the answer, because the
+    # second close is deduped by ``turn_active``. Assert its position.
+    timeline = [
+        f"status:{data['status']}"
+        if event_type == "external_session_status"
+        else f"item:{data.get('item_type')}"
+        for event_type, data in sink.posts
+        if event_type in ("external_session_status", "external_conversation_item")
+    ]
+    assert timeline.index("status:idle") > timeline.index("item:function_call_output"), (
+        f"IDLE fired before the tool finished — the spinner cleared mid-turn: {timeline}"
+    )
+
+
+def test_turn_close_false_for_streamed_planner_that_dispatched_a_tool() -> None:
+    """
+    REGRESSION: a STREAMED tool dispatch must not fire the IDLE edge.
+
+    The stream projection strips ``plannerResponse.toolCalls`` (the premise of
+    this whole mapper rewrite), so a dispatching planner arrives DONE with
+    neither tool calls nor text. Keying "did this dispatch?" on ``toolCalls``
+    therefore read it as a degenerate close and fired IDLE the moment agy called
+    a tool: the spinner cleared mid-turn and RUNNING could not re-open (it is
+    gated on USER_INPUT), so the session read idle while the tools still ran.
+
+    Uses the verbatim live stream frame rather than a hand-built dict — the
+    hand-built poll shape below is exactly what let the bug through.
+    """
+    dispatched = _load("stream_planner_tool_call")
+    # Pin the premise, so this test fails loudly if a future capture regains the
+    # field rather than silently passing for the wrong reason.
+    assert "toolCalls" not in dispatched["plannerResponse"], (
+        "fixture no longer models the stripped stream projection"
+    )
+    assert reader._is_turn_close_step(dispatched) is False
+
+
+def test_turn_close_true_for_streamed_planner_that_answered() -> None:
+    """The streamed ANSWER still closes the turn — text is the close signal."""
+    answered = _load("stream_planner_text_done")
+    assert reader._is_turn_close_step(answered) is True
+
+
+def test_turn_close_false_for_done_planner_no_text_no_tools() -> None:
+    """
+    A DONE planner with neither text nor tool calls does NOT close the turn.
+
+    This shape is byte-identical to a streamed tool dispatch, so it cannot be
+    read as a close without stranding every streamed tool turn (see above). A
+    genuinely degenerate turn is instead reconciled by the idle backstop
+    (``_close_turn_if_stranded``), which closes on agy's OWN cascade status —
+    authoritative where this shape is ambiguous, at the cost of one detector
+    interval.
+    """
     empty_done = {
         "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
         "status": "CORTEX_STEP_STATUS_DONE",
         "plannerResponse": {},
     }
-    assert reader._is_turn_close_step(empty_done) is True
+    assert reader._is_turn_close_step(empty_done) is False
 
 
 def test_turn_close_false_for_done_planner_with_tool_calls() -> None:

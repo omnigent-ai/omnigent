@@ -126,6 +126,7 @@ export const NATIVE_CODING_AGENTS = [
     agentName: "antigravity-native-ui",
     harness: "antigravity-native",
     wrapperLabel: "antigravity-native-ui",
+    subagentWrapperLabel: "antigravity-native-ui-subagent",
     displayName: "Antigravity",
     iconKind: "antigravity",
     sortRank: 45,

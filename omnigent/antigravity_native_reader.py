@@ -628,10 +628,15 @@ def _is_assistant_text_close_step(step: dict[str, object]) -> bool:
 
     The RPC equivalent of the transcript forwarder's
     :func:`_is_assistant_text_step`: a PLANNER_RESPONSE that carries assistant
-    text (``modifiedResponse`` or ``response``) and issues NO tool calls is the
-    closing edge of a turn — agy answered and stopped. A planner step that only
-    invokes a tool does not close the turn (the tool result, and possibly more
-    planner steps, follow).
+    text (``modifiedResponse`` or ``response``) is the closing edge of a turn —
+    agy answered and stopped. A planner step that only invokes a tool does not
+    close the turn (the tool result, and possibly more planner steps, follow).
+
+    The TEXT is what separates the two: a dispatching planner carries none, in
+    either RPC shape. The ``toolCalls`` test below is a poll-shape-only
+    belt-and-braces guard for a planner that somehow carried both — it cannot
+    fire on the stream, where the field is stripped (see
+    :func:`_is_turn_close_step`).
 
     :param step: One RPC step dict.
     :returns: ``True`` when the step is a DONE PLANNER_RESPONSE with non-empty
@@ -661,23 +666,31 @@ def _is_turn_close_step(step: dict[str, object]) -> bool:
     """
     Return whether a step ends the current turn (fire the IDLE edge).
 
-    A turn opens on USER_INPUT and stays open until agy stops working. The
-    canonical close is a DONE PLANNER_RESPONSE that carries assistant text and
-    dispatches no further tool calls (:func:`_is_assistant_text_close_step`).
-    But a turn can also END without that clean closing text step, and those
-    paths must fire IDLE too — otherwise ``turn_active`` sticks True forever:
-    the spinner never clears AND the next turn's USER_INPUT can't re-open
-    RUNNING (it is gated on ``not turn_active``). The additional closes:
+    A turn opens on USER_INPUT and stays open until agy stops working. Exactly
+    two steps close it:
 
+    * a DONE PLANNER_RESPONSE carrying assistant text
+      (:func:`_is_assistant_text_close_step`) — agy answered and stopped; and
     * a terminal-ERROR PLANNER_RESPONSE — agy's model step failed, so no tool
-      result or recovery planner follows; and
-    * a DONE PLANNER_RESPONSE that dispatches no tool call and carries no usable
-      text — a degenerate end with nothing more to do.
+      result or recovery planner follows.
 
-    A PLANNER_RESPONSE that DOES dispatch a tool call is never a close: the tool
-    result (and possibly more planner steps) follow. Non-planner steps never
-    close a turn here (a tool result is followed by a recovery/answer planner;
-    closing on it would pre-empt that planner).
+    **Assistant text is the close signal, not the absence of ``toolCalls``.**
+    Text is the one discriminator that holds in BOTH RPC shapes: a planner that
+    dispatches a tool carries no text on the poll shape *or* the stream shape,
+    while an answering planner carries text on both. ``toolCalls`` exists only
+    on the poll shape (the stream strips it, as does ``metadata.toolCall``), so
+    a "closes unless it dispatched" rule read a STREAMED dispatch — DONE, no
+    toolCalls, no text — as a degenerate close and fired IDLE the moment agy
+    called a tool, clearing the spinner for the rest of the turn.
+
+    A DONE planner with neither text nor a dispatch is therefore NOT treated as
+    a close: that shape is indistinguishable from a streamed dispatch, and
+    guessing wrong strands every streamed tool turn. The genuinely degenerate
+    turn is reconciled by the idle backstop (``_close_turn_if_stranded``), which
+    closes on agy's own cascade status one detector interval later.
+
+    Non-planner steps never close a turn here (a tool result is followed by a
+    recovery/answer planner; closing on it would pre-empt that planner).
 
     :param step: One RPC step dict.
     :returns: ``True`` when this step ends the turn.
@@ -686,15 +699,7 @@ def _is_turn_close_step(step: dict[str, object]) -> bool:
         return True
     if step.get("type") != _TYPE_PLANNER_RESPONSE:
         return False
-    status = step.get("status")
-    if status == _STATUS_ERROR:
-        return True
-    if status != _STATUS_DONE:
-        return False
-    # A DONE planner that dispatches a tool call is a continuation, not a close.
-    planner = step.get("plannerResponse")
-    tool_calls = planner.get("toolCalls") if isinstance(planner, dict) else None
-    return not (isinstance(tool_calls, list) and tool_calls)
+    return step.get("status") == _STATUS_ERROR
 
 
 def _status_event(status: str) -> OutboundEvent:
@@ -1216,10 +1221,12 @@ class _ReaderState:
         post nothing.
     :param interacted: Identities whose WAITING interaction was already handed to
         the bridge, so a re-sent WAITING frame does not re-fire it.
-    :param prefixes: Per-PLANNER ``step_index`` → the length of ``modifiedResponse``
-        already forwarded as deltas, so each frame emits only the NEW suffix.
-        Cleared for a step when its committed ``message`` is posted (stream path
-        only; the poll path never populates it).
+    :param prefixes: Per-PLANNER ``step_index`` → the ``modifiedResponse`` text
+        actually SENT as deltas so far, so each frame emits only the NEW suffix.
+        Advanced only when a delta goes out: it mirrors the server's buffer, and
+        anchoring it to text that was never sent would cut the next delta from
+        the wrong offset. Cleared for a step when its committed ``message`` is
+        posted (stream path only; the poll path never populates it).
     :param delta_chunks: Per-PLANNER ``step_index`` → how many text deltas have
         been emitted for it, which is the delta ``index`` the server orders on.
         A counter rather than the forwarded byte offset because agy can replace
@@ -2054,7 +2061,10 @@ async def _close_planner_delta_stream(
             index=_next_delta_index(delta_chunks, idx),
         ),
     )
-    prefixes[idx] = text
+    # What the server's buffer now holds — which is the committed text only when
+    # the stream was a true prefix of it. Keeps the tracker's meaning intact for
+    # the poll path, which does not clear it per step.
+    prefixes[idx] = forwarded + suffix
 
 
 def _next_delta_index(delta_chunks: dict[int, int], idx: int) -> int:
@@ -2165,10 +2175,14 @@ async def _emit_partial_delta(
     if text is None:
         return
     forwarded = prefixes.get(idx, "")
+    # Register the step as streaming even when this frame yields nothing, so the
+    # committed close still knows there is a live block of ours to retire.
+    prefixes.setdefault(idx, "")
     # Only forward growth that extends what we already sent. A frame that does not
-    # start with the forwarded prefix (an unexpected non-monotonic rewrite) or
-    # that has not grown yields no delta; we still re-anchor the tracker to the
-    # latest cumulative text so we never re-emit the overlap.
+    # start with the forwarded prefix (a non-monotonic rewrite) or that has not
+    # grown yields no delta — and MUST NOT move the tracker: it records what the
+    # server has actually received, so re-anchoring it to text we never sent would
+    # cut the next delta from the wrong offset and repeat the overlap.
     if text.startswith(forwarded) and len(text) > len(forwarded):
         suffix = text[len(forwarded) :]
         await _post_event(
@@ -2182,7 +2196,7 @@ async def _emit_partial_delta(
                 index=_next_delta_index(delta_chunks, idx),
             ),
         )
-    prefixes[idx] = text
+        prefixes[idx] = text
 
 
 async def _emit_partial_reasoning_delta(
@@ -2199,7 +2213,8 @@ async def _emit_partial_reasoning_delta(
     cumulative snapshot per frame, so the reader prefix-diffs against the suffix
     already forwarded for this step's ``step_index`` and emits only the growth.
     A no-growth re-send (or a non-extending rewrite) emits nothing; the tracker
-    still advances so deltas never overlap and concatenate to the full reasoning.
+    still advances, which is where this deliberately diverges from the text
+    path — see the comment on the re-anchor below.
 
     The step's FIRST reasoning delta carries ``started=True`` (keyed off the
     prefix tracker being absent for the step) so the server precedes it with one
@@ -2225,10 +2240,7 @@ async def _emit_partial_reasoning_delta(
     # Absent ⇒ this is the step's first reasoning delta (carries ``started``).
     started = idx not in reasoning_prefixes
     forwarded = reasoning_prefixes.get(idx, "")
-    # Mirror the text path: only forward growth that extends the forwarded prefix.
-    # A no-growth / non-extending frame emits nothing but still re-anchors the
-    # tracker. ``started`` is only consumed when an actual delta is emitted, so a
-    # first frame with empty ``thinking`` does not waste the marker.
+    # As on the text path, only forward growth that extends the forwarded prefix.
     if text.startswith(forwarded) and len(text) > len(forwarded):
         suffix = text[len(forwarded) :]
         await _post_event(
@@ -2240,9 +2252,13 @@ async def _emit_partial_reasoning_delta(
                 started=started,
             ),
         )
-    # Re-anchor unconditionally (mirrors the text path's ``prefixes[idx] = text``):
-    # a non-monotonic rewrite emits no delta but must still advance the tracker, or
-    # reasoning deltas freeze permanently for this step once a rewrite occurs.
+    # Re-anchored unconditionally, DELIBERATELY unlike the text path (which only
+    # advances on an emitted delta). Reasoning has no committed close to flush the
+    # remainder, so freezing the tracker on a rewrite would drop the rest of the
+    # thinking outright; the text path can freeze safely because
+    # ``_close_planner_delta_stream`` sends whatever is left. The cost here is that
+    # a rewrite can repeat an overlap in the reasoning block — cosmetic, and not
+    # part of the message the server retires by byte-equality.
     reasoning_prefixes[idx] = text
 
 
