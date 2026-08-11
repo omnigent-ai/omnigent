@@ -666,6 +666,16 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   [data-electron-mac] .conversations-sidebar.is-peek {
     top: 2.75rem;
   }
+  /* ...and once it floats down there, the header row it still carries is dead
+   * space. That row exists to reserve the title-bar strip for the lights and the
+   * icon cluster, which only applies to the DOCKED sidebar starting at y=0 — the
+   * peek card is already clear of all of it, so on mac the row is 2.25rem of
+   * empty canvas above the first entry (both the wordmark and the cluster inside
+   * it are hidden here). Drop it so the card's content lines up against its own
+   * top padding. */
+  [data-electron-mac] .conversations-sidebar.is-peek .sidebar-header-row {
+    display: none;
+  }
   /* The settings sidebar swaps the header row for a "Back" row, which would now
    * sit under the traffic lights. Push it below them — it has no cluster to
    * align beside the lights, so it clears them vertically instead. */

@@ -442,6 +442,9 @@ describe("index.css electron-mac sidebar header", () => {
   const peekCardRule = cssSource.match(
     /\[data-electron-mac\] \.conversations-sidebar\.is-peek \{[^}]*\}/,
   )?.[0];
+  const peekHeaderRowRule = cssSource.match(
+    /\[data-electron-mac\] \.conversations-sidebar\.is-peek \.sidebar-header-row \{[^}]*\}/,
+  )?.[0];
 
   it("starts the sidebar at the window's top edge (no empty strip above it)", () => {
     // Was 2.25rem, which left the band of blank canvas this change removes.
@@ -504,6 +507,14 @@ describe("index.css electron-mac sidebar header", () => {
     expect(peekCardRule).toContain("top: 2.75rem");
   });
 
+  it("drops the header row inside the peek card", () => {
+    // The row reserves the title-bar strip for the lights and cluster, which
+    // only applies to the docked sidebar starting at y=0. The peek card already
+    // floats clear of all of it, so the row is 2.25rem of empty canvas above the
+    // first entry — the content should line up against the card's own padding.
+    expect(peekHeaderRowRule).toContain("display: none");
+  });
+
   it("aligns the cluster to the lights' centre line", () => {
     // The lights sit ~y=19. Centring a 1.5rem button in the 2.25rem title-bar
     // strip gives y=18: (2.25rem − 1.5rem) / 2 = 0.375rem.
@@ -527,17 +538,26 @@ describe("index.css electron-mac sidebar header", () => {
 
   it("keeps every header rule scoped to the desktop shell", () => {
     // A browser tab has no window controls to align to, so none of this may
-    // apply there. Each rule must carry the [data-electron-mac] scope.
-    for (const selector of [
+    // apply there. Every SELECTOR mentioning these classes must carry the
+    // [data-electron-mac] scope somewhere ahead of the class — not necessarily
+    // immediately before it, since some are qualified further (e.g.
+    // `[data-electron-mac] .conversations-sidebar.is-peek .sidebar-header-row`).
+    // Selectors are checked whole so a leaked unscoped rule still fails.
+    const selectorsInSource = [...cssSource.matchAll(/(^|\})\s*([^{}]+?)\s*\{/g)].map((m) => m[2]);
+    for (const cls of [
       ".sidebar-header-row",
       ".sidebar-brand",
       ".settings-sidebar-header",
       ".electron-sidebar-header-actions",
       ".chat-header-sidebar-toggle",
     ]) {
-      const occurrences = cssSource.split(selector).length - 1;
-      const scoped = cssSource.split(`[data-electron-mac] ${selector}`).length - 1;
-      expect(scoped, `${selector} must always be [data-electron-mac]-scoped`).toBe(occurrences);
+      const mentioning = selectorsInSource.filter((sel) => sel.includes(cls));
+      expect(mentioning.length, `${cls} should appear in at least one rule`).toBeGreaterThan(0);
+      for (const sel of mentioning) {
+        expect(sel, `${cls} must always be [data-electron-mac]-scoped`).toContain(
+          "[data-electron-mac]",
+        );
+      }
     }
   });
 });
