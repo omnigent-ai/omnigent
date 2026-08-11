@@ -218,7 +218,7 @@ import { BrandLogo } from "@/components/BrandLogo";
 import { PoweredByOmnigent } from "@/components/PoweredByOmnigent";
 import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
-import type { CostControlMode } from "@/components/CostRoutingControl";
+import { formatModelDisplayName, type CostControlMode } from "@/components/CostRoutingControl";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
@@ -374,6 +374,17 @@ const CODEX_NATIVE_BYPASS_APPROVAL_OPTION = {
   description: "Runs Codex with no approval prompts and no command sandbox",
   args: [] as string[],
 };
+
+function displayModelId(option: Pick<NativeModelOption, "id">): string {
+  return formatModelDisplayName(option.id);
+}
+
+function defaultCodexModelLabel(
+  options: readonly Pick<NativeModelOption, "id" | "isDefault">[],
+): string {
+  const defaultOption = options.find((option) => option.isDefault);
+  return defaultOption ? `Default (${displayModelId(defaultOption)})` : "Default";
+}
 
 function createdHarnessOptions({
   harness,
@@ -1638,7 +1649,7 @@ function HarnessConfigModal({
     [claudeModelOptions],
   );
   const codexModelSelectOptions = useMemo(
-    () => codexModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
+    () => codexModelOptions.map((m) => ({ id: m.id, label: displayModelId(m) })),
     [codexModelOptions],
   );
   const onModelChange = (value: string) => {
@@ -1877,7 +1888,7 @@ function HarnessConfigModal({
                   offerSmartRouting={smartRoutingEligible}
                   testId="new-chat-landing-config-model"
                   models={codexModelSelectOptions}
-                  defaultLabel={defaultModelLabel(codexModelOptions)}
+                  defaultLabel={defaultCodexModelLabel(codexModelOptions)}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
                   componentId="new_chat.config.model"
                 >
@@ -3070,16 +3081,16 @@ export function NewChatLandingScreen() {
           ? CODEX_NATIVE_BYPASS_APPROVAL_OPTION.label
           : (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ??
             approvalMode);
-      const pickedCodexRow = codexModelOptions.find((m) => m.id === pickedModel);
+      const selectedCodexModel = codexModelOptions.find((m) => m.id === pickedModel);
       const modelRows =
         routingOn || !isCodex
           ? routingRow
           : [
               {
                 label: "Model",
-                value: pickedCodexRow
-                  ? nativeModelLabel(pickedCodexRow)
-                  : defaultModelLabel(codexModelOptions),
+                  value: selectedCodexModel
+                    ? displayModelId(selectedCodexModel)
+                    : defaultCodexModelLabel(codexModelOptions),
               },
             ];
       return [...modelRows, { label: "Approval", value: approvalValue }];
