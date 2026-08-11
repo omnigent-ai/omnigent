@@ -99,7 +99,7 @@ def resolve_bench_env(
 
     :param explicit_profile: The ``--profile`` value, or ``None`` to derive.
     :param require_gateway: When ``False`` — an ``own_auth`` native harness that
-        authenticates its own model (agy, codex, …) — unresolvable creds are
+        authenticates its own model (agy, cursor, …) — unresolvable creds are
         tolerated: the server boots with no ``OPENAI_*`` rather than raising,
         since a native-tui turn never routes through the gateway. Ambient
         ``OPENAI_*`` or a resolvable profile is still used when present.
