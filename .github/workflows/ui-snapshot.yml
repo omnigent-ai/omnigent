@@ -95,7 +95,7 @@ jobs:
           if ! files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename'); then
             echo "ui=true" >> "$GITHUB_OUTPUT"; echo "file list unavailable -> render"; exit 0
           fi
-          pattern='^(web/|tests/e2e_ui/visual/|tests/e2e_ui/conftest\.py|\.github/actions/setup-node/|\.github/workflows/ui-snapshot\.yml|pyproject\.toml|uv\.lock)'
+          pattern='^(web/|tests/e2e_ui/visual/|tests/e2e_ui/conftest\.py|\.github/actions/setup-pnpm/|\.github/workflows/ui-snapshot\.yml|pnpm-lock\.yaml|pnpm-workspace\.yaml|pyproject\.toml|uv\.lock)'
           if printf '%s\n' "$files" | grep -qE "$pattern"; then
             echo "ui=true" >> "$GITHUB_OUTPUT"
             echo "render-affecting files changed:"
@@ -106,7 +106,7 @@ jobs:
           fi
 
   ui-snapshot:
-    name: UI Snapshot (visual baselines) [non-blocking]
+    name: UI Snapshot (visual baselines)
     needs: detect
     # Skipped (not failed) when no render input changed -> reports SUCCESS, so a
     # non-UI PR neither runs the render nor blocks a required check.
@@ -130,8 +130,18 @@ jobs:
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
-      - name: Set up Node 20
-        uses: ./.github/actions/setup-node
+      # The pinned Playwright image doesn't ship Node, so install Node before
+      # the pnpm action (pnpm/action-setup's self-installer needs a Node binary).
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.15.1
+          standalone: true
 
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
@@ -156,14 +166,12 @@ jobs:
 
       - name: Build web SPA
         # Build BEFORE pytest: Vite's emptyOutDir clobbers the static dir, so
-        # never run it alongside the live server. --legacy-peer-deps avoids
-        # re-resolving the known React 19 peer conflict under @emoji-mart/react.
+        # never run it alongside the live server.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
-          cd web
-          npm ci --legacy-peer-deps --no-audit --no-fund
-          npm run build
+          pnpm install --frozen-lockfile --filter web
+          pnpm --filter web run build
 
       - name: Compare (PR) or regenerate (dispatch) the visual snapshots
         id: snapshot

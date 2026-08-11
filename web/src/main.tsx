@@ -16,14 +16,16 @@ import { resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
 import {
+  applyDesktopUiFontSize,
   applyUiFontFamily,
-  applyUiFontScale,
   readUiFontFamily,
   readUiFontSizePx,
 } from "./lib/uiFontPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
 import { initChatStore } from "./store/chatStore";
+import "katex/dist/katex.min.css";
+import "streamdown/styles.css";
 import "./index.css";
 
 // Start tracing before any request fires so fetch/XHR are patched in time
@@ -57,9 +59,19 @@ void resolveIdentity();
 // No-op off the iOS shell (the inset vars stay at their env()-only defaults).
 initNativeInsets();
 
-// Apply the saved UI font size and family before first paint so there's no flash.
-applyUiFontScale(readUiFontSizePx());
+// Apply the saved desktop UI font size and family before first paint so there's no flash.
+applyDesktopUiFontSize(readUiFontSizePx());
 applyUiFontFamily(readUiFontFamily());
+
+// The standalone sidebar font size control was removed. Clear its legacy value
+// so sidebar items follow the shared desktop interface size.
+if (typeof window !== "undefined") {
+  try {
+    localStorage.removeItem("omnigent:sidebar-font-size");
+  } catch {
+    // localStorage access errors are non-fatal.
+  }
+}
 
 // Apply the saved color palette (data-theme on <html>) before first paint too,
 // so the app renders in the chosen theme rather than flashing the brand default.
@@ -72,9 +84,9 @@ applyThemePalette(readThemePalette());
 // missing server doesn't deadlock first paint. We add a small
 // safety timeout (1.5s) so users on a flaky network still get
 // something on screen.
-const _bootProbe: Promise<ServerInfo> = Promise.race([
+const bootProbe: Promise<ServerInfo> = Promise.race([
   resolveServerInfo(),
-  new Promise<ServerInfo>((resolve) =>
+  new Promise<ServerInfo>((resolve) => {
     setTimeout(
       () =>
         resolve({
@@ -89,18 +101,20 @@ const _bootProbe: Promise<ServerInfo> = Promise.race([
           public_sharing_enabled: true,
           server_version: null,
           smart_routing_enabled: false,
+          smart_routing_sources: { external: false, oss: false },
+          harness_install_enabled: false,
+          installable_harnesses: [],
+          dictation_available: false,
           branding: null,
         }),
       1500,
-    ),
-  ),
+    );
+  }),
 ]);
 
-void _bootProbe.then((info) => {
-  if (info.branding?.app_name) {
-    document.title = info.branding.app_name;
-  }
-  const faviconUrl = info.branding?.logos?.favicon;
+void bootProbe.then((info) => {
+  if (info.branding?.app_name) document.title = info.branding.app_name;
+  const faviconUrl = info.branding?.logos.favicon;
   if (faviconUrl) {
     let link = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
     if (!link) {
@@ -108,7 +122,7 @@ void _bootProbe.then((info) => {
       link.rel = "icon";
       document.head.appendChild(link);
     }
-    link.removeAttribute("type"); // let the browser sniff the custom file's type
+    link.removeAttribute("type");
     link.href = faviconUrl;
   }
   createRoot(document.getElementById("root")!).render(

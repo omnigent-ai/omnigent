@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use crate::install::PYTHON_VERSION;
 use crate::pod::Pod;
 
 /// A resolved command line + working dir for one process. Env is applied by the
@@ -24,13 +25,15 @@ impl ProcSpec {
         ]
     }
 
-    /// `uv run omnigent --log-to-stderr server --host 127.0.0.1 --port <p>
+    /// `uv run --python <pinned> omnigent --log-to-stderr server --host 127.0.0.1 --port <p>
     /// --database-uri <db> --artifact-location <dir>`, from the repo root.
     pub fn server(pod: &Pod) -> ProcSpec {
         ProcSpec {
             program: "uv".into(),
             args: vec![
                 "run".into(),
+                "--python".into(),
+                PYTHON_VERSION.into(),
                 "omnigent".into(),
                 "--log-to-stderr".into(),
                 "server".into(),
@@ -48,13 +51,15 @@ impl ProcSpec {
         }
     }
 
-    /// `uv run omnigent --log-to-stderr host --server http://127.0.0.1:<p>`,
+    /// `uv run --python <pinned> omnigent --log-to-stderr host --server http://127.0.0.1:<p>`,
     /// from the repo root.
     pub fn host(pod: &Pod) -> ProcSpec {
         ProcSpec {
             program: "uv".into(),
             args: vec![
                 "run".into(),
+                "--python".into(),
+                PYTHON_VERSION.into(),
                 "omnigent".into(),
                 "--log-to-stderr".into(),
                 "host".into(),
@@ -66,32 +71,22 @@ impl ProcSpec {
         }
     }
 
-    /// `npm install`, from `web/`. Run before Vite when deps are missing or
+    /// `pnpm install`, from `web/`. Run before Vite when deps are missing or
     /// stale so Vite's dependency scan doesn't fail on an unresolved import.
-    ///
-    /// `--loglevel http` makes npm emit a line per package fetch even when its
-    /// stdout is piped (its progress bar is TTY-only), so the pane streams real
-    /// progress. `--no-fund --no-audit` trims the trailing noise.
-    pub fn npm_install(pod: &Pod) -> ProcSpec {
+    pub fn pnpm_install(pod: &Pod) -> ProcSpec {
         ProcSpec {
-            program: "npm".into(),
-            args: vec![
-                "install".into(),
-                "--no-fund".into(),
-                "--no-audit".into(),
-                "--loglevel".into(),
-                "http".into(),
-            ],
+            program: "pnpm".into(),
+            args: vec!["install".into()],
             cwd: pod.web_dir(),
             extra_env: Vec::new(),
         }
     }
 
-    /// `npm run dev -- --host <host> --port <p> --strictPort`, from `web/`.
+    /// `pnpm run dev -- --host <host> --port <p> --strictPort`, from `web/`.
     /// `OMNIGENT_URL` (in the pod env) points Vite's proxy at this pod's backend.
     pub fn vite(pod: &Pod) -> ProcSpec {
         ProcSpec {
-            program: "npm".into(),
+            program: "pnpm".into(),
             args: vec![
                 "run".into(),
                 "dev".into(),
@@ -152,6 +147,14 @@ mod tests {
         .unwrap();
 
         for spec in [ProcSpec::server(&pod), ProcSpec::host(&pod)] {
+            assert_eq!(
+                spec.args
+                    .iter()
+                    .take(4)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                vec!["run", "--python", PYTHON_VERSION, "omnigent"]
+            );
             assert!(
                 spec.args.iter().any(|arg| arg == "--log-to-stderr"),
                 "omnigent command should request stderr logging: {:?}",

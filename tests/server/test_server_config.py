@@ -13,10 +13,16 @@ from pathlib import Path
 import pytest
 
 from omnigent.server.server_config import (
+    BRANDING_ASSETS_DIRNAME,
+    branding_config,
+    branding_logo_asset,
     config_str_list,
     load_server_config,
     resolve_config_path,
 )
+
+_PNG = b"\x89PNG\r\n\x1a\n" + b"test"
+_SVG = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>'
 
 
 def _pin_data_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -110,3 +116,95 @@ def test_config_str_list_none_is_empty() -> None:
 
 def test_config_str_list_strips_and_drops_empty() -> None:
     assert config_str_list(["  a@x.com  ", "", "  "]) == ["a@x.com"]
+
+
+def _write_branding_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, logo: str) -> Path:
+    config = tmp_path / "config.yaml"
+    config.write_text(f"branding:\n  logo:\n    main: {logo}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    assets = tmp_path / BRANDING_ASSETS_DIRNAME
+    assets.mkdir()
+    return assets
+
+
+@pytest.mark.parametrize(
+    ("filename", "content", "media_type"),
+    [("logo.png", _PNG, "image/png"), ("logo.svg", _SVG, "image/svg+xml")],
+)
+def test_branding_logo_accepts_valid_images_in_assets_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    filename: str,
+    content: bytes,
+    media_type: str,
+) -> None:
+    assets = _write_branding_config(monkeypatch, tmp_path, filename)
+    logo = assets / filename
+    logo.write_bytes(content)
+
+    asset = branding_logo_asset()
+
+    assert asset is not None
+    assert asset.path == logo
+    assert asset.media_type == media_type
+    assert branding_config()["logos"]["main"] == "/v1/branding/logo/main"
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        ("secret.txt", b"api_key: super-secret"),
+        ("secret.png", b"api_key: super-secret"),
+        ("active.svg", b"<svg><script>alert(1)</script></svg>"),
+    ],
+)
+def test_branding_logo_rejects_non_images_and_active_svg(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, filename: str, content: bytes
+) -> None:
+    assets = _write_branding_config(monkeypatch, tmp_path, filename)
+    (assets / filename).write_bytes(content)
+
+    assert branding_logo_asset() is None
+    assert branding_config()["logos"]["main"] is None
+
+
+def test_branding_logo_cannot_serve_config_directory_secret(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _write_branding_config(monkeypatch, tmp_path, "secrets.png")
+    (tmp_path / "secrets.png").write_bytes(_PNG)
+
+    assert branding_logo_asset() is None
+
+
+@pytest.mark.parametrize("logo", ["../secret.png", "/tmp/secret.png"])
+def test_branding_logo_rejects_escape_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, logo: str
+) -> None:
+    _write_branding_config(monkeypatch, tmp_path, logo)
+    assert branding_logo_asset() is None
+
+
+def test_branding_logo_rejects_file_symlink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    assets = _write_branding_config(monkeypatch, tmp_path, "logo.png")
+    secret = tmp_path / "secret.png"
+    secret.write_bytes(_PNG)
+    (assets / "logo.png").symlink_to(secret)
+
+    assert branding_logo_asset() is None
+
+
+def test_branding_logo_rejects_symlinked_assets_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("branding:\n  logo: logo.png\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "logo.png").write_bytes(_PNG)
+    (tmp_path / BRANDING_ASSETS_DIRNAME).symlink_to(external, target_is_directory=True)
+
+    assert branding_logo_asset() is None

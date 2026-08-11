@@ -40,6 +40,80 @@ commands inside any Pod. The runner namespace enforces Pod Security `restricted`
 the generated runner Pod is already restricted-compliant (non-root uid 1000, drop
 `ALL` caps, `seccompProfile: RuntimeDefault`, no privilege escalation).
 
+## Agent classifier label (`omnigent.ai/agent`)
+
+Each runner Pod is stamped with `omnigent.ai/agent: <name>` naming the built-in
+agent its session runs, so an admission policy (or any Pod selector) can tell
+which agent a managed runner is running and augment it — the motivating case is
+injecting a workload-scoped credential into only the Pods running a given agent.
+
+The value is a **join key you write into your policy**: it equals the agent name
+exactly. The label is stamped only when two conditions hold, and is **omitted**
+otherwise — the server never emits a mangled or colliding value:
+
+- The session is bound to a **genuine built-in** (operator-seeded) agent. A
+  session-scoped agent whose name merely matches a built-in's fails the gate by
+  design, so a caller cannot self-classify a runner into another agent's
+  identity and attract its credential.
+- The agent name is **already a valid Kubernetes label value**. A name that
+  would need lossy rewriting is dropped rather than coerced, because two
+  distinct names must never collapse onto one credential-selecting value.
+
+### Lifecycle — when a session loses the label
+
+The classifier is re-derived from the bound agent at every launch and relaunch;
+it is never persisted. Some ordinary UI actions therefore drop it:
+
+- **Fork** and **switch-agent** mint a fresh *session-scoped* clone of the
+  agent. That clone fails the built-in gate, so the forked/switched session's
+  runner gets **no** `omnigent.ai/agent` label — and therefore no
+  policy-injected credential.
+- **Switching back does not restore it.** Switch-back takes the same path and
+  mints another session-scoped clone, so a switched session cannot regain the
+  label through the UI. Start a new session on the built-in agent instead.
+- **A running Pod keeps the previous agent's label until it is replaced.** The
+  label is a launch-time snapshot; Pods are not relabelled in place. A changed
+  value lands on the next runner Pod (a relaunch after the sandbox dies), not on
+  the live one.
+
+Whichever condition fails, the omission is logged — check these first when a
+runner Pod unexpectedly carries no credential:
+
+- Failing the built-in gate logs from `resolve_managed_agent_label`
+  (`omnigent/server/managed_hosts.py`), e.g. "agent … is not a genuine built-in;
+  omitting agent label".
+- A name that is not a valid label value logs a `WARNING` from
+  `build_pod_manifest` (`omnigent/onboarding/sandboxes/kubernetes.py`), e.g.
+  "agent … is not a valid omnigent.ai/agent value; runner Pod … stays
+  unclassified". Note the gate upstream will already have logged this agent as
+  classified, so this is the line that explains the missing label.
+
+### What the label does not do
+
+The server will not stamp a value the session is not entitled to, but the label
+is only as trustworthy as the layer that reads it. **A Pod label is an assertion
+by whoever created the Pod**, so before keying anything privileged on it:
+
+- **Restrict who can create Pods in the runner namespace.** Any principal with
+  `create` (or `patch`) on Pods there can set `omnigent.ai/agent` to any value.
+  The server's gate constrains what *the server* stamps, nothing else.
+- **Have the webhook verify the creating identity**, not just the label — e.g.
+  that `AdmissionReview.request.userInfo.username` is the server's service
+  account. Without this, the label alone is forgeable by a namespace-adjacent
+  principal.
+- **Write the policy fail-closed**: inject *when* the label matches, rather than
+  granting a permissive baseline to Pods without one. Resolution is best-effort
+  — a transient store error degrades to an unclassified runner — so absence must
+  never mean "more access". Note the inverse risk if you key a *restriction* on
+  the label: a Pod that loses it also leaves the restricted set, so build
+  restrictions as a default-deny base with this label as the allow-exception.
+- **Treat a credential as bound to the Pod, not the session.** A mutating
+  webhook injects at Pod creation, and `switch-agent` keeps the same runner
+  (host and workspace are untouched), so a session that switches from a
+  credentialed agent keeps that credential mounted for the Pod's remaining
+  lifetime while running the new agent. If that matters, avoid switch-agent for
+  credentialed agents or keep the sandbox's idle timeout short.
+
 ## Prerequisites
 
 1. **A server image built with the `kubernetes` extra.** The overlay's
@@ -128,15 +202,53 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
 | Key | Meaning |
 |---|---|
 | `server_url` | URL the runner Pod's host dials back to (in-cluster service DNS by default). |
+| `host_config` | Optional, top-level under `sandbox:` (provider-agnostic, not inside `kubernetes:`): verbatim in-sandbox `~/.omnigent/config.yaml` content installed before `omnigent host` starts — e.g. a `providers:` block routing the `pi` harness through a self-hosted gateway (LiteLLM/vLLM). Server-managed: entries injected by a previous launch are replaced or removed on the next launch/resume; config created inside the sandbox survives. Keep secrets out via `api_key_ref: env:VAR`, resolved inside the runner Pod against the `secret_name` Secret. Validated at server startup. |
 | `namespace` | Runner-Pod namespace (defaults to `omnigent-sandboxes`). |
 | `secret_name` | Harness-creds Secret projected into every Pod via `envFrom`. |
 | `service_account` | ServiceAccount the runner Pods run as (powerless). |
 | `image` | Optional runner image override (defaults to the official multi-arch amd64/arm64 host image). |
 | `env` | Optional list of SERVER env-var names to inject as literal Pod env (prefer `secret_name` for credentials). |
-| `node_selector` | Optional extra node labels, merged with a default `kubernetes.io/arch: amd64` — set that key to `arm64` to schedule runners on arm64 nodes. (arm64 note: the CEL policy module is unavailable there — `cel-expr-python` ships no aarch64 wheel — and degrades gracefully.) |
+| `node_selector` | Optional extra node labels, merged with a default `kubernetes.io/arch: amd64` — set that key to `arm64` to schedule runners on arm64 nodes. |
 | `resources` | Optional `requests` / `limits` (`cpu` / `memory`) override. |
 | `in_cluster` | Optional cluster-config source: `true` (in-cluster SA only), `false` (kubeconfig only), omit (try in-cluster, then kubeconfig). |
 | `kubeconfig` | Optional kubeconfig path for the out-of-cluster fallback (env: `OMNIGENT_KUBERNETES_KUBECONFIG`). |
+| `pvc_mounts` | Optional pre-created PersistentVolumeClaims mounted into every runner Pod — see [Persistent storage mounts](#persistent-storage-mounts-pvc_mounts). |
+
+## Persistent storage mounts (`pvc_mounts`)
+
+Runner Pods are ephemeral by design — the workspace lives on an `emptyDir` and
+dies with the Pod. To expose durable data (datasets, model caches, shared
+output directories) mount pre-created PersistentVolumeClaims:
+
+1. Create the PV/PVC **in the runner namespace** (`omnigent-sandboxes`) out of
+   band — via your GitOps repo, with whatever backend your cluster provides
+   (NFS/SMB CSI drivers, SAN, cloud disks). Omnigent only references the claim;
+   it never creates volumes, so the server RBAC stays unchanged.
+2. List the claims under `sandbox.kubernetes.pvc_mounts` (see
+   `sandbox-config.yaml`). Mount paths may not overlap `/home/omnigent`, the
+   OS directories, or their ancestors (e.g. `/home`, `/var`) — the server
+   rejects such config at startup.
+
+Caveats:
+
+- **Multiple runners share writable claims concurrently** — use a
+  `ReadWriteMany`-capable backend (NFS/SMB/CephFS) for anything writable, and
+  prefer `read_only: true` (the default) everywhere else: a writable shared
+  mount lets one session's agent read and modify what another session wrote,
+  and anything written there outlives the Pod and its launch token.
+- Runner Pods run as uid/gid 1000660000 with `fsGroup`. NFS `root_squash` and
+  SMB ownership mapping must permit that identity (export to the uid, or use
+  CSI mount options like `uid=`/`gid=` for SMB); `fsGroupChangePolicy:
+  OnRootMismatch` avoids re-chowning large exports on every start.
+- `ReadWriteOnce` claims pin all runners to one node — combine with
+  `node_selector` deliberately, or the second Pod sits `Pending`.
+- A mount visible in the Pod is not automatically visible to a harness's own
+  OS-level sandbox (OmniBox path grants are separate).
+
+To verify `host_config` end to end against a live cluster, run
+`python tests/e2e/integrations/deploy/kubernetes/e2e_managed_host_config.py
+--server <url>` — it creates a managed session and asserts the injected
+config inside the runner Pod.
 
 ## Troubleshooting
 

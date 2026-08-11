@@ -19,6 +19,7 @@
 import type React from "react";
 import { useEffect, useMemo, useState } from "react";
 import {
+  CalendarClockIcon,
   InboxIcon,
   type LucideIcon,
   PanelLeftIcon,
@@ -135,6 +136,13 @@ export function CommandPalette({
         run: () => navigate("/inbox"),
       },
       {
+        id: "go-tasks",
+        label: "Go to Automations",
+        icon: CalendarClockIcon,
+        keywords: ["scheduled", "recurring", "cron", "automation", "schedule"],
+        run: () => navigate("/tasks"),
+      },
+      {
         id: "go-settings",
         label: "Go to Settings",
         icon: SettingsIcon,
@@ -248,12 +256,12 @@ export function CommandPalette({
                       {s.snippet && (
                         // Where the match was found in the chat body — the
                         // session is often unidentifiable from the title alone.
-                        <span className="truncate text-left text-muted-foreground text-xs">
+                        <span className="truncate text-left text-muted-foreground text-sm">
                           <HighlightedText text={s.snippet} query={debouncedQuery} />
                         </span>
                       )}
                     </div>
-                    <span className="ml-2 shrink-0 text-xs text-muted-foreground">{s.agent}</span>
+                    <span className="ml-2 shrink-0 text-sm text-muted-foreground">{s.agent}</span>
                   </CommandItem>
                 ))}
               </CommandGroup>

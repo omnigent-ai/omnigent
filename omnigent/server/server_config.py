@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
 
 import yaml
 
@@ -174,19 +176,103 @@ def _branding_powered_by() -> bool:
 
 
 LOGO_VARIANTS: tuple[str, ...] = ("main", "loading", "favicon")
+BRANDING_ASSETS_DIRNAME = "branding-assets"
+BRANDING_ASSET_MAX_BYTES = 5 * 1024 * 1024
 
 
-def _resolve_under_config_dir(name: str) -> Path | None:
-    """Resolve *name* under the config file's directory, or None if it escapes it or is missing."""
-    config_path = resolve_config_path()
-    base = (config_path.parent if config_path is not None else resolve_data_dir()).resolve()
-    path = (base / name).resolve()
-    try:
-        path.relative_to(base)
-    except ValueError:
-        logger.warning("branding.logo %r escapes the config directory — ignoring", name)
+@dataclass(frozen=True)
+class BrandingAsset:
+    path: Path
+    media_type: str
+
+
+_RASTER_MEDIA_TYPES = {
+    ".gif": "image/gif",
+    ".ico": "image/x-icon",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+
+
+def _raster_media_type(path: Path, header: bytes) -> str | None:
+    media_type = _RASTER_MEDIA_TYPES.get(path.suffix.lower())
+    if media_type == "image/png" and header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return media_type
+    if media_type == "image/jpeg" and header.startswith(b"\xff\xd8\xff"):
+        return media_type
+    if media_type == "image/gif" and header.startswith((b"GIF87a", b"GIF89a")):
+        return media_type
+    if media_type == "image/webp" and header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        return media_type
+    if media_type == "image/x-icon" and header.startswith(b"\x00\x00\x01\x00"):
+        return media_type
+    return None
+
+
+def _svg_media_type(path: Path, content: bytes) -> str | None:
+    if path.suffix.lower() != ".svg":
         return None
-    return path if path.is_file() else None
+    lowered = content.lower()
+    if any(
+        marker in lowered
+        for marker in (b"<!doctype", b"<!entity", b"<script", b"<foreignobject", b"javascript:")
+    ):
+        return None
+    try:
+        root = ElementTree.fromstring(content)
+    except ElementTree.ParseError:
+        return None
+    return "image/svg+xml" if root.tag.rsplit("}", 1)[-1] == "svg" else None
+
+
+def _validated_image_media_type(path: Path) -> str | None:
+    try:
+        size = path.stat().st_size
+        if size <= 0 or size > BRANDING_ASSET_MAX_BYTES:
+            return None
+        content = path.read_bytes()
+    except OSError:
+        return None
+    return _svg_media_type(path, content) or _raster_media_type(path, content[:16])
+
+
+def _resolve_branding_asset(name: str) -> BrandingAsset | None:
+    """Resolve a validated image below the dedicated branding-assets directory."""
+    config_path = resolve_config_path()
+    config_dir = config_path.parent if config_path is not None else resolve_data_dir()
+    assets_dir = config_dir / BRANDING_ASSETS_DIRNAME
+    relative = Path(name)
+    if relative.is_absolute() or ".." in relative.parts:
+        logger.warning("branding.logo %r escapes %s — ignoring", name, assets_dir)
+        return None
+    if assets_dir.is_symlink():
+        logger.warning("branding assets directory %s is a symlink — ignoring", assets_dir)
+        return None
+    try:
+        assets_root = assets_dir.resolve(strict=True)
+        path = assets_root.joinpath(relative)
+        for parent in (path, *path.parents):
+            if parent == assets_root.parent:
+                break
+            if parent.is_symlink():
+                logger.warning("branding.logo %r traverses a symlink — ignoring", name)
+                return None
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(assets_root)
+    except (FileNotFoundError, OSError, ValueError):
+        logger.warning(
+            "branding.logo %r is outside or missing from %s — ignoring", name, assets_dir
+        )
+        return None
+    if not resolved.is_file():
+        return None
+    media_type = _validated_image_media_type(resolved)
+    if media_type is None:
+        logger.warning("branding.logo %r is not a supported image — ignoring", name)
+        return None
+    return BrandingAsset(path=resolved, media_type=media_type)
 
 
 def _branding_logo_names() -> dict[str, str]:
@@ -205,12 +291,12 @@ def _branding_logo_names() -> dict[str, str]:
     return {}
 
 
-def branding_logo_file(variant: str = "main") -> Path | None:
-    """Resolve the configured logo file for *variant*, or None."""
+def branding_logo_asset(variant: str = "main") -> BrandingAsset | None:
+    """Resolve the configured, validated image asset for *variant*."""
     name = _branding_logo_names().get(variant)
     if name is None:
         return None
-    return _resolve_under_config_dir(name)
+    return _resolve_branding_asset(name)
 
 
 def branding_config() -> dict[str, Any]:
@@ -219,7 +305,7 @@ def branding_config() -> dict[str, Any]:
         "app_name": _branding_str("app_name"),
         "heading": _branding_heading(),
         "logos": {
-            variant: (f"/v1/branding/logo/{variant}" if branding_logo_file(variant) else None)
+            variant: (f"/v1/branding/logo/{variant}" if branding_logo_asset(variant) else None)
             for variant in LOGO_VARIANTS
         },
         "powered_by": _branding_powered_by(),

@@ -4,11 +4,14 @@ import {
   detectLang,
   getSelectionOffsets,
   indexToLine,
+  getModelFormat,
   isBinaryPath,
   isImageFile,
+  isModelFile,
   isNotebookPath,
   isPdfFile,
   lineOverlapsSelection,
+  modelViewerTheme,
   openHtmlArtifactInNewTab,
   prepareHtmlPreviewDoc,
 } from "./codeViewerHelpers";
@@ -212,6 +215,137 @@ describe("isPdfFile", () => {
     expect(isPdfFile("report.pdf", null)).toBe(true);
     expect(isPdfFile("report.pdf", undefined)).toBe(true);
     expect(isPdfFile("notes.txt", null)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isModelFile — 3D model preview detection (STL / 3MF / OBJ)
+// ---------------------------------------------------------------------------
+
+describe("isModelFile", () => {
+  it.each(["part.stl", "assembly.3mf", "mesh.obj", "dir/nested/widget.STL", "MODEL.OBJ"])(
+    "classifies %s as a model by extension",
+    (path) => {
+      expect(isModelFile(path)).toBe(true);
+    },
+  );
+
+  it.each([
+    "app.py",
+    "logo.png",
+    "scene.gltf",
+    "model.glb",
+    "part.step",
+    "part.stp",
+    "notes.txt",
+    "data.json",
+  ])("classifies %s as non-model (out of scope or unrelated)", (path) => {
+    expect(isModelFile(path)).toBe(false);
+  });
+
+  it("treats a recognized model content type as authoritative on an unknown extension", () => {
+    expect(isModelFile("blob", "model/stl")).toBe(true);
+    expect(isModelFile("download", "application/vnd.ms-pki.stl")).toBe(true);
+    expect(isModelFile("blob", "model/3mf")).toBe(true);
+    expect(isModelFile("blob", "model/obj")).toBe(true);
+  });
+
+  it("ignores charset parameters on the content type", () => {
+    expect(isModelFile("blob", "model/obj; charset=utf-8")).toBe(true);
+  });
+
+  it("still previews a model extension even when the server reports a generic type", () => {
+    // Binary STL/3MF are commonly served as octet-stream and ASCII OBJ as
+    // text/plain — the extension must win so they don't fall to the binary or
+    // raw-text paths.
+    expect(isModelFile("part.stl", "application/octet-stream")).toBe(true);
+    expect(isModelFile("mesh.obj", "text/plain")).toBe(true);
+  });
+
+  it("does not treat plain text (no model extension) as a model", () => {
+    expect(isModelFile("readme.txt", "text/plain")).toBe(false);
+  });
+
+  it("treats extension-less paths with no content type as non-model", () => {
+    expect(isModelFile("Dockerfile")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getModelFormat — the SINGLE resolver shared by dispatch and loader selection
+// ---------------------------------------------------------------------------
+
+describe("getModelFormat", () => {
+  it.each([
+    ["part.stl", "stl"],
+    ["assembly.3mf", "3mf"],
+    ["mesh.obj", "obj"],
+    ["dir/WIDGET.STL", "stl"],
+  ])("resolves %s to %s by extension", (path, format) => {
+    expect(getModelFormat(path)).toBe(format);
+  });
+
+  it("resolves a recognized model MIME to the matching loader on an unknown extension", () => {
+    // MIME-first: a file with no/unknown extension still selects the correct
+    // loader — this is what keeps dispatch and parsing in lockstep.
+    expect(getModelFormat("blob", "model/stl")).toBe("stl");
+    expect(getModelFormat("download.bin", "application/vnd.ms-pki.stl")).toBe("stl");
+    expect(getModelFormat("blob", "model/3mf")).toBe("3mf");
+    expect(getModelFormat("blob", "model/obj")).toBe("obj");
+  });
+
+  it("prefers the MIME format over the extension when both are model types", () => {
+    // A .obj served with an STL MIME resolves to the STL loader (MIME-first).
+    expect(getModelFormat("weird.obj", "model/stl")).toBe("stl");
+  });
+
+  it("falls back to the extension for generic content types", () => {
+    expect(getModelFormat("part.stl", "application/octet-stream")).toBe("stl");
+    expect(getModelFormat("mesh.obj", "text/plain")).toBe("obj");
+  });
+
+  it("ignores charset parameters on the content type", () => {
+    expect(getModelFormat("blob", "model/obj; charset=utf-8")).toBe("obj");
+  });
+
+  it("returns null for non-model files", () => {
+    expect(getModelFormat("app.py")).toBeNull();
+    expect(getModelFormat("scene.gltf")).toBeNull();
+    expect(getModelFormat("readme.txt", "text/plain")).toBeNull();
+    expect(getModelFormat("Dockerfile")).toBeNull();
+  });
+
+  it("agrees with isModelFile (detection is exactly getModelFormat !== null)", () => {
+    for (const [path, ct] of [
+      ["part.stl", null],
+      ["blob", "model/3mf"],
+      ["app.py", null],
+      ["readme.txt", "text/plain"],
+    ] as const) {
+      expect(isModelFile(path, ct)).toBe(getModelFormat(path, ct) !== null);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// modelViewerTheme — resolved theme → 3D preview appearance (shared by formats)
+// ---------------------------------------------------------------------------
+
+describe("modelViewerTheme", () => {
+  it("returns distinct backgrounds for light and dark", () => {
+    expect(modelViewerTheme("light").background).not.toBe(modelViewerTheme("dark").background);
+  });
+
+  it("brightens the lights in dark mode so the mesh stays legible", () => {
+    const light = modelViewerTheme("light");
+    const dark = modelViewerTheme("dark");
+    expect(dark.ambientIntensity).toBeGreaterThan(light.ambientIntensity);
+    expect(dark.keyIntensity).toBeGreaterThan(light.keyIntensity);
+  });
+
+  it("provides an STL default material color for each mode", () => {
+    expect(typeof modelViewerTheme("light").stlMaterial).toBe("number");
+    expect(typeof modelViewerTheme("dark").stlMaterial).toBe("number");
   });
 });
 

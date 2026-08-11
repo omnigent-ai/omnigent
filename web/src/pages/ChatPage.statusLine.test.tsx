@@ -1,3 +1,9 @@
+import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as UseSessionModule from "@/hooks/useSession";
+import type * as UseHostsModule from "@/hooks/useHosts";
+import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
+import type * as AgentLabelsModule from "@/lib/agentLabels";
+
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -7,7 +13,7 @@ import { useChatStore } from "@/store/chatStore";
 // mentions); these status-line tests don't exercise it, so stub the hook to
 // avoid wrapping every render in a QueryClientProvider.
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/hooks/useWorkspaceChangedFiles")>();
+  const actual = await importOriginal<typeof UseWorkspaceChangedFilesModule>();
   return {
     ...actual,
     useWorkspaceAllFiles: () => ({ data: undefined }),
@@ -26,19 +32,19 @@ const { useSessionMock, useHostsMock, useSessionHostOnlineMock } = vi.hoisted(()
   useSessionHostOnlineMock: vi.fn(),
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useSession")>()),
+  ...(await importOriginal<typeof UseSessionModule>()),
   useSession: (id: string | null | undefined) => useSessionMock(id),
 }));
 vi.mock("@/hooks/useHosts", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useHosts")>()),
+  ...(await importOriginal<typeof UseHostsModule>()),
   useHosts: (opts: unknown) => useHostsMock(opts),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/RunnerHealthProvider")>()),
+  ...(await importOriginal<typeof RunnerHealthProviderModule>()),
   useSessionHostOnline: (id: string | undefined) => useSessionHostOnlineMock(id),
 }));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  ...(await importOriginal<typeof AgentLabelsModule>()),
   useBrainHarnessLabels: () => ({
     "claude-sdk": "Claude SDK",
     codex: "Codex",
@@ -49,6 +55,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   }),
 }));
 
+import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { Composer, composerHarnessLabel, formatModelEffortStatusLabel } from "./ChatPage";
 
 // Pins the visibility rules for the status-line tray under the composer:
@@ -67,9 +74,7 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     onSend: vi.fn(),
     onStop: vi.fn(),
     agents: undefined,
-    agentsLoading: false,
     selectedAgentId: null,
-    onSelectAgent: vi.fn(),
     permissionLevel: null,
     readOnlyReason: null,
     replyQuotes: [],
@@ -172,42 +177,23 @@ describe("Composer status line (branch + context ring)", () => {
     expect(screen.getByLabelText("25% of context used")).toBeInTheDocument();
   });
 
-  it("shows the harness label immediately left of the context ring", () => {
-    // The model/effort label moved to the picker trigger; the tray now shows
-    // the harness identity. Codex-native reads as the bare vendor name.
-    useChatStore.setState({ contextWindow: 100_000, tokensUsed: 25_000 });
-    renderComposer({ modelPickerKind: "codex" });
+  it("no longer renders the harness label in the status tray (moved to the config gear)", () => {
+    // The harness identity moved from the tray into the config gear's hover
+    // tooltip, so it must never resurface in the status line — for a native
+    // vendor session or an SDK/bundle session.
+    useChatStore.setState({ contextWindow: 100_000, tokensUsed: 25_000, sessionHarness: "pi" });
+    renderComposer({
+      modelPickerKind: "codex",
+      agents: [{ id: "a1", name: "polly" }],
+      selectedAgentId: "a1",
+    });
 
-    const harness = screen.getByTestId("composer-harness");
-    const ring = screen.getByLabelText("25% of context used");
-    expect(harness).toHaveTextContent("Codex");
-    expect(harness.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
-      Node.DOCUMENT_POSITION_FOLLOWING,
-    );
+    expect(screen.queryByTestId("composer-harness")).toBeNull();
   });
 
-  it("shows the agent + brain harness identity for SDK sessions", () => {
-    // SDK/bundle agents read as "<Agent> (<Harness>)" — e.g. Polly on Pi.
-    useChatStore.setState({ sessionHarness: "pi" });
-    renderComposer({ agents: [{ id: "a1", name: "polly" }], selectedAgentId: "a1" });
-
-    expect(screen.getByTestId("composer-harness")).toHaveTextContent("Polly (Pi)");
-  });
-
-  it("names the sub-agent head, not the bundle, for a head session", () => {
-    // A Debby GPT head session: the tray identifies the head being viewed
-    // ("Gpt"), not the bundle orchestrator ("Debby").
-    useChatStore.setState({ sessionHarness: "codex", subAgentName: "gpt" });
-    renderComposer({ agents: [{ id: "a1", name: "debby" }], selectedAgentId: "a1" });
-
-    const harness = screen.getByTestId("composer-harness");
-    expect(harness).toHaveTextContent("Gpt (Codex)");
-    expect(harness).not.toHaveTextContent("Debby");
-  });
-
-  it("no longer renders model/effort in the status tray (moved to the picker trigger)", () => {
+  it("no longer renders model/effort in the status tray (moved to the composer label)", () => {
     // The swap moved the model/effort label out of the tray and into the
-    // AgentPicker trigger, so it must never resurface here — even for a
+    // composer's read-only label, so it must never resurface here — even for a
     // vendor-owned native session where the model used to be (wrongly) shown.
     useChatStore.setState({
       llmModel: "claude-sonnet-4-6",
@@ -294,15 +280,28 @@ describe("Composer status line (branch + context ring)", () => {
     expect(screen.getByTestId("composer-plan-mode")).toHaveTextContent("Plan mode");
   });
 
-  it("places Plan mode to the left of the harness label", () => {
-    useChatStore.setState({ codexPlanMode: true });
+  it("places Plan mode to the left of the context ring", () => {
+    useChatStore.setState({ codexPlanMode: true, contextWindow: 100_000, tokensUsed: 25_000 });
     renderComposer({ modelPickerKind: "codex" });
 
     const plan = screen.getByTestId("composer-plan-mode");
-    const harness = screen.getByTestId("composer-harness");
-    expect(plan.compareDocumentPosition(harness) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+    const ring = screen.getByLabelText("25% of context used");
+    expect(plan.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
+  });
+
+  it("renders the tray for a host-bound session with no branch or ring", () => {
+    // Regression: removing the harness label from the tray must not take the
+    // host badge + context footer with it. A host-bound session (e.g. a codex
+    // session with no worktree branch, before the ring populates) still shows
+    // the tray so the host indicator is visible.
+    bindHost("mac-laptop");
+    useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
+    renderComposer();
+
+    expect(statusLine()).not.toBeNull();
+    expect(screen.getByTestId("host-badge")).toHaveTextContent("mac-laptop");
   });
 
   it("shows the host badge to the left of the worktree branch", () => {
@@ -320,9 +319,39 @@ describe("Composer status line (branch + context ring)", () => {
     );
   });
 
+  it("turns the host badge into a clickable reconnect prompt for an offline host", () => {
+    // An offline host surfaces the reconnect affordance in the host badge (in
+    // place of the old banner below the composer) while keeping the host name:
+    // the tray shows even with no branch/ring, and clicking opens the help.
+    bindHost("mac-laptop");
+    useSessionHostOnlineMock.mockReturnValue(false);
+    useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
+    const onShowReconnectHelp = vi.fn();
+    renderComposer({ onShowReconnectHelp });
+
+    expect(statusLine()).not.toBeNull();
+    const badge = screen.getByTestId("host-badge");
+    expect(badge.tagName).toBe("BUTTON");
+    expect(badge).toHaveTextContent("mac-laptop");
+    badge.click();
+    expect(onShowReconnectHelp).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the tray hidden for a session with no host and nothing else to show", () => {
+    // onShowReconnectHelp is now passed for every session, so it must not
+    // resurrect an empty tray on a session with no host badge to hang it on.
+    useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
+    renderComposer({ onShowReconnectHelp: vi.fn() });
+
+    expect(statusLine()).toBeNull();
+  });
+
   it("hides the host badge on a sub-agent session", () => {
     // A child session repurposes the header's left slot for the back
-    // affordance, so the host badge stays hidden there as it did before.
+    // affordance, so the host badge stays hidden there as it did before. Sub-
+    // agents are never host-bound (host_id is null), so they can't be
+    // host_offline anyway — a stranded child is local_stranded, handled by the
+    // banner elsewhere.
     bindHost("mac-laptop");
     useChatStore.setState({ gitBranch: "geist" });
     renderComposer({ subAgentLabel: "check-eligibility" });
@@ -340,6 +369,31 @@ describe("composerHarnessLabel", () => {
 
   it("reads SDK agents as '<Agent> (<Harness>)'", () => {
     expect(composerHarnessLabel(null, "polly", "pi")).toBe("Polly (Pi)");
+  });
+
+  // A Claude Code sub-agent's sub_agent_name is the Task tool's
+  // `subagent_type` ("general-purpose"), and the child reuses the parent's
+  // claude-native agent row — so without the wrapper the label reads
+  // "General-purpose" instead of naming the product running it.
+  it("reads a native sub-agent child as its vendor, not the vendor-side agent type", () => {
+    expect(
+      composerHarnessLabel(
+        null,
+        "general-purpose",
+        "claude-native",
+        BRAIN_HARNESS_LABELS,
+        "claude-code-native-ui-subagent",
+      ),
+    ).toBe("Claude Code");
+    expect(
+      composerHarnessLabel(
+        null,
+        "reviewer",
+        null,
+        BRAIN_HARNESS_LABELS,
+        "codex-native-ui-subagent",
+      ),
+    ).toBe("Codex");
   });
 
   it("falls back to the agent name alone when the harness is unmapped", () => {

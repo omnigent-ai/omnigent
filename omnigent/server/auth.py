@@ -27,22 +27,21 @@ and closed over by route factories — no per-request import cost.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from starlette.requests import HTTPConnection
 
 logger = logging.getLogger(__name__)
 
-# Opt-in multi-user switch. ``OMNIGENT_AUTH_ENABLED`` is the current
-# name; ``OMNIGENT_ACCOUNTS_ENABLED`` is the pre-rename name, still
-# honored as a deprecated alias (see :func:`_auth_enabled`).
+# Opt-in multi-user switch.
 _AUTH_ENABLED_ENV = "OMNIGENT_AUTH_ENABLED"
-_AUTH_ENABLED_ENV_DEPRECATED = "OMNIGENT_ACCOUNTS_ENABLED"
 
 RESERVED_USER_LOCAL = "local"
 RESERVED_USER_PUBLIC = "__public__"
@@ -216,6 +215,57 @@ def local_single_user_enabled() -> bool:
     return env_var_is_truthy(_LOCAL_SINGLE_USER_ENV)
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def bind_host_is_loopback(host: str) -> bool:
+    """Whether *host* only accepts connections from this machine.
+
+    A wildcard (``0.0.0.0`` / ``::``) is not loopback — it accepts traffic
+    from every reachable interface. Unparseable values (an unresolved
+    hostname) count as non-loopback, so a warning gated on this errs
+    toward "reachable".
+
+    :param host: Bind host, e.g. ``"127.0.0.1"``, ``"0.0.0.0"``.
+    :returns: ``True`` when the bind is loopback-only.
+    """
+    if host in _LOOPBACK_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def warn_if_single_user_exposed(host: str) -> str | None:
+    """Return a warning when a single-user server is network-reachable.
+
+    Header mode with the single-user marker serves every unauthenticated
+    request as :data:`RESERVED_USER_LOCAL` — the intended posture on
+    loopback, but on a reachable interface it hands that identity to
+    anyone who can connect. Accounts/oidc route identity through the
+    cookie path, so they are not exposed and stay silent.
+
+    Callers own how the text surfaces: Click's stderr for the CLI, a
+    logger for container entrypoints where stderr is buried.
+
+    :param host: The resolved bind host, e.g. ``"0.0.0.0"``.
+    :returns: The multi-line warning, or ``None`` when not exposed.
+    """
+    if bind_host_is_loopback(host):
+        return None
+    if not local_single_user_enabled() or resolve_auth_source() != "header":
+        return None
+    return (
+        f"SECURITY: {_LOCAL_SINGLE_USER_ENV} is set and the server is bound to "
+        f"the non-local interface {host}.\n"
+        f'    This server will serve UNAUTHENTICATED requests as the "'
+        f'{RESERVED_USER_LOCAL}" user to anyone who can reach this address.\n'
+        "    Only do this on a trusted private network.\n"
+        f"    Unset {_LOCAL_SINGLE_USER_ENV} to require login instead."
+    )
+
+
 def resolve_auth_header() -> str:
     """Resolve the trusted identity header name for header-auth mode.
 
@@ -257,40 +307,18 @@ def resolve_auth_header_strip_prefix() -> str:
     return os.environ.get(_AUTH_HEADER_STRIP_PREFIX_ENV, "").strip()
 
 
-_auth_enabled_deprecation_warned = False
-
-
 def _auth_enabled() -> bool:
     """Whether multi-user auth is opted in via the enable switch.
 
-    Reads ``OMNIGENT_AUTH_ENABLED``. The pre-rename name
-    ``OMNIGENT_ACCOUNTS_ENABLED`` is still honored as a deprecated
-    alias: when it is set and the current name is not, its value is
-    used and a one-time deprecation warning is logged. The current name
-    always wins when both are set, so a deploy migrating to the new name
-    can leave the old one in place without surprise.
-
-    Both names share the same truthiness rules (see
-    :func:`env_var_is_truthy`) and the same explicit-falsy kill-switch
-    semantics — ``OMNIGENT_AUTH_ENABLED=0`` disables auth even though
-    the var is "set", which is how the Docker entrypoint lets an
+    Reads ``OMNIGENT_AUTH_ENABLED``. The explicit-falsy kill-switch
+    semantics mean ``OMNIGENT_AUTH_ENABLED=0`` disables auth even
+    though the var is "set", which is how the Docker entrypoint lets an
     operator opt back out of the default-on accounts mode.
 
     :returns: ``True`` when multi-user auth should be enabled.
     """
-    global _auth_enabled_deprecation_warned
     if os.environ.get(_AUTH_ENABLED_ENV, "").strip():
         return env_var_is_truthy(_AUTH_ENABLED_ENV, default=False)
-    if os.environ.get(_AUTH_ENABLED_ENV_DEPRECATED, "").strip():
-        if not _auth_enabled_deprecation_warned:
-            logger.warning(
-                "%s is deprecated; rename it to %s. The old name still "
-                "works for now but will be removed in a future release.",
-                _AUTH_ENABLED_ENV_DEPRECATED,
-                _AUTH_ENABLED_ENV,
-            )
-            _auth_enabled_deprecation_warned = True
-        return env_var_is_truthy(_AUTH_ENABLED_ENV_DEPRECATED, default=False)
     return False
 
 
@@ -308,9 +336,8 @@ def resolve_auth_source() -> str:
       wins, e.g. ``"header"`` / ``"oidc"`` / ``"accounts"``. This is the
       low-level escape hatch.
     - Otherwise ``header`` is the default, unless the opt-in switch
-      ``OMNIGENT_AUTH_ENABLED`` is truthy (see :func:`_auth_enabled`,
-      which also honors the deprecated ``OMNIGENT_ACCOUNTS_ENABLED``
-      alias). When enabled, the mode depends on whether OIDC config was
+      ``OMNIGENT_AUTH_ENABLED`` is truthy (see :func:`_auth_enabled`).
+      When enabled, the mode depends on whether OIDC config was
       supplied:
 
       - ``OMNIGENT_OIDC_ISSUER`` is set → ``"oidc"`` (the operator
@@ -544,6 +571,8 @@ class UnifiedAuthProvider(AuthProvider):
         # share `cookie_secret` and `session_cookie_name` properties
         # by construction (see AccountsConfig docstring).
         cookie_config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        if cookie_config is None:
+            return None
         cookie_name = cookie_config.session_cookie_name
         token = request.cookies.get(cookie_name)
         if not token:
@@ -569,7 +598,7 @@ class UnifiedAuthProvider(AuthProvider):
             return None
 
         user_id = payload.get("sub")
-        if not user_id or user_id in _RESERVED_USERS:
+        if not isinstance(user_id, str) or not user_id or user_id in _RESERVED_USERS:
             return None
 
         # Delegated (device-grant) tokens carry a ``grant_id`` claim.
@@ -578,6 +607,8 @@ class UnifiedAuthProvider(AuthProvider):
         # served from the plain user-id cache (which would skip both).
         grant_id = payload.get("grant_id")
         if grant_id is not None:
+            if not isinstance(grant_id, str):
+                return None
             if not delegated_path_allowed(request.url.path):
                 return None
             if self._grant_revoked is not None and self._grant_revoked(grant_id):
@@ -677,11 +708,8 @@ def create_auth_provider() -> AuthProvider:
     ``Cf-Access-Authenticated-User-Email`` for Cloudflare Access — see
     :func:`resolve_auth_header`).
 
-    (``OMNIGENT_AUTH_ENABLED`` is the renamed opt-in gate,
-    commit ``b23e886e``, formerly ``OMNIGENT_ACCOUNTS_ENABLED``:
-    header is the shipped default, so the var is an enable switch, not
-    a kill switch. The old name is still honored as a deprecated
-    alias — see :func:`_auth_enabled`.)
+    (``OMNIGENT_AUTH_ENABLED`` is the opt-in gate: header is the
+    shipped default, so the var is an enable switch, not a kill switch.)
 
     Validates the source's required env vars at startup (fail
     loud) — OIDC fetches the discovery document, accounts decodes
@@ -723,6 +751,6 @@ def create_auth_provider() -> AuthProvider:
 # Backwards-compatible re-export of forward-referenced config
 # types — both are imported lazily inside `create_auth_provider`
 # to keep startup cost off the import path that doesn't use them.
-if False:  # TYPE_CHECKING equivalent without the import
+if TYPE_CHECKING:
     from omnigent.server.accounts_config import AccountsConfig
     from omnigent.server.oidc import OIDCConfig

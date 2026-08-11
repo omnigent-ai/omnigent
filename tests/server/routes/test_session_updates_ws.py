@@ -582,6 +582,44 @@ def test_session_added_for_inaccessible_session_is_not_pushed(
             )
 
 
+def test_pin_label_collapses_to_canonical_key_on_the_wire(
+    app: FastAPI, stores, fast_rescan: None
+) -> None:
+    """Pins are stored per-user (``omnigent.pinned.<user>``), but the watch
+    stream collapses the caller's own pin key to the canonical
+    ``omnigent.pinned`` and never emits another user's per-user key. Exercised
+    via the normal rescan-diff path: pinning a watched session out of band
+    surfaces on the next ``changed`` frame (``fast_rescan`` shrinks the tick).
+    """
+    from omnigent.stores.conversation_store import pinned_label_key
+
+    conversation_store, _agent_store, _permission_store = stores
+    s1 = _seed_session(stores, owner=ALICE, title="watched")
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+        _recv_until(ws, {"snapshot"})
+        # Pin s1 under Alice's per-user key (as PATCH does), plus a foreign pin
+        # under Bob's key that must NOT leak to Alice.
+        conversation_store.set_labels(
+            s1,
+            {
+                pinned_label_key(ALICE): "1721760000000",
+                pinned_label_key(BOB): "1700000000000",
+            },
+        )
+        changed = _recv_until(ws, {"changed"})
+        items = {item["id"]: item for item in changed["items"]}  # type: ignore[index]
+        assert s1 in items
+        labels = items[s1]["labels"]
+        # Alice's pin surfaces as the canonical bare key…
+        assert labels.get("omnigent.pinned") == "1721760000000"
+        # …and neither per-user key (hers or Bob's) leaks onto the wire.
+        assert pinned_label_key(ALICE) not in labels
+        assert pinned_label_key(BOB) not in labels
+
+
 # ── comments fingerprint ──────────────────────────────────────────────
 
 

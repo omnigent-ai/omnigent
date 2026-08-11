@@ -6,6 +6,8 @@
 // callback directly, while still pinning the pure URL builder contract
 // the server cares about.
 
+import type * as TerminalSessionModule from "./TerminalSession";
+
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,22 +21,24 @@ import {
 } from "./TerminalView";
 
 const terminalSessionMock = vi.hoisted(() => ({
-  instances: [] as Array<{
+  instances: [] as {
     url: string;
     nativeSelection: boolean;
     onState: (state: ConnectionState) => void;
     dispose: ReturnType<typeof vi.fn>;
     setTheme: ReturnType<typeof vi.fn>;
-  }>,
+    focus: ReturnType<typeof vi.fn>;
+  }[],
 }));
 
 vi.mock("./TerminalSession", async (importOriginal) => ({
   // Keep the real module (isUnexpectedTerminalClose and friends) —
   // only the session class itself is replaced.
-  ...(await importOriginal<typeof import("./TerminalSession")>()),
+  ...(await importOriginal<typeof TerminalSessionModule>()),
   TerminalSession: class {
     dispose = vi.fn();
     setTheme = vi.fn();
+    focus = vi.fn();
 
     constructor(
       _container: HTMLDivElement,
@@ -51,6 +55,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         onState,
         dispose: this.dispose,
         setTheme: this.setTheme,
+        focus: this.focus,
       });
     }
   },
@@ -145,6 +150,41 @@ describe("control-mode transport", () => {
     expect(inst.url).not.toContain("transport");
     expect(inst.nativeSelection).toBe(false);
     expect(screen.getByTestId("terminal-selection-hint")).toBeInTheDocument();
+  });
+});
+
+describe("hidden pre-warmed surface", () => {
+  it("keeps one live session across an active flip and focuses on reveal", async () => {
+    // Mount hidden (a pre-warmed attach behind the chat view): the
+    // session dials immediately — that is the whole point of the
+    // pre-warm — but must not take focus away from the composer.
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const inst = terminalSessionMock.instances[0];
+    expect(inst.focus).not.toHaveBeenCalled();
+
+    // Reveal: the SAME session is kept (no re-dial — a second instance
+    // here means the flip reconnected the WebSocket) and focused, since
+    // the WS-open auto-focus was a no-op while hidden.
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+    await waitFor(() => expect(inst.focus).toHaveBeenCalledTimes(1));
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    expect(inst.dispose).not.toHaveBeenCalled();
+
+    // Hiding again neither disposes nor re-focuses.
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />);
+    expect(inst.dispose).not.toHaveBeenCalled();
+    expect(inst.focus).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not focus on a plain active mount (WS-open handles it)", async () => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    // No reveal edge — the session's own WS-open focus owns this case;
+    // an extra explicit call would steal focus on every reconnect.
+    expect(terminalSessionMock.instances[0].focus).not.toHaveBeenCalled();
   });
 });
 
@@ -387,6 +427,50 @@ describe("automatic reconnect", () => {
       // Restore the default prototype getter for later tests.
       delete (document as { visibilityState?: unknown }).visibilityState;
     }
+  });
+
+  it("re-dials with a fresh budget when a hidden warm surface is revealed", async () => {
+    // A warm surface parked behind another session's view: the transport
+    // flaps with nobody watching and the background reconnect loop burns
+    // its whole budget.
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+    );
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(1);
+
+    for (const [, delay] of RECONNECT_BACKOFF_MS.entries()) {
+      closeNewest(1006);
+      // oxlint-disable-next-line no-await-in-loop
+      await elapse(delay);
+    }
+    closeNewest(1006);
+    await elapse(60_000);
+    const exhausted = RECONNECT_BACKOFF_MS.length + 1;
+    expect(terminalSessionMock.instances).toHaveLength(exhausted);
+
+    // Reveal: a user is now looking at the dead pane — that is the retry
+    // signal, same as a tab thaw. One fresh dial, budget restored.
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(exhausted + 1);
+  });
+
+  it("does not resurrect a deliberately closed terminal on reveal", async () => {
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+    );
+    await act(async () => {});
+    closeNewest(4405);
+    await elapse(60_000);
+    expect(terminalSessionMock.instances).toHaveLength(1);
+
+    // The server ended this terminal on purpose; revealing the surface
+    // must keep the dead-end overlay, not loop on the same answer.
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    expect(screen.getByText("Bridge closed: code 4405")).toBeInTheDocument();
   });
 });
 

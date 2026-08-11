@@ -12,6 +12,7 @@
 
 import { createPortal } from "react-dom";
 import {
+  isValidElement,
   lazy,
   Suspense,
   useCallback,
@@ -19,7 +20,9 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
   type RefObject,
+  type UIEvent,
 } from "react";
 import {
   AtSignIcon,
@@ -39,11 +42,13 @@ import remarkEmoji from "remark-emoji";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
-import { type Comment } from "@/hooks/useComments";
+import { mermaid } from "@streamdown/mermaid";
+import { Streamdown } from "streamdown";
+import type { Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
   fileContentToBlob,
-  useFileContent,
+  type useFileContent,
 } from "@/hooks/useFileContent";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
@@ -56,11 +61,13 @@ import {
   indexToLine,
   isBinaryPath,
   isImageFile,
+  isModelFile,
   isNotebookPath,
   isPdfFile,
   lineOverlapsSelection,
 } from "./codeViewerHelpers";
 import { NotebookPreview } from "./NotebookPreview";
+import { useScrollRestore } from "./useScrollRestore";
 import { PreviewSearchBar } from "./PreviewSearchBar";
 import { renderLineTokens } from "./codeViewerRendering";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
@@ -78,6 +85,11 @@ const MonacoCodeEditor = lazy(() =>
 // react-pdf + pdf.js (worker) is heavy; load it only when a PDF is actually
 // viewed so it never enters the initial bundle.
 const PdfViewer = lazy(() => import("./PdfViewer").then((m) => ({ default: m.PdfViewer })));
+
+// three.js (+ its loaders) is heavy; load the 3D model viewer only when a
+// model file is actually opened so it stays out of the main bundle (same
+// lazy strategy as Monaco).
+const ModelViewer = lazy(() => import("./ModelViewer").then((m) => ({ default: m.ModelViewer })));
 
 // ---------------------------------------------------------------------------
 // MarkdownPreview — read-only render of Markdown content via react-markdown + GFM
@@ -126,6 +138,18 @@ const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
   [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
 ];
 
+const MERMAID_STREAMDOWN_PLUGINS = { mermaid };
+
+function MermaidPreview({ source }: { source: string }) {
+  return (
+    <div data-testid="mermaid-preview" className="not-prose my-4 overflow-auto">
+      <Streamdown plugins={MERMAID_STREAMDOWN_PLUGINS}>
+        {`\`\`\`mermaid\n${source.replace(/\n$/, "")}\n\`\`\``}
+      </Streamdown>
+    </div>
+  );
+}
+
 // Tailwind Preflight applies `img { height: auto }`, which overrides the HTML
 // `width`/`height` *attributes* (presentational hints lose to any author CSS).
 // GitHub honors explicit dimensions, so mirror them onto an inline style —
@@ -133,6 +157,16 @@ const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
 // after sanitize (React components render the already-sanitized tree), so it
 // adds no attack surface. Only literal integer pixel values are forwarded.
 const MARKDOWN_COMPONENTS: Components = {
+  pre({ children, ...props }) {
+    const child = isValidElement(children) ? children : null;
+    if (
+      isValidElement<{ className?: string; children?: ReactNode }>(child) &&
+      child.props.className?.split(/\s+/).includes("language-mermaid")
+    ) {
+      return <MermaidPreview source={String(child.props.children ?? "")} />;
+    }
+    return <pre {...props}>{children}</pre>;
+  },
   img({ node: _node, width, height, style, ...props }) {
     const px = (v: string | number | undefined) =>
       typeof v === "number" || (typeof v === "string" && /^\d+$/.test(v)) ? `${v}px` : undefined;
@@ -141,7 +175,6 @@ const MARKDOWN_COMPONENTS: Components = {
       width: px(width) ?? style?.width,
       height: px(height) ?? style?.height,
     };
-    // eslint-disable-next-line jsx-a11y/alt-text -- alt is forwarded via props
     return <img {...props} style={sized} />;
   },
 };
@@ -149,14 +182,17 @@ const MARKDOWN_COMPONENTS: Components = {
 function MarkdownPreview({
   content,
   rootRef,
+  onScroll,
 }: {
   content: string;
   rootRef?: RefObject<HTMLDivElement | null>;
+  onScroll?: (event: UIEvent<HTMLElement>) => void;
 }) {
   return (
     <div
       ref={rootRef}
       data-preview-scroll
+      onScroll={onScroll}
       className="markdown-preview px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none"
     >
       <ReactMarkdown
@@ -181,6 +217,8 @@ function PreviewWithSearch({
   searchOpen,
   onSearchHandled,
   searchInputRef,
+  scrollKey,
+  scrollReady,
 }: {
   content: string;
   isNotebook: boolean;
@@ -188,8 +226,15 @@ function PreviewWithSearch({
   searchOpen: boolean;
   onSearchHandled: () => void;
   searchInputRef: RefObject<HTMLInputElement | null>;
+  /** Persist/restore the preview's scroll position under this cache key. */
+  scrollKey: string | null;
+  /** True once the file content backing the preview is present. */
+  scrollReady: boolean;
 }) {
   const previewRef = useRef<HTMLDivElement>(null);
+  // The preview div (not the FileViewer content area) is the real scroller
+  // here, so scroll persistence attaches to it directly.
+  const handleScroll = useScrollRestore(previewRef, scrollKey, scrollReady);
   const bar = (
     <PreviewSearchBar
       containerRef={previewRef}
@@ -200,9 +245,9 @@ function PreviewWithSearch({
     />
   );
   const preview = isNotebook ? (
-    <NotebookPreview content={content} rootRef={previewRef} />
+    <NotebookPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
   ) : (
-    <MarkdownPreview content={content} rootRef={previewRef} />
+    <MarkdownPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
   );
   // The find bar sits above the preview; a truncated preview also shows the
   // banner. The bar renders nothing when closed, so layout is unchanged then.
@@ -256,7 +301,7 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
   const filename = path.split("/").pop() ?? path;
 
   const body = errored ? (
-    <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+    <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
       {data.truncated
         ? "Image is too large to preview (truncated by the server)."
         : "Unable to render image."}
@@ -491,7 +536,7 @@ export function CodeViewer({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [panelOpen, isMarkdownEditor, showMonaco, searchOpen, setSearchOpen, searchInputRef]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [panelOpen, isMarkdownEditor, showMonaco, searchOpen, setSearchOpen, searchInputRef]);
 
   // In Monaco mode the custom search bar isn't rendered; the editor mirrors its
   // native find widget to `searchOpen` (open when set, close when cleared). This
@@ -555,7 +600,7 @@ export function CodeViewer({
     };
     container.addEventListener("mouseup", handleMouseUp);
     return () => container.removeEventListener("mouseup", handleMouseUp);
-  }, [rawLines]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [rawLines]);
 
   // Dismiss the floating buttons on any mousedown outside of them, or on any
   // scroll. Both the "Add comment" and "Attach to agent" buttons must be
@@ -613,14 +658,14 @@ export function CodeViewer({
 
   if (fileQuery.isLoading) {
     return (
-      <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+      <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
         Loading…
       </div>
     );
   }
   if (fileQuery.isError) {
     return (
-      <div className="p-8 text-destructive text-sm">
+      <div className="p-8 text-destructive text-ui">
         Error loading file:{" "}
         {fileQuery.error instanceof Error ? fileQuery.error.message : String(fileQuery.error)}
       </div>
@@ -633,7 +678,7 @@ export function CodeViewer({
     return (
       <Suspense
         fallback={
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
             Loading…
           </div>
         }
@@ -648,9 +693,22 @@ export function CodeViewer({
       </Suspense>
     );
   }
+  if (fileQuery.data && isModelFile(path, fileQuery.data.content_type)) {
+    return (
+      <Suspense
+        fallback={
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+            Loading 3D preview…
+          </div>
+        }
+      >
+        <ModelViewer data={fileQuery.data} path={path} />
+      </Suspense>
+    );
+  }
   if (fileQuery.data?.encoding === "base64" || isBinaryPath(path)) {
     return (
-      <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+      <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
         Preview not available for binary files.
       </div>
     );
@@ -701,6 +759,8 @@ export function CodeViewer({
         searchOpen={searchOpen}
         onSearchHandled={handleSearchHandled}
         searchInputRef={searchInputRef}
+        scrollKey={conversationId && path ? `viewer-preview:${conversationId}:${path}` : null}
+        scrollReady={fileQuery.data !== undefined}
       />
     );
   }
@@ -709,7 +769,7 @@ export function CodeViewer({
     return (
       <Suspense
         fallback={
-          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
             Loading…
           </div>
         }
@@ -782,9 +842,9 @@ export function CodeViewer({
               }
             }}
             placeholder="Find…"
-            className="min-w-0 flex-1 bg-transparent text-xs outline-none"
+            className="min-w-0 flex-1 bg-transparent text-sm outline-none"
           />
-          <span className="shrink-0 text-xs text-muted-foreground">
+          <span className="shrink-0 text-sm text-muted-foreground">
             {searchQuery.trim()
               ? matches.length > 0
                 ? `${safeMatchIdx + 1} / ${matches.length}`
@@ -824,7 +884,7 @@ export function CodeViewer({
       )}
 
       {/* GitHub Light/Dark backgrounds match the shiki themes used by highlightCode */}
-      <div ref={codeContainerRef} className="font-mono text-xs bg-white dark:bg-[#0d1117]">
+      <div ref={codeContainerRef} className="font-mono text-sm bg-white dark:bg-[#0d1117]">
         {rawLines.map((rawLine, idx) => {
           const lineNum = idx + 1;
           const isMatchLine =
@@ -879,7 +939,7 @@ export function CodeViewer({
                 <div
                   data-gutter-comment={commentOnLine ? true : undefined}
                   className={cn(
-                    "relative w-12 shrink-0 select-none border-r border-border text-xs",
+                    "relative w-12 shrink-0 select-none border-r border-border text-sm",
                     "flex items-center justify-end px-2 py-0.5 leading-5",
                     commentOnLine
                       ? "cursor-pointer text-yellow-500 dark:text-yellow-400 hover:bg-muted/60"
@@ -975,7 +1035,7 @@ export function CodeViewer({
             <button
               data-add-comment-btn
               type="button"
-              className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+              className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
               onClick={() => {
                 onSetActiveSelection({
                   start_index: selectionAnchor.start_index,
@@ -993,7 +1053,7 @@ export function CodeViewer({
               <button
                 data-attach-agent-btn
                 type="button"
-                className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+                className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
                 onClick={() => {
                   // Convert the selection's char offsets to a 1-based inclusive
                   // line span. ``end_index`` is exclusive, so step back one char

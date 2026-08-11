@@ -5,6 +5,10 @@ const fs = require("fs");
 const path = require("path");
 
 const areas = JSON.parse(fs.readFileSync(path.resolve(".github/areas.json"), "utf8")).areas;
+const priorityLabels = new Set(
+  JSON.parse(fs.readFileSync(path.resolve(".github/issue-prioritization-labels.json"), "utf8"))
+    .labels.map((label) => label.name),
+);
 const maint = new Set(
   fs.readFileSync(path.resolve(".github/MAINTAINER"), "utf8")
     .split("\n").map((l) => l.replace(/#.*/, "").trim().toLowerCase()).filter(Boolean)
@@ -32,6 +36,14 @@ for (const a of areas)
 for (const a of areas)
   assert(`area ${a.key} label ${a.label} is a real comp:*`, ALLOWED_LABELS.has(a.label));
 
+// V2 labels are declared separately so the active triage workflow can keep
+// using the legacy label until issue prioritization is enabled.
+for (const a of areas)
+  assert(
+    `area ${a.key} priority_label ${a.priority_label} is declared`,
+    priorityLabels.has(a.priority_label),
+  );
+
 // Every area has >= 2 owners (the 2+ codeowner requirement). Paused owners
 // still count -- pausing someone must not force adding a new active owner.
 for (const a of areas) {
@@ -43,6 +55,19 @@ for (const a of areas) {
 for (const a of areas) {
   assert(`area ${a.key} has a definition`, typeof a.definition === "string" && a.definition.length > 0);
   assert(`area ${a.key} has paths`, Array.isArray(a.paths) && a.paths.length > 0);
+}
+
+// Every area has a weight (importance multiplier for the priority score) drawn
+// from the allowed bands, tagged with its source (telemetry vs editorial).
+const ALLOWED_WEIGHTS = new Set([1.4, 1.2, 1.1, 1.0, 0.9]);
+const ALLOWED_WEIGHT_SOURCES = new Set(["telemetry", "editorial"]);
+for (const a of areas) {
+  assert(`area ${a.key} weight is an allowed band`, ALLOWED_WEIGHTS.has(a.weight), `${a.weight}`);
+  assert(
+    `area ${a.key} weight_source is telemetry|editorial`,
+    ALLOWED_WEIGHT_SOURCES.has(a.weight_source),
+    `${a.weight_source}`,
+  );
 }
 
 // Path resolution (last-match-wins startsWith) sends representative files to the
@@ -59,8 +84,10 @@ const cases = [
   ["omnigent/inner/kiro_native_harness.py", "harness-kiro"],
   ["web/src/main.tsx", "web"],
   ["web/ios/App.swift", "mobile-app"],
+  ["web/android/app/src/main/MainActivity.kt", "android-app"],
   ["web/electron/main.ts", "desktop-app"],
   ["omnigent/server/api.py", "server"],
+  ["omnigent/server/auth.py", "auth"],
 ];
 for (const [fn, key] of cases) {
   const m = resolve(fn);

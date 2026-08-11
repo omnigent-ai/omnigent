@@ -121,6 +121,49 @@ def _list_tmux_clients(socket_path: str, tmux_target: str) -> list[str]:
     return [line for line in proc.stdout.splitlines() if line.strip()]
 
 
+def _tmux_window_activity_at(socket_path: str, tmux_target: str) -> float | None:
+    """
+    Epoch seconds of the last output activity in *tmux_target*'s window.
+
+    tmux stamps ``window_activity`` on every byte a pane emits, making it
+    direct evidence that the terminal's program is producing output —
+    independent of any Omnigent-side status pipeline. Harness-agnostic.
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux target whose window to inspect, e.g. ``"main"``.
+    :returns: Epoch seconds of the window's last activity, or ``None`` when
+        the tmux server/target is gone or the value is unparseable.
+    """
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                socket_path,
+                "display-message",
+                "-p",
+                "-t",
+                tmux_target,
+                "#{window_activity}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_LIST_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return float(proc.stdout.strip())
+    except ValueError:
+        return None
+
+
 def launch_cost_popup(
     socket_path: str,
     tmux_target: str,

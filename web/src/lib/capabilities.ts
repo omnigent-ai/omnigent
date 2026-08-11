@@ -30,25 +30,29 @@ import { hostFetch } from "./host";
  * an unknown/missing value.
  */
 export type SharingMode = "on" | "read_only" | "restricted_read_only" | "off";
-const _SHARING_MODES: readonly SharingMode[] = ["on", "read_only", "restricted_read_only", "off"];
+const SHARING_MODES: readonly SharingMode[] = ["on", "read_only", "restricted_read_only", "off"];
 
 /**
- * Operator branding from ``GET /v1/info``.
+ * Which router can back a Smart Routing pick on this server.
  *
- * - ``app_name`` — null when unset (UI uses "Omnigent").
- * - ``heading`` — null when unset (UI uses its default); an explicit empty
- *   string ``""`` is preserved and hides the hero heading.
- * - ``logos`` — per-variant logo routes (``main``, ``loading``, ``favicon``);
- *   each is null when that variant has no configured file (the UI keeps its
- *   built-in default — the Otto mascot in-app, the shipped favicon in the tab).
- * - ``powered_by`` — whether to show the "Powered by Omnigent" attribution
- *   under the landing composer (only rendered when custom branding is set).
- *   Defaults to true; an explicit false hides it.
+ * ``external`` is the Databricks AI-Gateway ``task_v1`` router (only usable for
+ * a harness family the host runs through the gateway); ``oss`` is the built-in
+ * judge, which needs no gateway backing. A server that predates the field
+ * reports neither, so the parser degrades from ``smart_routing_enabled``.
  */
+export interface SmartRoutingSources {
+  external: boolean;
+  oss: boolean;
+}
+
 export interface Branding {
   app_name: string | null;
   heading: string | null;
-  logos: { main: string | null; loading: string | null; favicon: string | null };
+  logos: {
+    main: string | null;
+    loading: string | null;
+    favicon: string | null;
+  };
   powered_by: boolean;
 }
 
@@ -119,49 +123,78 @@ export interface ServerInfo {
    */
   server_version: string | null;
   /**
-   * True when the server has a routing client configured
-   * (``OMNIGENT_SMART_ROUTING=1`` + ``llm:`` config). Hidden by default.
+   * True when the server has a routing client configured — a server ``llm:``
+   * block, or a ``routing.provider=external`` block.
    */
   smart_routing_enabled: boolean;
   /**
-   * Operator branding (custom app name / hero heading / logo). ``null`` when
-   * the server sets no branding, so the UI uses its built-in defaults.
-   * Optional so older probe payloads / test fixtures that omit it still
-   * satisfy the shape — a missing value is treated the same as ``null``.
+   * Which router backs Smart Routing on this server — the external Databricks
+   * AI-Gateway ``task_v1`` router, the built-in judge, or both. Only the
+   * external router needs the host's harness family on the gateway, so this is
+   * what decides whether an off-gateway family can still be routed. A server
+   * that predates the field reports neither, and the parser degrades from
+   * ``smart_routing_enabled``.
    */
+  smart_routing_sources: SmartRoutingSources;
+  /**
+   * True when the server accepts UI-driven harness installs
+   * (``OMNIGENT_HARNESS_INSTALL_ENABLED=1``). Gates the New Chat dialog's
+   * one-click "Install" action for a missing harness. Fails to ``false`` so a
+   * failed probe never offers an install the server would reject.
+   */
+  harness_install_enabled: boolean;
+  /**
+   * Harness ids the install route accepts (bare ids + native spellings that
+   * resolve to an npm-installable family, e.g. ``"codex"``, ``"codex-native"``).
+   * The dialog offers the one-click install only for a harness in this set, so
+   * it never shows an Install button the server would reject. Empty when
+   * ``harness_install_enabled`` is false (or on a failed probe).
+   */
+  installable_harnesses: string[];
+  /**
+   * True when the server can transcribe dictation audio
+   * (``WS /v1/dictation/stream``; the ``dictation`` extra plus models
+   * are installed). Gates the composer mic button's server
+   * speech-to-text fallback where the browser Web Speech API has no
+   * backend (Electron, Firefox/Chromium).
+   */
+  dictation_available: boolean;
+  /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
 }
 
-/**
- * Normalize the raw ``branding`` blob from ``/v1/info`` into {@link Branding}.
- *
- * Returns null when absent or when every field is empty, so callers can treat
- * "no branding" as a single null check and fall back to defaults.
- */
 function parseBranding(raw: unknown): Branding | null {
   if (raw === null || typeof raw !== "object") return null;
-  const b = raw as Record<string, unknown>;
-  const nonEmpty = (v: unknown): string | null =>
-    typeof v === "string" && v.trim() !== "" ? v : null;
-  const app_name = nonEmpty(b.app_name);
-  // heading preserves an explicit "" (hides the heading); null only when unset.
-  const heading = typeof b.heading === "string" ? b.heading : null;
-  const rawLogos = (b.logos ?? {}) as Record<string, unknown>;
+  const value = raw as Record<string, unknown>;
+  const nonEmpty = (candidate: unknown): string | null =>
+    typeof candidate === "string" && candidate.trim() !== "" ? candidate : null;
+  const rawLogos =
+    value.logos !== null && typeof value.logos === "object"
+      ? (value.logos as Record<string, unknown>)
+      : {};
   const logos = {
     main: nonEmpty(rawLogos.main),
     loading: nonEmpty(rawLogos.loading),
     favicon: nonEmpty(rawLogos.favicon),
   };
-  const noLogos = logos.main === null && logos.loading === null && logos.favicon === null;
-  const powered_by = b.powered_by !== false;
-  if (app_name === null && heading === null && noLogos && powered_by) {
-    return null;
-  }
-  return { app_name, heading, logos, powered_by };
+  const branding = {
+    app_name: nonEmpty(value.app_name),
+    heading: typeof value.heading === "string" ? value.heading : null,
+    logos,
+    powered_by: value.powered_by !== false,
+  };
+  const isEmpty =
+    branding.app_name === null &&
+    branding.heading === null &&
+    logos.main === null &&
+    logos.loading === null &&
+    logos.favicon === null &&
+    branding.powered_by;
+  return isEmpty ? null : branding;
 }
 
 /** Sentinel used when the probe fails — accounts is off, no login URL. */
-const _OFF: ServerInfo = {
+const FALLBACK_SERVER_INFO: ServerInfo = {
   accounts_enabled: false,
   // Fail to multi-user: a failed probe must not hide account/sharing chrome.
   single_user: false,
@@ -176,24 +209,43 @@ const _OFF: ServerInfo = {
   public_sharing_enabled: true,
   server_version: null,
   smart_routing_enabled: false,
+  smart_routing_sources: { external: false, oss: false },
+  harness_install_enabled: false,
+  installable_harnesses: [],
+  dictation_available: false,
   branding: null,
 };
 
-let _cached: ServerInfo | null = null;
-let _pending: Promise<ServerInfo> | null = null;
+/**
+ * Read ``smart_routing_sources`` off the probe payload.
+ *
+ * Missing or non-object (a server that predates the field) degrades to
+ * ``smart_routing_enabled`` on both keys: a server that can route is assumed
+ * able to serve either source, so nothing is hidden on an older build.
+ */
+function parseSmartRoutingSources(raw: unknown, routingEnabled: boolean): SmartRoutingSources {
+  if (typeof raw !== "object" || raw === null) {
+    return { external: routingEnabled, oss: routingEnabled };
+  }
+  const sources = raw as Partial<Record<keyof SmartRoutingSources, unknown>>;
+  return { external: sources.external === true, oss: sources.oss === true };
+}
+
+let cachedServerInfo: ServerInfo | null = null;
+let pendingServerInfo: Promise<ServerInfo> | null = null;
 
 /**
  * Fetch ``/v1/info`` once and cache the result.
  *
- * Resolves to ``_OFF`` on any failure (network error, non-JSON,
+ * Resolves to ``FALLBACK_SERVER_INFO`` on any failure (network error, non-JSON,
  * 5xx). The frontend treats "no probe result" as "accounts is
  * off" — failing closed prevents the accounts UI from rendering
  * against a server that doesn't actually support it.
  */
 export async function resolveServerInfo(): Promise<ServerInfo> {
-  if (_cached !== null) return _cached;
-  if (_pending !== null) return _pending;
-  _pending = (async () => {
+  if (cachedServerInfo !== null) return cachedServerInfo;
+  if (pendingServerInfo !== null) return pendingServerInfo;
+  pendingServerInfo = (async () => {
     try {
       // Route through the host transport (`hostFetch`) so the embed hits the
       // proxied omnigent API; standalone `hostFetch` falls back to plain
@@ -201,7 +253,8 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
       const res = await hostFetch("/v1/info");
       if (res.ok) {
         const data = (await res.json()) as Partial<ServerInfo>;
-        _cached = {
+        const smartRoutingEnabled = data.smart_routing_enabled === true;
+        cachedServerInfo = {
           accounts_enabled: data.accounts_enabled === true,
           single_user: data.single_user === true,
           login_url: typeof data.login_url === "string" ? data.login_url : null,
@@ -210,24 +263,33 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           managed_sandboxes_enabled: data.managed_sandboxes_enabled === true,
           sandbox_provider:
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
-          sharing_mode: _SHARING_MODES.includes(data.sharing_mode as SharingMode)
+          sharing_mode: SHARING_MODES.includes(data.sharing_mode as SharingMode)
             ? (data.sharing_mode as SharingMode)
             : "on",
           // Fail open: only an explicit false disables the public toggle.
           public_sharing_enabled: data.public_sharing_enabled !== false,
           server_version: typeof data.server_version === "string" ? data.server_version : null,
-          smart_routing_enabled: data.smart_routing_enabled === true,
+          smart_routing_enabled: smartRoutingEnabled,
+          smart_routing_sources: parseSmartRoutingSources(
+            data.smart_routing_sources,
+            smartRoutingEnabled,
+          ),
+          harness_install_enabled: data.harness_install_enabled === true,
+          installable_harnesses: Array.isArray(data.installable_harnesses)
+            ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
+            : [],
+          dictation_available: data.dictation_available === true,
           branding: parseBranding(data.branding),
         };
-        return _cached;
+        return cachedServerInfo;
       }
     } catch {
       // Network failure — fall through to the off sentinel.
     }
-    _cached = _OFF;
-    return _cached;
+    cachedServerInfo = FALLBACK_SERVER_INFO;
+    return cachedServerInfo;
   })();
-  return _pending;
+  return pendingServerInfo;
 }
 
 /**
@@ -240,7 +302,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
  * than calling this directly.
  */
 export function getCachedServerInfo(): ServerInfo | null {
-  return _cached;
+  return cachedServerInfo;
 }
 
 /**
@@ -261,7 +323,7 @@ export function isSingleUserMode(info: ServerInfo | "loading"): boolean {
  * not listed here fall back to a title-cased id so a newly-wired
  * provider still reads sensibly without a frontend change.
  */
-const _SANDBOX_PROVIDER_NAMES: Record<string, string> = {
+const SANDBOX_PROVIDER_NAMES: Record<string, string> = {
   modal: "Modal",
   lakebox: "Databricks",
   daytona: "Daytona",
@@ -279,6 +341,6 @@ const _SANDBOX_PROVIDER_NAMES: Record<string, string> = {
 export function sandboxOptionLabel(provider: string | null): string {
   if (!provider) return "New Sandbox";
   const name =
-    _SANDBOX_PROVIDER_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
+    SANDBOX_PROVIDER_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
   return `${name} Sandbox`;
 }

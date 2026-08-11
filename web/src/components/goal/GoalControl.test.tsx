@@ -12,6 +12,25 @@ vi.mock("./GoalDialog", () => ({
   ),
 }));
 
+vi.mock("./CommandGoalDialog", () => ({
+  CommandGoalDialog: ({
+    open,
+    onStartGoal,
+  }: {
+    open: boolean;
+    onStartGoal: (condition: string) => void;
+  }) => (
+    <button
+      type="button"
+      data-testid="mock-command-goal-dialog"
+      data-open={open ? "true" : "false"}
+      onClick={() => onStartGoal("All tests pass")}
+    >
+      Start
+    </button>
+  ),
+}));
+
 const GOAL: Goal = {
   objective: "Ship goal mode",
   status: "active",
@@ -51,6 +70,26 @@ describe("GoalControl", () => {
     renderControl(null);
 
     expect(screen.getByTestId("goal-toggle")).toBeDisabled();
+  });
+
+  it("starts a command-backed goal", () => {
+    const onStartGoal = vi.fn();
+    render(
+      <TooltipProvider>
+        <GoalControl
+          mode="command"
+          conversationId="conv"
+          readOnly={false}
+          onStartGoal={onStartGoal}
+          backendLabel="Claude"
+        />
+      </TooltipProvider>,
+    );
+
+    fireEvent.click(screen.getByTestId("goal-toggle"));
+    expect(screen.getByTestId("mock-command-goal-dialog")).toHaveAttribute("data-open", "true");
+    fireEvent.click(screen.getByTestId("mock-command-goal-dialog"));
+    expect(onStartGoal).toHaveBeenCalledWith("All tests pass");
   });
 
   it("renders the status pill", () => {

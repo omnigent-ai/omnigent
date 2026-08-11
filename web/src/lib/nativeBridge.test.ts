@@ -8,8 +8,12 @@ import {
   nativeNotify,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
+  PRE_MANIFEST_BASELINE,
+  type ServerManifest,
+  serverManifestOf,
   setBadgeCount as bridgeSetBadge,
   setNativeServerSwitcherHidden,
+  setThemeSource,
   supportsBrowser,
 } from "./nativeBridge";
 
@@ -18,6 +22,7 @@ const electronSetBadge = vi.fn();
 const electronNotify = vi.fn().mockResolvedValue(true);
 const electronUnsubscribe = vi.fn();
 const electronOnNotificationActivated = vi.fn().mockReturnValue(electronUnsubscribe);
+const electronSetColorScheme = vi.fn();
 
 // The iOS WKWebView bridge mock, installed on window.omnigentNative.
 const iosSetBadge = vi.fn();
@@ -36,6 +41,7 @@ const androidSetBadge = vi.fn();
 const androidNotify = vi.fn().mockResolvedValue(true);
 const androidUnsubscribe = vi.fn();
 const androidOnNotificationActivated = vi.fn().mockReturnValue(androidUnsubscribe);
+const androidSetColorScheme = vi.fn();
 
 /**
  * Simulate running inside / outside the Electron shell via the preload key.
@@ -50,6 +56,7 @@ function setElectron(on: boolean, withClickRouting = true, withBrowser = false):
     (window as unknown as Record<string, unknown>).omnigentDesktop = {
       kind: "electron",
       setBadgeCount: (...args: unknown[]) => electronSetBadge(...args),
+      setColorScheme: (...args: unknown[]) => electronSetColorScheme(...args),
       notify: (...args: unknown[]) => electronNotify(...args),
       ...(withClickRouting
         ? {
@@ -91,6 +98,7 @@ function setAndroid(on: boolean, withClickRouting = true): void {
     (window as unknown as Record<string, unknown>).omnigentNative = {
       kind: "android",
       setBadgeCount: (...args: unknown[]) => androidSetBadge(...args),
+      setColorScheme: (...args: unknown[]) => androidSetColorScheme(...args),
       notify: (...args: unknown[]) => androidNotify(...args),
       ...(withClickRouting
         ? {
@@ -194,6 +202,95 @@ describe("supportsBrowser", () => {
   it("is false under a non-Electron native shell (iOS)", () => {
     setIOS(true);
     expect(supportsBrowser()).toBe(false);
+  });
+});
+
+describe("serverManifestOf", () => {
+  it("returns the baseline off-shell (no picker payload at all)", () => {
+    expect(serverManifestOf(null)).toEqual(PRE_MANIFEST_BASELINE);
+  });
+
+  it("returns the baseline when an older shell omits the manifest", () => {
+    // A shell that predates the manifest still sends currentOrigin/recents —
+    // it just has no serverManifest field. That must read as "pre-manifest",
+    // not crash or yield undefined, so a new SPA runs on an old shell.
+    const info = {
+      currentOrigin: "http://localhost:6767",
+      recentServers: ["http://localhost:6767/"],
+    };
+    expect(serverManifestOf(info)).toEqual(PRE_MANIFEST_BASELINE);
+    expect(serverManifestOf(info).manifestVersion >= 1).toBe(false);
+  });
+
+  it("passes through a manifest the shell forwarded", () => {
+    const manifest = {
+      manifestVersion: 1,
+      serverVersion: "0.6.0",
+      minDesktopVersion: null,
+      ui: { server_picker: "sidebar" },
+    };
+    expect(
+      serverManifestOf({
+        currentOrigin: "http://localhost:6767",
+        recentServers: [],
+        serverManifest: manifest,
+      }),
+    ).toBe(manifest);
+  });
+
+  it("keeps a newer envelope usable (gates are >=, never ===)", () => {
+    const result = serverManifestOf({
+      currentOrigin: "http://localhost:6767",
+      recentServers: [],
+      serverManifest: {
+        manifestVersion: 99,
+        serverVersion: "9.9.9",
+        minDesktopVersion: null,
+        ui: { server_picker: "some-future-shape" },
+      },
+    });
+    expect(result.manifestVersion >= 1).toBe(true);
+    expect(result.ui.server_picker).toBe("some-future-shape");
+  });
+
+  it("falls back to the baseline on a malformed manifest", () => {
+    // Crosses an IPC boundary from a shell of unknown vintage, so a bad
+    // manifestVersion degrades instead of producing NaN comparisons.
+    const result = serverManifestOf({
+      currentOrigin: "http://localhost:6767",
+      recentServers: [],
+      serverManifest: { manifestVersion: "1" } as unknown as ServerManifest,
+    });
+    expect(result).toEqual(PRE_MANIFEST_BASELINE);
+  });
+});
+
+describe("setThemeSource", () => {
+  it("routes the selected system theme through the Electron bridge", () => {
+    setElectron(true);
+    setThemeSource("system");
+    expect(electronSetColorScheme).toHaveBeenCalledWith("system");
+  });
+
+  it("routes an explicit selected theme through the Electron bridge", () => {
+    setElectron(true);
+    setThemeSource("dark");
+    expect(electronSetColorScheme).toHaveBeenCalledWith("dark");
+  });
+
+  it("routes the selected theme through the Android bridge", () => {
+    setAndroid(true);
+    setThemeSource("light");
+    expect(androidSetColorScheme).toHaveBeenCalledWith("light");
+  });
+
+  it("routes the selected theme through the Android bridge over Electron legacy", () => {
+    setElectron(true);
+    (
+      window as unknown as { omnigentNative?: { kind: string; setColorScheme?: unknown } }
+    ).omnigentNative = undefined;
+    setThemeSource("system");
+    expect(electronSetColorScheme).toHaveBeenCalledWith("system");
   });
 });
 

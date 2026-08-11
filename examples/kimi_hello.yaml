@@ -11,9 +11,8 @@ description: >-
 # under ``examples/polly/`` / ``examples/debby/``.
 executor:
   harness: kimi
-  # Override per-invocation via ``-m kimi-k2-turbo`` or ``/model`` in the REPL.
-  # With no model pinned, Kimi picks the default model set in its config.
-  model: kimi-k2-turbo
+  # Override per-invocation via ``-m <model-id>`` or ``/model`` in the REPL.
+  # Otherwise Kimi uses the default model from its own config.
 
 prompt: |
   You are Kimi Code, running headlessly inside Omnigent. Help the user with
@@ -42,7 +41,7 @@ prompt: |
 # Try it:
 #   omnigent run examples/kimi_hello.yaml
 #   omnigent run examples/kimi_hello.yaml -p "summarise the README"
-#   omnigent run examples/kimi_hello.yaml -m kimi-k2-turbo
+#   omnigent run examples/kimi_hello.yaml -m <model-id>
 #
 # Or as a shortcut for any kimi-harness run:
 #   omnigent kimi -p "list the files in the current directory"

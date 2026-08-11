@@ -271,6 +271,54 @@ def test_update_changes_name(
     assert updated.updated_at > 0
 
 
+def test_update_duplicate_name_raises(
+    store: SqlAlchemyPolicyStore,
+    session_id: str,
+) -> None:
+    """Renaming onto another policy's name in the same session raises IntegrityError."""
+    store.create(
+        policy_id="1c7d1c2f6e2f4a0b8d3e5f6a7b8c9d0e",
+        session_id=session_id,
+        name="first",
+        type="python",
+        handler="mod.func",
+    )
+    store.create(
+        policy_id="2d8e2d3f7f3f5b1c9e4f6a7b8c9d0e1f",
+        session_id=session_id,
+        name="second",
+        type="python",
+        handler="mod.func2",
+    )
+    with pytest.raises(IntegrityError):
+        store.update("2d8e2d3f7f3f5b1c9e4f6a7b8c9d0e1f", session_id, name="first")
+
+
+def test_update_same_name_different_sessions_ok(
+    store: SqlAlchemyPolicyStore,
+    session_id: str,
+    other_session_id: str,
+) -> None:
+    """A rename may collide with a name used in a different session."""
+    store.create(
+        policy_id="3e9f3e4a8a405c2daf5a6b7c8d9e0f1a",
+        session_id=other_session_id,
+        name="shared",
+        type="python",
+        handler="mod.func",
+    )
+    store.create(
+        policy_id="4fa04f5b9b516d3eb06b7c8d9e0f1a2b",
+        session_id=session_id,
+        name="local",
+        type="python",
+        handler="mod.func2",
+    )
+    updated = store.update("4fa04f5b9b516d3eb06b7c8d9e0f1a2b", session_id, name="shared")
+    assert updated is not None
+    assert updated.name == "shared"
+
+
 def test_update_changes_enabled(
     store: SqlAlchemyPolicyStore,
     session_id: str,

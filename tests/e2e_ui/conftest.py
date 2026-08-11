@@ -133,8 +133,18 @@ prompt: You are a friendly assistant. Say hello and answer questions.
 
 executor:
   model: gpt-4o-mini
-  config:
-    harness: openai-agents
+  harness: openai-agents
+
+# ``researcher`` sub-agent declared inline so the sub-agent create tests
+# (mobile workflow, subagent tab title) can spawn a child named
+# "researcher"; the create route rejects an undeclared sub_agent_name.
+tools:
+  researcher:
+    type: agent
+    prompt: You research questions and report findings.
+    executor:
+      model: gpt-4o-mini
+      harness: openai-agents
 
 # Required for PUT /filesystem/{path} seeding in UI tests (e.g. markdown
 # editor comments) — the runner returns 404 when os_env is absent.
@@ -200,8 +210,7 @@ prompt: You are a terse assistant with no filesystem.
 
 executor:
   model: gpt-4o-mini
-  config:
-    harness: openai-agents
+  harness: openai-agents
 """
 _FILES_PROBE_ENV_AGENT_YAML = f"""\
 name: {_FILES_PROBE_ENV_AGENT_NAME}
@@ -209,8 +218,7 @@ prompt: You are a terse assistant with a filesystem.
 
 executor:
   model: gpt-4o-mini
-  config:
-    harness: openai-agents
+  harness: openai-agents
 
 os_env:
   type: caller_process
@@ -291,6 +299,12 @@ def browser_type_launch_args(
     launch_args["args"] = [
         *launch_args.get("args", []),
         f"--host-resolver-rules=MAP {_PUBLIC_LOOPBACK_HOST} 127.0.0.1",
+        # Headless Chromium has no microphone; the dictation test
+        # (chat/test_dictation.py) needs getUserMedia to yield a fake
+        # input stream without a permission prompt. No effect on tests
+        # that never touch media capture.
+        "--use-fake-device-for-media-stream",
+        "--use-fake-ui-for-media-stream",
     ]
     # The pinned Playwright Docker image (the visual-snapshot renderer, both in
     # ui-snapshot.yml and the local regen script) runs as root, where Chromium
@@ -556,6 +570,64 @@ def reset_mock_llm(mock_url: str) -> None:
     resp.raise_for_status()
 
 
+def seed_committed_turn(
+    session_id: str,
+    *,
+    prompt: str,
+    reply: str,
+    response_id: str = "resp_seeded",
+) -> None:
+    """Write one committed user+assistant exchange straight into the store.
+
+    For tests that need a settled transcript to act on (per-message actions
+    anchor on a committed assistant response) but not the model's behaviour.
+    Skips the runner and the LLM entirely, so the test neither waits on a turn
+    nor inherits the mock-LLM harness's flakiness. Seed BEFORE navigating —
+    the chat hydrates its history on load.
+
+    Items are appended through the same store the server writes with, so they
+    are indistinguishable from a real turn's (same shape, ids, FTS rows).
+
+    :param session_id: Session to append to, e.g. ``"conv_abc123"``.
+    :param prompt: User message text, e.g. ``"ping"``.
+    :param reply: Assistant message text, e.g. ``"pong"``.
+    :param response_id: Response id shared by both items — per-message
+        actions pass it as the turn anchor (e.g. a fork's truncation point).
+    :raises RuntimeError: If the server under test isn't one we spawned
+        (``--ui-base-url``), so its database isn't reachable from here.
+    """
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    database_uri = _server_state.get("database_uri")
+    if not database_uri:
+        raise RuntimeError(
+            "seed_committed_turn needs the spawned server's database; it is "
+            "unavailable when running against --ui-base-url."
+        )
+    SqlAlchemyConversationStore(str(database_uri)).append(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=response_id,
+                data=MessageData(role="user", content=[{"type": "input_text", "text": prompt}]),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id=response_id,
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": reply}],
+                    agent="hello_world",
+                ),
+            ),
+        ],
+    )
+
+
 def set_fallback_mock_llm(
     mock_url: str,
     key: str,
@@ -665,9 +737,7 @@ def built_spa(request: pytest.FixtureRequest) -> None:
     pytest sessions or worktrees would clobber each other. A
     cross-process file lock at ``web/.build.lock`` serializes
     builds; the second caller waits for the first to finish and
-    then no-ops past its own build (npm is idempotent enough that
-    double-building is harmless, but the lock keeps the static
-    output consistent during the window the FastAPI app reads it).
+    then no-ops past its own build.
 
     :param request: pytest request — reads ``--ui-base-url`` /
         ``--ui-skip-build``.
@@ -681,17 +751,27 @@ def built_spa(request: pytest.FixtureRequest) -> None:
 
     lock_path = _WEB_DIR / ".build.lock"
     with filelock.FileLock(str(lock_path), timeout=600):
-        # --legacy-peer-deps: package-lock.json already pins the tree;
-        # without this flag npm spends the full job re-resolving the
-        # @emoji-mart/react / React 19 peer conflict. This matches the
-        # workflow-side fix for parity with local runs and the case
-        # where conftest installs override CI's build.
+        # pnpm frozen-lockfile uses the root workspace lockfile, which
+        # keeps the pinned tree matching CI and avoids re-resolving the
+        # React peer conflicts that used to require --legacy-peer-deps.
+        # COREPACK_ENABLE_DOWNLOAD_PROMPT=0 keeps a corepack `pnpm` shim
+        # from blocking on its download confirmation under captured
+        # pytest output, which reads as a hung test run.
+        env = {**os.environ, "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
         subprocess.run(
-            ["npm", "ci", "--legacy-peer-deps", "--no-audit", "--no-fund"],
-            cwd=_WEB_DIR,
+            ["pnpm", "install", "--frozen-lockfile", "--filter", "web"],
+            cwd=_REPO_ROOT,
             check=True,
+            stdin=subprocess.DEVNULL,
+            env=env,
         )
-        subprocess.run(["npm", "run", "build"], cwd=_WEB_DIR, check=True)
+        subprocess.run(
+            ["pnpm", "--filter", "web", "run", "build"],
+            cwd=_REPO_ROOT,
+            check=True,
+            stdin=subprocess.DEVNULL,
+            env=env,
+        )
 
     _assert_pwa_build(_BUILD_OUTPUT)
 
@@ -883,6 +963,10 @@ def live_server(
         "OPENAI_API_KEY": "mock-key",
         # Strip any ambient Anthropic credentials so they don't leak in.
         "ANTHROPIC_API_KEY": "",
+        # Deterministic dictation engine: /v1/info advertises dictation and
+        # WS /v1/dictation/stream transcribes any audio into FAKE_SCRIPT,
+        # so chat/test_dictation.py needs no sherpa models or real ASR.
+        "OMNIGENT_DICTATION_ENGINE": os.environ.get("OMNIGENT_DICTATION_ENGINE", "fake"),
     }
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime; closed in finally
     proc = subprocess.Popen(
@@ -1006,6 +1090,9 @@ def live_server(
     _server_state["binding_token"] = binding_token
     _server_state["server_url"] = base_url
     _server_state["mock_llm_url"] = mock_url
+    # Exposed so a test can seed a committed transcript straight into the
+    # store (see :func:`seed_committed_turn`) instead of driving the LLM.
+    _server_state["database_uri"] = f"sqlite:///{db_path}"
 
     # Set a non-resettable fallback for the policy-classifier LLM queue so
     # every per-test reset leaves the server's guardrails path functional.
@@ -1320,8 +1407,7 @@ prompt: |
 
 executor:
   model: gpt-4o-mini
-  config:
-    harness: openai-agents
+  harness: openai-agents
 
 os_env:
   type: caller_process
@@ -1495,12 +1581,14 @@ class TwoAgentChatSession:
         carries, e.g. ``"vogon-3a7f9c2e1b"``.
     :param question_code: Per-run nonce only Deep Thought's QUESTION reply
         carries (round 2), e.g. ``"babelfish-9c2e1b3a7f"``.
+    :param routing_token: Per-run token that selects Arthur's mock queue.
     """
 
     base_url: str
     session_id: str
     verification_code: str
     question_code: str
+    routing_token: str
 
 
 def _two_agent_chat_yaml(verification_code: str, question_code: str) -> str:
@@ -1583,15 +1671,18 @@ tools:
 @pytest.fixture
 def two_agent_chat_session(
     live_server: str,
+    mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[TwoAgentChatSession]:
     """Create a runner-bound session for the two-agent Hitchhiker's chat.
 
     Same runner-respawn and bind contract as :func:`terminal_session`.
-    Yields the per-run nonces so the test can assert that the sub-agent's
-    replies (and only the sub-agent's) reached the UI.
+    Separate content-routed mock queues drive Arthur and Deep Thought,
+    including both dispatch, child, and auto-wake turns. The original
+    model ids remain in the spec for a future real-gateway job.
 
     :param live_server: Spawned server fixture.
+    :param mock_llm_server_url: Mock LLM server used by credential-free runs.
     :param tmp_path_factory: Pytest temp path factory (for a respawn log).
     :returns: A :class:`TwoAgentChatSession` handle.
     """
@@ -1600,7 +1691,66 @@ def two_agent_chat_session(
 
     verification_code = f"vogon-{uuid.uuid4().hex[:10]}"
     question_code = f"babelfish-{uuid.uuid4().hex[:10]}"
+    suffix = uuid.uuid4().hex[:10]
+    routing_token = f"hitchhiker-parent-{suffix}"
+    child_token = f"hitchhiker-child-{suffix}"
     yaml_text = _two_agent_chat_yaml(verification_code, question_code)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_deep_thought_answer",
+                        "name": "sys_session_send",
+                        "arguments": json.dumps(
+                            {
+                                "agent": "deep_thought",
+                                "title": "deep_thought",
+                                "args": (
+                                    "What is the Answer to the Ultimate Question? "
+                                    f"Routing marker: {child_token}"
+                                ),
+                            }
+                        ),
+                    }
+                ]
+            },
+            {"text": "Dispatched Deep Thought; waiting for the answer."},
+            {"text": f"Deep Thought replied: 42. Verification code: {verification_code}."},
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_deep_thought_question",
+                        "name": "sys_session_send",
+                        "arguments": json.dumps(
+                            {
+                                "agent": "deep_thought",
+                                "title": "deep_thought",
+                                "args": (
+                                    "What is the Ultimate Question itself? "
+                                    f"Routing marker: {child_token}"
+                                ),
+                            }
+                        ),
+                    }
+                ]
+            },
+            {"text": "Dispatched the follow-up; waiting for the question."},
+            {"text": f"Deep Thought replied with question code {question_code}."},
+        ],
+        key=routing_token,
+        match=routing_token,
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": f"The Answer is 42. Verification code: {verification_code}."},
+            {"text": f"The Ultimate Question is unknown. Question code: {question_code}."},
+        ],
+        key=child_token,
+        match=child_token,
+    )
     respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
 
@@ -1635,6 +1785,7 @@ def two_agent_chat_session(
             session_id=session_id,
             verification_code=verification_code,
             question_code=question_code,
+            routing_token=routing_token,
         )
     finally:
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
@@ -1804,6 +1955,101 @@ def approval_session(
                 respawned_runner.wait(timeout=5)
 
 
+# ---------------------------------------------------------------------------
+# Tool-run fold probe: an ``os_env`` agent whose mock LLM queue emits a
+# deterministic sys_os_shell("ls") → sys_os_read("README.md") tool sequence,
+# then a short text reply. Used to assert the chat view's collapsed tool-run
+# summary carries the semantic action label ("Listed 1 directory, read 1
+# file") rather than a generic step count. Same registration/bind contract
+# as :func:`approval_session`, minus the guardrails block (nothing gated).
+# ---------------------------------------------------------------------------
+
+_TOOL_FOLD_AGENT_NAME = "tool_fold_probe"
+_TOOL_FOLD_AGENT_YAML = """\
+spec_version: 1
+name: {name}
+prompt: |
+  You are a deterministic tool-run assistant. When the user asks you to
+  inspect the workspace, you MUST do exactly this and nothing else:
+
+  1. Call sys_os_shell with command set to exactly: ls
+  2. Call sys_os_read with path set to exactly: README.md
+  3. Reply with one short sentence.
+
+executor:
+  model: {model}
+  config:
+    harness: openai-agents
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+"""
+
+
+@pytest.fixture
+def tool_fold_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session whose turn runs a shell + read tool pair.
+
+    The mock queue is keyed by a per-fixture unique model name (same
+    isolation rationale as :func:`approval_session`): two tool-call
+    responses, then a text fallback for the wrap-up LLM call.
+
+    :param live_server: Spawned server fixture.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``. Send any turn to run the
+        deterministic ls → read → reply sequence.
+    """
+    import json as _json
+    import uuid as _uuid
+
+    model = f"tool-fold-probe-{_uuid.uuid4().hex[:8]}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_ls",
+                        "name": "sys_os_shell",
+                        "arguments": _json.dumps({"command": "ls"}),
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_read",
+                        "name": "sys_os_read",
+                        "arguments": _json.dumps({"path": "README.md"}),
+                    }
+                ]
+            },
+        ],
+        key=model,
+    )
+    set_fallback_mock_llm(mock_llm_server_url, model, "Workspace inspected.")
+
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    yaml_text = _TOOL_FOLD_AGENT_YAML.format(name=_TOOL_FOLD_AGENT_NAME, model=model)
+    session_id = _create_bundled_session(live_server, runner_id, yaml_text)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            respawned.wait(timeout=5)
+
+
 @pytest.fixture(autouse=True)
 def _ui_defaults() -> None:
     """
@@ -1881,7 +2127,7 @@ def server_pid(live_server: str) -> int:
 # 1 + executor.config.harness routes through the strict parser; arcname
 # config.yaml keeps it on that path.
 _CUSTOM_AGENT_NAME = "echo_probe"
-_CLAUDE_MOCK_MODEL = "claude-3-5-sonnet-20241022"
+_CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
 _CODEX_MOCK_MODEL = "gpt-4o"
 _CUSTOM_AGENT_YAML = f"""\
 spec_version: 1
@@ -2156,7 +2402,8 @@ def _create_native_codex_session(base_url: str, runner_id: str) -> str:
     auto-bootstrap: it launches Codex in the session terminal, derives the
     gateway auth from its own credentials, and pre-accepts the first-run
     trust/onboarding prompts — no CLI client required. ``model=None`` lets the
-    configured provider's default model win (matching ``_build_codex_native_bundle``).
+    configured provider's default model win (matching the seeded codex bundle
+    built via ``_build_native_bundle``).
 
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.
@@ -2253,13 +2500,12 @@ def _temp_omnigent_mock_config(
 ) -> Generator[None, None, None]:
     """Temporarily write a mock provider config to ~/.omnigent/config.yaml.
 
-    The runner reads this at terminal-creation time, so it only needs to be
-    in place between the PATCH that binds a session to the runner (which
-    triggers auto-boot) and the terminal connecting. Restores the original
-    file (or removes it) on exit.
+    Native credential helpers may read provider configuration on every turn,
+    so the mock config stays in place for the fixture's full lifetime.
+    Restores the original file (or removes it) on exit.
 
     :param mock_llm_server_url: Base URL of the mock LLM server, e.g.
-        ``"http://127.0.0.1:51235"``. No /v1 suffix — each SDK appends it.
+        ``"http://127.0.0.1:51235"``.
     :param harness: ``"claude"`` or ``"codex"``.
     """
     config_dir = Path.home() / ".omnigent"
@@ -2286,7 +2532,7 @@ def _temp_omnigent_mock_config(
                 kind: key
                 default: [openai]
                 openai:
-                  base_url: "{mock_llm_server_url}"
+                  base_url: "{mock_llm_server_url}/v1"
                   api_key: "mock-key"
                   wire_api: responses
                   models:
@@ -2331,17 +2577,17 @@ def native_claude_mock_session(
         ctx = contextlib.nullcontext()
     with ctx:
         session_id = _create_native_claude_session(live_server, runner_id)
-    try:
-        yield (live_server, session_id)
-    finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        if respawned is not None:
-            respawned.terminate()
-            try:
-                respawned.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                respawned.kill()
-                respawned.wait(timeout=5)
+        try:
+            yield (live_server, session_id)
+        finally:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+            if respawned is not None:
+                respawned.terminate()
+                try:
+                    respawned.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    respawned.kill()
+                    respawned.wait(timeout=5)
 
 
 @pytest.fixture
@@ -2369,17 +2615,17 @@ def native_codex_mock_session(
         ctx = contextlib.nullcontext()
     with ctx:
         session_id = _create_native_codex_session(live_server, runner_id)
-    try:
-        yield (live_server, session_id)
-    finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        if respawned is not None:
-            respawned.terminate()
-            try:
-                respawned.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                respawned.kill()
-                respawned.wait(timeout=5)
+        try:
+            yield (live_server, session_id)
+        finally:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+            if respawned is not None:
+                respawned.terminate()
+                try:
+                    respawned.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    respawned.kill()
+                    respawned.wait(timeout=5)
 
 
 @dataclass(frozen=True)

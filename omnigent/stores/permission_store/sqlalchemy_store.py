@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from sqlalchemy import delete, exists, literal, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import CursorResult
+from sqlalchemy.sql.dml import Insert
 
 from omnigent.db.db_models import SqlSessionPermission, SqlUser, current_workspace_id
-from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
+from omnigent.db.utils import get_or_create_engine, make_named_managed_session_maker
 from omnigent.entities import Account, ResolvedAccess, SessionPermission
 from omnigent.server.auth import (
     LEVEL_OWNER,
@@ -70,7 +74,10 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """
         super().__init__(storage_location)
         self._engine = get_or_create_engine(storage_location)
-        self._session = make_managed_session_maker(self._engine)
+        self._session = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.permission_store",
+        )
 
     def grant(
         self,
@@ -79,13 +86,14 @@ class SqlAlchemyPermissionStore(PermissionStore):
         level: int,
     ) -> SessionPermission:
         """Upsert a permission grant. See base class for contract."""
-        with self._session() as session:
+        with self._session("grant_permission") as session:
             dialect = self._engine.dialect.name
             values = {
                 "user_id": user_id,
                 "conversation_id": conversation_id,
                 "level": level,
             }
+            stmt: Insert
             if dialect == "sqlite":
                 stmt = (
                     sqlite_insert(SqlSessionPermission)
@@ -120,19 +128,22 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
     def revoke(self, user_id: str, conversation_id: str) -> bool:
         """Remove a permission grant. See base class for contract."""
-        with self._session() as session:
-            result = session.execute(
-                delete(SqlSessionPermission).where(
-                    SqlSessionPermission.workspace_id == current_workspace_id(),
-                    SqlSessionPermission.user_id == user_id,
-                    SqlSessionPermission.conversation_id == conversation_id,
-                )
+        with self._session("revoke_permission") as session:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    delete(SqlSessionPermission).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.user_id == user_id,
+                        SqlSessionPermission.conversation_id == conversation_id,
+                    )
+                ),
             )
             return result.rowcount > 0
 
     def get(self, user_id: str, conversation_id: str) -> SessionPermission | None:
         """Look up a single grant. See base class for contract."""
-        with self._session() as session:
+        with self._session("select_permission") as session:
             row = session.get(
                 SqlSessionPermission, (current_workspace_id(), user_id, conversation_id)
             )
@@ -157,7 +168,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         :returns: The number of grants repointed to *to_user_id*.
         """
         moved = 0
-        with self._session() as session:
+        with self._session("reassign_user_grants") as session:
             # FK target: ensure the destination users.id row exists. Don't
             # downgrade an existing admin flag; only create it if missing.
             if session.get(SqlUser, (current_workspace_id(), to_user_id)) is None:
@@ -173,52 +184,81 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 .scalars()
                 .all()
             )
-            for row in rows:
-                conversation_id = row.conversation_id
-                if (
-                    session.get(
-                        SqlSessionPermission,
-                        (current_workspace_id(), to_user_id, conversation_id),
+            if not rows:
+                return 0
+            conversation_ids = [r.conversation_id for r in rows]
+            # Single query: which conversation_ids does to_user already hold?
+            existing_to = set(
+                session.execute(
+                    select(SqlSessionPermission.conversation_id).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.user_id == to_user_id,
+                        SqlSessionPermission.conversation_id.in_(conversation_ids),
                     )
-                    is not None
-                ):
-                    # Destination already has access — drop the duplicate.
-                    session.delete(row)
-                    continue
-                # user_id is part of the PK, so repoint with a targeted Core
-                # UPDATE rather than mutating the ORM object's primary key.
+                ).scalars()
+            )
+            # Partition into duplicates (to_user already has access) vs. reassigns.
+            duplicate_ids = [cid for cid in conversation_ids if cid in existing_to]
+            reassign_ids = [cid for cid in conversation_ids if cid not in existing_to]
+            # Bulk delete duplicates (to_user already has the grant).
+            if duplicate_ids:
+                session.execute(
+                    delete(SqlSessionPermission).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.user_id == from_user_id,
+                        SqlSessionPermission.conversation_id.in_(duplicate_ids),
+                    )
+                )
+            # Bulk UPDATE reassigns in one statement.
+            if reassign_ids:
+                # user_id is part of the PK, so use a Core UPDATE.
                 session.execute(
                     update(SqlSessionPermission)
                     .where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == from_user_id,
-                        SqlSessionPermission.conversation_id == conversation_id,
+                        SqlSessionPermission.conversation_id.in_(reassign_ids),
                     )
                     .values(user_id=to_user_id)
                 )
-                moved += 1
+                moved = len(reassign_ids)
             return moved
 
-    def list_for_session(self, conversation_id: str) -> list[SessionPermission]:
-        """Return all grants on a session. See base class for contract."""
-        with self._session() as session:
-            rows = (
-                session.execute(
-                    select(SqlSessionPermission).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.conversation_id == conversation_id,
-                    )
+    def list_for_session(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 100,
+        after_user_id: str | None = None,
+    ) -> tuple[list[SessionPermission], str | None]:
+        """Return grants on a session with cursor pagination. See base class for contract."""
+        with self._session("list_session_permissions") as session:
+            stmt = (
+                select(SqlSessionPermission)
+                .where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.conversation_id == conversation_id,
                 )
-                .scalars()
-                .all()
+                .order_by(SqlSessionPermission.user_id.asc())
+                .limit(limit + 1)
             )
-            return [_to_entity(r) for r in rows]
+            if after_user_id is not None:
+                stmt = stmt.where(SqlSessionPermission.user_id > after_user_id)
+            rows = session.execute(stmt).scalars().all()
+        if len(rows) > limit:
+            rows = rows[:limit]
+            # Cursor is the last returned user_id; the next page uses an
+            # exclusive ``user_id > after_user_id`` filter.
+            next_cursor: str | None = rows[-1].user_id
+        else:
+            next_cursor = None
+        return [_to_entity(r) for r in rows], next_cursor
 
     def list_for_sessions(self, conversation_ids: list[str]) -> dict[str, list[SessionPermission]]:
         """Return all grants for multiple sessions.  See base class for contract."""
         if not conversation_ids:
             return {}
-        with self._session() as session:
+        with self._session("list_permissions_for_sessions") as session:
             # Convert to entities inside the session so ORM attributes are
             # accessed while the session is still open (avoids DetachedInstanceError).
             entities = [
@@ -237,15 +277,17 @@ class SqlAlchemyPermissionStore(PermissionStore):
             result[entity.conversation_id].append(entity)
         return result
 
-    def list_for_user(self, user_id: str) -> list[SessionPermission]:
+    def list_for_user(self, user_id: str, *, limit: int = 1000) -> list[SessionPermission]:
         """Return all grants for a user. See base class for contract."""
-        with self._session() as session:
+        with self._session("list_user_permissions") as session:
             rows = (
                 session.execute(
-                    select(SqlSessionPermission).where(
+                    select(SqlSessionPermission)
+                    .where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == user_id,
                     )
+                    .limit(limit)
                 )
                 .scalars()
                 .all()
@@ -254,9 +296,10 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
     def ensure_user(self, user_id: str, *, is_admin: bool = False) -> None:
         """Upsert a user row. See base class for contract."""
-        with self._session() as session:
+        with self._session("ensure_user") as session:
             dialect = self._engine.dialect.name
             values = {"id": user_id, "is_admin": is_admin}
+            stmt: Insert
             if dialect == "sqlite":
                 stmt = (
                     sqlite_insert(SqlUser)
@@ -278,12 +321,14 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 )
             session.execute(stmt)
 
-    def list_users(self) -> list[Account]:
+    def list_users(self, *, limit: int = 1000) -> list[Account]:
         """List every real user row. See base class for contract."""
-        with self._session() as session:
+        with self._session("list_users") as session:
             rows = (
                 session.execute(
-                    select(SqlUser).where(SqlUser.workspace_id == current_workspace_id())
+                    select(SqlUser)
+                    .where(SqlUser.workspace_id == current_workspace_id())
+                    .limit(limit)
                 )
                 .scalars()
                 .all()
@@ -292,13 +337,13 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
     def is_admin(self, user_id: str) -> bool:
         """Check the admin flag. See base class for contract."""
-        with self._session() as session:
+        with self._session("select_user_admin_status") as session:
             row = session.get(SqlUser, (current_workspace_id(), user_id))
             return row is not None and row.is_admin
 
     def set_admin(self, user_id: str, is_admin: bool) -> None:
         """Set the admin flag on an existing user. See base class for contract."""
-        with self._session() as session:
+        with self._session("set_user_admin_status") as session:
             session.execute(
                 update(SqlUser)
                 .where(
@@ -364,7 +409,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         # paying three separate checkout/BEGIN/COMMIT cycles (which is what
         # calling is_admin + check_access + get_permission_level separately
         # did — see the GET /v1/sessions/{id} snapshot path).
-        with self._session() as session:
+        with self._session("resolve_access") as session:
             user_row = session.get(SqlUser, (current_workspace_id(), user_id))
             user_grant = session.get(
                 SqlSessionPermission, (current_workspace_id(), user_id, conversation_id)
@@ -381,7 +426,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
     def has_any_grants(self, conversation_id: str) -> bool:
         """Check for any permission rows. See base class for contract."""
-        with self._session() as session:
+        with self._session("select_user_grant_presence") as session:
             return session.execute(
                 select(
                     exists().where(

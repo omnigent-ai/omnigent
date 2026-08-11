@@ -99,6 +99,22 @@ function freshAuthHeaders(fallback) {
   return fallback || {};
 }
 
+// Return the relay URL and token from config.json when available. The runner
+// writes relayUrl + relayToken into config.json after the tool relay starts,
+// so policy POSTs can use the relay's non-expiring local token instead of a
+// baked server bearer.
+function relayCredentials() {
+  const cfg = readConfig();
+  if (
+    cfg &&
+    typeof cfg.relayUrl === "string" &&
+    typeof cfg.relayToken === "string"
+  ) {
+    return { url: cfg.relayUrl, token: cfg.relayToken };
+  }
+  return null;
+}
+
 /**
  * Evaluate a TOOL_CALL policy for a native Pi tool via the Omnigent server's
  * session-level HTTP endpoint (POST /v1/sessions/{sessionId}/policies/evaluate).
@@ -153,7 +169,11 @@ async function evalNativePolicyHttp(config, toolName, args) {
     typeof fetch !== "function"
   )
     return null;
-  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
+  // Prefer relay (non-expiring local token); fall back to direct server call.
+  const relay = relayCredentials();
+  const url = relay
+    ? `${relay.url}/policies/evaluate`
+    : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
   // Mint one stable re-attach id for this tool call. Every (re)POST carries
   // it so a re-park lands on the SAME elicitation — no duplicate approval
   // card. Kept for the whole call, across both the park loop and any
@@ -168,10 +188,15 @@ async function evalNativePolicyHttp(config, toolName, args) {
     },
     _omnigent_elicitation_id: elicitationId,
   });
-  const reqHeaders = {
-    "content-type": "application/json",
-    ...freshAuthHeaders(config.authHeaders),
-  };
+  const reqHeaders = relay
+    ? {
+        "content-type": "application/json",
+        authorization: `Bearer ${relay.token}`,
+      }
+    : {
+        "content-type": "application/json",
+        ...freshAuthHeaders(config.authHeaders),
+      };
 
   const parkDeadline = Date.now() + _PARK_TOTAL_BUDGET_MS;
   // Independent transient-error budget so a server that is actually down
@@ -1126,6 +1151,7 @@ module.exports = function (pi) {
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
   const postedReasoning = new Set();
+  const streamedReasoningBlocks = new Set();
   const toolCallsById = new Map();
   const pendingInterruptMs = 30_000;
   // Live streaming state for assistant text deltas. Pi emits
@@ -1196,6 +1222,157 @@ module.exports = function (pi) {
         });
       }
     }
+  }
+
+  let taskList = [];
+
+  function normalizeTaskList(value) {
+    if (!Array.isArray(value)) return null;
+    const statuses = new Set(["not-started", "in-progress", "completed"]);
+    const normalized = [];
+    for (const task of value) {
+      if (
+        !task ||
+        typeof task !== "object" ||
+        !Number.isInteger(task.id) ||
+        typeof task.title !== "string" ||
+        typeof task.description !== "string" ||
+        !statuses.has(task.status)
+      ) {
+        return null;
+      }
+      normalized.push({
+        id: task.id,
+        title: task.title,
+        description: task.description,
+        status: task.status,
+      });
+    }
+    return normalized;
+  }
+
+  async function publishTaskList() {
+    const status = {
+      "not-started": "pending",
+      "in-progress": "in_progress",
+      completed: "completed",
+    };
+    await postEvent(config, {
+      type: "external_session_todos",
+      data: {
+        todos: taskList.map((task) => ({
+          content: task.title,
+          status: status[task.status],
+          activeForm: task.description || task.title,
+        })),
+      },
+    });
+  }
+
+  function restoreTaskList(ctx) {
+    taskList = [];
+    const entries =
+      ctx &&
+      ctx.sessionManager &&
+      typeof ctx.sessionManager.getBranch === "function"
+        ? ctx.sessionManager.getBranch()
+        : [];
+    for (const entry of entries) {
+      const message = entry && entry.type === "message" ? entry.message : null;
+      if (
+        !message ||
+        message.role !== "toolResult" ||
+        message.toolName !== "manage_todo_list"
+      ) {
+        continue;
+      }
+      const restored = normalizeTaskList(
+        message.details && message.details.todos,
+      );
+      if (restored) taskList = restored;
+    }
+  }
+
+  function registerTaskToolIfMissing() {
+    if (typeof pi.registerTool !== "function") return;
+    const existing =
+      typeof pi.getAllTools === "function"
+        ? pi.getAllTools().some((tool) => tool.name === "manage_todo_list")
+        : false;
+    if (existing) return;
+    pi.registerTool({
+      name: "manage_todo_list",
+      label: "Task Plan",
+      description:
+        "Read or replace the task plan shown in the Omnigent Tasks panel.",
+      promptSnippet: "Read or replace the current task plan",
+      promptGuidelines: [
+        "For every multi-step task, you must call manage_todo_list before using other tools to create a plan, then update it after each step until all tasks are completed.",
+      ],
+      parameters: {
+        type: "object",
+        properties: {
+          operation: { type: "string", enum: ["read", "write"] },
+          todoList: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "integer" },
+                title: { type: "string" },
+                description: { type: "string" },
+                status: {
+                  type: "string",
+                  enum: ["not-started", "in-progress", "completed"],
+                },
+              },
+              required: ["id", "title", "description", "status"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["operation"],
+        additionalProperties: false,
+      },
+      async execute(_toolCallId, params) {
+        if (params && params.operation === "read") {
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(taskList, null, 2) },
+            ],
+            details: { operation: "read", todos: taskList },
+          };
+        }
+        if (!params || params.operation !== "write") {
+          throw new Error("operation must be read or write");
+        }
+        const next = normalizeTaskList(params.todoList);
+        if (!next) throw new Error("todoList must contain valid task items");
+        taskList = next;
+        await publishTaskList();
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Task plan updated (${taskList.length} task${taskList.length === 1 ? "" : "s"}).`,
+            },
+          ],
+          details: { operation: "write", todos: taskList },
+        };
+      },
+    });
+  }
+
+  async function syncTaskListFromResult(event) {
+    if (!event || event.toolName !== "manage_todo_list" || event.isError)
+      return;
+    const result =
+      event.result && typeof event.result === "object" ? event.result : event;
+    const next = normalizeTaskList(result.details && result.details.todos);
+    if (!next) return;
+    const changed = JSON.stringify(next) !== JSON.stringify(taskList);
+    taskList = next;
+    if (changed) await publishTaskList();
   }
 
   // Cumulative session token usage. Pi reports PER-MESSAGE counts (one
@@ -1388,13 +1565,19 @@ module.exports = function (pi) {
     });
   }
 
-  async function postReasoningText(text, responseId, keyHint) {
+  async function postCompletedReasoning(text, responseId, keyHint, streamed) {
     if (typeof text !== "string" || !text.trim()) return;
     const textKey = `${responseId}:text:${fingerprint(text)}`;
     const key = `${responseId}:${keyHint || fingerprint(text)}`;
     if (postedReasoning.has(key) || postedReasoning.has(textKey)) return;
     postedReasoning.add(key);
     postedReasoning.add(textKey);
+    if (!streamed) {
+      await postEvent(config, {
+        type: "external_output_reasoning_delta",
+        data: { delta: text, started: true },
+      });
+    }
     await postEvent(config, {
       type: "external_conversation_item",
       data: {
@@ -1406,6 +1589,21 @@ module.exports = function (pi) {
           content: [{ type: "reasoning_text", text }],
         },
       },
+    });
+  }
+
+  function reasoningBlockKey(responseId, contentIndex) {
+    return `${responseId}:msg:${streamingMessageOrdinal}:thinking:${contentIndex}`;
+  }
+
+  async function postReasoningDelta(update, responseId) {
+    if (typeof update.delta !== "string" || !update.delta) return;
+    const blockKey = reasoningBlockKey(responseId, update.contentIndex);
+    const started = !streamedReasoningBlocks.has(blockKey);
+    streamedReasoningBlocks.add(blockKey);
+    await postEvent(config, {
+      type: "external_output_reasoning_delta",
+      data: { delta: update.delta, started },
     });
   }
 
@@ -1475,7 +1673,13 @@ module.exports = function (pi) {
       if (block.type === "thinking") {
         const text = typeof block.thinking === "string" ? block.thinking : "";
         const key = block.thinkingSignature || `${turnOrdinal}:${index}`;
-        await postReasoningText(text, responseId, key);
+        const blockKey = reasoningBlockKey(responseId, index);
+        await postCompletedReasoning(
+          text,
+          responseId,
+          key,
+          streamedReasoningBlocks.has(blockKey),
+        );
       }
     }
   }
@@ -1492,6 +1696,9 @@ module.exports = function (pi) {
 
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
+    registerTaskToolIfMissing();
+    restoreTaskList(ctx);
+    if (taskList.length) await publishTaskList();
     setOmnigentStatus(config, ctx, "linked");
     startInboxPoller(
       pi,
@@ -1526,6 +1733,11 @@ module.exports = function (pi) {
       type: "external_session_status",
       data: { status: "idle", response_id: `pi-${Date.now()}-${++sequence}` },
     });
+  });
+
+  pi.on("session_tree", async (_event, ctx) => {
+    restoreTaskList(ctx);
+    await publishTaskList();
   });
 
   pi.on("model_select", async (event, ctx) => {
@@ -1563,6 +1775,7 @@ module.exports = function (pi) {
     postedToolCalls.clear();
     postedToolResults.clear();
     postedReasoning.clear();
+    streamedReasoningBlocks.clear();
     toolCallsById.clear();
     streamedTextIndex.clear();
     finalizedTextBlocks.clear();
@@ -1630,13 +1843,23 @@ module.exports = function (pi) {
       await postTextDelta(update, responseId);
       return;
     }
+    if (update.type === "thinking_delta") {
+      await postReasoningDelta(update, responseId);
+      return;
+    }
     if (update.type === "toolcall_end") {
       await postToolCall(update.toolCall, responseId);
       return;
     }
     if (update.type === "thinking_end") {
       const key = `${turnOrdinal}:${update.contentIndex}`;
-      await postReasoningText(update.content, responseId, key);
+      const blockKey = reasoningBlockKey(responseId, update.contentIndex);
+      await postCompletedReasoning(
+        update.content,
+        responseId,
+        key,
+        streamedReasoningBlocks.has(blockKey),
+      );
     }
   });
 
@@ -1689,6 +1912,7 @@ module.exports = function (pi) {
   pi.on("tool_result", async (event, ctx) => {
     rememberContext(ctx);
     replayPendingInterrupt(ctx);
+    await syncTaskListFromResult(event);
     await postToolResult(event, currentResponseId());
   });
 
@@ -1731,12 +1955,34 @@ module.exports = function (pi) {
     // posted and this finalize agree on the id regardless of whether Pi
     // fires message_start.
     await finalizeStreamingMessage(responseId);
-    streamingMessageOrdinal += 1;
     await mirrorAssistantMessage(message, responseId);
+    streamingMessageOrdinal += 1;
     // ``message_end`` is the primary usage-capture site (one completed
     // assistant message per LLM call); fold its token counts into the
     // cumulative session totals and flush to the server for pricing.
     if (accumulateUsage(message)) await postSessionUsage();
+    // Surface Pi-reported errors (e.g. 404 for unknown model ids, 400 for
+    // unsupported API types) as visible error items in the web UI so users
+    // aren't left staring at an empty turn.
+    const stopReason =
+      message && typeof message.stopReason === "string" ? message.stopReason : "";
+    const errorMessage =
+      message && typeof message.errorMessage === "string" ? message.errorMessage : "";
+    if (stopReason === "error" && errorMessage) {
+      await postEvent(config, {
+        type: "external_conversation_item",
+        data: {
+          response_id: responseId,
+          item_type: "error",
+          item_data: {
+            source: "execution",
+            code: "RuntimeError",
+            message: `Pi model error: ${errorMessage}`,
+          },
+        },
+      });
+      return;
+    }
     const text = textFromMessage(message);
     if (!text) return;
     // The authoritative assistant item. The web UI retires + replaces the

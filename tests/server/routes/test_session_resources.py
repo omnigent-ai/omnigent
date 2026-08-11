@@ -1099,6 +1099,51 @@ async def test_get_resource_by_id_404_from_runner(
     assert resp.json()["error"]["code"] == "not_found"
 
 
+@pytest.mark.asyncio
+async def test_get_resource_by_id_404_with_non_mapping_body(
+    client: httpx.AsyncClient,
+) -> None:
+    """A malformed runner 404 uses the default not-found message."""
+    fake_runner = _FakeRunnerClient(payload=["not", "an", "object"], status_code=404)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/nonexistent")
+
+    assert resp.status_code == 404
+    assert resp.json()["error"]["message"] == "Resource not found"
+
+
+@pytest.mark.asyncio
+async def test_get_resource_by_id_rejects_invalid_runner_json(
+    client: httpx.AsyncClient,
+) -> None:
+    """Malformed runner JSON becomes a controlled 502."""
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/bad-json"
+    fake_runner = _FakeRunnerClient(
+        text_responses={path: (200, "not-json", {"content-type": "application/json"})}
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(path)
+
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "runner resource endpoint returned invalid JSON"
+
+
+@pytest.mark.asyncio
+async def test_get_resource_by_id_rejects_non_mapping_runner_json(
+    client: httpx.AsyncClient,
+) -> None:
+    """Valid non-object runner JSON becomes a distinct controlled 502."""
+    fake_runner = _FakeRunnerClient(payload=["not", "an", "object"])
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/non-object")
+
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "runner resource endpoint returned non-object JSON"
+
+
 @pytest.fixture
 def bash_terminal_spec(monkeypatch: pytest.MonkeyPatch) -> None:
     """Resolve the session's agent spec to one declaring a ``bash`` terminal.
@@ -1717,6 +1762,41 @@ async def test_download_session_file_content(
         "attachment; filename=\"hello.txt\"; filename*=UTF-8''hello.txt"
     )
     assert resp.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_download_session_file_content_is_revalidatable(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """Content is immutable per file id, so it must be cacheable and revalidate to 304.
+
+    Transcripts re-render the same attachments on every session load and
+    the originals run to megabytes; without these headers the browser
+    re-downloads all of them each time.
+    """
+    upload = await file_client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
+        files={"file": ("shot.png", b"pretend-png-bytes", "image/png")},
+    )
+    file_id = upload.json()["id"]
+    url = f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files/{file_id}/content"
+
+    resp = await file_client.get(url)
+    assert resp.status_code == 200
+    etag = resp.headers["etag"]
+    assert etag == f'"{file_id}"'
+    assert resp.headers["cache-control"] == "private, max-age=31536000, immutable"
+
+    # A conditional re-request must skip the bytes entirely.
+    cached = await file_client.get(url, headers={"If-None-Match": etag})
+    assert cached.status_code == 304
+    assert cached.content == b""
+    assert cached.headers["etag"] == etag
+
+    # A stale validator still gets the full body back.
+    stale = await file_client.get(url, headers={"If-None-Match": '"file_gone"'})
+    assert stale.status_code == 200
+    assert stale.content == b"pretend-png-bytes"
 
 
 @pytest.mark.asyncio
@@ -4993,3 +5073,464 @@ async def test_relay_never_delivers_terminal_on_pty_status(
     await _relay_runner_stream(child_id, client, store)  # type: ignore[arg-type]
 
     assert client.posts == []
+
+
+# ── Offline (agent asleep) environment synthesis ──────────────────────────────
+
+_OFFLINE_SESSION = "b17c0a4f9d2e4c6a8f1b3d5e7a9c0b2d"
+_OFFLINE_WORKSPACE = "/Users/dev/project"
+
+
+class _OfflineRunnerClient:
+    """Runner client whose tunnel is gone, as a sleeping agent's is."""
+
+    async def get(self, url: str, *, params: Any = None, timeout: float | None = None) -> Any:
+        del params, timeout
+        raise OmnigentError(f"runner is not connected ({url})", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+
+@pytest.fixture
+def offline_env_app(
+    runner_globals_reset: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> FastAPI:
+    """App whose session is host-bound but whose runner is offline."""
+    del runner_globals_reset
+    from types import SimpleNamespace
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.server.routes.sessions import routes_resources as _routes
+
+    conv = Conversation(
+        id=_OFFLINE_SESSION,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=_OFFLINE_SESSION,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        host_id="host_offline",
+        workspace=_OFFLINE_WORKSPACE,
+    )
+    # The seeded native-agent shape: no OS-level sandbox, so the reach the
+    # runner would report is "unconfined, anchored on the workspace".
+    monkeypatch.setattr(
+        _routes,
+        "_load_agent_spec_for_session",
+        lambda _conv, _agent_store: SimpleNamespace(
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=".",
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        ),
+    )
+    set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
+
+    application = FastAPI()
+
+    @application.exception_handler(OmnigentError)
+    async def _handle(request: Request, exc: OmnigentError) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    application.include_router(
+        create_sessions_router(
+            SimpleNamespace(get_conversation=lambda _sid: conv),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]  — stub agent store
+            host_registry=SimpleNamespace(get=lambda _host_id: object()),  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    return application
+
+
+@pytest.fixture
+async def offline_env_client(offline_env_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    transport = httpx.ASGITransport(app=offline_env_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as c:
+        yield c
+
+
+@pytest.mark.asyncio
+async def test_offline_environment_advertises_the_same_reach_as_the_runner(
+    offline_env_client: httpx.AsyncClient,
+) -> None:
+    """A sleeping agent's environment still reports what browsing can reach.
+
+    The file panel gates its navigation affordance on ``metadata.reachable``.
+    When the runner sleeps the server synthesizes this resource itself, and
+    omitting the field there made the panel silently decide "nowhere else to
+    go" and drop the control -- even though the host-served path authorizes
+    and serves absolute browsing exactly as the live runner does.
+
+    Asserted as the full payload, not just presence: a synthesis that
+    advertised a *different* reach from the runner's would be its own bug.
+    """
+    resp = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default"
+    )
+
+    assert resp.status_code == 200, resp.text
+    metadata = resp.json()["metadata"]
+    assert metadata["root"] == _OFFLINE_WORKSPACE
+    assert metadata["reachable"] == {
+        "unconfined": True,
+        "roots": [{"path": _OFFLINE_WORKSPACE, "access": "write", "origin": "cwd"}],
+    }
+
+
+# ── Workspace-file gzip (GZipFileContentRoute) ───────────────────
+#
+# These exercise the real routes through the real router, because the whole
+# point of the route class is that eligibility follows the route table. A
+# synthesized endpoint would not prove the production routes are wrapped.
+
+
+def _fs_text_read_payload(lines: int = 2000) -> dict[str, object]:
+    """Canned runner response for a text file read.
+
+    Mirrors the runner's ``file_content`` shape and key order, including a
+    ``content_type`` that is deliberately *not* a text type: ``.ts`` resolves
+    to ``video/mp2t`` via ``mimetypes``, so a MIME-based eligibility check
+    would wrongly skip real TypeScript source. Compression must be decided
+    from ``encoding`` instead.
+
+    :param lines: How many lines of source to synthesize, e.g. ``2000``.
+    :returns: The payload dict.
+    """
+    content = "    const someVariableName = computeSomething(alpha, beta);\n" * lines
+    return {
+        "object": "session.environment.filesystem.file_content",
+        "path": "src/main.ts",
+        "content_type": "video/mp2t",
+        "bytes": len(content.encode()),
+        "truncated": False,
+        "encoding": "utf-8",
+        "content": content,
+    }
+
+
+def _fs_binary_read_payload(size: int = 256 * 1024) -> dict[str, object]:
+    """Canned runner response for a binary (base64) file read.
+
+    :param size: Decoded payload size in bytes, e.g. ``262144``.
+    :returns: The payload dict, with ``content`` as base64.
+    """
+    import base64
+
+    # Incompressible bytes: gzip would return ~1.0x for real CPU.
+    raw = bytes((i * 7 + 11) % 256 for i in range(size))
+    return {
+        "object": "session.environment.filesystem.file_content",
+        "path": "docs/logo.png",
+        "content_type": "image/png",
+        "bytes": size,
+        "truncated": False,
+        "encoding": "base64",
+        "content": base64.b64encode(raw).decode(),
+    }
+
+
+_FS_BASE = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+
+
+@pytest.mark.asyncio
+async def test_file_read_is_gzipped(client: httpx.AsyncClient) -> None:
+    """A text file read is compressed, and the body survives the round-trip.
+
+    The read inlines the whole file in ``content``, so without compression the
+    response costs a full file transfer.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    payload = _fs_text_read_payload()
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/src/main.ts",
+        headers={"Accept-Encoding": "gzip"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-encoding"] == "gzip"
+    # A shared cache must not serve these bytes to an identity client.
+    assert "accept-encoding" in resp.headers.get("vary", "").lower()
+    # httpx inflates transparently, so an intact body proves the encoding
+    # header and the bytes on the wire agree.
+    assert resp.json() == payload
+    # Compression actually happened, rather than the header being set on
+    # unchanged bytes.
+    assert int(resp.headers["content-length"]) < len(str(payload["content"]))
+
+
+@pytest.mark.asyncio
+async def test_binary_file_read_is_not_gzipped(client: httpx.AsyncClient) -> None:
+    """A base64 (binary) read skips compression.
+
+    Base64 of already-compressed media only carries base64's own redundancy, so
+    gzip returns ~1.3x for real event-loop time — 385 ms at the 10 MiB binary
+    cap. The decision comes from the payload's ``encoding``, because these
+    routes always answer ``application/json`` and the file's own MIME type is
+    merely a field inside that JSON.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    payload = _fs_binary_read_payload()
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/docs/logo.png",
+        headers={"Accept-Encoding": "gzip"},
+    )
+
+    assert resp.status_code == 200
+    assert "content-encoding" not in resp.headers
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+async def test_deeply_nested_binary_read_is_not_gzipped(client: httpx.AsyncClient) -> None:
+    """A long ``path`` must not push the ``encoding`` field out of range.
+
+    Eligibility is read from the serialized body. ``path`` precedes ``encoding``
+    and is bounded only by ``PATH_MAX``, so a fixed-size prefix scan would miss
+    the field on a deeply nested file and send a multi-megabyte binary through
+    synchronous gzip — the exact case this guards.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    payload = _fs_binary_read_payload()
+    # ~680 chars, comfortably past any small window.
+    payload["path"] = "/".join(["nested_directory"] * 40)
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/{payload['path']}",
+        headers={"Accept-Encoding": "gzip"},
+    )
+
+    assert resp.status_code == 200
+    assert "content-encoding" not in resp.headers
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+async def test_text_whose_content_fakes_the_encoding_marker_is_gzipped(
+    client: httpx.AsyncClient,
+) -> None:
+    """A text file containing ``"encoding":"base64"`` still compresses.
+
+    Eligibility matches the complete serialized key/value pair, which cannot
+    occur inside a JSON string — an embedded quote is backslash-escaped — so a
+    file's own bytes cannot fake a binary payload and suppress compression.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    payload = _fs_text_read_payload()
+    payload["content"] = 'config = {"encoding":"base64"}\n' * 200
+    payload["path"] = "settings.py"
+    payload["bytes"] = len(str(payload["content"]).encode())
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/settings.py",
+        headers={"Accept-Encoding": "gzip"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-encoding"] == "gzip"
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+async def test_directory_listing_is_gzipped(client: httpx.AsyncClient) -> None:
+    """A directory listing large enough to clear the minimum size compresses.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    listing = _fs_list_payload()
+    entries = listing["data"]
+    assert isinstance(entries, list)
+    # One entry is below minimum_size; a real directory of any depth is not.
+    listing["data"] = [dict(entries[0], id=f"f{i}.py", name=f"f{i}.py") for i in range(200)]
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=listing)))  # type: ignore[arg-type]
+
+    resp = await client.get(f"{_FS_BASE}/filesystem", headers={"Accept-Encoding": "gzip"})
+
+    assert resp.status_code == 200
+    assert resp.headers["content-encoding"] == "gzip"
+    assert resp.json() == listing
+
+
+@pytest.mark.asyncio
+async def test_file_diff_is_gzipped(client: httpx.AsyncClient) -> None:
+    """The diff read carries two file bodies, so it compresses too.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    text = "    const value = compute(alpha, beta);\n" * 1000
+    payload: dict[str, object] = {
+        "object": "session.environment.filesystem.file_diff",
+        "path": "src/main.ts",
+        "before": text,
+        "after": text + "// changed\n",
+    }
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/diff/src/main.ts",
+        headers={"Accept-Encoding": "gzip"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-encoding"] == "gzip"
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+async def test_file_read_honors_identity_request(client: httpx.AsyncClient) -> None:
+    """A client that declines gzip receives identity bytes.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    payload = _fs_text_read_payload()
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/src/main.ts",
+        headers={"Accept-Encoding": "identity"},
+    )
+
+    assert resp.status_code == 200
+    assert "content-encoding" not in resp.headers
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("token", "expect_gzip"),
+    [
+        ("gzip", True),
+        # Coding tokens are case-insensitive (RFC 9110 §12.5.3).
+        ("GZip", True),
+        ("GZIP", True),
+        ("gzip, deflate, br", True),
+        ("gzip;q=0.5", True),
+        ("*;q=0, gzip", True),
+        # q=0 means "do not use this coding" — a substring test would miss it.
+        ("gzip;q=0", False),
+        ("deflate, gzip;q=0", False),
+        ("deflate", False),
+        ("identity", False),
+    ],
+)
+async def test_file_read_negotiates_accept_encoding(
+    client: httpx.AsyncClient,
+    token: str,
+    expect_gzip: bool,
+) -> None:
+    """Compression follows ``Accept-Encoding``, including case and ``q`` values.
+
+    :param client: Test HTTP client.
+    :param token: The ``Accept-Encoding`` value to send.
+    :param expect_gzip: Whether gzip is expected for that value.
+    :returns: None.
+    """
+    payload = _fs_text_read_payload()
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/src/main.ts",
+        headers={"Accept-Encoding": token},
+    )
+
+    assert resp.status_code == 200
+    assert (resp.headers.get("content-encoding") == "gzip") is expect_gzip
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("PUT", "filesystem/notes.txt"),
+        ("PATCH", "filesystem/notes.txt"),
+        ("DELETE", "filesystem/notes.txt"),
+    ],
+)
+async def test_filesystem_mutations_are_not_gzipped(
+    client: httpx.AsyncClient,
+    method: str,
+    path: str,
+) -> None:
+    """Mutating handlers on the read paths stay uncompressed.
+
+    They share a URL with the read but return a small ack, so there is nothing
+    to compress. This is the guarantee a path-matching middleware could not
+    make: a path alone says nothing about the method. Because the reads live on
+    their own router, Starlette rejects a mismatched method before the wrapper
+    is ever reached.
+
+    :param client: Test HTTP client.
+    :param method: HTTP method under test.
+    :param path: Environment-relative request path.
+    :returns: None.
+    """
+    payload: dict[str, object] = {
+        "object": "session.environment.filesystem.write_result",
+        "path": "notes.txt",
+        # Padded past minimum_size so only the method decides the outcome.
+        "detail": "x" * 4096,
+    }
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.request(
+        method,
+        f"{_FS_BASE}/{path}",
+        headers={"Accept-Encoding": "gzip"},
+        json={"content": "hi", "old_text": "a", "new_text": "b"},
+    )
+
+    assert resp.status_code == 200
+    assert "content-encoding" not in resp.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["changes", "search?q=main", "shell"])
+async def test_sibling_environment_routes_are_not_gzipped(
+    client: httpx.AsyncClient,
+    path: str,
+) -> None:
+    """Sibling environment routes return bounded metadata and stay uncompressed.
+
+    Keeps the change's blast radius to the endpoints that inline file contents.
+
+    :param client: Test HTTP client.
+    :param path: Environment-relative request path.
+    :returns: None.
+    """
+    payload: dict[str, object] = {
+        "object": "list",
+        "data": [{"path": f"f{i}.py", "status": "modified"} for i in range(200)],
+        "has_more": False,
+    }
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    url = f"{_FS_BASE}/{path}"
+    headers = {"Accept-Encoding": "gzip"}
+    if path == "shell":
+        resp = await client.post(url, headers=headers, json={"command": "ls"})
+    else:
+        resp = await client.get(url, headers=headers)
+
+    assert resp.status_code == 200
+    assert "content-encoding" not in resp.headers

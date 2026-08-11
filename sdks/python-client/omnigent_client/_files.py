@@ -176,7 +176,7 @@ class SessionFilesNamespace:
         :param order: Sort order, e.g. ``"desc"``.
         :returns: File metadata entries.
         """
-        params: dict[str, object] = {"limit": limit, "order": order}
+        params: dict[str, str | int] = {"limit": limit, "order": order}
         if after is not None:
             params["after"] = after
         resp = await self._http.get(self._path, params=params)

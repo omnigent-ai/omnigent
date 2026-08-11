@@ -70,7 +70,7 @@ def test_custom_branding_reshapes_the_landing(page: Page, seeded_session: tuple[
 
     # Custom hero heading replaces the built-in default.
     expect(page.get_by_role("heading", name="Acme Corp")).to_be_visible()
-    expect(page.get_by_text("What should we do?")).to_have_count(0)
+    expect(page.get_by_text("What should we build?")).to_have_count(0)
 
     # Custom logo renders as an <img> (alt = app name); the favicon points at
     # the branding route.
@@ -94,9 +94,23 @@ def test_empty_heading_hides_the_hero_line(page: Page, seeded_session: tuple[str
     _open_landing(page, base_url)
 
     # Neither the custom nor the built-in default heading appears.
-    expect(page.get_by_text("What should we do?")).to_have_count(0)
+    expect(page.get_by_text("What should we build?")).to_have_count(0)
     # The landing did load branded (credit present), so this is a real hide.
     expect(page.get_by_test_id("powered-by-omnigent")).to_be_visible()
+
+
+def test_powered_by_false_hides_the_credit(page: Page, seeded_session: tuple[str, str]) -> None:
+    """A branded deployment can explicitly hide the Omnigent attribution."""
+    base_url, _ = seeded_session
+    _stub_logos(page)
+    _stub_info(
+        page,
+        {"app_name": "Acme Agent", "heading": "Acme Corp", "logos": _LOGOS, "powered_by": False},
+    )
+    _open_landing(page, base_url)
+
+    expect(page.get_by_role("heading", name="Acme Corp")).to_be_visible()
+    expect(page.get_by_test_id("powered-by-omnigent")).to_have_count(0)
 
 
 def test_unbranded_keeps_defaults_and_hides_credit(
@@ -107,6 +121,6 @@ def test_unbranded_keeps_defaults_and_hides_credit(
     _stub_info(page, None)
     _open_landing(page, base_url)
 
-    expect(page.get_by_role("heading", name="What should we do?")).to_be_visible()
+    expect(page.get_by_role("heading", name="What should we build?")).to_be_visible()
     expect(page.get_by_role("link", name="Omnigent")).to_be_visible()
     expect(page.get_by_test_id("powered-by-omnigent")).to_have_count(0)

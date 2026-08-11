@@ -4,19 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
 
 import click
 import httpx
 import yaml
+from omnigent_client._http import is_loopback_url
 
 from omnigent._native_resume_hint import echo_native_resume_hint
+from omnigent._platform import resolve_cli_binary
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import PI_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
@@ -28,6 +30,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -39,11 +42,18 @@ from omnigent.native_terminal import (
     DAEMON_TERMINAL_READY_TIMEOUT_S as _DAEMON_TERMINAL_READY_TIMEOUT_S,
 )
 from omnigent.native_terminal import bind_session_runner as _bind_session_runner
+from omnigent.native_terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
 from omnigent.native_terminal import url_component
 from omnigent.pi_native_bridge import bridge_dir_for_session_id
 
+_logger = logging.getLogger(__name__)
+
+
 _DEFAULT_PI_COMMAND = "pi"
 _PI_PATH_ENV = "OMNIGENT_PI_PATH"
+# Deprecated alias — remove in v0.8.0 (read via the legacy branch below, which warns).
 _LEGACY_HARNESS_PI_PATH_ENV = "HARNESS_PI_PATH"
 _AGENT_NAME = "pi-native-ui"
 _TERMINAL_NAME = "pi"
@@ -83,11 +93,21 @@ class PreparedPiTerminal:
 
 
 def _configured_pi_command(env: Mapping[str, str]) -> str:
-    """Return the configured Pi executable name/path from *env*."""
-    for key in (_PI_PATH_ENV, _LEGACY_HARNESS_PI_PATH_ENV):
-        value = env.get(key, "").strip()
-        if value:
-            return value
+    """Return the configured Pi executable name/path from *env*.
+
+    Reads ``OMNIGENT_PI_PATH`` (canonical) then the deprecated
+    ``HARNESS_PI_PATH`` (emitting a one-time-per-process deprecation warning
+    via the shared helper so wording/dedupe stay consistent).
+    """
+    value = env.get(_PI_PATH_ENV, "").strip()
+    if value:
+        return value
+    legacy = env.get(_LEGACY_HARNESS_PI_PATH_ENV, "").strip()
+    if legacy:
+        from omnigent.harness_startup_config import _warn_legacy_path
+
+        _warn_legacy_path(_LEGACY_HARNESS_PI_PATH_ENV, _PI_PATH_ENV)
+        return legacy
     return _DEFAULT_PI_COMMAND
 
 
@@ -107,7 +127,7 @@ def resolve_pi_executable(
     env = os.environ if env is None else env
     which = shutil.which if which is None else which
     command = _configured_pi_command(env)
-    resolved = which(command)
+    resolved = resolve_cli_binary(command, which=which)
     if resolved is None:
         raise click.ClickException(
             "Native Pi requires the 'pi' CLI on PATH. Install Pi, add it to PATH, "
@@ -184,7 +204,8 @@ def run_pi_native(
     *,
     server: str | None,
     session_id: str | None,
-    pi_args: tuple[str, ...],
+    extra_args: tuple[str, ...] | None = None,
+    pi_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     auto_open_conversation: bool = False,
 ) -> None:
@@ -199,6 +220,9 @@ def run_pi_native(
         conversation URL after launch.
     :returns: None after the terminal attach session ends.
     """
+    pi_args = _normalize_extra_args(
+        extra_args=extra_args, legacy_args=pi_args, legacy_param="pi_args"
+    )
     _preflight_local_tools()
     if server is None:
         raise click.ClickException(
@@ -225,7 +249,7 @@ def _materialize_pi_agent_spec(tmpdir: Path) -> Path:
     :returns: Path to the generated YAML spec.
     """
     yaml_path = tmpdir / "pi-native-ui.yaml"
-    raw: dict[str, Any] = {
+    raw: _JsonObject = {
         "name": _AGENT_NAME,
         "prompt": (
             "Pi is running in the session terminal. Web UI messages are "
@@ -346,7 +370,12 @@ async def _prepare_pi_terminal_via_daemon(
     """
     persist_args = list(pi_args)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         reattached = session_id is not None
         if session_id is None:
             if session_bundle is None:
@@ -438,7 +467,7 @@ async def _create_pi_session(
     :param terminal_launch_args: Pass-through Pi CLI args to persist.
     :returns: New Omnigent session id.
     """
-    metadata: dict[str, Any] = {"labels": dict(_SESSION_LABELS)}
+    metadata: _JsonObject = {"labels": dict(_SESSION_LABELS)}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(
@@ -458,7 +487,7 @@ async def _create_pi_session(
     return new_session_id
 
 
-async def _fetch_pi_session(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
+async def _fetch_pi_session(client: httpx.AsyncClient, session_id: str) -> _JsonObject:
     """Fetch an existing Omnigent session."""
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     if resp.status_code == 404:

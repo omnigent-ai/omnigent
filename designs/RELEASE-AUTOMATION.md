@@ -1,7 +1,7 @@
 # Deterministic release pipeline
 
 Status: accepted 2026-07-14; implemented in this repo 2026-07-15 (release.yml,
-finalize-release.yml, update-homebrew.yml, bump-version App token, branch-CI
+finalize-release.yml, homebrew-tap-pr.yml, bump-version App token, branch-CI
 triggers, lockstep CI check, RELEASING.md rewrite). Secure-repo restructure and
 the tag ruleset are follow-ups. Owner: @dhruv0811.
 
@@ -27,7 +27,7 @@ suggests. Per release step:
 | Bump main to next `.dev0` | human CLI (or `bump-version.yml` post-release) | 🟡 semi |
 | Draft GH release (prerelease flag for rc, rerun-safe) | `github-release.yml` on tag push | ✅ |
 | CHANGELOG PR + LLM-curated draft notes | `draft-release-notes.yml` via `workflow_run` (final tags only) | ✅ |
-| Secure-repo gates + PyPI publish | manual `gh workflow run omnigent.yml` ×2–3 (dry-run, [test-pypi], pypi) in `databricks/secure-public-registry-releases-eng` | ❌ manual dispatches |
+| Secure-repo gates + PyPI publish | manual `gh workflow run omnigent.yml` ×2–3 (dry-run, [test-pypi], pypi) in the internal secure-release repo | ❌ manual dispatches |
 | Post-publish validation (clean venv install + `--version`) | human CLI recipe | ❌ manual |
 | Publish GH release as Latest | human UI click | ❌ manual (and API publish does **not** set `make_latest` unless told to) |
 | Site release post + `X.Y-docs → main` PR | `publish-changelog.yml` on `release: published` | ✅ |
@@ -174,7 +174,18 @@ rc releases never finalize: their GH drafts stay unpublished prerelease drafts
 (**decided**: keep exactly today's pattern — rc drafts are never published on
 GitHub).
 
-## Workflow 4 — `update-homebrew.yml` (new, final releases only)
+## Workflow 4 — the homebrew tap bump PR (new, final releases only)
+
+> **Superseded.** This shipped as `update-homebrew.yml`, then was replaced by
+> `.github/workflows/homebrew-tap-pr.yml`, which renders the formula from a
+> checked-in template (`.github/scripts/homebrew/omnigent.rb.template`) plus a
+> `uv pip compile` closure instead of mutating the tap's formula in place with
+> `brew update-python-resources`. That answers open question 2 below: the
+> hand-maintained sections are owned by the template, so nothing has to survive
+> an in-place rewrite. `update-homebrew.yml` was deleted — it raced the new
+> workflow on the same `release: published` event and its "hand-maintained
+> sections survived" assertion checked for stanzas the template no longer emits,
+> so it failed on every run. The design below is kept as the original record.
 
 Current state of `omnigent-ai/homebrew-tap`: a homebrew-core-style tap that is
 already 2/3 automated —
@@ -223,7 +234,7 @@ formula 0.2.0 → 0.5.1 (expect that one resource diff to be large).
 
 `workflow_dispatch` is runnable by anyone with write access, which is too
 broad. Every release workflow (`release.yml`, `finalize-release.yml`,
-`update-homebrew.yml`'s dispatch path) gets a first `authorize` job that all
+`homebrew-tap-pr.yml`'s dispatch path) gets a first `authorize` job that all
 other jobs `need`:
 
 ```
@@ -478,15 +489,14 @@ effects. Worth stealing:
    workaround retired).
 4. **Release workflows are maintainer-only**: `authorize` actor-role gate
    (admin/maintain) + the `v[0-9]*` tag ruleset as backstop.
-5. **Homebrew joins the pipeline** via `update-homebrew.yml` on
+5. **Homebrew joins the pipeline** via `homebrew-tap-pr.yml` on
    `release: published`; tap-side human gate (`pr-pull` label) kept.
 
 ## Open questions
 
 1. Environment `publish-release` reviewer set = who may finalize a release.
-2. `brew update-python-resources` vs. the hand-maintained formula sections:
-   confirm on the catch-up run that the exclusion flags preserve the
-   `google-antigravity` platform stanzas and the brewed-dep comments, or keep
-   those sections behind guard comments the updater skips.
+2. ~~`brew update-python-resources` vs. the hand-maintained formula sections~~ —
+   **resolved** by generating the formula from a template instead of rewriting
+   it in place; see the note under Workflow 4.
 3. Tap bottle coverage (currently arm64 macOS only) — widen the test-bot
    matrix? Orthogonal to this pipeline; tracked here so it isn't forgotten.

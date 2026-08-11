@@ -49,8 +49,8 @@ allowed_domains:
 # copy_max_total_bytes: 268435456
 
 # Branding / white-labeling. Customize the app name, landing heading, and
-# logos shown in the web UI. Logo files resolve next to this config file
-# (SVG or PNG); served pre-auth so the login screen is branded too. Any unset
+# logos shown in the web UI. Logo files must live under branding-assets/ beside
+# this config file; served pre-auth so the login screen is branded too. Any unset
 # field keeps its built-in default. See deploy/README.md#branding-white-labeling.
 # branding:
 #   app_name: "Acme Agent"      # tab title, sidebar wordmark, login screen

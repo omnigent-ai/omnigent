@@ -24,14 +24,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Security precondition gate: npm ci/test runs the PR's own install hooks and
+  # Security precondition gate: pnpm install/test runs the PR's own install hooks and
   # test code, so untrusted PRs are held until the scan passes (security-gate.yml).
   # Trusted authors and non-PR events pass through.
   gate:
     uses: ./.github/workflows/security-gate.yml
 
-  npm-test:
-    name: npm test
+  web-test:
+    name: web test
     needs: gate
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
@@ -41,31 +41,29 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - name: Set up Node.js
-        uses: ./.github/actions/setup-node
+      - name: Set up pnpm
+        uses: ./.github/actions/setup-pnpm
 
       - name: Install dependencies
-        working-directory: web
-        # Pin the npm registry to the npmjs default.
+        # Pin the npm registry to the npmjs default; limit to the web package
+        # so the Electron package's large native devDependencies are not fetched.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: npm ci --legacy-peer-deps
+        run: pnpm install --frozen-lockfile --filter web
 
       - name: Check formatting
-        working-directory: web
-        run: npm run format:check
+        run: pnpm --filter web run format:check
 
       - name: Run tests with coverage
-        working-directory: web
-        run: npm run test:coverage
+        run: pnpm --filter web run test:coverage
 
       # Distill the v8 json-summary into a single total.txt, mirroring the
       # backend's coverage-report job. ui-code-coverage.yml (privileged
       # workflow_run) consumes this artifact and posts the report-only status.
       - name: Summarize coverage
         if: always()
-        working-directory: web
         run: |
+          cd web
           mkdir -p ui-coverage-summary
           if [[ ! -f coverage/coverage-summary.json ]]; then
             echo "::warning::No coverage-summary.json; skipping UI coverage report."

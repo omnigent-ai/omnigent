@@ -194,7 +194,7 @@ def test_check_constraint_allows_host_id_with_workspace(
         conn.execute(
             sa.text(
                 "INSERT INTO hosts "
-                "(owner, name, host_id, status, created_at, updated_at) "
+                "(user_id, name, host_id, status, created_at, updated_at) "
                 "VALUES (:o, :n, :hid, 1, :ts, :ts)"
             ),
             {
@@ -280,7 +280,7 @@ def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO hosts "
-                "(owner, name, host_id, status, created_at, updated_at) "
+                "(user_id, name, host_id, status, created_at, updated_at) "
                 "VALUES (:o, :n, :hid, 1, :ts, :ts)"
             ),
             {
@@ -399,6 +399,9 @@ def test_compressed_columns_are_binary_at_head(db_engine: Engine) -> None:
         ],
         "comments": ["body", "anchor_content"],
         "agents": ["description"],
+        "policies": ["handler", "factory_params"],
+        "hosts": ["configured_harnesses"],
+        "projects": ["config"],
     }
     for table, columns in expected.items():
         types = {c["name"]: c["type"] for c in inspector.get_columns(table)}

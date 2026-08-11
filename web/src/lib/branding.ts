@@ -2,9 +2,9 @@ import type { Branding } from "./capabilities";
 import { useServerInfo } from "./CapabilitiesContext";
 
 export const DEFAULT_APP_NAME = "Omnigent";
-export const DEFAULT_HEADING = "What should we do?";
+export const DEFAULT_HEADING = "What should we build?";
 
-const _EMPTY: Branding = {
+const EMPTY_BRANDING: Branding = {
   app_name: null,
   heading: null,
   logos: { main: null, loading: null, favicon: null },
@@ -14,7 +14,7 @@ const _EMPTY: Branding = {
 /** Current operator branding, or all-null while loading / when unset. */
 export function useBranding(): Branding {
   const info = useServerInfo();
-  return info !== "loading" && info.branding ? info.branding : _EMPTY;
+  return info !== "loading" && info.branding ? info.branding : EMPTY_BRANDING;
 }
 
 /** Operator app name, falling back to the built-in default. */

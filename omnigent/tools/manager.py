@@ -30,6 +30,10 @@ from omnigent.tools.builtins import (
     SysCancelAsyncTool,
     SysListModelsTool,
     SysReadInboxTool,
+    SysScheduledTaskCreateTool,
+    SysScheduledTaskDeleteTool,
+    SysScheduledTaskListTool,
+    SysScheduledTaskUpdateTool,
     SysSessionCloseTool,
     SysSessionCreateTool,
     SysSessionGetHistoryTool,
@@ -185,6 +189,9 @@ class ToolManager:
         # Policy tool is always auto-registered so agents can add
         # inline CEL policies at runtime without spec changes.
         self._register_policy_tools()
+        # Scheduled-task tools are always auto-registered so agents can
+        # manage recurring runs at runtime without the spec opting in.
+        self._register_scheduled_task_tools()
         # Embedded-browser tools are always auto-registered so any agent
         # can drive the desktop app's browser without the spec opting in
         # (framework-owned).
@@ -203,6 +210,23 @@ class ToolManager:
 
         self._tools[SysAddPolicyTool.name()] = SysAddPolicyTool()
         self._tools[SysPolicyRegistryTool.name()] = SysPolicyRegistryTool()
+
+    def _register_scheduled_task_tools(self) -> None:
+        """
+        Auto-register the scheduled-task management builtins.
+
+        Always available so an agent can create, list, update, and delete
+        recurring scheduled tasks at runtime without the spec opting in. The
+        runner dispatches all four via the Omnigent server's
+        ``/v1/scheduled-tasks`` REST endpoints.
+        """
+        for tool in (
+            SysScheduledTaskCreateTool(),
+            SysScheduledTaskListTool(),
+            SysScheduledTaskUpdateTool(),
+            SysScheduledTaskDeleteTool(),
+        ):
+            self._tools[tool.name()] = tool
 
     def _register_async_inbox_tools(self) -> None:
         """
@@ -462,10 +486,12 @@ class ToolManager:
         # Model awareness pairs with the dispatch grant: the per-worker
         # listing exists to pick a valid ``args.model`` for send.
         self._tools[SysListModelsTool.name()] = SysListModelsTool(spec=self._spec)
-        # Advise-models is capability-gated: expose it only when the server
-        # has a routing client configured. Hiding the tool prevents agents
-        # from probing router_on via a no-op call when routing is disabled.
-        if get_caps().routing_client is not None:
+        # Advise-models is capability-gated: expose it only when some router can
+        # answer. Hiding the tool prevents agents from probing router_on via a
+        # no-op call when routing is disabled.
+        from omnigent.server.routing_backend import routing_available
+
+        if routing_available(get_caps()):
             self._tools[SysAdviseModelsTool.name()] = SysAdviseModelsTool()
 
         # create: spawning OUTSIDE the declared list (existing agents

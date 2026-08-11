@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import tempfile
@@ -34,6 +35,9 @@ MCP_STARTUP_CANCELLED = "cancelled"
 MCP_STARTUP_STATES = frozenset(
     {MCP_STARTUP_STARTING, MCP_STARTUP_READY, MCP_STARTUP_FAILED, MCP_STARTUP_CANCELLED}
 )
+# Top-level ``model_reasoning_effort = "<value>"`` line, capturing the value so
+# a model switch can clamp it to one the new model accepts (GLM has no xhigh).
+_EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
 # Must match ``_CONFIG_FILE`` in ``claude_native_bridge.py`` because
 # ``serve-mcp`` reads this filename for the token.
 _MCP_CONFIG_FILE = "bridge.json"
@@ -231,6 +235,36 @@ def write_policy_hook_config(
             os.unlink(tmp_name)
 
 
+def update_policy_hook_auth_headers(
+    bridge_dir: Path,
+    headers: dict[str, str],
+) -> bool:
+    """Atomically replace ``ap_auth_headers`` in ``policy_hook.json``.
+
+    Returns ``True`` when the file existed and was updated.
+    """
+    path = bridge_dir / _POLICY_HOOK_FILE
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    payload["ap_auth_headers"] = dict(headers)
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_POLICY_HOOK_FILE}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    return True
+
+
 def read_policy_hook_config(bridge_dir: Path) -> dict[str, object] | None:
     """
     Read the Omnigent coordinates for the codex-native policy hook.
@@ -311,6 +345,63 @@ def read_codex_config_model(bridge_dir: Path) -> str | None:
     return model if isinstance(model, str) and model else None
 
 
+def write_codex_config_model(bridge_dir: Path, model: str) -> bool:
+    """
+    Upsert the top-level ``model`` key in this session's Codex ``config.toml``.
+
+    Companion writer to :func:`read_codex_config_model`, used when Omnigent
+    itself switches the running thread's model (web picker / intelligent
+    routing via ``thread/settings/update``). That RPC changes the live thread
+    but does NOT touch ``config.toml`` — while the forwarder's mirror and the
+    cost-gate hook both treat ``config.toml`` as the source of truth. Without
+    this write, the next ``turn/started`` re-reads the stale launch model and
+    mirrors it back to Omnigent as an ``external_model_change``, silently
+    reverting the switch. Writing the same top-level key an in-TUI ``/model``
+    writes keeps every reader consistent; a later in-TUI switch simply
+    overwrites it (last-wins, as for user switches).
+
+    Best-effort: an unreadable/unwritable file returns ``False`` — the live
+    thread already runs the new model, so failing the turn over a mirror
+    file would be worse than a temporarily stale mirror.
+
+    :param bridge_dir: The session's native-Codex bridge directory.
+    :param model: Model id to record, e.g. ``"gpt-5.6-luna"``.
+    :returns: ``True`` when the file was updated.
+    """
+    from omnigent.reasoning_effort import clamp_effort_for_model
+
+    config_path = codex_home_for_bridge_dir(bridge_dir) / "config.toml"
+    pin_line = f"model = {json.dumps(model)}"
+    try:
+        existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        lines = existing.splitlines()
+        replaced = False
+        for i, line in enumerate(lines):
+            # Only the top-level table: stop at the first [section] header.
+            if line.startswith("["):
+                break
+            if re.match(r"^model\s*=", line):
+                lines[i] = pin_line
+                replaced = True
+                continue
+            # The config keeps the launch model's effort (e.g. the user's
+            # xhigh default), which the switched-to model may reject (GLM has
+            # no xhigh). Clamp it to a value the new model accepts so the next
+            # turn does not 400 on reasoning.effort.
+            effort_match = _EFFORT_KEY_RE.match(line)
+            if effort_match:
+                clamped = clamp_effort_for_model(effort_match.group(2), model)
+                if clamped and clamped != effort_match.group(2):
+                    lines[i] = f"{effort_match.group(1)}{clamped}{effort_match.group(3)}"
+        if not replaced:
+            lines.insert(0, pin_line)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
 def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
     """
     Persist shared native Codex state atomically.
@@ -356,7 +447,11 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     :param bridge_dir: Native Codex bridge directory.
     :returns: None.
     """
-    for name in (_STATE_FILE, _STARTUP_ERROR_FILE, _MCP_STARTUP_FILE):
+    for name in (
+        _STATE_FILE,
+        _STARTUP_ERROR_FILE,
+        _MCP_STARTUP_FILE,
+    ):
         try:
             (bridge_dir / name).unlink()
         except FileNotFoundError:
@@ -588,8 +683,16 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
     thread_id = raw.get("thread_id")
     codex_home = raw.get("codex_home")
     active_turn_id = raw.get("active_turn_id")
-    required = (session_id, socket_path, thread_id, codex_home)
-    if not all(isinstance(value, str) and value for value in required):
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(socket_path, str)
+        or not socket_path
+        or not isinstance(thread_id, str)
+        or not thread_id
+        or not isinstance(codex_home, str)
+        or not codex_home
+    ):
         return None
     parsed_active_turn_id = (
         active_turn_id if isinstance(active_turn_id, str) and active_turn_id else None

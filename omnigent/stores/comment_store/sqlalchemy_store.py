@@ -6,11 +6,11 @@ import uuid
 
 from sqlalchemy import delete, func, select
 
-from omnigent.db.db_models import SqlComment, current_workspace_id, normalize_uuid
+from omnigent.db.db_models import SqlComment, current_workspace_id
 from omnigent.db.enum_codecs import decode_comment_status, encode_comment_status
 from omnigent.db.utils import (
     get_or_create_engine,
-    make_managed_session_maker,
+    make_named_managed_session_maker,
     now_epoch_us,
 )
 from omnigent.entities import Comment, CommentsFingerprint
@@ -54,13 +54,18 @@ class SqlAlchemyCommentStore(CommentStore):
         """
         super().__init__(storage_location)
         self._engine = get_or_create_engine(storage_location)
-        self._session = make_managed_session_maker(self._engine)
+        self._session = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.comment_store",
+        )
 
     def get(self, comment_id: str, conversation_id: str) -> Comment | None:
         """Fetch a single comment by id, scoped to a conversation. See base class for contract."""
-        with self._session() as session:
-            row = session.get(SqlComment, (current_workspace_id(), comment_id))
-            if row is None or row.conversation_id != normalize_uuid(conversation_id):
+        with self._session("select_comment_by_id") as session:
+            # conversation_id is part of the PK, so the lookup itself enforces
+            # the conversation scoping — a wrong conversation simply misses.
+            row = session.get(SqlComment, (current_workspace_id(), conversation_id, comment_id))
+            if row is None:
                 return None
             return _to_entity(row)
 
@@ -93,7 +98,7 @@ class SqlAlchemyCommentStore(CommentStore):
             anchor_content=anchor_content,
             created_by=created_by,
         )
-        with self._session() as session:
+        with self._session("insert_comment") as session:
             session.add(row)
             return _to_entity(row)
 
@@ -112,7 +117,7 @@ class SqlAlchemyCommentStore(CommentStore):
         # created_at is seconds-granular; id breaks same-second ties so the
         # listing has a stable, deterministic order.
         stmt = stmt.order_by(SqlComment.created_at, SqlComment.id)
-        with self._session() as session:
+        with self._session("list_comments") as session:
             rows = list(session.execute(stmt).scalars().all())
             return [_to_entity(r) for r in rows]
 
@@ -125,9 +130,9 @@ class SqlAlchemyCommentStore(CommentStore):
         body: str | None = None,
     ) -> Comment | None:
         """Update a comment's fields, scoped to a conversation. See base class for contract."""
-        with self._session() as session:
-            row = session.get(SqlComment, (current_workspace_id(), comment_id))
-            if row is None or row.conversation_id != normalize_uuid(conversation_id):
+        with self._session("update_comment") as session:
+            row = session.get(SqlComment, (current_workspace_id(), conversation_id, comment_id))
+            if row is None:
                 return None
             if status is not None:
                 row.status = encode_comment_status(status)
@@ -139,9 +144,9 @@ class SqlAlchemyCommentStore(CommentStore):
 
     def delete(self, comment_id: str, conversation_id: str) -> Comment | None:
         """Delete a single comment by id, scoped to a conversation. See base class for contract."""
-        with self._session() as session:
-            row = session.get(SqlComment, (current_workspace_id(), comment_id))
-            if row is None or row.conversation_id != normalize_uuid(conversation_id):
+        with self._session("delete_comment") as session:
+            row = session.get(SqlComment, (current_workspace_id(), conversation_id, comment_id))
+            if row is None:
                 return None
             entity = _to_entity(row)
             session.delete(row)
@@ -165,7 +170,7 @@ class SqlAlchemyCommentStore(CommentStore):
             )
             .group_by(SqlComment.conversation_id)
         )
-        with self._session() as session:
+        with self._session("select_comment_fingerprints") as session:
             return {
                 conversation_id: CommentsFingerprint(count=count, last_updated_at=last_updated)
                 for conversation_id, count, last_updated in session.execute(stmt)
@@ -177,5 +182,5 @@ class SqlAlchemyCommentStore(CommentStore):
             SqlComment.workspace_id == current_workspace_id(),
             SqlComment.conversation_id == conversation_id,
         )
-        with self._session() as session:
+        with self._session("delete_conversation_comments") as session:
             session.execute(stmt)
