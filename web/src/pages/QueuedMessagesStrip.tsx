@@ -28,9 +28,8 @@ interface QueuedMessagesStripProps {
   /** Pull a queued message back into the composer for editing. */
   onEdit: (queueId: string) => void;
   /**
-   * Send a queued message now (steer), instead of waiting for the idle flush.
-   * Omitted when the session can't steer mid-turn (e.g. native terminals),
-   * in which case no steer button is shown.
+   * Steer a queued message instead of waiting for the idle flush. Delivery is
+   * harness-dependent; omit this callback to hide the action.
    */
   onSteer?: (queueId: string) => void;
   /**
