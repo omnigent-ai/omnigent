@@ -310,6 +310,7 @@ def test_schemas_exclude_read_skill_file_without_resources(
     # directory so this repo's own .claude/skills/ doesn't contribute
     # resources to the check.
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     mgr = ToolManager(
         _make_spec([skill_no_resources]),
     )
@@ -331,6 +332,7 @@ def test_schemas_empty_when_no_skills(
     # directory so this repo's own .claude/skills/ doesn't contribute
     # skills/resources to the check.
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     mgr = ToolManager(_make_spec([]))
     assert _non_lifecycle_schemas(mgr) == []
 
@@ -807,6 +809,7 @@ def test_client_tools_registered_in_schemas(
     # directory so this repo's own .claude/skills/ doesn't contribute
     # extra tool schemas to the count below.
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     spec = _make_spec()
     mgr = ToolManager(
         spec,
@@ -912,6 +915,7 @@ def test_client_tools_none_equivalent_to_empty(
     # directory so this repo's own .claude/skills/ doesn't contribute
     # extra tool schemas to the empty-list check.
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     spec = _make_spec()
     mgr_none = ToolManager(spec, client_tool_specs=None)
     mgr_empty = ToolManager(spec, client_tool_specs=[])
@@ -1227,6 +1231,7 @@ def test_local_tools_skipped_without_workdir(
     # workdir); run from an empty directory so this repo's own
     # .claude/skills/ doesn't contribute extra tool schemas.
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     info = LocalToolInfo(
         name="some_tool",
         path="tools/python/some_tool.py",
