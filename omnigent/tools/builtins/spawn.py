@@ -952,6 +952,7 @@ class SysSessionCreateTool(Tool):
 
 def _project_activity_item(
     item: ConversationItem,
+    max_chars: int = _ACTIVITY_MAX_CHARS,
 ) -> dict[str, str | None]:
     """
     Project a conversation item into a compact dict.
@@ -976,6 +977,7 @@ def _project_activity_item(
             "name": data.get("name"),
             "args": _truncate(
                 data.get("arguments", ""),
+                max_chars,
             ),
         }
     if item.type == "function_call_output":
@@ -1392,6 +1394,18 @@ class SysSessionGetHistoryTool(Tool):
                                 "prompt size bounded."
                             ),
                         },
+                        "max_chars": {
+                            "type": "integer",
+                            "minimum": 2000,
+                            "maximum": 50000,
+                            "default": _ACTIVITY_MAX_CHARS,
+                            "description": (
+                                f"Maximum characters per content field. "
+                                f"Defaults to {_ACTIVITY_MAX_CHARS}. "
+                                "Set higher to retrieve longer items "
+                                "without truncation."
+                            ),
+                        },
                     },
                     "required": ["conversation_id"],
                     "additionalProperties": False,
@@ -1422,6 +1436,11 @@ class SysSessionGetHistoryTool(Tool):
         )
         if isinstance(tail_items, str):
             return tail_items
+        max_chars = resolution.args.get("max_chars", _ACTIVITY_MAX_CHARS)
+        if not isinstance(max_chars, int) or max_chars < 2000:
+            max_chars = _ACTIVITY_MAX_CHARS
+        if max_chars > 50000:
+            max_chars = 50000
         page = resolution.conv_store.list_items(
             resolution.child.id,
             limit=tail_items,
@@ -1430,7 +1449,7 @@ class SysSessionGetHistoryTool(Tool):
         # ``list_items(order="desc")`` returns newest-first; reverse
         # to chronological order so the LLM reads top-to-bottom.
         items: list[dict[str, Any]] = [
-            _project_activity_item(item) for item in reversed(page.data)
+            _project_activity_item(item, max_chars) for item in reversed(page.data)
         ]
         # A parked elicitation never lands in the conversation store
         # (it lives only in the pending-elicitations index), so without
