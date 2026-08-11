@@ -80,6 +80,7 @@ import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
+import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
 import {
@@ -938,6 +939,27 @@ export function AppShell() {
     setSidebarPeek(false);
   };
 
+  // Dwell-to-peek for the macOS title-bar toggle. ChatHeader owns this for its
+  // own collapsed-state button, but that button is hidden on the mac shell (the
+  // title-bar cluster replaces it), so the behaviour has to exist here too or
+  // dwell-to-peek would only work on a button the user can no longer see.
+  // Same 400ms as ChatHeader: a quick pass-over must not open the card.
+  const titleBarPeekTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelTitleBarPeek = useCallback(() => {
+    if (titleBarPeekTimer.current) {
+      clearTimeout(titleBarPeekTimer.current);
+      titleBarPeekTimer.current = null;
+    }
+  }, []);
+  const armTitleBarPeek = useCallback(() => {
+    cancelTitleBarPeek();
+    titleBarPeekTimer.current = setTimeout(() => {
+      setSidebarPeek(true);
+      setSidebarOpen(false);
+    }, 400);
+  }, [cancelTitleBarPeek]);
+  useEffect(() => cancelTitleBarPeek, [cancelTitleBarPeek]);
+
   // Toggle the workspace rail's full-screen (maximized) state. Entering
   // collapses the left sidebar (the maximized rail wants the full width) after
   // stashing its prior open-state; exiting restores that state. The sidebar
@@ -1365,6 +1387,39 @@ export function AppShell() {
           canvas for the traffic lights, and the strip is the window's one
           drag surface — content below and right stays fully clickable. */}
             {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
+            {/* The Search/Settings/toggle cluster lives HERE on the macOS shell,
+          not in the sidebar, so the three icons hold one fixed position beside
+          the traffic lights no matter what the sidebar does. Inside the sidebar
+          they would be clipped and inert once it collapses (md:w-0 +
+          overflow-hidden + inert), and while peeking the floating card's
+          inset-2 would drag them off the lights' centre line. The sidebar's own
+          copy is hidden on mac by CSS; this one is positioned by
+          .electron-sidebar-header-actions in index.css. */}
+            {isMacElectronShell() && (
+              <div className="electron-sidebar-header-actions">
+                <SidebarHeaderActions
+                  expanded={sidebarOpen || sidebarPeek}
+                  onToggle={() => {
+                    // Mirrors the ⌘⌥[ hotkey: a peeking sidebar counts as open,
+                    // so toggling from peek pins it open rather than collapsing.
+                    if (sidebarOpen) {
+                      setSidebarOpen(false);
+                    } else {
+                      setSidebarOpen(true);
+                    }
+                    setSidebarPeek(false);
+                  }}
+                  onOpenSearch={() => setCommandPaletteOpen(true)}
+                  // Dwell-to-peek moves here with the button: on mac this cluster
+                  // replaces ChatHeader's collapsed-state toggle, which is where
+                  // peek was armed, so without this the affordance would vanish.
+                  // Only meaningful while collapsed — peeking or open, there is
+                  // nothing to peek at.
+                  onTogglePointerEnter={sidebarOpen || sidebarPeek ? undefined : armTitleBarPeek}
+                  onTogglePointerLeave={cancelTitleBarPeek}
+                />
+              </div>
+            )}
             {/* The server picker is NOT here: it lives at the bottom of the
           sidebar (SidebarServerPicker). This strip is shared with the chat
           header — which is taller and also anchored at top-0 — so a centered

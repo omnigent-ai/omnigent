@@ -408,11 +408,13 @@ describe("index.css text selection colors", () => {
   });
 });
 
-/* The macOS desktop shell's sidebar header shares the window's top strip with
- * the OS traffic lights: no wordmark, and the action buttons sit beside the
- * window controls. Asserted at the CSS level because the whole change is CSS —
- * and because the lights are painted by macOS OUTSIDE the page, so no DOM test
- * (and no page screenshot) can see them. These values ARE the alignment.
+/* On the macOS desktop shell the window's top strip carries the OS traffic
+ * lights plus the Search/Settings/toggle cluster, and the cluster is owned by
+ * AppShell rather than the sidebar so it holds that spot whether the sidebar is
+ * open, collapsed, or peeking. Asserted at the CSS level because the whole
+ * change is CSS — and because the lights are painted by macOS OUTSIDE the page,
+ * so no DOM test (and no page screenshot) can see them. These values ARE the
+ * alignment.
  */
 describe("index.css electron-mac sidebar header", () => {
   const sidebarRule = cssSource.match(
@@ -422,8 +424,11 @@ describe("index.css electron-mac sidebar header", () => {
     /\[data-electron-mac\] \.sidebar-header-row \{[^}]*\}/,
   )?.[0];
   const brandRule = cssSource.match(/\[data-electron-mac\] \.sidebar-brand \{[^}]*\}/)?.[0];
-  const actionsRule = cssSource.match(
-    /\[data-electron-mac\] \[data-testid="sidebar-header-actions"\] \{(?:[^{}]|\{[^{}]*\})*\}/,
+  const inSidebarActionsRule = cssSource.match(
+    /\[data-electron-mac\] \.conversations-sidebar \[data-testid="sidebar-header-actions"\] \{[^}]*\}/,
+  )?.[0];
+  const stripActionsRule = cssSource.match(
+    /\[data-electron-mac\] \.electron-sidebar-header-actions \{(?:[^{}]|\{[^{}]*\})*\}/,
   )?.[0];
   const dragStripRule = cssSource.match(
     /\[data-electron-mac\] \.electron-drag-strip \{[^}]*\}/,
@@ -431,39 +436,76 @@ describe("index.css electron-mac sidebar header", () => {
   const settingsHeaderRule = cssSource.match(
     /\[data-electron-mac\] \.settings-sidebar-header \{[^}]*\}/,
   )?.[0];
+  const chatHeaderToggleRule = cssSource.match(
+    /\[data-electron-mac\] \.chat-header-sidebar-toggle \{[^}]*\}/,
+  )?.[0];
 
   it("starts the sidebar at the window's top edge (no empty strip above it)", () => {
-    // Was 2.25rem, which left the band of blank canvas this change removes: the
-    // 3rem header row is tall enough to host the lights itself.
+    // Was 2.25rem, which left the band of blank canvas this change removes.
     expect(sidebarRule).toContain("margin-top: 0");
   });
 
-  it("clears the traffic lights and left-aligns the action cluster", () => {
-    // justify-content must be overridden — the row's own justify-between would
-    // pin the buttons to the far right, leaving a gap where the wordmark was.
-    expect(headerRowRule).toContain("justify-content: flex-start");
-    expect(headerRowRule).toContain("padding-left: 5rem");
-  });
-
-  it("drops the brand mark, which has nowhere to sit in the title-bar row", () => {
+  it("drops the brand mark, which has nowhere to sit beside the lights", () => {
     expect(brandRule).toContain("display: none");
   });
 
-  it("aligns the buttons to the lights' centre line, not the row's", () => {
-    // The row centres its children at y=24; the lights sit ~y=19. Centring a
-    // 1.5rem button in the 2.25rem title-bar strip gives y=18 instead:
-    // (2.25rem − 1.5rem) / 2 = 0.375rem.
-    expect(actionsRule).toContain("align-self: flex-start");
-    expect(actionsRule).toContain("margin-top: 0.375rem");
+  it("collapses the emptied header row instead of leaving a dead band", () => {
+    // Both the wordmark and the cluster are gone from this row on mac, so a
+    // 3rem row would reintroduce the empty strip this change set out to remove.
+    expect(headerRowRule).toContain("height: 2.25rem");
+  });
+
+  it("hides the sidebar's own cluster in favour of the title-bar copy", () => {
+    // The AppShell copy is the one that renders on mac; two visible clusters
+    // would be a duplicated control.
+    expect(inSidebarActionsRule).toContain("display: none");
+  });
+
+  it("scopes that hide to the sidebar so it cannot match the AppShell copy", () => {
+    // Without the .conversations-sidebar qualifier this selector would also hit
+    // the title-bar cluster and hide the icons entirely on mac.
+    expect(inSidebarActionsRule).toContain(".conversations-sidebar");
+  });
+
+  it("pins the title-bar cluster beside the lights, independent of the sidebar", () => {
+    // Positioned against the app shell, NOT inside the sidebar — that is what
+    // keeps the icons in place while the sidebar collapses (md:w-0 +
+    // overflow-hidden + inert) or peeks (floating card at inset-2).
+    expect(stripActionsRule).toContain("position: absolute");
+    // 5rem clears the three lights plus their inset.
+    expect(stripActionsRule).toContain("left: 5rem");
+  });
+
+  it("stacks the cluster above the sidebar so it is actually painted", () => {
+    // Regression guard: the sidebar is a positioned sibling at z-index 50 with
+    // an OPAQUE gradient background, so any lower layer leaves the buttons
+    // measuring correctly in the DOM while being invisible on screen — a bug no
+    // geometry assertion catches. Must clear 50.
+    const z = stripActionsRule?.match(/z-index:\s*(\d+)/)?.[1];
+    expect(z, "cluster needs an explicit z-index").toBeDefined();
+    expect(Number(z)).toBeGreaterThan(50);
+  });
+
+  it("hides the chat header's duplicate open-sidebar button", () => {
+    // The title-bar toggle is present in every state and carries the same
+    // dwell-to-peek, so the chat header's copy would be a second, lower, offset
+    // instance of one control.
+    expect(chatHeaderToggleRule).toContain("display: none");
+  });
+
+  it("aligns the cluster to the lights' centre line", () => {
+    // The lights sit ~y=19. Centring a 1.5rem button in the 2.25rem title-bar
+    // strip gives y=18: (2.25rem − 1.5rem) / 2 = 0.375rem.
+    expect(stripActionsRule).toContain("top: 0.375rem");
     // Anchored to the SAME strip height the drag region uses, so the two can't
     // drift apart if that band is ever retuned.
     expect(dragStripRule).toContain("height: 2.25rem");
   });
 
   it("orders the cluster Collapse, Search, Settings left-to-right", () => {
-    // The DOM order is Search → Settings → Collapse (tab order follows
+    // The DOM order is Search → Settings → toggle (tab order follows
     // importance), so the toggle is reordered visually rather than moved.
-    expect(actionsRule).toMatch(/&\s*>\s*\*:last-child\s*\{[^}]*order:\s*-1/);
+    expect(stripActionsRule).toMatch(/&\s*>\s*\*\s*>\s*\*:last-child\s*\{[^}]*order:\s*-1/);
   });
 
   it("pushes the settings sidebar's Back row below the lights", () => {
@@ -475,7 +517,13 @@ describe("index.css electron-mac sidebar header", () => {
   it("keeps every header rule scoped to the desktop shell", () => {
     // A browser tab has no window controls to align to, so none of this may
     // apply there. Each rule must carry the [data-electron-mac] scope.
-    for (const selector of [".sidebar-header-row", ".sidebar-brand", ".settings-sidebar-header"]) {
+    for (const selector of [
+      ".sidebar-header-row",
+      ".sidebar-brand",
+      ".settings-sidebar-header",
+      ".electron-sidebar-header-actions",
+      ".chat-header-sidebar-toggle",
+    ]) {
       const occurrences = cssSource.split(selector).length - 1;
       const scoped = cssSource.split(`[data-electron-mac] ${selector}`).length - 1;
       expect(scoped, `${selector} must always be [data-electron-mac]-scoped`).toBe(occurrences);

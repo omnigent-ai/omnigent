@@ -38,20 +38,17 @@ import {
   Maximize2Icon,
   Minimize2Icon,
   MoreHorizontalIcon,
-  PanelRightOpenIcon,
   PencilIcon,
   PinIcon,
   PinOffIcon,
   SearchIcon,
   Settings2Icon,
-  SettingsIcon,
   ShareIcon,
   SquareIcon,
   SquareCheckIcon,
   SquarePenIcon,
   Trash2Icon,
   XIcon,
-  PanelLeftOpenIcon,
 } from "lucide-react";
 import {
   DndContext,
@@ -69,6 +66,7 @@ import {
 } from "@dnd-kit/core";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
+import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
 import {
@@ -797,85 +795,17 @@ export function Sidebar({
                 className="h-[15px] w-auto shrink-0 translate-y-px dark:invert"
               />
             </Link>
-            <div className="flex items-center gap-1" data-testid="sidebar-header-actions">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    aria-label="Search"
-                    onClick={() => onOpenSearch?.()}
-                    className="size-6 text-muted-foreground hover:text-foreground"
-                    data-testid="sidebar-search-button"
-                  >
-                    <SearchIcon className="ui-icon" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">Search</TooltipContent>
-              </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    asChild
-                    variant="ghost"
-                    size="icon-xs"
-                    aria-label="Settings"
-                    className="size-6 text-muted-foreground hover:text-foreground"
-                  >
-                    {/* No onNavClick: on mobile, entering Settings keeps the
-                    drawer open and swaps it to the section list. */}
-                    <Link to="/settings" data-testid="settings-button">
-                      <SettingsIcon className="ui-icon" />
-                    </Link>
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">Settings</TooltipContent>
-              </Tooltip>
-              {!peek ? (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      aria-label="Close sidebar"
-                      onClick={onClose}
-                      className="size-6 text-muted-foreground hover:text-foreground"
-                    >
-                      {/* panel-right-open while the sidebar IS open — this button
-                    only renders in the open state (ChatHeader's PanelLeftIcon
-                    covers the collapsed state). */}
-                      <PanelRightOpenIcon className="ui-icon" />
-                    </Button>
-                  </TooltipTrigger>
-                  {/* Bottom placement keeps the tooltip clear of the macOS
-                Electron shell's traffic lights at the window's top edge. */}
-                  <TooltipContent side="bottom">Collapse sidebar</TooltipContent>
-                </Tooltip>
-              ) : (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      aria-label="Open sidebar"
-                      onClick={onOpen}
-                      className="size-6 text-muted-foreground hover:text-foreground"
-                    >
-                      {/* panel-right-open while the sidebar IS open — this button
-                    only renders in the open state (ChatHeader's PanelLeftIcon
-                    covers the collapsed state). */}
-                      <PanelLeftOpenIcon className="ui-icon" />
-                    </Button>
-                  </TooltipTrigger>
-                  {/* Bottom placement keeps the tooltip clear of the macOS
-                Electron shell's traffic lights at the window's top edge. */}
-                  <TooltipContent side="bottom">Open sidebar</TooltipContent>
-                </Tooltip>
-              )}
-            </div>
+            {/* On the macOS shell this copy is hidden and an identical cluster
+            renders in the title-bar strip instead (see AppShell), so the icons
+            keep their place when the sidebar collapses or peeks. Everywhere
+            else this is the only copy. */}
+            <SidebarHeaderActions
+              expanded={!peek}
+              // onOpen is optional (the sidebar renders standalone in tests), so
+              // fall back to a no-op rather than widening the child's contract.
+              onToggle={peek ? () => onOpen?.() : onClose}
+              onOpenSearch={onOpenSearch}
+            />
           </div>
 
           <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
