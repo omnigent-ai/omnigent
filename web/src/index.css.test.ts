@@ -439,6 +439,9 @@ describe("index.css electron-mac sidebar header", () => {
   const chatHeaderToggleRule = cssSource.match(
     /\[data-electron-mac\] \.chat-header-sidebar-toggle \{[^}]*\}/,
   )?.[0];
+  const peekCardRule = cssSource.match(
+    /\[data-electron-mac\] \.conversations-sidebar\.is-peek \{[^}]*\}/,
+  )?.[0];
 
   it("starts the sidebar at the window's top edge (no empty strip above it)", () => {
     // Was 2.25rem, which left the band of blank canvas this change removes.
@@ -491,6 +494,14 @@ describe("index.css electron-mac sidebar header", () => {
     // dwell-to-peek, so the chat header's copy would be a second, lower, offset
     // instance of one control.
     expect(chatHeaderToggleRule).toContain("display: none");
+  });
+
+  it("floats the peek card below the title-bar controls", () => {
+    // The card's own inset-2 would put its first row level with the lights and
+    // the icon cluster, so it slides up UNDER the window controls. Its top edge
+    // must clear the 2.25rem strip (2.75rem = strip + the same 0.5rem gap the
+    // card's other edges use).
+    expect(peekCardRule).toContain("top: 2.75rem");
   });
 
   it("aligns the cluster to the lights' centre line", () => {

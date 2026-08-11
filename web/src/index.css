@@ -657,6 +657,15 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   [data-electron-mac] .chat-header-sidebar-toggle {
     display: none;
   }
+  /* The peek card floats at inset-2 (8px from the top), which on this shell puts
+   * its first row level with the traffic lights and the title-bar cluster — the
+   * card slides up UNDER the window controls and collides with them. Drop its
+   * top edge below the 2.25rem strip so it floats in beneath the controls
+   * instead, keeping the same 0.5rem breathing room the other edges use.
+   * The docked sidebar is unaffected: only the floating card is offset. */
+  [data-electron-mac] .conversations-sidebar.is-peek {
+    top: 2.75rem;
+  }
   /* The settings sidebar swaps the header row for a "Back" row, which would now
    * sit under the traffic lights. Push it below them — it has no cluster to
    * align beside the lights, so it clears them vertically instead. */
