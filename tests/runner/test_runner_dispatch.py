@@ -5306,14 +5306,38 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
     ]
 
 
+_REST_HISTORY_CONTENT_SCENARIOS = [
+    pytest.param(3000, 4000, "R" * 3000, id="raised-limit"),
+    pytest.param(3000, None, "R" * 2000 + " [truncated]", id="default-limit"),
+    pytest.param(13000, 50000, "R" * 12000 + " [truncated]", id="ceiling"),
+    # No REST request is expected because validation rejects before the GET.
+    pytest.param(None, 0, "content_max_chars must be >= 1", id="non-positive"),
+]
+
+
+@pytest.mark.parametrize(
+    ("content_length", "content_max_chars", "expected"),
+    _REST_HISTORY_CONTENT_SCENARIOS,
+)
 @pytest.mark.asyncio
-async def test_session_peek_rest_can_request_larger_bounded_item() -> None:
-    """The runner REST path honors an explicit larger per-item history limit."""
+async def test_session_peek_rest_content_limit_scenario(
+    content_length: int | None,
+    content_max_chars: int | None,
+    expected: str,
+) -> None:
+    """Apply one history content-limit scenario through runner REST dispatch."""
     from omnigent.runner.tool_dispatch import _execute_session_query_tool
 
-    long_review = "R" * 3000
+    content = "R" * content_length if content_length is not None else None
+    arguments: dict[str, object] = {"conversation_id": "conv_target"}
+    if content is not None:
+        arguments["tail_items"] = 1
+    if content_max_chars is not None:
+        arguments["content_max_chars"] = content_max_chars
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if content is None:
+            pytest.fail("REST request should not run for rejected arguments")
         if request.url.path == "/v1/sessions/conv_target/items":
             return httpx.Response(
                 200,
@@ -5324,7 +5348,7 @@ async def test_session_peek_rest_can_request_larger_bounded_item() -> None:
                             "id": "i1",
                             "type": "message",
                             "role": "assistant",
-                            "content": [{"type": "output_text", "text": long_review}],
+                            "content": [{"type": "output_text", "text": content}],
                         }
                     ],
                 },
@@ -5334,136 +5358,21 @@ async def test_session_peek_rest_can_request_larger_bounded_item() -> None:
         raise AssertionError(f"unexpected path {request.url.path}")
 
     async with _session_query_client(handler) as client:
-        out = json.loads(
+        payload = json.loads(
             await _execute_session_query_tool(
                 "sys_session_get_history",
-                json.dumps(
-                    {
-                        "conversation_id": "conv_target",
-                        "tail_items": 1,
-                        "content_max_chars": 4000,
-                    }
-                ),
+                json.dumps(arguments),
                 conversation_id="conv_caller",
                 server_client=client,
             )
         )
 
-    assert out["items"][0]["text"] == long_review
-
-
-@pytest.mark.asyncio
-async def test_session_peek_rest_default_content_limit_matches_activity_preview() -> None:
-    """Omitting the content limit keeps the exact activity preview behavior."""
-    from omnigent.runner.tool_dispatch import _execute_session_query_tool
-
-    long_review = "R" * 3000
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/sessions/conv_target/items":
-            return httpx.Response(
-                200,
-                json={
-                    "object": "list",
-                    "data": [
-                        {
-                            "id": "i1",
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": long_review}],
-                        }
-                    ],
-                },
-            )
-        if request.url.path == "/v1/sessions/conv_target":
-            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
-        raise AssertionError(f"unexpected path {request.url.path}")
-
-    async with _session_query_client(handler) as client:
-        out = json.loads(
-            await _execute_session_query_tool(
-                "sys_session_get_history",
-                json.dumps(
-                    {
-                        "conversation_id": "conv_target",
-                        "tail_items": 1,
-                    }
-                ),
-                conversation_id="conv_caller",
-                server_client=client,
-            )
-        )
-
-    assert out["items"][0]["text"] == long_review[:2000] + " [truncated]"
-
-
-@pytest.mark.asyncio
-async def test_session_peek_rest_clamps_content_limit_above_maximum() -> None:
-    """Provider input above the advertised ceiling is clamped by the handler."""
-    from omnigent.runner.tool_dispatch import _execute_session_query_tool
-
-    long_review = "R" * 13000
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/sessions/conv_target/items":
-            return httpx.Response(
-                200,
-                json={
-                    "object": "list",
-                    "data": [
-                        {
-                            "id": "i1",
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": long_review}],
-                        }
-                    ],
-                },
-            )
-        if request.url.path == "/v1/sessions/conv_target":
-            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
-        raise AssertionError(f"unexpected path {request.url.path}")
-
-    async with _session_query_client(handler) as client:
-        out = json.loads(
-            await _execute_session_query_tool(
-                "sys_session_get_history",
-                json.dumps(
-                    {
-                        "conversation_id": "conv_target",
-                        "tail_items": 1,
-                        "content_max_chars": 50000,
-                    }
-                ),
-                conversation_id="conv_caller",
-                server_client=client,
-            )
-        )
-
-    assert out["items"][0]["text"] == long_review[:12000] + " [truncated]"
-
-
-@pytest.mark.asyncio
-async def test_session_peek_rest_rejects_non_positive_content_limit() -> None:
-    """The runner REST path rejects invalid provider-supplied limits."""
-    from omnigent.runner.tool_dispatch import _execute_session_query_tool
-
-    async with _session_query_client(lambda _: pytest.fail("REST call should not run")) as client:
-        out = json.loads(
-            await _execute_session_query_tool(
-                "sys_session_get_history",
-                json.dumps(
-                    {
-                        "conversation_id": "conv_target",
-                        "content_max_chars": 0,
-                    }
-                ),
-                conversation_id="conv_caller",
-                server_client=client,
-            )
-        )
-
-    assert out["error"] == "content_max_chars must be >= 1"
+    if "error" in payload:
+        actual = payload["error"]
+    else:
+        assert payload["title"] == "auth"
+        actual = payload["items"][0]["text"]
+    assert actual == expected
 
 
 @pytest.mark.asyncio

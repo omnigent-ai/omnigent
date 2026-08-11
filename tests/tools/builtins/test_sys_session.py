@@ -391,122 +391,58 @@ def test_peek_returns_items_chronological(session_fixture: _Fixture) -> None:
     assert items[1]["content"] == "looking at handlers.py"
 
 
-def test_peek_can_request_more_than_activity_preview_limit(session_fixture: _Fixture) -> None:
-    """An explicit bounded limit returns a long child message in one read."""
-    long_review = "R" * 3000
-    session_fixture.conv_store.append(
-        session_fixture.child_conv_id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="resp_long_review",
-                data=MessageData(
-                    role="assistant",
-                    content=[{"type": "output_text", "text": long_review}],
-                    agent="researcher",
-                ),
-            )
-        ],
-    )
-
-    raw = SysSessionGetHistoryTool().invoke(
-        json.dumps(
-            {
-                "conversation_id": session_fixture.child_conv_id,
-                "tail_items": 1,
-                "content_max_chars": 4000,
-            }
-        ),
-        session_fixture.ctx,
-    )
-    payload = json.loads(raw)
-    assert payload["items"][0]["content"] == long_review
+_HISTORY_CONTENT_SCENARIOS = [
+    pytest.param(3000, 4000, "R" * 3000, id="raised-limit"),
+    pytest.param(3000, None, "R" * 2000 + " [truncated]", id="default-limit"),
+    pytest.param(13000, 50000, "R" * 12000 + " [truncated]", id="ceiling"),
+    # No stored item is needed because validation rejects before projection.
+    pytest.param(None, 0, "content_max_chars must be >= 1", id="non-positive"),
+]
 
 
-def test_peek_default_content_limit_matches_activity_preview(
+@pytest.mark.parametrize(
+    ("content_length", "content_max_chars", "expected"),
+    _HISTORY_CONTENT_SCENARIOS,
+)
+def test_peek_content_limit_scenario(
     session_fixture: _Fixture,
+    content_length: int | None,
+    content_max_chars: int | None,
+    expected: str,
 ) -> None:
-    """Omitting the content limit keeps the exact activity preview behavior."""
-    long_review = "R" * 3000
-    session_fixture.conv_store.append(
-        session_fixture.child_conv_id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="resp_default_review",
-                data=MessageData(
-                    role="assistant",
-                    content=[{"type": "output_text", "text": long_review}],
-                    agent="researcher",
-                ),
-            )
-        ],
+    """Apply one history content-limit scenario through the in-process tool."""
+    content = "R" * content_length if content_length is not None else None
+    arguments: dict[str, object] = {"conversation_id": session_fixture.child_conv_id}
+    if content is not None:
+        arguments["tail_items"] = 1
+    if content_max_chars is not None:
+        arguments["content_max_chars"] = content_max_chars
+
+    if content is not None:
+        session_fixture.conv_store.append(
+            session_fixture.child_conv_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="resp_content_limit",
+                    data=MessageData(
+                        role="assistant",
+                        content=[{"type": "output_text", "text": content}],
+                        agent="researcher",
+                    ),
+                )
+            ],
+        )
+
+    payload = json.loads(
+        SysSessionGetHistoryTool().invoke(json.dumps(arguments), session_fixture.ctx)
     )
-
-    raw = SysSessionGetHistoryTool().invoke(
-        json.dumps(
-            {
-                "conversation_id": session_fixture.child_conv_id,
-                "tail_items": 1,
-            }
-        ),
-        session_fixture.ctx,
-    )
-
-    content = json.loads(raw)["items"][0]["content"]
-    assert content == long_review[:2000] + " [truncated]"
+    actual = payload["error"] if "error" in payload else payload["items"][0]["content"]
+    assert actual == expected
 
 
-def test_peek_clamps_content_limit_above_maximum(session_fixture: _Fixture) -> None:
-    """Provider input above the advertised ceiling is clamped by the handler."""
-    long_review = "R" * 13000
-    session_fixture.conv_store.append(
-        session_fixture.child_conv_id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="resp_clamped_review",
-                data=MessageData(
-                    role="assistant",
-                    content=[{"type": "output_text", "text": long_review}],
-                    agent="researcher",
-                ),
-            )
-        ],
-    )
-
-    raw = SysSessionGetHistoryTool().invoke(
-        json.dumps(
-            {
-                "conversation_id": session_fixture.child_conv_id,
-                "tail_items": 1,
-                "content_max_chars": 50000,
-            }
-        ),
-        session_fixture.ctx,
-    )
-
-    content = json.loads(raw)["items"][0]["content"]
-    assert content == long_review[:12000] + " [truncated]"
-
-
-def test_peek_rejects_non_positive_content_limit(session_fixture: _Fixture) -> None:
-    """Handler validation rejects a limit that providers let through."""
-    raw = SysSessionGetHistoryTool().invoke(
-        json.dumps(
-            {
-                "conversation_id": session_fixture.child_conv_id,
-                "content_max_chars": 0,
-            }
-        ),
-        session_fixture.ctx,
-    )
-    assert json.loads(raw)["error"] == "content_max_chars must be >= 1"
-
-
-# The following three cases cover the helper shared with the runner REST
-# dispatcher through its import in tool_dispatch.py, so the REST suite does not
-# duplicate them.
+# These coercion cases cover the helper imported by the runner REST dispatcher.
+# The runner suite repeats only the four path-level scenarios, not these cases.
 
 
 def test_peek_rejects_boolean_content_limit(session_fixture: _Fixture) -> None:

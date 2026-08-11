@@ -23,7 +23,7 @@ from tests.e2e.conftest import (
     reset_mock_llm,
     send_user_message_to_session,
 )
-from tests.e2e.helpers import POLL_INTERVAL_S
+from tests.e2e.helpers import POLL_INTERVAL_S, get_output_items
 
 pytestmark = [
     pytest.mark.timeout(600, method="signal"),
@@ -41,17 +41,6 @@ def _tool_call(
     return {"call_id": call_id, "name": name, "arguments": json.dumps(arguments)}
 
 
-def _session_items(http_client: httpx.Client, session_id: str) -> list[dict[str, Any]]:
-    """Return persisted session items in chronological order."""
-    response = http_client.get(
-        f"/v1/sessions/{session_id}/items",
-        params={"limit": 100, "order": "asc"},
-    )
-    response.raise_for_status()
-    items: list[dict[str, Any]] = response.json()["data"]
-    return items
-
-
 def _wait_for_session_text(
     http_client: httpx.Client,
     session_id: str,
@@ -63,89 +52,18 @@ def _wait_for_session_text(
     deadline = time.monotonic() + timeout
     items: list[dict[str, Any]] = []
     while time.monotonic() < deadline:
-        items = _session_items(http_client, session_id)
+        response = http_client.get(
+            f"/v1/sessions/{session_id}/items",
+            params={"limit": 100, "order": "asc"},
+        )
+        response.raise_for_status()
+        items = response.json()["data"]
         if text in json.dumps(items):
             return items
         time.sleep(POLL_INTERVAL_S)
     raise AssertionError(
         f"{text!r} did not appear in session {session_id} within {timeout}s; last items={items!r}"
     )
-
-
-def _wait_for_child_session(
-    http_client: httpx.Client,
-    parent_id: str,
-    *,
-    timeout: float = 120,
-) -> str:
-    """Poll until the parent exposes its child session."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        response = http_client.get(f"/v1/sessions/{parent_id}/child_sessions")
-        response.raise_for_status()
-        children = response.json().get("data", [])
-        if children:
-            return str(children[0]["id"])
-        time.sleep(POLL_INTERVAL_S)
-    raise AssertionError(f"child session did not appear for parent {parent_id}")
-
-
-def _history_text(body: dict[str, Any], call_id: str) -> str:
-    """Extract the message text returned by one history tool call."""
-    output_item = next(
-        item
-        for item in body["output"]
-        if item.get("type") == "function_call_output" and item.get("call_id") == call_id
-    )
-    payload = json.loads(output_item["output"])
-    text: str = payload["items"][-1]["text"]
-    return text
-
-
-def _read_child_history(
-    http_client: httpx.Client,
-    *,
-    parent_id: str,
-    parent_model: str,
-    child_id: str,
-    mock_llm_server_url: str,
-    call_id: str,
-    content_max_chars: int | None,
-) -> str:
-    """Run one parent turn that reads the child session history."""
-    arguments: dict[str, object] = {
-        "conversation_id": child_id,
-        "tail_items": 1,
-    }
-    if content_max_chars is not None:
-        arguments["content_max_chars"] = content_max_chars
-
-    reset_mock_llm(mock_llm_server_url)
-    configure_mock_llm(
-        mock_llm_server_url,
-        [
-            {
-                "tool_calls": [
-                    _tool_call("sys_session_get_history", arguments, call_id),
-                ]
-            },
-            {"text": f"{call_id}_COMPLETE"},
-        ],
-        key=parent_model,
-    )
-    response_id = send_user_message_to_session(
-        http_client,
-        session_id=parent_id,
-        content="Read the child session history.",
-    )
-    body = poll_session_until_terminal(
-        http_client,
-        session_id=parent_id,
-        response_id=response_id,
-        timeout=120,
-    )
-    assert body["status"] == "completed", body.get("error")
-    return _history_text(body, call_id)
 
 
 def test_session_history_raised_content_limit_recovers_full_child_response_e2e(
@@ -234,28 +152,58 @@ def test_session_history_raised_content_limit_recovers_full_child_response_e2e(
     )
     assert body["status"] == "completed", body.get("error")
 
-    child_id = _wait_for_child_session(http_client, parent_id)
-    _wait_for_session_text(http_client, child_id, "|CHILD_END")
     _wait_for_session_text(http_client, parent_id, "AUTO_WAKE_COMPLETE")
+    response = http_client.get(f"/v1/sessions/{parent_id}/child_sessions")
+    response.raise_for_status()
+    child_sessions = response.json()["data"]
+    assert child_sessions, f"child session did not appear for parent {parent_id}"
+    child_id = child_sessions[0]["id"]
+    _wait_for_session_text(http_client, child_id, "|CHILD_END")
 
-    default_text = _read_child_history(
-        http_client,
-        parent_id=parent_id,
-        parent_model=parent_model,
-        child_id=child_id,
-        mock_llm_server_url=mock_llm_server_url,
-        call_id="call_default_history",
-        content_max_chars=None,
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    _tool_call(
+                        "sys_session_get_history",
+                        {"conversation_id": child_id, "tail_items": 1},
+                        "call_default_history",
+                    ),
+                    _tool_call(
+                        "sys_session_get_history",
+                        {
+                            "conversation_id": child_id,
+                            "tail_items": 1,
+                            "content_max_chars": 5000,
+                        },
+                        "call_raised_history",
+                    ),
+                ]
+            },
+            {"text": "HISTORY_READ_COMPLETE"},
+        ],
+        key=parent_model,
     )
+    response_id = send_user_message_to_session(
+        http_client,
+        session_id=parent_id,
+        content="Read the child session history with both limits.",
+    )
+    body = poll_session_until_terminal(
+        http_client,
+        session_id=parent_id,
+        response_id=response_id,
+        timeout=120,
+    )
+    assert body["status"] == "completed", body.get("error")
+
+    outputs = {
+        item["call_id"]: json.loads(item["output"])
+        for item in get_output_items(body, "function_call_output")
+    }
+    default_text = outputs["call_default_history"]["items"][-1]["text"]
+    raised_text = outputs["call_raised_history"]["items"][-1]["text"]
     assert default_text == long_child_text[:2000] + " [truncated]"
-
-    raised_text = _read_child_history(
-        http_client,
-        parent_id=parent_id,
-        parent_model=parent_model,
-        child_id=child_id,
-        mock_llm_server_url=mock_llm_server_url,
-        call_id="call_raised_history",
-        content_max_chars=5000,
-    )
     assert raised_text == long_child_text
