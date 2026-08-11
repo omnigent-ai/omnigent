@@ -639,8 +639,13 @@ function AddPolicyDialog({
             >
               Cancel
             </Button>
-            <Button type="button" onClick={handleAdd} disabled={!selected || addPolicy.isPending}>
-              {addPolicy.isPending ? "Adding..." : "Add"}
+            <Button
+              type="button"
+              onClick={handleAdd}
+              loading={addPolicy.isPending}
+              disabled={!selected}
+            >
+              Add
             </Button>
           </div>
         </div>
@@ -1036,10 +1041,11 @@ function McpServerManagerDialog({
                 type="button"
                 size="sm"
                 onClick={handleSave}
-                disabled={saving || validateMcpForm(form) !== null}
+                loading={saving}
+                disabled={validateMcpForm(form) !== null}
               >
                 <SaveIcon className="size-3.5" />
-                {saving ? "Saving..." : "Save"}
+                Save
               </Button>
             </div>
           </div>

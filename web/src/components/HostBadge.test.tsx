@@ -82,6 +82,13 @@ vi.mock("@/hooks/useHosts", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionHostOnline: (id: string | undefined) => useSessionHostOnlineMock(id),
 }));
+// Stub the switch dialog: it owns its own network/query wiring, so the badge
+// test only cares that it is mounted with the session's current binding.
+vi.mock("@/shell/SwitchHostDialog", () => ({
+  SwitchHostDialog: (props: { currentHostId: string | null }) => (
+    <div data-testid="switch-host-dialog" data-current-host={props.currentHostId ?? ""} />
+  ),
+}));
 
 beforeEach(() => {
   useSessionMock.mockReset();
@@ -116,7 +123,8 @@ describe("HostBadge", () => {
     // Status is conveyed by the visible name + an sr-only status word
     // (read together as "mac-laptop, online"), with `title` for hover.
     expect(badge.textContent).toBe("mac-laptop, online");
-    expect(badge.getAttribute("title")).toBe("Host mac-laptop, online");
+    // Hover copy also advertises the switch affordance the badge now carries.
+    expect(badge.getAttribute("title")).toBe("Host mac-laptop, online — click to switch");
   });
 
   it("renders nothing when the session is not host-bound", () => {
@@ -233,13 +241,17 @@ describe("HostBadge", () => {
     expect(onReconnect).toHaveBeenCalledTimes(1);
   });
 
-  it("stays passive for an online host even when onReconnect is set", () => {
+  it("never offers reconnect for an online host, even when onReconnect is set", () => {
     // onReconnect is wired for every host-bound session; a reachable host has
-    // nothing to reconnect, so the badge must not become a button.
-    render(<HostBadge sessionId="conv_1" onReconnect={vi.fn()} />);
+    // nothing to reconnect. The badge is still clickable — that click switches
+    // hosts — but it must never reach onReconnect or show reconnect copy.
+    const onReconnect = vi.fn();
+    render(<HostBadge sessionId="conv_1" onReconnect={onReconnect} />);
     const badge = screen.getByTestId("host-badge");
-    expect(badge.tagName).not.toBe("BUTTON");
     expect(badge.textContent).toBe("mac-laptop, online");
+    fireEvent.click(badge);
+    expect(onReconnect).not.toHaveBeenCalled();
+    expect(screen.getByTestId("switch-host-dialog")).toBeInTheDocument();
   });
 
   it("stays passive for a dormant resumable managed host", () => {
@@ -251,10 +263,14 @@ describe("HostBadge", () => {
       error: null,
     });
     useSessionHostOnlineMock.mockReturnValue(false);
-    render(<HostBadge sessionId="conv_1" onReconnect={vi.fn()} />);
+    const onReconnect = vi.fn();
+    render(<HostBadge sessionId="conv_1" onReconnect={onReconnect} />);
     const badge = screen.getByTestId("host-badge");
-    expect(badge.tagName).not.toBe("BUTTON");
     expect(badge.textContent).toBe("mac-laptop, offline");
+    // `omnigent host` is the wrong instruction here, so the click must not
+    // reach reconnect — it opens the switch dialog like any non-reconnect host.
+    fireEvent.click(badge);
+    expect(onReconnect).not.toHaveBeenCalled();
   });
 
   it("renders nothing when onReconnect is set but the session isn't host-bound", () => {
@@ -277,5 +293,102 @@ describe("HostBadge", () => {
     useSessionHostOnlineMock.mockReturnValue(undefined);
     render(<HostBadge sessionId="conv_1" />);
     expect(screen.getByTestId("host-badge").textContent).toBe("host_x9, status unknown");
+  });
+
+  it("opens the switch dialog on the current binding when the host name is clicked", () => {
+    render(<HostBadge sessionId="conv_1" />);
+    const badge = screen.getByTestId("host-badge");
+    expect(badge.tagName).toBe("BUTTON");
+    // Closed dialogs stay unmounted so the badge doesn't run the dialog's
+    // host query on every session.
+    expect(screen.queryByTestId("switch-host-dialog")).toBeNull();
+    fireEvent.click(badge);
+    expect(screen.getByTestId("switch-host-dialog").getAttribute("data-current-host")).toBe(
+      "host_a1b2",
+    );
+  });
+
+  it("keeps a sandbox session's badge passive — the server owns its placement", () => {
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_sb" },
+      isLoading: false,
+      error: null,
+    });
+    useHostsMock.mockReturnValue({
+      data: [
+        {
+          host_id: "host_sb",
+          name: "managed-abc123",
+          owner: "alice",
+          status: "online",
+          sandbox_provider: "lakebox",
+        },
+      ],
+    });
+    render(<HostBadge sessionId="conv_1" />);
+    expect(screen.getByTestId("host-badge").tagName).toBe("DIV");
+  });
+
+  it("leaves the click on reconnect for an offline host, not the switch", () => {
+    // Reconnect has no other entry point in that state, so it keeps the
+    // click; the move is offered inside the reconnect dialog instead.
+    useHostsMock.mockReturnValue({
+      data: [
+        {
+          host_id: "host_a1b2",
+          name: "mac-laptop",
+          owner: "alice",
+          status: "offline",
+          sandbox_provider: null,
+        },
+      ],
+    });
+    useSessionHostOnlineMock.mockReturnValue(false);
+    const onReconnect = vi.fn();
+    render(<HostBadge sessionId="conv_1" onReconnect={onReconnect} />);
+    fireEvent.click(screen.getByTestId("host-badge"));
+    expect(onReconnect).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("switch-host-dialog")).toBeNull();
+  });
+
+  it("doesn't paint a just-switched-to host red with the old host's liveness", () => {
+    // Host liveness is keyed by session and polled every ~10s, so right
+    // after a switch it still describes the host we left. The session
+    // snapshot repoints immediately, so attributing that value to the new
+    // host shows a red dot beside a machine that is demonstrably up (it had
+    // to be online to be offered as a target at all).
+    useHostsMock.mockReturnValue({
+      data: [
+        { host_id: "host_dead", name: "old-box", owner: "alice", status: "offline" },
+        { host_id: "host_live", name: "new-box", owner: "alice", status: "online" },
+      ],
+    });
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_dead" },
+      isLoading: false,
+      error: null,
+    });
+    useSessionHostOnlineMock.mockReturnValue(false);
+    const { rerender } = render(<HostBadge sessionId="conv_1" />);
+    expect(screen.getByTestId("host-badge").textContent).toBe("old-box, offline");
+
+    // The switch lands: hostId repoints, but the poll hasn't ticked, so
+    // `useSessionHostOnline` still returns the old host's `false`.
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_live" },
+      isLoading: false,
+      error: null,
+    });
+    rerender(<HostBadge sessionId="conv_1" />);
+    expect(screen.getByTestId("host-badge").textContent).toBe("new-box, online");
+
+    // Once the poll speaks for the new binding it is authoritative again —
+    // including when it reports the new host going down.
+    useSessionHostOnlineMock.mockReturnValue(true);
+    rerender(<HostBadge sessionId="conv_1" />);
+    expect(screen.getByTestId("host-badge").textContent).toBe("new-box, online");
+    useSessionHostOnlineMock.mockReturnValue(false);
+    rerender(<HostBadge sessionId="conv_1" />);
+    expect(screen.getByTestId("host-badge").textContent).toBe("new-box, offline");
   });
 });

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import queue
 import threading
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,6 +18,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import omnigent.claude_native_forwarder as forwarder
 from omnigent.claude_native_bridge import (
@@ -5210,6 +5215,248 @@ def test_usage_from_status_state_omits_cost_when_absent() -> None:
     assert "cumulative_cost_usd" not in result
 
 
+@pytest.fixture
+def otel_exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
+    """
+    Install a fresh TracerProvider with an in-memory exporter for one test.
+
+    Restores the previous provider on teardown so OTel's set-once
+    semantics do not leak into later tests in the same process.
+    """
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
+    previous = otel_trace._TRACER_PROVIDER  # type: ignore[attr-defined]
+    previous_done = otel_trace._TRACER_PROVIDER_SET_ONCE._done  # type: ignore[attr-defined]
+    in_mem = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(in_mem))
+    otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
+    try:
+        yield in_mem
+    finally:
+        in_mem.clear()
+        with contextlib.suppress(Exception):
+            provider.shutdown()
+        otel_trace._TRACER_PROVIDER = previous  # type: ignore[attr-defined]
+        otel_trace._TRACER_PROVIDER_SET_ONCE._done = previous_done  # type: ignore[attr-defined]
+
+
+def _ok_usage_client() -> httpx.AsyncClient:
+    """
+    Build a client whose ``POST /events`` always succeeds.
+
+    :returns: Client backed by a mock transport returning ``200``.
+    """
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+        base_url="http://omnigent.test",
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_session_usage_records_gen_ai_token_attributes(
+    otel_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    A native Claude usage post carries the turn's tokens as ``gen_ai.usage.*``.
+
+    A native turn runs to completion in the terminal, so the harness
+    executor's ``TurnComplete`` reports no usage and the agent span closes
+    without token attributes. This post is where the real counts are known,
+    so it must record them or the session's tokens stay invisible to
+    MLflow / any OTel backend.
+    """
+    async with _ok_usage_client() as client:
+        await forwarder._post_external_session_usage(
+            client,
+            session_id="conv_abc123",
+            usage={"context_tokens": 1773, "input_tokens": 1523, "output_tokens": 847},
+            context_window=200_000,
+            token_usage={
+                "input_tokens": 1523,
+                "output_tokens": 847,
+                "cache_read_input_tokens": 200,
+                "cache_creation_input_tokens": 50,
+            },
+        )
+
+    spans = [s for s in otel_exporter.get_finished_spans() if s.name == "claude_native.usage"]
+    assert len(spans) == 1
+    attrs = dict(spans[0].attributes or {})
+    assert attrs["gen_ai.usage.input_tokens"] == 1523
+    assert attrs["gen_ai.usage.output_tokens"] == 847
+    assert attrs["gen_ai.usage.total_tokens"] == 1523 + 847
+    assert attrs["gen_ai.usage.cache_read_input_tokens"] == 200
+    assert attrs["gen_ai.usage.cache_creation_input_tokens"] == 50
+
+
+@pytest.mark.asyncio
+async def test_post_session_usage_without_token_usage_records_no_tokens(
+    otel_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    A post with no ``token_usage`` records no token attributes.
+
+    Cost posts and context-window-only posts reach the same helper carrying
+    a usage snapshot but no new counts. Falling back to that snapshot would
+    re-record a figure already counted, or report a 0-token turn on every
+    cost tick.
+    """
+    async with _ok_usage_client() as client:
+        await forwarder._post_external_session_usage(
+            client,
+            session_id="conv_abc123",
+            usage={"cumulative_cost_usd": 0.42, "model": "claude-opus-4-8"},
+        )
+
+    spans = [s for s in otel_exporter.get_finished_spans() if s.name == "claude_native.usage"]
+    assert len(spans) == 1
+    attrs = dict(spans[0].attributes or {})
+    assert not [key for key in attrs if key.startswith("gen_ai.usage.")]
+
+
+@pytest.mark.asyncio
+async def test_forwarder_records_each_api_call_usage_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    otel_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    Each assistant API call contributes exactly one usage span.
+
+    The usage POST re-fires whenever the statusLine gauge or the context
+    window moves, which happens several times per API call. Recording the
+    snapshot on each of those would make a backend that SUMS
+    ``gen_ai.usage.*`` across spans multiply-count the same prompt. Only a
+    new completed assistant record may add a span.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+
+    def _assistant(uuid: str, text: str, usage: dict[str, int]) -> str:
+        """
+        Build one assistant JSONL line carrying ``message.usage``.
+
+        :param uuid: Transcript entry uuid, e.g. ``"a1"``.
+        :param text: Assistant text content.
+        :param usage: Anthropic ``message.usage`` block for the call.
+        :returns: A JSON-encoded transcript line.
+        """
+        return json.dumps(
+            {
+                "type": "assistant",
+                "uuid": uuid,
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-opus-4-8",
+                    "content": [{"type": "text", "text": text}],
+                    "usage": usage,
+                },
+            }
+        )
+
+    # The statusLine gauge moves every poll (a streaming message's output
+    # grows, cache reads land) — the churn that used to re-record tokens.
+    status_box = {"value": {"input_tokens": 1000, "output_tokens": 10}}
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge: {"context_window_size": 200_000, "current_usage": status_box["value"]},
+    )
+
+    transcript_path.write_text(
+        _assistant("a1", "hi", {"input_tokens": 1000, "output_tokens": 50}) + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    dedupe = forwarder._ForwardDedupeState()
+    retry_tracker = forwarder._PostRetryTracker()
+
+    transport = httpx.MockTransport(lambda _request: httpx.Response(202, json={}))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+
+        async def poll() -> None:
+            """Run one forwarder poll against the shared cursor state."""
+            nonlocal state
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=retry_tracker,
+                dedupe=dedupe,
+            )
+
+        await poll()
+        # Same API call, gauge still moving: re-posts usage, records nothing.
+        status_box["value"] = {"input_tokens": 1000, "output_tokens": 40}
+        await poll()
+        status_box["value"] = {
+            "input_tokens": 1000,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 900,
+        }
+        await poll()
+
+        recorded = _recorded_token_spans(otel_exporter)
+        assert recorded == [(1000, 50)], "one completed API call must record exactly one span"
+
+        # A second API call is new usage and does add a span.
+        with transcript_path.open("a", encoding="utf-8") as fh:
+            fh.write(_assistant("a2", "more", {"input_tokens": 2200, "output_tokens": 80}) + "\n")
+        await poll()
+
+    assert _recorded_token_spans(otel_exporter) == [(1000, 50), (2200, 80)]
+    assert dedupe.recorded_token_usage == {"input_tokens": 2200, "output_tokens": 80}
+
+
+def _recorded_token_spans(exporter: InMemorySpanExporter) -> list[tuple[int, int]]:
+    """
+    Collect ``(input_tokens, output_tokens)`` from every usage span recorded.
+
+    :param exporter: In-memory exporter holding the finished spans.
+    :returns: One pair per span that carried token attributes, in order.
+    """
+    pairs: list[tuple[int, int]] = []
+    for span in exporter.get_finished_spans():
+        attrs = dict(span.attributes or {})
+        if "gen_ai.usage.input_tokens" in attrs:
+            pairs.append((attrs["gen_ai.usage.input_tokens"], attrs["gen_ai.usage.output_tokens"]))
+    return pairs
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        # The cost tag and the derived context gauge are not token counters.
+        (
+            {"context_tokens": 1773, "input_tokens": 1523, "output_tokens": 847},
+            {"input_tokens": 1523, "output_tokens": 847},
+        ),
+        ({"cumulative_cost_usd": 0.42, "model": "claude-opus-4-8"}, None),
+        ({"context_tokens": 1773}, None),
+        (None, None),
+    ],
+)
+def test_gen_ai_usage_tokens_keeps_only_token_counters(
+    usage: dict[str, float | str] | None,
+    expected: dict[str, int] | None,
+) -> None:
+    """
+    Only real input/output token counters survive into the OTel payload.
+
+    :param usage: Usage payload posted to the Sessions API.
+    :param expected: Token counts to record, or ``None`` for no recording.
+    """
+    assert forwarder._gen_ai_usage_tokens(usage) == expected
+
+
 @dataclass
 class _CapturedDeltaPost:
     """
@@ -8117,3 +8364,63 @@ def test_is_subagent_delivery_not_confirmed_classifier() -> None:
     assert forwarder._is_subagent_delivery_not_confirmed(no_status) is False
     assert forwarder._is_subagent_delivery_not_confirmed(no_body) is False
     assert forwarder._is_subagent_delivery_not_confirmed(httpx.ConnectError("boom")) is False
+
+
+@pytest.mark.asyncio
+async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A stalled await inside one poll iteration is cancelled and the loop resumes.
+
+    A silent stall in any forwarding stage used to stop mirroring, status
+    events and the pane busy signal forever — with zero log output — and
+    the pane reaper then killed the live session an hour later. The
+    iteration deadline converts such a stall into a logged, bounded
+    hiccup: the stuck await is cancelled (the warning's traceback names
+    it) and the next iteration proceeds.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    monkeypatch.setattr(forwarder, "_FORWARD_LOOP_STALL_DEADLINE_S", 0.2)
+    ensure_calls: list[int] = []
+    real_ensure = forwarder._ensure_hook_state
+
+    async def _stalls_on_first_call(*args: Any, **kwargs: Any) -> Any:
+        ensure_calls.append(len(ensure_calls) + 1)
+        if len(ensure_calls) == 1:
+            await asyncio.Event().wait()
+        return await real_ensure(*args, **kwargs)
+
+    monkeypatch.setattr(forwarder, "_ensure_hook_state", _stalls_on_first_call)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.claude_native_forwarder"):
+        task = asyncio.create_task(
+            forward_claude_transcript_to_session(
+                base_url="http://127.0.0.1:9",
+                headers={},
+                session_id="conv_stall",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                start_at_end=False,
+                poll_interval_s=0.01,
+            )
+        )
+        try:
+
+            async def _second_iteration_ran() -> None:
+                while len(ensure_calls) < 2:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(_second_iteration_ran(), timeout=5.0)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    stall_warnings = [r for r in caplog.records if "iteration exceeded" in r.getMessage()]
+    assert stall_warnings, "the deadline trip must be loudly logged, never silent"
+    # The warning's traceback names the stalled await for next-time forensics.
+    assert stall_warnings[0].exc_info is not None

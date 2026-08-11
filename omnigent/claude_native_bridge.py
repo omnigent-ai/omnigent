@@ -1831,15 +1831,35 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
     event_name = payload.get("hook_event_name")
     if isinstance(event_name, str) and event_name:
         state["last_hook_event_name"] = event_name
-    transcript_path = payload.get("transcript_path")
-    if isinstance(transcript_path, str) and transcript_path:
-        state["transcript_path"] = transcript_path
     claude_session_id = payload.get("session_id")
-    if isinstance(claude_session_id, str) and claude_session_id:
-        state["claude_session_id"] = claude_session_id
-        seen = read_seen_claude_session_ids(bridge_dir)
-        seen.add(claude_session_id)
-        state["seen_claude_session_ids"] = sorted(seen)
+    pinned = state.get("claude_session_id")
+    # Identity pin: the transcript path and session identity may change only
+    # via a SessionStart announcement (startup / clear / resume / compact all
+    # fire one) or an event from the already-pinned session. A side-channel
+    # event carrying another session's identity (e.g. a background Task
+    # agent's edge) must not re-aim the forwarder at a foreign transcript.
+    identity_allowed = event_name == "SessionStart" or (
+        isinstance(claude_session_id, str)
+        and claude_session_id != ""
+        and (not isinstance(pinned, str) or not pinned or claude_session_id == pinned)
+    )
+    if identity_allowed:
+        transcript_path = payload.get("transcript_path")
+        if isinstance(transcript_path, str) and transcript_path:
+            state["transcript_path"] = transcript_path
+        if isinstance(claude_session_id, str) and claude_session_id:
+            state["claude_session_id"] = claude_session_id
+            seen = read_seen_claude_session_ids(bridge_dir)
+            seen.add(claude_session_id)
+            state["seen_claude_session_ids"] = sorted(seen)
+    else:
+        _logger.debug(
+            "Ignoring identity fields from side-channel hook event; "
+            "event=%s session_id=%s pinned=%s",
+            event_name,
+            claude_session_id,
+            pinned,
+        )
     state["updated_at"] = time.time()
     _write_json_file(bridge_dir / _STATE_FILE, state)
 

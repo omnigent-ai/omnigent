@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import logging
 import os
@@ -333,6 +334,16 @@ def terminal_log_formatter() -> logging.Formatter:
     return TerminalLogFormatter(use_colors=terminal_supports_color())
 
 
+def _unlink_if_empty(path: Path) -> None:
+    """Remove *path* if it is still an empty file.
+
+    :param path: Log file to sweep, e.g. a self-allocated host log.
+    """
+    with contextlib.suppress(OSError):
+        if path.stat().st_size == 0:
+            path.unlink()
+
+
 def configure_process_logging(
     destination: str,
     *,
@@ -354,6 +365,11 @@ def configure_process_logging(
     path = Path(log_path).expanduser() if log_path is not None else _process_log_file_from_env()
     if path is None:
         path = create_process_log_path(destination)
+        # A process that dies before its first record would leave this
+        # freshly created file empty forever (crash-at-birth hosts littered
+        # dozens a day); sweep it on exit. Self-allocated paths only — a
+        # parent-published or explicit path is the caller's to manage.
+        atexit.register(_unlink_if_empty, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     _current_process_log_path = path
 

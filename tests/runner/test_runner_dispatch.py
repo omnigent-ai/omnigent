@@ -1411,6 +1411,43 @@ def test_build_spawn_env_applies_model_override(
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
 
 
+def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dispatch chain routes ``hermes`` to its builder.
+
+    Regression: hermes had no arm here, so this returned ``None`` and the
+    subprocess got no spawn env at all — the session's sandbox fell back to the
+    wrap's ``sandbox=none`` default and its workspace to the runner's launch
+    directory, both silently. Having the builder is not enough; the chain has
+    to reach it.
+
+    :param tmp_path: Pytest temp dir for an isolated provider config.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.delenv("OMNIGENT_HERMES_PATH", raising=False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        os_env=OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+
+    env = _build_spawn_env_from_spec(spec, "hermes", cwd=workspace)
+
+    assert env is not None, "hermes is not routed to a spawn-env builder"
+    assert env["HARNESS_HERMES_CWD"] == str(workspace)
+    assert json.loads(env["HARNESS_HERMES_OS_ENV"])["sandbox"]["type"] == "linux_bwrap"
+    # The /model override reaches hermes through the same model env key.
+    overridden = _build_spawn_env_from_spec(spec, "hermes", model_override="hermes-4-70b")
+    assert overridden is not None
+    assert overridden["HARNESS_HERMES_MODEL"] == "hermes-4-70b"
+
+
 @pytest.mark.asyncio
 async def test_resolve_harness_config_applies_harness_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

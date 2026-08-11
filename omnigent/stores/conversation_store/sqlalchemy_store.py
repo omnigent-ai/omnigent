@@ -96,6 +96,18 @@ from omnigent.stores.conversation_store import (
 
 _logger = logging.getLogger(__name__)
 
+# Server-side deadline (ms) for the content-search query in
+# ``list_conversations``. Session search matches ``LOWER(search_text) LIKE
+# '%q%'`` across ``conversation_items``; that is index-backed by the pg_trgm
+# GIN index (migration ``d5e9f1a2b3c4``), but if the index is ever missing the
+# scan can run unbounded and — since the query runs in a worker thread — a
+# client disconnect does not stop it. ``SET LOCAL statement_timeout`` caps it so
+# a degraded deployment fails the search fast instead of pinning a DB
+# connection. Postgres-only; ``SET LOCAL`` reverts on commit so it never leaks
+# to the connection's next pooled use. Longer than the client's own
+# ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
+_SEARCH_STATEMENT_TIMEOUT_MS = 15_000
+
 
 class _RowCountResult(Protocol):
     rowcount: int
@@ -572,10 +584,14 @@ def _fetch_search_snippets(
     # workspace_id leads the (workspace_id, conversation_id, position) index.
     # Both the aggregate and the join-back below must include it or Postgres
     # can't use that index and falls back to a full table scan of every item.
+    # ILIKE on the raw column rather than ``lower(search_text) LIKE`` for the
+    # same reason as the content match in ``list_conversations``: the lower()
+    # form matches the pg_trgm index expression, and the planner then scans the
+    # whole workspace even though this is already scoped to one page of ids.
     match_pred = and_(
         SqlConversationItem.workspace_id == workspace_id,
         SqlConversationItem.conversation_id.in_(conversation_ids),
-        func.lower(SqlConversationItem.search_text).like(pattern),
+        SqlConversationItem.search_text.ilike(pattern),
     )
     # Earliest matching position per conversation — a small (conv_id, position)
     # aggregate, no bodies materialized.
@@ -2312,6 +2328,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
 
         with self._conv_session("list_conversations") as session:
+            # Bound the content-search scan server-side (Postgres only). SET
+            # LOCAL scopes to this transaction and reverts on commit, so it
+            # can't leak to the connection's next pooled use. See
+            # _SEARCH_STATEMENT_TIMEOUT_MS. A worker-thread query is not stopped
+            # by a client disconnect, so this is the only server-side bound.
+            is_postgres = session.bind is not None and session.bind.dialect.name == "postgresql"
+            if search_query and is_postgres:
+                # Postgres SET does not accept a bind parameter, so the value is
+                # inlined. Safe from injection: it is an int module constant, not
+                # caller input — coerced through int() to keep it that way.
+                session.execute(
+                    text(f"SET LOCAL statement_timeout = {int(_SEARCH_STATEMENT_TIMEOUT_MS)}")
+                )
+
             stmt = select(SqlConversation).where(
                 SqlConversation.workspace_id == current_workspace_id()
             )
@@ -2364,13 +2394,28 @@ class SqlAlchemyConversationStore(ConversationStore):
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
-                content_match = SqlConversation.id.in_(
+                # Correlated EXISTS rather than ``id IN (SELECT ...)``: the IN
+                # form is uncorrelated, so the match set is built for the WHOLE
+                # workspace before the outer query discards every row the caller
+                # cannot see. Correlating on conversation_id keeps each probe on
+                # the (workspace_id, conversation_id) index and lets it stop at
+                # the first matching item per conversation.
+                # ``ILIKE`` on the raw column, NOT ``lower(search_text) LIKE``:
+                # the latter matches the ``lower(search_text)`` pg_trgm index
+                # expression, and the planner then prefers that index — scanning
+                # every item in the workspace out of a multi-GB index that does
+                # not fit in shared_buffers. ILIKE is the same case-insensitive
+                # match but cannot use that index, so the probe stays on the
+                # (workspace_id, conversation_id) btree above. Do not "simplify"
+                # this back to lower(...) LIKE; see the covering test.
+                content_match = (
                     select(SqlConversationItem.conversation_id)
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
-                        func.lower(SqlConversationItem.search_text).like(pattern),
+                        SqlConversationItem.conversation_id == SqlConversation.id,
+                        SqlConversationItem.search_text.ilike(pattern),
                     )
-                    .distinct()
+                    .exists()
                 )
                 stmt = stmt.where(or_(title_match, content_match))
             if project is not None:

@@ -272,9 +272,32 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
     _AUTO_FORWARDER_TASKS[session_id] = task
 
     def _evict(done_task: asyncio.Task[object]) -> None:
-        """Drop the registry entry unless a successor already replaced it."""
+        """Drop the registry entry unless a successor already replaced it; log the exit."""
         if _AUTO_FORWARDER_TASKS.get(session_id) is done_task:
             del _AUTO_FORWARDER_TASKS[session_id]
+        # Obituary: a stopped forwarder takes mirroring, status and the busy
+        # signal with it, so no exit path may be silent. ``exception()`` also
+        # retrieves the failure (no "Task exception was never retrieved").
+        if done_task.cancelled():
+            _logger.info(
+                "Transcript forwarder task %s cancelled; session=%s",
+                done_task.get_name(),
+                session_id,
+            )
+        elif (exc := done_task.exception()) is not None:
+            _logger.error(
+                "Transcript forwarder task %s died; session mirroring is down "
+                "until the terminal is recreated; session=%s",
+                done_task.get_name(),
+                session_id,
+                exc_info=exc,
+            )
+        else:
+            _logger.warning(
+                "Transcript forwarder task %s returned; session mirroring has stopped; session=%s",
+                done_task.get_name(),
+                session_id,
+            )
 
     task.add_done_callback(_evict)
 
