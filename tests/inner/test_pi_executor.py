@@ -22,6 +22,7 @@ from omnigent.inner.executor import (
     CompactionComplete,
     ExecutorConfig,
     ExecutorError,
+    ExecutorProgress,
     LLMCallComplete,
     LLMCallStarted,
     ReasoningChunk,
@@ -5263,6 +5264,7 @@ def test_pi_waits_when_tool_execution_exceeds_idle_timeout() -> None:
         ]
 
         assert not any(isinstance(event, ExecutorError) for event in events)
+        assert len([event for event in events if isinstance(event, ExecutorProgress)]) == 1
         completed = [event for event in events if isinstance(event, TurnComplete)]
         assert len(completed) == 1
         assert completed[0].response == "The PR needs changes."

@@ -435,6 +435,11 @@ class TurnContext:
         # ``None`` disables it (watchdog off, or outside a guarded run).
         self._reset_idle_watchdog: Callable[[], None] | None = None
 
+    def mark_progress(self) -> None:
+        """Push the idle-watchdog deadline forward without emitting SSE."""
+        if self._reset_idle_watchdog is not None:
+            self._reset_idle_watchdog()
+
     def emit(self, event: HarnessStreamEvent) -> None:
         """
         Push an SSE event upstream.
@@ -455,8 +460,8 @@ class TurnContext:
         # progress — letting them reset the deadline would defeat the
         # watchdog (a wedged turn's 15s heartbeats would keep it alive
         # forever).
-        if self._reset_idle_watchdog is not None and not isinstance(event, HeartbeatEvent):
-            self._reset_idle_watchdog()
+        if not isinstance(event, HeartbeatEvent):
+            self.mark_progress()
         self._event_queue.put_nowait(event)
 
     async def dispatch_tool(

@@ -997,6 +997,7 @@ class _RecordingTurnContext:
         """
         self.response_id = response_id
         self.emitted: list[Any] = []
+        self.progress_count = 0
 
     def emit(self, event: Any) -> None:
         """Record an emitted event.
@@ -1005,6 +1006,24 @@ class _RecordingTurnContext:
             :class:`OutputItemDoneEvent`).
         """
         self.emitted.append(event)
+
+    def mark_progress(self) -> None:
+        """Record an internal progress signal."""
+        self.progress_count += 1
+
+
+def test_translate_event_executor_progress_resets_idle_without_sse() -> None:
+    """Executor progress resets the watchdog without creating a client event."""
+    from omnigent.inner.executor import ExecutorProgress
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+
+    adapter._translate_event(ExecutorProgress(), ctx)  # type: ignore[arg-type]
+
+    assert ctx.progress_count == 1
+    assert ctx.emitted == []
 
 
 def test_translate_event_mcp_tool_call_request_emits_observed_with_bare_name() -> None:

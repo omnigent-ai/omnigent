@@ -88,6 +88,7 @@ from .executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorProgress,
     LLMCallComplete,
     LLMCallStarted,
     Message,
@@ -3002,6 +3003,7 @@ class PiExecutor(Executor):
                             "PiExecutor: tool call still running after %.1fs; waiting",
                             elapsed,
                         )
+                        yield ExecutorProgress()
                         continue
                     yield ExecutorError(
                         message=(

@@ -51,6 +51,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorProgress,
     LLMCallComplete,
     LLMCallStarted,
     Message,
@@ -1390,7 +1391,9 @@ class ExecutorAdapter(HarnessApp):
         :param ctx: The per-turn context; events are pushed onto
             its queue.
         """
-        if isinstance(event, TextChunk):
+        if isinstance(event, ExecutorProgress):
+            ctx.mark_progress()
+        elif isinstance(event, TextChunk):
             ctx.emit(
                 OutputTextDeltaEvent(
                     type="response.output_text.delta",

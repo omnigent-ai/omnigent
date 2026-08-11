@@ -101,6 +101,11 @@ class ExecutorEvent:
 
 
 @dataclass
+class ExecutorProgress(ExecutorEvent):
+    """Internal progress signal with no user-facing payload."""
+
+
+@dataclass
 class TextChunk(ExecutorEvent):
     """Streaming text output.
 
