@@ -15,7 +15,7 @@ import { useProjectConfig, useProjects } from "@/hooks/useConversations";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
-import { NewChatLandingScreen } from "./NewChatDialog";
+import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
 
 // A `?project=` visit prefills the composer from the project's STORED config
 // (host / working directory / agent / worktree). A field the config leaves
@@ -149,6 +149,7 @@ async function submitAndReadBody(): Promise<Record<string, unknown>> {
 beforeEach(() => {
   navigateMock.mockReset();
   vi.mocked(authenticatedFetch).mockReset();
+  resetLandingDraft();
   searchParams = new URLSearchParams("project=Alpha");
   localStorage.clear();
   // A recent on the host that the generic seeding would use when the config
@@ -268,6 +269,36 @@ describe("NewChatLandingScreen project prefill", () => {
     );
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(BETA_REPO);
+    expect(body.agent_id).toBe("ag_other");
+  });
+
+  it("project pencil remount wins over a stale general landing draft", async () => {
+    // Real path: visit general New session (recent workspace seeds), navigate
+    // away (module draft saves host/workspace), then click a project's pencil
+    // (remount with ?project=). Project defaults must win; message can stay.
+    searchParams = new URLSearchParams("");
+    setProjectConfig({});
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "keep this draft" },
+    });
+    cleanup();
+
+    searchParams = new URLSearchParams("project=Alpha");
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
+      "keep this draft",
+    );
+    const body = await submitAndReadBody();
+    expect(body.workspace).toBe(REPO);
     expect(body.agent_id).toBe("ag_other");
   });
 
