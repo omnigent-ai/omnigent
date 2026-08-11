@@ -94,6 +94,7 @@ from omnigent.server.routes._content_type import (
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
+    _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY,
     _CLAUDE_NATIVE_UI_LABEL_KEY,
     _CLAUDE_NATIVE_UI_LABEL_VALUE,
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
@@ -225,14 +226,21 @@ def _promotion_tree_is_active(conversations: dict[str, Conversation]) -> bool:
 
 
 def _promoted_session_title(conversation: Conversation, latest_items: list[Any]) -> str | None:
-    """Build a useful top-level title for a promoted Codex child."""
-    if not _is_codex_native_subagent(conversation):
+    """Build a useful top-level title for a promoted native child."""
+    if _is_codex_native_subagent(conversation):
+        display_name = _codex_subagent_display_tool(conversation.labels)
+        summary = conversation.labels.get(_CODEX_NATIVE_SUBAGENT_PROMPT_LABEL_KEY)
+    elif _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY in conversation.labels:
+        display_name = conversation.sub_agent_name
+        if not display_name and conversation.title:
+            display_name = conversation.title.partition(":")[0]
+        summary = conversation.labels.get(_CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY)
+    else:
         return None
-    summary = conversation.labels.get(_CODEX_NATIVE_SUBAGENT_PROMPT_LABEL_KEY)
     summary = " ".join(summary.split()) if summary else _latest_message_preview(latest_items)
-    if not summary:
+    if not display_name or not summary:
         return None
-    prefix = f"{_codex_subagent_display_tool(conversation.labels)}: "
+    prefix = f"{display_name}: "
     remaining = _PROMOTED_SESSION_TITLE_LIMIT - len(prefix)
     if remaining < 2:
         return None
@@ -2290,7 +2298,10 @@ def register_core_routes(
             )
 
         promoted_title: str | None = None
-        if _is_codex_native_subagent(conversation):
+        if (
+            _is_codex_native_subagent(conversation)
+            or _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY in conversation.labels
+        ):
             latest_items = await asyncio.to_thread(
                 conversation_store.list_latest_message_items_for_conversations,
                 [session_id],

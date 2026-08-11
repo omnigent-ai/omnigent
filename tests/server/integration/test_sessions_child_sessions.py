@@ -89,6 +89,7 @@ def _seed_child(
     parent_id: str,
     title: str,
     agent_id: str | None = None,
+    sub_agent_name: str | None = None,
 ) -> Conversation:
     """
     Create a child sub-agent conversation.
@@ -105,6 +106,7 @@ def _seed_child(
         e.g. ``"researcher:auth"``.
     :param agent_id: Agent id to bind to this conversation (populates
         the ``agent_id`` field in the summary).
+    :param sub_agent_name: Optional sub-agent spec name retained by native children.
     :returns: The created child :class:`Conversation`.
     """
     return conv_store.create_conversation(
@@ -112,6 +114,7 @@ def _seed_child(
         title=title,
         parent_conversation_id=parent_id,
         agent_id=agent_id,
+        sub_agent_name=sub_agent_name,
     )
 
 
@@ -143,6 +146,7 @@ async def test_promote_session_detaches_subtree_and_updates_lists(
     assert body["kind"] == "default"
     assert body["parent_session_id"] is None
     assert body["root_conversation_id"] == promoted.id
+    assert body["title"] == "reviewer:B"
 
     old_children = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
     new_children = await client.get(f"/v1/sessions/{promoted.id}/child_sessions")
@@ -197,6 +201,37 @@ async def test_promote_codex_child_replaces_thread_id_with_name_and_summary(
     updated = conv_store.get_conversation(promoted.id)
     assert updated is not None
     assert updated.title == "Aquinas: Reviewed the promotion behavior"
+
+
+async def test_promote_claude_child_replaces_subagent_id_with_name_and_description(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A promoted Claude child uses its agent type and task description."""
+    parent = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    promoted = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="reviewer:agent-a1b2c3",
+        agent_id=parent["agent_id"],
+        sub_agent_name="reviewer",
+    )
+    conv_store.set_labels(
+        promoted.id,
+        {
+            "omnigent.wrapper": "claude-code-native-ui-subagent",
+            "omnigent.claude_native.description": "Review the promotion behavior",
+        },
+    )
+
+    response = await client.post(f"/v1/sessions/{promoted.id}/promote")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["title"] == "reviewer: Review the promotion behavior"
+    updated = conv_store.get_conversation(promoted.id)
+    assert updated is not None
+    assert updated.title == "reviewer: Review the promotion behavior"
 
 
 @pytest.mark.parametrize("active_node", ["target", "descendant"])
