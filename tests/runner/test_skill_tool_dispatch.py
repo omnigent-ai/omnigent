@@ -10,12 +10,7 @@ import pytest
 from omnigent.runner.tool_dispatch import _execute_skill_tool
 
 SKILL_MD = (
-    "---\n"
-    "name: example\n"
-    "description: An example skill.\n"
-    "---\n"
-    "\n"
-    "Body of the example skill.\n"
+    "---\nname: example\ndescription: An example skill.\n---\n\nBody of the example skill.\n"
 )
 
 
