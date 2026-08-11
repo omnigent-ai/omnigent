@@ -510,19 +510,21 @@ branding:
   app_name: "Acme Agent"        # tab title, sidebar wordmark, login screen
   heading: "How can I help?"     # landing hero; "" hides it, omit to keep the default
   logo:                          # a bare string sets `main`; or per-variant:
-    main: logo.svg               # branding-assets/logo.svg
-    loading: loading.svg         # working indicator (falls back to main)
-    favicon: favicon.svg         # browser-tab icon
+    main: logo.png               # branding-assets/logo.png
+    loading: loading.webp        # working indicator (falls back to main)
+    favicon: favicon.ico         # browser-tab icon
   powered_by: true               # "Powered by Omnigent" credit; false to hide
 ```
 
 Logo files must live under a dedicated `branding-assets/` directory beside the
-config file (for example, `/data/branding-assets/logo.svg`). PNG, JPEG, GIF,
-WebP, ICO, and passive SVG images up to 5 MiB are accepted; symlinks, escapes,
-non-images, and active SVG content are ignored. The values are served over the
-unauthed `GET /v1/info` and `GET /v1/branding/logo/<variant>` endpoints so the login
-screen is branded before sign-in. Any unset field keeps its built-in default,
-so a partial block is fine.
+config file (for example, `/data/branding-assets/logo.png`). PNG, JPEG, GIF,
+WebP, and ICO files up to 5 MiB are accepted only after full decoder validation;
+malformed, truncated, oversized, trailing-payload, SVG, symlinked, escaped, and
+non-image files are ignored. Images are also bounded to 4096 pixels per side,
+128 frames, 16 megapixels per frame, and 64 megapixels across all decoded frames.
+The values are served over the unauthenticated `GET /v1/info` and
+`GET /v1/branding/logo/<variant>` endpoints so the login screen is branded before
+sign-in. Any unset field keeps its built-in default, so a partial block is fine.
 
 The small "Powered by Omnigent" credit under the landing composer appears only
 once you set custom branding; `powered_by: false` hides it even then. It always

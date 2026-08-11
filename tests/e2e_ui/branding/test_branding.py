@@ -16,13 +16,13 @@ Omnigent" credit — which appears only when branding is set.
 
 from __future__ import annotations
 
+import base64
 import re
 
 from playwright.sync_api import Page, expect
 
-_LOGO_SVG = (
-    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" '
-    b'width="64" height="64"><rect width="64" height="64" fill="#0A5FFF"/></svg>'
+_LOGO_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
 
 _LOGOS = {
@@ -42,10 +42,10 @@ def _stub_info(page: Page, branding: object) -> None:
 
 
 def _stub_logos(page: Page) -> None:
-    """Serve any ``/v1/branding/logo/<variant>`` request as a small SVG."""
+    """Serve any ``/v1/branding/logo/<variant>`` request as a small PNG."""
     page.route(
         "**/v1/branding/logo/**",
-        lambda route: route.fulfill(status=200, content_type="image/svg+xml", body=_LOGO_SVG),
+        lambda route: route.fulfill(status=200, content_type="image/png", body=_LOGO_PNG),
     )
 
 

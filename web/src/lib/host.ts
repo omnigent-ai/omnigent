@@ -118,6 +118,7 @@ export interface OmnigentHostConfig {
 }
 
 let hostConfig: OmnigentHostConfig = {};
+let hostConfigGeneration = 0;
 let embedRoot: HTMLElement | null = null;
 
 export function setOmnigentHostConfig(config: OmnigentHostConfig): void {
@@ -128,10 +129,15 @@ export function setOmnigentHostConfig(config: OmnigentHostConfig): void {
   // to bare same-origin paths.
   if (!config?.fetcher && hostConfig.fetcher) return;
   hostConfig = config ?? {};
+  hostConfigGeneration += 1;
 }
 
 export function getOmnigentHostConfig(): OmnigentHostConfig {
   return hostConfig;
+}
+
+export function getOmnigentHostGeneration(): number {
+  return hostConfigGeneration;
 }
 
 /**

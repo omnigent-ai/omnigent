@@ -3771,7 +3771,7 @@ def server(
     cfg = _load_config(config_path)
 
     # Let the server-config reader (branding) see the same ``-c`` file.
-    if config_path and not os.environ.get("OMNIGENT_CONFIG"):
+    if config_path:
         os.environ["OMNIGENT_CONFIG"] = str(Path(config_path).resolve())
 
     # CLI args take precedence over config file, which takes precedence

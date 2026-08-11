@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from PIL import Image
 
 from omnigent.native_coding_agents import (
     ANTIGRAVITY_NATIVE_AGENT_NAME,
@@ -464,7 +466,9 @@ async def test_branding_logo_route_serves_only_validated_asset_pre_auth(
     config.write_text("branding:\n  logo: logo.png\n")
     assets = tmp_path / "branding-assets"
     assets.mkdir()
-    payload = b"\x89PNG\r\n\x1a\nroute-test"
+    output = BytesIO()
+    Image.new("RGBA", (2, 2), (25, 100, 200, 255)).save(output, format="PNG")
+    payload = output.getvalue()
     (assets / "logo.png").write_bytes(payload)
     monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
 
@@ -474,6 +478,33 @@ async def test_branding_logo_route_serves_only_validated_asset_pre_auth(
     assert response.content == payload
     assert response.headers["content-type"].startswith("image/png")
     assert response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_branding_openapi_declares_binary_images_and_typed_info(
+    client: httpx.AsyncClient,
+) -> None:
+    schema = (await client.get("/openapi.json")).json()
+    logo_response = schema["paths"]["/v1/branding/logo/{variant}"]["get"]["responses"]["200"]
+    assert set(logo_response["content"]) == {
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "image/x-icon",
+    }
+    assert logo_response["content"]["image/png"]["schema"] == {
+        "type": "string",
+        "format": "binary",
+    }
+
+    info_schema = schema["paths"]["/v1/info"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    assert info_schema["$ref"].endswith("/ServerInfoResponse")
+    properties = schema["components"]["schemas"]["ServerInfoResponse"]["properties"]
+    assert properties["branding"]["$ref"].endswith("/BrandingInfo")
+    assert properties["accounts_enabled"]["type"] == "boolean"
 
 
 @pytest.mark.asyncio

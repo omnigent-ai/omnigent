@@ -12,11 +12,12 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from sqlalchemy.exc import StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
@@ -98,6 +99,43 @@ from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
+
+
+class SmartRoutingSourcesInfo(BaseModel):
+    external: bool
+    oss: bool
+
+
+class BrandingLogosInfo(BaseModel):
+    main: str | None
+    loading: str | None
+    favicon: str | None
+
+
+class BrandingInfo(BaseModel):
+    app_name: str | None
+    heading: str | None
+    logos: BrandingLogosInfo
+    powered_by: bool
+
+
+class ServerInfoResponse(BaseModel):
+    accounts_enabled: bool
+    single_user: bool
+    login_url: str | None
+    needs_setup: bool
+    databricks_features: bool
+    managed_sandboxes_enabled: bool
+    sandbox_provider: str | None
+    sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
+    public_sharing_enabled: bool
+    server_version: str
+    smart_routing_enabled: bool
+    smart_routing_sources: SmartRoutingSourcesInfo
+    harness_install_enabled: bool
+    installable_harnesses: list[str]
+    dictation_available: bool
+    branding: BrandingInfo
 
 
 def _server_version() -> str:
@@ -1762,8 +1800,8 @@ def create_app(
             "ui": {"server_picker": "sidebar"},
         }
 
-    @app.get("/v1/info")
-    async def info() -> dict[str, Any]:
+    @app.get("/v1/info", response_model=ServerInfoResponse)
+    async def info() -> ServerInfoResponse:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -1898,35 +1936,56 @@ def create_app(
         from omnigent.server.dictation import engine_availability
 
         dictation_available, _ = engine_availability()
-        return {
-            "accounts_enabled": accounts_enabled,
-            "single_user": single_user,
-            "login_url": login_url,
-            "needs_setup": needs_setup,
-            "databricks_features": databricks_features,
-            "managed_sandboxes_enabled": managed_sandboxes_enabled,
-            "sandbox_provider": sandbox_provider,
-            "sharing_mode": sharing_mode.value,
-            "public_sharing_enabled": public_sharing_enabled,
-            "server_version": _server_version(),
-            "smart_routing_enabled": smart_routing_enabled,
-            "smart_routing_sources": smart_routing_sources,
-            "harness_install_enabled": harness_install_enabled,
-            "installable_harnesses": installable_harnesses,
-            "dictation_available": dictation_available,
-            "branding": branding_config(),
-        }
+        return ServerInfoResponse.model_validate(
+            {
+                "accounts_enabled": accounts_enabled,
+                "single_user": single_user,
+                "login_url": login_url,
+                "needs_setup": needs_setup,
+                "databricks_features": databricks_features,
+                "managed_sandboxes_enabled": managed_sandboxes_enabled,
+                "sandbox_provider": sandbox_provider,
+                "sharing_mode": sharing_mode.value,
+                "public_sharing_enabled": public_sharing_enabled,
+                "server_version": _server_version(),
+                "smart_routing_enabled": smart_routing_enabled,
+                "smart_routing_sources": smart_routing_sources,
+                "harness_install_enabled": harness_install_enabled,
+                "installable_harnesses": installable_harnesses,
+                "dictation_available": dictation_available,
+                "branding": branding_config(),
+            }
+        )
 
-    @app.get("/v1/branding/logo/{variant}")
-    async def branding_logo(variant: str) -> FileResponse:
+    @app.get(
+        "/v1/branding/logo/{variant}",
+        response_class=Response,
+        responses={
+            200: {
+                "description": "Validated raster branding image",
+                "content": {
+                    media_type: {"schema": {"type": "string", "format": "binary"}}
+                    for media_type in (
+                        "image/gif",
+                        "image/jpeg",
+                        "image/png",
+                        "image/webp",
+                        "image/x-icon",
+                    )
+                },
+            },
+            404: {"description": "Branding image not configured or invalid"},
+        },
+    )
+    async def branding_logo(variant: str) -> Response:
         """Serve a validated public branding asset, or 404 when unset."""
         from omnigent.server.server_config import branding_logo_asset
 
         asset = branding_logo_asset(variant)
         if asset is None:
             raise StarletteHTTPException(status_code=404, detail="Branding logo not found")
-        return FileResponse(
-            asset.path,
+        return Response(
+            content=asset.content,
             media_type=asset.media_type,
             headers={"X-Content-Type-Options": "nosniff"},
         )

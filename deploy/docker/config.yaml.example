@@ -56,7 +56,7 @@ allowed_domains:
 #   app_name: "Acme Agent"      # tab title, sidebar wordmark, login screen
 #   heading: "How can I help?"   # landing hero; "" hides it, omit for the default
 #   logo:                        # a bare string sets `main`; or per-variant:
-#     main: logo.svg             # hero / primary mark
-#     loading: loading.svg       # working indicator (falls back to main)
-#     favicon: favicon.svg       # browser-tab icon
+#     main: logo.png             # hero / primary mark
+#     loading: loading.webp      # working indicator (falls back to main)
+#     favicon: favicon.ico       # browser-tab icon
 #   powered_by: true             # "Powered by Omnigent" credit (only when branded); false to hide

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { StrictMode } from "react";
+import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import App from "./App.tsx";
@@ -12,6 +12,7 @@ import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
+import { createBootServerInfo } from "./lib/bootCapabilities";
 import { resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
@@ -84,38 +85,23 @@ applyThemePalette(readThemePalette());
 // missing server doesn't deadlock first paint. We add a small
 // safety timeout (1.5s) so users on a flaky network still get
 // something on screen.
-const bootProbe: Promise<ServerInfo> = Promise.race([
-  resolveServerInfo(),
-  new Promise<ServerInfo>((resolve) => {
-    setTimeout(
-      () =>
-        resolve({
-          accounts_enabled: false,
-          single_user: false,
-          login_url: null,
-          needs_setup: false,
-          databricks_features: false,
-          managed_sandboxes_enabled: false,
-          sandbox_provider: null,
-          sharing_mode: "on",
-          public_sharing_enabled: true,
-          server_version: null,
-          smart_routing_enabled: false,
-          smart_routing_sources: { external: false, oss: false },
-          harness_install_enabled: false,
-          installable_harnesses: [],
-          dictation_available: false,
-          branding: null,
-        }),
-      1500,
-    );
-  }),
-]);
+const bootServerInfo = createBootServerInfo(resolveServerInfo());
 
-void bootProbe.then((info) => {
-  if (info.branding?.app_name) document.title = info.branding.app_name;
-  const faviconUrl = info.branding?.logos.favicon;
-  if (faviconUrl) {
+function RootApp({ initialInfo }: { initialInfo: ServerInfo }) {
+  const [info, setInfo] = useState(initialInfo);
+  useEffect(() => {
+    let alive = true;
+    void bootServerInfo.settled.then((resolved) => {
+      if (alive) setInfo(resolved);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  useEffect(() => {
+    if (info.branding?.app_name) document.title = info.branding.app_name;
+    const faviconUrl = info.branding?.logos.favicon;
+    if (!faviconUrl) return;
     let link = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
     if (!link) {
       link = document.createElement("link");
@@ -124,29 +110,35 @@ void bootProbe.then((info) => {
     }
     link.removeAttribute("type");
     link.href = faviconUrl;
-  }
+  }, [info]);
+  return (
+    <CapabilitiesProvider info={info}>
+      <QueryClientProvider client={queryClient}>
+        <ThemeProvider>
+          <PWAUpdateBanner />
+          <TooltipProvider>
+            <ImageLightboxProvider>
+              <BrowserRouter>
+                <SessionUpdatesProvider>
+                  <RunnerHealthProvider>
+                    <QueueFlushProvider>
+                      <App />
+                    </QueueFlushProvider>
+                  </RunnerHealthProvider>
+                </SessionUpdatesProvider>
+              </BrowserRouter>
+            </ImageLightboxProvider>
+          </TooltipProvider>
+        </ThemeProvider>
+      </QueryClientProvider>
+    </CapabilitiesProvider>
+  );
+}
+
+void bootServerInfo.initial.then((initialInfo) => {
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
-      <CapabilitiesProvider info={info}>
-        <QueryClientProvider client={queryClient}>
-          <ThemeProvider>
-            <PWAUpdateBanner />
-            <TooltipProvider>
-              <ImageLightboxProvider>
-                <BrowserRouter>
-                  <SessionUpdatesProvider>
-                    <RunnerHealthProvider>
-                      <QueueFlushProvider>
-                        <App />
-                      </QueueFlushProvider>
-                    </RunnerHealthProvider>
-                  </SessionUpdatesProvider>
-                </BrowserRouter>
-              </ImageLightboxProvider>
-            </TooltipProvider>
-          </ThemeProvider>
-        </QueryClientProvider>
-      </CapabilitiesProvider>
+      <RootApp initialInfo={initialInfo} />
     </StrictMode>,
   );
 });

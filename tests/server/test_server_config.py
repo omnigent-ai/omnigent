@@ -8,11 +8,15 @@ for ``admins`` / ``allowed_domains``.
 
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from omnigent.server.server_config import (
+    BRANDING_ASSET_MAX_BYTES,
+    BRANDING_ASSET_MAX_DIMENSION,
     BRANDING_ASSETS_DIRNAME,
     branding_config,
     branding_logo_asset,
@@ -21,8 +25,29 @@ from omnigent.server.server_config import (
     resolve_config_path,
 )
 
-_PNG = b"\x89PNG\r\n\x1a\n" + b"test"
-_SVG = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>'
+
+def _image_bytes(image_format: str, *, size: tuple[int, int] = (2, 2)) -> bytes:
+    mode = "RGB" if image_format == "JPEG" else "RGBA"
+    image = Image.new(mode, size, (25, 100, 200) if mode == "RGB" else (25, 100, 200, 255))
+    output = BytesIO()
+    save_kwargs: dict[str, object] = {}
+    if image_format == "ICO":
+        save_kwargs["sizes"] = [size]
+    if image_format == "WEBP":
+        save_kwargs["lossless"] = True
+    image.save(output, format=image_format, **save_kwargs)
+    return output.getvalue()
+
+
+_VALID_RASTERS = {
+    "logo.gif": (_image_bytes("GIF"), "image/gif"),
+    "logo.ico": (_image_bytes("ICO", size=(16, 16)), "image/x-icon"),
+    "logo.jpeg": (_image_bytes("JPEG"), "image/jpeg"),
+    "logo.jpg": (_image_bytes("JPEG"), "image/jpeg"),
+    "logo.png": (_image_bytes("PNG"), "image/png"),
+    "logo.webp": (_image_bytes("WEBP"), "image/webp"),
+}
+_PNG = _VALID_RASTERS["logo.png"][0]
 
 
 def _pin_data_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -129,9 +154,12 @@ def _write_branding_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, logo
 
 @pytest.mark.parametrize(
     ("filename", "content", "media_type"),
-    [("logo.png", _PNG, "image/png"), ("logo.svg", _SVG, "image/svg+xml")],
+    [
+        pytest.param(filename, *fixture, id=filename)
+        for filename, fixture in _VALID_RASTERS.items()
+    ],
 )
-def test_branding_logo_accepts_valid_images_in_assets_dir(
+def test_branding_logo_accepts_fully_decoded_rasters_in_assets_dir(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     filename: str,
@@ -147,6 +175,7 @@ def test_branding_logo_accepts_valid_images_in_assets_dir(
     assert asset is not None
     assert asset.path == logo
     assert asset.media_type == media_type
+    assert asset.content == content
     assert branding_config()["logos"]["main"] == "/v1/branding/logo/main"
 
 
@@ -155,10 +184,14 @@ def test_branding_logo_accepts_valid_images_in_assets_dir(
     [
         ("secret.txt", b"api_key: super-secret"),
         ("secret.png", b"api_key: super-secret"),
+        ("passive.svg", b'<svg xmlns="http://www.w3.org/2000/svg"></svg>'),
         ("active.svg", b"<svg><script>alert(1)</script></svg>"),
+        ("event.svg", b'<svg onload="alert(1)"></svg>'),
+        ("external.svg", b'<svg><image href="https://example.com/x"/></svg>'),
+        ("css.svg", b"<svg><style>@import url(https://example.com/x)</style></svg>"),
     ],
 )
-def test_branding_logo_rejects_non_images_and_active_svg(
+def test_branding_logo_rejects_non_images_and_all_svg(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, filename: str, content: bytes
 ) -> None:
     assets = _write_branding_config(monkeypatch, tmp_path, filename)
@@ -166,6 +199,112 @@ def test_branding_logo_rejects_non_images_and_active_svg(
 
     assert branding_logo_asset() is None
     assert branding_config()["logos"]["main"] is None
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        pytest.param("secret.png", b"\x89PNG\r\n\x1a\nAPI_TOKEN=top-secret", id="png"),
+        pytest.param("secret.jpg", b"\xff\xd8\xffAPI_TOKEN=top-secret\xff\xd9", id="jpeg"),
+        pytest.param("secret.gif", b"GIF89aAPI_TOKEN=top-secret;", id="gif"),
+        pytest.param("secret.webp", b"RIFF\x14\x00\x00\x00WEBPAPI_TOKEN=top-secret", id="webp"),
+        pytest.param("secret.ico", b"\x00\x00\x01\x00API_TOKEN=top-secret", id="ico"),
+    ],
+)
+def test_branding_logo_rejects_magic_prefixed_secrets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, filename: str, content: bytes
+) -> None:
+    assets = _write_branding_config(monkeypatch, tmp_path, filename)
+    (assets / filename).write_bytes(content)
+
+    assert branding_logo_asset() is None
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        pytest.param(
+            filename,
+            fixture[0][: max(1, len(fixture[0]) // 2)],
+            id=filename,
+        )
+        for filename, fixture in _VALID_RASTERS.items()
+    ],
+)
+def test_branding_logo_rejects_truncated_rasters(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, filename: str, content: bytes
+) -> None:
+    assets = _write_branding_config(monkeypatch, tmp_path, filename)
+    (assets / filename).write_bytes(content)
+
+    assert branding_logo_asset() is None
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        pytest.param(filename, fixture[0] + b"API_TOKEN=top-secret", id=filename)
+        for filename, fixture in _VALID_RASTERS.items()
+    ],
+)
+def test_branding_logo_rejects_trailing_payloads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, filename: str, content: bytes
+) -> None:
+    assets = _write_branding_config(monkeypatch, tmp_path, filename)
+    (assets / filename).write_bytes(content)
+
+    assert branding_logo_asset() is None
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        pytest.param(
+            "logo.jpg",
+            _VALID_RASTERS["logo.jpg"][0] + b"API_TOKEN=top-secret\xff\xd9",
+            id="jpeg-fake-final-eoi",
+        ),
+        pytest.param(
+            "logo.gif",
+            _VALID_RASTERS["logo.gif"][0] + b"API_TOKEN=top-secret;",
+            id="gif-fake-final-trailer",
+        ),
+    ],
+)
+def test_branding_logo_rejects_payloads_hidden_before_fake_terminators(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, filename: str, content: bytes
+) -> None:
+    assets = _write_branding_config(monkeypatch, tmp_path, filename)
+    (assets / filename).write_bytes(content)
+
+    assert branding_logo_asset() is None
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(b"", id="empty"),
+        pytest.param(b"x" * (BRANDING_ASSET_MAX_BYTES + 1), id="oversized"),
+    ],
+)
+def test_branding_logo_rejects_empty_and_oversized_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: bytes
+) -> None:
+    assets = _write_branding_config(monkeypatch, tmp_path, "logo.png")
+    (assets / "logo.png").write_bytes(content)
+
+    assert branding_logo_asset() is None
+
+
+def test_branding_logo_rejects_excessive_dimensions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    assets = _write_branding_config(monkeypatch, tmp_path, "logo.png")
+    (assets / "logo.png").write_bytes(
+        _image_bytes("PNG", size=(BRANDING_ASSET_MAX_DIMENSION + 1, 1))
+    )
+
+    assert branding_logo_asset() is None
 
 
 def test_branding_logo_cannot_serve_config_directory_secret(
