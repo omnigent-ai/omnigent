@@ -155,6 +155,50 @@ async def test_promote_session_detaches_subtree_and_updates_lists(
     assert promoted.id in top_level_ids
 
 
+async def test_promote_codex_child_replaces_thread_id_with_name_and_summary(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A promoted Codex child gets a useful sidebar title."""
+    parent = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    promoted = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="codex-native-ui-subagent:019fee4d-9e32-79b3-8709-f70bc75f455b",
+        agent_id=parent["agent_id"],
+    )
+    conv_store.set_labels(
+        promoted.id,
+        {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Aquinas",
+        },
+    )
+    conv_store.append(
+        promoted.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_codex_summary",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "Reviewed the promotion behavior"}],
+                    agent="codex-native-ui",
+                ),
+            )
+        ],
+    )
+
+    response = await client.post(f"/v1/sessions/{promoted.id}/promote")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["title"] == "Aquinas: Reviewed the promotion behavior"
+    updated = conv_store.get_conversation(promoted.id)
+    assert updated is not None
+    assert updated.title == "Aquinas: Reviewed the promotion behavior"
+
+
 @pytest.mark.parametrize("active_node", ["target", "descendant"])
 async def test_promote_session_rejects_active_tree(
     client: httpx.AsyncClient,

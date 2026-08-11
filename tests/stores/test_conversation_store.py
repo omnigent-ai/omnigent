@@ -1510,12 +1510,13 @@ def test_promote_subtree_detaches_target_and_preserves_descendants(
         ],
     )
 
-    result = conversation_store.promote_subtree(promoted.id)
+    result = conversation_store.promote_subtree(promoted.id, title="reviewer: keep this history")
 
     assert result.id == promoted.id
     assert result.kind == "default"
     assert result.parent_conversation_id is None
     assert result.root_conversation_id == promoted.id
+    assert result.title == "reviewer: keep this history"
     assert conversation_store.list_items(promoted.id).data[0].data == MessageData(
         role="user",
         content=[{"type": "input_text", "text": "keep this history"}],

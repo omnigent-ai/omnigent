@@ -99,6 +99,7 @@ from omnigent.server.routes._sessions.common import (
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODES,
+    _CODEX_NATIVE_SUBAGENT_PROMPT_LABEL_KEY,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _logger,
     _managed_launch_tasks,
@@ -118,11 +119,14 @@ from omnigent.server.routes._sessions.helpers import (
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
     _codex_plan_mode_enabled,
+    _codex_subagent_display_tool,
     _collect_descendant_conversation_ids,
     _discovery_key,
     _forward_session_change_to_runner,
     _get_runner_client,
     _invalidate_runner_backed_snapshot_state,
+    _is_codex_native_subagent,
+    _latest_message_preview,
     _multipart_missing_detail,
     _notify_runner_of_bundled_child,
     _parse_session_create_metadata,
@@ -195,6 +199,7 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 
 _ACTIVE_SANDBOX_STAGES = frozenset({"provisioning", "cloning", "starting", "connecting"})
+_PROMOTED_SESSION_TITLE_LIMIT = 60
 
 
 def _promotion_tree_is_active(conversations: dict[str, Conversation]) -> bool:
@@ -217,6 +222,23 @@ def _promotion_tree_is_active(conversations: dict[str, Conversation]) -> bool:
         if sandbox_status is not None and sandbox_status.stage in _ACTIVE_SANDBOX_STAGES:
             return True
     return False
+
+
+def _promoted_session_title(conversation: Conversation, latest_items: list[Any]) -> str | None:
+    """Build a useful top-level title for a promoted Codex child."""
+    if not _is_codex_native_subagent(conversation):
+        return None
+    summary = conversation.labels.get(_CODEX_NATIVE_SUBAGENT_PROMPT_LABEL_KEY)
+    summary = " ".join(summary.split()) if summary else _latest_message_preview(latest_items)
+    if not summary:
+        return None
+    prefix = f"{_codex_subagent_display_tool(conversation.labels)}: "
+    remaining = _PROMOTED_SESSION_TITLE_LIMIT - len(prefix)
+    if remaining < 2:
+        return None
+    if len(summary) > remaining:
+        summary = summary[: remaining - 1].rstrip() + "…"
+    return prefix + summary
 
 
 def register_core_routes(
@@ -2267,6 +2289,18 @@ def register_core_routes(
                 code=ErrorCode.CONFLICT,
             )
 
+        promoted_title: str | None = None
+        if _is_codex_native_subagent(conversation):
+            latest_items = await asyncio.to_thread(
+                conversation_store.list_latest_message_items_for_conversations,
+                [session_id],
+                1,
+            )
+            promoted_title = _promoted_session_title(
+                conversation,
+                latest_items.get(session_id, []),
+            )
+
         if permission_store is not None and user_id is not None:
             await asyncio.to_thread(permission_store.ensure_user, user_id)
             await asyncio.to_thread(
@@ -2280,6 +2314,7 @@ def register_core_routes(
             updated = await asyncio.to_thread(
                 conversation_store.promote_subtree,
                 session_id,
+                title=promoted_title,
             )
         except LookupError as exc:
             raise OmnigentError(

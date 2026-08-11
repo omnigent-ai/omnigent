@@ -1623,7 +1623,12 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def promote_subtree(self, conversation_id: str) -> Conversation:
+    def promote_subtree(
+        self,
+        conversation_id: str,
+        *,
+        title: str | None = None,
+    ) -> Conversation:
         """Promote a child conversation and its descendants to a new tree.
 
         The target becomes top-level and every node in its subtree uses the
@@ -1631,6 +1636,7 @@ class ConversationStore(ABC):
         conversation content remain unchanged.
 
         :param conversation_id: Child conversation to promote.
+        :param title: Optional top-level title to assign during promotion.
         :returns: The updated target conversation.
         :raises LookupError: If the conversation does not exist.
         :raises ValueError: If the conversation is already top-level.
