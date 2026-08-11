@@ -5307,6 +5307,75 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_peek_rest_can_request_larger_bounded_item() -> None:
+    """The runner REST path honors an explicit larger per-item history limit."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    long_review = "R" * 3000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target/items":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "i1",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": long_review}],
+                        }
+                    ],
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps(
+                    {
+                        "conversation_id": "conv_target",
+                        "tail_items": 1,
+                        "content_max_chars": 4000,
+                    }
+                ),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out["items"][0]["text"] == long_review
+
+
+@pytest.mark.asyncio
+async def test_session_peek_rest_rejects_non_positive_content_limit() -> None:
+    """The runner REST path rejects invalid provider-supplied limits."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    async with _session_query_client(lambda _: pytest.fail("REST call should not run")) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps(
+                    {
+                        "conversation_id": "conv_target",
+                        "content_max_chars": 0,
+                    }
+                ),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out["error"] == "content_max_chars must be >= 1"
+
+
+@pytest.mark.asyncio
 async def test_session_peek_appends_pending_elicitation_from_snapshot() -> None:
     """
     ``sys_session_get_history`` appends the target's parked elicitations (read

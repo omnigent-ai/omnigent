@@ -304,7 +304,11 @@ def test_peek_schema_required_fields_and_no_extra_props() -> None:
     params = schema["function"]["parameters"]
     assert params["required"] == ["conversation_id"]
     assert params["additionalProperties"] is False
-    assert set(params["properties"].keys()) == {"conversation_id", "tail_items"}
+    assert set(params["properties"].keys()) == {
+        "conversation_id",
+        "tail_items",
+        "content_max_chars",
+    }
 
 
 def test_peek_schema_tail_items_bounds() -> None:
@@ -322,6 +326,16 @@ def test_peek_schema_tail_items_bounds() -> None:
     assert tail_schema["type"] == "integer"
     assert tail_schema["minimum"] == 1
     assert tail_schema["maximum"] == _HISTORY_MAX_TAIL
+
+
+def test_peek_schema_content_limit_is_bounded() -> None:
+    """History can request a larger item without making the limit unbounded."""
+    content_schema = SysSessionGetHistoryTool().get_schema()["function"]["parameters"][
+        "properties"
+    ]["content_max_chars"]
+    assert content_schema["type"] == "integer"
+    assert content_schema["minimum"] == 1
+    assert content_schema["maximum"] == 12000
 
 
 def test_close_schema_required_fields_and_no_extra_props() -> None:
@@ -375,6 +389,84 @@ def test_peek_returns_items_chronological(session_fixture: _Fixture) -> None:
     assert items[0]["content"] == "find the auth bug"
     assert items[1]["role"] == "assistant"
     assert items[1]["content"] == "looking at handlers.py"
+
+
+def test_peek_can_request_more_than_activity_preview_limit(session_fixture: _Fixture) -> None:
+    """An explicit bounded limit returns a long child message in one read."""
+    long_review = "R" * 3000
+    session_fixture.conv_store.append(
+        session_fixture.child_conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_long_review",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": long_review}],
+                    agent="researcher",
+                ),
+            )
+        ],
+    )
+
+    raw = SysSessionGetHistoryTool().invoke(
+        json.dumps(
+            {
+                "conversation_id": session_fixture.child_conv_id,
+                "tail_items": 1,
+                "content_max_chars": 4000,
+            }
+        ),
+        session_fixture.ctx,
+    )
+    payload = json.loads(raw)
+    assert payload["items"][0]["content"] == long_review
+
+
+def test_peek_rejects_non_positive_content_limit(session_fixture: _Fixture) -> None:
+    """Handler validation rejects a limit that providers let through."""
+    raw = SysSessionGetHistoryTool().invoke(
+        json.dumps(
+            {
+                "conversation_id": session_fixture.child_conv_id,
+                "content_max_chars": 0,
+            }
+        ),
+        session_fixture.ctx,
+    )
+    assert json.loads(raw)["error"] == "content_max_chars must be >= 1"
+
+
+def test_peek_combined_limits_preserve_total_prompt_bound(session_fixture: _Fixture) -> None:
+    """The per-item override scales down when a large tail is requested."""
+    long_review = "R" * 3000
+    session_fixture.conv_store.append(
+        session_fixture.child_conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_bounded_review",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": long_review}],
+                    agent="researcher",
+                ),
+            )
+        ],
+    )
+
+    raw = SysSessionGetHistoryTool().invoke(
+        json.dumps(
+            {
+                "conversation_id": session_fixture.child_conv_id,
+                "tail_items": _HISTORY_MAX_TAIL,
+                "content_max_chars": 12000,
+            }
+        ),
+        session_fixture.ctx,
+    )
+    content = json.loads(raw)["items"][-1]["content"]
+    assert content == long_review[:2000] + " [truncated]"
 
 
 def test_peek_surfaces_pending_elicitation_after_stored_items(
