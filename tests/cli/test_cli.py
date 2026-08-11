@@ -1248,6 +1248,30 @@ def test_polly_command_runs_bundled_polly_and_forwards_run_flags(
     assert kwargs["resume_parts"][:3] == ["omnigent", "run", _bundled_example_path("polly")]
 
 
+def test_goose_command_launches_acp_harness_and_forwards_run_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``omnigent goose`` dispatches ``run --harness goose`` (the ACP harness).
+
+    Goose has no native TUI, so the shorthand must resolve to the ACP harness
+    rather than a terminal launch, and pass-through ``run`` flags must survive
+    the forwarding. The replay prefix has to stay the canonical re-runnable
+    ``omnigent run --harness goose`` form.
+    """
+    result, dispatch = _invoke_bundled_agent_command(
+        monkeypatch, ["goose", "-p", "review the last commit", "--model", "m1"]
+    )
+
+    assert result.exit_code == 0, result.output
+    dispatch.assert_called_once()
+    kwargs = dispatch.call_args.kwargs
+    assert kwargs["harness"] == "goose"
+    assert kwargs["target"] is None
+    assert kwargs["prompt"] == "review the last commit"
+    assert kwargs["model"] == "m1"
+    assert kwargs["resume_parts"][:4] == ["omnigent", "run", "--harness", "goose"]
+
+
 def test_debby_command_runs_bundled_debby(monkeypatch: pytest.MonkeyPatch) -> None:
     """``omnigent debby`` dispatches ``run`` on the packaged debby agent."""
     result, dispatch = _invoke_bundled_agent_command(monkeypatch, ["debby"])

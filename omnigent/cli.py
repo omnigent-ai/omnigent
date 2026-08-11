@@ -1602,6 +1602,7 @@ _HARNESS_COMMANDS: frozenset[str] = frozenset(
         "codex",
         "cursor",
         "debby",
+        "goose",
         "hermes",
         "kimi",
         "kiro",
@@ -1845,6 +1846,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "debug",
         "diagnose",
         "doctor",
+        "goose",
         "hermes",
         "host",
         "import",
@@ -5549,6 +5551,39 @@ def debby(run_args: tuple[str, ...]) -> None:
       omnigent debby -p "name ideas for a CLI that runs agents"
     """
     _run_bundled_agent("debby", run_args)
+
+
+@cli.command(
+    context_settings={
+        "ignore_unknown_options": True,
+        "allow_extra_args": True,
+    }
+)
+@click.argument("run_args", nargs=-1, type=click.UNPROCESSED)
+def goose(run_args: tuple[str, ...]) -> None:
+    # Param docs live in comments — Click uses the docstring for --help.
+    # :param run_args: Pass-through args for ``run``.
+    """Launch Goose with Omnigent.
+
+    Shorthand for ``omnigent run --harness goose``. Goose runs over the Agent
+    Client Protocol (``goose acp``) with no terminal pane, so Omnigent
+    policies, cost budgets and sandboxing apply to its tool calls. All ``run``
+    options are accepted and forwarded.
+
+    \b
+    Examples:
+      omnigent goose
+      omnigent goose -p "review the last commit"
+      omnigent goose --resume conv_abc123
+    """
+    # Re-dispatch through ``run``'s own parser so every ``run`` flag works
+    # unchanged without redeclaring its options; see :func:`_run_bundled_agent`
+    # for the prog_name / standalone_mode rationale, which applies verbatim.
+    run.main(
+        args=["--harness", "goose", *run_args],
+        prog_name="omnigent run",
+        standalone_mode=False,
+    )
 
 
 @cli.command()
