@@ -469,11 +469,16 @@ export function AppShell() {
     : isCurrentServerLocal()
       ? "Sharing is unavailable from a local server."
       : "Sharing has been disabled for this Omnigent server.";
-  // Any viewer can fork a shared session; top-level only (the server
-  // rejects forking a sub-agent). Surfaced as ForkDialogContext.canFork —
-  // the per-message "Fork from here" action is the only fork entry point.
+  // Any viewer can fork a shared session, sub-agents included — forking a
+  // child is how it gets promoted to a top-level session of its own. Gated on
+  // knowing which the session is (sidebar row or loaded snapshot) so the
+  // affordance doesn't flicker in before that resolves. Surfaced as
+  // ForkDialogContext.canFork — the per-message "Fork from here" action is
+  // the only fork entry point.
   const canClone =
-    !!conversationId && isKnownTopLevel && (permissionLevel === null || permissionLevel >= 1);
+    !!conversationId &&
+    (isKnownTopLevel || isChildSession) &&
+    (permissionLevel === null || permissionLevel >= 1);
   // Agent tools/policies exist to show.
   const hasAgentInfo = !!conversationId && agentHasInfo(boundAgent, conversationId);
   // Whether the mobile three-dot menu has any entry to offer.
