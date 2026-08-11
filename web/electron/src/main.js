@@ -562,6 +562,18 @@ function pinWindow(win, origin) {
     // Leaving a server: this window's unread contribution goes with it.
     state.badgeCount = 0;
     updateBadge();
+    // Destroy the window's embedded-browser views. They belong to sessions on
+    // the origin we're leaving, and the navigation tears down the renderer
+    // (setup page / new server) WITHOUT running BrowserPane's unmount detach —
+    // so without this the native WebContentsView keeps painting over the new
+    // page. Skip the initial pin (no prior origin: cold connect, nothing open).
+    if (state.origin != null) {
+      try {
+        state.browserRegistry?.closeAll("server-changed");
+      } catch {
+        /* registry already torn down */
+      }
+    }
   }
   state.origin = origin;
 }
