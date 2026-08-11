@@ -3623,7 +3623,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
           </MessageContent>
         </div>
-        <div className="mt-0.5 flex items-center gap-2">
+        <div className="mt-0.5 flex items-center gap-2 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
           {(() => {
             const ts = formatBubbleTimestamp(bubble.createdAtS);
             return ts ? (
@@ -3633,7 +3633,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             ) : null;
           })()}
           {text && (
-            <MessageActions className="opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+            <MessageActions>
               <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
                 {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
               </MessageAction>
@@ -3733,7 +3733,7 @@ function AssistantBubble({
             the user can see, and hanging them off a collapsed row spaced
             consecutive rows unevenly depending on hidden narration. */}
         {!foldOnly && (
-          <div className="mt-0.5 flex items-center gap-2">
+          <div className="mt-0.5 flex items-center gap-2 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
             {(() => {
               const ts = formatBubbleTimestamp(bubble.createdAtS);
               return ts ? (
@@ -3743,7 +3743,7 @@ function AssistantBubble({
               ) : null;
             })()}
             {markdownText && (
-              <MessageActions className="opacity-40 transition-opacity md:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100">
+              <MessageActions>
                 <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
                   {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
                 </MessageAction>
