@@ -504,6 +504,73 @@ def test_peek_rejects_non_positive_content_limit(session_fixture: _Fixture) -> N
     assert json.loads(raw)["error"] == "content_max_chars must be >= 1"
 
 
+# The following three cases cover the helper shared with the runner REST
+# dispatcher through its import in tool_dispatch.py, so the REST suite does not
+# duplicate them.
+
+
+def test_peek_rejects_boolean_content_limit(session_fixture: _Fixture) -> None:
+    """Boolean content limits do not pass as integers."""
+    raw = SysSessionGetHistoryTool().invoke(
+        json.dumps(
+            {
+                "conversation_id": session_fixture.child_conv_id,
+                "content_max_chars": True,
+            }
+        ),
+        session_fixture.ctx,
+    )
+
+    assert json.loads(raw)["error"] == "content_max_chars must be a whole number, got True"
+
+
+def test_peek_rejects_fractional_float_content_limit(session_fixture: _Fixture) -> None:
+    """Fractional float content limits are rejected instead of truncated."""
+    raw = SysSessionGetHistoryTool().invoke(
+        json.dumps(
+            {
+                "conversation_id": session_fixture.child_conv_id,
+                "content_max_chars": 1.5,
+            }
+        ),
+        session_fixture.ctx,
+    )
+
+    assert json.loads(raw)["error"] == "content_max_chars must be a whole number, got 1.5"
+
+
+def test_peek_accepts_integral_float_content_limit(session_fixture: _Fixture) -> None:
+    """An integral float applies its exact effective content limit."""
+    content = "abcdefghij"
+    session_fixture.conv_store.append(
+        session_fixture.child_conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_integral_float_limit",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": content}],
+                    agent="researcher",
+                ),
+            )
+        ],
+    )
+
+    raw = SysSessionGetHistoryTool().invoke(
+        json.dumps(
+            {
+                "conversation_id": session_fixture.child_conv_id,
+                "tail_items": 1,
+                "content_max_chars": 5.0,
+            }
+        ),
+        session_fixture.ctx,
+    )
+
+    assert json.loads(raw)["items"][0]["content"] == "abcde [truncated]"
+
+
 def test_peek_combined_limits_preserve_total_prompt_bound(session_fixture: _Fixture) -> None:
     """The per-item override scales down when a large tail is requested."""
     long_review = "R" * 3000

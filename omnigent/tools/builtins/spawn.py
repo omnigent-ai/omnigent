@@ -49,8 +49,8 @@ _ACTIVITY_MAX_CHARS = 2000
 # response without sending another turn.
 _HISTORY_DEFAULT_TAIL = 10
 _HISTORY_MAX_TAIL = 50
-# Six activity previews in one field can hold a substantive review while
-# keeping an explicit read bounded.
+# Enough for one substantive child result while staying below the ~100k
+# aggregate bound. Wide tails automatically reduce the per-item limit.
 _HISTORY_MAX_CHARS_PER_ITEM = 12000
 # The total budget intentionally follows the default preview and tail cap;
 # changing either value above also changes this budget.
@@ -1326,15 +1326,30 @@ def _clamp_history_content_chars(raw: Any) -> int | str:
     """
     Validate and clamp the per-item history content limit.
 
-    :param raw: Provider-supplied value, which may not have passed JSON
-        schema validation.
+    Accepts integers, integral floats, and other non-boolean values that
+    ``int()`` converts to whole numbers, including numeric integer strings.
+    Rejects booleans, fractional floats, values ``int()`` cannot convert, and
+    values below 1.
+
+    :param raw: Provider-supplied value that may not have passed JSON schema
+        validation.
     :returns: An integer in ``[1, _HISTORY_MAX_CHARS_PER_ITEM]`` or a
         JSON error string suitable for returning to the model.
     """
-    try:
+    error = json.dumps({"error": f"content_max_chars must be a whole number, got {raw!r}"})
+    if isinstance(raw, bool):
+        return error
+    if isinstance(raw, int):
+        max_chars = raw
+    elif isinstance(raw, float):
+        if not raw.is_integer():
+            return error
         max_chars = int(raw)
-    except (TypeError, ValueError):
-        return json.dumps({"error": f"content_max_chars must be an integer, got {raw!r}"})
+    else:
+        try:
+            max_chars = int(raw)
+        except (TypeError, ValueError):
+            return error
     if max_chars < 1:
         return json.dumps({"error": "content_max_chars must be >= 1"})
     return min(max_chars, _HISTORY_MAX_CHARS_PER_ITEM)
