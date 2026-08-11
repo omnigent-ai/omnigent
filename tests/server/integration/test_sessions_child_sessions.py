@@ -1645,7 +1645,14 @@ async def test_multipart_create_with_parent_links_child(
     resp = await client.post(
         "/v1/sessions",
         data={
-            "metadata": json.dumps({"parent_session_id": parent["id"], "title": "bundled helper"})
+            "metadata": json.dumps(
+                {
+                    "parent_session_id": parent["id"],
+                    "title": "bundled helper",
+                    "model_override": "gpt-5.6-luna",
+                    "reasoning_effort": "high",
+                }
+            )
         },
         files={"bundle": ("agent.tar.gz", child_bundle, "application/gzip")},
     )
@@ -1663,6 +1670,8 @@ async def test_multipart_create_with_parent_links_child(
     # Parent linkage + agent binding traversed metadata → store → row.
     assert snap.json()["parent_session_id"] == parent["id"]
     assert snap.json()["agent_id"] == body["agent_id"]
+    assert snap.json()["model_override"] == "gpt-5.6-luna"
+    assert snap.json()["reasoning_effort"] == "high"
 
     listing = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
     assert listing.status_code == 200, listing.text
@@ -1670,6 +1679,9 @@ async def test_multipart_create_with_parent_links_child(
     # kind="sub_agent" is what the child_sessions listing filters on —
     # absence here means the multipart path created a top-level row.
     assert child_id in listed_ids
+    listed_child = next(c for c in listing.json()["data"] if c["id"] == child_id)
+    assert listed_child["model_override"] == "gpt-5.6-luna"
+    assert listed_child["reasoning_effort"] == "high"
 
 
 async def test_multipart_create_with_unknown_parent_404s(

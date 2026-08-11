@@ -174,7 +174,11 @@ import {
   type WorkspaceFile,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
-import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
+import {
+  formatModelDisplayName,
+  isCostRoutingSession,
+  isSubagentRoutingSession,
+} from "@/components/CostRoutingControl";
 import {
   SMART_ROUTING_ARMS,
   hostBacksHarnessWithGateway,
@@ -4375,7 +4379,11 @@ export function formatStatusModelLabel(
   if (!raw) return null;
   const lower = raw.toLowerCase();
   const codexOption = findNativeModelOption(codexModelOptions, raw);
-  if (codexOption) return codexOption.displayName ?? codexOption.id;
+  if (codexOption) {
+    return formatModelDisplayName(codexOption.displayName ?? codexOption.id);
+  }
+  const known = CLAUDE_NATIVE_MODELS.find((m) => m.id === lower);
+  if (known) return known.label;
   // An alias-shaped id the session's catalog doesn't list (e.g. during
   // the pre-catalog window): render it friendly mechanically — "sonnet"
   // → "Sonnet", "sonnet_5" → "Sonnet 5", "sonnet[1m]" → "Sonnet
@@ -4389,7 +4397,7 @@ export function formatStatusModelLabel(
     if (alias[3]) label += " (1M context)";
     return label;
   }
-  return raw;
+  return formatModelDisplayName(raw);
 }
 
 function formatStatusEffortLabel(effort: string | null, raw = false): string | null {
