@@ -114,3 +114,44 @@ def test_skill_tools_agree_when_filter_suppresses_host_skills(
     )
     assert "not found" in loaded
     assert "not found" in read
+
+
+def test_load_then_read_auxiliary_file_reported_sequence(
+    tmp_path: Path,
+    isolated_home: Path,
+) -> None:
+    """load_skill advertises the auxiliary file, and read_skill_file returns it."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    skill_dir = workspace / ".claude" / "skills" / "codebase-design"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: codebase-design\ndescription: Designs codebases.\n---\n\nDesign body.\n"
+    )
+    (skill_dir / "DEEPENING.md").write_text("Deepening content.\n")
+    (skill_dir / "DESIGN-IT-TWICE.md").write_text("Design it twice content.\n")
+    spec = SimpleNamespace(skills=[], skills_filter="all")
+
+    loaded = _execute_skill_tool(
+        "load_skill",
+        {"name": "codebase-design"},
+        agent_spec=spec,
+        runner_workspace=workspace,
+    )
+    assert "## Available files" in loaded
+    assert "- DEEPENING.md" in loaded
+    assert "- DESIGN-IT-TWICE.md" in loaded
+
+    for path, expected in (
+        ("DEEPENING.md", "Deepening content.\n"),
+        ("DESIGN-IT-TWICE.md", "Design it twice content.\n"),
+    ):
+        assert (
+            _execute_skill_tool(
+                "read_skill_file",
+                {"skill_name": "codebase-design", "path": path},
+                agent_spec=spec,
+                runner_workspace=workspace,
+            )
+            == expected
+        )
