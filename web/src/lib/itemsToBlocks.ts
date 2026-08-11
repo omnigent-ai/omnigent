@@ -344,9 +344,8 @@ function ctxFor(item: ConversationItem): BlockContext {
     responseId: item.response_id,
     itemId: item.id,
     ...(createdBy !== undefined ? { createdBy } : {}),
-    createdAtS:
-      typeof item.created_at === "number" && item.created_at > 0
-        ? item.created_at
-        : Math.floor(Date.now() / 1000),
+    ...(typeof item.created_at === "number" && item.created_at > 0
+      ? { createdAtS: item.created_at }
+      : {}),
   };
 }
