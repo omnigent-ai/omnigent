@@ -100,6 +100,16 @@ function createProxyConfig(target: string, useAuth: boolean): Record<string, Pro
       changeOrigin: true,
       configure,
     },
+    // The server's version manifest (/.well-known/omnigent.json), which the
+    // desktop shell reads to learn what it's talking to. Without this the dev
+    // server answers with the SPA's index.html, and the shell — which rightly
+    // refuses to parse HTML as a manifest — sees every dev server as
+    // "pre-manifest", making the capability invisible in local development.
+    "/.well-known": {
+      target: origin,
+      changeOrigin: true,
+      configure,
+    },
   };
 }
 
@@ -296,17 +306,26 @@ export default defineConfig({
     emptyOutDir: true,
     rollupOptions: {
       output: {
-        // Keep Shiki and its first-party packages in a single chunk. pnpm's
-        // symlinks + Vite's default split expose a top-level cyclic import
-        // between the full language bundle and the alias-map chunk that ends
-        // up executing before its data dependency is initialized, producing
-        // "Cannot read properties of undefined (reading 'flatMap')" and a
-        // blank Monaco/file-viewer screen.
         manualChunks(id) {
           const normalized = id.replaceAll("\\", "/");
+          // Shiki lazily imports each language grammar (`@shikijs/langs/<lang>`)
+          // via dynamic import; leave those as their own on-demand chunks
+          // instead of folding ~200 grammars into the eagerly-loaded core.
+          if (normalized.includes("/@shikijs/langs/")) {
+            return;
+          }
+          // Keep Shiki's core, engines, and bundle glue (incl. the language
+          // index + alias map) in one chunk. pnpm's symlinks + Vite's default
+          // split otherwise expose a top-level cyclic import between the
+          // language bundle and the alias-map chunk that executes before its
+          // data dependency is initialized, producing "Cannot read properties
+          // of undefined (reading 'flatMap')" and a blank Monaco/file-viewer
+          // screen. The engines must stay here too: excluding them splits the
+          // cyclic core across chunks and reintroduces the bug.
           if (normalized.includes("/shiki") || normalized.includes("/@shikijs/")) {
             return "shiki";
           }
+          return undefined;
         },
       },
     },

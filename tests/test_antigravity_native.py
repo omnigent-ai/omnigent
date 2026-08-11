@@ -619,6 +619,68 @@ async def test_launch_and_record_threads_headless_skip_flag(
     assert "--dangerously-skip-permissions" in captured_args
 
 
+async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The CLI launch scopes agy to a per-session Gemini dir, like the runner path.
+
+    agy loads MCP servers and settings only from the dir its ``--gemini_dir``
+    points at. Without the flag this path read the user's real ``~/.gemini``: agy
+    saw no Omnigent relay (so no ``sys_*`` tools, #1194) and the survey/trust
+    seeds rewrote the user's own ``settings.json``. Asserts the relay config lands
+    in the isolated dir, the flag points at it, and ``HOME`` stays real so
+    keyring-backed auth (macOS Keychain) still resolves (#1477).
+    """
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    real_home = tmp_path / "real-home"
+    (real_home / ".gemini" / "antigravity-cli").mkdir(parents=True)
+    user_settings = real_home / ".gemini" / "antigravity-cli" / "settings.json"
+    user_settings.write_text('{"model":"gemini-3-pro"}', encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: real_home))
+
+    captured_args: list[str] = []
+    captured_env: dict[str, str] = {}
+
+    def _capture_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured_args.extend(body["spec"]["args"])
+        captured_env.update(body["spec"]["env"])
+        return httpx.Response(200, json={"id": "terminal_antigravity_main", "metadata": {}})
+
+    async with _mock_client(_capture_handler) as client:
+        await _mod._launch_and_record(
+            client,
+            session_id="conv_abc123",
+            bridge_id="bridge_gemini_dir_test",
+            conversation_id=_PLACEHOLDER_ID,
+            resume=False,
+            antigravity_args=(),
+            command="agy",
+            model=None,
+            permission_mode=None,
+            headless=True,
+            startup_progress=None,
+        )
+
+    bridge_dir = bridge_mod.bridge_dir_for_bridge_id("bridge_gemini_dir_test")
+    iso_gemini = bridge_mod.agy_gemini_dir(bridge_dir)
+    # The flag leads the args so it is never swallowed by a later positional.
+    assert captured_args[0] == f"--gemini_dir={iso_gemini}"
+    # HOME must stay real: relocating it breaks keyring-backed auth on macOS.
+    assert "HOME" not in captured_env
+    # The relay config + token exist, so the wrapped agy can reach the sys_* tools.
+    relay_config = iso_gemini / "config" / "mcp_config.json"
+    payload = json.loads(relay_config.read_text(encoding="utf-8"))
+    assert "sys_session_create" in payload["mcpServers"]["omnigent"]["enabledTools"]
+    assert (bridge_dir / "bridge.json").is_file()
+    # The survey/trust seeds landed in the isolated dir, never the user's own file.
+    iso_settings = json.loads(
+        (iso_gemini / "antigravity-cli" / "settings.json").read_text(encoding="utf-8")
+    )
+    assert iso_settings["showFeedbackSurvey"] is False
+    assert user_settings.read_text(encoding="utf-8") == '{"model":"gemini-3-pro"}'
+
+
 # ---------------------------------------------------------------------------
 # _attach_terminal teardown: the eager terminal-close decision
 # ---------------------------------------------------------------------------

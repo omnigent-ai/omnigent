@@ -13,16 +13,16 @@ import shutil
 import socket
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
 
 import click
 import httpx
 import yaml
+from omnigent_client._http import is_loopback_url
 
 from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
@@ -74,6 +74,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -95,6 +96,7 @@ from omnigent.native_terminal import (
 )
 
 _logger = logging.getLogger(__name__)
+
 
 _AGENT_NAME = "codex-native-ui"
 _DEFAULT_CODEX_COMMAND = "codex"
@@ -196,7 +198,8 @@ def _codex_auth_json_has_available_credential(auth_path: Path) -> bool:
 def _find_codex_cli() -> str | None:
     """Return the resolved path to the Codex CLI binary, if any."""
     from omnigent._platform import resolve_cli_binary
-    from omnigent.onboarding.harness_install import OPENAI_FAMILY, harness_install_spec
+    from omnigent.onboarding.harness_install import harness_install_spec
+    from omnigent.onboarding.provider_config import OPENAI_FAMILY
 
     spec = harness_install_spec(OPENAI_FAMILY)
     if spec is None:
@@ -220,10 +223,12 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     fail-open the ``claude-sdk`` / ``openai-agents`` gateway harnesses already
     rely on: their gateway token is a runtime mint the daemon can't observe.
 
-    The check stays synchronous, side-effect free, and local: it resolves the
-    launch (local config reads) and, only on the defer-to-login path, inspects
-    the local auth source. It never runs ``codex login``, a status command, or a
-    network probe; any resolver failure fails safe onto the ``auth.json`` check.
+    The check stays synchronous and local: it resolves the launch (local config
+    reads) and, only on the defer-to-login path, inspects the local auth source.
+    It never runs ``codex login`` or a status command; the CLI ``--version``
+    probe it does run is bounded by ``READINESS_CLI_PROBE_TIMEOUT_S`` so a hung
+    CLI can't stall the readiness refresh, and any resolver failure fails safe
+    onto the ``auth.json`` check.
 
     :returns: ``"binary-missing"`` when the CLI is absent, ``"needs-auth"``
         when the launch would defer to Codex's own login but ``auth.json`` is
@@ -233,13 +238,14 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
         not judged locally — it surfaces at the first turn via the executor.
     """
     from omnigent.onboarding.harness_install import (
-        OPENAI_FAMILY,
+        READINESS_CLI_PROBE_TIMEOUT_S,
         harness_cli_installed,
     )
+    from omnigent.onboarding.provider_config import OPENAI_FAMILY
 
     if _find_codex_cli() is None:
         return HARNESS_BINARY_MISSING
-    if not harness_cli_installed(OPENAI_FAMILY):
+    if not harness_cli_installed(OPENAI_FAMILY, timeout=READINESS_CLI_PROBE_TIMEOUT_S):
         return HARNESS_VERSION_TOO_LOW
     # On a host with no configured provider this may run ambient detection.
     # configured_harness_map shares one probe across all Codex aliases.
@@ -345,6 +351,13 @@ class PreparedCodexTerminal:
     app_server: CodexNativeAppServer | None
     event_client: CodexAppServerClient | None
     reattached: bool
+
+
+def _require_codex_app_server_url(prepared: PreparedCodexTerminal) -> str:
+    """Return the prepared app-server URL or fail on inconsistent state."""
+    if prepared.app_server_url is None:
+        raise click.ClickException("Codex app-server transport was not initialized.")
+    return prepared.app_server_url
 
 
 def run_codex_native(
@@ -476,13 +489,16 @@ def _prompt_codex_resume_workspace_action(
     click.echo("Codex resume is workspace-scoped. Choose an action:", err=True)
     for option in options:
         click.echo(f"  {option.action:<6} - {option.label}", err=True)
-    return click.prompt(
+    action = click.prompt(
         "Resume action",
         type=click.Choice([option.action for option in options]),
         default=options[0].action,
         show_choices=True,
         err=True,
     )
+    if not isinstance(action, str):
+        raise click.ClickException("Codex resume action must be a string.")
+    return action
 
 
 def _codex_resume_workspace_action_options(
@@ -534,7 +550,7 @@ def _materialize_codex_agent_spec(
     executor: dict[str, str] = {"harness": "codex-native"}
     if model is not None:
         executor["model"] = model
-    raw: dict[str, Any] = {
+    raw: _JsonObject = {
         "name": _AGENT_NAME,
         "prompt": (
             "Codex is running in the session terminal. Web UI messages are "
@@ -648,9 +664,15 @@ def _run_with_local_server(
                 prompt=prompt,
             )
             if resolved_session_id is None:
+                # A native ``/new`` rotates ownership to a fresh session, so
+                # read the active id from bridge state instead of the id this
+                # process started with — otherwise the hint resumes a session
+                # the user already cleared away from.
                 echo_native_resume_hint(
                     native_command="codex",
-                    session_id=prepared.session_id,
+                    session_id=(
+                        _active_codex_session_id(prepared.bridge_dir) or prepared.session_id
+                    ),
                 )
 
         asyncio.run(_drive())
@@ -759,9 +781,13 @@ def _run_with_remote_server(
                 recover=_recover,
             )
             if resolved_session_id is None:
+                # See the local path: ``/new`` rotation means bridge state,
+                # not ``prepared``, holds the session worth resuming.
                 echo_native_resume_hint(
                     native_command="codex",
-                    session_id=prepared.session_id,
+                    session_id=(
+                        _active_codex_session_id(prepared.bridge_dir) or prepared.session_id
+                    ),
                     server=base_url,
                 )
 
@@ -814,7 +840,12 @@ async def _prepare_codex_terminal_via_daemon(
     """
     persist_args = list(codex_args)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         reattached = session_id is not None
         if session_id is None:
             if session_bundle is None:
@@ -860,7 +891,7 @@ async def _prepare_codex_terminal_via_daemon(
                     event_client=None,
                     reattached=True,
                 )
-            patch: dict[str, Any] = {}
+            patch: _JsonObject = {}
             if persist_args:
                 patch["terminal_launch_args"] = persist_args
             if model is not None:
@@ -987,6 +1018,7 @@ async def _post_initial_prompt(
     """
     async with httpx.AsyncClient(
         base_url=base_url,
+        trust_env=not is_loopback_url(base_url),
         headers=headers,
         auth=auth,
         timeout=httpx.Timeout(30.0),
@@ -1035,7 +1067,12 @@ async def _prepare_codex_terminal(
     :returns: Prepared terminal details.
     """
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         bridge_id: str
         thread_id: str | None = None
         if session_id is None:
@@ -1212,7 +1249,7 @@ async def _attach_with_forwarder(
     headers: dict[str, str],
     prepared: PreparedCodexTerminal,
     prompt: str | None,
-    recover: Any | None = None,
+    recover: Callable[[], Awaitable[None]] | None = None,
     auth: httpx.Auth | None = None,
 ) -> None:
     """
@@ -1254,7 +1291,7 @@ async def _attach_with_forwarder(
                     )
                     if prompt:
                         await _start_initial_turn(
-                            prepared.app_server_url,
+                            _require_codex_app_server_url(prepared),
                             prepared.thread_id,
                             prompt,
                         )
@@ -1274,7 +1311,11 @@ async def _attach_with_forwarder(
                     auth=auth,
                 )
                 if prompt:
-                    await _start_initial_turn(prepared.app_server_url, prepared.thread_id, prompt)
+                    await _start_initial_turn(
+                        _require_codex_app_server_url(prepared),
+                        prepared.thread_id,
+                        prompt,
+                    )
             await _attach_terminal_resource(
                 base_url=base_url,
                 headers=headers,
@@ -1319,13 +1360,14 @@ def _start_codex_forwarder(
     """
     if prepared.thread_id is None:
         raise click.ClickException("Codex thread id was not initialized.")
+    app_server_url = _require_codex_app_server_url(prepared)
     return asyncio.create_task(
         supervise_forwarder(
             base_url=base_url,
             headers=headers,
             session_id=prepared.session_id,
             bridge_dir=prepared.bridge_dir,
-            app_server_url=prepared.app_server_url,
+            app_server_url=app_server_url,
             thread_id=prepared.thread_id,
             client=prepared.event_client,
             auth=auth,
@@ -1357,9 +1399,11 @@ async def _initialize_fresh_terminal_thread(
     """
     if prepared.event_client is None:
         raise click.ClickException("Codex event listener was not initialized.")
+    app_server_url = _require_codex_app_server_url(prepared)
     thread_id = await _wait_for_thread_started(prepared.event_client)
     async with httpx.AsyncClient(
         base_url=base_url,
+        trust_env=not is_loopback_url(base_url),
         headers=headers,
         timeout=httpx.Timeout(30.0),
     ) as client:
@@ -1368,7 +1412,7 @@ async def _initialize_fresh_terminal_thread(
         prepared.bridge_dir,
         CodexNativeBridgeState(
             session_id=prepared.session_id,
-            socket_path=prepared.app_server_url,
+            socket_path=app_server_url,
             thread_id=thread_id,
             codex_home=str(codex_home_for_bridge_dir(prepared.bridge_dir)),
         ),
@@ -1381,7 +1425,7 @@ async def _attach_terminal_resource(
     base_url: str,
     headers: dict[str, str],
     prepared: PreparedCodexTerminal,
-    recover: Any | None,
+    recover: Callable[[], Awaitable[None]] | None,
 ) -> None:
     """
     Attach the current terminal to the prepared Omnigent terminal resource.
@@ -1508,7 +1552,7 @@ async def _create_codex_session(
     labels = dict(_SESSION_LABELS)
     if bridge_id is not None:
         labels[CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = bridge_id
-    metadata = {
+    metadata: _JsonObject = {
         "labels": labels,
     }
     if terminal_launch_args:
@@ -1530,7 +1574,7 @@ async def _create_codex_session(
     return new_session_id
 
 
-async def _fetch_codex_session(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
+async def _fetch_codex_session(client: httpx.AsyncClient, session_id: str) -> _JsonObject:
     """
     Fetch an existing Omnigent session.
 
@@ -1857,7 +1901,7 @@ def _codex_resume_rollout_path(codex_home: Path, external_session_id: str) -> Pa
 async def _fetch_all_session_items_for_codex_resume(
     client: httpx.AsyncClient,
     session_id: str,
-) -> list[dict[str, Any]]:
+) -> list[_JsonObject]:
     """
     Fetch committed Omnigent session items in chronological order.
 
@@ -1868,7 +1912,7 @@ async def _fetch_all_session_items_for_codex_resume(
     :raises click.ClickException: If an item page cannot be fetched or
         parsed.
     """
-    items: list[dict[str, Any]] = []
+    items: list[_JsonObject] = []
     after: str | None = None
     while True:
         params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
@@ -1908,7 +1952,7 @@ async def _fetch_all_session_items_for_codex_resume(
 
 
 def _codex_rollout_records_from_session_items(
-    items: list[dict[str, Any]],
+    items: list[_JsonObject],
     *,
     session_id: str,
     external_session_id: str,
@@ -1916,7 +1960,7 @@ def _codex_rollout_records_from_session_items(
     model_provider: str,
     cli_version: str,
     terminal_launch_args: Sequence[str] | None = None,
-) -> list[dict[str, Any]]:
+) -> list[_JsonObject]:
     """
     Convert Omnigent session items into Codex rollout JSONL records.
 
@@ -1952,7 +1996,7 @@ def _codex_rollout_records_from_session_items(
     turn_context_policy_fields = _codex_turn_context_policy_fields_from_launch_args(
         terminal_launch_args
     )
-    records: list[dict[str, Any]] = [
+    records: list[_JsonObject] = [
         {
             "timestamp": timestamp,
             "type": "session_meta",
@@ -1977,17 +2021,18 @@ def _codex_rollout_records_from_session_items(
         if item.get("type") == "compaction":
             compacted_msgs = item.get("compacted_messages")
             if compacted_msgs:
-                compacted_record: dict[str, Any] = {
+                compacted_payload: _JsonObject = {
+                    "message": item.get("summary", ""),
+                    "replacement_history": compacted_msgs,
+                }
+                compacted_record: _JsonObject = {
                     "timestamp": timestamp,
                     "type": "compacted",
-                    "payload": {
-                        "message": item.get("summary", ""),
-                        "replacement_history": compacted_msgs,
-                    },
+                    "payload": compacted_payload,
                 }
                 w_id = item.get("window_id")
                 if w_id is not None:
-                    compacted_record["payload"]["window_id"] = w_id
+                    compacted_payload["window_id"] = w_id
                 # Replace all prior response_item records — the
                 # replacement_history is the new context baseline.
                 # Keep only session_meta and turn_context records.
@@ -2032,7 +2077,7 @@ def _codex_rollout_records_from_session_items(
 
 def _codex_turn_context_policy_fields_from_launch_args(
     terminal_launch_args: Sequence[str] | None,
-) -> dict[str, Any]:
+) -> _JsonObject:
     """Return rollout policy fields matching persisted Codex launch args."""
     approval_policy = "on-request"
     sandbox_mode: str | None = None
@@ -2066,17 +2111,17 @@ def _codex_turn_context_policy_fields_from_launch_args(
                 sandbox_mode = "danger-full-access"
             i += 1
         i += 1
-    fields: dict[str, Any] = {"approval_policy": approval_policy}
+    fields: _JsonObject = {"approval_policy": approval_policy}
     if sandbox_mode in {"read-only", "workspace-write", "danger-full-access"}:
         fields["sandbox_policy"] = {"type": sandbox_mode}
     return fields
 
 
 def _codex_event_msg_record_for_message(
-    payload: dict[str, Any],
+    payload: _JsonObject,
     *,
     timestamp: str,
-) -> dict[str, Any] | None:
+) -> _JsonObject | None:
     """
     Build the ``event_msg`` mirror record for a message ``response_item``.
 
@@ -2097,14 +2142,23 @@ def _codex_event_msg_record_for_message(
     """
     if payload.get("type") != "message":
         return None
-    text = " ".join(
-        block.get("text", "") for block in payload.get("content", []) if isinstance(block, dict)
-    ).strip()
+    content = payload.get("content", [])
+    if not isinstance(content, list):
+        return None
+    text_parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_text = block.get("text", "")
+        if not isinstance(block_text, str):
+            raise click.ClickException("Codex message content text must be a string.")
+        text_parts.append(block_text)
+    text = " ".join(text_parts).strip()
     if not text:
         return None
     role = payload.get("role")
     if role == "user":
-        event_payload: dict[str, Any] = {
+        event_payload: _JsonObject = {
             "type": "user_message",
             "message": text,
             "images": [],
@@ -2123,7 +2177,7 @@ def _codex_event_msg_record_for_message(
     return {"timestamp": timestamp, "type": "event_msg", "payload": event_payload}
 
 
-def _interrupted_response_ids_from_session_items(items: list[dict[str, Any]]) -> set[str]:
+def _interrupted_response_ids_from_session_items(items: list[_JsonObject]) -> set[str]:
     """
     Return response ids for Omnigent turns that ended interrupted.
 
@@ -2147,7 +2201,7 @@ def _interrupted_response_ids_from_session_items(items: list[dict[str, Any]]) ->
     return response_ids
 
 
-def _session_item_response_id(item: dict[str, Any]) -> str | None:
+def _session_item_response_id(item: _JsonObject) -> str | None:
     """
     Extract a non-empty Omnigent response id from a flat item.
 
@@ -2159,7 +2213,7 @@ def _session_item_response_id(item: dict[str, Any]) -> str | None:
     return response_id if isinstance(response_id, str) and response_id else None
 
 
-def _codex_response_item_from_session_item(item: dict[str, Any]) -> dict[str, Any] | None:
+def _codex_response_item_from_session_item(item: _JsonObject) -> _JsonObject | None:
     """
     Convert one Omnigent item into one Codex ``response_item`` payload.
 
@@ -2177,7 +2231,7 @@ def _codex_response_item_from_session_item(item: dict[str, Any]) -> dict[str, An
     return payload
 
 
-def _is_interrupted_assistant_session_item(item: dict[str, Any]) -> bool:
+def _is_interrupted_assistant_session_item(item: _JsonObject) -> bool:
     """
     Return whether an Omnigent item is an interrupted assistant partial.
 
@@ -2197,7 +2251,7 @@ def _is_interrupted_assistant_session_item(item: dict[str, Any]) -> bool:
     )
 
 
-def _codex_response_item_payload(item: dict[str, Any]) -> dict[str, Any] | None:
+def _codex_response_item_payload(item: _JsonObject) -> _JsonObject | None:
     """
     Convert one supported Omnigent item into a Codex response payload body.
 
@@ -2215,7 +2269,7 @@ def _codex_response_item_payload(item: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _codex_message_payload_from_session_item(item: dict[str, Any]) -> dict[str, Any] | None:
+def _codex_message_payload_from_session_item(item: _JsonObject) -> _JsonObject | None:
     """
     Convert an Omnigent message item into a Codex message payload.
 
@@ -2237,8 +2291,8 @@ def _codex_message_payload_from_session_item(item: dict[str, Any]) -> dict[str, 
 
 
 def _codex_function_call_payload_from_session_item(
-    item: dict[str, Any],
-) -> dict[str, Any] | None:
+    item: _JsonObject,
+) -> _JsonObject | None:
     """
     Convert an Omnigent function call item into a Codex function call payload.
 
@@ -2270,8 +2324,8 @@ def _codex_function_call_payload_from_session_item(
 
 
 def _codex_function_call_output_payload_from_session_item(
-    item: dict[str, Any],
-) -> dict[str, Any] | None:
+    item: _JsonObject,
+) -> _JsonObject | None:
     """
     Convert an Omnigent function output item into a Codex function output payload.
 
@@ -2302,7 +2356,7 @@ def _codex_content_blocks_from_api_content(
     content: object,
     *,
     api_type: str,
-) -> list[dict[str, Any]]:
+) -> list[_JsonObject]:
     """
     Extract text blocks from an Omnigent content array for Codex rollout items.
 
@@ -2314,7 +2368,7 @@ def _codex_content_blocks_from_api_content(
     """
     if not isinstance(content, list):
         return []
-    blocks: list[dict[str, Any]] = []
+    blocks: list[_JsonObject] = []
     for block in content:
         if not isinstance(block, dict) or block.get("type") != api_type:
             continue
@@ -2328,7 +2382,7 @@ def _codex_turn_id_for_session_item(
     *,
     session_id: str,
     external_session_id: str,
-    item: dict[str, Any],
+    item: _JsonObject,
     index: int,
 ) -> str:
     """
@@ -2658,6 +2712,7 @@ async def _close_codex_terminal(
     with contextlib.suppress(Exception):
         async with httpx.AsyncClient(
             base_url=base_url,
+            trust_env=not is_loopback_url(base_url),
             headers=headers,
             timeout=httpx.Timeout(10.0),
         ) as client:

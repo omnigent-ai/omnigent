@@ -32,6 +32,15 @@ interface MainTerminalViewProps {
    */
   initialTerminalKey?: string | null;
   /**
+   * False while the surface is mounted but hidden behind the chat view
+   * (the pre-warmed overlay in MainAgentSurface). The WS attach and
+   * xterm buffer stay alive so flipping to Terminal is instant; on the
+   * visible→hidden edge a user-shell selection resets to the agent
+   * terminal so the next open targets the agent pane, matching the old
+   * unmount-on-close behavior. Default true.
+   */
+  visible?: boolean;
+  /**
    * When true, attach every terminal (agent TUI and user shells)
    * read-only — the viewer can watch but not type. Set for non-owners:
    * a shared PTY's keystrokes carry no per-user identity, so only the
@@ -50,6 +59,7 @@ interface MainTerminalViewProps {
 export function MainTerminalView({
   conversationId,
   initialTerminalKey,
+  visible = true,
   readOnly = false,
   onSurfaceElement,
 }: MainTerminalViewProps) {
@@ -94,6 +104,17 @@ export function MainTerminalView({
     if (!stillValid) setActiveKey(terminalTabKey(agentTerminals[0] ?? terminals[0]));
   }, [terminals, agentTerminals, activeKey]);
 
+  // While hidden, drop a user-shell selection back to the agent terminal.
+  // The surface used to unmount on close (forgetting the selection), so
+  // reopening always showed the agent pane; the persistent pre-warmed
+  // mount must reproduce that, and it points the background attach at
+  // the pane the next open will actually show.
+  useEffect(() => {
+    if (visible || terminals.length === 0) return;
+    const fallback = agentTerminals[0] ?? terminals[0];
+    setActiveKey(terminalTabKey(fallback));
+  }, [visible, terminals, agentTerminals]);
+
   const activeTerminal = terminals.find((t) => terminalTabKey(t) === activeKey) ?? null;
   // A user shell opened from the rail takes over the pane chrome-free:
   // a single header row naming the shell plus a close X — no agent tab
@@ -127,11 +148,14 @@ export function MainTerminalView({
       // Exposed for e2e assertions that an expand targeted the right
       // terminal (not just that the view opened).
       data-active-terminal={activeKey}
+      // Distinguishes the revealed surface from the hidden pre-warmed
+      // mount for tests — both are in the DOM.
+      data-visible={visible}
       className="main-terminal-view flex min-h-0 flex-1 flex-col px-3 pt-14 pb-1.5"
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-sm">
         {terminals.length === 0 ? (
-          <div className="flex flex-1 items-center justify-center text-muted-foreground text-sm">
+          <div className="flex flex-1 items-center justify-center text-muted-foreground text-ui">
             No terminals available.
           </div>
         ) : (
@@ -139,7 +163,7 @@ export function MainTerminalView({
             {isShellView && activeTerminal && (
               // Shell header — identity + close, nothing else.
               <div className="flex shrink-0 items-center gap-1.5 border-b border-border px-2 pt-1 pb-2">
-                <span className="flex items-center gap-1.5 rounded-sm bg-muted px-2 py-1 text-foreground text-xs">
+                <span className="flex items-center gap-1.5 rounded-sm bg-muted px-2 py-1 text-foreground text-sm">
                   <TerminalIcon className="size-3 shrink-0" />
                   <span className="max-w-[8rem] truncate">{activeTerminal.name}</span>
                   <span className="shrink-0 text-muted-foreground/60">
@@ -160,12 +184,19 @@ export function MainTerminalView({
             )}
             <div className="min-h-0 flex-1">
               {activeTerminal && (
-                <div key={activeTerminal.id} className="flex h-full flex-col">
+                // Scope the key to the session: agent terminals share a fixed
+                // id across same-shape sessions (e.g. `terminal_claude_main`),
+                // so id alone reuses the xterm mount and shows stale scrollback.
+                <div
+                  key={`${conversationId}:${activeTerminal.id}`}
+                  className="flex h-full flex-col"
+                >
                   <TerminalView
                     sessionId={conversationId}
                     terminalId={activeTerminal.id}
                     readOnly={readOnly}
                     transport={activeTerminal.transport}
+                    active={visible}
                     onStateChange={(state) => {
                       setTerminalConnectionState(activeTerminal.id, state);
                     }}

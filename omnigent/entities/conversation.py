@@ -9,6 +9,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from omnigent.inner.native_attachments import UNRESOLVED_ATTACHMENT_MARKER_PATTERN
+from omnigent.llms.adapters._content import redact_binary_payloads
 
 # Attachment markers the native executors prepend to prompt text
 # ("[Attached: /tmp/.../x.png]" from claude-native's _content_to_text,
@@ -118,6 +119,14 @@ class Conversation:
         ``PATCH /v1/sessions/{id}`` (the web "Cost Optimized"
         toggle). Read by the cost-control advisor pipeline at turn
         start; mirrors the persistence shape of ``model_override``.
+    :param subagent_routing_override: Per-session subagent-routing
+        switch, two-state: ``"on"`` routes native/SDK subagent spawns,
+        and ``"off"`` or ``None`` (unset) both leave them on the parent's
+        model. A session created on Smart Routing is stamped ``"on"`` by
+        the create route, so unset reads as Default and inherits nothing.
+        Mutable via ``PATCH /v1/sessions/{id}`` at any time; read per
+        spawn by the route-subagent relay, so a change takes effect on
+        the next spawn.
     :param harness_override: Per-session harness override for the
         bound agent's brain, e.g. ``"pi"`` or ``"openai-agents"``.
         ``None`` means use the harness declared in the agent spec
@@ -213,6 +222,7 @@ class Conversation:
     reasoning_effort: str | None = None
     model_override: str | None = None
     cost_control_mode_override: str | None = None
+    subagent_routing_override: str | None = None
     harness_override: str | None = None
     sub_agent_name: str | None = None
     external_session_id: str | None = None
@@ -404,6 +414,21 @@ class ReasoningData(BaseModel):
     encrypted_content: str | None = None
 
 
+def _binary_payload_omitted(media_type: str, _payload_length: int) -> str:
+    """
+    Build the marker written over a dropped compaction-snapshot payload.
+
+    The payload length is deliberately unused: a compaction row is
+    re-validated on every read, so a length would describe the previous
+    marker on the second pass and the strip would stop being idempotent.
+
+    :param media_type: The block's declared media type, if any.
+    :param _payload_length: Unused.
+    :returns: The replacement text.
+    """
+    return f"[{media_type or 'binary'} content omitted from the compaction snapshot]"
+
+
 class CompactionData(BaseModel):
     """
     Data payload for a compaction summary item.
@@ -434,6 +459,29 @@ class CompactionData(BaseModel):
     token_count: int
     compacted_messages: list[dict[str, Any]] | None = None
     window_id: int | None = None
+
+    @field_validator("compacted_messages")
+    @classmethod
+    def strip_binary_payloads(
+        cls,
+        value: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]] | None:
+        """
+        Drop base64 payloads from the compaction snapshot.
+
+        Every harness builds the snapshot by copying its vendor transcript
+        verbatim, so a single screenshot turns one compaction item into
+        megabytes of base64 that is stored forever and re-read on every
+        session load. Stripping here rather than in each forwarder covers
+        every producer through one seam. Only newly written rows shrink —
+        a row already on disk keeps its size, and validation runs on the
+        way out, not back into the store.
+
+        :param value: The compacted message list, or ``None``.
+        :returns: The list with binary payloads replaced by a marker,
+            or ``None`` unchanged.
+        """
+        return redact_binary_payloads(value, _binary_payload_omitted)
 
 
 class NativeToolData(BaseModel):
@@ -532,6 +580,33 @@ class RoutingDecisionData(BaseModel):
     :param rationale: The router's one-line explanation, shown as muted
         secondary text, e.g. ``"Multi-file refactor needs deep
         reasoning."``.
+    :param harness: Harness the decision applies to, e.g.
+        ``"claude-native"`` or ``"codex"``. ``None`` when the decision
+        picked a model only (no harness dimension).
+    :param scope: What the decision governs — ``"session"`` (auto-harness
+        session routing), ``"turn"`` (per-turn routing), ``"child_session"``
+        (an Omnigent-spawned sub-agent) or ``"native_subagent"`` (a Task /
+        ``spawn_agent`` spawn routed inside the harness). Defaults to
+        ``"turn"`` so rows persisted before this field deserialize.
+    :param decision_id: Router decision identifier, e.g.
+        ``"3f1c…"``. Correlates the transcript item with the routing
+        telemetry event and the child-sessions API row. ``None`` for
+        decisions made before decision ids existed.
+    :param raw_model: The router-vocabulary pick before resolution to a
+        servable catalog id, e.g. ``"gpt-5-6-sol"``. ``None`` when the
+        pick needed no resolution.
+    :param attempted_override: Model the spawning agent asked for and the
+        router overrode, e.g. ``"databricks-gpt-5-5"`` — an LLM-supplied
+        ``args.model`` on a child session, or a native spawn's own
+        ``requested_model``. ``None`` when nothing was asked for, or when
+        the router's pick names the same arm as the ask.
+    :param router_source: Which router produced the decision —
+        ``"databricks-aigw"`` for the external AI-Gateway ``task_v1``
+        service, ``"oss-llm"`` for the built-in judge. Deliberately a
+        plain ``str`` rather than a ``Literal``: a source added later
+        must still round-trip through stored rows and the wire instead
+        of failing validation. ``None`` on rows written before the
+        field existed.
     """
 
     model: str
@@ -541,6 +616,12 @@ class RoutingDecisionData(BaseModel):
     #: item is being mirrored into the parent's transcript, e.g. ``"claude_code"``.
     #: ``None`` for session-local routing decisions (the usual case).
     agent: str | None = None
+    harness: str | None = None
+    scope: Literal["session", "turn", "child_session", "native_subagent"] = "turn"
+    decision_id: str | None = None
+    raw_model: str | None = None
+    attempted_override: str | None = None
+    router_source: str | None = None
 
     @field_validator("model")
     @classmethod
@@ -764,6 +845,7 @@ class ConversationItem(BaseModel):
 
             {"id": "msg_abc", "response_id": "resp_xyz",
              "type": "message", "status": "completed",
+             "created_at": 1753900000,
              "role": "assistant",
              "content": [{"type": "output_text", "text": "hi"}],
              "model": "databricks-gpt-5-4"}
@@ -773,6 +855,7 @@ class ConversationItem(BaseModel):
             "response_id": self.response_id,
             "type": self.type,
             "status": self.status,
+            "created_at": self.created_at,
             **self.data.model_dump(exclude_none=True, by_alias=True),
             # created_by is present only for human-authored items;
             # omitted (not null) for agent/tool/system messages so the

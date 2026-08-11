@@ -13,6 +13,8 @@ import pytest
 from omnigent import (
     claude_native_bridge,
     codex_native_bridge,
+    cursor_native,
+    cursor_native_bridge,
     kiro_native,
     kiro_native_bridge,
 )
@@ -323,6 +325,104 @@ async def test_kiro_native_model_options_failure_is_retryable(
 
     assert response.status_code == 503, response.text
     assert response.json()["error"] == "kiro_native_model_options_failed"
+
+
+@pytest.mark.asyncio
+async def test_cursor_native_model_options_use_cli_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conv_id = "c7e721bf0e124d2fb5bc1bc36772864e"
+    expected = [
+        {
+            "id": "provider-latest",
+            "displayName": "Provider Latest",
+            "isDefault": True,
+            "isCurrent": False,
+        }
+    ]
+    monkeypatch.setattr(cursor_native, "list_cursor_cli_model_options", lambda: expected)
+    injected: list[tuple[str, str | None]] = []
+
+    def _inject_model(
+        _bridge_dir: Path,
+        *,
+        model: str,
+        expected_display_name: str | None,
+        timeout_s: float,
+    ) -> None:
+        del timeout_s
+        injected.append((model, expected_display_name))
+
+    monkeypatch.setattr(cursor_native_bridge, "inject_model_command", _inject_model)
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        response = await client.get(f"/v1/sessions/{conv_id}/cursor-model-options")
+        event_response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "provider-latest"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"models": expected}
+    assert event_response.status_code == 204
+    assert injected == [("provider-latest", "Provider Latest")]
+
+
+@pytest.mark.asyncio
+async def test_cursor_native_model_options_failure_is_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery failures return 503 so the server leaves its cache cold."""
+    conv_id = "d29b45fd569245b2bc0dd79694e73886"
+
+    def _fail_discovery() -> list[dict[str, object]]:
+        raise RuntimeError("catalog unavailable")
+
+    monkeypatch.setattr(cursor_native, "list_cursor_cli_model_options", _fail_discovery)
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        response = await client.get(f"/v1/sessions/{conv_id}/cursor-model-options")
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "cursor_native_model_options_failed"
 
 
 @pytest.mark.asyncio
@@ -2267,11 +2367,12 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(tmp_path: Pat
         *,
         on_activity: object | None = None,
         on_exit: object | None = None,
+        on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, idle_threshold_s, poll_interval_s
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s
         callbacks["on_exit"] = on_exit
         callbacks["replace"] = replace
 
@@ -2376,6 +2477,90 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_required_terminal_exit_classifies_root_failure(tmp_path: Path) -> None:
+    """A recognized failure carries structured title/cause/remediation.
+
+    When the terminal output matches a known failure (Claude refusing
+    ``--dangerously-skip-permissions`` as root), the ``failed`` status event
+    carries the friendly ``title`` / ``cause`` / ``remediation`` fields (so the
+    web UI can render a clear card) in addition to the composed ``message``.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = uuid.uuid4().hex
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    instance.command = "claude"
+    instance.args = ["--dangerously-skip-permissions"]
+    instance.launch_cwd = str(tmp_path)
+    instance._remember_pane_snapshot(
+        "--dangerously-skip-permissions cannot be run with root privileges for security reasons"
+    )
+    instance._remember_exit_status("1 1")
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("claude", "main")] = instance
+    callbacks: dict[str, Any] = {}
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        on_tick: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        callbacks["on_exit"] = on_exit
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    resource_registry = app.state.session_resource_registry
+
+    async def _collect_failed() -> dict[str, Any]:
+        while True:
+            queue = _session_event_queues_ref.get(conv_id)
+            if queue is not None:
+                while not queue.empty():
+                    item = queue.get_nowait()
+                    if (
+                        isinstance(item, dict)
+                        and item.get("type") == "session.status"
+                        and item.get("status") == "failed"
+                    ):
+                        return item
+            await asyncio.sleep(0)
+
+    try:
+        await resource_registry.observe_required_terminal(conv_id, "claude", "main", instance)
+        on_exit = callbacks.get("on_exit")
+        assert callable(on_exit)
+        on_exit()
+        failed = await asyncio.wait_for(_collect_failed(), timeout=1.0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+
+    error = failed["error"]
+    assert error["code"] == "required_terminal_exited"
+    assert error["title"] == "Claude Code can't run as root"
+    assert "root" in error["cause"].lower()
+    assert "non-root" in error["remediation"].lower()
+    # The composed message leads with the diagnosis and still carries the raw
+    # diagnostics (exit status included) for the collapsible details view.
+    assert error["message"].startswith("Claude Code can't run as root")
+    assert "exited with status 1" in error["message"]
+
+
+@pytest.mark.asyncio
 async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path: Path) -> None:
     """
     A required terminal that exits while the session is idle is a clean shutdown.
@@ -2408,11 +2593,12 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
         *,
         on_activity: object | None = None,
         on_exit: object | None = None,
+        on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, idle_threshold_s, poll_interval_s, replace
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
@@ -2601,11 +2787,12 @@ async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path:
         *,
         on_activity: object | None = None,
         on_exit: object | None = None,
+        on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, idle_threshold_s, poll_interval_s, replace
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
@@ -2699,9 +2886,10 @@ async def test_events_effort_change_on_native_session_types_slash_command(
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Record the call and return without touching tmux."""
-        captured.append((bridge_dir, command, timeout_s))
+        captured.append((bridge_dir, command, timeout_s, confirm_hint))
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
@@ -2768,8 +2956,13 @@ async def test_events_effort_change_on_native_session_types_slash_command(
     assert len(captured) == 1, (
         f"Expected one inject_slash_command call from native effort_change, got {len(captured)}."
     )
-    bridge_dir, command, timeout_s = captured[0]
+    bridge_dir, command, timeout_s, confirm_hint = captured[0]
     assert bridge_dir == bridge_dir_for_conversation_id("c7e9584b9bb34910a0068521106c1abc")
+    # The effort dialog's own title, not "Switch model?". Watching for the wrong
+    # one would leave the pane wedged behind an unconfirmed modal; watching for
+    # "any dialog" would answer a foreign one (a permission prompt, a picker the
+    # person opened) that rendered while the poll was running.
+    assert confirm_hint == claude_native_bridge.EFFORT_DIALOG_HINT
     # Body contract: ``/effort high`` is the literal Claude Code's TUI
     # accepts. A regression in shape (``/efforthigh``, ``effort high``,
     # missing leading slash) would either 404 on the slash router or

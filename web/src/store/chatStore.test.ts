@@ -15,6 +15,8 @@
 // Session metadata and item pages are shimmed through `seedSession`
 // helpers so tests can model capped snapshots and full transcripts.
 
+import type * as IdentityModule from "@/lib/identity";
+
 import { type InfiniteData, QueryClient } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
@@ -30,7 +32,7 @@ import type {
 import type { ConversationItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { buildBubbles } from "@/lib/renderItems";
-import { SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
+import { INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
 import type {
   SessionCreatedEvent,
@@ -48,6 +50,8 @@ import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSe
 import {
   consumePendingInitialPrompt,
   handleSessionEvent,
+  isStaleCompletedResponse,
+  reviveStrayCompletedResponse,
   initChatStore,
   pumpStreamEvents,
   setPendingInitialPrompt,
@@ -70,7 +74,7 @@ const realSend = useChatStore.getState().send;
 // per-test `mockReturnValue` works; reset in afterEach so a stubbed
 // identity never leaks across tests.
 vi.mock("@/lib/identity", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/identity")>();
+  const actual = await importOriginal<typeof IdentityModule>();
   return { ...actual, getCurrentAuthorId: vi.fn<() => string | null>(() => null) };
 });
 
@@ -82,19 +86,6 @@ function userMessage(responseId: string, text: string): ConversationItem {
     role: "user",
     status: "completed",
     content: [{ type: "input_text", text }],
-  };
-}
-
-// A `[System: …]` marker — sent as a user-role message but re-classified by
-// the UI as a muted marker, not a real user turn / rail tick.
-function systemMarker(responseId: string, inner = "timer t1 fired"): ConversationItem {
-  return {
-    id: `msg_${responseId}_sys`,
-    response_id: responseId,
-    type: "message",
-    role: "user",
-    status: "completed",
-    content: [{ type: "input_text", text: `[System: ${inner}]` }],
   };
 }
 
@@ -187,14 +178,15 @@ let client: QueryClient;
 const fetchMock = vi.fn();
 let sessionSnapshots: Map<string, ConversationItem[]>;
 let sessionItems: Map<string, ConversationItem[]>;
-let sessionPendingElicitations: Map<string, Array<Record<string, unknown>>>;
+let sessionPendingElicitations: Map<string, Record<string, unknown>[]>;
 let sessionPendingInputs: Map<
   string,
-  Array<{ pending_id: string; content: unknown[]; created_by?: string }>
+  { pending_id: string; content: unknown[]; created_by?: string }[]
 >;
 // Per-session cost-control switch the snapshot/PATCH handlers serve;
 // absent key = unset (the wire field comes back null).
 let sessionCostControlOverrides: Map<string, "on" | "off">;
+let sessionSubagentRoutingOverrides: Map<string, "on" | "off">;
 // Per-session labels the snapshot/PATCH handlers serve.
 let sessionLabels: Map<string, Record<string, string>>;
 
@@ -265,6 +257,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       ? (JSON.parse(init.body as string) as {
           runner_id?: string;
           cost_control_mode_override?: "on" | "off" | null;
+          subagent_routing_override?: "on" | "off" | null;
           collaboration_mode?: string;
         })
       : {};
@@ -276,6 +269,13 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
         sessionCostControlOverrides.delete(sessionId);
       } else {
         sessionCostControlOverrides.set(sessionId, body.cost_control_mode_override);
+      }
+    }
+    if ("subagent_routing_override" in body) {
+      if (body.subagent_routing_override == null) {
+        sessionSubagentRoutingOverrides.delete(sessionId);
+      } else {
+        sessionSubagentRoutingOverrides.set(sessionId, body.subagent_routing_override);
       }
     }
     if ("collaboration_mode" in body && typeof body.collaboration_mode === "string") {
@@ -291,6 +291,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       items: sessionSnapshots.get(sessionId) ?? [],
       labels,
       cost_control_mode_override: sessionCostControlOverrides.get(sessionId) ?? null,
+      subagent_routing_override: sessionSubagentRoutingOverrides.get(sessionId) ?? null,
     });
   }
   if (snapshotMatch && (init?.method ?? "GET") === "GET") {
@@ -305,6 +306,7 @@ function defaultFetchHandler(input: RequestInfo | URL, init?: RequestInit): Resp
       pending_elicitations: sessionPendingElicitations.get(sessionId) ?? [],
       pending_inputs: sessionPendingInputs.get(sessionId) ?? [],
       cost_control_mode_override: sessionCostControlOverrides.get(sessionId) ?? null,
+      subagent_routing_override: sessionSubagentRoutingOverrides.get(sessionId) ?? null,
     });
   }
   if (url === "/v1/sessions" && init?.method === "POST") {
@@ -364,6 +366,7 @@ beforeEach(() => {
   sessionPendingElicitations = new Map();
   sessionPendingInputs = new Map();
   sessionCostControlOverrides = new Map();
+  sessionSubagentRoutingOverrides = new Map();
   sessionLabels = new Map();
   initChatStore(client);
   useChatStore.setState({
@@ -382,6 +385,7 @@ beforeEach(() => {
     loadingConversation: false,
     conversationLoadError: null,
     costControlModeOverride: null,
+    subagentRoutingOverride: null,
     codexPlanMode: false,
     abortController: null,
     // Restore the real send action; a prior test may have stubbed it.
@@ -402,7 +406,10 @@ afterEach(() => {
 });
 
 /** Yield to the microtask queue so background pump kicks off. */
-const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+const tick = () =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, 0);
+  });
 
 /** Seed the session snapshot returned by GET /v1/sessions/{id}. */
 function seedSession(id: string, items: ConversationItem[] = []): void {
@@ -418,13 +425,13 @@ function seedSessionItems(id: string, items: ConversationItem[] = []): void {
   sessionItems.set(id, items);
 }
 
-function seedPendingElicitations(id: string, events: Array<Record<string, unknown>>): void {
+function seedPendingElicitations(id: string, events: Record<string, unknown>[]): void {
   sessionPendingElicitations.set(id, events);
 }
 
 function seedPendingInputs(
   id: string,
-  inputs: Array<{ pending_id: string; content: unknown[]; created_by?: string }>,
+  inputs: { pending_id: string; content: unknown[]; created_by?: string }[],
 ): void {
   sessionPendingInputs.set(id, inputs);
 }
@@ -1150,9 +1157,9 @@ describe("chatStore — switchTo", () => {
 
     await Promise.race([
       useChatStore.getState().switchTo("conv_waiting"),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("switchTo timed out waiting for stalled stream")), 200),
-      ),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error("switchTo timed out waiting for stalled stream")), 200);
+      }),
     ]);
 
     const elicitation = useChatStore
@@ -1165,22 +1172,22 @@ describe("chatStore — switchTo", () => {
     expect(elicitation?.message).toBe("Approve stalled stream command?");
   });
 
-  it("hydrates only the most recent page and flags that older history remains", async () => {
-    // More than two pages so the loaded window is a strict subset.
-    const total = SESSION_HISTORY_PAGE_SIZE * 2 + 5;
+  it("hydrates only the initial window and flags that older history remains", async () => {
+    // Longer than the initial window so the loaded window is a strict subset.
+    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE + 5;
     const fullItems = Array.from({ length: total }, (_, idx) =>
       userMessage(`resp_${idx.toString().padStart(4, "0")}`, `message ${idx}`),
     );
-    seedSessionSnapshot("conv_big", fullItems.slice(-SESSION_HISTORY_PAGE_SIZE));
+    seedSessionSnapshot("conv_big", fullItems.slice(-INITIAL_WINDOW_ITEMS));
     seedSessionItems("conv_big", fullItems);
 
     await useChatStore.getState().switchTo("conv_big");
 
     const state = useChatStore.getState();
-    // Only the newest page is hydrated. If bind regressed to loading the
-    // whole transcript this would be `total` (205) — the slow-open bug
-    // this windowing fixes.
-    expect(state.blocks).toHaveLength(SESSION_HISTORY_PAGE_SIZE);
+    // Only the initial window is hydrated. If bind regressed to loading the
+    // whole transcript this would be `total` — the slow-open bug this
+    // windowing fixes.
+    expect(state.blocks).toHaveLength(INITIAL_WINDOW_ITEMS);
     // Newest item is the last block: proves we fetched the tail
     // (order=desc) and reversed to chronological, not the convo head.
     expect(state.blocks.at(-1)).toMatchObject({
@@ -1190,8 +1197,8 @@ describe("chatStore — switchTo", () => {
     // Older items remain, so scroll-up loading is armed. `false` here
     // would strand the user with no way to reach earlier turns.
     expect(state.hasMoreHistory).toBe(true);
-    // One descending page request on bind — not the sequential per-page
-    // walk the old full-transcript hydration did.
+    // Exactly ONE request on bind. More than one means the open resumed
+    // fetching history the reader never asked for.
     const itemFetches = fetchMock.mock.calls.filter(([u]) =>
       String(u).startsWith("/v1/sessions/conv_big/items"),
     );
@@ -1200,41 +1207,41 @@ describe("chatStore — switchTo", () => {
   });
 
   it("loadMoreHistory prepends the page of items immediately older than the window", async () => {
-    const total = SESSION_HISTORY_PAGE_SIZE * 2 + 5;
+    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE + 5;
     const fullItems = Array.from({ length: total }, (_, idx) =>
       userMessage(`resp_${idx.toString().padStart(4, "0")}`, `message ${idx}`),
     );
-    seedSessionSnapshot("conv_big", fullItems.slice(-SESSION_HISTORY_PAGE_SIZE));
+    seedSessionSnapshot("conv_big", fullItems.slice(-INITIAL_WINDOW_ITEMS));
     seedSessionItems("conv_big", fullItems);
 
     await useChatStore.getState().switchTo("conv_big");
-    // Precondition: bind loaded exactly the newest page.
-    expect(useChatStore.getState().blocks).toHaveLength(SESSION_HISTORY_PAGE_SIZE);
+    // Precondition: bind loaded exactly the initial window.
+    expect(useChatStore.getState().blocks).toHaveLength(INITIAL_WINDOW_ITEMS);
 
     await useChatStore.getState().loadMoreHistory();
 
     const state = useChatStore.getState();
-    // Two pages now loaded (initial + one older page). A wrong older-page
-    // cursor — e.g. the pre-fix bug that fetched the convo head — would
-    // yield the wrong count or duplicate blocks.
-    expect(state.blocks).toHaveLength(SESSION_HISTORY_PAGE_SIZE * 2);
-    // The older page sits before the original, oldest item first. Its
-    // first block is index `total - 2*PAGE` (= 5): proves the prepend
-    // order and the descending+after cursor math are correct.
+    // Window + one older page. A wrong older-page cursor — e.g. the pre-fix
+    // bug that fetched the convo head — would yield the wrong count or
+    // duplicate blocks.
+    expect(state.blocks).toHaveLength(INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE);
+    // The older page sits before the original, oldest item first. Its first
+    // block is index `total - WINDOW - PAGE` (= 5): proves the prepend order
+    // and the descending+after cursor math are correct.
     expect(state.blocks[0]).toMatchObject({
       type: "user_message",
       ctx: {
-        itemId: `msg_resp_${(total - 2 * SESSION_HISTORY_PAGE_SIZE)
+        itemId: `msg_resp_${(total - INITIAL_WINDOW_ITEMS - SESSION_HISTORY_PAGE_SIZE)
           .toString()
           .padStart(4, "0")}_user`,
       },
     });
-    // 5 still-older items (total - 2*PAGE) remain, so more is flagged.
+    // 5 still-older items remain, so more is flagged.
     expect(state.hasMoreHistory).toBe(true);
   });
 
   it("drops a stale loadMoreHistory page that resolves after navigating away and back", async () => {
-    const total = SESSION_HISTORY_PAGE_SIZE * 2;
+    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE;
     const itemsA = Array.from({ length: total }, (_, idx) =>
       userMessage(`a_${idx.toString().padStart(4, "0")}`, `a ${idx}`),
     );
@@ -1243,7 +1250,7 @@ describe("chatStore — switchTo", () => {
 
     await useChatStore.getState().switchTo("conv_a");
     const windowIds = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
-    expect(windowIds).toHaveLength(SESSION_HISTORY_PAGE_SIZE);
+    expect(windowIds).toHaveLength(INITIAL_WINDOW_ITEMS);
 
     // Defer ONLY the first scroll-up page (the `after=` cursor fetch);
     // binds use cursorless initial-window fetches and stay live.
@@ -1269,7 +1276,7 @@ describe("chatStore — switchTo", () => {
     // round trip passed the conversation-id guard, so only the generation
     // check stops it from prepending below the fresh hydration merge.
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(windowIds);
-    expect(state.oldestItemId).toBe(itemsA.at(-SESSION_HISTORY_PAGE_SIZE)!.id);
+    expect(state.oldestItemId).toBe(itemsA.at(-INITIAL_WINDOW_ITEMS)!.id);
     expect(state.hasMoreHistory).toBe(true);
     expect(state.loadingMoreHistory).toBe(false);
 
@@ -1282,7 +1289,7 @@ describe("chatStore — switchTo", () => {
   });
 
   it("loadMoreHistory dedupes a page overlapping blocks kept across a rebind", async () => {
-    const total = SESSION_HISTORY_PAGE_SIZE * 3;
+    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE * 2;
     const items = Array.from({ length: total }, (_, idx) =>
       userMessage(`r_${idx.toString().padStart(4, "0")}`, `r ${idx}`),
     );
@@ -1290,14 +1297,16 @@ describe("chatStore — switchTo", () => {
 
     await useChatStore.getState().switchTo("conv_re");
     await useChatStore.getState().loadMoreHistory();
-    expect(useChatStore.getState().blocks).toHaveLength(2 * SESSION_HISTORY_PAGE_SIZE);
+    expect(useChatStore.getState().blocks).toHaveLength(
+      INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE,
+    );
 
     // The stream died (idle disconnect): the send-triggered rebind
     // re-hydrates the newest window, resetting the cursor to its top while
     // the scrolled-up blocks stay rendered.
     useChatStore.setState({ abortController: null });
     await useChatStore.getState().send("hello again", "agent_xyz");
-    expect(useChatStore.getState().oldestItemId).toBe(items.at(-SESSION_HISTORY_PAGE_SIZE)!.id);
+    expect(useChatStore.getState().oldestItemId).toBe(items.at(-INITIAL_WINDOW_ITEMS)!.id);
 
     // This page (older than the rewound cursor) fully overlaps the blocks
     // kept across the rebind — without itemId dedupe each would render twice.
@@ -1314,7 +1323,7 @@ describe("chatStore — switchTo", () => {
   });
 
   it("clears loadingMoreHistory when a rebind hydration voids the in-flight page", async () => {
-    const total = SESSION_HISTORY_PAGE_SIZE * 2;
+    const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE;
     const items = Array.from({ length: total }, (_, idx) =>
       userMessage(`lh_${idx.toString().padStart(4, "0")}`, `lh ${idx}`),
     );
@@ -1356,207 +1365,6 @@ describe("chatStore — switchTo", () => {
       ...items.slice(0, SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
       ...windowIds,
     ]);
-  });
-
-  it("loadHistoryUntilUserMessages pages older history until the target user count", async () => {
-    // Dense turns: each turn is one user message followed by several
-    // non-user items (assistant + tool call), so a page spans many items per
-    // user prompt — the case the eager loader's large page size targets.
-    // 15 turns × 3 items = 45 items, comfortably past the initial window so
-    // the eager loader genuinely pages older history rather than no-opping.
-    const TURNS = 15;
-    const items: ConversationItem[] = [];
-    for (let t = 0; t < TURNS; t++) {
-      const rid = `t_${t.toString().padStart(3, "0")}`;
-      items.push(userMessage(rid, `prompt ${t}`));
-      items.push(nativeToolItem(rid));
-      items.push(assistantMessage(rid, `reply ${t}`));
-    }
-    seedSessionSnapshot("conv_dense", items.slice(-SESSION_HISTORY_PAGE_SIZE));
-    seedSessionItems("conv_dense", items);
-
-    await useChatStore.getState().switchTo("conv_dense");
-    // The initial window holds only the newest slice of items, so far fewer
-    // than TURNS user prompts are loaded — the stub the eager loader fills in.
-    const initialUsers = useChatStore
-      .getState()
-      .blocks.filter((b) => b.type === "user_message").length;
-    expect(initialUsers).toBeLessThan(TURNS);
-
-    await useChatStore.getState().loadHistoryUntilUserMessages(TURNS);
-
-    const state = useChatStore.getState();
-    // Reached (at least) the requested user count and ran history dry.
-    expect(state.blocks.filter((b) => b.type === "user_message")).toHaveLength(TURNS);
-    expect(state.hasMoreHistory).toBe(false);
-    expect(state.loadingMoreHistory).toBe(false);
-  });
-
-  it("loadHistoryUntilUserMessages keeps items in chronological order", async () => {
-    // Regression: the eager loader used to prepend each fetched block
-    // one-by-one, which reversed every page's internal order and scrambled
-    // the transcript (a mid-conversation prompt would surface at the top).
-    // Dense turns force multi-item pages so any per-page reversal shows up.
-    // 15 turns × 3 items is well past the initial window, so the eager loader
-    // pages a real multi-item older window (where the reversal manifested).
-    const TURNS = 15;
-    const items: ConversationItem[] = [];
-    for (let t = 0; t < TURNS; t++) {
-      const rid = `o_${t.toString().padStart(3, "0")}`;
-      items.push(userMessage(rid, `prompt ${t}`));
-      items.push(nativeToolItem(rid));
-      items.push(assistantMessage(rid, `reply ${t}`));
-    }
-    seedSessionSnapshot("conv_order", items.slice(-SESSION_HISTORY_PAGE_SIZE));
-    seedSessionItems("conv_order", items);
-
-    await useChatStore.getState().switchTo("conv_order");
-    await useChatStore.getState().loadHistoryUntilUserMessages(TURNS);
-
-    // The loaded blocks must match the seeded chronological order exactly.
-    const loadedIds = useChatStore
-      .getState()
-      .blocks.map((b) => b.ctx.itemId)
-      .filter((iid): iid is string => Boolean(iid));
-    expect(loadedIds).toEqual(items.map((item) => item.id));
-    // And user prompts read oldest-first (prompt 0 before prompt 1 …).
-    const userIds = useChatStore
-      .getState()
-      .blocks.filter((b): b is UserMessageBlock => b.type === "user_message")
-      .map((b) => b.ctx.itemId);
-    const seededUserIds = items
-      .filter((item) => item.type === "message" && item.role === "user")
-      .map((item) => item.id);
-    expect(userIds).toEqual(seededUserIds);
-  });
-
-  it("loadHistoryUntilUserMessages no-ops when the target is already met", async () => {
-    const items = Array.from({ length: SESSION_HISTORY_PAGE_SIZE }, (_, idx) =>
-      userMessage(`m_${idx.toString().padStart(3, "0")}`, `m ${idx}`),
-    );
-    seedSession("conv_met", items);
-
-    await useChatStore.getState().switchTo("conv_met");
-    const before = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
-    const itemFetchesBefore = fetchMock.mock.calls.filter(([u]) =>
-      String(u).startsWith("/v1/sessions/conv_met/items"),
-    ).length;
-
-    // The window already holds SESSION_HISTORY_PAGE_SIZE user prompts, so a
-    // smaller target must not fetch or mutate anything.
-    await useChatStore.getState().loadHistoryUntilUserMessages(2);
-
-    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(before);
-    const itemFetchesAfter = fetchMock.mock.calls.filter(([u]) =>
-      String(u).startsWith("/v1/sessions/conv_met/items"),
-    ).length;
-    expect(itemFetchesAfter).toBe(itemFetchesBefore);
-  });
-
-  it("loadHistoryUntilUserMessages disables further history on fetch failure", async () => {
-    // The rail's eager-load effect auto-fires this with no user gesture, so a
-    // persistent fetch failure that left hasMoreHistory true would re-arm the
-    // effect and hammer the failing endpoint in a tight loop. On error we
-    // commit progress AND clear hasMoreHistory to break that loop.
-    const TURNS = 15;
-    const items: ConversationItem[] = [];
-    for (let t = 0; t < TURNS; t++) {
-      const rid = `f_${t.toString().padStart(3, "0")}`;
-      items.push(userMessage(rid, `prompt ${t}`));
-      items.push(assistantMessage(rid, `reply ${t}`));
-    }
-    seedSessionSnapshot("conv_fail", items.slice(-SESSION_HISTORY_PAGE_SIZE));
-    seedSessionItems("conv_fail", items);
-
-    await useChatStore.getState().switchTo("conv_fail");
-    expect(useChatStore.getState().hasMoreHistory).toBe(true);
-
-    // Fail every older-history page fetch (the `olderThan=` cursor read).
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/conv_fail\/items\?.*olderThan=/.test(url)) {
-        return Promise.reject(new Error("boom"));
-      }
-      return defaultFetchHandler(input, init);
-    });
-
-    await useChatStore.getState().loadHistoryUntilUserMessages(TURNS);
-
-    const state = useChatStore.getState();
-    // hasMoreHistory is cleared so the auto-firing effect can't re-loop.
-    expect(state.hasMoreHistory).toBe(false);
-    expect(state.loadingMoreHistory).toBe(false);
-  });
-
-  it("loadHistoryUntilUserMessages ignores [System: …] markers when counting turns", async () => {
-    // The rail derives ticks from REAL user turns only (system markers are
-    // dropped), so the loader must count the same way. If it counted markers,
-    // it could early-return at the target while the rail has too few ticks —
-    // and, since the early-return leaves hasMoreHistory set, wedge the rail
-    // permanently hidden. Here every turn carries a [System: …] marker: with
-    // 15 real turns the loader must page ALL of them (running history dry)
-    // rather than stopping early on the inflated user-block count.
-    const TARGET = 10;
-    const TURNS = 15;
-    const items: ConversationItem[] = [];
-    for (let t = 0; t < TURNS; t++) {
-      const rid = `s_${t.toString().padStart(3, "0")}`;
-      items.push(userMessage(rid, `prompt ${t}`));
-      items.push(systemMarker(rid)); // a user-role block that is NOT a real turn
-      items.push(assistantMessage(rid, `reply ${t}`));
-    }
-    seedSessionSnapshot("conv_sys", items.slice(-SESSION_HISTORY_PAGE_SIZE));
-    seedSessionItems("conv_sys", items);
-
-    await useChatStore.getState().switchTo("conv_sys");
-    await useChatStore.getState().loadHistoryUntilUserMessages(TARGET);
-
-    const state = useChatStore.getState();
-    // Real user turns actually loaded — the count that feeds the rail.
-    const blockText = (b: (typeof state.blocks)[number]): string =>
-      b.type === "user_message"
-        ? b.content
-            .filter((c): c is { type: "input_text"; text: string } => c.type === "input_text")
-            .map((c) => c.text)
-            .join("")
-        : "";
-    const realTurns = state.blocks.filter(
-      (b) => b.type === "user_message" && !/^\[System: /.test(blockText(b)),
-    ).length;
-    expect(realTurns).toBeGreaterThanOrEqual(TARGET);
-    // hasMoreHistory settles false only because we counted real turns, not the
-    // (larger) raw user-block count — proving the loader didn't stop early.
-    expect(state.loadingMoreHistory).toBe(false);
-  });
-
-  it("loadHistoryUntilUserMessages assembles turns across multiple pages in order", async () => {
-    // EAGER_PAGE_LIMIT is 200, so to actually exercise the cross-page
-    // `older.unshift(...)` assembly (and the MAX_EAGER_PAGES loop) we need more
-    // than 200 items. 120 turns × 2 items = 240 items > one page.
-    const TURNS = 120;
-    const items: ConversationItem[] = [];
-    for (let t = 0; t < TURNS; t++) {
-      const rid = `p_${t.toString().padStart(3, "0")}`;
-      items.push(userMessage(rid, `prompt ${t}`));
-      items.push(assistantMessage(rid, `reply ${t}`));
-    }
-    seedSessionSnapshot("conv_multi", items.slice(-SESSION_HISTORY_PAGE_SIZE));
-    seedSessionItems("conv_multi", items);
-
-    await useChatStore.getState().switchTo("conv_multi");
-    // Target more turns than fit in a single 200-item page, forcing ≥2 pages.
-    await useChatStore.getState().loadHistoryUntilUserMessages(110);
-
-    // Whatever loaded must be a contiguous chronological suffix of the seed —
-    // any per-page reversal or misordered cross-page splice would break this.
-    const loadedIds = useChatStore
-      .getState()
-      .blocks.map((b) => b.ctx.itemId)
-      .filter((iid): iid is string => Boolean(iid));
-    const seededIds = items.map((item) => item.id);
-    const suffix = seededIds.slice(seededIds.length - loadedIds.length);
-    expect(loadedIds).toEqual(suffix);
-    expect(loadedIds.length).toBeGreaterThan(2 * SESSION_HISTORY_PAGE_SIZE);
   });
 
   it("does not run flat session items through the nested snapshot flattener", async () => {
@@ -1770,7 +1578,7 @@ describe("chatStore — send (first-send ordering)", () => {
     // Control /events resolution: each POST returns a deferred promise so the
     // test can hold the first one open and observe whether the next fires.
     const eventBodies: string[] = [];
-    const resolvers: Array<() => void> = [];
+    const resolvers: (() => void)[] = [];
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url === "/v1/sessions/conv_x/events" && init?.method === "POST") {
@@ -2495,15 +2303,16 @@ describe("chatStore — send while streaming (queueing)", () => {
       error: null,
     });
 
-    // Accepted trade-off: the server's deny short-circuit still publishes a
-    // session-level running→idle pair for the denied out-of-band input, and
-    // the client now trusts `session.status` 1:1 (the guard that used to
-    // suppress this stray idle was removed to fix the fresh-session
-    // "Working…" persists bug). So this idle DOES flip `sessionStatus` to
-    // idle mid-stream. The bubble lifecycle is unaffected — `status` /
-    // `activeResponse` still defer to the streaming turn's own response_end —
-    // and the next real status edge re-asserts running, so the effect is a
-    // brief indicator blip confined to the rare deny-while-streaming case.
+    // The server's deny short-circuit still publishes a session-level
+    // running→idle pair for the denied out-of-band input, and the client
+    // trusts `session.status` 1:1 — so this stray idle flips
+    // `sessionStatus` AND finalizes the streaming turn (a bare terminal
+    // edge is the NORMAL turn-end shape for id-less emitters like the
+    // PTY-activity relay, so it must settle the bubble; see the bare-idle
+    // tests below). The deny corner is healed by the live-delta revive:
+    // the still-streaming turn's next delta reopens it
+    // (reviveStrayCompletedResponse), so the misread is a brief flicker,
+    // not a mid-turn fold.
     handleSessionEvent({
       type: "session_status",
       conversationId: "conv_abc",
@@ -2511,12 +2320,199 @@ describe("chatStore — send while streaming (queueing)", () => {
     });
     const afterIdle = useChatStore.getState();
     expect(afterIdle.sessionStatus).toBe("idle");
-    expect(afterIdle.status).toBe("streaming");
+    expect(afterIdle.status).toBe("idle");
     expect(afterIdle.activeResponse).toEqual({
+      responseId: "resp_in_flight",
+      state: "completed",
+      error: null,
+      completedAt: expect.any(Number),
+    });
+
+    // The turn was actually still live — its next delta revives it, and
+    // the session's busy signal comes back with it: leaving
+    // sessionStatus "idle" let a mid-turn send bypass shouldQueueSend's
+    // queue gate. Local `status` stays "idle" — this client sent
+    // nothing, so no local send is in flight.
+    reviveStrayCompletedResponse(useChatStore.setState);
+    expect(useChatStore.getState().activeResponse).toEqual({
+      responseId: "resp_in_flight",
+      state: "streaming",
+      error: null,
+      completedAt: expect.any(Number),
+    });
+    expect(useChatStore.getState().sessionStatus).toBe("running");
+    expect(useChatStore.getState().status).toBe("idle");
+  });
+
+  it("finalizes a streaming turn on a bare idle edge (no response id)", () => {
+    // Most idle publishes carry no response_id (the PTY-activity relay,
+    // orchestration teardown). Leaving the turn "streaming" hid the
+    // settled turn's "Worked for" fold and Fork action until a reload.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_a", state: "streaming", error: null },
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "idle",
+    });
+    const state = useChatStore.getState();
+    expect(state.status).toBe("idle");
+    expect(state.activeResponse).toEqual({
+      responseId: "resp_a",
+      state: "completed",
+      error: null,
+      completedAt: expect.any(Number),
+    });
+  });
+
+  it("finalizes a streaming turn to failed on a bare failed edge", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_a", state: "streaming", error: null },
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "failed",
+    });
+    expect(useChatStore.getState().activeResponse?.state).toBe("failed");
+  });
+
+  it("preserves a cancelled turn across a bare idle edge", () => {
+    // The user's interrupt verdict must survive the trailing idle the
+    // teardown publishes — and the revive must never resurrect it.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "idle",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_a", state: "cancelled", error: null },
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "idle",
+    });
+    expect(useChatStore.getState().activeResponse?.state).toBe("cancelled");
+    reviveStrayCompletedResponse(useChatStore.setState);
+    expect(useChatStore.getState().activeResponse?.state).toBe("cancelled");
+  });
+
+  it("surfaces a failed send without settling the live turn", async () => {
+    // A send that fails while a turn is streaming used to roll its optimistic
+    // bubble back and stop there — no error block, no status change. That
+    // silence is why a message that never reaches the agent looks like it was
+    // never typed. The error must show; the live turn must not be touched.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_in_flight", state: "streaming", error: null },
+      blocks: [],
+      pendingUserMessages: [],
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_abc/events" && init?.method === "POST") {
+        return Promise.reject(new Error("network down"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("does this vanish?", "agent_xyz");
+
+    const state = useChatStore.getState();
+    const errorBlocks = state.blocks.filter((b) => b.type === "error");
+    expect(errorBlocks).toHaveLength(1);
+    expect(errorBlocks[0]).toMatchObject({ type: "error", message: "network down" });
+    // The optimistic bubble rolls back — no server record will reconcile it.
+    expect(state.pendingUserMessages).toHaveLength(0);
+    // The in-flight turn keeps its lifecycle: not failed, not settled.
+    expect(state.activeResponse).toEqual({
       responseId: "resp_in_flight",
       state: "streaming",
       error: null,
     });
+    expect(state.status).toBe("streaming");
+  });
+
+  it("revive is a no-op for failed and absent responses", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "idle",
+      activeResponse: { responseId: "resp_a", state: "failed", error: "boom" },
+    });
+    reviveStrayCompletedResponse(useChatStore.setState);
+    expect(useChatStore.getState().activeResponse?.state).toBe("failed");
+    expect(useChatStore.getState().sessionStatus).toBe("idle");
+
+    useChatStore.setState({ activeResponse: null });
+    reviveStrayCompletedResponse(useChatStore.setState);
+    expect(useChatStore.getState().activeResponse).toBeNull();
+    expect(useChatStore.getState().sessionStatus).toBe("idle");
+  });
+
+  it("gates the revive to a window after the finalize", () => {
+    // A scheduled wake's first deltas stream ahead of the batch that
+    // names the new turn; reviving the minutes-old finished turn
+    // popped its "Worked for" fold open at every /loop iteration. A
+    // finalize moments ago is a plausible stray idle and still revives.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "idle",
+      activeResponse: {
+        responseId: "resp_prev_iter",
+        state: "completed",
+        error: null,
+        completedAt: Date.now() - 60_000,
+      },
+    });
+    reviveStrayCompletedResponse(useChatStore.setState);
+    expect(useChatStore.getState().activeResponse?.state).toBe("completed");
+    expect(useChatStore.getState().sessionStatus).toBe("idle");
+
+    useChatStore.setState({
+      activeResponse: {
+        responseId: "resp_live",
+        state: "completed",
+        error: null,
+        completedAt: Date.now() - 1_000,
+      },
+    });
+    reviveStrayCompletedResponse(useChatStore.setState);
+    expect(useChatStore.getState().activeResponse?.state).toBe("streaming");
+    expect(useChatStore.getState().sessionStatus).toBe("running");
+  });
+
+  it("isStaleCompletedResponse: only an old finalize is stale", () => {
+    const base = { responseId: "r", error: null } as const;
+    expect(
+      isStaleCompletedResponse({
+        activeResponse: { ...base, state: "completed", completedAt: Date.now() - 60_000 },
+      }),
+    ).toBe(true);
+    expect(
+      isStaleCompletedResponse({
+        activeResponse: { ...base, state: "completed", completedAt: Date.now() - 1_000 },
+      }),
+    ).toBe(false);
+    // No stamp (legacy snapshot) and non-completed states are never stale.
+    expect(isStaleCompletedResponse({ activeResponse: { ...base, state: "completed" } })).toBe(
+      false,
+    );
+    expect(
+      isStaleCompletedResponse({
+        activeResponse: { ...base, state: "streaming", completedAt: Date.now() - 60_000 },
+      }),
+    ).toBe(false);
+    expect(isStaleCompletedResponse({ activeResponse: null })).toBe(false);
   });
 });
 
@@ -2901,6 +2897,72 @@ describe("chatStore — send (file attachments)", () => {
     ]);
   });
 
+  it("does not hand the upload to the interrupt marker that precedes it", async () => {
+    // Steering mid-tool-use makes Claude write its own "[Request interrupted
+    // by user...]" record BEFORE the steering message, and the forwarder
+    // mirrors both back as consumed events. The marker was never queued
+    // here, so the FIFO-head fallback must not pop the optimistic bubble for
+    // it — otherwise the marker renders as raw user text beside the
+    // screenshots and the real message lands as a blank bubble.
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/resources/files")) {
+        return mockResponse({
+          id: "file_real_shot",
+          name: "shot.png",
+          metadata: { filename: "shot.png", bytes: 10, created_at: 0 },
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const file = new File(["bytes"], "shot.png", { type: "image/png" });
+    await useChatStore.getState().send("", "agent_xyz", [file]);
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "msg_interrupt",
+      itemType: "message",
+      data: {
+        role: "user",
+        content: [{ type: "input_text", text: "[Request interrupted by user for tool use]" }],
+      },
+    });
+
+    // Marker committed bare, optimistic bubble untouched.
+    const afterMarker = useChatStore.getState();
+    expect(afterMarker.pendingUserMessages).toHaveLength(1);
+    const marker = afterMarker.blocks[0] as UserMessageBlock;
+    expect(marker.content).toEqual([
+      { type: "input_text", text: "[Request interrupted by user for tool use]" },
+    ]);
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "msg_steer",
+      itemType: "message",
+      data: {
+        role: "user",
+        content: [{ type: "input_text", text: "[Attached: /tmp/uploads/shot.png]" }],
+      },
+    });
+
+    // The upload landed on the message that actually queued it.
+    const state = useChatStore.getState();
+    expect(state.pendingUserMessages).toEqual([]);
+    const steered = state.blocks[1] as UserMessageBlock;
+    expect(steered.ctx.itemId).toBe("msg_steer");
+    expect(steered.content).toEqual([
+      { type: "input_image", file_id: "file_real_shot", filename: "shot.png" },
+      { type: "input_text", text: "[Attached: /tmp/uploads/shot.png]" },
+    ]);
+  });
+
   it("keeps the optimistic bubble's stable key on the native path (no pending_id adoption)", async () => {
     // The native POST returns a pending_id, but the optimistic bubble
     // must KEEP its client temp id as its React key — swapping to the
@@ -2999,6 +3061,45 @@ describe("chatStore — send (file attachments)", () => {
     failPost = false;
     await useChatStore.getState().send("look at this", "agent_xyz", [file]);
     expect(uploads).toBe(1);
+  });
+
+  it("hands the message back for retry when the upload is rejected", async () => {
+    // A 415 on an unsupported attachment must not swallow the typed text: the
+    // optimistic bubble rolls back, so `failedSendDraft` is the only thing
+    // left holding it. The banner carries the server's reason, not "415".
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/resources/files")) {
+        return mockResponse(
+          {
+            detail:
+              "Unsupported attachment type 'application/zip'. Only images, " +
+              "PDF, and text/code files can be attached.",
+          },
+          { ok: false, status: 415 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const zip = new File([new Uint8Array(4)], "photos.zip", { type: "application/zip" });
+    await useChatStore.getState().send("summarize these photos", "agent_xyz", [zip]);
+
+    const state = useChatStore.getState();
+    // Optimistic bubble rolled back — the send never reached the server.
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.failedSendDraft).toEqual({
+      conversationId: "conv_existing",
+      text: "summarize these photos",
+      files: [zip],
+    });
+    const error = state.blocks.at(-1) as { type: string; message: string };
+    expect(error.type).toBe("error");
+    expect(error.message).toContain("Unsupported attachment type 'application/zip'");
   });
 });
 
@@ -3272,7 +3373,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
-    it("idle settles sessionStatus but preserves a still-streaming bubble until response_end", () => {
+    it("idle settles sessionStatus AND finalizes a still-streaming bubble", () => {
       useChatStore.setState({
         status: "streaming",
         sessionStatus: "running",
@@ -3288,17 +3389,20 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       const state = useChatStore.getState();
       // sessionStatus tracks the server's session-level status 1:1 — a server
       // idle means idle, and the "Working…" indicator (which reads only
-      // sessionStatus) must turn off. The bubble lifecycle is separate: a real
-      // response bubble is still closed by response_end, not by the coarser
-      // session.status signal, so the local `status`/`activeResponse` stay
-      // streaming until response_end lands (dropping the guard that used to
-      // strand sessionStatus at "running" — the "Working…" persists bug).
+      // sessionStatus) must turn off. The bubble lifecycle settles on the
+      // same edge: a bare (id-less) idle is the NORMAL turn-end shape for
+      // the PTY-activity relay and orchestration teardown, and leaving the
+      // turn "streaming" hid its "Worked for" fold and Fork action until a
+      // reload. A stray idle for a turn that is actually still live (the
+      // policy-deny short-circuit) is healed by the live-delta revive —
+      // see reviveStrayCompletedResponse.
       expect(state.sessionStatus).toBe("idle");
-      expect(state.status).toBe("streaming");
+      expect(state.status).toBe("idle");
       expect(state.activeResponse).toEqual({
         responseId: "resp_live",
-        state: "streaming",
+        state: "completed",
         error: null,
+        completedAt: expect.any(Number),
       });
     });
 
@@ -3445,15 +3549,16 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(readConversationRows().find((c) => c.id === "conv_abc")?.status).toBe("idle");
     });
 
-    it("keeps the sidebar row 'running' while background shells outlive the turn", () => {
-      // The claude-native turn settles to idle while shells keep running; the
-      // sticky tally must keep the sidebar spinner lit (the grey RunningDot),
-      // matching the in-chat "N background tasks still running" indicator — not
-      // fall idle the way it did before this fix.
+    it("drops the sidebar row to 'idle' while background shells outlive the turn", () => {
+      // The claude-native turn settles to idle while shells keep running. The
+      // session takes a new message right away, so the row must NOT keep
+      // spinning — only the in-chat indicator reports the shells (via the
+      // tally, which stays put for it).
       seedConversationsCache([conv("conv_abc", "running")]);
       useChatStore.setState({ conversationId: "conv_abc", backgroundTaskCount: 1 });
       handleSessionEvent({ type: "session_status", conversationId: "conv_abc", status: "idle" });
-      expect(readConversationRows().find((c) => c.id === "conv_abc")?.status).toBe("running");
+      expect(readConversationRows().find((c) => c.id === "conv_abc")?.status).toBe("idle");
+      expect(useChatStore.getState().backgroundTaskCount).toBe(1);
     });
 
     it("drops the sidebar row to 'idle' once the last background shell finishes", () => {
@@ -3789,7 +3894,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
      */
     function seedSnapshotSkills(
       seedId: string,
-      skills: Array<{ name: string; description: string }>,
+      skills: { name: string; description: string }[],
     ): void {
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
@@ -4507,6 +4612,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         responseId: "resp_1",
         state: "cancelled",
         error: null,
+        completedAt: expect.any(Number),
       });
     });
 
@@ -5358,7 +5464,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     model_override?: string | null;
     cost_control_mode_override?: "on" | "off" | null;
     parent_session_id?: string | null;
-    model_options?: Array<Record<string, unknown>>;
+    model_options?: Record<string, unknown>[];
   }
 
   /** Override the snapshot GET so a test can inject labels + overrides. */
@@ -5385,7 +5491,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     });
   }
 
-  function patchCallsFor(id: string): Array<Record<string, unknown>> {
+  function patchCallsFor(id: string): Record<string, unknown>[] {
     return fetchMock.mock.calls
       .filter(([u, init]) => {
         const url = typeof u === "string" ? u : u.toString();
@@ -6952,9 +7058,11 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
   /** Drain reconcile's sequential await chain under fake timers. */
   async function drainAsync(turns = 25): Promise<void> {
+    /* oxlint-disable no-await-in-loop */
     for (let i = 0; i < turns; i += 1) {
       await vi.advanceTimersByTimeAsync(1);
     }
+    /* oxlint-enable no-await-in-loop */
   }
 
   function gapUser(prefix: string, idx: number): ConversationItem {
@@ -7033,19 +7141,22 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(sinks).toHaveLength(2);
 
     const state = useChatStore.getState();
-    // The window was replaced wholesale with the newest page, exactly as a
-    // cold bind would load it — not left with a mid-transcript hole.
+    // The window was replaced wholesale with one fresh window fetch, exactly
+    // as a cold bind loads it — not left with a mid-transcript hole, and not
+    // paged in over several requests (which would shift the transcript under
+    // a reader who never asked for this).
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      gap.slice(-INITIAL_WINDOW_ITEMS).map((item) => item.id),
     );
     // The cursor was rewound to the fresh window's top, so everything older
-    // (the rest of the gap included) is reachable again by paging up.
-    expect(state.oldestItemId).toBe(gap.at(-SESSION_HISTORY_PAGE_SIZE)!.id);
+    // (the pre-gap transcript included) is reachable again by paging up.
+    expect(state.oldestItemId).toBe(gap.at(-INITIAL_WINDOW_ITEMS)!.id);
     expect(state.hasMoreHistory).toBe(true);
 
+    // Scroll-up still pages from the window's top, one page at a time.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      [...preGap.slice(-SESSION_HISTORY_PAGE_SIZE), ...gap].map((item) => item.id),
     );
 
     const last = sinks[1]!;
@@ -7150,7 +7261,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(releaseBackfill).not.toBeNull();
 
     // The user leaves and comes back: the revisit hydrates a FRESH window
-    // (the newest 20 gap items) and then scrolls one page up.
+    // (the newest INITIAL_WINDOW_ITEMS, i.e. every gap item) and then
+    // scrolls one page up.
     const away = useChatStore.getState().switchTo("conv_other");
     await drainAsync(5);
     await away;
@@ -7160,7 +7272,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await useChatStore.getState().loadMoreHistory();
     const fresh = useChatStore.getState();
     expect(fresh.blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      [...preGap.slice(-SESSION_HISTORY_PAGE_SIZE), ...gap].map((item) => item.id),
     );
 
     // The stale page resolves: the conversation id matches again, so only
@@ -7173,17 +7285,17 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // re-hydrate fallback, which rewound the scroll-up cursor to the
     // window top and bumped the generation (voiding future legit pages).
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-2 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      [...preGap.slice(-SESSION_HISTORY_PAGE_SIZE), ...gap].map((item) => item.id),
     );
-    expect(state.oldestItemId).toBe(gap.at(-2 * SESSION_HISTORY_PAGE_SIZE)!.id);
+    expect(state.oldestItemId).toBe(preGap.at(-SESSION_HISTORY_PAGE_SIZE)!.id);
     expect(state.historyGeneration).toBe(fresh.historyGeneration);
 
     // The new window still pages older from where it left off: pre-fix the
     // rewound cursor re-fetched the already-rendered page (all dupes) and
-    // this would still show only 40 items.
+    // the transcript would not have grown.
     await useChatStore.getState().loadMoreHistory();
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
-      gap.slice(-3 * SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      [...preGap, ...gap].map((item) => item.id),
     );
 
     // Unpark the orphaned pump so the awaited loop can exit.
@@ -7261,7 +7373,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // The fresh fetch returns ITEMS only — dropping these blocks would lose
     // the pending ApprovalCard (and the failure reason) with no way back.
     expect(state.blocks.map((b) => b.ctx.itemId ?? b.type)).toEqual([
-      ...gap.slice(-SESSION_HISTORY_PAGE_SIZE).map((item) => item.id),
+      ...gap.slice(-INITIAL_WINDOW_ITEMS).map((item) => item.id),
       "elicitation",
       "error",
     ]);
@@ -7284,7 +7396,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   }
 
   /** The `live:<messageId>` provisional preview blocks currently rendered. */
-  function livePreviews(): Array<Extract<AnyBlock, { type: "text_done" }>> {
+  function livePreviews(): Extract<AnyBlock, { type: "text_done" }>[] {
     return useChatStore
       .getState()
       .blocks.filter(
@@ -7534,6 +7646,54 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     controller.abort();
   });
 
+  it("gives the provisional the LIVE TURN's response id so it shares that bubble", async () => {
+    // `walkBubbles` groups by response id, so a synthetic preview id split
+    // one native turn into several fragment bubbles while streaming that
+    // merged back into one on reload — the turn rendered differently live
+    // vs. reloaded, and the shifting fragment boundaries made the "Worked
+    // for" fold flicker on codex. The preview must join the live turn.
+    useChatStore.setState({
+      conversationId: "conv_live_rid",
+      blocks: [],
+      isNativeTerminalSession: true,
+      activeResponse: { responseId: "codex_turn_1", state: "streaming", error: null },
+    });
+    const { sink, controller } = startPump("conv_live_rid");
+
+    sink.push(nativeDelta("m1", 0, "Checking the CLI", true));
+    await tick();
+
+    const prov = provisional();
+    expect(prov?.ctx.itemId).toBe("live:m1");
+    expect(prov?.ctx.responseId).toBe("codex_turn_1");
+
+    controller.abort();
+  });
+
+  it("keeps the synthetic response id when no turn is tracked", async () => {
+    // A preview that lands before any turn id is known keeps its own id, so
+    // it can't be grouped into an unrelated bubble. (A `completed` turn does
+    // NOT hit this path: a live delta proves that turn is still running, so
+    // `reviveStrayCompletedResponse` reopens it first and the preview
+    // correctly joins it.)
+    useChatStore.setState({
+      conversationId: "conv_live_norid",
+      blocks: [],
+      isNativeTerminalSession: true,
+      activeResponse: null,
+    });
+    const { sink, controller } = startPump("conv_live_norid");
+
+    sink.push(nativeDelta("m9", 0, "early chunk", true));
+    await tick();
+
+    const prov = provisional();
+    expect(prov?.ctx.itemId).toBe("live:m9");
+    expect(prov?.ctx.responseId).toBe("live:m9");
+
+    controller.abort();
+  });
+
   it("replaces the provisional in place with the authoritative item", async () => {
     useChatStore.setState({
       conversationId: "conv_live2",
@@ -7662,6 +7822,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
       responseId: "codex_turn_123",
       state: "cancelled",
       error: null,
+      completedAt: expect.any(Number),
     });
     expect(state.interruptedResponseIds).toEqual(["codex_turn_123"]);
     useChatStore.setState({ activeResponse: null });
@@ -7982,6 +8143,141 @@ describe("chatStore — setCostControlMode", () => {
   });
 });
 
+describe("chatStore — setSubagentRouting", () => {
+  /** The session PATCHes issued against `sessionId`, newest last. */
+  function patchBodies(sessionId: string): unknown[] {
+    return fetchMock.mock.calls
+      .filter(([u, init]) => {
+        const url = typeof u === "string" ? u : (u as URL | Request).toString();
+        return (
+          url === `/v1/sessions/${sessionId}` &&
+          (init as RequestInit | undefined)?.method === "PATCH"
+        );
+      })
+      .map(([, init]) => JSON.parse((init as RequestInit).body as string));
+  }
+
+  it("optimistically writes, PATCHes the wire field, and keeps the server's value", async () => {
+    seedSession("conv_sr", []);
+    await useChatStore.getState().switchTo("conv_sr");
+    // Fresh session: unset, which reads as Default (sub-agents unrouted).
+    expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
+
+    const settled = useChatStore.getState().setSubagentRouting("on");
+    expect(useChatStore.getState().subagentRoutingOverride).toBe("on");
+    await settled;
+
+    expect(patchBodies("conv_sr")).toEqual([{ subagent_routing_override: "on" }]);
+    expect(useChatStore.getState().subagentRoutingOverride).toBe("on");
+  });
+
+  it("never touches the session's own model or cost switch", async () => {
+    // This knob governs the sub-agents' models, so it must not drag the
+    // parent's `model_override` / routing switch along the way.
+    seedSession("conv_sr2", []);
+    await useChatStore.getState().switchTo("conv_sr2");
+    useChatStore.setState({ sessionModelOverride: "claude-opus-4-7" });
+
+    await useChatStore.getState().setSubagentRouting("on");
+
+    expect(patchBodies("conv_sr2")).toEqual([{ subagent_routing_override: "on" }]);
+    expect(useChatStore.getState().sessionModelOverride).toBe("claude-opus-4-7");
+    expect(useChatStore.getState().costControlModeOverride).toBeNull();
+  });
+
+  it("rolls back the optimistic write when the PATCH fails", async () => {
+    seedSession("conv_sr3", []);
+    await useChatStore.getState().switchTo("conv_sr3");
+
+    fetchMock.mockImplementationOnce((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_sr3" && init?.method === "PATCH") {
+        return mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await expect(useChatStore.getState().setSubagentRouting("on")).rejects.toThrow();
+    // Back to unset: the row must not claim a state the server never persisted.
+    expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
+  });
+
+  it("hydrates from the session snapshot on bind and resets on switch-away", async () => {
+    seedSession("conv_sr4", []);
+    seedSession("conv_sr5", []);
+    sessionSubagentRoutingOverrides.set("conv_sr4", "off");
+
+    await useChatStore.getState().switchTo("conv_sr4");
+    expect(useChatStore.getState().subagentRoutingOverride).toBe("off");
+
+    await useChatStore.getState().switchTo("conv_sr5");
+    // Session-scoped: a session with no override reads back as unset.
+    expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
+  });
+
+  it("no-ops without an active conversation", async () => {
+    useChatStore.setState({ conversationId: null });
+    await useChatStore.getState().setSubagentRouting("on");
+    const patches = fetchMock.mock.calls.filter(
+      ([, init]) => (init as RequestInit | undefined)?.method === "PATCH",
+    );
+    expect(patches).toHaveLength(0);
+  });
+});
+
+// Nothing pushes a routing-switch change to the client, so a control that only
+// ever read the bind-time snapshot would keep showing a stale value (the
+// "Default shown while 'on' is stored" mismatch). These pin the re-read.
+describe("chatStore — refreshSessionOverrides", () => {
+  it("re-reads both routing switches from the server", async () => {
+    seedSession("conv_ro", []);
+    await useChatStore.getState().switchTo("conv_ro");
+    expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
+    expect(useChatStore.getState().costControlModeOverride).toBeNull();
+
+    // Changed out of band (another tab / the CLI), so the store is now stale.
+    sessionSubagentRoutingOverrides.set("conv_ro", "on");
+    sessionCostControlOverrides.set("conv_ro", "on");
+    await useChatStore.getState().refreshSessionOverrides();
+
+    expect(useChatStore.getState().subagentRoutingOverride).toBe("on");
+    expect(useChatStore.getState().costControlModeOverride).toBe("on");
+  });
+
+  it("reads a cleared override back as inherit", async () => {
+    seedSession("conv_ro2", []);
+    sessionSubagentRoutingOverrides.set("conv_ro2", "off");
+    await useChatStore.getState().switchTo("conv_ro2");
+    expect(useChatStore.getState().subagentRoutingOverride).toBe("off");
+
+    sessionSubagentRoutingOverrides.delete("conv_ro2");
+    await useChatStore.getState().refreshSessionOverrides();
+
+    expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
+  });
+
+  it("keeps the current values when the snapshot fetch fails", async () => {
+    seedSession("conv_ro3", []);
+    sessionSubagentRoutingOverrides.set("conv_ro3", "on");
+    await useChatStore.getState().switchTo("conv_ro3");
+
+    fetchMock.mockImplementationOnce(() =>
+      mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 }),
+    );
+    await useChatStore.getState().refreshSessionOverrides();
+
+    // A blip must not read as "no override" — that would silently flip the
+    // row to Inherit and let a Save write it back.
+    expect(useChatStore.getState().subagentRoutingOverride).toBe("on");
+  });
+
+  it("no-ops without an active conversation", async () => {
+    useChatStore.setState({ conversationId: null });
+    await useChatStore.getState().refreshSessionOverrides();
+    expect(useChatStore.getState().subagentRoutingOverride).toBeNull();
+  });
+});
+
 // Elicitations are keyed by elicitationId, never itemId (they are not
 // persisted conversation items), so neither the reconnect item backfill
 // nor the itemId dedupe can see them. These tests cover the dedicated
@@ -8049,9 +8345,11 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
 
   /** Drain the pump + reconcile's sequential await chain under fake timers. */
   async function drainAsync(turns = 25): Promise<void> {
+    /* oxlint-disable no-await-in-loop */
     for (let i = 0; i < turns; i += 1) {
       await vi.advanceTimersByTimeAsync(1);
     }
+    /* oxlint-enable no-await-in-loop */
   }
 
   /** Open the stream-pump loop for `id` and drain until the first sink exists. */
@@ -8830,11 +9128,102 @@ describe("chatStore — client-side message queue", () => {
     expect(sendSpy).toHaveBeenCalledTimes(1);
     expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["stranded?", "agent_xyz"]);
   });
+
+  /**
+   * Drive a send whose POST never settles, leaving `status` latched to
+   * "streaming", then queue a message behind it.
+   *
+   * @param rowStatus - the session's status in the sidebar cache, i.e. the
+   *   server's own view of whether a turn is running.
+   * @returns the texts delivered to /events, appended to as the test advances.
+   */
+  async function wedgeOnHungSend(rowStatus: Conversation["status"]): Promise<string[]> {
+    seedConversationsCache([conv("conv_abc", rowStatus)]);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "idle",
+      queuedMessages: [],
+    });
+
+    const delivered: string[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_abc/events" && init?.method === "POST") {
+        const text = JSON.parse(init.body as string).data.content[0].text;
+        delivered.push(text);
+        if (text === "hung") return new Promise<Response>(() => {});
+        return mockResponse({ queued: true, item_id: "ci_ok" });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    void useChatStore.getState().send("hung", "agent_xyz");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(delivered).toEqual(["hung"]);
+    expect(useChatStore.getState().status).toBe("streaming");
+
+    // enqueueMessage flushes eagerly; the latch must hold it back.
+    useChatStore.getState().enqueueMessage("queued", undefined);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(delivered).toEqual(["hung"]);
+    return delivered;
+  }
+
+  it("drains the queue once a stranded send latch outlives any plausible POST", async () => {
+    // The wedge: postEvent has no timeout, so a POST whose connection dies
+    // mid-flight never settles. `status` stays "streaming" forever and that
+    // same flag gates the queue — every later message queues with no error and
+    // no recovery short of a page reload.
+    vi.useFakeTimers();
+    try {
+      const delivered = await wedgeOnHungSend("idle");
+
+      // Still within the window a real POST could take: the latch is honored.
+      await vi.advanceTimersByTimeAsync(120_000);
+      useChatStore.getState().maybeFlushQueuedHead();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(delivered).toEqual(["hung"]);
+
+      // Past it, with the session's own row reading idle, the latch is
+      // stranded: it clears and the queue drains.
+      await vi.advanceTimersByTimeAsync(60_000);
+      useChatStore.getState().maybeFlushQueuedHead();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(delivered).toEqual(["hung", "queued"]);
+      expect(useChatStore.getState().queuedMessages).toEqual([]);
+      // The stale latch was cleared — the drain's own send owns this one, and
+      // its clock restarts, so it can't inherit the stranded send's staleness.
+      expect(useChatStore.getState().status).toBe("streaming");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the queue parked when the session is genuinely running", async () => {
+    // Same elapsed time, different server truth. Overriding the latch here
+    // would double-send into a live turn, so only the server's own idle row
+    // may override it.
+    vi.useFakeTimers();
+    try {
+      const delivered = await wedgeOnHungSend("running");
+
+      await vi.advanceTimersByTimeAsync(300_000);
+      useChatStore.getState().maybeFlushQueuedHead();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(delivered).toEqual(["hung"]);
+      expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["queued"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("chatStore — background cross-session flush", () => {
   /** /events POSTs the flush fired, as (conversationId, text) pairs. */
-  const eventPosts = (): Array<{ id: string; text: string }> =>
+  const eventPosts = (): { id: string; text: string }[] =>
     fetchMock.mock.calls
       .filter(
         ([u, init]) =>
@@ -9121,58 +9510,222 @@ describe("chatStore — background cross-session flush", () => {
     });
   });
 
-  it("serializes a background flush behind an in-flight foreground send (FIFO across paths)", async () => {
-    // The navigate-away race: a foreground send() for the active conversation is
-    // still in flight (its /events POST held open) when the background flush
-    // fires for another conversation. Both POSTs must go through the one send
-    // chain, so the background POST cannot overtake the foreground one — it
-    // waits until the foreground POST resolves.
-    seedConversationsCache([conv("conv_active", "idle"), conv("conv_bg", "idle")]);
+  it("serializes a background flush behind an in-flight foreground send to the same conversation", async () => {
+    // The navigate-away race: a foreground send() for conv_a is still in flight
+    // (its /events POST held open) when the user switches away, so conv_a's
+    // queue now drains via the background path. Both take a slot on conv_a's
+    // chain, so the background POST cannot overtake the foreground one.
+    seedConversationsCache([conv("conv_a", "idle"), conv("conv_other", "idle")]);
     useChatStore.setState({
-      conversationId: "conv_active",
+      conversationId: "conv_a",
       boundAgentId: "agent_xyz",
       abortController: new AbortController(),
       status: "idle",
       sessionStatus: "idle",
-      queuedMessages: [{ queueId: "q_1", text: "bg-msg", conversationId: "conv_bg" }],
+      queuedMessages: [],
     });
 
-    // Hold conv_active's foreground POST open; conv_bg's background POST resolves
-    // immediately. Records delivery order across both endpoints.
+    // Both POSTs hit the same endpoint, so order is recorded by message text.
     const delivered: string[] = [];
     let releaseForeground: () => void = () => {};
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url === "/v1/sessions/conv_active/events" && init?.method === "POST") {
-        delivered.push("foreground");
-        return new Promise<Response>((resolve) => {
-          releaseForeground = () => resolve(mockResponse({ queued: true, item_id: "ci_fg" }));
-        });
-      }
-      if (url === "/v1/sessions/conv_bg/events" && init?.method === "POST") {
-        delivered.push("background");
+      if (url === "/v1/sessions/conv_a/events" && init?.method === "POST") {
+        const text = JSON.parse(init.body as string).data.content[0].text;
+        delivered.push(text);
+        if (text === "fg-msg") {
+          return new Promise<Response>((resolve) => {
+            releaseForeground = () => resolve(mockResponse({ queued: true, item_id: "ci_fg" }));
+          });
+        }
         return mockResponse({ queued: true, item_id: "ci_bg" });
       }
       return defaultFetchHandler(input, init);
     });
 
-    // Foreground send() takes the first chain slot and its POST is held open.
+    // Foreground send() takes conv_a's first chain slot; its POST is held open.
     const fg = useChatStore.getState().send("fg-msg", "agent_xyz");
     await tick();
-    expect(delivered).toEqual(["foreground"]);
+    expect(delivered).toEqual(["fg-msg"]);
 
-    // Background flush fires while the foreground POST is still in flight. It
-    // must NOT deliver yet — it's queued behind the foreground POST on the chain.
+    // User navigates away, handing conv_a's queue to the background path.
+    useChatStore.setState({
+      conversationId: "conv_other",
+      queuedMessages: [{ queueId: "q_1", text: "bg-msg", conversationId: "conv_a" }],
+    });
     useChatStore.getState().flushBackgroundQueues();
     await tick();
     await tick();
-    expect(delivered).toEqual(["foreground"]);
+    expect(delivered).toEqual(["fg-msg"]);
 
     // Release the foreground POST → the background POST is now free to deliver.
     releaseForeground();
     await fg;
     await tick();
     await tick();
-    expect(delivered).toEqual(["foreground", "background"]);
+    expect(delivered).toEqual(["fg-msg", "bg-msg"]);
+  });
+
+  it("does not serialize sends across different conversations", async () => {
+    // Ordering only means anything WITHIN a conversation. A single global chain
+    // let one stalled POST wedge every session in the tab, so a POST held open
+    // for conv_a must not delay a send to conv_b.
+    seedConversationsCache([conv("conv_a", "idle"), conv("conv_b", "idle")]);
+    useChatStore.setState({
+      conversationId: "conv_a",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "idle",
+      queuedMessages: [],
+    });
+
+    const delivered: string[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_a/events" && init?.method === "POST") {
+        delivered.push("conv_a");
+        // Never settles — conv_a's chain stays occupied for the whole test.
+        return new Promise<Response>(() => {});
+      }
+      if (url === "/v1/sessions/conv_b/events" && init?.method === "POST") {
+        delivered.push("conv_b");
+        return mockResponse({ queued: true, item_id: "ci_b" });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    void useChatStore.getState().send("a-msg", "agent_xyz");
+    await tick();
+    expect(delivered).toEqual(["conv_a"]);
+
+    useChatStore.setState({ conversationId: "conv_b" });
+    void useChatStore.getState().send("b-msg", "agent_xyz");
+    await tick();
+    await tick();
+    expect(delivered).toEqual(["conv_a", "conv_b"]);
+  });
+
+  it("releases the chain when a prior send's POST never settles", async () => {
+    // postEvent issues its fetch with no timeout, so a connection that dies
+    // mid-flight never settles and that send's `finally` never runs. The wait on
+    // the prior send is bounded so the next send to the SAME conversation still
+    // goes out — otherwise the composer queues forever with no error and no
+    // recovery short of a page reload.
+    vi.useFakeTimers();
+    try {
+      seedConversationsCache([conv("conv_a", "idle")]);
+      useChatStore.setState({
+        conversationId: "conv_a",
+        boundAgentId: "agent_xyz",
+        abortController: new AbortController(),
+        status: "idle",
+        sessionStatus: "idle",
+        queuedMessages: [],
+      });
+
+      const delivered: string[] = [];
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "/v1/sessions/conv_a/events" && init?.method === "POST") {
+          const text = JSON.parse(init.body as string).data.content[0].text;
+          delivered.push(text);
+          if (text === "hung") return new Promise<Response>(() => {});
+          return mockResponse({ queued: true, item_id: "ci_ok" });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      void useChatStore.getState().send("hung", "agent_xyz");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(delivered).toEqual(["hung"]);
+
+      // Second send parks behind the hung one until the bounded wait expires.
+      void useChatStore.getState().send("after", "agent_xyz");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(delivered).toEqual(["hung"]);
+
+      // A legitimately slow POST (runner session-init, sandbox-host wake) must
+      // still keep its ordering — the bound sits above those, not under them.
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(delivered).toEqual(["hung"]);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(delivered).toEqual(["hung", "after"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("chatStore — attributing pre-turn blocks to the turn", () => {
+  const block = (itemId: string | null, responseId: string, text: string): AnyBlock => ({
+    type: "text_done",
+    ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId, itemId },
+    fullText: text,
+    hasCodeBlocks: false,
+  });
+
+  it("adopts the trailing turn-id-less run when the turn is named", () => {
+    // Codex opens its reasoning block ~2s before the `running` edge that
+    // carries the turn id, so those blocks are stamped with an empty id
+    // and would render as a bubble of their own beside the turn.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      activeResponse: null,
+      blocks: [
+        block("m_old", "codex_prev", "previous turn answer"),
+        block(null, "", "Thinking…"),
+        block(null, "", "…still thinking"),
+      ],
+    });
+
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "running",
+      responseId: "codex_now",
+    });
+
+    const rids = useChatStore.getState().blocks.map((b) => b.ctx.responseId);
+    // The prior turn is untouched; both pre-turn blocks join the new turn.
+    expect(rids).toEqual(["codex_prev", "codex_now", "codex_now"]);
+  });
+
+  it("leaves blocks alone when none are unattributed", () => {
+    const blocks = [block("m1", "codex_prev", "answer")];
+    useChatStore.setState({ conversationId: "conv_abc", activeResponse: null, blocks });
+
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "running",
+      responseId: "codex_now",
+    });
+
+    // Same array identity — no needless rebuild (bubble memoization).
+    expect(useChatStore.getState().blocks).toBe(blocks);
+  });
+
+  it("does not reach past an attributed block into older history", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      activeResponse: null,
+      blocks: [
+        block(null, "", "orphan from an older turn"),
+        block("m_old", "codex_prev", "previous turn answer"),
+        block(null, "", "Thinking…"),
+      ],
+    });
+
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "running",
+      responseId: "codex_now",
+    });
+
+    const rids = useChatStore.getState().blocks.map((b) => b.ctx.responseId);
+    expect(rids).toEqual(["", "codex_prev", "codex_now"]);
   });
 });

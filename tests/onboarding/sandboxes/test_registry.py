@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -274,18 +273,17 @@ def test_get_launcher_uses_registry() -> None:
 def test_get_launcher_unknown_raises_click_exception() -> None:
     """An unknown provider still surfaces as a click.ClickException."""
     reset_plugin_state_for_tests()
-    with contextlib.suppress(DeprecationWarning):
-        with pytest.raises(
-            click.ClickException,
-            match="Unknown or unavailable sandbox provider",
-        ):
-            get_launcher("definitely-not-real")
+    with pytest.raises(
+        click.ClickException,
+        match="Unknown or unavailable sandbox provider",
+    ):
+        get_launcher("definitely-not-real")
 
 
 def test_instantiate_rejects_non_launcher_class(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A contribution whose launcher class is not a SandboxLauncher is rejected."""
+    """A contribution without the host-launch contract is rejected."""
     reset_plugin_state_for_tests()
     contribution = SandboxProviderContribution(
         name="not-a-launcher",
@@ -309,5 +307,5 @@ def test_instantiate_rejects_non_launcher_class(
         lambda _: _NotALauncher,
     )
 
-    with pytest.raises(SandboxRegistryError, match="not a SandboxLifecycle subclass"):
+    with pytest.raises(SandboxRegistryError, match="not a SandboxHostLauncher subclass"):
         instantiate("not-a-launcher")

@@ -177,6 +177,39 @@ remote DB.
 256 MB default does not, so the Fly config pins a 1 GB machine, and the
 Modal app pins `memory=1024` for the same reason.
 
+## Serving: put an HTTP/2 proxy in front for many concurrent views
+
+Each open session in the web UI holds a long-lived streaming HTTP
+response (`GET /v1/sessions/{id}/stream`, `text/event-stream`) for as
+long as the view is on screen. Over **HTTP/1.1 browsers cap concurrent
+connections at ~6 per origin**, and every open stream occupies one of
+those slots. Open a handful of windows or tabs against the same server
+and the pool fills with held-open streams — then every *other* request
+the UI makes (sending a message, the session list, `/health`, auth)
+queues behind the cap and never fires. The symptom is the whole UI
+appearing to freeze across all windows while the server itself is idle;
+in DevTools → Network the stuck requests sit in **Stalled/Queued**, not
+"waiting for server".
+
+**Fix: serve over HTTP/2.** HTTP/2 multiplexes every stream over one
+connection, so the per-origin cap stops mattering. `uvicorn` (the
+server's ASGI server) speaks HTTP/1.1 only, so HTTP/2 comes from a
+reverse proxy that terminates TLS in front of it — which most real
+deploys already have:
+
+- **The bundled Caddy overlay** (`docker/docker-compose.https.yaml`)
+  gives you this for free — Caddy negotiates HTTP/2 (and HTTP/3) over
+  TLS via ALPN with no extra config. See
+  [`docker/README.md`](docker/README.md#multi-user-mode-oidc).
+- **The one-click platforms** (Render, Railway, Fly, Cloudflare) and
+  managed **Databricks** terminate TLS with HTTP/2 at their edge, so
+  they're already covered.
+
+The gap is only when you expose the raw `:8000` HTTP/1.1 port directly
+to browsers (e.g. `docker compose up` with no proxy, reached over
+plain HTTP). That's fine for a single window; put a proxy in front once
+you or your team routinely open several.
+
 ## Execution model
 
 Omnigent runs in two pieces that talk to each other over a

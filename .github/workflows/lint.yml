@@ -1,6 +1,6 @@
 name: Lint
 
-# Runs the project's pre-commit hooks (ruff, TypeScript lint, custom
+# Runs the project's pre-commit hooks (ruff, Pyrefly, TypeScript lint/type-check, custom
 # anti-pattern grep hooks, etc.) on every non-draft PR and on push to main.
 # Surfaces as the `Pre-commit checks` check, a REQUIRED gate entry in
 # merge-ready.yml. Draft PRs are skipped; `ready_for_review` refires so the
@@ -82,12 +82,12 @@ jobs:
       - name: Set up pnpm
         uses: ./.github/actions/setup-pnpm
 
-      - name: Install web dependencies
-        # Pin the npm registry to the npmjs default; limit to the web package
-        # so Electron's large native devDependencies are not fetched.
+      - name: Install TypeScript dependencies
+        # Pin the npm registry to the npmjs default; limit installs to packages
+        # checked here so Electron's large native devDependencies are not fetched.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: pnpm install --frozen-lockfile --filter web
+        run: pnpm install --frozen-lockfile --filter web --filter omnigent-vscode
 
       # The pnpm equivalent of the `uv sync --locked` gate above.
       # `pnpm install --frozen-lockfile` only checks the lockfile is CONSISTENT
@@ -103,6 +103,13 @@ jobs:
             echo "::error::pnpm-lock.yaml is out of date. Run 'pnpm install --lockfile-only' at the repo root and commit the result."
             exit 1
           }
+
+      # A `--frozen-lockfile` / lockfile-regen gate can't catch an override that
+      # pins a version outside a package.json range: overrides outrank
+      # package.json, so the declared version is silently ignored and the lock
+      # stays internally consistent for the pin. Check overrides directly.
+      - name: Check pnpm overrides satisfy declared ranges
+        run: .venv/bin/python dev/lint/lint_pnpm_override_consistency.py
 
       # ktlint is invoked by the android-ktlint-* pre-commit hooks. The wrapper
       # script (web/android/bin/ktlint.sh) exits 0 if ktlint is absent, so we
@@ -121,7 +128,7 @@ jobs:
           chmod +x /tmp/ktlint
           sudo mv /tmp/ktlint /usr/local/bin/ktlint
 
-      - name: Run formatting and lint checks
+      - name: Run formatting, lint, and type checks
         run: uv run pre-commit run --all-files --show-diff-on-failure
 
   # The four packages release in lockstep (identical versions + `==` sibling

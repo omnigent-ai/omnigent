@@ -35,7 +35,8 @@ Factory form (with ``factory_params``)::
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict
+from collections.abc import Awaitable
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, cast
 
 if TYPE_CHECKING:
     from omnigent.policies.types import PolicyLLMClient
@@ -136,6 +137,8 @@ class EventContext(TypedDict, total=False):
 
     :param actor: The identity of the user driving the session.
     :param usage: Cumulative LLM token usage for the session.
+    :param subtree_usage: Cumulative LLM usage for this conversation and
+        its descendants. Present when subagent cost enforcement is enabled.
     :param user_daily_cost: The session owner's per-UTC-day cost
         rollup (``cost_usd`` / ``ask_approved_usd``). Present only when
         the per-user daily cost-budget policy is configured; read via
@@ -162,6 +165,7 @@ class EventContext(TypedDict, total=False):
 
     actor: ActorContext
     usage: UsageContext
+    subtree_usage: UsageContext
     user_daily_cost: UserDailyCostContext
     # ``str | None`` (not ``str``): the value is ``ctx.model``, which is
     # ``None`` when the engine could not determine a model — the dict carries
@@ -231,11 +235,11 @@ class PolicyEvent(TypedDict, total=False):
         "llm_response",
     ]
     target: str | None
-    data: Any
+    data: object
     context: EventContext
-    session_state: dict[str, Any]
+    session_state: dict[str, object]
     llm_client: PolicyLLMClient | None
-    request_data: Any
+    request_data: object
 
 
 # ── Response (output from callable) ──────────────────────────────────────────
@@ -254,7 +258,7 @@ class StateUpdateEntry(TypedDict, total=False):
 
     key: str
     action: Literal["set", "increment", "delete", "append"]
-    value: Any
+    value: object
 
 
 class PolicyResponse(TypedDict, total=False):
@@ -299,12 +303,14 @@ class PolicyResponse(TypedDict, total=False):
 
     result: Literal["ALLOW", "DENY", "ASK"]
     reason: str
-    data: Any
+    data: object
     state_updates: list[StateUpdateEntry]
     set_labels: dict[str, str]
 
 
 # ── Callable protocol ────────────────────────────────────────────────────────
+
+_PolicyCallableReturn: TypeAlias = PolicyResponse | Awaitable[PolicyResponse | None] | None
 
 
 class PolicyCallable(Protocol):
@@ -322,7 +328,8 @@ class PolicyCallable(Protocol):
             return {"result": "ALLOW"}
     """
 
-    def __call__(self, event: PolicyEvent) -> PolicyResponse | None: ...
+    def __call__(self, event: PolicyEvent) -> _PolicyCallableReturn:
+        raise NotImplementedError
 
 
 class PolicyCallableWithConfig(Protocol):
@@ -341,13 +348,14 @@ class PolicyCallableWithConfig(Protocol):
             ...
     """
 
-    def __call__(self, event: PolicyEvent, config: dict[str, str]) -> PolicyResponse | None: ...
+    def __call__(self, event: PolicyEvent, config: dict[str, str]) -> _PolicyCallableReturn:
+        raise NotImplementedError
 
 
 # ── REQUEST-phase data helpers ───────────────────────────────────────────────
 
 
-def request_user_text(data: Any) -> str:
+def request_user_text(data: object) -> str:
     """Extract the user's typed text from a REQUEST-phase ``event["data"]``.
 
     Request ``data`` is a dict ``{"user_content", "attachments"}`` from the
@@ -374,7 +382,7 @@ def request_user_text(data: Any) -> str:
     return ""
 
 
-def request_attachments(data: Any) -> list[dict[str, Any]]:
+def request_attachments(data: object) -> list[dict[str, object]]:
     """Return the text attachments on a REQUEST-phase ``event["data"]``.
 
     Each entry is ``{"filename", "content_type", "text"}`` — the decoded text of
@@ -387,7 +395,11 @@ def request_attachments(data: Any) -> list[dict[str, Any]]:
     if isinstance(data, dict):
         attachments = data.get("attachments")
         if isinstance(attachments, list):
-            return [att for att in attachments if isinstance(att, dict)]
+            return [
+                cast("dict[str, object]", attachment)
+                for attachment in attachments
+                if isinstance(attachment, dict)
+            ]
     return []
 
 

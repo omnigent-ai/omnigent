@@ -1248,12 +1248,14 @@ async def test_runner_cold_cache_uses_resolved_message_not_stored_file_id() -> N
 @pytest.mark.asyncio
 async def test_runner_post_returns_503_when_spec_resolver_fails(
     caplog: pytest.LogCaptureFixture,
+    pinned_runner_log: Path,
 ) -> None:
     """Spec resolver failures are surfaced as structured 503 errors.
 
     :param caplog: Pytest log capture, used to confirm the raw cause is
         logged server-side (the other half of the log-and-genericize
         contract).
+    :param pinned_runner_log: The log path the detail must name.
     :returns: None.
     """
 
@@ -1289,11 +1291,13 @@ async def test_runner_post_returns_503_when_spec_resolver_fails(
 
     assert response.status_code == 503
     body = response.json()
-    # The structured error slug is preserved for the caller; the detail is a
-    # fixed client-safe string. The raw resolver exception text must not leak
-    # into the HTTP body (it is logged on the runner instead).
+    # The structured error slug is preserved for the caller; the detail names
+    # the runner log holding the cause. The raw resolver exception text must
+    # not leak into the HTTP body (it is logged on the runner instead).
     assert body["error"] == "spec_resolver_failed"
-    assert body["detail"] == "Request failed on the runner; see runner logs for details."
+    assert body["detail"] == (
+        f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+    )
     assert "spec resolver unavailable" not in body["detail"]
     # The other half of the contract: the raw cause IS logged for operators.
     # If this fails, log-and-genericize logged nothing and the detail is the
@@ -1405,6 +1409,43 @@ def test_build_spawn_env_applies_model_override(
     assert base["HARNESS_CLAUDE_SDK_MODEL"] != "claude-sonnet-4-6"
     # … and the override wins, landing in the model env var the SDK reads.
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+
+
+def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dispatch chain routes ``hermes`` to its builder.
+
+    Regression: hermes had no arm here, so this returned ``None`` and the
+    subprocess got no spawn env at all — the session's sandbox fell back to the
+    wrap's ``sandbox=none`` default and its workspace to the runner's launch
+    directory, both silently. Having the builder is not enough; the chain has
+    to reach it.
+
+    :param tmp_path: Pytest temp dir for an isolated provider config.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.delenv("OMNIGENT_HERMES_PATH", raising=False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        os_env=OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+
+    env = _build_spawn_env_from_spec(spec, "hermes", cwd=workspace)
+
+    assert env is not None, "hermes is not routed to a spawn-env builder"
+    assert env["HARNESS_HERMES_CWD"] == str(workspace)
+    assert json.loads(env["HARNESS_HERMES_OS_ENV"])["sandbox"]["type"] == "linux_bwrap"
+    # The /model override reaches hermes through the same model env key.
+    overridden = _build_spawn_env_from_spec(spec, "hermes", model_override="hermes-4-70b")
+    assert overridden is not None
+    assert overridden["HARNESS_HERMES_MODEL"] == "hermes-4-70b"
 
 
 @pytest.mark.asyncio
@@ -2269,8 +2310,10 @@ class _StubTerminalInstance:
         on_idle: Callable[[], None] | None = None,
         *,
         on_activity: Callable[[], None] | None = None,
+        **kwargs: object,
     ) -> None:
         """Record the activity callback instead of polling real tmux."""
+        del kwargs
         if on_activity is not None:
             self.activity_watchers.append(on_activity)
 
@@ -3364,7 +3407,7 @@ async def test_sys_session_send_model_rejected_for_unplumbed_harness(
         pytest.param(
             "codex-native",
             "databricks-claude-sonnet-4-6",
-            "only runs GPT models",
+            "only runs codex-compatible models",
             id="claude-on-codex",
         ),
         pytest.param(
@@ -5059,7 +5102,10 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                         "title": "researcher:done",
                         "tool": "researcher",
                         "session_name": "done",
-                        "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                        "labels": {
+                            CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE,
+                            "attempt": 1,
+                        },
                     },
                     {
                         "id": "c5",
@@ -5083,7 +5129,8 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                 "sys_session_list", "{}", conversation_id="conv_parent", server_client=client
             )
         )
-    # c3 (explicitly closed), c5 (legacy title tombstone), and c4
+    # c3 (explicitly closed despite its mixed-type label map), c5
+    # (legacy title tombstone), and c4
     # (no colon) dropped; the ui:-added child surfaces under its bound
     # agent + label.
     assert out["sub_agents"] == [
@@ -6405,6 +6452,7 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         requested_paths.append(request.url.path)
         if request.url.path == "/v1/sessions/conv_caller":
+            assert request.url.params["include_items"] == "false"
             return httpx.Response(
                 200,
                 json={
@@ -6413,6 +6461,7 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
                     "agent_name": "main",
                     "status": "idle",
                     "created_at": 1,
+                    "updated_at": 42,
                     "runner_id": None,
                     "pending_elicitations": [],
                 },
@@ -6436,6 +6485,7 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
     # never queried (a stray /v1/runners call would mean the None-runner
     # short-circuit regressed).
     assert info["runner_online"] is None
+    assert info["last_activity_at"] == 42
     assert info["pending_elicitations"] == []
     assert info["pending_elicitation_count"] == 0
     assert not any(p.startswith("/v1/runners") for p in requested_paths)
@@ -6810,6 +6860,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            assert request.url.params["include_items"] == "false"
+            assert request.url.params["include_liveness"] == "false"
             return httpx.Response(
                 200,
                 json={
@@ -6818,6 +6870,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "agent_name": "researcher",
                     "status": "running",
                     "created_at": 1,
+                    "updated_at": 84,
                     "title": "auth flow",
                     "runner_id": "runner_1",
                     "host_id": None,
@@ -6849,6 +6902,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     info = json.loads(output)
     assert info["session_id"] == "conv_target"
     assert info["status"] == "running"
+    assert info["last_activity_at"] == 84
     assert info["title"] == "auth flow"
     assert info["agent_id"] == "ag_xyz"
     assert info["agent_name"] == "researcher"
@@ -7458,3 +7512,130 @@ async def test_spawn_async_tool_cancels_losing_future_no_leak(
     await asyncio.sleep(0)
     assert inbox.get_nowait()["status"] == "cancelled"
     assert _leaked(before) == []
+
+
+@pytest.mark.asyncio
+async def test_spawn_async_tool_phase_tool_call_policy_deny(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_spawn_async_tool`` evaluates PHASE_TOOL_CALL policy via the AP server
+    before dispatching.  A DENY verdict must suppress execution and push a
+    failed item to the inbox — the tool must never run.
+    """
+    from omnigent.runner import tool_dispatch
+
+    executed: list[str] = []
+
+    async def _should_not_run(**_kw: Any) -> str:
+        executed.append("ran")
+        return "should not reach"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _should_not_run)
+
+    policy_requests: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and "/policies/evaluate" in request.url.path:
+            policy_requests.append(json.loads(request.content))
+            return httpx.Response(
+                200, json={"result": "POLICY_ACTION_DENY", "reason": "test deny"}
+            )
+        return httpx.Response(404)
+
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        tool_dispatch._spawn_async_tool(
+            {"tool": "sys_os_shell", "args": '{"command": "echo hi"}'},
+            session_inbox=inbox,
+            session_async_tasks=tasks,
+            server_client=server_client,
+            terminal_registry=None,
+            resource_registry=None,
+            agent_spec=None,
+            conversation_id="conv_policy_deny",
+            task_id=None,
+            agent_id=None,
+            agent_name=None,
+            runner_workspace=None,
+            mcp_manager=None,
+            filesystem_registry=None,
+        )
+        bg_task, _evt = next(iter(tasks.values()))
+        await bg_task
+
+    assert executed == [], "Tool must not execute when PHASE_TOOL_CALL is denied"
+    assert len(policy_requests) == 1
+    event = policy_requests[0]["event"]
+    assert event["type"] == "PHASE_TOOL_CALL"
+    assert event["data"]["name"] == "sys_os_shell"
+    # arguments must arrive as a dict so argument-aware policies (e.g. safety
+    # rules that inspect arguments.command) see the same structure every
+    # in-turn evaluation path delivers — not a raw JSON string.
+    assert isinstance(event["data"]["arguments"], dict), (
+        "arguments must be a dict, not a JSON string"
+    )
+    assert event["data"]["arguments"] == {"command": "echo hi"}
+
+    item = inbox.get_nowait()
+    assert item["status"] == "failed"
+    assert "policy" in item["output"].lower()
+
+
+@pytest.mark.asyncio
+async def test_spawn_async_tool_phase_tool_call_policy_allow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A PHASE_TOOL_CALL ALLOW verdict must let the tool execute normally.
+    """
+    from omnigent.runner import tool_dispatch
+
+    executed: list[str] = []
+
+    async def _fast(**_kw: Any) -> str:
+        executed.append("ran")
+        return "ok"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _fast)
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if "/policies/evaluate" in request.url.path:
+            return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"})
+        return httpx.Response(404)
+
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        tool_dispatch._spawn_async_tool(
+            {"tool": "sys_os_shell", "args": '{"command": "echo hi"}'},
+            session_inbox=inbox,
+            session_async_tasks=tasks,
+            server_client=server_client,
+            terminal_registry=None,
+            resource_registry=None,
+            agent_spec=None,
+            conversation_id="conv_policy_allow",
+            task_id=None,
+            agent_id=None,
+            agent_name=None,
+            runner_workspace=None,
+            mcp_manager=None,
+            filesystem_registry=None,
+        )
+        bg_task, _evt = next(iter(tasks.values()))
+        await bg_task
+
+    assert executed == ["ran"], "Tool must execute when PHASE_TOOL_CALL is allowed"
+    item = inbox.get_nowait()
+    assert item["status"] == "completed"
+    assert item["output"] == "ok"

@@ -30,6 +30,7 @@ from omnigent.runtime.workflow import (
     _build_claude_sdk_spawn_env,
     _build_codex_spawn_env,
     _build_goose_spawn_env,
+    _build_hermes_spawn_env,
     _build_kimi_spawn_env,
     _build_openai_agents_sdk_spawn_env,
     _build_pi_spawn_env,
@@ -148,7 +149,13 @@ def _make_spec(
     )
 
 
-def _key_family(base_url: str, api_key: str, default_model: str) -> dict[str, object]:
+def _key_family(
+    base_url: str,
+    api_key: str,
+    default_model: str,
+    *,
+    wire_api: str | None = None,
+) -> dict[str, object]:
     """
     Build a single provider-family config block (inline static key).
 
@@ -158,11 +165,14 @@ def _key_family(base_url: str, api_key: str, default_model: str) -> dict[str, ob
     :param default_model: The family's ``models.default``, e.g. ``"gpt-4o"``.
     :returns: A family mapping ready to nest under a provider entry.
     """
-    return {
+    family: dict[str, object] = {
         "base_url": base_url,
         "api_key": api_key,
         "models": {"default": default_model},
     }
+    if wire_api is not None:
+        family["wire_api"] = wire_api
+    return family
 
 
 def _anthropic_default_config() -> dict[str, object]:
@@ -492,6 +502,23 @@ def test_pi_uses_anthropic_global_default(config_home: Path) -> None:
     assert env["HARNESS_PI_GATEWAY_HOST"] == "https://anthropic.example.com"
     assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-secret"
     assert env["HARNESS_PI_MODEL"] == "claude-default-model"
+
+
+def test_pi_threads_generic_openai_wire_api(config_home: Path) -> None:
+    """Pi routes a generic OpenAI provider using configured wire metadata."""
+    config = _openai_default_config()
+    provider = config["providers"]["vendor-openai"]
+    provider["openai"] = _key_family(
+        "https://openai.example.com/v1",
+        "sk-oai-secret",
+        "gpt-default-model",
+        wire_api="responses",
+    )
+    _write_config(config_home, config)
+
+    env = _build_pi_spawn_env(_make_spec(harness="pi"), workdir=None)
+
+    assert env["HARNESS_PI_GATEWAY_OPENAI_WIRE_API"] == "responses"
 
 
 # ── Named ProviderAuth selection ───────────────────────────────────────────
@@ -1164,6 +1191,76 @@ def test_pi_cli_config_databricks_default_routes_gateway(
     assert env["HARNESS_PI_MODEL"] == _CATALOG_DEFAULTS[("databricks", "claude")]
 
 
+def test_pi_gateway_default_pi_scope_unresolved_credential_names_var(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``kind: gateway`` provider with ``default: pi`` names the missing env var on failure.
+
+    When a ``kind: gateway`` provider is the pi default via an explicit
+    ``default: pi`` scope and its ``api_key_ref: env:VAR`` cannot resolve
+    (the env var is unset in the runner), the error must name the missing
+    variable. The original credential-resolution error from ``resolve_secret``
+    is surfaced rather than a generic message that omits the variable name.
+    """
+    from omnigent.errors import OmnigentError
+
+    monkeypatch.delenv("MY_GATEWAY_TOKEN", raising=False)
+    monkeypatch.delenv("OMNIGENT_MY_GATEWAY_TOKEN", raising=False)
+    config: dict[str, object] = {
+        "providers": {
+            "my-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "api_key_ref": "env:MY_GATEWAY_TOKEN",
+                    "base_url": "https://example.com/v1",
+                    "models": {"default": "some-model-id"},
+                },
+            }
+        }
+    }
+    _write_config(config_home, config)
+    spec = _make_spec(harness="pi")
+
+    with pytest.raises(OmnigentError, match="MY_GATEWAY_TOKEN"):
+        _build_pi_spawn_env(spec, workdir=None)
+
+
+def test_pi_gateway_default_pi_scope_resolved_credential_succeeds(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``kind: gateway`` provider with ``default: pi`` routes pi when the credential resolves.
+
+    When ``MY_GATEWAY_TOKEN`` is exported, ``_build_pi_spawn_env`` must
+    populate the openai family's gateway transport vars correctly for a
+    provider that only claims the ``pi`` default scope (not ``openai``).
+    """
+    monkeypatch.setenv("MY_GATEWAY_TOKEN", "sk-gw-secret")
+    config: dict[str, object] = {
+        "providers": {
+            "my-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "api_key_ref": "env:MY_GATEWAY_TOKEN",
+                    "base_url": "https://example.com/v1",
+                    "models": {"default": "some-model-id"},
+                },
+            }
+        }
+    }
+    _write_config(config_home, config)
+    spec = _make_spec(harness="pi")
+
+    env = _build_pi_spawn_env(spec, workdir=None)
+
+    assert env["HARNESS_PI_GATEWAY"] == "true"
+    assert env["HARNESS_PI_GATEWAY_BASE_URLS"] == '{"openai": "https://example.com/v1"}'
+    assert env["HARNESS_PI_GATEWAY_HOST"] == "https://example.com"
+    assert env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] == "printf %s sk-gw-secret"
+    assert env["HARNESS_PI_MODEL"] == "some-model-id"
+
+
 _DISMISSIBLE_CODEX_CONFIG_TOML = """
 model_provider = "Databricks"
 
@@ -1352,6 +1449,86 @@ def test_kimi_os_env_serialized(config_home: Path) -> None:
     assert decoded["sandbox"]["type"] == "darwin_seatbelt"
 
 
+# ── Hermes Agent CLI spawn-env ────────────────────────────────────────────
+
+
+def test_hermes_spawn_env_threads_spec_model_and_skills(config_home: Path) -> None:
+    """The hermes builder emits the model plus the skills filter, and no
+    gateway vars: Hermes owns its file-based auth (``hermes setup`` /
+    ``hermes model``) and has no per-spawn provider override to configure.
+
+    Regression: hermes had no builder at all, so a spec model never reached the
+    subprocess and it silently ran on whatever default Hermes had configured."""
+    _write_config(config_home, {"providers": {}})
+    spec = _make_spec(harness="hermes", model="hermes-4-405b")
+
+    env = _build_hermes_spawn_env(spec, cwd=None, workdir=None)
+
+    assert env == {
+        "HARNESS_HERMES_MODEL": "hermes-4-405b",
+        "HARNESS_HERMES_SKILLS_FILTER": '"all"',
+    }
+
+
+def test_hermes_ignores_global_default_provider(config_home: Path) -> None:
+    """An openai default provider injects no creds into the hermes env.
+
+    Same reasoning as kimi: Hermes reads credentials from its own
+    ``auth.json`` / ``.env`` under ``HERMES_HOME``, so injecting an ambient key
+    the executor cannot pass through would mis-bill the user against a
+    provider their Hermes install never uses."""
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness="hermes")
+
+    env = _build_hermes_spawn_env(spec, cwd=None, workdir=None)
+
+    assert "HARNESS_HERMES_GATEWAY_BASE_URL" not in env
+    assert "HARNESS_HERMES_GATEWAY_API_KEY" not in env
+    assert "HARNESS_HERMES_DATABRICKS_PROFILE" not in env
+
+
+def test_hermes_os_env_serialized(config_home: Path) -> None:
+    """``spec.os_env`` is serialized into ``HARNESS_HERMES_OS_ENV`` so the wrap
+    rebuilds the sandbox spec instead of falling back to ``sandbox=none``.
+
+    This is what makes a sandbox picked in the web session dialog actually
+    confine hermes — without it the harness ran unconfined while the UI
+    reported a sandbox."""
+    import json as _json
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    _write_config(config_home, {"providers": {}})
+    os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=None,
+        sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
+        fork=False,
+    )
+    spec = _make_spec(harness="hermes", os_env=os_env)
+
+    env = _build_hermes_spawn_env(spec, cwd=None, workdir=None)
+
+    assert "HARNESS_HERMES_OS_ENV" in env
+    decoded = _json.loads(env["HARNESS_HERMES_OS_ENV"])
+    assert decoded["sandbox"]["type"] == "linux_bwrap"
+
+
+def test_hermes_omits_reserved_bundle_dir(config_home: Path, tmp_path: Path) -> None:
+    """``workdir`` is accepted for signature parity but not threaded.
+
+    ``HARNESS_HERMES_BUNDLE_DIR`` is reserved in the wrap — there is no
+    ``hermes chat`` flag for it — so emitting it would set a var the executor
+    cannot pass on. Locks the deliberate omission so a future reader doesn't
+    "fix" it without wiring the argv side."""
+    _write_config(config_home, {"providers": {}})
+    spec = _make_spec(harness="hermes")
+
+    env = _build_hermes_spawn_env(spec, cwd=None, workdir=tmp_path)
+
+    assert "HARNESS_HERMES_BUNDLE_DIR" not in env
+
+
 # ---------------------------------------------------------------------------
 # harness.<canonical>.command → OMNIGENT_<NAME>_PATH (spawn-env builders)
 # ---------------------------------------------------------------------------
@@ -1381,6 +1558,7 @@ def _call_builder(builder: object, spec: AgentSpec) -> dict[str, str]:  # type: 
         ("kimi", _build_kimi_spawn_env, "OMNIGENT_KIMI_PATH"),
         ("goose", _build_goose_spawn_env, "OMNIGENT_GOOSE_PATH"),
         ("qwen", _build_qwen_spawn_env, "OMNIGENT_QWEN_PATH"),
+        ("hermes", _build_hermes_spawn_env, "OMNIGENT_HERMES_PATH"),
     ],
 )
 def test_spawn_env_threads_config_command_to_path(
@@ -1408,6 +1586,7 @@ def test_spawn_env_threads_config_command_to_path(
         ("kimi", _build_kimi_spawn_env, "OMNIGENT_KIMI_PATH"),
         ("goose", _build_goose_spawn_env, "OMNIGENT_GOOSE_PATH"),
         ("qwen", _build_qwen_spawn_env, "OMNIGENT_QWEN_PATH"),
+        ("hermes", _build_hermes_spawn_env, "OMNIGENT_HERMES_PATH"),
     ],
 )
 def test_spawn_env_ambient_env_wins_over_config_command(

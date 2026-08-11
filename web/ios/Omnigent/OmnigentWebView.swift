@@ -7,7 +7,7 @@ struct OmnigentWebView: UIViewRepresentable {
   @ObservedObject var model: WebViewModel
   @ObservedObject var settings: SettingsStore
   let loadFailed: (URL, String) -> Void
-  let loadSucceeded: (URL) -> Void
+  let loadSucceeded: () -> Void
 
   func makeCoordinator() -> Coordinator {
     Coordinator(self)
@@ -117,10 +117,38 @@ struct OmnigentWebView: UIViewRepresentable {
           ].join(", ")
         );
       };
-      if (document.head) {
+      // A workspace-hosted page reassigns the whole `content` attribute after it
+      // mounts, dropping `viewport-fit=cover` — and with it every
+      // `env(safe-area-inset-*)` the web layer pads with, so content lands under the
+      // status bar. One-shot injection isn't enough: the host rewrites again on its
+      // own re-renders, so re-assert whenever the token goes missing.
+      const hasViewportFitCover = () => {
+        const meta = document.querySelector('meta[name="viewport"]');
+        if (!meta) return false;
+        const content = (meta.getAttribute("content") || "").toLowerCase();
+        return content.split(" ").join("").includes("viewport-fit=cover");
+      };
+      const watchViewportFit = () => {
+        if (!document.head || typeof MutationObserver === "undefined") return;
+        // `ensureViewportFit` writes the attribute we're observing; the guard turns
+        // that re-entry into a no-op rather than a loop.
+        new MutationObserver(() => {
+          if (!hasViewportFitCover()) ensureViewportFit();
+        }).observe(document.head, {
+          childList: true, // the host may replace the tag instead of editing it
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["content"],
+        });
+      };
+      const applyViewportFit = () => {
         ensureViewportFit();
+        watchViewportFit();
+      };
+      if (document.head) {
+        applyViewportFit();
       } else {
-        document.addEventListener("DOMContentLoaded", ensureViewportFit, { once: true });
+        document.addEventListener("DOMContentLoaded", applyViewportFit, { once: true });
       }
       const callbacks = new Set();
       const openPathCallbacks = new Set();
@@ -267,8 +295,18 @@ struct OmnigentWebView: UIViewRepresentable {
   {
     var parent: OmnigentWebView
     private weak var webView: WKWebView?
+    /// The server this web view is pinned to; nil before the first load. Doubles as
+    /// the identity `updateUIView` compares against, so a re-render only reloads
+    /// when SwiftUI hands over a different server.
     private(set) var pinnedURL: URL?
-    private var pinnedOrigin: String?
+    /// Derived, never stored: a cached copy would be one more thing to keep in sync
+    /// with `pinnedURL`.
+    private var pinnedOrigin: String? { pinnedURL?.omnigentOrigin }
+    /// Bare-root → mount bounces since the last app page loaded; see
+    /// `workspaceRootBounceTarget` for why they're capped.
+    private var rootBounces = 0
+    private static let maxRootBounces = 1
+    private var urlObservation: NSKeyValueObservation?
 
     init(_ parent: OmnigentWebView) {
       self.parent = parent
@@ -276,11 +314,55 @@ struct OmnigentWebView: UIViewRepresentable {
 
     func attach(_ webView: WKWebView) {
       self.webView = webView
+      // In-page navigation: the SPA swapped the URL with pushState / replaceState,
+      // or the user moved through history. No page is loaded, so no navigation
+      // delegate callback runs — KVO on `url` is the only way to observe the user
+      // routing client-side back to the workspace root.
+      urlObservation = webView.observe(\.url) { [weak self] _, _ in
+        Task { @MainActor in
+          guard let self, let webView = self.webView else { return }
+          self.bounceIfWorkspaceRoot(webView)
+        }
+      }
     }
 
     func detach() {
       parent.model.cancelServerSwitcherWatchdog()
+      urlObservation = nil
       webView = nil
+    }
+
+    /// Send a landing on the bare Databricks workspace root to the SPA mount. The
+    /// root serves the Databricks landing page, so leaving the user there hides the
+    /// app and lets them wander into another workspace app with no way back.
+    private func bounceIfWorkspaceRoot(_ webView: WKWebView) {
+      guard let url = webView.url, url.omnigentOrigin == pinnedOrigin,
+        let target = workspaceRootBounceTarget(for: url)
+      else {
+        return
+      }
+      bounce(webView, to: target)
+    }
+
+    /// The mount URL to bounce to when `url` is a bare Databricks workspace root, or
+    /// nil when there's nothing to do.
+    ///
+    /// Budgeted, and spent by the caller that acts on it: a workspace that answers
+    /// the mount with a redirect back to the root (e.g. it isn't enabled there)
+    /// would otherwise loop forever. One bounce per app page load, so a failed
+    /// bounce leaves the user on the root and `didFinish` re-arms the budget as soon
+    /// as an app page loads.
+    private func workspaceRootBounceTarget(for url: URL) -> URL? {
+      guard let target = WorkspaceURLExpander.workspaceUIURL(forBareRoot: url) else { return nil }
+      guard rootBounces < Self.maxRootBounces else { return nil }
+      rootBounces += 1
+      return target
+    }
+
+    /// Posted, never loaded inline: a load issued while WebKit is committing a
+    /// navigation can be dropped.
+    private func bounce(_ webView: WKWebView, to target: URL) {
+      DispatchQueue.main.async { webView.load(URLRequest(url: target)) }
     }
 
     // A left-edge swipe drives the web app's sidebar as an interactive drawer.
@@ -322,7 +404,9 @@ struct OmnigentWebView: UIViewRepresentable {
 
     func load(_ url: URL, in webView: WKWebView) {
       pinnedURL = url
-      pinnedOrigin = url.omnigentOrigin
+      // A new pin is a new server: the previous one's exhausted bounce budget must
+      // not suppress the first bounce here.
+      rootBounces = 0
       publishModelChanges { model in
         model.currentURL = url
         model.serverSwitcherHidden = true
@@ -385,16 +469,35 @@ struct OmnigentWebView: UIViewRepresentable {
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
       parent.model.currentURL = webView.url ?? parent.model.currentURL
+      // Workspace roots are caught here too, not only in decidePolicyFor: that
+      // callback is skipped for loads the shell starts itself, and the Databricks
+      // login chain hands the session back with a form POST landing on the root.
+      // didCommit sees every committed main-frame load.
+      bounceIfWorkspaceRoot(webView)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
       parent.model.isLoading = false
       parent.model.currentURL = webView.url ?? parent.model.currentURL
-      if webView.url?.path.starts(with: WorkspaceURLExpander.workspaceUIPath) == true {
-        injectWorkspaceChromeCSS(webView)
+      // A page other than the bare root finished loading, so the last bounce (if
+      // any) got us somewhere: re-arm the budget for the next landing on the root.
+      // Deliberately loose — an auth page also re-arms, which at worst costs one
+      // extra bounce attempt rather than stranding the user on the root.
+      if let url = webView.url, url.omnigentOrigin == pinnedOrigin,
+        WorkspaceURLExpander.workspaceUIURL(forBareRoot: url) == nil
+      {
+        rootBounces = 0
       }
-      if webView.url?.omnigentOrigin == pinnedOrigin, let pinnedURL {
-        parent.loadSucceeded(pinnedURL)
+      // Databricks workspace-hosted Omnigent renders inside the workspace's
+      // top-nav chrome (the SPA is a workspace page). Hide it by overlaying
+      // Omnigent's own root — see WorkspaceChromeScript, which also explains why
+      // this is keyed on the pinned origin and never on the URL's path.
+      // Re-applied on every full load (a server switch is a fresh document); the
+      // SPA's client-side routing keeps the same document, so the injected
+      // stylesheet persists across in-app navigation.
+      if pinnedOrigin != nil, webView.url?.omnigentOrigin == pinnedOrigin {
+        webView.evaluateJavaScript(WorkspaceChromeScript.source)
+        parent.loadSucceeded()
       }
     }
 
@@ -428,6 +531,16 @@ struct OmnigentWebView: UIViewRepresentable {
       if navigationAction.targetFrame == nil {
         openExternal(url)
         decisionHandler(.cancel)
+        return
+      }
+
+      // A main-frame landing on the bare workspace root belongs to Databricks
+      // rather than the app — cancel it and load the SPA mount instead.
+      if navigationAction.targetFrame?.isMainFrame == true, url.omnigentOrigin == pinnedOrigin,
+        let target = workspaceRootBounceTarget(for: url)
+      {
+        decisionHandler(.cancel)
+        bounce(webView, to: target)
         return
       }
 
@@ -551,33 +664,10 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     private func failedURL(from error: NSError) -> URL? {
-      if let url = error.userInfo[NSURLErrorFailingURLErrorKey] as? URL {
-        return url
-      }
-      if let value = error.userInfo[NSURLErrorFailingURLStringErrorKey] as? String {
-        return URL(string: value)
-      }
-      return nil
-    }
-
-    private func injectWorkspaceChromeCSS(_ webView: WKWebView) {
-      let css = """
-        .omnigent-app {
-          position: fixed !important;
-          inset: 0 !important;
-          z-index: 2147483647 !important;
-        }
-        """
-      let script = """
-        (() => {
-          if (document.querySelector("style[data-omnigent-workspace-chrome]")) return;
-          const style = document.createElement("style");
-          style.dataset.omnigentWorkspaceChrome = "true";
-          style.textContent = \(WebViewModel.javascriptString(css));
-          document.documentElement.appendChild(style);
-        })();
-        """
-      webView.evaluateJavaScript(script)
+      // The string-keyed variant this used to fall back on is deprecated and
+      // redundant on the supported OS versions; callers already fall back to the
+      // web view's own URL when the key is absent.
+      error.userInfo[NSURLErrorFailingURLErrorKey] as? URL
     }
 
     private func topViewController() -> UIViewController? {

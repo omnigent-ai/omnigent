@@ -23,6 +23,11 @@ from omnigent.spec.types import AgentSpec, ExecutorSpec, LLMConfig
 _AGENTS = [
     {"name": "Gemini CLI", "command": "gemini --experimental-acp"},
     {"name": "Goose", "command": "goose acp", "model": "gpt-5.3", "session_id_mode": "client"},
+    {
+        "name": "OpenClaw",
+        "command": "openclaw acp --url https://gateway --token token",
+        "omnigent_mcp": False,
+    },
 ]
 _MISSING = object()
 
@@ -66,6 +71,7 @@ def test_slug_resolves_to_command(_isolate_config: Path) -> None:
     assert env["HARNESS_ACP_COMMAND"] == "goose acp"
     assert env["HARNESS_ACP_NAME"] == "Goose"
     assert env["HARNESS_ACP_SESSION_ID_MODE"] == "client"
+    assert env["HARNESS_ACP_OMNIGENT_MCP"] == "1"
     # Per-agent model applies when the spec pins none.
     assert env["HARNESS_ACP_MODEL"] == "gpt-5.3"
 
@@ -120,10 +126,76 @@ def test_send_model_flag_forwarded(_isolate_config: Path) -> None:
     assert env["HARNESS_ACP_SEND_MODEL"] == "1"
 
 
+def test_omnigent_mcp_flag_forwarded(_isolate_config: Path) -> None:
+    _write_acp_config(_isolate_config)
+    env = _build_acp_spawn_env(_make_spec(harness="acp:openclaw"))
+    assert env["HARNESS_ACP_COMMAND"] == "openclaw acp --url https://gateway --token token"
+    assert env["HARNESS_ACP_OMNIGENT_MCP"] == "0"
+
+
+def test_embedded_omnigent_mcp_flag_forwarded() -> None:
+    env = _build_acp_spawn_env(
+        _make_spec(
+            harness="acp:openclaw",
+            acp_agent={
+                "name": "OpenClaw",
+                "command": "openclaw acp",
+                "omnigent_mcp": False,
+            },
+        )
+    )
+    assert env["HARNESS_ACP_OMNIGENT_MCP"] == "0"
+
+
 @pytest.mark.parametrize(
     "acp_agent",
-    [None, "not-a-mapping", {}, {"name": "Helper"}, {"name": "Helper", "command": " "}],
+    [
+        None,
+        "not-a-mapping",
+        {},
+        {"name": "Helper"},
+        {"name": "Helper", "command": " "},
+        {"name": "Helper", "command": "helper", "omnigent_mcp": "false"},
+    ],
 )
 def test_malformed_embedded_agent_fails_loudly(acp_agent: object) -> None:
     with pytest.raises(ValueError, match="executor acp_agent"):
         _build_acp_spawn_env(_make_spec(harness="acp:helper", acp_agent=acp_agent))
+
+
+def test_env_passthrough_names_are_forwarded(_isolate_config: Path) -> None:
+    """Declared names reach the wrap so the agent can authenticate."""
+    _write_acp_config(
+        _isolate_config,
+        agents=[
+            {
+                "name": "Grok Build",
+                "command": "grok agent stdio",
+                "env_passthrough": ["XAI_API_KEY", "GROK_TOKEN"],
+            }
+        ],
+    )
+    env = _build_acp_spawn_env(_make_spec(harness="acp:grok-build"))
+    assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == "XAI_API_KEY,GROK_TOKEN"
+
+
+def test_env_passthrough_absent_when_undeclared(_isolate_config: Path) -> None:
+    """No declaration writes no var, so the spawn env stays deny-by-default."""
+    _write_acp_config(_isolate_config)
+    env = _build_acp_spawn_env(_make_spec(harness="acp:goose"))
+    assert "HARNESS_ACP_ENV_PASSTHROUGH" not in env
+
+
+def test_embedded_agent_forwards_env_passthrough(_isolate_config: Path) -> None:
+    """A spec-embedded one-shot agent declares names the same way."""
+    _write_acp_config(_isolate_config, agents=[])
+    spec = _make_spec(
+        harness="acp:embedded",
+        acp_agent={
+            "name": "Embedded",
+            "command": "agent stdio",
+            "env_passthrough": ["XAI_API_KEY"],
+        },
+    )
+    env = _build_acp_spawn_env(spec)
+    assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == "XAI_API_KEY"

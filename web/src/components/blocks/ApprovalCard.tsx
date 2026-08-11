@@ -149,8 +149,6 @@ interface ApprovalCardProps {
    * elicitation (edit tools take the ``allowAllEdits`` path instead).
    */
   rememberScope?: RememberScope | null;
-  /** Whether this viewer may accept the pending action. Rejection stays available. */
-  canApprove?: boolean;
   /**
    * Verdict submitter override. Defaults to `chatStore.submitApproval`
    * (the in-chat path: optimistic block flip + resolve POST + rollback).
@@ -175,7 +173,6 @@ export function ApprovalCard({
   codexCommand,
   allowAllEdits,
   rememberScope,
-  canApprove = true,
   onSubmit,
 }: ApprovalCardProps) {
   const submit: SubmitApprovalFn =
@@ -289,12 +286,12 @@ export function ApprovalCard({
     : undefined;
   const binaryButtons = (
     <div className="flex flex-wrap gap-2 pt-1">
-      <Button size="sm" onClick={() => submitBinary("accept")} disabled={!canApprove}>
+      <Button size="sm" onClick={() => submitBinary("accept")}>
         <CheckIcon className="mr-1 size-3.5" />
         Approve
       </Button>
       {allowAllEdits && (
-        <Button size="sm" variant="outline" onClick={submitAllowAllEdits} disabled={!canApprove}>
+        <Button size="sm" variant="outline" onClick={submitAllowAllEdits}>
           <CheckIcon className="mr-1 size-3.5" />
           Accept & allow all edits
         </Button>
@@ -304,7 +301,6 @@ export function ApprovalCard({
           size="sm"
           variant="outline"
           onClick={submitRemember}
-          disabled={!canApprove}
           title={rememberTitle}
           data-testid="approval-card-remember"
         >
@@ -320,7 +316,7 @@ export function ApprovalCard({
   );
   const codexCommandButtons = (
     <div className="flex flex-wrap items-center gap-2 pt-1" data-testid="codex-command-actions">
-      <Button size="sm" onClick={() => submitBinary("accept")} disabled={!canApprove}>
+      <Button size="sm" onClick={() => submitBinary("accept")}>
         <CheckIcon className="mr-1 size-3.5" />
         Approve
       </Button>
@@ -329,7 +325,6 @@ export function ApprovalCard({
           size="sm"
           variant="outline"
           onClick={() => submitExecPolicyAmendment(execPolicyAmendment)}
-          disabled={!canApprove}
         >
           <CheckIcon className="mr-1 size-3.5" />
           Approve and remember
@@ -412,22 +407,22 @@ export function ApprovalCard({
         data-state="responded"
         className="flex flex-col gap-1 border-muted"
       >
-        <AlertTitle className="flex items-center gap-2 text-sm">
+        <AlertTitle className="flex items-center gap-2 text-ui">
           {icon}
           {label}
-          {policyName && <span className="text-muted-foreground text-xs">· {policyName}</span>}
+          {policyName && <span className="text-muted-foreground text-sm">· {policyName}</span>}
         </AlertTitle>
-        <AlertDescription className="flex flex-col gap-1 text-xs">
+        <AlertDescription className="flex flex-col gap-1 text-sm">
           {isCodexCommandApproval ? (
             <>
               {codexCommand.reason && <span>{codexCommand.reason}</span>}
-              <pre className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap">
+              <pre className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap">
                 {codexCommand.command}
               </pre>
               {codexCommand.cwd && (
                 <span>
                   <span className="text-muted-foreground">cwd: </span>
-                  <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">
+                  <code className="rounded bg-muted px-1 py-0.5 font-mono text-sm">
                     {codexCommand.cwd}
                   </code>
                 </span>
@@ -463,7 +458,7 @@ export function ApprovalCard({
       data-state="pending"
       className="flex flex-col gap-2 py-3 px-4"
     >
-      <AlertTitle className="flex items-center gap-2 text-sm">
+      <AlertTitle className="flex items-center gap-2 text-ui">
         {isCodexCommandApproval ? (
           <TerminalIcon className="size-4 text-yellow-600 dark:text-yellow-400" />
         ) : isExitPlanMode ? (
@@ -481,18 +476,13 @@ export function ApprovalCard({
                 ? "Choose an option"
                 : "Approval required"}
         {policyName && !isAskUserQuestion && !isExitPlanMode && (
-          <span className="text-muted-foreground text-xs">· {policyName}</span>
+          <span className="text-muted-foreground text-sm">· {policyName}</span>
         )}
         {phase && !isMultiChoice && !isAskUserQuestion && !isExitPlanMode && (
-          <span className="text-muted-foreground text-xs">({phase})</span>
+          <span className="text-muted-foreground text-sm">({phase})</span>
         )}
       </AlertTitle>
       <AlertDescription className="flex flex-col gap-2">
-        {!canApprove && (
-          <span className="text-xs text-muted-foreground" role="note">
-            Only the session owner or a delegated approver can approve. You can still reject.
-          </span>
-        )}
         {isExitPlanMode ? (
           <>
             <span>Claude finished planning and wants to proceed.</span>
@@ -501,7 +491,6 @@ export function ApprovalCard({
               onAcceptAuto={submitAllowAllEdits}
               onAccept={() => submitBinary("accept")}
               onReject={submitPlanRejection}
-              canApprove={canApprove}
             />
           </>
         ) : isAskUserQuestion ? (
@@ -509,17 +498,16 @@ export function ApprovalCard({
             questions={askPayload.questions}
             onSubmit={submitAnswers}
             onReject={() => submitBinary("decline")}
-            canSubmit={canApprove}
           />
         ) : isCodexCommandApproval ? (
           <>
             <span>Codex wants to run this command.</span>
             {codexCommand.reason && <span className="text-foreground">{codexCommand.reason}</span>}
-            <pre className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-xs text-foreground whitespace-pre-wrap">
+            <pre className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-sm text-foreground whitespace-pre-wrap">
               {codexCommand.command}
             </pre>
             {codexCommand.cwd && (
-              <span className="text-xs">
+              <span className="text-sm">
                 cwd:{" "}
                 <code className="rounded bg-muted px-1 py-0.5 font-mono">{codexCommand.cwd}</code>
               </span>
@@ -530,7 +518,7 @@ export function ApprovalCard({
           <>
             <span>{message}</span>
             {formattedPreview && (
-              <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap break-words">
+              <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
                 {formattedPreview}
               </pre>
             )}
@@ -551,7 +539,6 @@ export function ApprovalCard({
                     size="sm"
                     variant="outline"
                     onClick={() => submitOption(optLabel)}
-                    disabled={!canApprove}
                   >
                     {optLabel}
                   </Button>
@@ -577,11 +564,9 @@ export function ApprovalCard({
 export function ElicitationCard({
   item,
   onSubmit,
-  canApprove,
 }: {
   item: Extract<RenderItem, { kind: "elicitation" }>;
   onSubmit?: SubmitApprovalFn;
-  canApprove?: boolean;
 }) {
   return (
     <ApprovalCard
@@ -599,7 +584,6 @@ export function ElicitationCard({
       codexCommand={item.codexCommand}
       allowAllEdits={item.allowAllEdits}
       rememberScope={item.rememberScope}
-      canApprove={canApprove}
       onSubmit={onSubmit}
     />
   );

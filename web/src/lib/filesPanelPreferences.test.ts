@@ -12,19 +12,14 @@ afterEach(() => {
 });
 
 describe("filesPanelPreferences", () => {
-  it("defaults to the full tree (All) when nothing is stored", () => {
-    // The whole point: with no saved choice the scope is "All"
-    // (changedOnly false), not "Changed".
+  it("defaults the sort order when nothing is stored", () => {
     expect(readFilesPanelPreferences()).toEqual(DEFAULT_FILES_PANEL_PREFERENCES);
-    expect(DEFAULT_FILES_PANEL_PREFERENCES.changedOnly).toBe(false);
+    expect(DEFAULT_FILES_PANEL_PREFERENCES.sort).toBe("recent");
   });
 
   it("round-trips a written preference", () => {
-    writeFilesPanelPreferences({ changedOnly: true, sort: "alpha" });
-    expect(readFilesPanelPreferences()).toEqual({
-      changedOnly: true,
-      sort: "alpha",
-    });
+    writeFilesPanelPreferences({ sort: "alpha" });
+    expect(readFilesPanelPreferences()).toEqual({ sort: "alpha" });
   });
 
   it("falls back to defaults on malformed JSON", () => {
@@ -40,21 +35,8 @@ describe("filesPanelPreferences", () => {
     expect(readFilesPanelPreferences()).toEqual(DEFAULT_FILES_PANEL_PREFERENCES);
   });
 
-  it("defaults changedOnly when the stored field has the wrong type", () => {
-    // A record present but with a non-boolean changedOnly must default the
-    // field rather than pass a garbage value through to the panel.
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ changedOnly: "yes" }));
-    expect(readFilesPanelPreferences()).toEqual({
-      changedOnly: false,
-      sort: "recent",
-    });
-  });
-
   it("defaults sort when the stored value is invalid", () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ changedOnly: true, sort: "bogus" }));
-    expect(readFilesPanelPreferences()).toEqual({
-      changedOnly: true,
-      sort: "recent",
-    });
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ sort: "bogus" }));
+    expect(readFilesPanelPreferences()).toEqual({ sort: "recent" });
   });
 });

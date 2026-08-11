@@ -66,6 +66,7 @@ async def test_events_effort_change_on_native_session_skips_inject_for_unsupport
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Fail the test if the runner reaches inject for an unsupported level."""
         del bridge_dir, command, timeout_s
@@ -141,6 +142,7 @@ async def test_events_effort_change_on_native_session_returns_503_when_bridge_no
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Simulate the bridge-not-ready path."""
         del bridge_dir, command, timeout_s
@@ -216,6 +218,7 @@ async def test_events_effort_change_on_non_native_session_is_204_noop(
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Fail the test if a non-native session reaches the injector."""
         del bridge_dir, command, timeout_s
@@ -301,6 +304,7 @@ async def test_events_compact_on_native_session_types_slash_command(
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Record the call (including auto_confirm) without touching tmux."""
         captured.append((bridge_dir, command, timeout_s, auto_confirm))
@@ -408,6 +412,7 @@ async def test_events_compact_on_native_session_returns_503_when_bridge_not_read
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Simulate the bridge-not-ready path."""
         del bridge_dir, command, timeout_s, auto_confirm
@@ -1648,6 +1653,7 @@ async def test_events_compact_on_non_native_session_is_204_noop(
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Fail the test if a non-native session reaches the injector."""
         del bridge_dir, command, timeout_s, auto_confirm
@@ -1847,11 +1853,19 @@ async def test_events_model_change_on_native_session_types_slash_command(
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Record the call and return without touching tmux."""
-        captured.append((bridge_dir, command, timeout_s))
+        captured.append((bridge_dir, command, timeout_s, confirm_hint))
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    # The pane's own picker vocabulary: this id occupies the custom slot, so
+    # ``/model`` takes it exactly rather than stepping down to ``opus``.
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_env",
+        lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
+    )
 
     native_spec = AgentSpec(
         spec_version=1,
@@ -1909,14 +1923,81 @@ async def test_events_model_change_on_native_session_types_slash_command(
     assert len(captured) == 1, (
         f"Expected one inject_slash_command call from native model_change, got {len(captured)}."
     )
-    _bridge_dir, command, timeout_s = captured[0]
+    _bridge_dir, command, timeout_s, confirm_hint = captured[0]
     assert command == "/model claude-opus-4-7", (
         f"Expected '/model claude-opus-4-7' literal, got {command!r}."
     )
     assert timeout_s == 1.0
+    # The model dialog's title is known, so it is polled for rather than
+    # confirmed blind after a fixed settle.
+    assert confirm_hint == claude_native_bridge.SWITCH_MODEL_DIALOG_HINT
     assert queued_events == [], (
         f"model_change must not publish session events; got {queued_events!r}."
     )
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_rejects_a_model_the_picker_cannot_spell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A model outside the pane's ``/model`` vocabulary fails loud, typing nothing.
+
+    Typing a bare catalog id the picker has no row for leaves the pane on its
+    old model while the handler reports success, so the session's recorded
+    model diverges from the one it is running.
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    captured: list[Any] = []
+
+    def _fake_inject(bridge_dir: Any, **kwargs: Any) -> None:
+        """Record any injection so the assertion can prove none happened."""
+        captured.append((bridge_dir, kwargs))
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    # Every alias is pinned to something else, so the routed id maps to nothing
+    # ``/model`` accepts.
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_env",
+        lambda _bridge_dir: {"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5"},
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "57c7c1acc5eeec3978c5e62043da51a5",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            "/v1/sessions/57c7c1acc5eeec3978c5e62043da51a5/events",
+            json={"type": "model_change", "model": "databricks-claude-opus-4-8"},
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_unsupported"
+    assert captured == []
 
 
 @pytest.mark.asyncio
@@ -2017,6 +2098,7 @@ async def test_events_model_change_on_native_session_skips_inject_for_empty_or_n
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Fail the test if the runner reaches inject for an empty value."""
         del bridge_dir, command, timeout_s
@@ -2088,6 +2170,7 @@ async def test_events_model_change_on_native_session_returns_503_when_bridge_not
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Simulate the bridge-not-ready path."""
         del bridge_dir, command, timeout_s
@@ -2159,6 +2242,7 @@ async def test_events_model_change_on_non_native_session_is_204_noop(
         command: str,
         timeout_s: float,
         auto_confirm: bool = False,
+        confirm_hint: str | None = None,
     ) -> None:
         """Fail the test if a non-native session reaches the injector."""
         del bridge_dir, command, timeout_s
@@ -2223,11 +2307,17 @@ async def test_events_model_change_on_cursor_native_session_types_slash_command(
     """
     from omnigent.spec.types import ExecutorSpec
 
-    captured: list[tuple[Any, str, float]] = []
+    captured: list[tuple[Any, str, str | None, float]] = []
 
-    def _fake_inject(bridge_dir: Any, *, model: str, timeout_s: float) -> None:
+    def _fake_inject(
+        bridge_dir: Any,
+        *,
+        model: str,
+        expected_display_name: str | None,
+        timeout_s: float,
+    ) -> None:
         """Record the call and return without touching tmux."""
-        captured.append((bridge_dir, model, timeout_s))
+        captured.append((bridge_dir, model, expected_display_name, timeout_s))
 
     monkeypatch.setattr(cursor_native_bridge, "inject_model_command", _fake_inject)
 
@@ -2269,8 +2359,9 @@ async def test_events_model_change_on_cursor_native_session_types_slash_command(
         f"got {resp.status_code}: {resp.text}"
     )
     assert len(captured) == 1, f"Expected one inject_model_command call, got {len(captured)}."
-    _bridge_dir, model, timeout_s = captured[0]
+    _bridge_dir, model, expected_display_name, timeout_s = captured[0]
     assert model == "gpt-5.2", f"Expected the model id passed through, got {model!r}."
+    assert expected_display_name is None
     assert timeout_s == 1.0
 
 
@@ -2348,9 +2439,15 @@ async def test_events_model_change_on_cursor_native_session_returns_503_when_not
     """
     from omnigent.spec.types import ExecutorSpec
 
-    def _fake_inject(bridge_dir: Any, *, model: str, timeout_s: float) -> None:
+    def _fake_inject(
+        bridge_dir: Any,
+        *,
+        model: str,
+        expected_display_name: str | None,
+        timeout_s: float,
+    ) -> None:
         """Simulate the bridge-not-ready path."""
-        del bridge_dir, model, timeout_s
+        del bridge_dir, model, expected_display_name, timeout_s
         raise RuntimeError("tmux target is not advertised")
 
     monkeypatch.setattr(cursor_native_bridge, "inject_model_command", _fake_inject)

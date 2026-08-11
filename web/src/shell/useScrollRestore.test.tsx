@@ -38,7 +38,12 @@ function mount(scrollKey: string | null, ready = true) {
 let now = 0;
 
 async function nextFrame() {
-  await act(() => new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))));
+  await act(
+    () =>
+      new Promise((resolve) => {
+        requestAnimationFrame(() => resolve(undefined));
+      }),
+  );
 }
 
 // jsdom has no layout (scrollHeight/clientHeight are 0), so a saved offset > 0

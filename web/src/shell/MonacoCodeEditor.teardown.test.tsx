@@ -40,7 +40,7 @@ interface FakeEditor {
   restoreViewState: () => void;
   getAction: () => { run: () => void };
   getContribution: () => null;
-  __set: (v: string) => void;
+  setValueForTest: (v: string) => void;
 }
 
 function makeFakeEditor(initial: string): FakeEditor {
@@ -60,7 +60,7 @@ function makeFakeEditor(initial: string): FakeEditor {
     restoreViewState: () => {},
     getAction: () => ({ run: () => {} }),
     getContribution: () => null,
-    __set: (v) => {
+    setValueForTest: (v) => {
       value = v;
     },
   };
@@ -143,7 +143,7 @@ async function renderMounted(el: React.ReactElement) {
 
 // Drive an edit + fire the debounce so a save goes in flight (deferred write).
 async function editAndStartSave() {
-  fakeEditor!.__set(EDITED);
+  fakeEditor!.setValueForTest(EDITED);
   await act(async () => {
     h.onChange?.(EDITED, {});
   });

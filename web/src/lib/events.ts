@@ -8,6 +8,7 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseCreated → "response_created").
 
+import type { RoutingDecisionExtras } from "./routingDecision";
 import type { ErrorInfo, ModelUsage, RememberScope, Response, SandboxLaunchStage } from "./types";
 
 /** Provider-native tool item types. */
@@ -287,7 +288,7 @@ export interface NativeToolCall {
 /** The final assistant message from `output_item.done` (type `message`). */
 export interface MessageDone {
   type: "message_done";
-  content: Array<Record<string, unknown>>;
+  content: Record<string, unknown>[];
   itemId: string;
   responseId: string;
 }
@@ -328,6 +329,8 @@ export interface SlashCommand {
  */
 export interface RoutingDecision {
   type: "routing_decision";
+  /** Routing identity (harness, scope, decision id …); absent on legacy rows. */
+  routing?: RoutingDecisionExtras;
   /** Model id the router chose, e.g. `databricks-claude-opus-4-8`. */
   model: string;
   /** `true` when the brain ran on `model`; `false` = "would have picked". */
@@ -458,8 +461,19 @@ export interface SessionStatusEvent {
   status: "idle" | "launching" | "running" | "waiting" | "failed";
   responseId?: string;
   backgroundTaskCount?: number;
-  /** Structured failure detail; only present when `status === "failed"`. */
-  error?: { code: string; message: string };
+  /**
+   * Short phrase naming what a still-`running` session is parked on, e.g.
+   * "permission prompt". Terminal-backed agents can block on a dialog the
+   * web UI does not mirror; this says why nothing is moving. Absent when
+   * the session is not parked.
+   */
+  blockedOn?: string;
+  /**
+   * Structured failure detail; only present when `status === "failed"`.
+   * Carries the optional `title` / `cause` / `remediation` fields when the
+   * runner classified the failure (see `ErrorInfo`).
+   */
+  error?: ErrorInfo;
 }
 
 /**
@@ -565,11 +579,11 @@ export interface SessionAgentChangedEvent {
 export interface SessionTodosEvent {
   type: "session_todos";
   conversationId: string;
-  todos: Array<{
+  todos: {
     content: string;
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
-  }>;
+  }[];
 }
 
 /**

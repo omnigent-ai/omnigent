@@ -48,13 +48,15 @@ import { OttoIcon } from "@/components/icons/OttoIcon";
 import { PiIcon } from "@/components/icons/PiIcon";
 import { Button } from "@/components/ui/button";
 import { RunningDot } from "@/components/RunningDot";
+import { shortModelName } from "@/components/CostRoutingControl";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
-const SubagentsGraphView = lazy(() =>
-  import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
-);
 import { useSession } from "@/hooks/useSession";
 import type { SessionItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
+
+const SubagentsGraphView = lazy(() =>
+  import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
+);
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import {
   activityDotClassName,
@@ -120,14 +122,14 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   // show alongside the "main" row.
   if (isLoading && children.length === 0) {
     return (
-      <div className="flex h-full flex-1 items-center justify-center px-4 py-8 text-center text-xs text-muted-foreground bg-card">
+      <div className="flex h-full flex-1 items-center justify-center px-4 py-8 text-center text-sm text-muted-foreground bg-card">
         Loading…
       </div>
     );
   }
   if (error && children.length === 0) {
     return (
-      <div className="flex h-full flex-1 items-center justify-center px-4 py-8 text-center text-xs text-muted-foreground bg-card">
+      <div className="flex h-full flex-1 items-center justify-center px-4 py-8 text-center text-sm text-muted-foreground bg-card">
         Failed to load agents.
       </div>
     );
@@ -139,7 +141,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
         <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
         <Suspense
           fallback={
-            <div className="flex h-full flex-1 items-center justify-center text-xs text-muted-foreground">
+            <div className="flex h-full flex-1 items-center justify-center text-sm text-muted-foreground">
               Loading graph…
             </div>
           }
@@ -341,7 +343,7 @@ function StatusIndicator({ activity, label, details }: AgentStatus) {
         aria-label={title}
         title={title}
         data-testid="subagent-status-dot"
-        className="inline-flex shrink-0 items-center text-xs"
+        className="inline-flex shrink-0 items-center text-sm"
       >
         <Badge className="border-transparent bg-warning/15 text-warning">Needs response</Badge>
       </span>
@@ -353,7 +355,7 @@ function StatusIndicator({ activity, label, details }: AgentStatus) {
         aria-label={title}
         title={title}
         data-testid="subagent-status-dot"
-        className="inline-flex shrink-0 items-center gap-1 text-destructive text-xs"
+        className="inline-flex shrink-0 items-center gap-1 text-destructive text-sm"
       >
         <span>{label}</span>
         <span
@@ -380,7 +382,7 @@ function StatusIndicator({ activity, label, details }: AgentStatus) {
       aria-label={title}
       title={title}
       data-testid="subagent-status-dot"
-      className={cn("inline-flex shrink-0 items-center gap-1 text-xs", wrapperTextClass)}
+      className={cn("inline-flex shrink-0 items-center gap-1 text-sm", wrapperTextClass)}
     >
       {!QUIET_STATE[activity] && <span>{label}</span>}
       {activity === "working" ? (
@@ -539,7 +541,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
       >
         <div className="flex w-full items-center gap-1">
           <Icon className="size-3.5 shrink-0 text-muted-foreground" />
-          <span className="shrink-0 truncate text-xs font-medium">{label}</span>
+          <span className="shrink-0 truncate text-sm font-medium">{label}</span>
           <span className="flex-1" />
           <StatusIndicator {...sessionStatus(session?.status, session?.lastTaskError)} />
         </div>
@@ -547,7 +549,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
           // Indented to align with the title text above: 14px icon + 4px gap.
           <p
             data-testid="subagent-main-preview"
-            className="truncate pl-[18px] text-[11px] text-muted-foreground"
+            className="truncate pl-[18px] text-sm text-muted-foreground"
           >
             {preview}
           </p>
@@ -646,7 +648,18 @@ function SubagentRow({
               />
             )}
             <Icon className="size-3.5 shrink-0 text-muted-foreground" />
-            <span className="shrink-0 truncate text-xs font-medium">{primary}</span>
+            <span className="shrink-0 truncate text-sm font-medium">{primary}</span>
+            {child.routed_model ? (
+              // Model the intelligent router picked for this sub-agent — the
+              // per-subagent half of routing visibility.
+              <span
+                data-testid="subagent-routed-model"
+                title={`Smart routing picked ${child.routed_model}`}
+                className="shrink-0 truncate font-mono text-[10px] text-muted-foreground"
+              >
+                {shortModelName(child.routed_model)}
+              </span>
+            ) : null}
             <span className="flex-1" />
             <StatusIndicator {...status} />
           </div>
@@ -655,7 +668,7 @@ function SubagentRow({
             // above: 12px connector - 12px (-ml-3) + 4px gap + 14px bot
             // icon + 4px gap = 22px. Relative to the row's own padding,
             // so it tracks the depth-stepped gutter automatically.
-            <p className="truncate pl-[22px] text-[11px] text-muted-foreground">
+            <p className="truncate pl-[22px] text-sm text-muted-foreground">
               {child.last_message_preview}
             </p>
           )}

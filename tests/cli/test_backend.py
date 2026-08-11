@@ -11,10 +11,14 @@ wiring that routes ``--server`` through them.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import re
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import click
 import pytest
@@ -270,6 +274,26 @@ def test_build_host_daemon_env_remote_strips_provider_credentials(
     assert "ANTHROPIC_API_KEY" not in env
     # Databricks auth is intentionally preserved for the daemon's server auth.
     assert env["DATABRICKS_TOKEN"] == "test-databricks-token"
+
+
+def test_build_host_daemon_env_remote_keeps_runner_env_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator env-forwarding control var survives the remote daemon hop.
+
+    ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` names extra env vars for the daemon to
+    forward on to runners. In ``--server`` mode the daemon env is allowlisted by
+    a prefix set that includes ``DATABRICKS_`` but *not* plain ``OMNIGENT_``, so
+    without an explicit allowlist entry the control var itself is stripped here —
+    and ``_build_runner_env`` never sees the names it lists, making the whole
+    passthrough a silent no-op remotely. It carries only var names, not secrets.
+    """
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "MY_GATEWAY_TOKEN")
+
+    env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
+
+    assert env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "MY_GATEWAY_TOKEN"
 
 
 def test_ensure_host_daemon_reuses_same_target(
@@ -594,6 +618,101 @@ def test_daemon_host_online_false_when_no_host_id(
         resolved_server_url="http://127.0.0.1:8123",
     )
     assert cli._daemon_host_online(record) is False
+
+
+# Every proxy variable httpx consults, so the cases below see exactly the
+# ambient proxy configuration they set up (a developer's own ``NO_PROXY``
+# would otherwise exempt loopback and skip the proxy transport entirely).
+_PROXY_ENV_VARS = (
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+)
+
+
+def _socks_proxy_without_extra(monkeypatch: pytest.MonkeyPatch, base_url: str) -> None:
+    """Point the ambient environment at a SOCKS proxy httpx cannot build.
+
+    Reproduces a shell exporting ``ALL_PROXY=socks5://…`` on an install
+    without the ``httpx[socks]`` extra: httpx raises ``ImportError`` while
+    constructing the client. Blanking ``socksio`` in :data:`sys.modules`
+    makes the extra look absent whether or not it is really installed.
+
+    :param monkeypatch: Fixture used to scope the environment changes.
+    :param base_url: Server URL to pre-seed headers for, so the probe does
+        not resolve real credentials.
+    """
+    for name in _PROXY_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:1080")
+    monkeypatch.setitem(sys.modules, "socksio", None)
+    monkeypatch.setitem(cli._host_http_headers_cache, base_url, {})
+
+
+def test_host_http_json_reports_failure_when_socks_extra_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxy httpx cannot build is a transport failure, not a crash.
+
+    Uses a remote server because that is where a proxy still applies:
+    loopback targets bypass proxies outright (see the companion test), so
+    there is no proxy transport left to fail to build.
+    """
+    base_url = "https://server.example.com"
+    _socks_proxy_without_extra(monkeypatch, base_url)
+
+    result = cli._host_http_json(
+        base_url=base_url,
+        method="GET",
+        path="/v1/hosts/host_abc",
+        timeout_s=2.0,
+    )
+
+    assert result.status_code == 0
+    assert "socksio" in str(result.body)
+
+
+def test_host_http_json_ignores_proxy_for_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The local server is reached directly, never through a proxy.
+
+    A proxy resolves ``127.0.0.1`` against itself, so honoring one here
+    means a developer who exports ``ALL_PROXY`` cannot reach their own
+    server at all — every call fails before it leaves the machine.
+    """
+    base_url = "http://127.0.0.1:8123"
+    _socks_proxy_without_extra(monkeypatch, base_url)
+
+    result = cli._host_http_json(
+        base_url=base_url,
+        method="GET",
+        path="/v1/hosts/host_abc",
+        timeout_s=2.0,
+    )
+
+    assert result.status_code == 0
+    # The SOCKS transport was never built, so this is an ordinary refused
+    # connection rather than the missing-extra ImportError.
+    assert "socksio" not in str(result.body)
+
+
+def test_daemon_host_online_false_when_socks_extra_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reuse probe degrades to "offline" instead of failing the command.
+
+    ``_daemon_host_online`` runs on the way into every command that ensures
+    the backend, so an unbuildable proxy must not escape as an exception.
+    """
+    _socks_proxy_without_extra(monkeypatch, "http://127.0.0.1:8123")
+
+    assert cli._daemon_host_online(_online_record()) is False
 
 
 def test_daemon_tunnel_recovers_returns_true_on_immediate_online(
@@ -1042,7 +1161,9 @@ def test_host_status_wide_terminal_shows_full_session_and_runner_ids() -> None:
     """Wide ``host status`` tables preserve full session and runner ids."""
     session_id = "conv_1234567890abcdef1234567890abcdef12345678"
     runner_id = "runner_token_1234567890abcdef1234567890abcdef12345678"
-    console = Console(width=180, record=True, color_system=None)
+    # Rich only honours an explicit width when height is set too; otherwise
+    # it falls back to detecting the real terminal size.
+    console = Console(width=180, height=40, record=True, color_system=None)
 
     cli._add_host_payload_sessions_table(
         console,
@@ -1062,6 +1183,127 @@ def test_host_status_wide_terminal_shows_full_session_and_runner_ids() -> None:
     rendered = console.export_text()
     assert session_id in rendered
     assert runner_id in rendered
+
+
+_LONG_SERVER_URL = "https://omnigent-000000000000000.workspace.example.databricksapps.com"
+_LONG_LOG_PATH = "/Users/example/.omnigent/logs/host/host-20260801-095205-263883.log"
+
+_ANSI_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;]*[A-Za-z]")
+_OSC8_OPEN_RE = re.compile(r"\x1b\]8;[^;]*;([^\x1b\x07]+)(?:\x07|\x1b\\)")
+_OSC8_CLOSE_RE = re.compile(r"\x1b\]8;[^;]*;(?:\x07|\x1b\\)")
+
+
+def _render_host_status(*, width: int, payload: dict[str, Any]) -> str:
+    """Render one host-status payload through a fixed-width terminal console.
+
+    :param width: Terminal width in cells, e.g. ``60``.
+    :param payload: Daemon payload as built by ``_daemon_status_payload``.
+    :returns: Rendered output including ANSI and OSC escape sequences.
+    """
+    buffer = io.StringIO()
+    console = Console(
+        file=buffer,
+        width=width,
+        height=40,
+        force_terminal=True,
+        color_system="truecolor",
+        highlight=False,
+    )
+    with patch.object(cli, "_host_console", lambda: console):
+        cli._echo_daemon_payloads([payload])
+    return buffer.getvalue()
+
+
+def _daemon_payload(**overrides: Any) -> dict[str, Any]:
+    """Build a daemon status payload for host-status rendering tests.
+
+    :param overrides: Payload fields to replace, e.g. ``server_url``.
+    :returns: Payload accepted by ``_echo_daemon_payloads``.
+    """
+    payload: dict[str, Any] = {
+        "target": _LONG_SERVER_URL,
+        "mode": "server",
+        "server_url": _LONG_SERVER_URL,
+        "pid": 45867,
+        "process": "online",
+        "log_path": _LONG_LOG_PATH,
+        "host_id": "host_77599b2c44934910b00cfdfda3ba21fc",
+        "host_status": "online",
+        "sessions": [],
+        "error": None,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_host_status_links_the_full_server_url_when_display_is_shortened() -> None:
+    """A narrow ``host status`` still links the untruncated server URL.
+
+    Middle-truncating the URL into the visible text is fine, but the click
+    target must stay openable rather than pointing at ``https://omni…com``.
+    """
+    rendered = _render_host_status(width=60, payload=_daemon_payload())
+
+    targets = _OSC8_OPEN_RE.findall(rendered)
+    assert _LONG_SERVER_URL in targets, f"full server URL is not a link target: {targets!r}"
+    assert "…" in _ANSI_RE.sub("", rendered), "expected the narrow display text to be shortened"
+    assert not any("…" in target for target in targets), (
+        f"a truncated URL was used as a click target: {targets!r}"
+    )
+
+
+def test_host_status_hyperlinks_never_span_a_line_break() -> None:
+    """Every hyperlink opened by ``host status`` closes on the same line.
+
+    An unterminated OSC 8 run makes the terminal treat the rest of the
+    status block as part of the link, so clicking opens a URL with the
+    following lines glued on.
+    """
+    rendered = _render_host_status(width=60, payload=_daemon_payload(error="host not found"))
+
+    for line in rendered.split("\n"):
+        opens = len(_OSC8_OPEN_RE.findall(line))
+        closes = len(_OSC8_CLOSE_RE.findall(line))
+        assert opens == closes, f"unbalanced hyperlink escapes on line: {line!r}"
+
+
+def test_host_status_lines_fit_the_terminal_width() -> None:
+    """``host status`` lines stay inside the terminal width.
+
+    A line that fills or exceeds the width is soft-wrapped, and terminals
+    join soft-wrapped rows into one logical line when detecting links —
+    which is how the log path and the URL end up merged into one target.
+    """
+    width = 60
+    rendered = _render_host_status(width=width, payload=_daemon_payload())
+
+    for line in rendered.split("\n"):
+        visible = _ANSI_RE.sub("", line)
+        assert len(visible) < width, f"line fills or overflows the terminal: {visible!r}"
+
+
+def test_host_status_links_the_daemon_log_path() -> None:
+    """The daemon log path is emitted as a clickable ``file://`` link."""
+    rendered = _render_host_status(width=60, payload=_daemon_payload())
+
+    targets = _OSC8_OPEN_RE.findall(rendered)
+    assert f"file://{_LONG_LOG_PATH}" in targets, f"log path is not linked: {targets!r}"
+
+
+def test_host_status_plain_output_has_no_escape_sequences() -> None:
+    """Piped ``host status`` output stays free of hyperlink escapes.
+
+    Link markup must degrade to plain text so redirected output and
+    ``grep`` keep working.
+    """
+    buffer = io.StringIO()
+    console = Console(file=buffer, width=100, height=40, force_terminal=False, highlight=False)
+    with patch.object(cli, "_host_console", lambda: console):
+        cli._echo_daemon_payloads([_daemon_payload()])
+
+    rendered = buffer.getvalue()
+    assert "\x1b" not in rendered, f"unexpected escape sequences in piped output: {rendered!r}"
+    assert _LONG_SERVER_URL in rendered
 
 
 def test_host_sessions_subcommand_is_removed() -> None:
@@ -1163,6 +1405,85 @@ def test_host_stop_daemon_only_skips_session_stop(
 
     assert result.exit_code == 0, result.output
     assert terminated == ["https://server.example.com"]
+
+
+def test_host_stop_session_list_timeout_points_at_force(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A session-list timeout names the flags that stop the daemon anyway.
+
+    ``GET /v1/sessions`` is one of the slowest managed APIs, so the
+    pre-check times out on healthy hosts. The failure has to name the
+    escape hatch or the daemon looks unstoppable.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: cli._HostHttpResult(
+            status_code=0,
+            body="ReadTimeout: The read operation timed out",
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: pytest.fail("daemon terminated despite the failure"),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com"],
+    )
+
+    assert result.exit_code != 0
+    assert "ReadTimeout" in result.output
+    assert "--force" in result.output
+    assert "--daemon-only" in result.output
+
+
+def test_host_stop_force_terminates_after_session_list_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--force`` stops the daemon when the session pre-check times out."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: cli._HostHttpResult(
+            status_code=0,
+            body="ReadTimeout: The read operation timed out",
+        ),
+    )
+    terminated: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: terminated.append(record.target),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com", "--force"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert terminated == ["https://server.example.com"]
+    assert "sessions_stopped=0" in result.output
 
 
 def test_host_stop_session_stops_only_named_sessions(

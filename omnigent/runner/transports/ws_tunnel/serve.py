@@ -19,9 +19,10 @@ import contextlib
 import logging
 import random
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import TypeAlias
 from urllib.parse import quote, urlsplit, urlunsplit
 
+from starlette.types import ASGIApp, Message, Scope
 from websockets.exceptions import ConnectionClosedOK, InvalidURI, WebSocketException
 
 from omnigent.runner.identity import (
@@ -54,15 +55,7 @@ from omnigent.tls import client_ssl_context
 
 _logger = logging.getLogger(__name__)
 
-# ASGI app type — async callable with the standard 3-arg shape.
-_ASGIApp = Callable[
-    [
-        dict[str, Any],
-        Callable[[], Awaitable[dict[str, Any]]],
-        Callable[[dict[str, Any]], Awaitable[None]],
-    ],
-    Awaitable[None],
-]
+_ASGIApp: TypeAlias = ASGIApp
 
 # Reconnect backoff: 0.5 s initial, 10 s cap, ±50% jitter. The
 # jitter spreads simultaneous reconnects from many runners across
@@ -80,8 +73,17 @@ _INITIAL_RECONNECT_DELAY_S = 0.5
 _MAX_RECONNECT_DELAY_S = 10.0
 _RECONNECT_JITTER_FRACTION = 0.5
 _FATAL_SERVER_CLOSE_CODES = {4001, 4002, 4004, 4500}
-_REFRESHABLE_HTTP_STATUSES = {401}
-_FATAL_SERVER_HTTP_STATUSES = {403}
+# Both 401 and 403 are treated as refreshable: the server may return 403
+# (not 401) when a previously-valid token expires while the machine is
+# offline or sleeping. A fresh token from the factory is obtained and the
+# connection is retried with normal backoff. After
+# _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS consecutive rejections the runner
+# gives up — a genuinely-forbidden runner must not busy-reconnect forever.
+_REFRESHABLE_HTTP_STATUSES = {401, 403}
+# Maximum consecutive HTTP 401/403 rejections before the runner exits.
+# A single rejection is almost certainly an expired token; a persistent
+# streak means the credentials can't be fixed and we should fail loud.
+_HTTP_AUTH_REJECTION_FATAL_ATTEMPTS = 3
 # Routine server-initiated recycles, NOT errors: 1012 "service restart" and
 # 1001 "going away" (and a 502 upgrade rejection) are how the Databricks Apps
 # ingress cycles long-lived WebSockets out from under a healthy app. The
@@ -147,7 +149,7 @@ async def dispatch_via_asgi(
     """
     body_bytes = decode_body(frame.body, frame.encoding) if frame.body is not None else b""
 
-    scope = {
+    scope: Scope = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
         "http_version": "1.1",
@@ -167,7 +169,7 @@ async def dispatch_via_asgi(
     response_headers_raw: list[tuple[bytes, bytes]] = []
     head_sent_to_ws: bool = False
 
-    async def receive() -> dict[str, Any]:
+    async def receive() -> Message:
         nonlocal body_sent
         if not body_sent:
             body_sent = True
@@ -183,10 +185,10 @@ async def dispatch_via_asgi(
         # can proxy harness SSE chunks. A real tunnel disconnect or
         # request.cancel frame cancels the dispatch task, which also
         # cancels this receive wait.
-        disconnect: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        disconnect: asyncio.Future[Message] = asyncio.get_running_loop().create_future()
         return await disconnect
 
-    async def send(event: dict[str, Any]) -> None:
+    async def send(event: Message) -> None:
         nonlocal head_sent_to_ws
         ev_type = event.get("type")
         if ev_type == "http.response.start":
@@ -335,11 +337,14 @@ async def serve_tunnel(
     ever_connected = False
     # Consecutive login-page redirects; reset by a successful upgrade.
     login_redirect_streak = 0
+    # Consecutive HTTP 401/403 rejections; reset by a successful upgrade.
+    http_auth_rejection_streak = 0
 
     def _mark_connected() -> None:
-        nonlocal ever_connected, login_redirect_streak
+        nonlocal ever_connected, login_redirect_streak, http_auth_rejection_streak
         ever_connected = True
         login_redirect_streak = 0
+        http_auth_rejection_streak = 0
 
     while True:
         if shutdown_event is not None and shutdown_event.is_set():
@@ -413,38 +418,53 @@ async def serve_tunnel(
                 )
             else:
                 http_status = _websocket_http_status(exc)
-                if http_status in _REFRESHABLE_HTTP_STATUSES:
+                if http_status is not None and http_status in _REFRESHABLE_HTTP_STATUSES:
+                    http_auth_rejection_streak += 1
+                    if http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS:
+                        login_hint = (
+                            f"run `databricks auth login --host {server_url}` to re-authenticate"
+                            if server_url
+                            else "check remote server authentication"
+                        )
+                        raise RuntimeError(
+                            f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
+                            f"(HTTP {http_status} persisted across "
+                            f"{http_auth_rejection_streak} attempts); "
+                            f"{login_hint}"
+                        ) from exc
+                    # Invalidate the cached token so the loop-top _refresh_auth_token
+                    # fetches a fresh one on the next attempt. The loop-top call is
+                    # already guarded against transient factory errors (OSError etc.),
+                    # so we don't call the factory directly here.
                     _invalidate_auth_token_factory(auth_token_factory)
-                    auth_token = await _handle_refreshable_auth_failure(
-                        auth_token_factory, http_status, exc
-                    )
+                    _logger.info("HTTP %d; invalidated auth token, retrying", http_status)
+                    retry_reason = f"HTTP {http_status}; retrying with refreshed token"
                     delay_s = _INITIAL_RECONNECT_DELAY_S
-                    continue
-                if http_status in _FATAL_SERVER_HTTP_STATUSES:
-                    raise RuntimeError(
-                        f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
-                        f"(HTTP {http_status}); check remote server authentication"
-                    ) from exc
-                close_code = _websocket_close_code(exc)
-                if close_code in _FATAL_SERVER_CLOSE_CODES:
-                    raise RuntimeError(
-                        f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
-                        f"(close code {close_code}); check frame protocol compatibility"
-                    ) from exc
-                if (
-                    close_code in _TUNNEL_RECYCLE_CLOSE_CODES
-                    or http_status in _TUNNEL_RECYCLE_HTTP_STATUSES
-                ):
-                    # Routine ingress recycle — reconnect promptly, don't
-                    # escalate the backoff (which would leave the runner
-                    # unregistered for seconds each recycle and drop
-                    # in-flight message delivery).
-                    delay_s = _INITIAL_RECONNECT_DELAY_S
-                    recycle = True
-                    detail = f"close {close_code}" if close_code else f"HTTP {http_status or 0}"
-                    retry_reason = f"server recycled the tunnel ({detail}); reconnecting promptly"
                 else:
-                    retry_reason = str(exc)
+                    close_code = _websocket_close_code(exc)
+                    if close_code in _FATAL_SERVER_CLOSE_CODES:
+                        raise RuntimeError(
+                            f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
+                            f"(close code {close_code}); check frame protocol compatibility"
+                        ) from exc
+                    if (
+                        close_code in _TUNNEL_RECYCLE_CLOSE_CODES
+                        or http_status in _TUNNEL_RECYCLE_HTTP_STATUSES
+                    ):
+                        # Routine ingress recycle — reconnect promptly, don't
+                        # escalate the backoff (which would leave the runner
+                        # unregistered for seconds each recycle and drop
+                        # in-flight message delivery).
+                        delay_s = _INITIAL_RECONNECT_DELAY_S
+                        recycle = True
+                        detail = (
+                            f"close {close_code}" if close_code else f"HTTP {http_status or 0}"
+                        )
+                        retry_reason = (
+                            f"server recycled the tunnel ({detail}); reconnecting promptly"
+                        )
+                    else:
+                        retry_reason = str(exc)
         except (ConnectionError, OSError, ValueError) as exc:
             retry_reason = str(exc)
         jittered = delay_s * (
@@ -514,7 +534,7 @@ async def _handle_refreshable_auth_failure(
     exc: WebSocketException,
 ) -> str | None:
     """
-    Attempt a token refresh after an HTTP 401 rejection.
+    Attempt a token refresh after an HTTP 302 login-page redirect.
 
     If the factory produces a new token, returns it so the caller
     can retry immediately. If no factory is available or the refresh
@@ -522,7 +542,7 @@ async def _handle_refreshable_auth_failure(
 
     :param factory: Sync callable returning a fresh token.
     :param http_status: The HTTP status that triggered this call,
-        e.g. ``401``.
+        e.g. ``302`` for a login-page redirect.
     :param exc: The original ``WebSocketException``.
     :returns: A refreshed token string.
     :raises RuntimeError: When no factory is available or refresh
@@ -903,28 +923,28 @@ async def _handle_tunnel_frame(
     elif isinstance(frame, RequestCancelFrame):
         if on_activity is not None:
             on_activity()
-        task = dispatch_tasks.get(frame.id)
-        if task is not None:
-            task.cancel()
+        dispatch_task = dispatch_tasks.get(frame.id)
+        if dispatch_task is not None:
+            dispatch_task.cancel()
     elif isinstance(frame, WSOpenFrame):
         if on_activity is not None:
             on_activity()
-        channel = _RunnerWSChannel(ch_id=frame.ch_id, send_text=send_text)
-        ws_channels[frame.ch_id] = channel
-        channel.task = asyncio.create_task(
-            _dispatch_ws_via_asgi(app, frame, channel),
+        opened_channel = _RunnerWSChannel(ch_id=frame.ch_id, send_text=send_text)
+        ws_channels[frame.ch_id] = opened_channel
+        opened_channel.task = asyncio.create_task(
+            _dispatch_ws_via_asgi(app, frame, opened_channel),
             name=f"ws-tunnel-attach:{frame.ch_id}",
         )
-        channel.task.add_done_callback(_forget_ws_channel(ws_channels, frame.ch_id))
+        opened_channel.task.add_done_callback(_forget_ws_channel(ws_channels, frame.ch_id))
     elif isinstance(frame, WSFrame):
         if on_activity is not None:
             on_activity()
-        channel = ws_channels.get(frame.ch_id)
-        if channel is None:
+        active_channel = ws_channels.get(frame.ch_id)
+        if active_channel is None:
             _logger.debug("runner: dropping ws.frame for unknown ch_id %r", frame.ch_id)
             return
         if frame.encoding == "utf-8":
-            channel.inbound.put_nowait(("text", frame.data))
+            active_channel.inbound.put_nowait(("text", frame.data))
         elif frame.encoding == "base64":
             try:
                 decoded = base64.b64decode(frame.data, validate=True)
@@ -934,16 +954,16 @@ async def _handle_tunnel_frame(
                     frame.ch_id,
                 )
                 return
-            channel.inbound.put_nowait(("bytes", decoded))
+            active_channel.inbound.put_nowait(("bytes", decoded))
         else:
             _logger.warning("runner: dropping ws.frame with unknown encoding %r", frame.encoding)
     elif isinstance(frame, WSCloseFrame):
         if on_activity is not None:
             on_activity()
-        channel = ws_channels.get(frame.ch_id)
-        if channel is None:
+        closing_channel = ws_channels.get(frame.ch_id)
+        if closing_channel is None:
             return
-        channel.inbound.put_nowait(("close", (frame.code, frame.reason)))
+        closing_channel.inbound.put_nowait(("close", (frame.code, frame.reason)))
 
 
 async def _cancel_dispatch_tasks(dispatch_tasks: dict[str, asyncio.Task[None]]) -> None:
@@ -1001,7 +1021,7 @@ async def _dispatch_ws_via_asgi(
     :param frame: The ``ws.open`` that triggered this dispatch.
     :param channel: Per-channel state for the receive side.
     """
-    scope: dict[str, Any] = {
+    scope: Scope = {
         "type": "websocket",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
         "http_version": "1.1",
@@ -1020,7 +1040,7 @@ async def _dispatch_ws_via_asgi(
     connect_event_consumed = False
     close_seen: tuple[int, str] | None = None
 
-    async def receive() -> dict[str, Any]:
+    async def receive() -> Message:
         nonlocal connect_event_consumed, close_seen
         if not connect_event_consumed:
             connect_event_consumed = True
@@ -1046,7 +1066,7 @@ async def _dispatch_ws_via_asgi(
             return {"type": "websocket.receive", "bytes": bytes(bytes_payload)}
         raise RuntimeError(f"runner ws-channel {channel.ch_id!r}: unknown tag {tag!r}")
 
-    async def send(event: dict[str, Any]) -> None:
+    async def send(event: Message) -> None:
         ev_type = event.get("type")
         if ev_type == "websocket.accept":
             channel.accepted = True

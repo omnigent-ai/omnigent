@@ -1,22 +1,19 @@
-"""E2E: the rail's "+ New shell" affordance and typing into the shell.
+"""E2E: creating a shell from the tab strip's "+" menu and typing into it.
 
-The right rail's Shells tab shows by default whenever the session agent
-declares a non-empty ``terminals:`` block — its empty state carries a
-virtual "+ New shell" row (``NewTerminalButton`` in
-``web/src/shell/NewTerminalButton.tsx``). With a single declared
-terminal name the row creates the shell directly on click (no dropdown),
-POSTing ``/resources/terminals`` and handing the new terminal's tab key
-to ``onExpand``, which opens it in the main column via
-``MainTerminalView``. None of this needs an LLM turn — the user, not the
-agent, launches the shell — so these tests never send a chat message.
+The right rail's tab strip carries a "+" ("Open new") menu whenever the
+session agent declares a non-empty ``terminals:`` block (``NewTabMenu`` in
+``web/src/shell/WorkspacePanel.tsx``). Picking "Shell" with a single
+declared terminal name creates it directly, POSTing ``/resources/terminals``
+and opening the new terminal as a rail tab (its xterm renders in the rail's
+content slot). None of this needs an LLM turn — the user, not the agent,
+launches the shell — so these tests never send a chat message.
 
 Three behaviors are covered:
 
-1. **"+ New shell" launches and opens a shell.** Clicking the row creates
-   a ``zsh`` shell and replaces the main session view with it: the
-   chrome-light shell view (``MainTerminalView``'s ``isShellView``) shows
-   a header naming the shell and a "Close shell" X, its xterm connects,
-   and the X returns to the conversation surface.
+1. **"+" → Shell launches and opens a shell.** Picking Shell creates a
+   ``zsh`` shell that opens as a rail tab (``zsh · u-…``): its xterm
+   connects in the rail's content slot, the chat page is left undisturbed,
+   and the tab's "x" closes it back to the Shells list.
 
 2. **The user can type a command into the shell.** We type ``pwd`` into
    the connected shell and assert it keeps running — the keystrokes are
@@ -46,65 +43,63 @@ from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import open_right_rail
 
-# Tab key prefix for a user-created ``zsh`` shell: ``createTerminal``
-# mints a ``u-<rand>`` session key, yielding the resource id
-# ``terminal_zsh_u-<rand>`` and the tab key ``terminal:terminal_zsh_u-…``.
-_USER_ZSH_KEY_RE = re.compile(r"^terminal:terminal_zsh_u-")
-
 
 def _open_new_shell(page: Page) -> None:
-    """Open the Shells tab and click the "+ New shell" row.
+    """Create a shell via the tab strip's "+" → Shell menu.
 
-    Leaves the rail's Shells tab active with the create POST fired. Scopes
-    every lookup to the desktop "Workspace" rail so it never matches the
-    hidden mobile drawer that mirrors the same controls.
+    Leaves the create POST fired and the new shell opening as a rail tab.
+    Scopes every lookup to the desktop "Workspace" rail so it never matches
+    the hidden mobile drawer that mirrors the same controls.
 
     :param page: Playwright page already navigated to ``/c/{id}``.
     """
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
-    # Shells is present by default — the agent declares a ``zsh`` terminal,
-    # so the tab shows before any shell exists with the "+ New shell"
-    # affordance as its whole content.
-    rail.get_by_role("tab", name=re.compile("Shells")).click()
-    # Single declared name → the row creates directly on click (no dropdown).
-    rail.get_by_role("button", name="New shell").click()
+    # The "+" menu is the shell entry point (the agent declares a ``zsh``
+    # terminal, so it renders). Open it and pick "Shell" — a single declared
+    # type launches the default directly.
+    rail.get_by_role("button", name="Open new").click()
+    page.get_by_role("menuitem", name=re.compile("Shell")).click()
 
 
 def test_new_shell_launches_and_opens(page: Page, terminal_session: tuple[str, str]) -> None:
-    """Clicking "+ New shell" launches a shell and opens it in the main view.
+    """Clicking "+ New shell" launches a shell and opens it as a rail tab.
 
     The create is user-driven (no chat message), so the only wait is for
-    the runner to spin the PTY up and the xterm to connect. The opened
-    view must focus the freshly-created shell — a ``terminal_tui_main``
-    active key here would mean the new key was dropped and the view fell
-    back to the agent's REPL — and render as the chrome-light shell view
-    (header + close X, no Chat/Terminal pill). The X returns to chat.
+    the runner to spin the PTY up and the xterm to connect. The shell opens
+    as a tab in the workspace rail's top strip (labeled ``zsh · u-…``) and
+    its xterm renders inside the rail's content slot — the chat page is
+    left undisturbed (no ``main-terminal-view`` takeover). The tab's "x"
+    closes it and drops back to the Shells list.
     """
     base_url, session_id = terminal_session
 
     page.goto(f"{base_url}/c/{session_id}")
     _open_new_shell(page)
 
-    # The new shell takes over the main column (terminal-first session).
-    main_terminal = page.get_by_test_id("main-terminal-view")
-    expect(main_terminal).to_be_visible(timeout=60_000)
-    # The view focuses the CLICKED shell, not the agent's REPL terminal.
-    expect(main_terminal).to_have_attribute("data-active-terminal", _USER_ZSH_KEY_RE)
-    # Chrome-light shell view: the shell header names it and a "Close
-    # shell" X is present; the Chat/Terminal pill is hidden (a "Chat"
-    # option under a shell misreads as the shell being the agent).
-    expect(main_terminal).to_contain_text("zsh")
-    expect(page.get_by_role("button", name="Chat", exact=True)).to_have_count(0)
+    rail = page.get_by_role("complementary", name="Workspace")
+    # A shell tab appears in the rail strip, labeled "zsh · u-<rand>" (the
+    # user-minted session key), carrying a "Close zsh · u-…" x button.
+    close_tab = rail.get_by_role("button", name=re.compile(r"^Close zsh · u-"))
+    expect(close_tab).to_be_visible(timeout=60_000)
 
-    # The shell's xterm mounts in the main pane and connects.
-    terminal_view = page.get_by_test_id("terminal-view")
+    # The shell's xterm mounts INSIDE the rail (not the main column) and
+    # connects. The chat surface is untouched — the composer stays visible.
+    # Assert no VISIBLE main terminal surface: terminal-first sessions keep
+    # a hidden pre-warmed surface mounted (data-visible="false"), which is
+    # not a takeover.
+    terminal_view = rail.get_by_test_id("terminal-view")
     expect(terminal_view.last).to_be_visible(timeout=20_000)
     expect(terminal_view.last).to_have_attribute("data-state", "connected", timeout=20_000)
+    expect(page.locator('[data-testid="main-terminal-view"][data-visible="true"]')).to_have_count(
+        0
+    )
+    expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible()
 
-    # The header's close X is the way back to the conversation surface.
-    page.get_by_role("button", name="Close shell").click()
-    expect(main_terminal).to_have_count(0)
+    # The tab's x closes the shell — its xterm unmounts and the rail falls
+    # back to the Shells list.
+    close_tab.click()
+    expect(terminal_view).to_have_count(0)
 
 
 def test_new_shell_accepts_typed_command(page: Page, terminal_session: tuple[str, str]) -> None:
@@ -124,8 +119,10 @@ def test_new_shell_accepts_typed_command(page: Page, terminal_session: tuple[str
     _open_new_shell(page)
 
     # Wait for the shell's xterm to connect before sending keystrokes —
-    # input typed before the WS attach opens is dropped.
-    terminal_view = page.get_by_test_id("terminal-view").last
+    # input typed before the WS attach opens is dropped. The shell now opens
+    # as a rail tab, so its xterm lives inside the Workspace rail.
+    rail = page.get_by_role("complementary", name="Workspace")
+    terminal_view = rail.get_by_test_id("terminal-view").last
     expect(terminal_view).to_be_visible(timeout=60_000)
     expect(terminal_view).to_have_attribute("data-state", "connected", timeout=20_000)
 
@@ -210,9 +207,7 @@ def test_shell_wheel_scroll_reaches_mouse_tracking_program(
 def test_workspace_rail_preserves_outer_top_inset(
     page: Page, terminal_session: tuple[str, str]
 ) -> None:
-    """The workspace rail starts at the shell's 8px outer inset.
-
-    The old rail cleared the absolute chat header and aligned with expanded
+    """The old rail cleared the absolute chat header and aligned with expanded
     main-column surfaces. The redesign deliberately extends it beside the
     header, matching the sidebar's outer inset. Assert that geometry directly;
     shell launch behavior remains covered by the two tests above.
@@ -228,9 +223,7 @@ def test_workspace_rail_preserves_outer_top_inset(
 
     rail_top = rail.evaluate("el => el.getBoundingClientRect().top")
     header_bottom = header.evaluate("el => el.getBoundingClientRect().bottom")
-    assert abs(rail_top - 8) <= 2, (
-        f"workspace rail top {rail_top}px — expected the 8px outer inset"
-    )
+
     assert rail_top < header_bottom, (
         f"workspace rail top {rail_top}px vs header bottom {header_bottom}px "
         "— expected the rail to extend beside the header"

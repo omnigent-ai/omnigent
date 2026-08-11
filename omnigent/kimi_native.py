@@ -22,11 +22,11 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
 
 import click
 import httpx
 import yaml
+from omnigent_client._http import is_loopback_url
 
 from omnigent._native_resume_hint import echo_native_cold_resume_hint, echo_native_resume_hint
 from omnigent._platform import resolve_cli_binary
@@ -41,6 +41,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -206,7 +207,7 @@ def _materialize_kimi_agent_spec(tmpdir: Path) -> Path:
     :returns: Path to the generated YAML spec.
     """
     yaml_path = tmpdir / "kimi-native-ui.yaml"
-    raw: dict[str, Any] = {
+    raw: _JsonObject = {
         "name": _AGENT_NAME,
         "prompt": (
             "Kimi is running in the session terminal. The user drives the kimi TUI directly."
@@ -320,7 +321,12 @@ async def _prepare_kimi_terminal_via_daemon(
     """
     persist_args = list(kimi_args)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         # Resuming an existing session can either reattach to a live
         # terminal (prior chat intact) or, if that terminal has exited,
         # cold-start a fresh TUI. We only know which after probing for a
@@ -419,7 +425,7 @@ async def _create_kimi_session(
     terminal_launch_args: list[str] | None = None,
 ) -> str:
     """Create a bundled terminal-first kimi-native session."""
-    metadata: dict[str, Any] = {"labels": dict(_SESSION_LABELS)}
+    metadata: _JsonObject = {"labels": dict(_SESSION_LABELS)}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(
@@ -439,7 +445,7 @@ async def _create_kimi_session(
     return new_session_id
 
 
-async def _fetch_kimi_session(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
+async def _fetch_kimi_session(client: httpx.AsyncClient, session_id: str) -> _JsonObject:
     """Fetch an existing Omnigent session."""
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     if resp.status_code == 404:

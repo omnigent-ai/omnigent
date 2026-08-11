@@ -4,20 +4,53 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { UIMessage } from "ai";
 import { ArrowDownIcon, DownloadIcon } from "lucide-react";
-import type { ComponentProps } from "react";
-import { useCallback } from "react";
+import type { ComponentProps, ReactNode } from "react";
+import { createContext, useCallback, useMemo } from "react";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 
 export type ConversationProps = ComponentProps<typeof StickToBottom>;
 
-export const Conversation = ({ className, ...props }: ConversationProps) => (
+/** StickToBottom's bottom-lock controls, for descendants that reposition the scroll. */
+export interface ConversationScrollLock {
+  stopScroll: () => void;
+  state: { isAtBottom: boolean; escapedFromLock: boolean };
+}
+
+export const ConversationScrollLockContext = createContext<ConversationScrollLock | null>(null);
+
+/**
+ * Exposes the bottom-lock controls to deep descendants without the
+ * library's throwing hook: a component that repositions the scroll (the
+ * "Worked for" fold's snap-to-top) must release the lock first or the
+ * resize-driven scrollToBottom yanks its scroll back to the bottom, and
+ * it must no-op when rendered outside a conversation (tests, previews).
+ * `stopScroll`/`state` exist at runtime but not in the library's public
+ * types — same cast as ChatPage's ConversationScrollRefBridge.
+ */
+const ScrollLockBridge = ({ children }: { children: ReactNode }) => {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> &
+    ConversationScrollLock;
+  const value = useMemo(
+    () => ({ stopScroll: ctx.stopScroll, state: ctx.state }),
+    [ctx.stopScroll, ctx.state],
+  );
+  return (
+    <ConversationScrollLockContext.Provider value={value}>
+      {children}
+    </ConversationScrollLockContext.Provider>
+  );
+};
+
+export const Conversation = ({ className, children, ...props }: ConversationProps) => (
   <StickToBottom
     className={cn("relative flex-1 overflow-y-hidden", className)}
     initial="instant"
     resize="instant"
     role="log"
     {...props}
-  />
+  >
+    {typeof children === "function" ? children : <ScrollLockBridge>{children}</ScrollLockBridge>}
+  </StickToBottom>
 );
 
 export type ConversationContentProps = ComponentProps<typeof StickToBottom.Content>;
@@ -52,7 +85,7 @@ export const ConversationEmptyState = ({
         {icon && <div className="text-muted-foreground">{icon}</div>}
         <div className="space-y-1.5">
           <h3 className="text-2xl font-medium tracking-[-0.02em]">{title}</h3>
-          {description && <p className="text-muted-foreground text-base">{description}</p>}
+          {description && <p className="text-muted-foreground text-ui">{description}</p>}
         </div>
       </>
     )}
@@ -75,7 +108,10 @@ export const ConversationScrollButton = ({
     !isAtBottom && (
       <Button
         className={cn(
-          "absolute bottom-4 left-[50%] translate-x-[-50%] rounded-full",
+          // Offset by the composer's growth (0 elsewhere): a grown composer
+          // overlaps the bottom of this scroll area, and the button has to
+          // stay above its card.
+          "absolute bottom-[calc(1rem+var(--composer-growth,0px))] left-[50%] translate-x-[-50%] rounded-full",
           // Keep the fill OPAQUE on hover. The outline variant's hover (bg-muted)
           // is a translucent black wash (--muted is #0000000f), so over the chat
           // content behind it the button reads as transparent on hover. Hover

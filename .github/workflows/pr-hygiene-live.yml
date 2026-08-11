@@ -1,0 +1,70 @@
+name: PR Hygiene (live)
+
+# Runs the issue-reference nudge and the ready-for-review gate against a single PR
+# the moment something changes on it, so a contributor is not waiting on the hourly
+# sweep. GitHub's cron is best-effort and in practice fires every 1.5 to 2.5 hours.
+#
+# The sweep in demo-check.yml stays as the safety net: it catches PRs this misses
+# (a run that failed, a link added from the sidebar, which fires no webhook) and it
+# is the only path that reaches PRs opened before this workflow existed. Both routes
+# call the same scripts with the same decision logic; only the fetch differs, so
+# they cannot disagree.
+#
+# `pull_request_target` because the scripts need write access to comment and label on
+# fork PRs. Safe here: it checks out only the trusted default branch's .github and
+# runs no PR-authored code, matching the sweep.
+
+on:
+  pull_request_target:
+    # `edited` matters: adding "Closes #123" to the description is how a nudged
+    # contributor satisfies the rule, and it should clear immediately.
+    types: [opened, reopened, ready_for_review, edited, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Per PR, cancelling superseded runs: rapid edits should not queue up duplicates.
+  group: pr-hygiene-live-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  hygiene:
+    if: github.repository == 'omnigent-ai/omnigent' && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # Job-level permissions REPLACE the workflow-level block, so restate read.
+      contents: read
+      issues: write # the nudge comment
+      pull-requests: write # commenting on a PR needs this too, not just issues
+    steps:
+      # Trusted default branch, .github only. Never the PR head, so no PR-authored
+      # code runs with the elevated token.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: .github
+      - name: Issue-link check
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ENFORCE: "true"
+          # One PR per run, so the sweep's LIMIT (which bounds a batch) does not apply.
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        with:
+          retries: 3
+          script: |
+            const script = require(".github/workflows/pr-issue-link.js");
+            await script({ context, github, core });
+      - name: Ready-for-review gate
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ENFORCE: "true"
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        with:
+          retries: 3
+          script: |
+            const script = require(".github/workflows/ready-for-review.js");
+            await script({ context, github, core });

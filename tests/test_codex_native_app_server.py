@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import stat
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,15 +17,156 @@ except ImportError:  # pragma: no cover - Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 
 from omnigent.codex_native_app_server import (
+    _FRAMEWORK_APPROVED_TOOLS,
     _POLICY_HOOK_TIMEOUT_SECONDS,
     CodexNativeAppServer,
+    _build_native_codex_app_server_argv,
     _codex_policy_hooks_settings,
+    _hooks_list_diagnostics,
+    _model_discovery_cache,
+    _our_policy_hooks_from_list,
     _sync_codex_developer_instructions,
     build_codex_native_server,
+    discover_codex_model_options,
+    framework_approved_tools,
+    trust_codex_router_hooks,
     trust_native_policy_hooks,
 )
 from omnigent.codex_native_hook import _EVALUATE_POLICY_TIMEOUT_S
-from omnigent.inner.codex_executor import _populate_codex_home_config
+from omnigent.inner.codex_executor import (
+    _populate_codex_home_config,
+    _provider_codex_config_overrides,
+)
+
+
+async def test_discover_codex_model_options_strips_secrets_and_stops_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-launch discovery uses an empty home, no credentials, and clean teardown."""
+    from omnigent import codex_native_app_server
+
+    captured_env: dict[str, str] = {}
+
+    class _FakeProcess:
+        pid = None
+        returncode: int | None = None
+        terminated = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = 0
+
+        def kill(self) -> None:
+            self.returncode = -1
+
+        async def wait(self) -> int:
+            self.returncode = 0 if self.returncode is None else self.returncode
+            return self.returncode
+
+    process = _FakeProcess()
+
+    async def _fake_start(
+        *,
+        codex_path: str,
+        listen_url: str,
+        env: dict[str, str],
+        cwd: Path,
+    ) -> _FakeProcess:
+        assert codex_path == "/test/codex"
+        assert listen_url.startswith("ws://127.0.0.1:")
+        assert cwd.is_dir()
+        assert Path(env["CODEX_HOME"]).is_dir()
+        captured_env.update(env)
+        return process
+
+    async def _fake_wait(process: _FakeProcess, port: int) -> None:
+        assert process is not None
+        assert port > 0
+
+    class _FakeClient:
+        def __init__(self, *, ws_url: str, client_name: str) -> None:
+            assert ws_url.startswith("ws://127.0.0.1:")
+            assert client_name == "omnigent-codex-model-discovery"
+
+        async def connect(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def request(
+            self,
+            method: str,
+            params: dict[str, object],
+        ) -> dict[str, object]:
+            assert method == "model/list"
+            assert params == {"includeHidden": False}
+            return {
+                "result": {
+                    "data": [
+                        {
+                            "id": "coding-model",
+                            "model": "coding-model",
+                            "isDefault": True,
+                        }
+                    ],
+                    "nextCursor": None,
+                }
+            }
+
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_clean_codex_env",
+        lambda: {
+            "PATH": "/bin",
+            "OPENAI_API_KEY": "openai-secret",
+            "OPENAI_BASE_URL": "https://example.invalid/v1",
+            "DATABRICKS_BEARER": "databricks-secret",
+            "DATABRICKS_CODEX_TOKEN": "databricks-secret",
+        },
+    )
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_start_codex_model_discovery_process",
+        _fake_start,
+    )
+    monkeypatch.setattr(codex_native_app_server, "_wait_for_discovery_listener", _fake_wait)
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _FakeClient)
+    _model_discovery_cache.clear()
+
+    options = await discover_codex_model_options(codex_path="/test/codex")
+
+    assert options == [{"id": "coding-model", "model": "coding-model", "isDefault": True}]
+    assert captured_env == {"PATH": "/bin", "CODEX_HOME": captured_env["CODEX_HOME"]}
+    assert process.terminated is True
+    _model_discovery_cache.clear()
+
+
+# Spelled out per session class rather than derived from the constants under
+# test: a comprehension over ``_FRAMEWORK_APPROVED_TOOLS`` passes no matter what
+# is added to it, so it can never catch the approval surface growing.
+#
+# A plain codex session pre-approves exactly the one tool the framework calls
+# unprompted on any session. Any Smart Routing session — pinned harness or auto
+# — additionally pre-approves the four its routed spawns run on: discover the
+# agent, start the routed child, deliver the task, collect the result. Nobody is
+# watching for an approval prompt in the middle of a spawn.
+_PLAIN_TOOL_APPROVALS = {"sys_session_rename": {"approval_mode": "approve"}}
+_ROUTED_TOOL_APPROVALS = {
+    "sys_session_rename": {"approval_mode": "approve"},
+    "sys_session_create": {"approval_mode": "approve"},
+    "sys_agent_list": {"approval_mode": "approve"},
+    "sys_session_send": {"approval_mode": "approve"},
+    "sys_read_inbox": {"approval_mode": "approve"},
+}
+
+
+def test_the_framework_tool_approvals_are_scoped_to_the_session_class() -> None:
+    assert set(framework_approved_tools(routed_spawns=False)) == set(_PLAIN_TOOL_APPROVALS)
+    assert set(framework_approved_tools(routed_spawns=True)) == set(_ROUTED_TOOL_APPROVALS)
+    # The base set is a subset of the routed one, so a routed session never
+    # loses an approval a plain session has.
+    assert set(_FRAMEWORK_APPROVED_TOOLS) <= set(_ROUTED_TOOL_APPROVALS)
 
 
 def test_sync_developer_instructions_preserves_and_restores_user_config(tmp_path: Path) -> None:
@@ -133,6 +275,17 @@ def _hook(key: str, command: str, trust: str, current_hash: str = "sha256:h") ->
         "trustStatus": trust,
         "currentHash": current_hash,
     }
+
+
+def test_hooks_list_empty_result_does_not_fall_back_to_envelope() -> None:
+    """A valid empty result remains authoritative over envelope metadata."""
+    listed = {
+        "result": {},
+        "data": [{"cwd": _CWD, "hooks": [_hook("k1", _OUR_COMMAND, "trusted")]}],
+    }
+
+    assert _our_policy_hooks_from_list(listed, _CWD) == []
+    assert "returned no hooks" in _hooks_list_diagnostics(listed, _CWD)
 
 
 @dataclass
@@ -384,6 +537,7 @@ def _test_app_server(
     codex_home: Path,
     bridge_dir: Path,
     workspace: Path,
+    env: dict[str, str] | None = None,
 ) -> CodexNativeAppServer:
     """
     Build a Codex app-server wrapper for startup unit tests.
@@ -392,13 +546,15 @@ def _test_app_server(
     :param codex_home: Private Codex home to write.
     :param bridge_dir: Bridge directory for the generated MCP args.
     :param workspace: Working directory for the subprocess.
+    :param env: Process env for the app-server, carrying the routing
+        signals the session class is read from. ``None`` is a plain session.
     :returns: Configured app-server wrapper.
     """
     return CodexNativeAppServer(
         codex_path=sys.executable,
         socket_path=tmp_path / "codex.sock",
         codex_home=codex_home,
-        env={},
+        env=dict(env or {}),
         config_overrides=[],
         cwd=workspace,
         bridge_dir=bridge_dir,
@@ -470,9 +626,7 @@ args = []
             "--bridge-dir",
             str(bridge_dir),
         ],
-        "tools": {
-            "sys_session_rename": {"approval_mode": "approve"},
-        },
+        "tools": _PLAIN_TOOL_APPROVALS,
     }
 
 
@@ -501,6 +655,8 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
 
     rendered = (codex_home / "config.toml").read_text(encoding="utf-8")
     assert rendered.startswith("[mcp_servers.omnigent]\n")
+    assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
+    assert stat.S_IMODE((codex_home / "config.toml").stat().st_mode) == 0o600
     parsed = tomllib.loads(rendered)
     assert parsed["mcp_servers"]["omnigent"] == {
         "command": "/new/python",
@@ -512,10 +668,270 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
             "--bridge-dir",
             str(bridge_dir),
         ],
-        "tools": {
-            "sys_session_rename": {"approval_mode": "approve"},
-        },
+        "tools": _PLAIN_TOOL_APPROVALS,
     }
+
+
+# ── The codex-native session classes ────────────────────────────────
+#
+# Everything below is a per-class snapshot of the private CODEX_HOME a
+# codex-native session boots on. A plain session must be indistinguishable from
+# a pre-Smart-Routing one: codex's bundled model catalog (no ``codex debug
+# models`` probe), no ``spawn_agent`` routing gate in hooks.json, and only the
+# one framework tool approval.
+#
+# Every Smart Routing session — pinned harness or auto — adds the extended
+# catalog, the spawn gate and the routed-spawn approvals, because on this arm
+# the spawn tools are neither gated nor pre-approved without them and the spawn
+# simply stalls on a prompt nobody is watching. The home is therefore the same
+# shape for pinned and auto; what separates them is the cross-family framing in
+# ``developer_instructions``, which the launch site adds for auto-harness only
+# (``test_routed_spawn_note_appends_then_restores_the_user_base``).
+#
+# The catalog-only shape is still reachable: on a codex too old for the spawn
+# gate the advertisement is dropped, and the session degrades to it.
+
+
+def _stub_model_catalog_probe(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace the ``codex debug models`` probe and record its calls."""
+    from omnigent.inner import codex_executor
+
+    probes: list[str] = []
+
+    def _probe(codex_path: str, source_home: Path, *, timeout: float) -> dict[str, Any]:
+        del source_home, timeout
+        probes.append(codex_path)
+        return {
+            "models": [
+                {"slug": "gpt-5.6-luna", "visibility": "list", "supported_reasoning_levels": []}
+            ]
+        }
+
+    monkeypatch.setattr(codex_executor, "_find_codex_cli", lambda: "/bin/codex")
+    monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_CACHE", {})
+    monkeypatch.setattr(codex_executor, "_MODEL_CATALOG_FAILURES", {})
+    monkeypatch.setattr(codex_executor, "_probe_codex_model_catalog", _probe)
+    return probes
+
+
+async def _start_codex_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    env: dict[str, str],
+) -> tuple[Path, list[str]]:
+    """Boot an app-server with *env* and return its home plus probe calls."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    (real_codex_home / "config.toml").write_text('model = "gpt-5.5"\n', encoding="utf-8")
+    (real_codex_home / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PreToolUse": [{"hooks": [{"type": "command", "command": "user-pre"}]}],
+                    "Stop": [{"hooks": [{"type": "command", "command": "user-stop"}]}],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    probes = _stub_model_catalog_probe(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace, env)
+    await server.start()
+    await server.close()
+    return codex_home, probes
+
+
+#: The regex the routing gate is registered under (codex flattens the tool name).
+_SPAWN_MATCHER = r".*spawn_agent"
+
+
+def _mcp_tool_approvals(codex_home: Path) -> dict[str, Any]:
+    parsed = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    return parsed["mcp_servers"]["omnigent"]["tools"]
+
+
+def _hook_matchers(codex_home: Path, event: str) -> list[str | None]:
+    payload = json.loads((codex_home / "hooks.json").read_text(encoding="utf-8"))
+    return [entry.get("matcher") for entry in payload["hooks"].get(event, [])]
+
+
+async def test_a_plain_codex_native_session_looks_like_a_plain_codex_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codex_home, probes = await _start_codex_home(tmp_path, monkeypatch, env={})
+
+    assert probes == []
+    assert not (codex_home / "model_catalog.json").exists()
+    assert "model_catalog_json" not in (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert _mcp_tool_approvals(codex_home) == _PLAIN_TOOL_APPROVALS
+    # The policy gate and the user's own hooks are a plain codex session's
+    # pre-existing PreToolUse entries; what it must not gain is a gate on the
+    # spawn tool, which stalls ~30 s on a wedged server before failing open.
+    assert _SPAWN_MATCHER not in _hook_matchers(codex_home, "PreToolUse")
+
+
+async def test_a_smart_routing_codex_native_session_gains_the_spawn_apparatus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pinned and auto-harness alike: the routed spawn has to be able to run.
+
+    The pinned class used to be withheld the advertisement, which took the
+    ``spawn_agent`` gate AND the four routed-spawn approvals with it — so a
+    pinned Smart Routing session's spawns did not merely go unrouted, they
+    stalled on an approval prompt nobody was watching.
+    """
+    from omnigent.inner.codex_executor import (
+        CODEX_EXTENDED_CATALOG_ENV_VAR,
+        CODEX_ROUTER_DIR_ENV_VAR,
+        CODEX_ROUTER_SESSION_ID_ENV_VAR,
+    )
+
+    router_dir = tmp_path / "router"
+    router_dir.mkdir()
+    codex_home, probes = await _start_codex_home(
+        tmp_path,
+        monkeypatch,
+        env={
+            CODEX_EXTENDED_CATALOG_ENV_VAR: "1",
+            CODEX_ROUTER_DIR_ENV_VAR: str(router_dir),
+            CODEX_ROUTER_SESSION_ID_ENV_VAR: "conv_abc",
+        },
+    )
+
+    assert probes == ["/bin/codex"]
+    assert (codex_home / "model_catalog.json").is_file()
+    assert "model_catalog_json" in (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert _mcp_tool_approvals(codex_home) == _ROUTED_TOOL_APPROVALS
+    # Omnigent's policy hook stays first, then the spawn gate, then user hooks.
+    assert _hook_matchers(codex_home, "PreToolUse") == [None, _SPAWN_MATCHER, None]
+
+
+async def test_an_old_codex_degrades_a_routed_session_to_catalog_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Below the spawn gate's CLI floor the session launches, unrouted.
+
+    The advertisement is dropped, so everything keyed off it falls back to the
+    plain shape — no gate, no routed-spawn approvals — while the extended
+    catalog (keyed off its own env var) stays. The gear still offers the
+    subagent-routing row; the choice simply no-ops until codex is upgraded.
+    """
+    from omnigent.inner.codex_executor import (
+        CODEX_EXTENDED_CATALOG_ENV_VAR,
+        CODEX_ROUTER_DIR_ENV_VAR,
+        CODEX_ROUTER_SESSION_ID_ENV_VAR,
+    )
+
+    router_dir = tmp_path / "router"
+    router_dir.mkdir()
+    _set_codex_version(monkeypatch, (0, 144, 9))
+    codex_home, probes = await _start_codex_home(
+        tmp_path,
+        monkeypatch,
+        env={
+            CODEX_EXTENDED_CATALOG_ENV_VAR: "1",
+            CODEX_ROUTER_DIR_ENV_VAR: str(router_dir),
+            CODEX_ROUTER_SESSION_ID_ENV_VAR: "conv_abc",
+        },
+    )
+
+    assert probes == ["/bin/codex"]
+    assert (codex_home / "model_catalog.json").is_file()
+    assert _mcp_tool_approvals(codex_home) == _PLAIN_TOOL_APPROVALS
+    assert _SPAWN_MATCHER not in _hook_matchers(codex_home, "PreToolUse")
+
+
+async def test_native_codex_materializes_provider_auth_for_app_server_and_tui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native app-server and remote TUI argv contain no provider secret."""
+    from omnigent import codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text(
+        'model_providers = { existing = { name = "Existing", '
+        'base_url = "https://existing.invalid/v1", wire_api = "responses" } }\n',
+        encoding="utf-8",
+    )
+    codex_home = tmp_path / "codex-home"
+    bridge_dir = tmp_path / "bridge"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _disable_codex_startup_rpc(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, bridge_dir, workspace)
+    server.config_overrides = [
+        *_provider_codex_config_overrides(
+            model="test-model",
+            base_url="https://provider.invalid/v1",
+            auth_command="credential-helper --token sk-sentinel-do-not-use",
+            wire_api="responses",
+        ),
+        'approval_policy="never"',
+        'sandbox_mode="danger-full-access"',
+    ]
+    await server.start()
+    await server.close()
+
+    app_server_argv = _build_native_codex_app_server_argv(
+        tagged_argv0="codex session-tag",
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=server.config_overrides,
+    )
+    remote_argv = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+        config_overrides=tuple(server.config_overrides),
+    )
+    assert all("sk-sentinel-do-not-use" not in arg for arg in app_server_argv)
+    assert all("sk-sentinel-do-not-use" not in arg for arg in remote_argv)
+    assert 'model_provider="omnigent_provider"' in app_server_argv
+    assert 'model_provider="omnigent_provider"' in remote_argv
+    assert 'approval_policy="never"' in app_server_argv
+    assert 'sandbox_mode="danger-full-access"' in app_server_argv
+
+    config_path = codex_home / "config.toml"
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    provider = config["model_providers"]["omnigent_provider"]
+    assert config["model_providers"]["existing"]["name"] == "Existing"
+    assert provider["base_url"] == "https://provider.invalid/v1"
+    assert provider["auth"]["args"] == [
+        "-c",
+        "credential-helper --token sk-sentinel-do-not-use",
+    ]
+    assert provider["wire_api"] == "responses"
+    assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+
+def test_remote_codex_rejects_unmaterialized_provider_config() -> None:
+    """Remote TUI construction fails closed on provider table overrides."""
+    from omnigent import codex_native_app_server
+
+    provider_override = _provider_codex_config_overrides(
+        model=None,
+        base_url="https://provider.invalid/v1",
+        auth_command="printf %s sk-sentinel-do-not-use",
+        wire_api="responses",
+    )[-1]
+
+    with pytest.raises(ValueError, match="must be materialized"):
+        codex_native_app_server.build_codex_remote_args(
+            codex_args=(),
+            thread_id=None,
+            remote_url="ws://127.0.0.1:9876",
+            config_overrides=(provider_override,),
+        )
 
 
 async def test_untrusted_hook_is_trusted_via_batchwrite() -> None:
@@ -602,6 +1018,88 @@ def test_write_codex_policy_hooks_file_no_symlink_unchanged(tmp_path: Path) -> N
 
     payload = json.loads((codex_home / "hooks.json").read_text())
     assert set(payload["hooks"]) == {"PreToolUse", "PostToolUse", "UserPromptSubmit"}
+
+
+def test_write_codex_policy_hooks_file_merges_router_hooks(tmp_path: Path) -> None:
+    """Routing hooks share the one hooks.json codex loads, user hooks kept."""
+    from omnigent.codex_native_app_server import _write_codex_policy_hooks_file
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    router_dir = tmp_path / "router"
+    router_dir.mkdir()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    user_hooks = tmp_path / "user-hooks.json"
+    user_hooks.write_text(
+        '{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo bye"}]}]}}'
+    )
+
+    _write_codex_policy_hooks_file(
+        codex_home,
+        bridge_dir,
+        sys.executable,
+        router_bridge_dir=router_dir,
+        router_session_id="conv_abc",
+        user_hooks_source=user_hooks,
+    )
+
+    hooks = json.loads((codex_home / "hooks.json").read_text())["hooks"]
+    commands = [h["command"] for entry in hooks["PreToolUse"] for h in entry["hooks"]]
+    assert any("codex_router_hook" in c and "--session-id conv_abc" in c for c in commands)
+    assert any("codex_policy_hook" in c or "policy" in c for c in commands)
+    # The user's own hook survives alongside our route-subagent gate.
+    assert hooks["Stop"][0]["hooks"][0]["command"] == "echo bye"
+
+
+def test_user_prompt_submit_carries_the_route_turn_hook(tmp_path: Path) -> None:
+    """First-message routing rides the UserPromptSubmit entry codex trusts.
+
+    Pins the launch-path invariant a UI-created terminal session depends on:
+    the ``route-turn`` command is registered, points at the SAME bridge dir
+    the runner advertises ``turn_router.json`` in, and lives under the
+    policy-hook module so the trust handshake covers it. A hook codex loads
+    but never trusts is a silent fail-open, and one pointed at a different
+    directory finds no advertisement and falls open too.
+    """
+    from omnigent.codex_native_app_server import (
+        _POLICY_HOOK_MODULE,
+        _our_policy_hooks_from_list,
+        _write_codex_policy_hooks_file,
+    )
+    from omnigent.runner.turn_routing import HARNESS_HOOK_TIMEOUT_S
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    user_hooks = tmp_path / "user-hooks.json"
+    user_hooks.write_text(
+        '{"hooks": {"UserPromptSubmit": [{"hooks": '
+        '[{"type": "command", "command": "echo mine"}]}]}}'
+    )
+
+    _write_codex_policy_hooks_file(
+        codex_home,
+        bridge_dir,
+        sys.executable,
+        user_hooks_source=user_hooks,
+        turn_routing=True,
+    )
+
+    hooks = json.loads((codex_home / "hooks.json").read_text())["hooks"]
+    commands = [h for entry in hooks["UserPromptSubmit"] for h in entry["hooks"]]
+    routing = [h for h in commands if "route-turn" in h["command"]]
+    assert len(routing) == 1
+    assert f"--bridge-dir {bridge_dir}" in routing[0]["command"]
+    assert "--harness codex-native" in routing[0]["command"]
+    assert routing[0]["timeout"] == HARNESS_HOOK_TIMEOUT_S
+    # Trust is filtered by module, so route-turn must ride the policy one.
+    assert _POLICY_HOOK_MODULE in routing[0]["command"]
+    listed = {"result": {"data": [{"cwd": "/repo", "hooks": commands}]}}
+    assert len(_our_policy_hooks_from_list(listed, "/repo")) == 2
+    # The user's own prompt hook survives the merge.
+    assert any(h["command"] == "echo mine" for h in commands)
 
 
 async def test_missing_hook_raises() -> None:
@@ -845,6 +1343,46 @@ async def test_unknown_codex_version_treated_as_supported(
         await server.close()
 
 
+async def test_old_codex_with_routing_armed_keeps_user_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Arming subagent routing on old codex must not delete the user's hooks.
+
+    On codex < 0.129 no generated hooks file is written, so the user's
+    ``hooks.json`` has to stay symlinked into the private home. Fails if
+    the routing arm drops the symlink and nothing takes its place.
+    """
+    from omnigent.inner.codex_executor import CODEX_ROUTER_DIR_ENV_VAR
+
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    user_hooks = real_codex_home / "hooks.json"
+    user_hooks.write_text(
+        json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "user-stop"}]}]}})
+    )
+    codex_home = tmp_path / "codex-home"
+    bridge_dir = tmp_path / "bridge"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    router_dir = tmp_path / "router"
+    router_dir.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", _fake_wait_until_ready)
+    _set_codex_version(monkeypatch, (0, 128, 0))
+
+    server = _test_app_server(tmp_path, codex_home, bridge_dir, workspace)
+    server.env = {CODEX_ROUTER_DIR_ENV_VAR: str(router_dir)}
+    await server.start()
+    try:
+        hooks_path = codex_home / "hooks.json"
+        assert hooks_path.exists()
+        assert json.loads(hooks_path.read_text())["hooks"]["Stop"]
+        assert server.router_hooks_registered is False
+    finally:
+        await server.close()
+
+
 async def test_trust_failure_is_fail_open_with_reason(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1006,3 +1544,204 @@ class TestPinCodexConfigModel:
         # read_codex_config_model resolves codex-home under the bridge dir.
         _pin_codex_config_model(home, "databricks-gpt-5-4-mini")
         assert read_codex_config_model(bridge_dir) == "databricks-gpt-5-4-mini"
+
+
+# --- Subagent-routing hook trust ---------------------------------------
+#
+# Empirically (codex-cli 0.145.0) ``--dangerously-bypass-hook-trust`` does
+# NOT make hooks run under ``codex app-server``: an untrusted routing hook
+# stayed silent with the flag and fired only once its
+# ``hooks.state.<key>.trusted_hash`` was persisted. The routing hooks
+# therefore need their own trust pass; the policy pass filters by module
+# and would leave them untrusted (a silent fail-open on the spawn gate).
+
+_ROUTER_GATE_COMMAND = (
+    "/venv/bin/python -m omnigent.inner.hook_scripts.codex_router_hook "
+    "route-subagent --bridge-dir /b --harness codex-native"
+)
+
+
+async def test_router_hooks_are_trusted_via_batchwrite() -> None:
+    """Untrusted routing hooks are trusted with their currentHash."""
+    client = _FakeCodexClient(
+        hooks=[
+            _hook("gate", _ROUTER_GATE_COMMAND, "untrusted", "sha256:gate"),
+        ]
+    )
+    assert await trust_codex_router_hooks(client.request, cwd=_CWD) == []
+
+    writes = _batchwrite_calls(client)
+    assert len(writes) == 1
+    edit = writes[0].params["edits"][0]
+    assert edit["keyPath"] == "hooks.state"
+    assert edit["value"] == {
+        "gate": {"trusted_hash": "sha256:gate"},
+    }
+    assert writes[0].params["reloadUserConfig"] is True
+
+
+async def test_router_hook_trust_never_touches_user_or_policy_hooks() -> None:
+    """Only the routing hooks are trusted by the routing pass."""
+    client = _FakeCodexClient(
+        hooks=[
+            _hook("gate", _ROUTER_GATE_COMMAND, "untrusted", "sha256:gate"),
+            _hook("policy", _OUR_COMMAND, "untrusted", "sha256:policy"),
+            _hook("theirs", _USER_COMMAND, "untrusted", "sha256:theirs"),
+        ]
+    )
+    await trust_codex_router_hooks(client.request, cwd=_CWD)
+    assert _batchwrite_calls(client)[0].params["edits"][0]["value"] == {
+        "gate": {"trusted_hash": "sha256:gate"}
+    }
+
+
+async def test_router_hook_trust_reports_still_untrusted_without_raising() -> None:
+    """A routing-trust failure is reported, never raised (policy must survive)."""
+    client = _FakeCodexClient(
+        hooks=[_hook("gate", _ROUTER_GATE_COMMAND, "untrusted")], flip_on_trust=False
+    )
+    assert await trust_codex_router_hooks(client.request, cwd=_CWD) == ["gate"]
+    assert len(_batchwrite_calls(client)) == 1
+
+
+async def test_router_hook_trust_noop_without_routing_hooks() -> None:
+    """No routing hooks registered → no write, no failure."""
+    client = _FakeCodexClient(hooks=[_hook("policy", _OUR_COMMAND, "trusted")])
+    assert await trust_codex_router_hooks(client.request, cwd=_CWD) == []
+    assert _batchwrite_calls(client) == []
+
+
+async def test_already_trusted_router_hooks_skip_batchwrite() -> None:
+    """Routing hooks already trusted issue no config write."""
+    client = _FakeCodexClient(hooks=[_hook("gate", _ROUTER_GATE_COMMAND, "trusted")])
+    assert await trust_codex_router_hooks(client.request, cwd=_CWD) == []
+    assert _batchwrite_calls(client) == []
+
+
+async def test_trust_step_covers_router_hooks_when_routing_armed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The startup trust step trusts the routing hooks alongside the policy hook."""
+    from omnigent.inner.codex_executor import CODEX_ROUTER_DIR_ENV_VAR
+
+    client = _FakeCodexClient(
+        hooks=[
+            _hook("policy", _OUR_COMMAND, "untrusted", "sha256:policy"),
+            _hook("gate", _ROUTER_GATE_COMMAND, "untrusted", "sha256:gate"),
+        ]
+    )
+
+    async def _fake_connect(self: Any) -> None:
+        return None
+
+    async def _fake_close(self: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient.connect", _fake_connect
+    )
+    monkeypatch.setattr("omnigent.codex_native_app_server.CodexAppServerClient.close", _fake_close)
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient.request",
+        lambda self, method, params: client.request(method, params),
+    )
+
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", Path(_CWD))
+    server.env[CODEX_ROUTER_DIR_ENV_VAR] = str(tmp_path / "bridge")
+    server.router_hooks_registered = True
+    await server._trust_policy_hooks()
+
+    trusted = {}
+    for write in _batchwrite_calls(client):
+        trusted.update(write.params["edits"][0]["value"])
+    assert set(trusted) == {"policy", "gate"}
+
+
+async def test_policy_hook_command_runs_python_isolated() -> None:
+    """The policy hook command passes ``-I`` before ``-m``.
+
+    Same silent fail-open as the routing hooks: codex runs hooks with the
+    session workspace as cwd, so without isolation a workspace containing an
+    ``omnigent`` directory shadows the installed package and the policy gate
+    dies on an import error codex never reports.
+    """
+    import shlex
+
+    from omnigent.codex_native_app_server import _codex_policy_hook_command
+
+    argv = shlex.split(_codex_policy_hook_command(Path("/b"), "/venv/bin/python"))
+    assert argv[1:3] == ["-I", "-m"]
+
+
+def test_routed_spawn_note_appends_then_restores_the_user_base(tmp_path: Path) -> None:
+    """The codex routed-spawn note rides ``developer_instructions``, reversibly.
+
+    It must be additive to the user's own guidance on a fresh auto-harness
+    launch and gone again on a resumed / pinned launch, which is what keeps a
+    session that leaves auto-harness mode from carrying stale routing framing.
+    """
+    from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
+
+    note = smart_routing_spawn_note("codex-native")
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text('developer_instructions = "Keep user guidance."\n', encoding="utf-8")
+
+    _sync_codex_developer_instructions(codex_home, note)
+
+    active = tomllib.loads(config_path.read_text(encoding="utf-8"))["developer_instructions"]
+    assert active == f"Keep user guidance.\n\n{note}"
+    assert "sys_session_create" in active
+    # Codex takes bare MCP names plus a namespace, never a prefixed spelling.
+    assert "mcp__omnigent__" not in active
+
+    _sync_codex_developer_instructions(codex_home, None)
+
+    resumed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert resumed["developer_instructions"] == "Keep user guidance."
+
+
+@pytest.mark.parametrize(
+    ("labels", "harness_override", "expected"),
+    [
+        ({"omnigent.routing.auto_harness": "1"}, None, True),
+        # The sentinel survives until first-message routing resolves a harness.
+        ({}, "auto", True),
+        ({}, "codex-native", False),
+        ({}, None, False),
+    ],
+    ids=["label", "sentinel", "pinned", "neither"],
+)
+async def test_codex_native_launch_config_reads_the_auto_harness_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    labels: dict[str, str],
+    harness_override: str | None,
+    expected: bool,
+) -> None:
+    """Only an auto-harness codex session gets the routed-spawn instructions."""
+    import httpx
+
+    from omnigent.runner.native.orchestration import _codex_native_launch_config
+    from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+
+    assert AUTO_HARNESS_LABEL_KEY == "omnigent.routing.auto_harness"
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:9999")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "workspace": str(tmp_path),
+                "labels": labels,
+                "harness_override": harness_override,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as client:
+        config = await _codex_native_launch_config(session_id="conv_abc", server_client=client)
+
+    assert config.auto_harness is expected

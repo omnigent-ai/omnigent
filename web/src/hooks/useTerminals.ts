@@ -3,36 +3,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { authenticatedFetch } from "../lib/identity";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 
-/**
- * UI-facing terminal record.
- *
- * The wire response from ``GET /v1/sessions/{id}/resources/terminals``
- * is a richer ``session.resource``-shaped envelope; this struct lifts
- * the fields the UI actually renders and addresses (``id`` for
- * attach/close/tab keys, ``name``/``session`` for display).
- */
-export interface TerminalInfo {
-  /**
-   * Opaque, stable resource id, e.g. ``"terminal_bash_s1"``. Used as
-   * the addressing key for WS attach, close, and tab identity.
-   */
-  id: string;
-  /** Terminal name from the spec, e.g. ``"bash"``. From ``metadata.terminal_name``. */
-  name: string;
-  /** Session key, e.g. ``"s1"``. From ``metadata.session_key``. */
-  session: string;
-  /** Whether the underlying tmux session is currently running. */
-  running: boolean;
-  /**
-   * Web-attach transport for this terminal, from
-   * ``metadata.terminal_transport``: ``"control"`` (tmux control mode —
-   * native browser scrollback + selection) or ``"pty"`` (the legacy forked
-   * ``tmux attach`` stream). ``undefined`` when the server omits it (older
-   * server / treat as PTY).
-   */
-  transport?: "control" | "pty";
-}
+export { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 
 /**
  * Stable tab-id for a terminal, used as the Tabs trigger value.
@@ -118,19 +91,6 @@ export function inventoryTerminals(
   return terminals.filter((t) => !AGENT_TERMINAL_IDS.has(t.id));
 }
 
-/**
- * TanStack Query key for a conversation's terminals.
- *
- * Exported so the chatStore SSE handler can target the same cache
- * entry when applying ``session.resource.{created,deleted}`` updates.
- *
- * :param conversationId: Session/conversation identifier.
- * :returns: Tuple identifying the cache entry.
- */
-export function terminalsQueryKey(conversationId: string): readonly unknown[] {
-  return ["conversation", conversationId, "terminals"];
-}
-
 interface UseTerminalsResult {
   terminals: TerminalInfo[];
   isLoading: boolean;
@@ -185,60 +145,12 @@ interface UseTerminalsOptions {
   reconcileWhilePending?: boolean;
 }
 
-/**
- * Convert a single terminal-resource wire dict into the UI-facing
- * :class:`TerminalInfo`.
- *
- * The sole producer is the SSE-driven cache updater
- * (``applyTerminalCreated`` in the chatStore), which receives the
- * resource dict from ``session.resource.created`` events — both the
- * live deltas and the snapshot-on-connect replay.
- *
- * :param resource: Wire-shape resource dict from
- *     ``session.resource.created``. ``Record<string, unknown>`` to
- *     accommodate the SSE handler's permissive payload.
- * :returns: The mapped :class:`TerminalInfo`, or ``null`` when the
- *     resource lacks the minimum required fields.
- */
-export function terminalInfoFromResource(resource: Record<string, unknown>): TerminalInfo | null {
-  const id = resource.id;
-  if (typeof id !== "string" || !id) return null;
-  const rawMetadata = resource.metadata;
-  const metadata =
-    rawMetadata && typeof rawMetadata === "object" && !Array.isArray(rawMetadata)
-      ? (rawMetadata as Record<string, unknown>)
-      : {};
-  const terminalName = metadata.terminal_name;
-  const sessionKey = metadata.session_key;
-  const running = metadata.running;
-  const rawTransport = metadata.terminal_transport;
-  const transport = rawTransport === "control" || rawTransport === "pty" ? rawTransport : undefined;
-  const fallbackName = resource.name;
-  return {
-    id,
-    // metadata.terminal_name / metadata.session_key are the canonical
-    // wire location for these display fields under the resources API.
-    // Fall back to the resource ``name`` for terminal_name so a server
-    // that omits metadata still renders something recognizable; empty
-    // string for session is acceptable because the UI dedupes by id.
-    name:
-      typeof terminalName === "string" && terminalName
-        ? terminalName
-        : typeof fallbackName === "string"
-          ? fallbackName
-          : "",
-    session: typeof sessionKey === "string" ? sessionKey : "",
-    running: typeof running === "boolean" ? running : false,
-    transport,
-  };
-}
-
 // Status codes that mean "no terminal yet / runner not reachable" rather
 // than a hard error: the runner may not be bound or online when the page
 // first loads. We treat these as an empty list (the live SSE
 // ``session.resource.created`` event fills it in once the terminal lands)
 // instead of throwing, so React Query does not enter an error state.
-const _SOFT_TERMINAL_LIST_STATUSES = new Set([404, 409, 502, 503]);
+const SOFT_TERMINAL_LIST_STATUSES = new Set([404, 409, 502, 503]);
 
 /**
  * Fetch the current terminal resources for a conversation over HTTP.
@@ -265,14 +177,14 @@ const _SOFT_TERMINAL_LIST_STATUSES = new Set([404, 409, 502, 503]);
  * :param conversationId: Session/conversation identifier,
  *     e.g. ``"conv_abc123"``.
  * :returns: The mapped terminals, or an empty array when the runner is
- *     not yet reachable (see :data:`_SOFT_TERMINAL_LIST_STATUSES`).
+ *     not yet reachable (see :data:`SOFT_TERMINAL_LIST_STATUSES`).
  * :raises Error: On a non-soft HTTP error status.
  */
 export async function fetchTerminals(conversationId: string): Promise<TerminalInfo[]> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals?order=asc&limit=1000`,
   );
-  if (_SOFT_TERMINAL_LIST_STATUSES.has(res.status)) return [];
+  if (SOFT_TERMINAL_LIST_STATUSES.has(res.status)) return [];
   if (!res.ok) throw new Error(`terminals fetch failed: ${res.status} ${res.statusText}`);
   const json = (await res.json()) as { data?: unknown };
   const rows = Array.isArray(json.data) ? json.data : [];

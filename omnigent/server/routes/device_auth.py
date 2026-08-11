@@ -101,14 +101,15 @@ def _generate_user_code() -> str:
     return f"{chars[:4]}-{chars[4:]}"
 
 
-def _client_id(body: dict) -> str | None:
+def _client_id(body: dict[str, object]) -> str | None:
     """Extract the RFC 8628 ``client_id`` from an authorize body.
 
     A public string naming the requesting application (e.g. Slack passes
     ``"slack"``), the same for every grant that application initiates.
     Display + audit only — never an authorization key.
     """
-    return (body.get("client_id") or "").strip() or None
+    value = body.get("client_id")
+    return value.strip() or None if isinstance(value, str) else None
 
 
 def _mint_refresh_token() -> str:
@@ -730,7 +731,10 @@ def _consent_html(
     self-contained (no JS framework) so it works regardless of the
     server's front-end build.
     """
-    esc = lambda s: html.escape(str(s or ""))  # noqa: E731
+
+    def esc(value: object) -> str:
+        return html.escape(str(value or ""))
+
     # Requesting client's identifier, defaulting to a neutral label when it
     # didn't identify itself.
     app_name = esc(client_id) if client_id else "An application"

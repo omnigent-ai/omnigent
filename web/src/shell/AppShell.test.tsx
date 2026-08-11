@@ -1,3 +1,7 @@
+import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseSessionModule from "@/hooks/useSession";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import {
@@ -23,7 +27,7 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   // Keep the real module (inventoryTerminals, EMBEDDED_REPL_TERMINAL_ID)
   // — the REPL rail-inventory tests exercise the real filter; only the
   // network-backed hook is replaced.
-  ...(await importOriginal<typeof import("@/hooks/useTerminals")>()),
+  ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
 }));
 
@@ -35,14 +39,14 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (childSessionsQueryKey, MAX_TREE_DEPTH,
   // cachedTreeContains) — only the hook is replaced.
-  ...(await importOriginal<typeof import("@/hooks/useChildSessions")>()),
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(() => ({ children: [], isLoading: false, error: null })),
 }));
 
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   // useRootSessionId stays real — with useSession mocked to a null /
   // top-level session it resolves synchronously without fetching.
-  ...(await importOriginal<typeof import("@/hooks/useSession")>()),
+  ...(await importOriginal<typeof UseSessionModule>()),
   useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
 }));
 
@@ -57,22 +61,24 @@ vi.mock("@/hooks/useAgents", () => ({
 }));
 
 vi.mock("./Sidebar", () => ({
-  Sidebar: () => <div data-testid="sidebar" />,
+  // Reflect the open prop so tests can assert sidebar collapse/expand.
+  Sidebar: ({ open }: { open: boolean }) => (
+    <div data-testid="sidebar" data-open={open ? "true" : "false"} />
+  ),
 }));
 vi.mock("./FilesPanel", () => ({
   // Scope-only stand-in matching the real FilesPanel after the open-file tabs
-  // and the FileViewer moved up to WorkspacePanel. It exposes file-select and
-  // scope-toggle buttons only; the inline viewer is now rendered directly by
-  // WorkspacePanel via the FileViewer mock below (data-testid="file-viewer-
-  // inline"), so the desktop file-viewer assertions still hold.
+  // and the FileViewer moved up to WorkspacePanel. It echoes its fixed scope
+  // (data-flat-view) and exposes file-select buttons; the scope is now the
+  // Files vs Changes rail tab (driven by the real WorkspacePanel), not an
+  // in-panel toggle. The inline viewer is rendered directly by WorkspacePanel
+  // via the FileViewer mock below (data-testid="file-viewer-inline").
   FilesPanel: ({
     onFileSelect,
     flatView,
-    onFlatViewChange,
   }: {
     onFileSelect: (path: string) => void;
     flatView: boolean;
-    onFlatViewChange: (v: boolean) => void;
   }) => (
     <div data-testid="files-panel" data-flat-view={String(flatView)}>
       <button
@@ -88,20 +94,6 @@ vi.mock("./FilesPanel", () => ({
         onClick={() => onFileSelect("AGENTS.md")}
       >
         select-agents
-      </button>
-      <button
-        type="button"
-        aria-label="files: switch to explore"
-        onClick={() => onFlatViewChange(false)}
-      >
-        explore
-      </button>
-      <button
-        type="button"
-        aria-label="files: switch to changed"
-        onClick={() => onFlatViewChange(true)}
-      >
-        changed
       </button>
     </div>
   ),
@@ -151,6 +143,13 @@ vi.mock("./SubagentsPanel", () => ({
     <div data-testid="subagents-panel" data-conversation-id={conversationId} />
   ),
 }));
+// The real WorkspacePanel mounts a rail xterm for an open shell tab; stub the
+// low-level view to a marker echoing the attached terminal id.
+vi.mock("@/components/blocks/TerminalView", () => ({
+  TerminalView: ({ terminalId }: { terminalId: string }) => (
+    <div data-testid="terminal-view-stub">{terminalId}</div>
+  ),
+}));
 vi.mock("./TodoPanel", () => ({
   TodoPanel: () => <div data-testid="todo-panel" />,
 }));
@@ -184,6 +183,7 @@ vi.mock("./TerminalsPanel", () => ({
 
 import { useConversations } from "@/hooks/useConversations";
 import { useTerminals } from "@/hooks/useTerminals";
+
 const useConvMock = vi.mocked(useConversations);
 const useTerminalsMock = vi.mocked(useTerminals);
 
@@ -191,17 +191,21 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceChangedFiles,
 } from "@/hooks/useWorkspaceChangedFiles";
+
 const useEnvironmentMock = vi.mocked(useWorkspaceEnvironment);
 const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 
 import { useChildSessions } from "@/hooks/useChildSessions";
+
 const useChildSessionsMock = vi.mocked(useChildSessions);
 
 import { useSession } from "@/hooks/useSession";
+
 const useSessionMock = vi.mocked(useSession);
 
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { Agent } from "@/hooks/useAgents";
+
 const useSessionAgentMock = vi.mocked(useSessionAgent);
 
 import { AppShell } from "./AppShell";
@@ -211,13 +215,10 @@ import { useChatStore } from "@/store/chatStore";
 
 /**
  * Test-only consumer of the TerminalFirstContext provided by AppShell.
- * The production view toggle now lives inside ChatPage's
- * ConnectionIndicator; these tests are scoped to the shell's state
- * machine, so we use a probe component with the exact same
- * `aria-label`s as the production pill ("Chat" / "Terminal" — see
- * ConnectedTerminalFirstPill in ChatPage.tsx) to drive `setView`. If
- * the production labels ever change, these tests fail loudly instead
- * of drifting silently.
+ * The production view toggle lives in the header (ViewModeToggle); these
+ * tests are scoped to the shell's state machine, so we use a probe
+ * component with its own "Chat" / "Terminal" buttons to drive `setView`
+ * and read the context's derived flags off data attributes.
  */
 function TerminalFirstViewProbe() {
   const ctx = useTerminalFirst();
@@ -320,6 +321,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -368,13 +370,13 @@ function renderShell(path: string, info?: ServerInfo) {
 }
 
 function mockConversations(
-  convs: Array<{
+  convs: {
     id: string;
     permission_level: number | null;
     labels?: Record<string, string>;
     host_id?: string | null;
     runner_id?: string | null;
-  }>,
+  }[],
 ) {
   useConvMock.mockReturnValue({
     data: {
@@ -714,6 +716,110 @@ describe("TerminalFirstContext", () => {
     expect(screen.queryByTestId("terminals-panel")).toBeNull();
   });
 
+  it("falls back to chat when an open terminal view loses its terminal", () => {
+    // A runner stop / disconnect empties the terminal list (useTerminals clears
+    // it on the runner-offline edge). Landing while the terminal view is open,
+    // that would strand the user on "No terminals available"; the view must
+    // fall back to chat, where the composer can resume the session.
+    mockConversations([
+      { id: "conv_native", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    // Stable QueryClient + fresh element per render so the rerender reads the
+    // updated mock (React bails on an identical element reference).
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const makeTree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_native"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(makeTree());
+
+    // Open the terminal view (a terminal is present).
+    fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+
+    // The runner stops: the terminal list empties out from under the open view.
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
+    rerender(makeTree());
+
+    // Fell back to chat rather than stranding on "No terminals available".
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
+  });
+
+  it("stays in terminal view while the terminal is relaunching", () => {
+    // A relaunch (terminalPending) also empties the list briefly, but the
+    // terminal is coming right back — the startingUp guard must hold the
+    // terminal view so a wake doesn't flip chat/terminal back and forth.
+    mockConversations([
+      { id: "conv_native", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    // terminalPending + a non-failed status makes terminalStartingUp true once
+    // the list empties (see the startup-spinner tests above).
+    useChatStore.setState({ terminalPending: true, sessionStatus: "running" });
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "claude", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const makeTree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_native"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(makeTree());
+
+    fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+
+    // Terminal drops but is relaunching (startingUp) — must NOT fall back.
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
+    rerender(makeTree());
+
+    const probe = screen.getByTestId("view-probe");
+    expect(probe).toHaveAttribute("data-terminal-starting-up", "true");
+    expect(probe).toHaveAttribute("data-view", "terminal");
+  });
+
   it("restores the terminal view when re-entering a native session within the same tab", () => {
     // Bug: switching to another chat and back used to drop the user
     // out of terminal view because the conversation-switch effect reset
@@ -968,8 +1074,9 @@ describe("Right-rail terminals card", () => {
 });
 
 describe("Chat-mode terminal panel layout", () => {
-  it("hides chat and makes the panel fluid when a terminal is opened from the rail", () => {
-    // Rail click → chat hidden, panel fluid (no split, no resize).
+  it("opens the shell as a rail tab (not the full-width push panel) and keeps chat visible", () => {
+    // Desktop rail click → the shell opens as a tab inside the workspace rail;
+    // the full-width push panel stays closed and chat is not hidden.
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
@@ -983,22 +1090,152 @@ describe("Chat-mode terminal panel layout", () => {
 
     renderShell("/c/conv_abc");
 
-    // Baseline: closed, push-panel sizing, chat visible. The md:hidden gate
-    // lives on the chat+workspace group (main's parent), not main itself.
+    // Baseline: closed push panel, chat visible. The md:hidden gate lives on
+    // the chat+workspace group (main's parent), not main itself.
     const chatGroup = () => screen.getByRole("main").parentElement as HTMLElement;
     expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
-    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-fluid", "false");
     expect(chatGroup().className.split(" ")).not.toContain("md:hidden");
 
-    // Switch the rail to the Terminals tab so the inline section mounts.
-    // Radix Tabs activates on mousedown, not click.
+    // Switch the rail to the Shells tab so the inline section mounts, then open
+    // a shell. Radix Tabs activates on mousedown, not click.
     fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
     fireEvent.click(screen.getByRole("button", { name: /rail: open terminal/i }));
 
-    // After click: open, fluid, chat hidden.
-    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
-    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-fluid", "true");
-    expect(chatGroup().className.split(" ")).toContain("md:hidden");
+    // After click: the push panel stays closed and chat stays visible — the
+    // shell now lives in a rail tab (its xterm surfaces in the rail's content
+    // slot), so the main column is undisturbed.
+    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
+    expect(chatGroup().className.split(" ")).not.toContain("md:hidden");
+    // The shell tab's xterm is mounted in the rail.
+    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_main");
+  });
+
+  it("closes a shell tab from the rail — xterm unmounts and the Shells list returns", () => {
+    // Open a shell tab, then close it via the tab's "x". The rail falls back to
+    // the Shells list (no tab selected) and the xterm is gone.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "main", session: "u-1", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_abc");
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
+    fireEvent.click(screen.getByRole("button", { name: /rail: open terminal/i }));
+    // The shell tab and its xterm are present.
+    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_main");
+
+    // Close the tab via its "x" (labeled by the resolved name · session).
+    fireEvent.click(screen.getByRole("button", { name: "Close main · u-1" }));
+
+    // The xterm unmounts; with no tab selected the Shells list is shown again.
+    expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
+    expect(screen.getByTestId("inline-terminals-section")).toBeInTheDocument();
+  });
+});
+
+describe("Workspace rail maximize", () => {
+  it("toggles the rail between docked and full-screen, collapsing the sidebar on maximize", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+
+    renderShell("/c/conv_abc");
+
+    const rail = () => screen.getByRole("complementary", { name: "Workspace" });
+    // Open the sidebar first (jsdom defaults it closed) so we can prove maximize
+    // collapses it. Docked baseline: fixed-width flex child, no cover classes.
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(rail().className).toContain("md:shrink-0");
+    expect(rail().className).not.toContain("md:absolute");
+
+    // Maximize → the rail breaks out to cover the content region, and the left
+    // sidebar collapses so the maximized rail owns the full content width.
+    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    expect(rail().className).toContain("md:absolute");
+    expect(rail().className).toContain("md:inset-0");
+    // Still keeps the docked flush/bordered styling — only the width changes.
+    expect(rail().className).toContain("md:border-l");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    // Minimize → back to the docked flex child, and the sidebar is restored to
+    // its pre-maximize state (it was open, so it reopens).
+    fireEvent.click(screen.getByRole("button", { name: "Exit full screen" }));
+    expect(rail().className).toContain("md:shrink-0");
+    expect(rail().className).not.toContain("md:absolute");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("keeps the sidebar collapsed after exiting full screen if it was collapsed before", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+
+    renderShell("/c/conv_abc");
+
+    // Sidebar starts collapsed (jsdom default). Maximize then exit — it must
+    // stay collapsed, not spuriously reopen.
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    fireEvent.click(screen.getByRole("button", { name: "Exit full screen" }));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+  });
+
+  it("restores the collapsed sidebar when a session switch un-maximizes the rail", () => {
+    // Maximizing collapses the sidebar; the toggle handler restores it on exit,
+    // but a session switch un-maximizes directly (setRightPanelMaximized(false))
+    // — it must restore the sidebar too, or the user's open sidebar is silently
+    // lost. Same AppShell mount, only the :conversationId route param changes,
+    // so we build a tree with SessionNavButton (renderShell has none).
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_abc", permission_level: null },
+      { id: "conv_xyz", permission_level: null },
+    ]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_abc"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route path="c/:conversationId" element={<SessionNavButton to="/c/conv_xyz" />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    // Open the sidebar, then maximize → sidebar collapses (state stashed).
+    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    // Switch conversation — the rail un-maximizes AND the sidebar is restored.
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    // Back to docked (a fresh session starts docked).
+    expect(screen.getByRole("complementary", { name: "Workspace" }).className).not.toContain(
+      "md:absolute",
+    );
   });
 });
 
@@ -1812,6 +2049,120 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByTitle("b.ts")).toBeInTheDocument();
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
   });
+
+  it("restores the open shell tabs per session (switch away and back keeps them)", () => {
+    // Regression: shell tabs used to live only in transient component state and
+    // were cleared on every conversation switch, so navigating away and back
+    // lost them. They now persist per session like file tabs. Seed a session
+    // with one open + selected shell tab whose terminal is live, and assert the
+    // tab strip restores it and mounts its xterm.
+    writeSessionWorkspaceState("conv_shellmem", {
+      open: true,
+      openTerminals: ["terminal:terminal_bash_s1"],
+      selectedTerminalKey: "terminal:terminal_bash_s1",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_bash_s1", name: "bash", session: "s1", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    mockConversations([{ id: "conv_shellmem", permission_level: null }]);
+
+    renderShell("/c/conv_shellmem");
+
+    // The remembered tab renders in the strip (title = "name · session"), and
+    // the persisted active key drives the rail's xterm (stub echoes the id).
+    expect(screen.getByTitle("bash · s1")).toBeInTheDocument();
+    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_bash_s1");
+  });
+
+  it("keeps restored shell tabs while the terminal list is still loading, then prunes dead ones", () => {
+    // The prune effect drops tabs whose terminal is gone — but the incoming
+    // session's list is momentarily empty *while loading*, indistinguishable
+    // from "all closed". Pruning then would wipe the just-restored tabs. The
+    // effect is gated on isLoading: it must skip the load window, then prune
+    // once the real (still-empty) list confirms the terminal is truly gone.
+    writeSessionWorkspaceState("conv_shellload", {
+      open: true,
+      openTerminals: ["terminal:terminal_bash_s1"],
+      selectedTerminalKey: "terminal:terminal_bash_s1",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    // Loading: list empty but not yet resolved.
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: true, error: null });
+    mockConversations([{ id: "conv_shellload", permission_level: null }]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const makeTree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_shellload"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(makeTree());
+
+    // While loading the restored tab survives the transient empty list.
+    expect(screen.getByTitle("terminal_bash_s1")).toBeInTheDocument();
+
+    // The list resolves to genuinely empty (the terminal is really gone) —
+    // now the prune runs and drops the dead tab.
+    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
+    rerender(makeTree());
+
+    expect(screen.queryByTitle("terminal_bash_s1")).toBeNull();
+    expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
+  });
+
+  it("keeps restored shell tabs when the terminals fetch errors (non-authoritative empty list)", () => {
+    // An errored terminals fetch also yields terminals: [], but that empty list
+    // is not authoritative — we couldn't reach the PTYs, not "they're gone".
+    // Pruning against it would wipe the restored tab, so the prune effect is
+    // gated on error too. The tab must survive an errored read.
+    writeSessionWorkspaceState("conv_shellerr", {
+      open: true,
+      openTerminals: ["terminal:terminal_bash_s1"],
+      selectedTerminalKey: "terminal:terminal_bash_s1",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    useTerminalsMock.mockReturnValue({
+      terminals: [],
+      isLoading: false,
+      error: new Error("terminals fetch failed: 503"),
+    });
+    mockConversations([{ id: "conv_shellerr", permission_level: null }]);
+
+    renderShell("/c/conv_shellerr");
+
+    // The restored tab survives the errored (non-authoritative) empty list —
+    // the strip keeps the tab (title falls back to the raw id until the
+    // terminal loads) instead of pruning it as if the PTY were gone.
+    expect(screen.getByTitle("terminal_bash_s1")).toBeInTheDocument();
+  });
 });
 
 describe("Embedded REPL terminal rail inventory", () => {
@@ -1882,13 +2233,11 @@ describe("Embedded REPL terminal rail inventory", () => {
     expect(tab).toHaveTextContent(/Shells\s*1/);
   });
 
-  it("shows the Shells tab by default when the agent declares shell access", () => {
-    // No shells exist yet (only the embedded REPL, which is excluded
-    // from the inventory), but the agent's spec has a terminals: block
-    // — the tab must show anyway so the "+ New shell" empty state is
-    // reachable. A missing tab here means the gate still requires an
-    // existing shell; a "0" in the tab means the badge leaked for the
-    // empty default state.
+  it("hides the Shells tab when no shell exists, even if the agent declares shell access", () => {
+    // Shell creation now lives in the tab strip's "+" menu, so the Shells tab
+    // is a pure list — it must NOT show just because the agent declares a
+    // terminals: block. Here the only terminal is the embedded REPL (excluded
+    // from the inventory), so there's no shell to list and no tab.
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
       isLoading: false,
@@ -1911,14 +2260,32 @@ describe("Embedded REPL terminal rail inventory", () => {
 
     renderShell("/c/conv_sdk");
 
+    expect(screen.queryByRole("tab", { name: /Shells/i })).toBeNull();
+  });
+
+  it("shows the Shells tab once a shell exists", () => {
+    // A real (non-REPL) shell in the inventory surfaces the tab, which lists it.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_zsh_s1", name: "zsh", session: "s1", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+    } as ReturnType<typeof useSessionAgent>);
+    mockConversations([{ id: "conv_sdk", permission_level: null }]);
+
+    renderShell("/c/conv_sdk");
+
     const tab = screen.getByRole("tab", { name: /Shells/i });
-    expect(tab).not.toHaveTextContent(/0/);
     // Display order: Shells sits to the RIGHT of Agents in the strip.
     const agentsTab = screen.getByRole("tab", { name: /Agents/i });
     expect(agentsTab.compareDocumentPosition(tab) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    // Selecting the tab mounts the shells section (whose empty state
-    // carries the new-shell affordance), not a fall-through to the
-    // Files panel — the content branch must share the trigger's gate.
+    // Selecting it mounts the shells list.
     fireEvent.mouseDown(tab);
     expect(screen.getByTestId("inline-terminals-section")).toBeInTheDocument();
   });
@@ -1975,17 +2342,17 @@ describe("AppShell URL sync — file param", () => {
     expect(screen.getByTestId("files-panel")).toBeInTheDocument();
   });
 
-  it("adds ?file= to the URL when a file is selected while already in explore view", () => {
+  it("adds ?file= to the URL when a file is selected from the Files (tree) tab", () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
     mockConversations([{ id: "conv_abc", permission_level: null }]);
 
-    // Start from the legacy ?view=explore link — resolves to the tree view.
-    renderShell("/c/conv_abc?view=explore");
+    // Files is the default tab — the tree scope.
+    renderShell("/c/conv_abc");
 
-    // Sanity-check: tree (explore) mode active, no file open yet.
+    // Sanity-check: tree mode active, no file open yet.
     expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "false");
 
     fireEvent.click(screen.getByRole("button", { name: /files: select README.md/i }));
@@ -2037,7 +2404,7 @@ describe("AppShell URL sync — file param", () => {
     expect(params).not.toContain("comment=");
   });
 
-  it("clears file/diff/comment/view params from the URL when the rail is collapsed", () => {
+  it("clears file/diff/comment params from the URL when the rail is collapsed", () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
@@ -2046,72 +2413,37 @@ describe("AppShell URL sync — file param", () => {
 
     // Deep-link into the workspace with every rail-pointing param. conv_abc is
     // seeded open, so the rail mounts open with the params live.
-    renderShell("/c/conv_abc?file=README.md&diff=1&comment=c1&view=changed");
+    renderShell("/c/conv_abc?file=README.md&diff=1&comment=c1");
 
     // Sanity: the rail is open and the params survived restore.
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
     expect(screen.getByTestId("url-params").textContent).toContain("file=README.md");
-    expect(screen.getByTestId("url-params").textContent).toContain("view=changed");
 
     fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
 
     // Collapsing hides the workspace, so every param that points into it is
-    // stripped: file/diff/comment by the toggle's clearFileViewerUrl, and
-    // view= by the scope-sync effect's rightPanelOpen gate. Failure means a
-    // reload would re-open the rail to a file/view the user just dismissed.
+    // stripped by the toggle's clearFileViewerUrl. Failure means a reload would
+    // re-open the rail to a file the user just dismissed.
     const afterCollapse = screen.getByTestId("url-params").textContent ?? "";
     expect(afterCollapse).not.toContain("file=");
     expect(afterCollapse).not.toContain("diff=");
     expect(afterCollapse).not.toContain("comment=");
-    expect(afterCollapse).not.toContain("view=");
 
     fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
 
     // Reopening rehydrates the URL from the remembered workspace state: the
-    // file (re-added by the toggle) and the Changed scope (re-added by the
-    // scope-sync effect). diff/comment were URL-only ephemerals, so they stay
-    // gone. Failure means a reopened rail is no longer reflected/shareable in
-    // the URL.
+    // file is re-added by the toggle. diff/comment were URL-only ephemerals, so
+    // they stay gone. Failure means a reopened rail is no longer
+    // reflected/shareable in the URL.
     const afterReopen = screen.getByTestId("url-params").textContent ?? "";
     expect(afterReopen).toContain("file=README.md");
-    expect(afterReopen).toContain("view=changed");
     expect(afterReopen).not.toContain("diff=");
     expect(afterReopen).not.toContain("comment=");
   });
 });
 
-describe("AppShell URL sync — view param", () => {
-  it("restores the tree view from the legacy ?view=explore URL param on load", () => {
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_abc", permission_level: null }]);
-
-    renderShell("/c/conv_abc?view=explore");
-
-    // FilesPanel mock exposes data-flat-view; false means the folder tree.
-    // Failure: the conversationId effect did not read searchParams.get("view")
-    // and call setFilesPanelFlatView(false).
-    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "false");
-  });
-
-  it("restores Changed-only view from the ?view=changed URL param on load", () => {
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_abc", permission_level: null }]);
-
-    renderShell("/c/conv_abc?view=changed");
-
-    // FilesPanel mock exposes data-flat-view; true means Changed-only.
-    // Failure: the conversationId effect did not read searchParams.get("view")
-    // and call setFilesPanelFlatView(true).
-    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
-  });
-
-  it("writes ?view=changed to the URL when the user enables Changed only", () => {
+describe("Files/Changes tabs drive the panel scope", () => {
+  it("defaults to the Files (tree) tab with no ?view= param in the URL", () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
@@ -2120,217 +2452,64 @@ describe("AppShell URL sync — view param", () => {
 
     renderShell("/c/conv_abc");
 
-    // Baseline: Files tab, tree view (flatView=false, no ?view= param).
+    // The Files tab pins the panel to the tree; no scope param is written.
     expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "false");
+    expect(screen.getByRole("tab", { name: /files/i })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("url-params").textContent).not.toContain("view=");
+  });
 
-    fireEvent.click(screen.getByRole("button", { name: /files: switch to changed/i }));
+  it("shows the changed-only list on the Changes tab without touching the URL", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
 
-    // After enabling Changed only: flat list active, ?view=changed in URL.
-    // Failure: the filesPanelFlatView sync useEffect did not call setSearchParams.
+    renderShell("/c/conv_abc");
+
+    // Radix Tabs activate on mouseDown, not click.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /changes/i }));
+
+    // Selecting Changes flips the panel to the changed-only flat list; the
+    // scope is the tab, so no ?view= param is written.
     expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
-    expect(screen.getByTestId("url-params").textContent).toContain("view=changed");
+    expect(screen.getByTestId("url-params").textContent).not.toContain("view=");
+  });
+
+  it("restores the Changes tab per session from persisted workspace state", () => {
+    // The selected tab is the scope now: a session left on Changes reopens on
+    // the changed-only list.
+    writeSessionWorkspaceState("conv_changesmem", { open: true, rightRailTab: "changes" });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_changesmem", permission_level: null }]);
+
+    renderShell("/c/conv_changesmem");
+
+    expect(screen.getByRole("tab", { name: /changes/i })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
   });
 });
 
-describe("Files scope default and persistence", () => {
-  const PREF_KEY = "omnigent:files-panel-preferences";
-
-  function mockChangedFiles(paths: string[]) {
-    useChangedFilesMock.mockReturnValue({
-      data: {
-        available: true,
-        data: paths.map((path) => ({
-          path,
-          name: path.split("/").pop() ?? path,
-          status: "modified" as const,
-          bytes: 1,
-          modified_at: 1,
-        })),
-      },
-      isSuccess: true,
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceChangedFiles>);
-  }
-
-  it("defaults to All (tree) even when the conversation loads with changes", () => {
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_abc", permission_level: null }]);
-    // Changes are present, but with nothing persisted the panel must open on
-    // "All", not "Changed" — the core behavior change. Failure here
-    // means the old auto-default-to-Changed-when-changes-exist logic is back.
-    mockChangedFiles(["src/App.tsx"]);
-
-    renderShell("/c/conv_abc");
-
-    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "false");
-    expect(screen.getByTestId("url-params").textContent).not.toContain("view=");
-    // And the default must stay unpersisted: merely loading a conversation
-    // with changes must not write a "Changed" preference behind the user's
-    // back. A non-null value here means the removed auto-default crept back
-    // in as a silent localStorage write.
-    expect(localStorage.getItem(PREF_KEY)).toBeNull();
-  });
-
-  it("restores the remembered Changed scope on load from localStorage", () => {
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_abc", permission_level: null }]);
-    // A previously-saved "Changed" choice must seed the scope on a fresh
-    // mount. Failure means the useState initializer / restore effect isn't
-    // reading the persisted preference.
-    localStorage.setItem(PREF_KEY, JSON.stringify({ changedOnly: true }));
-
-    renderShell("/c/conv_abc");
-
-    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
-  });
-
-  it("persists the toggle choice so it carries into the next session", () => {
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([
-      { id: "conv_abc", permission_level: null },
-      { id: "conv_xyz", permission_level: null },
-    ]);
-
-    // Session 1: opens on All, user switches to Changed.
-    renderShell("/c/conv_abc");
-    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "false");
-    fireEvent.click(screen.getByRole("button", { name: /files: switch to changed/i }));
-    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
-    // The choice was written to localStorage — that's what makes it sticky.
-    expect(localStorage.getItem(PREF_KEY)).toBe(
-      JSON.stringify({ changedOnly: true, sort: "recent" }),
-    );
-
-    // Re-enter a *different* session fresh: it must open on the remembered
-    // "Changed" scope. cleanup() unmounts the shell but does NOT touch
-    // localStorage (only beforeEach clears it, between tests), so the choice
-    // written above survives into this second mount — exactly the cross-
-    // session carry-over the issue asks for. Failure means the choice didn't
-    // carry across sessions.
-    cleanup();
-    renderShell("/c/conv_xyz");
-    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
-  });
-
-  it("keeps the toggled scope on an in-mount session switch when the storage write is blocked", () => {
-    // Simulate blocked storage (Safari private mode): the write is swallowed,
-    // so localStorage stays empty. The remembered scope must come from the
-    // in-memory ref, not a fresh localStorage read — otherwise switching
-    // sessions resets the user's just-made choice back to the default.
-    //
-    // jsdom routes setItem through Storage.prototype (an instance-level spy is
-    // a no-op), so we spy there but throw ONLY for the files-panel preference
-    // key and delegate every other key to the real method. That keeps the
-    // blast radius to this one localStorage write — AppShell's sessionStorage
-    // panel-key writes on mount/navigation still go through untouched.
-    const realSetItem = Storage.prototype.setItem;
-    const setItemSpy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (
-      this: Storage,
-      key: string,
-      value: string,
-    ) {
-      if (key === PREF_KEY) throw new Error("storage blocked");
-      realSetItem.call(this, key, value);
-    });
-    try {
-      useEnvironmentMock.mockReturnValue({
-        data: { available: true, root: null },
-        isLoading: false,
-      } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-      mockConversations([
-        { id: "conv_abc", permission_level: null },
-        { id: "conv_xyz", permission_level: null },
-      ]);
-
-      // Stable QueryClient + a fresh element per call so AppShell stays mounted
-      // across the navigation (a fresh client would remount and reset the ref).
-      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-      render(
-        <QueryClientProvider client={qc}>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/c/conv_abc"]}>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route
-                    path="c/:conversationId"
-                    element={
-                      <>
-                        <SessionNavButton to="/c/conv_xyz" />
-                        <LocationDisplay />
-                      </>
-                    }
-                  />
-                </Route>
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
-        </QueryClientProvider>,
-      );
-
-      // Opens on All, user switches to Changed. The write throws (swallowed),
-      // so localStorage never records the choice.
-      expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "false");
-      fireEvent.click(screen.getByRole("button", { name: /files: switch to changed/i }));
-      expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
-      expect(localStorage.getItem(PREF_KEY)).toBeNull();
-
-      // Switch to another session within the same mount (bare path → no ?view=
-      // param, so the conversation-switch effect hits the remembered-scope
-      // fallback). Failure here means the fallback re-read empty localStorage
-      // and reverted to All instead of using the in-memory ref.
-      fireEvent.click(screen.getByTestId("nav-session"));
-      expect(screen.getByTestId("url-params").textContent).not.toContain("view=");
-      expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
-    } finally {
-      setItemSpy.mockRestore();
-    }
-  });
-
-  it("lets a deep-link ?view=explore param win over the remembered scope", () => {
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_abc", permission_level: null }]);
-    // Remembered choice is "Changed", but the explicit deep-link to the tree
-    // must win for this navigation.
-    localStorage.setItem(PREF_KEY, JSON.stringify({ changedOnly: true }));
-
-    renderShell("/c/conv_abc?view=explore");
-
-    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "false");
-    // The deep-link override is transient: it must NOT rewrite the stored
-    // preference. If this flips to changedOnly:false, a shared ?view=explore
-    // link would silently clobber the recipient's remembered choice.
-    expect(localStorage.getItem(PREF_KEY)).toBe(JSON.stringify({ changedOnly: true }));
-  });
-});
-
-describe("AppShell scope switch — conversation redirect (stale-closure regression)", () => {
-  it("keeps the URL on the current conversation when All is clicked after an in-app switch", () => {
-    // Regression for the "click All → jump to a different conversation" bug.
-    // AppShell is a layout route that never remounts across /c/:a → /c/:b, so
-    // when showScopeView was useCallback([]) it stayed frozen to AppShell's
-    // first render: its clearFileViewerUrl closed over react-router's
-    // first-mount navigate, whose relative setSearchParams resolves against the
-    // pathname captured then. Clicking a scope button after switching sessions
-    // therefore yanked the URL back to the conversation open at first mount.
+describe("AppShell scope view — conversation redirect (stale-closure regression)", () => {
+  it("keeps the URL on the current conversation when the scope view is revealed after an in-app switch", () => {
+    // Regression for the "reveal the scope view → jump to a different
+    // conversation" bug. AppShell is a layout route that never remounts across
+    // /c/:a → /c/:b, so when showScopeView was useCallback([]) it stayed frozen
+    // to AppShell's first render: its clearFileViewerUrl closed over
+    // react-router's first-mount navigate, whose relative setSearchParams
+    // resolves against the pathname captured then. Revealing the scope view
+    // after switching sessions therefore yanked the URL back to the
+    // conversation open at first mount.
     //
     // This test reproduces that exact flow: mount on conv_abc, switch in-app to
     // conv_xyz (AppShell stays mounted, carrying the stale closure), open a
-    // file, click All. With the bug the pathname reverts to /c/conv_abc; with
-    // the fix (showScopeView depends on clearFileViewerUrl → setSearchParams →
-    // the live location) it stays on /c/conv_xyz.
+    // file, close it to reveal the scope view. With the bug the pathname
+    // reverts to /c/conv_abc; with the fix (showScopeView depends on
+    // clearFileViewerUrl → setSearchParams → the live location) it stays on
+    // /c/conv_xyz.
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
@@ -2375,9 +2554,7 @@ describe("AppShell scope switch — conversation redirect (stale-closure regress
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
 
     // Close the file via the viewer — this invokes showScopeView, the callback
-    // that regressed. (The Changed/All switch lives in FilesPanel, which is
-    // unmounted while a file is open, so the viewer's close is now the
-    // affordance wired to showScopeView.)
+    // that regressed. The viewer's close is the affordance wired to it.
     fireEvent.click(
       within(screen.getByTestId("file-viewer-inline")).getByRole("button", {
         name: /file-viewer: close/i,
@@ -2558,22 +2735,17 @@ describe("Mobile session menu", () => {
     expect(screen.getByRole("menuitem", { name: /Shells/i })).toBeInTheDocument();
   });
 
-  it("shows the Shells entry on mobile when the agent declares shell access", () => {
-    // No user shells exist yet (only the embedded REPL, excluded from the
-    // Shells inventory), but the agent declares a terminals: block. Mobile
-    // must mirror the desktop rail so the empty-state "+ New shell" entry
-    // point is reachable before the first shell exists.
+  it("shows the Shells entry on mobile at zero shells when the agent declares shell access", () => {
+    // Mobile has no tab-strip "+" menu, so the drawer is the create entry point:
+    // its Shells entry shows before any shell exists (declared access), unlike
+    // the desktop rail tab which gates on an existing shell. Here the only
+    // terminal is the embedded REPL (excluded from the inventory), so there's
+    // no shell yet — the entry must still appear.
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([
-      {
-        id: "conv_sdk",
-        permission_level: null,
-        labels: { "omnigent.ui": "terminal" },
-      },
-    ]);
+    mockConversations([{ id: "conv_sdk", permission_level: null }]);
     useTerminalsMock.mockReturnValue({
       terminals: [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }],
       isLoading: false,
@@ -2586,9 +2758,8 @@ describe("Mobile session menu", () => {
     renderShell("/c/conv_sdk");
     openSessionMenu();
 
-    const shellsEntry = screen.getByRole("menuitem", { name: /^Shells$/i });
+    const shellsEntry = screen.getByRole("menuitem", { name: /^Shells/i });
     expect(shellsEntry).toBeInTheDocument();
-    expect(shellsEntry).not.toHaveTextContent(/0/);
     fireEvent.click(shellsEntry);
 
     const drawer = screen.getByTestId("shells-panel-drawer");
@@ -2642,7 +2813,7 @@ describe("Mobile session menu", () => {
     );
   });
 
-  it("opens the files drawer from the Files entry in the default tree view", () => {
+  it("opens the files drawer in the tree view from the Files entry", () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
@@ -2654,12 +2825,30 @@ describe("Mobile session menu", () => {
     openSessionMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: /^Files$/i }));
 
-    // Files → drawer open in the default tree view (flatView=false). The
-    // "Changed only" scope is the drawer's own toggle, not forced by the entry.
-    // Failure: openFilesPanel didn't set filesPanelOpen.
+    // Files → drawer open pinned to the full folder tree (flatView=false).
+    // Failure: openFilesPanel didn't set filesPanelOpen / the drawer scope.
     const drawer = screen.getByTestId("files-panel-drawer");
     expect(drawer).toHaveAttribute("data-state", "open");
     expect(drawer).toHaveAttribute("data-flat-view", "false");
+  });
+
+  it("opens the files drawer in the changed-only list from the Changes entry", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+
+    renderShell("/c/conv_abc");
+
+    openSessionMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Changes$/i }));
+
+    // Changes → same drawer, pinned to the changed-files-only list
+    // (flatView=true). Failure: openChangesPanel didn't set the drawer scope.
+    const drawer = screen.getByTestId("files-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(drawer).toHaveAttribute("data-flat-view", "true");
   });
 
   it("opens the Tasks drawer for a claude-native session with todos", () => {
@@ -2692,36 +2881,31 @@ describe("Mobile session menu", () => {
     expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
   });
 
-  it("opens the Tasks drawer for a codex-native session with todos", () => {
-    // Codex-native maps its plan updates to the same todo schema, so the
-    // Tasks entry must gate on codex-native too — not just claude-native.
+  it.each([
+    ["codex-native", "conv_codex", "codex-native-ui"],
+    ["pi-native", "conv_pi", "pi-native-ui"],
+  ])("opens the Tasks drawer for a %s session with todos", (_harness, id, wrapper) => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
     mockConversations([
       {
-        id: "conv_codex",
+        id,
         permission_level: null,
-        labels: { "omnigent.wrapper": "codex-native-ui" },
+        labels: { "omnigent.wrapper": wrapper },
       },
     ]);
     useChatStore.setState({
-      todos: [
-        { content: "Locate CLI parser", status: "in_progress", activeForm: "Locate CLI parser" },
-      ],
+      todos: [{ content: "Locate CLI parser", status: "in_progress", activeForm: "Locating" }],
     });
 
-    renderShell("/c/conv_codex");
-
+    renderShell(`/c/${id}`);
     expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "closed");
-    expect(screen.queryByTestId("todo-panel")).toBeNull();
 
     openSessionMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: /Tasks/i }));
 
-    // A codex-native session with a non-empty plan opens the Tasks drawer,
-    // the same as a claude-native session with todos.
     expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "open");
     expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
   });
@@ -2746,6 +2930,7 @@ describe("Mobile session menu", () => {
     });
     expect(screen.getByRole("menuitem", { name: /Agents\s*1/i })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: /Files/i })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: /Changes/i })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: /Shells/i })).toBeNull();
   });
 });

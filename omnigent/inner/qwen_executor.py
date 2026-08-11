@@ -28,9 +28,9 @@ import json
 import logging
 import os
 import secrets
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, TypeAlias
 
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
@@ -42,12 +42,30 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     TextChunk,
+    ToolCallComplete,
+    ToolCallRequest,
+    ToolCallStatus,
+    ToolSpec,
     TurnComplete,
+    describe_exception,
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 
 logger = logging.getLogger(__name__)
+
+# Qwen speaks the extensible ACP JSON-RPC schema; consumers narrow fields
+# before use.
+_AcpJsonObject: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+
+
+class _PolicyVerdict(Protocol):
+    action: str
+
+
+_PolicyEvaluator: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[_PolicyVerdict]]
+_ElicitationHandler: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[bool]]
+_ToolExecutor: TypeAlias = Callable[[str, _AcpJsonObject], Awaitable[_AcpJsonObject]]
 
 # ACP error code qwen maps to a filesystem "not found" (ENOENT) when a
 # delegated ``fs/read_text_file`` fails — qwen's AcpFileSystemService special-
@@ -110,7 +128,7 @@ _INIT_TIMEOUT_SECONDS = 30.0
 _PROTOCOL_VERSION = 1
 
 
-def _inline_text_file_data(file_data: Any) -> str:  # type: ignore[explicit-any]
+def _inline_text_file_data(file_data: object) -> str:
     """Decode a text ``input_file`` ``file_data`` data URI into inline text.
 
     Mirrors the codex executor: ``input_file`` blocks may carry a
@@ -138,7 +156,7 @@ def _inline_text_file_data(file_data: Any) -> str:  # type: ignore[explicit-any]
         return ""
 
 
-def _parse_image_data_uri(data_uri: Any) -> tuple[str, str] | None:  # type: ignore[explicit-any]
+def _parse_image_data_uri(data_uri: object) -> tuple[str, str] | None:
     """Split an ``image/*`` ``data:`` URI into ``(mime_type, base64_payload)``.
 
     ACP's ``image`` content block carries the raw base64 payload plus its media
@@ -222,10 +240,10 @@ class QwenExecutor(Executor):
         self._gateway_auth_command = gateway_auth_command
 
         # Asyncio subprocess (created on first run_turn call).
-        self._proc: asyncio.subprocess.Process | None = None  # type: ignore[name-defined]
+        self._proc: asyncio.subprocess.Process | None = None
 
         # Queue fed by the stdout-reader coroutine.
-        self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()  # type: ignore[explicit-any]
+        self._queue: asyncio.Queue[_AcpJsonObject] = asyncio.Queue()
         self._reader_task: asyncio.Task[None] | None = None
         # Drains qwen stderr so a chatty CLI can't fill the pipe buffer
         # (~64 KiB) and wedge the subprocess mid-turn — see _read_stderr.
@@ -237,7 +255,7 @@ class QwenExecutor(Executor):
         # Pending RPC responses keyed by request id.
         # When _reader_task receives a response (has "id" + "result"/"error"),
         # it places it here for the awaiting coroutine.
-        self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}  # type: ignore[explicit-any]
+        self._pending: dict[int, asyncio.Future[_AcpJsonObject]] = {}
 
         # ACP session id assigned by qwen (returned in session/new response).
         self._session_id: str | None = None
@@ -266,14 +284,18 @@ class QwenExecutor(Executor):
         # them and the intent is explicit. ``None`` means "no bridge wired"
         # (standalone use / unit tests), in which case permission falls back
         # to allow. See _decide_permission.
-        self._policy_evaluator: Any | None = None  # type: ignore[explicit-any]
-        self._elicitation_handler: Any | None = None  # type: ignore[explicit-any]
+        self._policy_evaluator: _PolicyEvaluator | None = None
+        self._elicitation_handler: _ElicitationHandler | None = None
         # Adapter-injected tool bridge + the Omnigent-tool MCP relay it backs.
         # Exposes Omnigent builtin tools to qwen via session/new.mcpServers (the
         # shared serve-mcp relay); qwen keeps its own built-in tool registry.
-        self._tool_executor: Any | None = None  # type: ignore[explicit-any]
+        self._tool_executor: _ToolExecutor | None = None
         self._mcp = OmnigentAcpMcp(label="qwen")
-        self._omnigent_tools: list[Any] = []  # type: ignore[explicit-any]
+        self._omnigent_tools: list[ToolSpec] = []
+
+        # ToolCall records for delegated fs ops; run_turn drains them onto the
+        # turn stream so the I/O shows in history.
+        self._fs_events: list[ExecutorEvent] = []
 
     # ------------------------------------------------------------------
     # Low-level ACP helpers
@@ -480,7 +502,7 @@ class QwenExecutor(Executor):
                 if not line:
                     continue
                 try:
-                    msg: dict[str, Any] = json.loads(line)  # type: ignore[explicit-any]
+                    msg: _AcpJsonObject = json.loads(line)
                 except json.JSONDecodeError:
                     logger.debug("qwen: non-JSON stdout line: %r", line[:200])
                     continue
@@ -510,9 +532,9 @@ class QwenExecutor(Executor):
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(exc)
-            await self._queue.put({"type": "error", "message": str(exc)})
+            await self._queue.put({"type": "error", "message": describe_exception(exc)})
 
-    async def _send(self, msg: dict[str, Any]) -> None:  # type: ignore[explicit-any]
+    async def _send(self, msg: _AcpJsonObject) -> None:
         """Write one newline-terminated JSON message to qwen stdin."""
         assert self._proc and self._proc.stdin
         encoded = (json.dumps(msg) + "\n").encode("utf-8")
@@ -522,9 +544,9 @@ class QwenExecutor(Executor):
     async def _rpc(
         self,
         method: str,
-        params: dict[str, Any],  # type: ignore[explicit-any]
+        params: _AcpJsonObject,
         timeout: float = _INIT_TIMEOUT_SECONDS,
-    ) -> dict[str, Any]:  # type: ignore[explicit-any]
+    ) -> _AcpJsonObject:
         """Send a JSON-RPC 2.0 request and await its response.
 
         :param method: RPC method name, e.g. ``"initialize"``.
@@ -538,10 +560,10 @@ class QwenExecutor(Executor):
         self._rpc_id += 1
         req_id = self._rpc_id
         loop = asyncio.get_event_loop()
-        fut: asyncio.Future[dict[str, Any]] = loop.create_future()  # type: ignore[explicit-any]
+        fut: asyncio.Future[_AcpJsonObject] = loop.create_future()
         self._pending[req_id] = fut
 
-        request: dict[str, Any] = {  # type: ignore[explicit-any]
+        request: _AcpJsonObject = {
             "jsonrpc": "2.0",
             "id": req_id,
             "method": method,
@@ -554,9 +576,9 @@ class QwenExecutor(Executor):
             self._pending.pop(req_id, None)
             raise
 
-    async def _notify(self, method: str, params: dict[str, Any]) -> None:  # type: ignore[explicit-any]
+    async def _notify(self, method: str, params: _AcpJsonObject) -> None:
         """Send a JSON-RPC 2.0 notification (no response expected)."""
-        notification: dict[str, Any] = {  # type: ignore[explicit-any]
+        notification: _AcpJsonObject = {
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
@@ -613,7 +635,7 @@ class QwenExecutor(Executor):
             tool_executor=getattr(self, "_tool_executor", None),
             loop=asyncio.get_event_loop(),
         )
-        params: dict[str, Any] = {  # type: ignore[explicit-any]
+        params: _AcpJsonObject = {
             "sessionId": secrets.token_urlsafe(16),
             "cwd": self._cwd,
             "mcpServers": mcp_servers,
@@ -646,7 +668,7 @@ class QwenExecutor(Executor):
     # Server-initiated requests (agent → client)
     # ------------------------------------------------------------------
 
-    async def _respond_to_agent_request(self, request: dict[str, Any]) -> None:  # type: ignore[explicit-any]
+    async def _respond_to_agent_request(self, request: _AcpJsonObject) -> None:
         """Answer a server-initiated ACP request from qwen.
 
         qwen can drive the client mid-turn (e.g. permission prompts). A blanket
@@ -676,8 +698,8 @@ class QwenExecutor(Executor):
         # actually delegates permissions/fs to us (vs handling them itself).
         logger.debug("qwen agent request: method=%s id=%s", method, req_id)
 
-        result: dict[str, Any] | None = None  # type: ignore[explicit-any]
-        error: dict[str, Any] | None = None  # type: ignore[explicit-any]
+        result: _AcpJsonObject | None = None
+        error: _AcpJsonObject | None = None
 
         try:
             if method == "session/request_permission":
@@ -700,7 +722,7 @@ class QwenExecutor(Executor):
             logger.debug("qwen agent request %s failed: %s", method, exc)
             error = {"code": -32603, "message": f"{method} failed: {exc}"}
 
-        reply: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id}  # type: ignore[explicit-any]
+        reply: _AcpJsonObject = {"jsonrpc": "2.0", "id": req_id}
         if error is not None:
             reply["error"] = error
         else:
@@ -728,18 +750,63 @@ class QwenExecutor(Executor):
             self._os_environment = env
         return self._os_environment
 
-    async def _handle_fs_read(self, params: dict[str, Any]) -> dict[str, Any]:  # type: ignore[explicit-any]
+    async def _fs_call_policy_denies(self, tool_name: str, args: _AcpJsonObject) -> bool:
+        """Call-phase gate for a delegated fs side effect, evaluated before it runs."""
+        policy_eval = getattr(self, "_policy_evaluator", None)
+        if policy_eval is None:
+            return False
+        try:
+            verdict = await policy_eval("PHASE_TOOL_CALL", {"name": tool_name, "arguments": args})
+        except Exception as exc:  # noqa: BLE001 — call phase fails closed for side effects
+            logger.warning("qwen TOOL_CALL policy eval failed for %s: %s", tool_name, exc)
+            return True
+        return getattr(verdict, "action", None) in ("POLICY_ACTION_DENY", "POLICY_ACTION_ASK")
+
+    async def _fs_result_policy_denies(self, tool_name: str, result: Any) -> bool:
+        """Result-phase check on delegated fs results before they reach the model."""
+        policy_eval = getattr(self, "_policy_evaluator", None)
+        if policy_eval is None:
+            return False
+        try:
+            verdict = await policy_eval("PHASE_TOOL_RESULT", {"result": result})
+        except Exception as exc:  # noqa: BLE001 — result phase fails open
+            logger.warning("qwen TOOL_RESULT policy eval failed for %s: %s", tool_name, exc)
+            return False
+        return getattr(verdict, "action", None) == "POLICY_ACTION_DENY"
+
+    def _record_fs_op(
+        self,
+        tool_name: str,
+        args: _AcpJsonObject,
+        *,
+        status: ToolCallStatus,
+        result: Any = None,
+        error: str | None = None,
+    ) -> None:
+        """Buffer a paired ToolCallRequest + ToolCallComplete for a delegated fs op."""
+        call_id = f"fsacp_{secrets.token_hex(8)}"
+        self._fs_events.append(
+            ToolCallRequest(name=tool_name, args=args, metadata={"call_id": call_id})
+        )
+        self._fs_events.append(
+            ToolCallComplete(
+                name=tool_name,
+                status=status,
+                result=result,
+                error=error,
+                metadata={"call_id": call_id},
+            )
+        )
+
+    async def _handle_fs_read(self, params: _AcpJsonObject) -> _AcpJsonObject:
         """Serve an ACP ``fs/read_text_file`` by reading through the OSEnvironment.
 
         ACP params: ``{path, line?, limit?}`` where ``line`` is a 1-based start
         line and ``limit`` a max line count (both optional → whole file). Maps
-        onto :meth:`OSEnvironment.read`'s ``offset`` / ``limit``.
-
-        :param params: The request params.
-        :returns: ``{"content": <text>}`` per the ACP response shape.
-        :raises _AcpRequestError: On a missing path arg, a non-text/binary file,
-            or a read failure (mapped to ENOENT when it looks like a missing
-            file so qwen raises the right error to the model).
+        onto :meth:`OSEnvironment.read`'s ``offset`` / ``limit``. The op is
+        recorded onto the turn stream. Call-phase policy gates the read by path
+        before it runs, and the returned content runs through result-phase policy
+        before it reaches qwen.
         """
         path = params.get("path")
         if not isinstance(path, str) or not path:
@@ -748,28 +815,57 @@ class QwenExecutor(Executor):
         limit = params.get("limit")
         offset = line if isinstance(line, int) and line >= 1 else 1
         read_limit = limit if isinstance(limit, int) and limit >= 1 else None
+        args: _AcpJsonObject = {"path": path}
+        if line is not None:
+            args["line"] = line
+        if limit is not None:
+            args["limit"] = limit
 
-        env = await self._ensure_os_environment()
-        result = await env.read(path, offset=offset, limit=read_limit)
-        if "error" in result:
-            message = str(result["error"])
-            code = _ACP_RESOURCE_NOT_FOUND_CODE if _looks_like_missing_file(message) else -32603
-            raise _AcpRequestError(code, message)
-        # A binary file comes back base64-encoded (or descriptor-only); ACP
-        # read_text_file is text-only, so refuse rather than hand back bytes.
-        if result.get("encoding") != "utf-8":
-            raise _AcpRequestError(-32603, f"{path}: not a UTF-8 text file")
-        return {"content": result.get("content", "")}
+        if await self._fs_call_policy_denies("read_text_file", args):
+            self._record_fs_op(
+                "read_text_file", args, status=ToolCallStatus.BLOCKED, error="blocked by policy"
+            )
+            raise _AcpRequestError(-32603, f"{path}: blocked by policy")
 
-    async def _handle_fs_write(self, params: dict[str, Any]) -> dict[str, Any]:  # type: ignore[explicit-any]
+        try:
+            env = await self._ensure_os_environment()
+            read_result = await env.read(path, offset=offset, limit=read_limit)
+            if "error" in read_result:
+                message = str(read_result["error"])
+                code = (
+                    _ACP_RESOURCE_NOT_FOUND_CODE if _looks_like_missing_file(message) else -32603
+                )
+                raise _AcpRequestError(code, message)
+            if read_result.get("encoding") != "utf-8":
+                raise _AcpRequestError(-32603, f"{path}: not a UTF-8 text file")
+        except _AcpRequestError as exc:
+            self._record_fs_op(
+                "read_text_file", args, status=ToolCallStatus.ERROR, error=exc.message
+            )
+            raise
+
+        content = read_result.get("content", "")
+        if await self._fs_result_policy_denies("read_text_file", content):
+            self._record_fs_op(
+                "read_text_file",
+                args,
+                status=ToolCallStatus.BLOCKED,
+                error="blocked by content policy",
+            )
+            raise _AcpRequestError(-32603, f"{path}: blocked by content policy")
+        self._record_fs_op(
+            "read_text_file", args, status=ToolCallStatus.SUCCESS, result={"content": content}
+        )
+        return {"content": content}
+
+    async def _handle_fs_write(self, params: _AcpJsonObject) -> _AcpJsonObject:
         """Serve an ACP ``fs/write_text_file`` by writing through the OSEnvironment.
 
         ACP params: ``{path, content}``. The write goes through the helper, so
-        the spec's sandbox write roots are enforced at the Python layer.
-
-        :param params: The request params.
-        :returns: An empty result object (ACP expects no payload on success).
-        :raises _AcpRequestError: On missing/invalid args or a write failure.
+        the spec's sandbox write roots are enforced at the Python layer. The op
+        is recorded onto the turn stream, and call-phase policy gates the write
+        before it runs. Result-phase policy evaluates the write result after the
+        side effect; a denial refuses the response without undoing the write.
         """
         path = params.get("path")
         content = params.get("content")
@@ -777,15 +873,41 @@ class QwenExecutor(Executor):
             raise _AcpRequestError(-32602, "fs/write_text_file requires a string 'path'")
         if not isinstance(content, str):
             raise _AcpRequestError(-32602, "fs/write_text_file requires string 'content'")
+        args: _AcpJsonObject = {"path": path, "content": content}
 
-        env = await self._ensure_os_environment()
-        result = await env.write(path, content)
-        if "error" in result:
-            raise _AcpRequestError(-32603, str(result["error"]))
+        if await self._fs_call_policy_denies("write_text_file", args):
+            self._record_fs_op(
+                "write_text_file",
+                args,
+                status=ToolCallStatus.BLOCKED,
+                error="blocked by policy",
+            )
+            raise _AcpRequestError(-32603, f"{path}: blocked by policy")
+        try:
+            env = await self._ensure_os_environment()
+            write_result = await env.write(path, content)
+            if "error" in write_result:
+                raise _AcpRequestError(-32603, str(write_result["error"]))
+        except _AcpRequestError as exc:
+            self._record_fs_op(
+                "write_text_file", args, status=ToolCallStatus.ERROR, error=exc.message
+            )
+            raise
+        if await self._fs_result_policy_denies("write_text_file", write_result):
+            self._record_fs_op(
+                "write_text_file",
+                args,
+                status=ToolCallStatus.BLOCKED,
+                error="blocked by result policy",
+            )
+            raise _AcpRequestError(-32603, f"{path}: blocked by result policy")
+        self._record_fs_op(
+            "write_text_file", args, status=ToolCallStatus.SUCCESS, result=write_result
+        )
         return {}
 
     @staticmethod
-    def _extract_tool_call(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:  # type: ignore[explicit-any]
+    def _extract_tool_call(params: _AcpJsonObject) -> tuple[str, _AcpJsonObject]:
         """Pull ``(tool_name, tool_input)`` from a ``session/request_permission``.
 
         Qwen's payload carries a ``toolCall`` with ``_meta.toolName`` (e.g.
@@ -801,7 +923,7 @@ class QwenExecutor(Executor):
             args = {}
         return str(name), args
 
-    async def _decide_permission(self, params: dict[str, Any]) -> bool:  # type: ignore[explicit-any]
+    async def _decide_permission(self, params: _AcpJsonObject) -> bool:
         """Decide allow/deny for a permission request — policy then elicitation.
 
         Mirrors ``ClaudeSDKExecutor``'s ``can_use_tool`` gate, composed of two
@@ -869,9 +991,7 @@ class QwenExecutor(Executor):
         return True
 
     @staticmethod
-    def _permission_outcome(  # type: ignore[explicit-any]
-        params: dict[str, Any], *, allow: bool
-    ) -> dict[str, Any]:
+    def _permission_outcome(params: _AcpJsonObject, *, allow: bool) -> _AcpJsonObject:
         """Map an allow/deny decision to an ACP permission ``outcome``.
 
         On allow, prefer a once-scoped grant (``allow_once``) over
@@ -880,7 +1000,7 @@ class QwenExecutor(Executor):
         """
         options = [o for o in (params.get("options") or []) if isinstance(o, dict)]
 
-        def _pick(*kinds: str) -> dict[str, Any] | None:  # type: ignore[explicit-any]
+        def _pick(*kinds: str) -> _AcpJsonObject | None:
             for kind in kinds:  # exact-kind preference order
                 for opt in options:
                     if opt.get("kind") == kind:
@@ -902,9 +1022,7 @@ class QwenExecutor(Executor):
         return {"outcome": "selected", "optionId": chosen.get("optionId")}
 
     @staticmethod
-    def _accumulate_usage(  # type: ignore[explicit-any]
-        acc: dict[str, int], update: dict[str, Any]
-    ) -> None:
+    def _accumulate_usage(acc: dict[str, int], update: _AcpJsonObject) -> None:
         """Fold a ``session/update``'s ``_meta.usage`` into the turn accumulator.
 
         qwen reports token usage out-of-band on an ``agent_message_chunk`` update
@@ -933,7 +1051,7 @@ class QwenExecutor(Executor):
         if not isinstance(usage, dict):
             return
 
-        def _int(value: Any) -> int:  # type: ignore[explicit-any]
+        def _int(value: object) -> int:
             return int(value) if isinstance(value, (int, float)) else 0
 
         cached = _int(usage.get("cachedReadTokens"))
@@ -947,7 +1065,7 @@ class QwenExecutor(Executor):
             acc["cache_read_input_tokens"] = acc.get("cache_read_input_tokens", 0) + cached
 
     @staticmethod
-    def _image_blocks_from_content(content: Any) -> list[dict[str, Any]]:  # type: ignore[explicit-any]
+    def _image_blocks_from_content(content: object) -> list[_AcpJsonObject]:
         """Build ACP ``image`` prompt blocks from a message's ``input_image`` blocks.
 
         The runner resolves a ``file_id`` into an inline ``image_url`` (or
@@ -959,7 +1077,7 @@ class QwenExecutor(Executor):
         :param content: A message's ``content`` (block list, or non-list → none).
         :returns: A list of ACP image content blocks (possibly empty).
         """
-        out: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+        out: list[_AcpJsonObject] = []
         if not isinstance(content, list):
             return out
         for block in content:
@@ -973,9 +1091,9 @@ class QwenExecutor(Executor):
 
     @staticmethod
     def _text_from_blocks(
-        blocks: list[Any],
+        blocks: list[object],
         *,
-        emit_image_marker: bool = False,  # type: ignore[explicit-any]
+        emit_image_marker: bool = False,
     ) -> str:
         """Extract prompt text from a Responses-API content-block list.
 
@@ -1046,7 +1164,7 @@ class QwenExecutor(Executor):
         return "\n".join(parts)
 
     @classmethod
-    def _history_prefix(cls, prior: list[Any]) -> str:  # type: ignore[explicit-any]
+    def _history_prefix(cls, prior: Sequence[object]) -> str:
         """Serialize prior conversation turns into a text prefix.
 
         On a *fresh* ACP session (the first turn of a newly spawned/respawned
@@ -1095,7 +1213,7 @@ class QwenExecutor(Executor):
     async def run_turn(
         self,
         messages: list[Message],
-        tools: list[Any],  # type: ignore[explicit-any]  # qwen runs its own tools; used for the Omnigent MCP relay
+        tools: list[ToolSpec],
         system_prompt: str,
         config: ExecutorConfig | None = None,  # noqa: ARG002 — unused; required by the Executor interface
     ) -> AsyncIterator[ExecutorEvent]:
@@ -1122,7 +1240,7 @@ class QwenExecutor(Executor):
             await self._ensure_initialized()
             session_id = await self._ensure_session()
         except Exception as exc:  # noqa: BLE001
-            yield ExecutorError(message=str(exc), retryable=False)
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
 
         # A fresh ACP session (first turn of a new/respawned process, or after
@@ -1132,7 +1250,7 @@ class QwenExecutor(Executor):
 
         # Build the prompt payload from the most recent user message.
         user_text = ""
-        image_blocks: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+        image_blocks: list[_AcpJsonObject] = []
         latest_user_idx: int | None = None
         for idx in range(len(messages) - 1, -1, -1):
             msg = messages[idx]
@@ -1173,7 +1291,7 @@ class QwenExecutor(Executor):
             self._system_prompt_sent = True
 
         # Text first, then any image blocks (ACP prompt is an ordered array).
-        prompt_blocks: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+        prompt_blocks: list[_AcpJsonObject] = []
         if user_text or not image_blocks:
             prompt_blocks.append({"type": "text", "text": user_text})
         prompt_blocks.extend(image_blocks)
@@ -1190,15 +1308,20 @@ class QwenExecutor(Executor):
             if isinstance(stale, dict) and stale.get("id") is not None and stale.get("method"):
                 await self._respond_to_agent_request(stale)
 
+        # Answering a stale request above can run real fs I/O, so emit its ToolCall
+        # audit events into history rather than dropping them.
+        while self._fs_events:
+            yield self._fs_events.pop(0)
+
         # Send the turn — this is a JSON-RPC *request*, so we wait for
         # both streaming notifications AND the final response.
         self._rpc_id += 1
         req_id = self._rpc_id
         loop = asyncio.get_event_loop()
-        fut: asyncio.Future[dict[str, Any]] = loop.create_future()  # type: ignore[explicit-any]
+        fut: asyncio.Future[_AcpJsonObject] = loop.create_future()
         self._pending[req_id] = fut
 
-        prompt_request: dict[str, Any] = {  # type: ignore[explicit-any]
+        prompt_request: _AcpJsonObject = {
             "jsonrpc": "2.0",
             "id": req_id,
             "method": _AGENT_METHOD_SESSION_PROMPT,
@@ -1301,6 +1424,10 @@ class QwenExecutor(Executor):
                 # permission goes through policy + elicitation; anything else
                 # gets method-not-found. Blocks while the human decides.
                 await self._respond_to_agent_request(notification)
+                # Surface any fs ToolCall events the handler buffered so the
+                # I/O shows in history.
+                while self._fs_events:
+                    yield self._fs_events.pop(0)
 
             # Inbound message = progress; reset the idle deadline. Runs after the
             # human-approval block above so a slow approval doesn't time out.

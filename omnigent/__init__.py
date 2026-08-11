@@ -20,7 +20,7 @@ def _fips_safe_md5(*args, **kwargs):  # type: ignore[no-untyped-def]
     return _fips_safe_orig_md5(*args, **kwargs)
 
 
-_fips_safe_hashlib.md5 = _fips_safe_md5  # type: ignore[assignment]
+_fips_safe_hashlib.md5 = _fips_safe_md5
 
 # Mirror legacy ``OMNIAGENTS_*`` env vars onto their new ``OMNIGENT_*`` names
 # before any submodule below reads the environment, so the dual-read

@@ -15,6 +15,10 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.native_coding_agents import (
+    ANTIGRAVITY_NATIVE_AGENT_NAME,
+    QWEN_NATIVE_AGENT_NAME,
+)
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import app as server_app
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -64,6 +68,65 @@ def test_server_version_reads_version_constant() -> None:
     from omnigent.version import VERSION
 
     assert server_app._server_version() == VERSION
+
+
+@pytest.mark.asyncio
+async def test_well_known_manifest_shape(client: httpx.AsyncClient) -> None:
+    """GET /.well-known/omnigent.json returns the version manifest.
+
+    The desktop shell reads this BEFORE loading the SPA to decide how to open a
+    window, so the envelope keys are a contract: every one asserted here is a
+    key a shipped shell may branch on.
+    """
+    from omnigent.version import VERSION
+
+    resp = await client.get("/.well-known/omnigent.json")
+    assert resp.status_code == 200
+    # JSON, not the SPA's index.html — see the not-swallowed test below.
+    assert resp.headers["content-type"].startswith("application/json")
+    body = resp.json()
+
+    assert body["manifest_version"] == server_app.WELL_KNOWN_MANIFEST_VERSION
+    # An int, so clients can compare with >= rather than parsing a string.
+    assert isinstance(body["manifest_version"], int)
+    # Same source of truth as /api/version and /v1/info.server_version, so a
+    # client never sees three different answers for one server.
+    assert body["server_version"] == VERSION
+    # Present-but-null: clients rely on the key existing, and null is the
+    # "no floor" path every shipped shell must accept.
+    assert "min_desktop_version" in body
+    assert body["min_desktop_version"] is None
+    # Tells the shell where server-driven chrome lives, so it need not infer
+    # placement from the version number.
+    assert body["ui"]["server_picker"] == "sidebar"
+
+
+@pytest.mark.asyncio
+async def test_well_known_manifest_is_unauthed(client: httpx.AsyncClient) -> None:
+    """The manifest is readable without a session cookie.
+
+    The shell consults it before the app loads — i.e. before any login could
+    have happened — so an auth gate here would defeat its purpose entirely.
+    """
+    resp = await client.get("/.well-known/omnigent.json", headers={"Cookie": ""})
+    assert resp.status_code == 200
+    assert resp.json()["manifest_version"] >= 1
+
+
+def test_well_known_prefix_is_not_spa_fallback() -> None:
+    """An unmatched /.well-known/* path must 404, never fall back to the SPA.
+
+    The web UI is mounted at "/" and serves ``index.html`` for unmatched paths
+    so client routes survive a refresh. Without ``.well-known`` on the API
+    allowlist, a shell probing an OLDER server (which has no manifest route)
+    would receive ``200 text/html`` and could parse the SPA shell as a
+    manifest. The 404 is what makes "no manifest" detectable, and therefore
+    what makes the pre-manifest fallback path work at all.
+    """
+    assert server_app._is_web_ui_api_fallback_path(".well-known/omnigent.json")
+    assert server_app._is_web_ui_api_fallback_path(".well-known/anything-else")
+    # Sanity: a real client route still falls through to index.html.
+    assert not server_app._is_web_ui_api_fallback_path("c/conv_abc123")
 
 
 class _StubWebSocket:
@@ -605,43 +668,101 @@ def test_ensure_extra_builtin_agents_skips_bad_path_and_seeds_good(
     assert seed_stores.agent_store.get_by_name("does-not-exist") is None
 
 
-def test_ensure_default_qwen_agent_seeds_card(seed_stores: _SeedStores) -> None:
+def test_ensure_default_native_agents_seeds_qwen_card(seed_stores: _SeedStores) -> None:
     """
-    Seeding registers qwen-native-ui as a built-in the picker can render.
+    The native seeding loop registers qwen-native-ui as a picker-renderable built-in.
 
     The new-session picker reads built-ins from ``GET /v1/agents``; without this
     seeder Qwen Code only appears after the ``omnigent qwen`` CLI first registers
     it, so it was absent from the Web UI dropdown.
     """
-    server_app._ensure_default_qwen_agent(
+    server_app._ensure_default_native_agents(
         seed_stores.agent_store,
         seed_stores.artifact_store,
         seed_stores.agent_cache,
     )
 
-    seeded = seed_stores.agent_store.get_by_name(server_app._QWEN_NATIVE_AGENT_NAME)
+    seeded = seed_stores.agent_store.get_by_name(QWEN_NATIVE_AGENT_NAME)
     assert seeded is not None, "qwen-native-ui was not registered"
-    assert seeded.name == "qwen-native-ui"
+    assert seeded.name == QWEN_NATIVE_AGENT_NAME
     # The bundle must be retrievable, not just referenced.
     assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
 
 
-def test_ensure_default_qwen_agent_is_idempotent(seed_stores: _SeedStores) -> None:
-    """A second seed call is a no-op — startup runs the seeder every boot."""
-    server_app._ensure_default_qwen_agent(
+def test_ensure_default_native_agents_seeds_every_native_agent(
+    seed_stores: _SeedStores,
+) -> None:
+    """
+    The loop seeds every ``NATIVE_CODING_AGENTS`` entry under its stable id.
+
+    Guards the whole seeded set (not just one card): each native agent must be
+    registered as a session-scope-NULL built-in, keyed by its name-derived
+    :func:`builtin_agent_id`, with a retrievable bundle. A harness dropped from
+    the loop — or seeded under the wrong name/id — is caught here.
+    """
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+
+    server_app._ensure_default_native_agents(
         seed_stores.agent_store,
         seed_stores.artifact_store,
         seed_stores.agent_cache,
     )
-    first = seed_stores.agent_store.get_by_name(server_app._QWEN_NATIVE_AGENT_NAME)
+
+    for agent in NATIVE_CODING_AGENTS:
+        seeded = seed_stores.agent_store.get_by_name(agent.agent_name)
+        assert seeded is not None, f"{agent.agent_name} was not registered"
+        assert seeded.id == builtin_agent_id(agent.agent_name)
+        assert seeded.session_id is None, "built-ins must be session-scope NULL"
+        assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+
+
+def test_ensure_default_native_agents_raises_when_provider_missing(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A native agent with no provider row raises instead of silently unseeding."""
+    from omnigent.errors import OmnigentError
+
+    monkeypatch.setattr(server_app, "native_provider_for_key", lambda _key: None)
+    with pytest.raises(OmnigentError, match="no provider row to seed from"):
+        server_app._ensure_default_native_agents(
+            seed_stores.agent_store,
+            seed_stores.artifact_store,
+            seed_stores.agent_cache,
+        )
+
+
+def test_build_native_bundle_raises_without_materialize_hook() -> None:
+    """A provider missing its ``materialize_agent_spec`` hook raises loudly."""
+    from omnigent.errors import OmnigentError
+    from omnigent.harness_plugins import NativeHarnessProvider
+
+    provider = NativeHarnessProvider(
+        key="ghost",
+        run_native="omnigent.ghost_native:run_ghost_native",
+        auto_create_terminal="omnigent.runner.native:_launch_ghost",
+        materialize_agent_spec=None,
+    )
+    with pytest.raises(OmnigentError, match="no materialize_agent_spec hook"):
+        server_app._build_native_bundle(provider)
+
+
+def test_ensure_default_native_agents_is_idempotent(seed_stores: _SeedStores) -> None:
+    """A second seed call is a no-op — startup runs the seeder every boot."""
+    server_app._ensure_default_native_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    first = seed_stores.agent_store.get_by_name(QWEN_NATIVE_AGENT_NAME)
     assert first is not None
-    server_app._ensure_default_qwen_agent(
+    server_app._ensure_default_native_agents(
         seed_stores.agent_store,
         seed_stores.artifact_store,
         seed_stores.agent_cache,
     )
     page = seed_stores.agent_store.list(limit=100)
-    qwen_rows = [a for a in page.data if a.name == "qwen-native-ui"]
+    qwen_rows = [a for a in page.data if a.name == QWEN_NATIVE_AGENT_NAME]
     assert len(qwen_rows) == 1
     assert qwen_rows[0].id == first.id
     assert qwen_rows[0].version == first.version == 1
@@ -677,15 +798,15 @@ def test_ensure_default_antigravity_agent_seeds_card(seed_stores: _SeedStores) -
     NULL (a built-in) and carry the ``antigravity-native`` harness so the
     runner boots the agy native terminal rather than an SDK harness.
     """
-    server_app._ensure_default_antigravity_agent(
+    server_app._ensure_default_native_agents(
         seed_stores.agent_store,
         seed_stores.artifact_store,
         seed_stores.agent_cache,
     )
 
-    seeded = seed_stores.agent_store.get_by_name(server_app._ANTIGRAVITY_NATIVE_AGENT_NAME)
+    seeded = seed_stores.agent_store.get_by_name(ANTIGRAVITY_NATIVE_AGENT_NAME)
     assert seeded is not None, "antigravity-native-ui was not registered"
-    assert seeded.name == "antigravity-native-ui"
+    assert seeded.name == ANTIGRAVITY_NATIVE_AGENT_NAME
     # Built-ins are session-scope NULL so ``GET /v1/agents`` (which filters on
     # ``session_id IS NULL``) returns them to the picker.
     assert seeded.session_id is None
@@ -711,9 +832,7 @@ def test_ensure_default_agents_includes_antigravity(seed_stores: _SeedStores) ->
         seed_stores.agent_cache,
     )
 
-    assert (
-        seed_stores.agent_store.get_by_name(server_app._ANTIGRAVITY_NATIVE_AGENT_NAME) is not None
-    )
+    assert seed_stores.agent_store.get_by_name(ANTIGRAVITY_NATIVE_AGENT_NAME) is not None
 
 
 def test_ensure_default_polly_agent_is_idempotent(seed_stores: _SeedStores) -> None:

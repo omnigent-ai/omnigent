@@ -48,7 +48,7 @@ export function CliCommandBlock({
     // are the common case in the resume-runner dialog). `break-words`
     // is too gentle — it only breaks a word when it sits alone on a
     // line, which doesn't fire if surrounding tokens push it to wrap.
-    <div className="flex w-full items-center gap-2 rounded-md border border-border bg-muted px-3 py-2 font-mono text-xs">
+    <div className="flex w-full items-center gap-2 rounded-md border border-border bg-muted px-3 py-2 font-mono text-sm">
       <code
         className="min-w-0 flex-1 break-all whitespace-pre-wrap [font-variant-ligatures:none] [font-feature-settings:'liga'_0,'calt'_0]"
         data-testid={`${testIdPrefix}-command`}

@@ -12,9 +12,21 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 from omnigent._platform import stable_user_id
+from omnigent.json_types import JsonObject as _JsonObject
+
+
+class _McpServerEntry(TypedDict):
+    command: str
+    args: list[str]
+    env: dict[str, str]
+
+
+class _KiroMcpConfig(TypedDict):
+    mcpServers: dict[str, _McpServerEntry]
+
 
 KIRO_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_KIRO_NATIVE_BRIDGE_DIR"
 KIRO_ACP_RECORD_PATH_ENV_VAR = "KIRO_ACP_RECORD_PATH"
@@ -30,6 +42,13 @@ _MCP_BRIDGE_CONFIG_FILE = "bridge.json"
 # (confirmed against kiro-cli 2.10.0). Mirrors cursor-native's ``.cursor/mcp.json``.
 _WORKSPACE_MCP_CONFIG_REL = Path(".kiro") / "settings" / "mcp.json"
 _TMUX_READY_TIMEOUT_S = 30.0
+# kiro's TUI shows "Initializing · type to queue a message" while it boots its
+# JS renderer; on a slow or degraded network that boot measured 35-38s, past the
+# 30s gate, so the first web turn failed on an otherwise healthy TUI. While that
+# banner is on the pane kiro is provably still coming up, so keep waiting up to
+# this longer ceiling instead of giving up at ``_TMUX_READY_TIMEOUT_S``.
+_KIRO_BOOT_READY_TIMEOUT_S = 120.0
+_KIRO_BOOT_MARKERS = ("Initializing",)
 _TMUX_SEND_TIMEOUT_S = 10.0
 _POLL_INTERVAL_S = 0.2
 _TYPE_SETTLE_S = 0.3
@@ -136,7 +155,7 @@ def write_mcp_bridge_config(bridge_dir: Path) -> None:
 
 def build_kiro_mcp_config(
     bridge_dir: Path, *, python_executable: str | None = None
-) -> dict[str, Any]:
+) -> _KiroMcpConfig:
     """Build the kiro ``mcpServers`` entry for the Omnigent relay MCP server.
 
     Reuses the shared stdio ``serve-mcp`` server (the same one cursor/claude use)
@@ -182,7 +201,7 @@ def write_kiro_workspace_mcp_config(
     write_mcp_bridge_config(bridge_dir)
     path = workspace / _WORKSPACE_MCP_CONFIG_REL
     path.parent.mkdir(parents=True, exist_ok=True)
-    config: dict[str, Any] = {}
+    config: _JsonObject = {}
     if path.exists():
         with contextlib.suppress(OSError, ValueError):
             loaded = json.loads(path.read_text(encoding="utf-8"))
@@ -231,7 +250,7 @@ def write_tmux_target(
 ) -> None:
     """Advertise the tmux socket + target for the running Kiro terminal."""
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    payload: dict[str, Any] = {
+    payload: _JsonObject = {
         "socket_path": str(socket_path),
         "tmux_target": tmux_target,
         "updated_at": time.time(),
@@ -276,7 +295,7 @@ def write_forwarder_ready(bridge_dir: Path) -> None:
     os.replace(tmp, bridge_dir / _FORWARDER_READY_FILE)
 
 
-def _read_bridge_json(bridge_dir: Path, filename: str) -> dict[str, Any] | None:
+def _read_bridge_json(bridge_dir: Path, filename: str) -> _JsonObject | None:
     try:
         raw = (bridge_dir / filename).read_text(encoding="utf-8")
     except OSError:
@@ -291,7 +310,7 @@ def _read_bridge_json(bridge_dir: Path, filename: str) -> dict[str, Any] | None:
 def _wait_for_forwarder_ready_if_required(
     bridge_dir: Path,
     *,
-    tmux_info: dict[str, Any],
+    tmux_info: _JsonObject,
     timeout_s: float,
 ) -> None:
     if tmux_info.get("requires_forwarder_ready") is not True:
@@ -505,13 +524,45 @@ def _wait_for_kiro_input_ready(
     *,
     timeout_s: float,
 ) -> None:
-    """Wait until Kiro has rendered an input prompt before typing."""
+    """Wait until Kiro has rendered an input prompt before typing.
+
+    Extends the wait to :data:`_KIRO_BOOT_READY_TIMEOUT_S` while kiro's
+    "Initializing" banner is still on the pane, so a slow TUI boot delays the
+    first turn instead of failing it. A pane that is neither ready nor booting
+    still fails at *timeout_s*.
+    """
     deadline = time.monotonic() + timeout_s
+    boot_deadline = time.monotonic() + max(timeout_s, _KIRO_BOOT_READY_TIMEOUT_S)
+    pane = ""
     while time.monotonic() < deadline:
-        if _kiro_input_ready(_capture_pane(socket_path, tmux_target)):
+        pane = _capture_pane(socket_path, tmux_target)
+        if _kiro_input_ready(pane):
             return
+        if _kiro_still_booting(pane) and time.monotonic() < boot_deadline:
+            deadline = boot_deadline
         time.sleep(_POLL_INTERVAL_S)
-    raise RuntimeError("kiro-native TUI input prompt was not ready before injection")
+    # A kiro-cli that refused its own argv (e.g. an unsupported flag) leaves the
+    # error on the pane and never renders a prompt; quote it so the surfaced
+    # failure names the real cause instead of just the readiness timeout.
+    raise RuntimeError(
+        "kiro-native TUI input prompt was not ready before injection"
+        + (f"; kiro terminal showed: {detail}" if (detail := _kiro_pane_error(pane)) else "")
+    )
+
+
+def _kiro_still_booting(pane: str) -> bool:
+    """Return whether Kiro's input region shows it is still initializing."""
+    region = _kiro_input_region(pane)
+    return any(marker in region for marker in _KIRO_BOOT_MARKERS)
+
+
+def _kiro_pane_error(pane: str) -> str:
+    """Return the last error-looking line from the pane, or an empty string."""
+    for raw_line in reversed(pane.splitlines()):
+        line = raw_line.strip()
+        if line.lower().startswith(("error:", "warning: ", "thread '")):
+            return line[:200]
+    return ""
 
 
 def _paste_payload_bytes(text: str) -> bytes:

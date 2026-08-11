@@ -199,6 +199,48 @@ def _write_opencode_cli_fixture(home: Path) -> tuple[Path, str]:
     return bin_dir, session_id
 
 
+def _write_force_import_fixture(home: Path, harness: str, text: str) -> str:
+    """Write an updateable Claude or Codex transcript for force-import coverage."""
+    session_id = f"019f8888-0001-7000-8000-00000000000{1 if harness == 'claude' else 2}"
+    if harness == "claude":
+        transcript = home / ".claude" / "projects" / "-repo" / f"{session_id}.jsonl"
+        records = [
+            {
+                "type": "user",
+                "uuid": "user-1",
+                "cwd": "/repo",
+                "message": {"role": "user", "content": text},
+            }
+        ]
+    else:
+        transcript = (
+            home
+            / ".codex"
+            / "sessions"
+            / "2026"
+            / "07"
+            / "16"
+            / f"rollout-2026-07-16T00-00-01-{session_id}.jsonl"
+        )
+        records = [
+            {"type": "session_meta", "payload": {"id": session_id, "cwd": "/repo"}},
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            },
+        ]
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records),
+        encoding="utf-8",
+    )
+    return session_id
+
+
 def test_cli_imports_claude_chat_into_live_server(live_server: str, tmp_path: Path) -> None:
     """The real CLI and server create a readable session from Claude JSONL."""
     source_session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
@@ -395,6 +437,7 @@ def test_cli_imports_recent_codex_chats_as_batch(live_server: str, tmp_path: Pat
     env.update(
         {
             "HOME": str(tmp_path),
+            "CODEX_HOME": str(tmp_path / ".codex"),
             "OMNIGENT_CONFIG_HOME": str(tmp_path / "config"),
             "OMNIGENT_DATA_DIR": str(tmp_path / "omnigent-data"),
         }
@@ -434,6 +477,72 @@ def test_cli_imports_recent_codex_chats_as_batch(live_server: str, tmp_path: Pat
         )
         session.raise_for_status()
         assert session.json()["external_session_id"] == source_id
+
+
+@pytest.mark.parametrize("harness", ["claude", "codex"])
+def test_cli_force_replaces_imported_chat(
+    live_server: str,
+    tmp_path: Path,
+    harness: str,
+) -> None:
+    """The real CLI and server replace Claude and Codex imports in place."""
+    source_session_id = _write_force_import_fixture(tmp_path, harness, "old prompt")
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(tmp_path),
+            "CODEX_HOME": str(tmp_path / ".codex"),
+            "OMNIGENT_CONFIG_HOME": str(tmp_path / "config"),
+            "OMNIGENT_DATA_DIR": str(tmp_path / "omnigent-data"),
+        }
+    )
+    command = [
+        sys.executable,
+        "-m",
+        "omnigent",
+        "import",
+        "--harness",
+        harness,
+        "--session",
+        source_session_id,
+        "--server",
+        live_server,
+    ]
+    first = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    first_match = re.search(r"into (\S+)\.", first.stdout)
+    assert first_match is not None, first.stdout
+
+    _write_force_import_fixture(tmp_path, harness, "new prompt")
+    replaced = subprocess.run(
+        [*command, "--force"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    replaced_match = re.search(r"into (\S+)\.", replaced.stdout)
+    assert replaced_match is not None, replaced.stdout
+    assert replaced_match.group(1) == first_match.group(1)
+
+    session_id = replaced_match.group(1)
+    session = httpx.get(
+        f"{live_server}/v1/sessions/{session_id}",
+        params={"include_items": "false", "include_liveness": "false"},
+        timeout=10,
+    )
+    session.raise_for_status()
+    assert session.json()["title"] == "new prompt"
+    items = httpx.get(f"{live_server}/v1/sessions/{session_id}/items", timeout=10)
+    items.raise_for_status()
+    assert [item["content"][0]["text"] for item in items.json()["data"]] == ["new prompt"]
 
 
 @pytest.mark.parametrize("harness", ["qwen", "kiro", "pi", "kimi"])

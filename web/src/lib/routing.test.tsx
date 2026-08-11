@@ -45,7 +45,7 @@ describe("basenamedRouting Link rebasing", () => {
   });
 
   it("does not double-prefix the bare basename carrying a query", () => {
-    // Regression guard: the settings "Back to Omnigent" link targets the
+    // Regression guard: the settings Back link targets the
     // pre-settings location captured from `useLocation()`, which in the embed
     // already includes the basename. On the home page that's the bare basename
     // plus the host's `?o=<workspace>` search (e.g. `/mount?o=123`). The old

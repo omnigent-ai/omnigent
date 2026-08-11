@@ -57,6 +57,12 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         # without it a corporate-CA user upgrading would hit TLS failures from
         # every harness that does not happen to own a NODE_ prefix of its own.
         "NODE_EXTRA_CA_CERTS",
+        # ssh-agent socket path, so an agent's git-over-SSH and SSH-cert
+        # tooling authenticates. A path to a unix socket, not a bearer token:
+        # reaching the agent still requires the user's own ssh-agent to be
+        # running and to hold the key. Shared here because every harness runs
+        # git, not just the one whose bug surfaced it.
+        "SSH_AUTH_SOCK",
         OMNIGENT_SESSION_ENV_VAR,
     }
 )
@@ -101,9 +107,12 @@ def declared_passthrough(os_env: object | None) -> tuple[str, ...]:
     """Env-var names the spec declared for passthrough.
 
     Lives on ``os_env.sandbox.env_passthrough``. Returns an empty tuple when
-    any link in that chain is absent. Duplicated from
-    ``codex_executor._declared_passthrough`` so non-codex harnesses do not have
-    to import the codex module to read a field that belongs to the sandbox spec.
+    any link in that chain is absent.
+
+    Lives here rather than in any one executor so no harness has to import a
+    sibling harness's module to read a field that belongs to the sandbox spec.
+    Duck-typed on purpose: the only contract is the ``sandbox.env_passthrough``
+    chain, so a caller holding a partially-built or stubbed spec is fine.
     """
     sandbox = getattr(os_env, "sandbox", None) if os_env is not None else None
     names = getattr(sandbox, "env_passthrough", None) if sandbox is not None else None

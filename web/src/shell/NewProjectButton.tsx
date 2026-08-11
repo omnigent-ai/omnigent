@@ -45,6 +45,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
             size="icon-xs"
             aria-label="New project"
             data-testid="new-project"
+            className="text-muted-foreground"
             onClick={(e) => {
               e.stopPropagation();
               setName("");
@@ -66,7 +67,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
           </DialogHeader>
           <input
             autoFocus
-            className="w-full rounded-md border bg-transparent px-3 py-2 text-sm outline-none"
+            className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none"
             placeholder="Project name…"
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -78,7 +79,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
             }}
           />
           {createProject.isError && (
-            <p className="text-sm text-destructive" role="alert">
+            <p className="text-ui text-destructive" role="alert">
               {(createProject.error as Error).message}
             </p>
           )}
@@ -94,10 +95,11 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
             <Button
               type="button"
               data-testid="new-project-confirm"
-              disabled={createProject.isPending || name.trim() === ""}
+              loading={createProject.isPending}
+              disabled={name.trim() === ""}
               onClick={submit}
             >
-              {createProject.isPending ? "Creating…" : "Create"}
+              Create
             </Button>
           </DialogFooter>
         </DialogContent>

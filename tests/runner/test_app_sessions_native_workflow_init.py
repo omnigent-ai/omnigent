@@ -17,6 +17,7 @@ import pytest
 
 from omnigent import native_dispatch
 from omnigent.codex_native_bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+from omnigent.entities.session_resources import SessionResourceView
 from omnigent.runner import create_runner_app
 from omnigent.runner import tool_dispatch as _tool_dispatch
 from omnigent.runner.app import (
@@ -620,6 +621,236 @@ async def test_launch_native_terminal_reraise_propagates_without_error_event(
     # No start-error event was published (the caller converts the raise to a 503);
     # only the pending on/off bracket events, none of which carry an error.
     assert not any("error" in name.lower() or "error" in event for name, event in events)
+
+
+class _FakeEnsureRegistry:
+    """Resource registry stub for the ensure-shell (attach path) tests.
+
+    The ensure shell is view-based: it reads the existing terminal via
+    ``get_terminal_resource`` and replaces a non-owned one via
+    ``close_terminal``. ``terminal_registry`` is unused by the ensure shell
+    but present for interface parity.
+    """
+
+    terminal_registry = None
+
+    def __init__(self, existing: SessionResourceView | None = None, close_ok: bool = True) -> None:
+        self._existing = existing
+        self._close_ok = close_ok
+        self.closed: list[tuple[str, str]] = []
+
+    async def get_terminal_resource(
+        self, session_id: str, terminal_id: str
+    ) -> SessionResourceView | None:
+        return self._existing
+
+    async def close_terminal(self, session_id: str, terminal_id: str) -> bool:
+        self.closed.append((session_id, terminal_id))
+        return self._close_ok
+
+
+def _ensure_ctx(registry: _FakeEnsureRegistry, session_id: str = "conv_e") -> NativeLaunchContext:
+    """Build a launch context whose registry drives the ensure-shell tests."""
+    return NativeLaunchContext(
+        session_id=session_id,
+        resource_registry=registry,  # type: ignore[arg-type]
+        publish_event=lambda _name, _event: None,
+    )
+
+
+def _terminal_view(name: str, terminal_id: str = "terminal_goose_main") -> SessionResourceView:
+    return SessionResourceView(id=terminal_id, type="terminal", session_id="conv_e", name=name)
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_returns_existing_without_creating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An existing terminal is returned as-is; the adapter never runs."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    created = False
+
+    async def _fake_launch(ctx: NativeLaunchContext) -> object:
+        nonlocal created
+        created = True
+        return object()
+
+    monkeypatch.setattr("omnigent.runner.native._launch_goose", _fake_launch)
+    registry = _FakeEnsureRegistry(existing=_terminal_view("existing"))
+    resp = await _ensure_native_terminal("goose", _ensure_ctx(registry), ensure_locks={})
+
+    assert resp is not None and resp.status_code == 200
+    assert json.loads(bytes(resp.body))["name"] == "existing"
+    assert created is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_creates_when_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no existing terminal, the shell resolves the adapter and creates one."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    async def _fake_launch(ctx: NativeLaunchContext) -> SessionResourceView:
+        return _terminal_view("auto-created")
+
+    monkeypatch.setattr("omnigent.runner.native._launch_goose", _fake_launch)
+    registry = _FakeEnsureRegistry(existing=None)
+    locks: dict[str, Any] = {}
+    resp = await _ensure_native_terminal("goose", _ensure_ctx(registry), ensure_locks=locks)
+
+    assert resp is not None and resp.status_code == 200
+    assert json.loads(bytes(resp.body))["name"] == "auto-created"
+    assert "conv_e" in locks
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_builder_error_returns_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A builder failure becomes a structured 500 JSON, not a live-published error."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    async def _boom(ctx: NativeLaunchContext) -> object:
+        raise ImportError("Native goose requires the 'goose' CLI on PATH.")
+
+    monkeypatch.setattr("omnigent.runner.native._launch_goose", _boom)
+    resp = await _ensure_native_terminal(
+        "goose", _ensure_ctx(_FakeEnsureRegistry(existing=None)), ensure_locks={}
+    )
+
+    assert resp is not None and resp.status_code == 500
+    body = json.loads(bytes(resp.body))
+    # The raw ImportError text must not leak; a fixed client-safe message is used
+    # (the display name "Goose" identifies the runtime, not the raw cause).
+    assert "requires the 'goose' CLI" not in body["error"]["message"]
+    assert "Goose" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_non_native_returns_none() -> None:
+    """A non-native terminal name returns None so the caller uses the generic path."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    resp = await _ensure_native_terminal(
+        "bash", _ensure_ctx(_FakeEnsureRegistry()), ensure_locks={}
+    )
+    assert resp is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_owned_existing_uses_finalize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An owned existing terminal is returned through ``finalize`` (codex notice wrap)."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    existing = _terminal_view("owned-existing", terminal_id="terminal_codex_main")
+    registry = _FakeEnsureRegistry(existing=existing)
+
+    def _finalize(view: SessionResourceView) -> Any:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=200, content={"name": view.name, "wrapped": True})
+
+    resp = await _ensure_native_terminal(
+        "codex",
+        _ensure_ctx(registry),
+        ensure_locks={},
+        is_owned=lambda _reg, _view: True,
+        finalize=_finalize,
+    )
+
+    assert resp is not None and resp.status_code == 200
+    body = json.loads(bytes(resp.body))
+    assert body == {"name": "owned-existing", "wrapped": True}
+    assert registry.closed == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_non_owned_closes_and_recreates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-owned existing terminal is closed, then the native one is created."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    async def _fake_launch(ctx: NativeLaunchContext) -> SessionResourceView:
+        return _terminal_view("recreated", terminal_id="terminal_codex_main")
+
+    monkeypatch.setattr("omnigent.runner.native._launch_codex", _fake_launch)
+    existing = _terminal_view("foreign", terminal_id="terminal_codex_main")
+    registry = _FakeEnsureRegistry(existing=existing, close_ok=True)
+
+    resp = await _ensure_native_terminal(
+        "codex",
+        _ensure_ctx(registry),
+        ensure_locks={},
+        is_owned=lambda _reg, _view: False,
+        conflict_message="conflict",
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert json.loads(bytes(resp.body))["name"] == "recreated"
+    assert registry.closed == [("conv_e", "terminal_codex_main")]
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_non_owned_close_fails_returns_409() -> None:
+    """When a non-owned terminal cannot be closed, the shell returns a 409 conflict."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    existing = _terminal_view("foreign", terminal_id="terminal_antigravity_main")
+    registry = _FakeEnsureRegistry(existing=existing, close_ok=False)
+
+    resp = await _ensure_native_terminal(
+        "antigravity",
+        _ensure_ctx(registry),
+        ensure_locks={},
+        is_owned=lambda _reg, _view: False,
+        conflict_message="Existing antigravity terminal is not runner-owned.",
+    )
+
+    assert resp is not None and resp.status_code == 409
+    body = json.loads(bytes(resp.body))
+    assert body["error"]["code"] == "terminal_conflict"
+    assert body["error"]["message"] == "Existing antigravity terminal is not runner-owned."
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_build_context_runs_only_on_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``build_context`` runs on create but is skipped when a terminal already exists."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    calls: list[str] = []
+
+    async def _fake_launch(ctx: NativeLaunchContext) -> SessionResourceView:
+        return _terminal_view("created")
+
+    async def _build(ctx: NativeLaunchContext) -> NativeLaunchContext:
+        calls.append("build")
+        return dataclasses.replace(ctx, agent_name="resolved")
+
+    monkeypatch.setattr("omnigent.runner.native._launch_goose", _fake_launch)
+
+    # Create path: build_context runs.
+    await _ensure_native_terminal(
+        "goose",
+        _ensure_ctx(_FakeEnsureRegistry(existing=None)),
+        ensure_locks={},
+        build_context=_build,
+    )
+    # Existing path: build_context skipped.
+    await _ensure_native_terminal(
+        "goose",
+        _ensure_ctx(_FakeEnsureRegistry(existing=_terminal_view("existing"))),
+        ensure_locks={},
+        build_context=_build,
+    )
+
+    assert calls == ["build"]
 
 
 @pytest.mark.asyncio

@@ -3,12 +3,13 @@
 // the new-chat composer pre-fill host / working directory / agent and the
 // isolated-worktree default when starting a session in the project.
 //
-// Scope mirrors what the composer prefills today: host, workspace, agent, and
-// whether new sessions start in a fresh git worktree. Model / reasoning-effort
-// / harness are per-agent run config, and the worktree BASE branch is a global
-// preference (Settings › Git) — both deliberately out of scope here. The host
-// and agent pickers reuse the composer's components; the working directory
-// reuses its filesystem browser (inline, so it scrolls inside the modal).
+// Scope mirrors what the composer prefills today: host, workspace, agent,
+// whether new sessions start in a fresh git worktree, and the base branch a
+// worktree forks from (which overrides the user-global default in Settings ›
+// Git). Model / reasoning-effort / harness are per-agent run config,
+// deliberately out of scope here. The host and agent pickers reuse the
+// composer's components; the working directory reuses its filesystem browser
+// (inline, so it scrolls inside the modal).
 // Fields are optional: an unset one stores no default (an absent key), and an
 // all-default dialog stores an empty config.
 
@@ -62,8 +63,8 @@ function Field({
   return (
     <div className="flex flex-col gap-1.5 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
       <label htmlFor={htmlFor} className="flex flex-col pt-1.5">
-        <span className="font-medium text-sm">{label}</span>
-        {hint && <span className="text-muted-foreground text-xs">{hint}</span>}
+        <span className="font-medium text-ui">{label}</span>
+        {hint && <span className="text-muted-foreground text-sm">{hint}</span>}
       </label>
       <div className="sm:w-64">{children}</div>
     </div>
@@ -117,6 +118,10 @@ export function ProjectSettingsDialog({
   // stored (as use_worktree:true), which the composer honors by creating a
   // fresh worktree for new sessions in the project.
   const [useWorktree, setUseWorktree] = useState(false);
+  // Base branch a new worktree forks from; blank stores no default (falls
+  // through to the user-global default in Settings › Git). Only meaningful
+  // alongside the worktree default, but kept independent so it survives toggling.
+  const [baseBranch, setBaseBranch] = useState("");
   const [agentId, setAgentId] = useState<string | null>(null);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
 
@@ -161,6 +166,7 @@ export function ProjectSettingsDialog({
     setHostId(c.host_id ?? NONE);
     setWorkspace(c.workspace ?? "");
     setUseWorktree(c.use_worktree ?? false);
+    setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
     setWorkspaceOpen(false);
   }, [open, stored, loadFailed]);
@@ -185,6 +191,11 @@ export function ProjectSettingsDialog({
     // Worktrees are opt-in: only an explicit ON is stored (as use_worktree:true);
     // leaving it OFF stores nothing, so an all-default dialog still clears to {}.
     if (useWorktree) config.use_worktree = true;
+    // A base branch only forks a worktree, so it's only meaningful when the
+    // worktree default is on — drop it otherwise so it can't linger as a stale,
+    // invisible default after the toggle is turned off.
+    const base = useWorktree ? trimOrUndef(baseBranch) : undefined;
+    if (base) config.base_branch = base;
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
@@ -284,7 +295,7 @@ export function ProjectSettingsDialog({
               // be chosen once a host is selected (the file browser lists
               // against a concrete host, and a path is host-relative anyway).
               <p
-                className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-sm"
+                className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-ui"
                 data-testid="project-settings-workspace"
               >
                 Pick a host first
@@ -306,7 +317,7 @@ export function ProjectSettingsDialog({
                   onClick={() => setWorkspaceOpen((v) => !v)}
                   aria-expanded={workspaceOpen}
                   disabled={isLoading}
-                  className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-sm outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                  className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <span className={workspace ? "truncate" : "truncate text-muted-foreground"}>
                     {workspace || "Browse…"}
@@ -328,7 +339,7 @@ export function ProjectSettingsDialog({
                       className="fixed inset-0 z-10 cursor-default"
                       onClick={() => setWorkspaceOpen(false)}
                     />
-                    <div className="absolute top-full right-0 left-0 z-20 mt-1 rounded-md border bg-popover shadow-md">
+                    <div className="absolute top-full right-0 left-0 z-20 mt-1 rounded-[12px] border border-border bg-popover p-2 shadow-menu [&>[data-testid=workspace-picker]]:border-0">
                       <WorkspacePicker
                         hostId={browsableHostId}
                         initialPath={isNavigablePath(workspace) ? workspace : undefined}
@@ -344,7 +355,7 @@ export function ProjectSettingsDialog({
               <input
                 id="project-settings-workspace"
                 data-testid="project-settings-workspace"
-                className="w-full rounded-md border bg-transparent px-3 py-2 text-sm outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
                 placeholder="/path/to/repo"
                 value={workspace}
                 onChange={(e) => setWorkspace(e.target.value)}
@@ -366,6 +377,24 @@ export function ProjectSettingsDialog({
               />
             </div>
           </Field>
+
+          {useWorktree && (
+            <Field
+              label="Base branch"
+              hint="Branch new worktrees fork from; blank uses the current branch"
+              htmlFor="project-settings-base-branch"
+            >
+              <input
+                id="project-settings-base-branch"
+                data-testid="project-settings-base-branch"
+                className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                placeholder="e.g. main"
+                value={baseBranch}
+                onChange={(e) => setBaseBranch(e.target.value)}
+                disabled={isLoading}
+              />
+            </Field>
+          )}
 
           <Field label="Agent" hint="Default agent / harness for new sessions">
             <div className="flex flex-col items-end gap-1" data-testid="project-settings-agent">
@@ -400,14 +429,14 @@ export function ProjectSettingsDialog({
                 // (full width, bordered, h-8) so the control right-aligns with
                 // the host / effort dropdowns instead of floating mid-row.
                 triggerClassName="h-8 w-full justify-between rounded-md border border-input bg-transparent px-3 text-foreground hover:bg-transparent hover:text-foreground"
-                triggerLabelClassName="max-w-none text-sm"
+                triggerLabelClassName="max-w-none text-ui"
               />
               {agentId && (
                 <Button
                   type="button"
                   variant="ghost"
                   size="sm"
-                  className="h-auto p-0 text-muted-foreground text-xs hover:bg-transparent"
+                  className="h-auto p-0 text-muted-foreground text-sm hover:bg-transparent"
                   onClick={() => setAgentId(null)}
                 >
                   Clear
@@ -418,7 +447,7 @@ export function ProjectSettingsDialog({
 
           {loadFailed && (
             <p
-              className="text-destructive text-sm"
+              className="text-destructive text-ui"
               role="alert"
               data-testid="project-settings-load-error"
             >
@@ -427,7 +456,7 @@ export function ProjectSettingsDialog({
             </p>
           )}
           {updateConfig.isError && (
-            <p className="text-destructive text-sm" role="alert">
+            <p className="text-destructive text-ui" role="alert">
               {(updateConfig.error as Error).message}
             </p>
           )}
@@ -444,9 +473,10 @@ export function ProjectSettingsDialog({
             <Button
               type="submit"
               data-testid="project-settings-save"
-              disabled={updateConfig.isPending || isLoading || loadFailed}
+              loading={updateConfig.isPending}
+              disabled={isLoading || loadFailed}
             >
-              {updateConfig.isPending ? "Saving…" : "Save"}
+              Save
             </Button>
           </DialogFooter>
         </form>

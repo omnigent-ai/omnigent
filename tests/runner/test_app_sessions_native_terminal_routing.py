@@ -162,7 +162,9 @@ async def test_create_session_terminal_ensure_routes_claude_native(
             name="launched",
         )
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _stub_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _stub_auto_create
+    )
     monkeypatch.setattr(SessionResourceRegistry, "get_terminal_resource", _stub_get_terminal)
     monkeypatch.setattr(
         SessionResourceRegistry,
@@ -203,6 +205,7 @@ async def test_create_session_terminal_ensure_routes_claude_native(
 @pytest.mark.asyncio
 async def test_create_session_terminal_ensure_failure_returns_json_without_live_error(
     monkeypatch: pytest.MonkeyPatch,
+    pinned_runner_log: Path,
 ) -> None:
     """
     Native terminal ensure failures are reported to AP, not published live.
@@ -216,6 +219,7 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
     the relay.
 
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param pinned_runner_log: The log path the message must name.
     :returns: None.
     """
     sid = "aefc71354fadf0dd2ae5c224c40e772c"
@@ -234,7 +238,9 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
         """Fail if the ensure endpoint tries to publish the live banner."""
         raise AssertionError("ensure endpoint must not publish response.error")
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _failing_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _failing_auto_create
+    )
     monkeypatch.setattr(
         "omnigent.runner.app._publish_native_terminal_start_error",
         _unexpected_live_publish,
@@ -253,13 +259,14 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
         )
 
     assert resp.status_code == 500
-    # Structured code is preserved; the message is a fixed client-safe
-    # string. The raw ImportError text ("requires the 'claude' CLI") must
-    # not appear in the HTTP body — it is logged on the runner instead.
+    # Structured code is preserved; the message names the runner log file so
+    # the reader can find the cause. The raw ImportError text ("requires the
+    # 'claude' CLI") must not appear in the HTTP body — only in that log.
     body = resp.json()
     assert body["error"]["code"] == "native_terminal_start_failed"
     assert body["error"]["message"] == (
-        "Native Claude terminal failed to start; see runner logs for details."
+        "Native Claude terminal failed to start; "
+        f"see the runner log for details: {pinned_runner_log}"
     )
     assert "requires the 'claude' CLI" not in body["error"]["message"]
 
@@ -491,7 +498,9 @@ async def test_create_session_terminal_ensure_routes_codex_native(
             name="launched",
         )
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_codex_terminal", _stub_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", _stub_auto_create
+    )
     monkeypatch.setattr(SessionResourceRegistry, "get_terminal_resource", _stub_get_terminal)
     monkeypatch.setattr(
         SessionResourceRegistry,
@@ -977,7 +986,9 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
             id="terminal_claude_main", type="terminal", session_id=session_id, name="re-created"
         )
 
-    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _stub_auto_create)
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _stub_auto_create
+    )
 
     registry = TerminalRegistry()
     dead_instance = TerminalInstance(

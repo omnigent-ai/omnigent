@@ -17,10 +17,11 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
 from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
+from omnigent.json_types import JsonValue
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
@@ -41,17 +42,20 @@ from .sandbox import (
     cleanup_private_tmpdir,
     create_private_tmpdir,
     get_backend,
+    reachable_roots,
     resolve_sandbox,
     set_temp_env,
     with_additional_write_roots,
 )
+
+if TYPE_CHECKING:
+    import asyncio
+
+    from .egress import EgressProxyHandle
+    from .egress.proxy import EgressProxy
 from .sandbox import (
     run_launcher as _run_launcher,
 )
-
-# Any JSON-shaped leaf — used for the encode/decode serializer helpers that
-# mirror the pattern in ``omnigent/sandbox.py`` and ``omnigent/uc_tools.py``.
-JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
 # Result dict returned by ``read`` / ``write`` / ``edit`` / ``shell`` and the
 # corresponding ``_*_impl`` helpers. Keys vary by op (content/offset/total_lines
@@ -72,6 +76,10 @@ OpRequest: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 EditEntry: TypeAlias = dict[str, str]
 
 
+class _PopenKwargs(TypedDict, total=False):
+    pass_fds: tuple[int, ...]
+
+
 # Environment variables every helper subprocess inherits unconditionally.
 # Names that any reasonable Python program or POSIX shell expects to find
 # in its environment regardless of who is running it. Adding to this list
@@ -90,8 +98,13 @@ EditEntry: TypeAlias = dict[str, str]
 #   non-interactive startup.
 # - ``PROMPT_COMMAND``: arbitrary command run by bash before each prompt.
 # - ``CDPATH``: changes the resolution of relative paths in shell ``cd``.
-# - ``SSH_AUTH_SOCK``: the user's running ssh-agent socket — a
-#   credential surface masquerading as a path.
+# - ``SSH_AUTH_SOCK``: the user's ssh-agent socket. Allowed through the
+#   weaker host→runner and harness-CLI boundaries (a socket path, like
+#   ``KUBECONFIG``), but an ACTIVE sandbox is where the agent is being
+#   deliberately confined, and signing with the user's keys is exactly
+#   what that confinement is for. Opt in per-spec, and grant the socket
+#   path too: under seatbelt / bwrap the name alone points at something
+#   unreachable.
 # - ``DBUS_SESSION_BUS_ADDRESS``: lets the helper talk to the user's
 #   D-Bus session.
 # - ``XDG_RUNTIME_DIR``: per-session socket directory (Wayland, ssh-
@@ -300,6 +313,7 @@ class OSEnvironment(ABC):
         path: str,
         offset: int = 1,
         limit: int | None = None,
+        max_binary_bytes: int | None = None,
     ) -> OpResult:
         raise NotImplementedError
 
@@ -374,15 +388,15 @@ class _HelperProcessClient:
         # ``_stop_locked`` to tear down the helper's process tree.
         self._sandbox_handle: ContainmentHandle | None = None
         self._tmpdir: Path | None = None
-        self._egress_proxy: Any | None = None  # EgressProxy when active
-        self._egress_loop: Any | None = None  # asyncio event loop for proxy
+        self._egress_proxy: EgressProxy | None = None
+        self._egress_loop: asyncio.AbstractEventLoop | None = None
         self._egress_thread: threading.Thread | None = None
         # Controller handle for unified start/stop. The legacy
         # ``_egress_proxy`` / ``_egress_loop`` / ``_egress_thread``
         # mirrors are kept for back-compat with any tooling that
         # introspects them, but the lifecycle is driven through
         # the handle when present.
-        self._egress_handle: Any | None = None  # EgressProxyHandle
+        self._egress_handle: EgressProxyHandle | None = None
         self._lock = threading.Lock()
         self._closed = False
         atexit.register(self.close)
@@ -573,7 +587,7 @@ class _HelperProcessClient:
         # in the child, which is why we can pass it as a plain ``--config-fd``
         # argv arg. On Windows the config came via ``--config-file`` instead,
         # so there is no fd to inherit.
-        popen_kwargs: dict[str, Any] = {}
+        popen_kwargs: _PopenKwargs = {}
         if r_fd is not None:
             popen_kwargs["pass_fds"] = (r_fd,)
         try:
@@ -1105,6 +1119,9 @@ def _assert_within_reach(
     """Confine a file-tool op to *cwd*, extended by declared sandbox grants.
 
     Replaces the historical cwd-only guard at the read / write / edit sites.
+    The grants come from :func:`omnigent.inner.sandbox.reachable_roots`, which
+    is also what the filesystem APIs advertise as reachable, so what is
+    enforced here and what a caller is told it can reach cannot drift apart.
     *resolved* is already canonicalised by :func:`_resolve_path` (symlinks
     followed, ``..`` collapsed) and every grant root is canonicalised at
     resolve time, so a symlink or ``..`` chain whose real target leaves both
@@ -1151,18 +1168,13 @@ def _assert_within_reach(
     :raises PermissionError: If *resolved* is outside *cwd* and no grant of
         the required kind covers it.
     """
-    resolved_cwd = cwd.resolve()
-    if _is_within(resolved, resolved_cwd):
-        return
-    # Write grants (directories + single files) admit both reads and writes.
-    if any(_is_within(resolved, root) for root in policy.write_roots):
-        return
-    if any(resolved == grant for grant in policy.write_files):
-        return
-    # Read grants admit reads only.
-    if not need_write and policy.read_roots is not None:
-        if any(_is_within(resolved, root) for root in policy.read_roots):
+    for root in reachable_roots(cwd, policy):
+        # Read grants admit reads only; write grants admit both.
+        if need_write and root.access != "write":
+            continue
+        if root.contains(resolved):
             return
+    resolved_cwd = cwd.resolve()
     kind = "write" if need_write else "read"
     raise PermissionError(
         f"Access to '{resolved}' is blocked: path is outside the "

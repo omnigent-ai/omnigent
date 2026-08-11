@@ -26,11 +26,11 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
 
 import click
 import httpx
 import yaml
+from omnigent_client._http import is_loopback_url
 
 from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
@@ -44,6 +44,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.native_coding_agents import native_shell_terminal_spec
 from omnigent.native_terminal import (
     DAEMON_HOST_ONLINE_TIMEOUT_S as _DAEMON_HOST_ONLINE_TIMEOUT_S,
@@ -84,7 +85,7 @@ def _materialize_opencode_agent_spec(
     executor: dict[str, str] = {"harness": "opencode-native"}
     if model is not None:
         executor["model"] = model
-    raw: dict[str, Any] = {
+    raw: _JsonObject = {
         "name": _AGENT_NAME,
         "prompt": (
             "OpenCode is running in the session terminal. Web UI messages are "
@@ -285,7 +286,12 @@ async def _prepare_opencode_terminal_via_daemon(  # pragma: no cover
     """Create or resume an opencode-native session through a daemon runner."""
     persist_args = list(opencode_args)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    ) as client:
         reattached = session_id is not None
         if session_id is None:
             if session_bundle is None:
@@ -365,7 +371,7 @@ async def _create_opencode_session(
     terminal_launch_args: list[str] | None = None,
 ) -> str:
     """Create a bundled terminal-first opencode-native session."""
-    metadata: dict[str, Any] = {"labels": dict(_SESSION_LABELS)}
+    metadata: _JsonObject = {"labels": dict(_SESSION_LABELS)}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(
@@ -387,7 +393,7 @@ async def _create_opencode_session(
     return new_session_id
 
 
-async def _fetch_opencode_session(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
+async def _fetch_opencode_session(client: httpx.AsyncClient, session_id: str) -> _JsonObject:
     """Fetch an existing Omnigent session."""
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     if resp.status_code == 404:
@@ -521,13 +527,16 @@ def _prompt_opencode_resume_workspace_action(
         f"  {_RESUME_ACTION_SWITCH:<6} - Switch working directory to {recorded_path}", err=True
     )
     click.echo(f"  {_RESUME_ACTION_CANCEL:<6} - Cancel resume", err=True)
-    return click.prompt(
+    action = click.prompt(
         "Resume action",
         type=click.Choice([_RESUME_ACTION_SWITCH, _RESUME_ACTION_CANCEL]),
         default=_RESUME_ACTION_SWITCH,
         show_choices=True,
         err=True,
     )
+    if not isinstance(action, str):
+        raise click.ClickException("Resume action must be a string.")
+    return action
 
 
 async def _find_running_opencode_terminal(

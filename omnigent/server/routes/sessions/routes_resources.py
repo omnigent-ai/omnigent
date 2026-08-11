@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import mimetypes
+import ntpath
 import urllib.parse
-from typing import Annotated, Any
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import Annotated, Any, cast
 
 import httpx
 from fastapi import (
@@ -40,6 +44,7 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
 )
@@ -54,15 +59,30 @@ from omnigent.server.routes._content_type import (
     require_json_content_type,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
+from omnigent.server.routes._gzip_route import GZipFileContentRoute, skip_gzip
 from omnigent.server.routes._origin import require_trusted_origin
-from omnigent.server.routes._sessions.common import *
 from omnigent.server.routes._sessions.common import (
+    _logger,
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import *
-from omnigent.server.routes._sessions.helpers import _load_agent_spec_for_session
-from omnigent.server.routes._sessions.orchestration import *
+from omnigent.server.routes._sessions.helpers import (
+    FILE_CONTENT_CACHE_CONTROL,
+    _ancestor_session_ids,
+    _attachment_disposition,
+    _file_content_etag,
+    _get_runner_client_for_resource_access,
+    _if_none_match_matches,
+    _load_agent_spec_for_session,
+    _proxy_get_session_resources_to_runner,
+    _publish_and_persist_resource_event,
+    _publish_changed_files_invalidated,
+    _read_upload_capped,
+    _stored_file_to_resource,
+)
+from omnigent.server.routes._sessions.orchestration import (
+    ensure_runner_connected,
+)
 from omnigent.server.schemas import (
     CopiedFile,
     CopyFilesRequest,
@@ -251,20 +271,34 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
             ) from exc
+        try:
+            response_payload = resp.json()
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=502, detail="runner resource endpoint returned invalid JSON"
+            ) from exc
         if resp.status_code == 404:
+            message = "Resource not found"
+            if isinstance(response_payload, dict):
+                error = response_payload.get("error")
+                if isinstance(error, dict) and isinstance(error.get("message"), str):
+                    message = error["message"]
             raise OmnigentError(
-                resp.json().get("error", {}).get("message", "Resource not found"),
+                message,
                 code=ErrorCode.NOT_FOUND,
             )
         if resp.status_code != 200:
-            try:
-                body = resp.json()
-                error = body.get("error", {})
+            if isinstance(response_payload, dict):
+                error = response_payload.get("error", {})
                 msg = error.get("message") or "runner resource endpoint failed"
-            except Exception:
+            else:
                 msg = "runner resource endpoint failed"
             raise HTTPException(status_code=502, detail=msg)
-        return resp.json()
+        if not isinstance(response_payload, dict):
+            raise HTTPException(
+                status_code=502, detail="runner resource endpoint returned non-object JSON"
+            )
+        return cast(dict[str, Any], response_payload)
 
     async def _fs_get_with_host_fallback(
         session_id: str,
@@ -273,6 +307,7 @@ def register_resources_routes(
         host_params: dict[str, Any],
         runner_path: str,
         runner_params: dict[str, str] | None = None,
+        host_workspace_resolver: Callable[[], Awaitable[str]] | None = None,
     ) -> dict[str, Any]:
         """Serve a filesystem read, falling back to the host when offline.
 
@@ -290,6 +325,14 @@ def register_resources_routes(
         :param host_params: Op-specific args for the host reader.
         :param runner_path: Runner-relative URL for the live path.
         :param runner_params: Optional query params for the runner path.
+        :param host_workspace_resolver: Resolves the absolute root the host
+            reader should be rooted at, for an absolute browse target.
+            Awaited ONLY when the fallback is actually taken: a live runner
+            authorizes the path itself against its own resolved policy, and
+            a runner-only session (no host, so no recorded ``workspace``)
+            has nothing for this to resolve against. Resolving it eagerly
+            would refuse absolute browsing on exactly those sessions even
+            though the online runner can serve them.
         :returns: The runner-shaped filesystem result.
         :raises OmnigentError: Re-raised runner-offline error when the
             host cannot serve the read either.
@@ -305,17 +348,138 @@ def register_resources_routes(
                 raise
             runner_offline = exc
 
-        payload = await _read_workspace_via_host(session_id, op, host_params)
+        host_workspace = await host_workspace_resolver() if host_workspace_resolver else None
+        payload = await _read_workspace_via_host(
+            session_id, op, host_params, workspace_override=host_workspace
+        )
         if payload is None:
             # No reachable host either — surface the original offline
             # error (503) so the client shows its reconnect affordance.
             raise runner_offline
         return payload
 
+    async def _environment_reach_for_session(
+        session_id: str,
+    ) -> tuple[list[Any], bool, str] | None:
+        """Compute a session's browse reach without consulting the runner.
+
+        Lets the offline (host-served) path authorize an absolute target
+        with the same grants the runner would apply, so browsing behaves
+        identically whether or not the agent is awake. The host is never
+        trusted to enforce this — it reads whatever root it is handed, so
+        the decision has to be made here.
+
+        :param session_id: Session/conversation identifier.
+        :returns: ``(roots, unconfined, workspace)``, or ``None`` when the
+            session has no workspace or spec to resolve.
+        """
+        from omnigent.inner.sandbox import is_unconfined, reachable_roots, resolve_sandbox
+
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or not conv.workspace:
+            return None
+        spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+        spec_os_env = getattr(spec, "os_env", None) if spec is not None else None
+        if spec_os_env is None:
+            return None
+        root = Path(conv.workspace)
+        policy = resolve_sandbox(spec_os_env, root)
+        return reachable_roots(root, policy), is_unconfined(policy), conv.workspace
+
+    def _mutating_runner_path(
+        session_id: str,
+        environment_id: str,
+        relative_path: str,
+    ) -> str:
+        """Build the runner URL for a write / edit / delete.
+
+        A leading slash means an absolute location rather than a path under
+        the workspace, and the runner refuses those unless the server vouches
+        for the caller. The caller's level is checked separately — see
+        :func:`_mutating_level`, which raises the bar to owner-only for an
+        absolute target.
+
+        :param session_id: Session/conversation identifier.
+        :param environment_id: Environment resource id.
+        :param relative_path: Client-supplied path.
+        :returns: The runner-relative URL.
+        """
+        absolute = relative_path.startswith("/")
+        # Encode only the leading slash: a literal "//" is what proxies
+        # collapse, while interior slashes travel fine.
+        encoded = (
+            "%2F" + urllib.parse.quote(relative_path.lstrip("/")) if absolute else relative_path
+        )
+        return (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{environment_id}/filesystem/{encoded}"
+        )
+
+    def _browse_level(client_path: str, *, within_workspace: int) -> int:
+        """Permission level a filesystem request needs for *client_path*.
+
+        Inside the workspace, the caller's usual bar (``LEVEL_READ`` to read,
+        ``LEVEL_EDIT`` to mutate) — the workspace is the session's shared
+        context, so a collaborator granted the session gets it.
+
+        Outside it, ``LEVEL_OWNER``, for reads as much as writes. Everything
+        past the workspace is the owner's own machine, and the host-scoped
+        endpoint that already browses it (``/v1/hosts/{id}/filesystem``,
+        behind the workspace picker) is owner-scoped. Anything weaker here
+        would make a shared session a way around that check.
+
+        This is the ONLY place the boundary is decided. The runner is handed
+        the path and nothing else: it cannot see who is asking, so it does
+        not try to — it enforces the sandbox grants, this enforces identity.
+
+        ``ntpath.isabs`` is used deliberately, and on every platform: it is
+        true for BOTH a POSIX leading slash (the wire form this API defines)
+        and a Windows drive or UNC root. A gate about identity has to fail
+        closed on anything that could be absolute *anywhere*, not just on the
+        shape the current deployment happens to send — otherwise a
+        ``C:\\Users\\...`` path would slip through at the collaborator level
+        and be stopped only by the runner rejecting it further down.
+
+        Note this is the AUTHORIZATION predicate, not the wire-format one.
+        Deciding how to encode the path for the runner stays
+        ``startswith("/")``, because that is a URL question and URLs use ``/``
+        on every platform. The two can disagree only for a Windows-style
+        path, where the result is a stricter gate plus a runner-side refusal
+        — closed on both counts.
+
+        :param client_path: Client-supplied path; a leading ``/`` is absolute.
+        :param within_workspace: Level required for a workspace-relative path.
+        :returns: The required permission level.
+        """
+        return LEVEL_OWNER if ntpath.isabs(client_path) else within_workspace
+
+    async def _authorize_absolute_browse(session_id: str, absolute_path: str) -> str:
+        """Authorize an absolute browse target for the host-served path.
+
+        :param session_id: Session/conversation identifier.
+        :param absolute_path: Absolute path the caller asked for.
+        :returns: The resolved, authorized absolute path.
+        :raises HTTPException: 403 when no grant covers it and the
+            environment is confined.
+        """
+        from omnigent.entities.environment_filesystem import PathUnreachable
+        from omnigent.runner.environment_filesystem import resolve_browse_target
+
+        reach = await _environment_reach_for_session(session_id)
+        if reach is None:
+            raise HTTPException(status_code=403, detail="session has no browsable environment")
+        roots, unconfined, _workspace = reach
+        try:
+            return str(resolve_browse_target(absolute_path, roots, unconfined=unconfined))
+        except PathUnreachable as exc:
+            raise HTTPException(status_code=403, detail=exc.message) from exc
+
     async def _read_workspace_via_host(
         session_id: str,
         op: str,
         host_params: dict[str, Any],
+        *,
+        workspace_override: str | None = None,
     ) -> dict[str, Any] | None:
         """Read the session's workspace over its host tunnel.
 
@@ -346,7 +510,7 @@ def register_resources_routes(
                 host_registry=host_registry,
                 host_conn=host_conn,
                 op=op,
-                workspace=conv.workspace,
+                workspace=workspace_override or conv.workspace,
                 session_id=session_id,
                 params=host_params,
             )
@@ -561,9 +725,9 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :param environment_id: Requested environment id; only the default
             environment is synthesized.
-        :returns: A minimal environment resource dict with
-            ``metadata.root`` set to the workspace path, or ``None`` when
-            not applicable (non-default env, no host, no workspace).
+        :returns: An environment resource dict carrying ``metadata.root``
+            and (when the spec resolves) ``metadata.reachable``, or ``None``
+            when not applicable (non-default env, no host, no workspace).
         """
         if environment_id != "default" or host_registry is None:
             return None
@@ -572,11 +736,24 @@ def register_resources_routes(
             return None
         if host_registry.get(conv.host_id) is None:
             return None
+
+        from omnigent.inner.sandbox import reach_payload
+
+        metadata: dict[str, Any] = {"root": conv.workspace}
+        # Advertise the same reach the runner would. Without it the file
+        # panel reads "nothing else reachable" and silently drops its
+        # navigation affordance the moment the agent sleeps -- even though
+        # the host-served path authorizes and serves absolute browsing
+        # exactly as the live runner does.
+        reach = await _environment_reach_for_session(session_id)
+        if reach is not None:
+            roots, unconfined, _workspace = reach
+            metadata["reachable"] = reach_payload(roots, unconfined=unconfined)
         return {
             "id": environment_id,
             "object": "session.resource",
             "type": "environment",
-            "metadata": {"root": conv.workspace},
+            "metadata": metadata,
         }
 
     @router.get(
@@ -670,6 +847,22 @@ def register_resources_routes(
                     ),
                     code=ErrorCode.INVALID_INPUT,
                 )
+        # A session whose runner merely went to sleep (host still up, or a
+        # resumable managed sandbox) is transparently reconnected here, so
+        # opening a shell from the web wakes it instead of dead-ending on a
+        # 502 — the same relaunch the next chat message would trigger. Only
+        # the wakeable states recover; a non-host-bound stranded session or an
+        # offline external host still falls through to the 502 below (the CLI
+        # reconnect path owns those).
+        # Called for its reconnect side effect; the proxy below re-resolves the
+        # (now-live) runner client itself, so neither return value is bound.
+        await ensure_runner_connected(
+            session_id=session_id,
+            conv=conv,
+            app_state=request.app.state,
+            conversation_store=conversation_store,
+            runner_router=runner_router or get_server_runner_router(),
+        )
         path = f"/v1/sessions/{session_id}/resources/terminals"
         status, payload = await _proxy_post_to_runner(
             session_id,
@@ -1038,13 +1231,25 @@ def register_resources_routes(
                 status_code=501,
                 detail="file store not configured",
             )
-        stored = file_store.get(file_id, session_id=session_id)
+        stored = await asyncio.to_thread(file_store.get, file_id, session_id=session_id)
         if stored is None:
             raise OmnigentError(
                 "File not found",
                 code=ErrorCode.NOT_FOUND,
             )
-        content = artifact_store.get(stored.id)
+        # Content is immutable per file id, so a still-valid cached copy can be
+        # answered before ever touching the artifact store. Transcripts re-render
+        # the same attachments on every load, and the originals run to megabytes.
+        etag = _file_content_etag(stored.id)
+        if _if_none_match_matches(request.headers.get("if-none-match"), etag):
+            return Response(
+                status_code=304,
+                headers={
+                    "ETag": etag,
+                    "Cache-Control": FILE_CONTENT_CACHE_CONTROL,
+                },
+            )
+        content = await asyncio.to_thread(artifact_store.get, stored.id)
         media_type = mimetypes.guess_type(stored.filename)[0] or "application/octet-stream"
         # The filename and bytes are fully user-controlled. Serving the
         # content inline lets a browser navigating directly to this URL
@@ -1060,6 +1265,8 @@ def register_resources_routes(
             headers={
                 "Content-Disposition": _attachment_disposition(stored.filename),
                 "X-Content-Type-Options": "nosniff",
+                "ETag": etag,
+                "Cache-Control": FILE_CONTENT_CACHE_CONTROL,
             },
         )
 
@@ -1343,7 +1550,34 @@ def register_resources_routes(
             _publish_changed_files_invalidated(session_id, environment_id)
         return payload
 
-    @router.get(
+    # Reads that inline a whole file in their JSON body, so the response is as
+    # large as the file. Grouped on their own router purely to attach
+    # GZipFileContentRoute: the route table stays the source of truth for what
+    # compresses, and the PUT/PATCH/DELETE handlers sharing these paths — which
+    # return small acks — are registered on ``router`` and stay uncompressed.
+    # Included into ``router`` at the end of this function.
+    file_read_router = APIRouter(route_class=GZipFileContentRoute)
+
+    def _skip_gzip_for_binary(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+        """
+        Opt a base64 (binary) file read out of gzip, and return the payload.
+
+        Base64 of already-compressed media gains ~1.3x from gzip for real
+        event-loop time (385 ms at the 10 MiB binary cap), so it is skipped.
+        The decision is made here because this is where the payload is known —
+        the response is ``application/json`` for every file, so the transport
+        layer cannot tell binary from text without re-parsing the body.
+
+        :param request: The active request, carrying the flag to the route class.
+        :param payload: The read result, either a file-content object or a
+            directory listing.
+        :returns: *payload*, unchanged, for direct return by the caller.
+        """
+        if payload.get("encoding") == "base64":
+            skip_gzip(request)
+        return payload
+
+    @file_read_router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}/filesystem",
         response_model=None,
     )
@@ -1376,17 +1610,20 @@ def register_resources_routes(
         qs = urllib.parse.urlencode(params)
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem?{qs}"
         await _validate_session(session_id, request, LEVEL_READ)
-        return await _fs_get_with_host_fallback(
-            session_id,
-            op="list_or_read",
-            host_params={
-                "path": "",
-                "limit": limit,
-                "after": after,
-                "before": before,
-                "order": order,
-            },
-            runner_path=path,
+        return _skip_gzip_for_binary(
+            request,
+            await _fs_get_with_host_fallback(
+                session_id,
+                op="list_or_read",
+                host_params={
+                    "path": "",
+                    "limit": limit,
+                    "after": after,
+                    "before": before,
+                    "order": order,
+                },
+                runner_path=path,
+            ),
         )
 
     @router.get(
@@ -1425,19 +1662,104 @@ def register_resources_routes(
         :param limit: Maximum number of results (1-500, default 500).
         :returns: JSON list response with matching filesystem entries.
         """
+        return await _proxy_search(
+            request,
+            session_id,
+            environment_id,
+            "",
+            q=q,
+            include=include,
+            exclude=exclude,
+            limit=limit,
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/environments/{environment_id}/search/{path:path}",
+        response_model=None,
+    )
+    async def search_environment_files_under(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        path: str,
+        q: str = Query(min_length=1, pattern=r".*\S.*"),
+        include: str | None = Query(default=None),
+        exclude: str | None = Query(default=None),
+        limit: int = Query(default=500, ge=1, le=500),
+    ) -> Any:
+        """
+        Search under a directory rather than the whole workspace.
+
+        Takes the same path shape as the filesystem routes: relative to the
+        workspace, or absolute with a leading slash. Keeps search covering
+        exactly what the file tree is showing.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param environment_id: Environment resource id.
+        :param path: Directory to search under.
+        :param q: Case-insensitive search substring.
+        :param include: Comma-separated include globs.
+        :param exclude: Comma-separated exclude globs.
+        :param limit: Maximum number of results (1-500, default 500).
+        :returns: JSON list response with matching filesystem entries.
+        """
+        return await _proxy_search(
+            request,
+            session_id,
+            environment_id,
+            path,
+            q=q,
+            include=include,
+            exclude=exclude,
+            limit=limit,
+        )
+
+    async def _proxy_search(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        path: str,
+        *,
+        q: str,
+        include: str | None,
+        exclude: str | None,
+        limit: int,
+    ) -> Any:
         params: dict[str, str] = {"q": q, "limit": str(limit)}
         if include is not None:
             params["include"] = include
         if exclude is not None:
             params["exclude"] = exclude
+
+        absolute = path.startswith("/")
+        await _validate_session(
+            session_id, request, _browse_level(path, within_workspace=LEVEL_READ)
+        )
+
         qs = urllib.parse.urlencode(params)
-        path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/search?{qs}"
-        await _validate_session(session_id, request, LEVEL_READ)
+        suffix = ""
+        if path:
+            suffix = "/" + ("%2F" + urllib.parse.quote(path.lstrip("/")) if absolute else path)
+        runner_path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{environment_id}/search{suffix}?{qs}"
+        )
+        resolver = (
+            functools.partial(_authorize_absolute_browse, session_id, path) if absolute else None
+        )
         return await _fs_get_with_host_fallback(
             session_id,
             op="search",
-            host_params={"q": q, "include": include, "exclude": exclude, "limit": limit},
-            runner_path=path,
+            host_params={
+                "q": q,
+                "include": include,
+                "exclude": exclude,
+                "limit": limit,
+                "path": "" if absolute else path,
+            },
+            runner_path=runner_path,
+            host_workspace_resolver=resolver,
         )
 
     @router.get(
@@ -1470,7 +1792,7 @@ def register_resources_routes(
             runner_path=path,
         )
 
-    @router.get(
+    @file_read_router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}/diff/{relative_path:path}",
         # Internal (UI diff view) — hidden from the public API reference.
         include_in_schema=False,
@@ -1507,7 +1829,7 @@ def register_resources_routes(
             runner_path=path,
         )
 
-    @router.get(
+    @file_read_router.get(
         "/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}",
         response_model=None,
@@ -1541,23 +1863,53 @@ def register_resources_routes(
             params["after"] = after
         if before is not None:
             params["before"] = before
+
+        # A leading slash means an absolute location rather than a path under
+        # the workspace, so it is owner-only: the workspace is the session's
+        # shared context, everything past it is the owner's own machine. See
+        # `_mutating_level` for why anything weaker would make this route a
+        # way around the owner-scoped host filesystem endpoint.
+        absolute = relative_path.startswith("/")
+        await _validate_session(
+            session_id, request, _browse_level(relative_path, within_workspace=LEVEL_READ)
+        )
+
         qs = urllib.parse.urlencode(params)
+        # Encode only the leading slash: a literal "//" is what proxies
+        # collapse, while interior slashes travel fine and keep logs readable.
+        runner_rel = (
+            "%2F" + urllib.parse.quote(relative_path.lstrip("/")) if absolute else relative_path
+        )
         path = (
             f"/v1/sessions/{session_id}/resources/environments"
-            f"/{environment_id}/filesystem/{relative_path}?{qs}"
+            f"/{environment_id}/filesystem/{runner_rel}?{qs}"
         )
-        await _validate_session(session_id, request, LEVEL_READ)
-        return await _fs_get_with_host_fallback(
-            session_id,
-            op="list_or_read",
-            host_params={
-                "path": relative_path,
-                "limit": limit,
-                "after": after,
-                "before": before,
-                "order": order,
-            },
-            runner_path=path,
+        # Offline, the host reads whatever root it is handed, so the server
+        # authorizes the target itself before rooting the reader there. Deferred:
+        # a live runner does its own authorization, and a runner-only session has
+        # no recorded workspace for this to resolve against.
+        resolver = (
+            functools.partial(_authorize_absolute_browse, session_id, relative_path)
+            if absolute
+            else None
+        )
+        # The session is already validated above at the browse level, which is
+        # stricter than main's plain LEVEL_READ for an absolute path.
+        return _skip_gzip_for_binary(
+            request,
+            await _fs_get_with_host_fallback(
+                session_id,
+                op="list_or_read",
+                host_params={
+                    "path": "" if absolute else relative_path,
+                    "limit": limit,
+                    "after": after,
+                    "before": before,
+                    "order": order,
+                },
+                runner_path=path,
+                host_workspace_resolver=resolver,
+            ),
         )
 
     @router.put(
@@ -1581,10 +1933,7 @@ def register_resources_routes(
         :returns: Write result.
         """
         body = await request.json()
-        path = (
-            f"/v1/sessions/{session_id}/resources/environments"
-            f"/{environment_id}/filesystem/{relative_path}"
-        )
+        path = _mutating_runner_path(session_id, environment_id, relative_path)
         return await _proxy_fs_response(
             session_id,
             "PUT",
@@ -1592,6 +1941,7 @@ def register_resources_routes(
             body,
             request=request,
             environment_id=environment_id,
+            required_level=_browse_level(relative_path, within_workspace=LEVEL_EDIT),
         )
 
     @router.patch(
@@ -1615,10 +1965,7 @@ def register_resources_routes(
         :returns: Edit result.
         """
         body = await request.json()
-        path = (
-            f"/v1/sessions/{session_id}/resources/environments"
-            f"/{environment_id}/filesystem/{relative_path}"
-        )
+        path = _mutating_runner_path(session_id, environment_id, relative_path)
         return await _proxy_fs_response(
             session_id,
             "PATCH",
@@ -1626,6 +1973,7 @@ def register_resources_routes(
             body,
             request=request,
             environment_id=environment_id,
+            required_level=_browse_level(relative_path, within_workspace=LEVEL_EDIT),
         )
 
     @router.delete(
@@ -1648,16 +1996,14 @@ def register_resources_routes(
         :param relative_path: Path relative to environment root.
         :returns: Delete result.
         """
-        path = (
-            f"/v1/sessions/{session_id}/resources/environments"
-            f"/{environment_id}/filesystem/{relative_path}"
-        )
+        path = _mutating_runner_path(session_id, environment_id, relative_path)
         return await _proxy_fs_response(
             session_id,
             "DELETE",
             path,
             request=request,
             environment_id=environment_id,
+            required_level=_browse_level(relative_path, within_workspace=LEVEL_EDIT),
         )
 
     # ── Phase 5: environment shell proxy ─────────────────────────
@@ -1718,3 +2064,9 @@ def register_resources_routes(
         await _validate_session(session_id, request, LEVEL_READ)
         path = f"/v1/sessions/{session_id}/resources/{resource_id}"
         return await _proxy_get_to_runner(session_id, path)
+
+    # Mount the gzip-wrapped file reads. Appended after every sibling route so
+    # the `{relative_path:path}` catch-alls cannot shadow a more specific
+    # sibling (e.g. `.../environments/{id}/shell`), which is how they behaved
+    # when they were registered inline on `router`.
+    router.include_router(file_read_router)

@@ -52,6 +52,26 @@ def test_build_omnigent_mcp_server_honors_python_executable() -> None:
     assert block["omnigent"]["command"][0] == "/custom/python"
 
 
+@pytest.mark.parametrize(
+    "server",
+    [
+        {"command": "python", "args": [1], "env": {}},
+        {"command": "python", "args": [], "env": {"TOKEN": 1}},
+    ],
+)
+def test_build_omnigent_mcp_server_rejects_non_string_values(
+    monkeypatch: pytest.MonkeyPatch,
+    server: dict[str, object],
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.build_mcp_config",
+        lambda bridge_dir, *, python_executable=None: {"mcpServers": {"omnigent": server}},
+    )
+
+    with pytest.raises(ValueError, match="Claude MCP server"):
+        build_opencode_omnigent_mcp_server(Path("/tmp/b"))
+
+
 def test_build_model_default_config_pins_model_without_provider_block() -> None:
     cfg = build_opencode_model_default_config("anthropic/claude-sonnet-4-5")
     assert cfg == {

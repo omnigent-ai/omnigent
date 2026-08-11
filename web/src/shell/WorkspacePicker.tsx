@@ -1,4 +1,5 @@
 import {
+  FolderDotIcon,
   FolderIcon,
   FolderPlusIcon,
   FileIcon,
@@ -10,9 +11,11 @@ import {
   XIcon,
   AlertTriangleIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
 
 /**
@@ -184,6 +187,59 @@ export function listingFilter(
   return normalizeTypedPath(dirText, home) === currentAbsolute ? partial : null;
 }
 
+/**
+ * Icon button in the picker header, with a styled hover tooltip.
+ *
+ * The tooltip hangs off a wrapping span rather than the button so it still
+ * appears while the button is *disabled* — that is exactly when a user is
+ * most likely to hover asking "what is this, and why can't I click it?".
+ * A disabled button receives no pointer events of its own.
+ *
+ * @param label Tooltip text, also the accessible name.
+ * @param icon Rendered glyph.
+ * @param onClick Activation handler.
+ * @param disabled Whether the action is unavailable.
+ * @param testId ``data-testid`` for the button.
+ */
+function PickerIconButton({
+  label,
+  icon,
+  onClick,
+  disabled = false,
+  testId,
+}: {
+  label: string;
+  icon: ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+  testId: string;
+}) {
+  return (
+    // Provides its own context so the button works wherever it is rendered --
+    // the picker is mounted in dialogs and popovers, and in tests, not only
+    // under the app-root provider. Mirrors FilesPanel's hidden-files toggle.
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="shrink-0">
+            <button
+              type="button"
+              onClick={onClick}
+              disabled={disabled}
+              aria-label={label}
+              className="block rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
+              data-testid={testId}
+            >
+              {icon}
+            </button>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">{label}</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
 interface WorkspacePickerProps {
   /** Host to browse, or ``null`` to render an empty state. */
   hostId: string | null;
@@ -221,6 +277,15 @@ interface WorkspacePickerProps {
    * disables the banner entirely.
    */
   occupancyForPath?: (absolutePath: string) => number;
+  /**
+   * Absolute path of the session's workspace, e.g.
+   * ``"/Users/corey/repo"``. When set, a "back to workspace" button appears
+   * beside Home so a user who has wandered off can return in one click.
+   * Omit where there is no workspace yet — the new-session / fork / project
+   * dialogs are *choosing* one, so for them Home (``~``) is the only
+   * meaningful anchor.
+   */
+  workspacePath?: string;
 }
 
 /**
@@ -251,6 +316,7 @@ export function WorkspacePicker({
   onNavigate,
   initialPath,
   occupancyForPath,
+  workspacePath,
 }: WorkspacePickerProps) {
   // "" means home — the server forwards ~ to list_dir. initialPath
   // seeds the start dir (read once at mount).
@@ -291,29 +357,35 @@ export function WorkspacePicker({
 
   const { data, isLoading, error, isPlaceholderData } = useHostFilesystem(hostId, path);
 
-  // Once the home listing comes back, derive the home dir's
-  // absolute path from the first entry's parent. Only first
-  // entry — they all share the same parent. Skip placeholder data
-  // (the prior directory kept on screen during a load) or we'd
-  // derive home from the wrong directory's entries.
+  // Resolve the host's home dir independently of where the picker is
+  // browsing, so a typed "~"-relative path can be expanded even when the
+  // picker opened straight at an absolute initialPath and thus never visits
+  // the "" home view. The query fires at mount and disables once home
+  // resolves; when the picker IS at the home view it shares the main
+  // listing's query key, so this adds no extra fetch there. An empty home
+  // has no entry to derive from and stays unresolved (the picker still
+  // opens onto it fine, and "~" typing is moot in an empty home).
+  const { data: homeData, isPlaceholderData: homeIsPlaceholder } = useHostFilesystem(
+    hostId,
+    resolvedHome === null ? "" : null,
+  );
+
+  // Derive the home dir's absolute path from the first entry's parent (all
+  // entries share one parent). Skip placeholder data (the prior directory
+  // kept on screen during a load) or we'd derive home from the wrong dir.
   useEffect(() => {
-    if (
-      path === "" &&
-      resolvedHome === null &&
-      !isPlaceholderData &&
-      data &&
-      data.entries.length > 0
-    ) {
-      const first = data.entries[0];
-      // first.path is "/Users/corey/x" → parent is "/Users/corey".
-      const idx = first.path.lastIndexOf("/");
-      if (idx > 0) {
-        setResolvedHome(first.path.slice(0, idx));
-      } else if (idx === 0) {
-        setResolvedHome("/");
-      }
+    if (resolvedHome !== null || homeIsPlaceholder || !homeData || homeData.entries.length === 0) {
+      return;
     }
-  }, [path, resolvedHome, data, isPlaceholderData]);
+    const first = homeData.entries[0];
+    // first.path is "/Users/corey/x" → parent is "/Users/corey".
+    const idx = first.path.lastIndexOf("/");
+    if (idx > 0) {
+      setResolvedHome(first.path.slice(0, idx));
+    } else if (idx === 0) {
+      setResolvedHome("/");
+    }
+  }, [resolvedHome, homeData, homeIsPlaceholder]);
 
   // Absolute path of the directory currently shown, derived from the
   // first entry's parent (entries share one parent). This is how a ""
@@ -458,27 +530,28 @@ export function WorkspacePicker({
       data-testid="workspace-picker"
     >
       <div className="flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
-        <button
-          type="button"
+        <PickerIconButton
+          label="Up one level"
+          icon={<ArrowUpIcon className="size-4" />}
           onClick={() => parent !== null && navigateTo(parent)}
           disabled={parent === null}
-          aria-label="Up one level"
-          title="Up one level"
-          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
-          data-testid="workspace-picker-up"
-        >
-          <ArrowUpIcon className="size-4" />
-        </button>
-        <button
-          type="button"
+          testId="workspace-picker-up"
+        />
+        {workspacePath !== undefined && (
+          <PickerIconButton
+            label="Workspace root"
+            icon={<FolderDotIcon className="size-4" />}
+            onClick={() => navigateTo(workspacePath)}
+            disabled={currentAbsolute === workspacePath}
+            testId="workspace-picker-workspace"
+          />
+        )}
+        <PickerIconButton
+          label="Home"
+          icon={<HomeIcon className="size-4" />}
           onClick={() => navigateTo("")}
-          aria-label="Home"
-          title="Home"
-          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-          data-testid="workspace-picker-home"
-        >
-          <HomeIcon className="size-4" />
-        </button>
+          testId="workspace-picker-home"
+        />
         <input
           type="text"
           value={pathInput}
@@ -497,31 +570,22 @@ export function WorkspacePicker({
           spellCheck={false}
           autoCapitalize="off"
           autoCorrect="off"
-          className="min-w-0 flex-1 bg-transparent text-xs text-muted-foreground focus:outline-none"
+          className="min-w-0 flex-1 bg-transparent text-sm text-muted-foreground focus:outline-none"
           data-testid="workspace-picker-path-input"
         />
-        <button
-          type="button"
+        <PickerIconButton
+          label={showHidden ? "Hide hidden files" : "Show hidden files"}
+          icon={showHidden ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />}
           onClick={() => setShowHidden((v) => !v)}
-          aria-label={showHidden ? "Hide hidden" : "Show hidden"}
-          aria-pressed={showHidden}
-          title={showHidden ? "Hide hidden" : "Show hidden"}
-          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-          data-testid="workspace-picker-show-hidden"
-        >
-          {showHidden ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />}
-        </button>
-        <button
-          type="button"
+          testId="workspace-picker-show-hidden"
+        />
+        <PickerIconButton
+          label="New folder"
+          icon={<FolderPlusIcon className="size-4" />}
           onClick={openNewFolder}
           disabled={!canCreateFolder}
-          aria-label="New folder"
-          title="New folder"
-          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
-          data-testid="workspace-picker-new-folder"
-        >
-          <FolderPlusIcon className="size-4" />
-        </button>
+          testId="workspace-picker-new-folder"
+        />
         {onSelect && (
           <Button
             type="button"
@@ -537,16 +601,12 @@ export function WorkspacePicker({
           </Button>
         )}
         {onClose && (
-          <button
-            type="button"
+          <PickerIconButton
+            label="Close"
+            icon={<XIcon className="size-4" />}
             onClick={onClose}
-            aria-label="Close"
-            title="Close"
-            className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-            data-testid="workspace-picker-close"
-          >
-            <XIcon className="size-4" />
-          </button>
+            testId="workspace-picker-close"
+          />
         )}
       </div>
       {newFolderName !== null && (
@@ -558,8 +618,7 @@ export function WorkspacePicker({
             <FolderPlusIcon className="size-4 shrink-0 text-muted-foreground" />
             <input
               type="text"
-              // eslint-disable-next-line jsx-a11y/no-autofocus -- focus belongs on
-              // the field the user just opened; the picker is already a focus trap.
+              // Focus belongs on the field the user just opened; the picker is already a focus trap.
               autoFocus
               value={newFolderName}
               onChange={(e) => {
@@ -579,7 +638,7 @@ export function WorkspacePicker({
               spellCheck={false}
               autoCapitalize="off"
               autoCorrect="off"
-              className="min-w-0 flex-1 bg-transparent text-xs text-foreground focus:outline-none"
+              className="min-w-0 flex-1 bg-transparent text-sm text-foreground focus:outline-none"
               data-testid="workspace-picker-new-folder-input"
             />
             <button
@@ -591,7 +650,11 @@ export function WorkspacePicker({
               className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
               data-testid="workspace-picker-new-folder-create"
             >
-              <CheckIcon className="size-4" />
+              {createDir.isPending ? (
+                <Spinner className="size-4" />
+              ) : (
+                <CheckIcon className="size-4" />
+              )}
             </button>
             <button
               type="button"
@@ -606,7 +669,7 @@ export function WorkspacePicker({
           </div>
           {createError !== null && (
             <span
-              className="text-xs text-destructive"
+              className="text-sm text-destructive"
               data-testid="workspace-picker-new-folder-error"
             >
               {createError}
@@ -616,7 +679,7 @@ export function WorkspacePicker({
       )}
       {occupiedCount > 0 && (
         <div
-          className="flex shrink-0 items-start gap-1.5 border-b bg-warning/10 px-3 py-2 text-xs text-warning"
+          className="flex shrink-0 items-start gap-1.5 border-b bg-warning/10 px-3 py-2 text-sm text-warning"
           data-testid="workspace-picker-conflict"
         >
           <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
@@ -628,14 +691,14 @@ export function WorkspacePicker({
         </div>
       )}
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {isLoading && <div className="px-3 py-3 text-xs text-muted-foreground">Loading…</div>}
+        {isLoading && <div className="px-3 py-3 text-sm text-muted-foreground">Loading…</div>}
         {error !== null && error !== undefined && !isLoading && (
-          <div className="px-3 py-3 text-xs text-destructive" data-testid="workspace-picker-error">
+          <div className="px-3 py-3 text-sm text-destructive" data-testid="workspace-picker-error">
             {error instanceof Error ? error.message : "Failed to load directory"}
           </div>
         )}
         {!isLoading && error === null && entries.length === 0 && (
-          <div className="px-3 py-3 text-xs text-muted-foreground">
+          <div className="px-3 py-3 text-sm text-muted-foreground">
             {activeFilter !== null ? "No matching entries" : "(empty directory)"}
           </div>
         )}
@@ -653,7 +716,7 @@ export function WorkspacePicker({
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => isDir && navigateTo(entry.path)}
               className={
-                "flex w-full items-center gap-2 border-b px-3 py-2 text-left text-xs last:border-b-0 " +
+                "flex w-full items-center gap-2 border-b px-3 py-2 text-left text-sm last:border-b-0 " +
                 (isDir
                   ? "hover:bg-accent hover:text-accent-foreground cursor-pointer"
                   : "text-muted-foreground cursor-not-allowed")
@@ -667,7 +730,7 @@ export function WorkspacePicker({
         })}
         {data?.truncated && (
           <div
-            className="px-3 py-2 text-xs text-muted-foreground"
+            className="px-3 py-2 text-sm text-muted-foreground"
             data-testid="workspace-picker-truncated"
           >
             Too many entries to list fully — type a path above to jump directly.
