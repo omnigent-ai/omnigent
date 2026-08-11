@@ -1980,9 +1980,7 @@ def create_runner_app(
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     _native_pane_status: dict[str, str] = {}
     _session_message_buffers: dict[str, list[_JsonObject]] = {}
-    _ingest_next_seq: dict[str, int] = {}
-    _ingest_now_serving: dict[str, int] = {}
-    _ingest_cond: dict[str, asyncio.Condition] = {}
+    _ingest_locks: dict[str, asyncio.Lock] = {}
     _interrupted_sessions: set[str] = set()
     app.state.interrupted_sessions = _interrupted_sessions
     _background_tasks: set[asyncio.Task[object]] = set()
@@ -3304,9 +3302,7 @@ def create_runner_app(
         _session_message_buffers.pop(session_id, None)
         _live_response_id.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
-        _ingest_next_seq.pop(session_id, None)
-        _ingest_now_serving.pop(session_id, None)
-        _ingest_cond.pop(session_id, None)
+        _ingest_locks.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -4937,16 +4933,8 @@ def create_runner_app(
         session_id: str,
     ) -> None:
 
-        _seq = _ingest_next_seq.get(session_id, 0)
-        _ingest_next_seq[session_id] = _seq + 1
-        _cond = _ingest_cond.get(session_id)
-        if _cond is None:
-            _cond = asyncio.Condition()
-            _ingest_cond[session_id] = _cond
-        async with _cond:
-            while _ingest_now_serving.get(session_id, 0) != _seq:
-                await _cond.wait()
-        try:
+        _ingest_lock = _ingest_locks.setdefault(session_id, asyncio.Lock())
+        async with _ingest_lock:
             if session_id in _active_turns:
                 return
 
@@ -4992,10 +4980,6 @@ def create_runner_app(
                 _background_tasks.discard,
             )
             _background_tasks.add(_turn_task)
-        finally:
-            async with _cond:
-                _ingest_now_serving[session_id] = _seq + 1
-                _cond.notify_all()
 
     async def _post_subagent_wake_notice(
         parent_id: str, notice: str, child_id: str, created_by: str | None
@@ -6206,16 +6190,8 @@ def create_runner_app(
             if _is_native_harness(conversation_id):
                 resource_registry.note_session_turn_started(conversation_id)
 
-            _seq = _ingest_next_seq.get(conversation_id, 0)
-            _ingest_next_seq[conversation_id] = _seq + 1
-            _cond = _ingest_cond.get(conversation_id)
-            if _cond is None:
-                _cond = asyncio.Condition()
-                _ingest_cond[conversation_id] = _cond
-            async with _cond:
-                while _ingest_now_serving.get(conversation_id, 0) != _seq:
-                    await _cond.wait()
-            try:
+            _ingest_lock = _ingest_locks.setdefault(conversation_id, asyncio.Lock())
+            async with _ingest_lock:
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
                     message_body["content"] = await _resolve_forwarded_message_content(
@@ -6333,10 +6309,6 @@ def create_runner_app(
                         "detail": "Turn started.",
                     },
                 )
-            finally:
-                async with _cond:
-                    _ingest_now_serving[conversation_id] = _seq + 1
-                    _cond.notify_all()
 
         if body_type == "interrupt":
             _harness = _session_harness_name(conversation_id)
