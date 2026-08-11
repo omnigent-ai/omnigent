@@ -1008,6 +1008,68 @@ export function AppShell() {
   }, [cancelTitleBarPeek]);
   useEffect(() => cancelTitleBarPeek, [cancelTitleBarPeek]);
 
+  // Dismiss a peeking card when the pointer is clearly elsewhere.
+  //
+  // The card closes itself on its own pointerleave, which is enough when peek is
+  // armed from a button INSIDE it. The title-bar trigger sits outside, so a
+  // pointer that dwells there and then moves away without ever crossing the card
+  // leaves it with no pointerenter — and therefore no pointerleave — so nothing
+  // closes it and the card sits open indefinitely. Watch the document instead:
+  // once the pointer is over neither the card nor the trigger, dismiss on the
+  // same 200ms grace the card uses, so a wobble between the two doesn't.
+  //
+  // A click outside dismisses immediately: at that point the user has committed
+  // their attention elsewhere and waiting out a grace period just feels sticky.
+  const peekDismissTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!sidebarPeek) return;
+    const cancel = () => {
+      if (peekDismissTimer.current) {
+        clearTimeout(peekDismissTimer.current);
+        peekDismissTimer.current = null;
+      }
+    };
+    // Anything the peek card legitimately spawns outside its own subtree (Radix
+    // menus, tooltips, dialogs) must not count as "outside", or opening a row's
+    // context menu would dismiss the card under it.
+    const insidePeekSurface = (target: EventTarget | null) => {
+      if (!(target instanceof Element)) return false;
+      return !!target.closest(
+        [
+          "aside.conversations-sidebar",
+          ".electron-sidebar-header-actions",
+          "[data-radix-popper-content-wrapper]",
+          '[role="menu"]',
+          '[role="dialog"]',
+          '[role="tooltip"]',
+        ].join(","),
+      );
+    };
+    const onPointerMove = (e: PointerEvent) => {
+      if (insidePeekSurface(e.target)) {
+        cancel();
+        return;
+      }
+      if (peekDismissTimer.current) return;
+      peekDismissTimer.current = setTimeout(() => {
+        peekDismissTimer.current = null;
+        setSidebarPeek(false);
+      }, 200);
+    };
+    const onPointerDown = (e: PointerEvent) => {
+      if (insidePeekSurface(e.target)) return;
+      cancel();
+      setSidebarPeek(false);
+    };
+    document.addEventListener("pointermove", onPointerMove);
+    document.addEventListener("pointerdown", onPointerDown, true);
+    return () => {
+      cancel();
+      document.removeEventListener("pointermove", onPointerMove);
+      document.removeEventListener("pointerdown", onPointerDown, true);
+    };
+  }, [sidebarPeek]);
+
   // Toggle the workspace rail's full-screen (maximized) state. Entering
   // collapses the left sidebar (the maximized rail wants the full width) after
   // stashing its prior open-state; exiting restores that state. The sidebar

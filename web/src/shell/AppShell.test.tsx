@@ -3,7 +3,7 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   MemoryRouter,
   Route,
@@ -61,9 +61,18 @@ vi.mock("@/hooks/useAgents", () => ({
 }));
 
 vi.mock("./Sidebar", () => ({
-  // Reflect the open prop so tests can assert sidebar collapse/expand.
-  Sidebar: ({ open }: { open: boolean }) => (
-    <div data-testid="sidebar" data-open={open ? "true" : "false"} />
+  // Reflect the open/peek props so tests can assert sidebar collapse/expand and
+  // whether it is peeking (a floating hover card rather than a docked panel).
+  // Rendered as aside.conversations-sidebar like the real one, so the
+  // peek-dismiss logic (which treats that selector as "inside the card") sees
+  // the same shape here as in the app.
+  Sidebar: ({ open, peek }: { open: boolean; peek?: boolean }) => (
+    <aside
+      className="conversations-sidebar"
+      data-testid="sidebar"
+      data-open={open ? "true" : "false"}
+      data-peek={peek ? "true" : "false"}
+    />
   ),
 }));
 vi.mock("./FilesPanel", () => ({
@@ -1234,6 +1243,41 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("dismisses a peeking sidebar once the pointer moves elsewhere", async () => {
+    // The card closes itself on its own pointerleave, which only covers a peek
+    // armed from INSIDE it. Armed from the title-bar trigger (outside), a pointer
+    // that never crosses the card leaves it with no pointerenter and therefore no
+    // pointerleave, so the card used to sit open indefinitely.
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    fireEvent.pointerEnter(screen.getByRole("button", { name: /open sidebar/i }));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true"));
+
+    // Pointer over something that is not the card, the trigger, or a popper.
+    fireEvent.pointerMove(screen.getByTestId("url-params"));
+    await waitFor(() =>
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "false"),
+    );
+  });
+
+  it("keeps peeking while the pointer is over the card itself", async () => {
+    // The other half: dismissal must not be so eager that moving onto the card —
+    // the entire point of peeking — closes it.
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    fireEvent.pointerEnter(screen.getByRole("button", { name: /open sidebar/i }));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true"));
+
+    fireEvent.pointerMove(screen.getByTestId("sidebar"));
+    await new Promise((resolve) => {
+      // Past the 200ms dismiss grace, so "still peeking" is a real result.
+      setTimeout(resolve, 350);
+    });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true");
   });
 
   it("keeps the sidebar pinned open for the whole /settings visit", () => {
