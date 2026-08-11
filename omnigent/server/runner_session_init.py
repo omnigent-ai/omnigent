@@ -21,7 +21,7 @@ class RunnerSessionInitializer:
         self._registry = registry
         self._server_version = server_version
         self._tasks: dict[
-            tuple[str, int, str, str, str | None],
+            tuple[str, int, str, str, str | None, str | None],
             asyncio.Task[httpx.Response],
         ] = {}
 
@@ -49,6 +49,7 @@ class RunnerSessionInitializer:
             conversation.id,
             agent_id,
             conversation.sub_agent_name,
+            conversation.parent_conversation_id,
         )
         task = self._tasks.get(key)
         if task is None:

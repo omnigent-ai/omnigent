@@ -27,6 +27,7 @@ import {
   FileTextIcon,
   FlaskConicalIcon,
   ListIcon,
+  MoreHorizontalIcon,
   NetworkIcon,
   PlusIcon,
   ScanSearchIcon,
@@ -47,10 +48,27 @@ import { OpenCodeIcon } from "@/components/icons/OpenCodeIcon";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { PiIcon } from "@/components/icons/PiIcon";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { showToast } from "@/components/ui/toast";
 import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
+import { usePromoteSession } from "@/hooks/usePromoteSession";
+import { isOwnerLevel } from "@/lib/permissionsApi";
 import type { SessionItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -105,18 +123,48 @@ interface SubagentsPanelProps {
    *  child it is the child's parent id. AppShell resolves this from
    *  ``activeSession.parentSessionId``. */
   rootSessionId: string;
+  /** Effective permission on the tree's root session. */
+  permissionLevel: number | null;
 }
 
 type ViewMode = "list" | "graph";
+interface PromotionTarget {
+  id: string;
+  label: string;
+  previousParentId: string;
+}
 
-export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
+export function SubagentsPanel({
+  conversationId,
+  rootSessionId,
+  permissionLevel,
+}: SubagentsPanelProps) {
   const { children, isLoading, error } = useChildSessions(rootSessionId);
+  const promoteSession = usePromoteSession();
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
+  const [promotionTarget, setPromotionTarget] = useState<PromotionTarget | null>(null);
+  const canPromote = isOwnerLevel(permissionLevel);
   const toggleCollapsedRow = (id: string) => {
     setCollapsedRows((current) => ({ ...current, [id]: !current[id] }));
   };
+
+  async function confirmPromotion(): Promise<void> {
+    if (promotionTarget === null) return;
+    try {
+      await promoteSession.mutateAsync({
+        sessionId: promotionTarget.id,
+        previousParentId: promotionTarget.previousParentId,
+      });
+      setPromotionTarget(null);
+      showToast("Agent promoted to a top-level session.");
+    } catch (cause) {
+      showToast(cause instanceof Error ? cause.message : "Unable to promote this agent.", {
+        duration: 0,
+      });
+    }
+  }
 
   // Loading/error states only surface when there's no cached data to
   // show alongside the "main" row.
@@ -171,9 +219,12 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
             key={child.id}
             child={child}
             depth={1}
+            parentSessionId={rootSessionId}
             conversationId={conversationId}
             collapsedRows={collapsedRows}
             onToggleCollapsed={toggleCollapsedRow}
+            canPromote={canPromote}
+            onRequestPromotion={setPromotionTarget}
           />
         ))}
       </ul>
@@ -182,6 +233,34 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
       {addOpen && (
         <AddAgentDialog parentSessionId={rootSessionId} open={addOpen} onOpenChange={setAddOpen} />
       )}
+      <Dialog
+        open={promotionTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setPromotionTarget(null);
+        }}
+      >
+        <DialogContent data-testid="promote-agent-dialog">
+          <DialogHeader>
+            <DialogTitle>Promote {promotionTarget?.label ?? "this agent"}?</DialogTitle>
+            <DialogDescription>
+              Its sub-agents will move with it, and it will no longer belong to the current parent
+              session. People who only have access through the parent may lose access.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setPromotionTarget(null)}
+              disabled={promoteSession.isPending}
+            >
+              Cancel
+            </Button>
+            <Button onClick={() => void confirmPromotion()} disabled={promoteSession.isPending}>
+              {promoteSession.isPending ? "Promoting…" : "Promote"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -573,17 +652,24 @@ function rowPaddingLeft(depth: number): number {
 function SubagentRow({
   child,
   depth,
+  parentSessionId,
   conversationId,
   collapsedRows,
   onToggleCollapsed,
+  canPromote,
+  onRequestPromotion,
 }: {
   child: ChildSessionInfo;
   /** Levels below the root, 1 = direct child of "main". */
   depth: number;
+  /** Immediate parent used to invalidate the correct child list. */
+  parentSessionId: string;
   /** The conversation currently rendered in main, for row highlighting. */
   conversationId: string;
   collapsedRows: Record<string, boolean>;
   onToggleCollapsed: (id: string) => void;
+  canPromote: boolean;
+  onRequestPromotion: (target: PromotionTarget) => void;
 }) {
   const collapsed = collapsedRows[child.id] ?? false;
   const status = childStatus(child);
@@ -619,6 +705,36 @@ function SubagentRow({
             <ToggleIcon aria-hidden="true" className="size-3.5" />
           </button>
         )}
+        {canPromote && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label={`Actions for ${primary}`}
+                data-testid="subagent-actions"
+                className="absolute top-1.5 right-1.5 z-20"
+              >
+                <MoreHorizontalIcon className="size-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem
+                disabled={child.busy || child.pending_elicitations_count > 0}
+                onSelect={() =>
+                  onRequestPromotion({
+                    id: child.id,
+                    label: primary,
+                    previousParentId: parentSessionId,
+                  })
+                }
+              >
+                Promote to session
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
         <Link
           // See MainRow: drop session-scoped params on rail navigation
           // (preserving global ones like ``?debug=1``) so a sticky
@@ -631,7 +747,8 @@ function SubagentRow({
           // under its parent, signaling where it sits in the tree.
           style={{ paddingLeft: rowPaddingLeft(depth) }}
           className={cn(
-            "flex w-full flex-col gap-0.5 py-2 pr-2.5 text-left hover:bg-accent/60",
+            "flex w-full flex-col gap-0.5 py-2 text-left hover:bg-accent/60",
+            canPromote ? "pr-10" : "pr-2.5",
             isActive && "bg-accent",
             dim && "opacity-60 hover:opacity-100",
           )}
@@ -680,9 +797,12 @@ function SubagentRow({
             key={grandchild.id}
             child={grandchild}
             depth={depth + 1}
+            parentSessionId={child.id}
             conversationId={conversationId}
             collapsedRows={collapsedRows}
             onToggleCollapsed={onToggleCollapsed}
+            canPromote={canPromote}
+            onRequestPromotion={onRequestPromotion}
           />
         ))}
     </>

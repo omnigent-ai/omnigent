@@ -102,6 +102,10 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _logger,
     _managed_launch_tasks,
+    _session_active_response_cache,
+    _session_background_task_count_cache,
+    _session_sandbox_status_cache,
+    _session_terminal_pending_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -114,6 +118,7 @@ from omnigent.server.routes._sessions.helpers import (
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
     _codex_plan_mode_enabled,
+    _collect_descendant_conversation_ids,
     _discovery_key,
     _forward_session_change_to_runner,
     _get_runner_client,
@@ -188,6 +193,30 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+
+_ACTIVE_SANDBOX_STAGES = frozenset({"provisioning", "cloning", "starting", "connecting"})
+
+
+def _promotion_tree_is_active(conversations: dict[str, Conversation]) -> bool:
+    """Return whether any session in a proposed promoted tree is doing work."""
+    for conversation in conversations.values():
+        session_id = conversation.id
+        sandbox_status = _session_sandbox_status_cache.get(session_id)
+        if _session_status_from_cache(session_id, conversation.live_status) == "running":
+            return True
+        if (conversation.pending_elicitation_count or 0) > 0:
+            return True
+        if pending_elicitations.count_for(session_id) > 0:
+            return True
+        if session_id in _session_active_response_cache:
+            return True
+        if _session_background_task_count_cache.get(session_id, 0) > 0:
+            return True
+        if _session_terminal_pending_cache.get(session_id, False):
+            return True
+        if sandbox_status is not None and sandbox_status.stage in _ACTIVE_SANDBOX_STAGES:
+            return True
+    return False
 
 
 def register_core_routes(
@@ -2182,6 +2211,108 @@ def register_core_routes(
             permission_level=level,
             last_task_error=None,
             agent_name=base_agent.name,
+        )
+
+    # ── POST /sessions/{session_id}/promote ──────────────────────
+
+    @router.post(
+        "/sessions/{session_id}/promote",
+        response_model=None,
+        responses={200: {"model": SessionResponse}},
+    )
+    async def promote_session(request: Request, session_id: str) -> SessionResponse:
+        """Promote an inactive child session and its descendants to a new tree."""
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id,
+            session_id,
+            LEVEL_OWNER,
+            permission_store,
+            conversation_store,
+        )
+        conversation = access.conversation
+        if conversation is None:
+            conversation = await asyncio.to_thread(
+                conversation_store.get_conversation,
+                session_id,
+            )
+        if conversation is None:
+            raise OmnigentError(
+                f"Session not found: {session_id!r}",
+                code=ErrorCode.NOT_FOUND,
+            )
+        if conversation.parent_conversation_id is None:
+            raise OmnigentError(
+                "This agent is already a top-level session.",
+                code=ErrorCode.CONFLICT,
+            )
+
+        descendant_ids = await _collect_descendant_conversation_ids(
+            conversation_store,
+            session_id,
+        )
+        tree = await asyncio.to_thread(
+            conversation_store.get_conversations,
+            [session_id, *descendant_ids],
+        )
+        if len(tree) != len(descendant_ids) + 1:
+            raise OmnigentError(
+                "The session tree changed while promotion was being prepared. Try again.",
+                code=ErrorCode.CONFLICT,
+            )
+        if _promotion_tree_is_active(tree):
+            raise OmnigentError(
+                "This agent or one of its sub-agents is currently active. "
+                "Try again after it finishes.",
+                code=ErrorCode.CONFLICT,
+            )
+
+        if permission_store is not None and user_id is not None:
+            await asyncio.to_thread(permission_store.ensure_user, user_id)
+            await asyncio.to_thread(
+                permission_store.grant,
+                user_id,
+                session_id,
+                LEVEL_OWNER,
+            )
+
+        try:
+            updated = await asyncio.to_thread(
+                conversation_store.promote_subtree,
+                session_id,
+            )
+        except LookupError as exc:
+            raise OmnigentError(
+                f"Session not found: {session_id!r}",
+                code=ErrorCode.NOT_FOUND,
+            ) from exc
+        except ValueError as exc:
+            raise OmnigentError(
+                "This agent is already a top-level session.",
+                code=ErrorCode.CONFLICT,
+            ) from exc
+
+        _announce_session_added(user_id, session_id)
+        items = await asyncio.to_thread(
+            conversation_store.list_items,
+            session_id,
+            limit=10000,
+        )
+        level = await _get_permission_level(user_id, session_id, permission_store)
+        agent_name: str | None = None
+        if updated.agent_id is not None:
+            bound_agent = await asyncio.to_thread(agent_store.get, updated.agent_id)
+            agent_name = bound_agent.name if bound_agent is not None else None
+        return _build_session_response(
+            updated,
+            items.data,
+            _session_status_from_cache(session_id, updated.live_status),
+            permission_level=level,
+            last_task_error=None,
+            agent_name=agent_name,
+            viewer_id=user_id,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
         )
 
     # ── POST /sessions/{session_id}/switch-agent ─────────────────

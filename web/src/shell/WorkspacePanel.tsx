@@ -923,7 +923,11 @@ export function WorkspacePanel({
           // measures this rail slot to position the native view over it.
           <BrowserPane conversationId={conversationId} className="min-h-0 flex-1" />
         ) : rightRailTab === "subagents" && rootSessionId ? (
-          <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+          <SubagentsPanel
+            conversationId={conversationId}
+            rootSessionId={rootSessionId}
+            permissionLevel={permissionLevel}
+          />
         ) : rightRailTab === "todos" && todosSupported ? (
           <TodoPanel frameless />
         ) : rightRailTab === "terminals" && showShellsTab ? (

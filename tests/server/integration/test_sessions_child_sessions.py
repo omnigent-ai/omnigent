@@ -115,6 +115,81 @@ def _seed_child(
     )
 
 
+async def test_promote_session_detaches_subtree_and_updates_lists(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The public endpoint promotes B while keeping C attached to it."""
+    parent = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    promoted = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="reviewer:B",
+        agent_id=parent["agent_id"],
+    )
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=promoted.id,
+        title="researcher:C",
+        agent_id=parent["agent_id"],
+    )
+
+    response = await client.post(f"/v1/sessions/{promoted.id}/promote")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["id"] == promoted.id
+    assert body["kind"] == "default"
+    assert body["parent_session_id"] is None
+    assert body["root_conversation_id"] == promoted.id
+
+    old_children = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
+    new_children = await client.get(f"/v1/sessions/{promoted.id}/child_sessions")
+    assert [row["id"] for row in old_children.json()["data"]] == []
+    assert [row["id"] for row in new_children.json()["data"]] == [child.id]
+
+    top_level = await client.get("/v1/sessions?limit=100")
+    top_level_ids = {row["id"] for row in top_level.json()["data"]}
+    assert parent["id"] in top_level_ids
+    assert promoted.id in top_level_ids
+
+
+@pytest.mark.parametrize("active_node", ["target", "descendant"])
+async def test_promote_session_rejects_active_tree(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    active_node: str,
+) -> None:
+    """An active target or descendant keeps the complete tree attached."""
+    parent = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    promoted = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="reviewer:B",
+        agent_id=parent["agent_id"],
+    )
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=promoted.id,
+        title="researcher:C",
+        agent_id=parent["agent_id"],
+    )
+    active_id = promoted.id if active_node == "target" else child.id
+    sessions_module._session_status_cache[active_id] = "running"
+    try:
+        response = await client.post(f"/v1/sessions/{promoted.id}/promote")
+    finally:
+        sessions_module._session_status_cache.pop(active_id, None)
+
+    assert response.status_code == 409
+    assert "currently active" in response.json()["error"]["message"]
+    unchanged = conv_store.get_conversation(promoted.id)
+    assert unchanged is not None
+    assert unchanged.parent_conversation_id == parent["id"]
+
+
 # ── 404 ──────────────────────────────────────────────────
 
 

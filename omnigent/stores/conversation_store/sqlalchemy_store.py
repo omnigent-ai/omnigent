@@ -3824,6 +3824,61 @@ class SqlAlchemyConversationStore(ConversationStore):
             raise LookupError(f"conversation not found: {conversation_id!r}")
         return conv
 
+    def promote_subtree(self, conversation_id: str) -> Conversation:
+        """Detach a child conversation and make its subtree a new tree.
+
+        The parent detach and recursive root rewrite share one Agent Platform
+        transaction. The target is re-checked while holding the write lock so a
+        retry cannot silently re-promote an already top-level conversation.
+
+        :param conversation_id: Child conversation to promote.
+        :returns: The promoted target conversation.
+        :raises LookupError: If the conversation does not exist.
+        :raises ValueError: If the conversation is already top-level.
+        """
+        with self._conv_session_immediate("promote_subtree") as session:
+            target_query = select(SqlConversation).where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id == conversation_id,
+            )
+            if self._supports_for_update:
+                target_query = target_query.with_for_update()
+            target = session.execute(target_query).scalar_one_or_none()
+            if target is None:
+                raise LookupError(f"conversation not found: {conversation_id!r}")
+            if target.parent_conversation_id is None:
+                raise ValueError(f"conversation is already top-level: {conversation_id!r}")
+
+            subtree = (
+                select(SqlConversation.id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
+                .cte(name="promoted_subtree", recursive=True)
+            )
+            subtree = subtree.union_all(
+                select(SqlConversation.id).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.parent_conversation_id == subtree.c.id,
+                )
+            )
+            session.execute(
+                update(SqlConversation)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id.in_(select(subtree.c.id)),
+                )
+                .values(root_conversation_id=conversation_id)
+            )
+            target.parent_conversation_id = None
+            target.updated_at = now_epoch()
+
+        promoted = self.get_conversation(conversation_id)
+        if promoted is None:
+            raise LookupError(f"conversation not found: {conversation_id!r}")
+        return promoted
+
     async def delete_conversation(self, conversation_id: str) -> bool:
         """
         Delete a conversation and all of its descendants, cleaning up

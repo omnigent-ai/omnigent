@@ -1623,6 +1623,21 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def promote_subtree(self, conversation_id: str) -> Conversation:
+        """Promote a child conversation and its descendants to a new tree.
+
+        The target becomes top-level and every node in its subtree uses the
+        target as ``root_conversation_id``. Descendant parent links and all
+        conversation content remain unchanged.
+
+        :param conversation_id: Child conversation to promote.
+        :returns: The updated target conversation.
+        :raises LookupError: If the conversation does not exist.
+        :raises ValueError: If the conversation is already top-level.
+        """
+        ...
+
+    @abstractmethod
     async def delete_conversation(self, conversation_id: str) -> bool:
         """
         Delete a conversation and all its items.

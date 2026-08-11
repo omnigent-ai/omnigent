@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from typing import Any
 
 import httpx
@@ -106,6 +107,36 @@ async def test_initializer_evicts_rejected_result_for_retry() -> None:
 
     assert first.status_code == second.status_code == 503
     assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_initializer_reinitializes_when_parent_topology_changes() -> None:
+    """Promoting a child invalidates readiness for its prior parent link."""
+    registry = _Registry()
+    client = _Client()
+    client.release.set()
+    initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
+        registry,
+        server_version="0.6.0.dev0",
+    )
+    child = dataclasses.replace(
+        _conversation(),
+        root_conversation_id="conv_parent",
+        parent_conversation_id="conv_parent",
+        sub_agent_name="reviewer",
+    )
+
+    await initializer.initialize(child, client, timeout=10)  # type: ignore[arg-type]
+    promoted = dataclasses.replace(
+        child,
+        root_conversation_id=child.id,
+        parent_conversation_id=None,
+    )
+    await initializer.initialize(promoted, client, timeout=10)  # type: ignore[arg-type]
+
+    assert len(client.calls) == 2
+    assert client.calls[0]["session_init"]["snapshot"]["parent_session_id"] == "conv_parent"
+    assert client.calls[1]["session_init"]["snapshot"]["parent_session_id"] is None
 
 
 @pytest.mark.asyncio

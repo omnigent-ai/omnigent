@@ -128,6 +128,7 @@ async def _post_native_idle(
     child_body: dict[str, Any],
     seed_parent_inbox: bool,
     register_work: bool,
+    initialize_sub_agent_name: bool = False,
     output: str = "review complete: LGTM",
 ) -> tuple[int, list[dict[str, Any]]]:
     """POST a native ``external_session_status: idle`` and return (http, inbox items).
@@ -136,7 +137,8 @@ async def _post_native_idle(
     ``register_work`` seeds the in-memory work entry (the healthy case); leaving
     it ``False`` models a reconnect-wiped map or a ``sys_session_create`` child
     the dispatch never registered. ``seed_parent_inbox`` controls whether the
-    parent's inbox queue is present on this runner.
+    parent's inbox queue is present on this runner. ``initialize_sub_agent_name``
+    registers the retained sub-spec identity before the status arrives.
     """
     if seed_parent_inbox:
         runner_app._session_inboxes_ref[PARENT_SESSION_ID] = asyncio.Queue()
@@ -165,6 +167,16 @@ async def _post_native_idle(
     )
 
     async with _runner_client(app) as client:
+        if initialize_sub_agent_name:
+            initialized = await client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": CHILD_SESSION_ID,
+                    "agent_id": "ag_reviewer",
+                    "sub_agent_name": "reviewer",
+                },
+            )
+            assert initialized.status_code == 201, initialized.text
         resp = await client.post(
             f"/v1/sessions/{CHILD_SESSION_ID}/events",
             json={
@@ -345,6 +357,22 @@ async def test_top_level_session_idle_is_noop(
         child_body=_child_snapshot(sub_agent_name=None, parent_session_id=None),
         seed_parent_inbox=True,
         register_work=False,
+    )
+
+    assert http == 204
+    assert items == []
+
+
+@pytest.mark.asyncio
+async def test_promoted_session_retains_sub_agent_name_without_parent_delivery(
+    _clean_subagent_registry: None,
+) -> None:
+    """A promoted session keeps its sub-spec identity but behaves as top-level."""
+    http, items = await _post_native_idle(
+        child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=None),
+        seed_parent_inbox=True,
+        register_work=False,
+        initialize_sub_agent_name=True,
     )
 
     assert http == 204

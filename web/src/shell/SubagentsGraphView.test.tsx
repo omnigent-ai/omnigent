@@ -41,6 +41,10 @@ vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(),
 }));
 
+vi.mock("@/hooks/usePromoteSession", () => ({
+  usePromoteSession: () => ({ mutateAsync: vi.fn(), isPending: false }),
+}));
+
 vi.mock("@/components/icons/ClaudeIcon", () => ({
   ClaudeIcon: (props: Record<string, unknown>) => <svg {...props} data-icon="claude" />,
 }));
@@ -114,6 +118,7 @@ function renderPanel(opts: { conversationId?: string; rootSessionId?: string } =
       <SubagentsPanel
         conversationId={opts.conversationId ?? "conv_root"}
         rootSessionId={opts.rootSessionId ?? "conv_root"}
+        permissionLevel={4}
       />
     </MemoryRouter>,
   );

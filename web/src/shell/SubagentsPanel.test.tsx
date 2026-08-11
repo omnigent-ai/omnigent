@@ -1,6 +1,7 @@
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UsePromoteSessionModule from "@/hooks/usePromoteSession";
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   BookOpenIcon,
   Code2Icon,
@@ -15,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
+import { usePromoteSession } from "@/hooks/usePromoteSession";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
@@ -26,6 +28,11 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(),
+}));
+
+vi.mock("@/hooks/usePromoteSession", async (importOriginal) => ({
+  ...(await importOriginal<typeof UsePromoteSessionModule>()),
+  usePromoteSession: vi.fn(),
 }));
 
 // Stub the brand logos with plain SVGs so jsdom doesn't have to resolve
@@ -54,22 +61,31 @@ vi.mock("@/components/icons/OttoIcon", () => ({
 
 const useChildSessionsMock = vi.mocked(useChildSessions);
 const useSessionMock = vi.mocked(useSession);
+const usePromoteSessionMock = vi.mocked(usePromoteSession);
+const promoteMutateAsyncMock = vi.fn();
 
 interface RenderOptions {
   /** The conversation in main — used only for active-row highlighting. */
   conversationId?: string;
   /** The root id whose children populate the list. */
   rootSessionId?: string;
+  /** Effective root permission. */
+  permissionLevel?: number | null;
 }
 
 function renderPanel({
   conversationId = "conv_parent",
   rootSessionId = "conv_parent",
+  permissionLevel = 4,
   initialEntries,
 }: RenderOptions & { initialEntries?: string[] } = {}) {
   return render(
     <MemoryRouter initialEntries={initialEntries}>
-      <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+      <SubagentsPanel
+        conversationId={conversationId}
+        rootSessionId={rootSessionId}
+        permissionLevel={permissionLevel}
+      />
     </MemoryRouter>,
   );
 }
@@ -138,6 +154,13 @@ const ICON_CASES: [string | null, ReturnType<typeof iconForAgentType>][] = [
 beforeEach(() => {
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
+  usePromoteSessionMock.mockReset();
+  promoteMutateAsyncMock.mockReset();
+  promoteMutateAsyncMock.mockResolvedValue({ id: "conv_promoted" });
+  usePromoteSessionMock.mockReturnValue({
+    mutateAsync: promoteMutateAsyncMock,
+    isPending: false,
+  } as unknown as ReturnType<typeof usePromoteSession>);
   // Default: parent's status is idle. Tests override per-case.
   useSessionMock.mockReturnValue({
     session: {
@@ -164,6 +187,42 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("SubagentsPanel", () => {
+  it("lets an owner confirm promotion for a child row", async () => {
+    mockChildTree({
+      conv_root: [childInfo({ id: "conv_child", session_name: "reviewer" })],
+    });
+    renderPanel({ rootSessionId: "conv_root" });
+
+    fireEvent.pointerDown(screen.getByTestId("subagent-actions"), { button: 0 });
+    fireEvent.click(await screen.findByText("Promote to session"));
+
+    expect(screen.getByTestId("promote-agent-dialog")).toHaveTextContent("Promote reviewer?");
+    fireEvent.click(screen.getByRole("button", { name: "Promote" }));
+    await waitFor(() =>
+      expect(promoteMutateAsyncMock).toHaveBeenCalledWith({
+        sessionId: "conv_child",
+        previousParentId: "conv_root",
+      }),
+    );
+  });
+
+  it("hides promotion actions from non-owners", () => {
+    mockChildTree({ conv_root: [childInfo({ id: "conv_child" })] });
+
+    renderPanel({ rootSessionId: "conv_root", permissionLevel: 2 });
+
+    expect(screen.queryByTestId("subagent-actions")).toBeNull();
+  });
+
+  it("disables promotion while the child is active", async () => {
+    mockChildTree({ conv_root: [childInfo({ id: "conv_child", busy: true })] });
+    renderPanel({ rootSessionId: "conv_root" });
+
+    fireEvent.pointerDown(screen.getByTestId("subagent-actions"), { button: 0 });
+
+    expect(await screen.findByText("Promote to session")).toHaveAttribute("data-disabled");
+  });
+
   it("always renders a 'main' row linking to the root session", () => {
     // No children at all — the panel still shows the main link so
     // the user always has a path back to the parent.

@@ -1471,6 +1471,82 @@ def test_list_conversations_archive_toggle_round_trips(
 # ── Delete ───────────────────────────────────────────
 
 
+def test_promote_subtree_detaches_target_and_preserves_descendants(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Promotion rewrites only the promoted subtree's structural fields."""
+    root = conversation_store.create_conversation(title="A")
+    promoted = conversation_store.create_conversation(
+        kind="sub_agent",
+        title="B",
+        parent_conversation_id=root.id,
+    )
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        title="C",
+        parent_conversation_id=promoted.id,
+    )
+    grandchild = conversation_store.create_conversation(
+        kind="sub_agent",
+        title="D",
+        parent_conversation_id=child.id,
+    )
+    sibling = conversation_store.create_conversation(
+        kind="sub_agent",
+        title="sibling",
+        parent_conversation_id=root.id,
+    )
+    conversation_store.append(
+        promoted.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_promote",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "keep this history"}],
+                ),
+            )
+        ],
+    )
+
+    result = conversation_store.promote_subtree(promoted.id)
+
+    assert result.id == promoted.id
+    assert result.kind == "default"
+    assert result.parent_conversation_id is None
+    assert result.root_conversation_id == promoted.id
+    assert conversation_store.list_items(promoted.id).data[0].data == MessageData(
+        role="user",
+        content=[{"type": "input_text", "text": "keep this history"}],
+    )
+
+    fetched_child = conversation_store.get_conversation(child.id)
+    fetched_grandchild = conversation_store.get_conversation(grandchild.id)
+    fetched_sibling = conversation_store.get_conversation(sibling.id)
+    assert fetched_child is not None
+    assert fetched_child.parent_conversation_id == promoted.id
+    assert fetched_child.root_conversation_id == promoted.id
+    assert fetched_grandchild is not None
+    assert fetched_grandchild.parent_conversation_id == child.id
+    assert fetched_grandchild.root_conversation_id == promoted.id
+    assert fetched_sibling is not None
+    assert fetched_sibling.parent_conversation_id == root.id
+    assert fetched_sibling.root_conversation_id == root.id
+
+
+def test_promote_subtree_rejects_missing_and_top_level(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A retry or an unknown id cannot mutate an unrelated tree."""
+    root = conversation_store.create_conversation()
+
+    with pytest.raises(LookupError, match="conversation not found"):
+        conversation_store.promote_subtree("f" * 32)
+    with pytest.raises(ValueError, match="already top-level"):
+        conversation_store.promote_subtree(root.id)
+
+
 @pytest.mark.asyncio
 async def test_delete_conversation(
     conversation_store: SqlAlchemyConversationStore,

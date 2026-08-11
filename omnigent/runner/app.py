@@ -592,9 +592,9 @@ class _SessionSnapshot:
         sub-agent's name, e.g. ``"claude_code"`` — used to swap the
         parent spec to the child's sub-spec so the child's harness
         (e.g. ``claude-native``) is resolved instead of the parent's.
-        ``None`` for top-level sessions. Projected from the server
-        snapshot so the identity survives a runner reconnect / spec-cache
-        eviction (the in-memory ``_session_sub_agent_names`` map does not).
+        Promoted sessions retain this value so their original sub-spec and
+        harness still resolve. Projected from the server snapshot so the
+        identity survives a runner reconnect / spec-cache eviction.
     :param parent_session_id: For sub-agent sessions, the parent
         conversation's id, e.g. ``"conv_parent987"``. ``None`` for
         top-level sessions. Lets ``_ensure_subagent_work_entry`` rebuild a lost
@@ -2420,6 +2420,10 @@ def create_runner_app(
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
+        if snapshot.parent_session_id is None:
+            unregister_child_session(session_id)
+            unregister_subagent_work(session_id)
+            _drained_delivered_subagent_children.discard(session_id)
         if envelope.sub_agent_name:
             _session_sub_agent_names[session_id] = envelope.sub_agent_name
         _session_init_envelopes[session_id] = (time.monotonic(), envelope)
@@ -6279,9 +6283,12 @@ def create_runner_app(
                     output=output or "Error: native sub-agent turn failed",
                 )
             if delivery_ack is not None:
-                is_known = (
-                    conversation_id in _session_sub_agent_names or recovered_entry is not None
-                )
+                snapshot = _session_snapshot_cache.get(conversation_id)
+                is_known = recovered_entry is not None or delivery_ack.entry is not None
+                if snapshot is not None:
+                    is_known = is_known or snapshot.parent_session_id is not None
+                else:
+                    is_known = is_known or conversation_id in _session_sub_agent_names
                 not_confirmed = _subagent_delivery_not_confirmed_response(
                     delivery_ack,
                     is_runner_known_subagent=is_known,
