@@ -5116,6 +5116,14 @@ def create_runner_app(
         try:
             spec_entry = await _resolve_session_spec_entry(session_id)
         except OmnigentError:
+            # Resolution failed; this is not the same as a session that
+            # resolves to no spec. A relay already serving the session was
+            # built from a real spec, so replacing it with the fallback
+            # surface would withdraw spec-gated tools the agent does grant.
+            # Keep it: once resolution recovers, the resolved spec differs
+            # from the stored one and the relay rebuilds then.
+            if session_id in _session_comment_relays:
+                return
             spec_entry = None
 
         # The bridge dir, when the caller pinned it down or handed over the
@@ -5132,6 +5140,12 @@ def create_runner_app(
                 session_labels.get(BRIDGE_ID_LABEL_KEY) or session_id
             )
 
+        # Same agent and no bridge hint to check against: skip the lookup that
+        # would cost a server round trip. This rests on a bridge id only ever
+        # being reassigned alongside the agent (a native-harness-family
+        # switch), which the spec comparison already caught. The callers that
+        # can reassign it independently — the terminal-launch and per-harness
+        # startup paths — all pass a bridge hint and take the branch below.
         current = _session_comment_relays.get(session_id)
         if current is not None and current.spec_entry is spec_entry and known_bridge_dir is None:
             return
