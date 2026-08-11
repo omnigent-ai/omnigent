@@ -355,6 +355,16 @@ def test_inexact_rendered_selection_cannot_create_comment(
     editor_content = file_viewer.locator("[contenteditable='true']")
     expect(editor_content).to_be_visible(timeout=10_000)
 
+    add_comment_btn = page.get_by_role(
+        "button",
+        name=re.compile("Add comment", re.IGNORECASE),
+    )
+
+    plain_paragraph = editor_content.get_by_text(_SELECTABLE_TEXT, exact=True)
+    expect(plain_paragraph).to_be_visible()
+    plain_paragraph.select_text()
+    expect(add_comment_btn).to_be_visible()
+
     formatted_paragraph = editor_content.get_by_text(
         _FORMATTED_PARAGRAPH_TEXT,
         exact=True,
@@ -362,8 +372,4 @@ def test_inexact_rendered_selection_cannot_create_comment(
     expect(formatted_paragraph).to_be_visible()
     formatted_paragraph.select_text()
 
-    add_comment_btn = page.get_by_role(
-        "button",
-        name=re.compile("Add comment", re.IGNORECASE),
-    )
     expect(add_comment_btn).not_to_be_visible()
