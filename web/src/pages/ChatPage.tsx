@@ -164,7 +164,11 @@ import {
   type WorkspaceFile,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
-import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
+import {
+  formatModelDisplayName,
+  isCostRoutingSession,
+  isSubagentRoutingSession,
+} from "@/components/CostRoutingControl";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import {
   Dialog,
@@ -4199,10 +4203,12 @@ export function formatStatusModelLabel(
   if (!raw) return null;
   const lower = raw.toLowerCase();
   const codexOption = findNativeModelOption(codexModelOptions, raw);
-  if (codexOption) return codexOption.displayName ?? codexOption.id;
+  if (codexOption) {
+    return formatModelDisplayName(codexOption.displayName ?? codexOption.id);
+  }
   const known = CLAUDE_NATIVE_MODELS.find((m) => m.id === lower);
   if (known) return known.label;
-  return raw;
+  return formatModelDisplayName(raw);
 }
 
 function formatStatusEffortLabel(effort: string | null, raw = false): string | null {

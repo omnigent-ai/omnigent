@@ -87,6 +87,11 @@ export function isSubagentRoutingSession(
 // The tier-defining token of Claude model ids ("databricks-claude-haiku-4-5" → "haiku").
 const MODEL_FAMILY_HINTS = ["haiku", "sonnet", "opus"] as const;
 
+/** Convert router-style dashed GPT versions to the Codex/UI spelling. */
+export function formatModelDisplayName(model: string): string {
+  return model.replace(/(^|[-/])(gpt)-(\d+)-(\d+)(?=-|$)/gi, "$1$2-$3.$4");
+}
+
 /**
  * Friendly short name for a model id, for the routing decision chip and the
  * SmartRoutingCard plan rows.

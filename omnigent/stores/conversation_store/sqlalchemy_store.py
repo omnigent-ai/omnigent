@@ -3231,6 +3231,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
+        model_override: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
@@ -3297,6 +3298,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             title=title,
             labels=labels,
             reasoning_effort=reasoning_effort,
+            model_override=model_override,
             workspace=workspace,
             terminal_launch_args=terminal_launch_args,
             parent_conversation_id=parent_conversation_id,
@@ -3314,6 +3316,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
+        model_override: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
@@ -3347,7 +3350,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             parent_conversation_id=parent_conversation_id,
             root_conversation_id=root_conversation_id,
             agent_id=agent_id,
-            session_overrides=_encode_session_overrides({"reasoning_effort": reasoning_effort}),
+            session_overrides=_encode_session_overrides(
+                {
+                    "reasoning_effort": reasoning_effort,
+                    "model_override": model_override,
+                }
+            ),
         )
         with self._conv_session("create_session_with_agent") as ap_sess:
             ap_sess.add(conversation_row)
