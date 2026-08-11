@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "omnigent"
 # Keep in sync with omnigent/version.py's VERSION constant.
-version = "0.9.0.dev0"
+version = "0.10.0.dev0"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,8 +26,8 @@ dependencies = [
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the
     # release tag). Local/editable installs still resolve via tool.uv.sources.
-    "omnigent-client==0.9.0.dev0",
-    "omnigent-ui-sdk==0.9.0.dev0",
+    "omnigent-client==0.10.0.dev0",
+    "omnigent-ui-sdk==0.10.0.dev0",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
     # OpenClaw stores its wrapped acpx registry as JSON5.
@@ -250,7 +250,7 @@ nimble = ["nimble-python>=1.2.0,<2"]
 # (`omnigent-client`, `omnigent-ui-sdk`) and the sub-package's own
 # `[project].version` in `integrations/slack/pyproject.toml`.
 slack = [
-    "omnigent-slack==0.9.0.dev0",
+    "omnigent-slack==0.10.0.dev0",
 ]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
