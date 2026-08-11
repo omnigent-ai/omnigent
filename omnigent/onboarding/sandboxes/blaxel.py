@@ -14,6 +14,7 @@ from __future__ import annotations
 import codecs
 import contextlib
 import io
+import math
 import os
 import re
 import shlex
@@ -69,6 +70,10 @@ _STREAM_BUFFER_BYTES = _MAX_PROCESS_OUTPUT_BYTES
 _UTF8_COUNT_CHARS = 16 * 1024
 _STREAM_CLOSE_TIMEOUT_S = 1.0
 _DEFAULT_TTL = "24h"
+_TOKEN_TTL_SLACK_S = 3600
+_TTL_UNIT_SECONDS = {"w": 604800, "d": 86400, "h": 3600, "m": 60, "s": 1}
+_TTL_DURATION_RE = re.compile(r"(?:\d+(?:\.\d+)?[wdhms])+")
+_TTL_TERM_RE = re.compile(r"(\d+(?:\.\d+)?)([wdhms])")
 _TERMINAL_PROCESS_STATUSES = frozenset({"completed", "failed", "killed", "stopped"})
 _RUNNING_SANDBOX_STATUSES = frozenset({"deployed"})
 _STOPPED_SANDBOX_STATUSES = frozenset(
@@ -77,6 +82,43 @@ _STOPPED_SANDBOX_STATUSES = frozenset(
 _CONTROL_CREDENTIAL_ENV_VARS = frozenset({"BL_API_KEY", "BL_CLIENT_CREDENTIALS"})
 _CREATE_ATTEMPT_LABEL = "omnigent-create-attempt"
 _ENV_ASSIGNMENT_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=")
+
+
+def parse_ttl_seconds(ttl: str | None = None) -> int:
+    """
+    Resolve a Blaxel sandbox max-age duration to whole seconds.
+
+    Blaxel's ``ttl`` is an age from creation, not an idle timeout: the
+    sandbox is deleted this long after creation regardless of activity.
+
+    :param ttl: A Blaxel duration in units ``w``, ``d``, ``h``, ``m``, or
+        ``s``, alone or combined (``30m``, ``24h``, ``7d``, ``1h30m``).
+        ``None`` resolves the provider default (``24h``).
+    :returns: The sandbox lifetime in seconds.
+    :raises ValueError: When the duration is malformed or non-positive.
+    """
+    text = _DEFAULT_TTL if ttl is None else ttl.strip().lower()
+    if not _TTL_DURATION_RE.fullmatch(text):
+        raise ValueError(f"expected a duration like '30m', '24h', '7d', or '2w'; got {ttl!r}")
+    seconds = math.ceil(
+        sum(float(value) * _TTL_UNIT_SECONDS[unit] for value, unit in _TTL_TERM_RE.findall(text))
+    )
+    if seconds <= 0:
+        raise ValueError(f"expected a positive duration; got {ttl!r}")
+    return seconds
+
+
+def managed_token_ttl_s(ttl: str | None = None) -> int:
+    """
+    Launch-token TTL for the managed path, derived from (and always above)
+    the sandbox max age so the token outlives the sandbox Blaxel reaps
+    across tunnel reconnects.
+
+    :param ttl: The configured ``sandbox.blaxel.ttl``, or ``None`` for the
+        provider default.
+    :returns: The token lifetime in seconds.
+    """
+    return parse_ttl_seconds(ttl) + _TOKEN_TTL_SLACK_S
 
 
 def _ensure_sdk() -> None:
@@ -985,9 +1027,10 @@ class BlaxelSandboxLauncher(ExecModelHostLauncher):
             log_stream,
             timeout_s=_COMMAND_TIMEOUT_S,
         )
-        # The streaming protocol is progress/cap enforcement. It cannot
-        # reliably separate writes containing embedded newlines, so use the one
-        # final process state as the authoritative stdout/stderr split.
+        # The stream is the primary cap: its parser kills the process on
+        # overflow. The final state is re-read only for the authoritative
+        # stdout/stderr split, which the stream cannot recover for writes with
+        # embedded newlines; the size check below is a backstop.
         stdout = str(getattr(current, "stdout", "") or "")
         stderr = str(getattr(current, "stderr", "") or "")
         output_bytes = _bounded_utf8_size(

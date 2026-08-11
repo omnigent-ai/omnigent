@@ -105,6 +105,8 @@ Omnigent uses `blaxel/omnigent-host:latest` by default. This public Blaxel Hub i
 
 The host uses Blaxel keep-alive mode until the TTL or managed teardown. Process output through the provider API is limited to 4 MiB per command. Omnigent stops commands that cross this limit.
 
+`ttl` is the single knob that sizes a managed session. It is an age from creation, not an idle timeout, so Blaxel deletes the sandbox at that age even while the session is active. The server mints each launch token for that age plus one hour, so the token never outlives the sandbox by more than the reconnect margin. A managed session that must run longer than 24 hours needs a larger `ttl`, for example `7d`. Durations accept `w`, `d`, `h`, `m`, and `s`, alone or combined as `1h30m`.
+
 The Blaxel SDK can send SDK error events to its vendor Sentry endpoint when tracking is enabled in Blaxel configuration. Tracking is off by default. Set `DO_NOT_TRACK=1` on the Omnigent server to disable Blaxel SDK telemetry.
 
 ## Run the live smoke test

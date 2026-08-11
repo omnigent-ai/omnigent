@@ -22,6 +22,8 @@ from omnigent.onboarding.sandboxes.blaxel import (
     _bounded_utf8_size,
     _LineSink,
     _OutputLimitExceeded,
+    managed_token_ttl_s,
+    parse_ttl_seconds,
 )
 from tests.e2e.integrations.deploy.blaxel.blaxel_smoke_test import _production_workspace_name
 
@@ -427,6 +429,43 @@ def test_provision_applies_public_image_and_bounded_default_ttl(
 
     assert state.created[0]["image"] == DEFAULT_BLAXEL_HOST_IMAGE
     assert state.created[0]["ttl"] == "24h"
+    assert parse_ttl_seconds(state.created[0]["ttl"]) == 24 * 3600
+
+
+@pytest.mark.parametrize(
+    ("ttl", "expected"),
+    [
+        (None, 24 * 3600),
+        ("30m", 1800),
+        ("24h", 24 * 3600),
+        ("7d", 7 * 24 * 3600),
+        ("2w", 14 * 24 * 3600),
+        ("1h30m", 5400),
+        (" 12H ", 12 * 3600),
+        ("1.5h", 5400),
+        ("90s", 90),
+    ],
+)
+def test_parse_ttl_seconds_reads_blaxel_durations(ttl: str | None, expected: int) -> None:
+    """Every unit the Blaxel runtime documents for ``ttl`` (w, d, h, m, s)."""
+    assert parse_ttl_seconds(ttl) == expected
+
+
+@pytest.mark.parametrize("ttl", ["", "forever", "24", "h", "24hh", "1y", "-1h", "0h"])
+def test_parse_ttl_seconds_rejects_unusable_durations(ttl: str) -> None:
+    with pytest.raises(ValueError):
+        parse_ttl_seconds(ttl)
+
+
+def test_managed_token_ttl_outlives_the_sandbox_it_authenticates() -> None:
+    """
+    Blaxel reaps a sandbox at its max age, so the launch token is minted for
+    that age plus a reconnect margin, never the reverse, which would drop a
+    live managed session's host mid-session.
+    """
+    for ttl in (None, "30m", "24h", "7d"):
+        assert managed_token_ttl_s(ttl) == parse_ttl_seconds(ttl) + 3600
+    assert managed_token_ttl_s("7d") > managed_token_ttl_s()
 
 
 def test_provision_cleans_name_after_ambiguous_create_timeout(

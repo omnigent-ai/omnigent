@@ -9,4 +9,7 @@ sandbox:
       - OPENAI_API_KEY
     # region: us-was-1
     # memory_mb: 4096
-    # ttl: 24h  # default maximum age; set another bounded value if needed
+    # Maximum sandbox age, and the bound the launch-token lifetime is
+    # derived from (ttl + 1h). Raise it for managed sessions that must
+    # outlive the 24h default, e.g. 7d.
+    # ttl: 24h

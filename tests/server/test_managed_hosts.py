@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import re
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,11 +18,11 @@ from httpx import ASGITransport, AsyncClient
 from omnigent.db.utils import builtin_agent_id, generate_agent_id, now_epoch
 from omnigent.entities.agent import Agent
 from omnigent.onboarding.sandboxes.base import render_host_config_write_command
+from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s as blaxel_managed_token_ttl_s
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
-    BLAXEL_MANAGED_TOKEN_TTL_S,
     BOXLITE_MANAGED_TOKEN_TTL_S,
     DAYTONA_MANAGED_TOKEN_TTL_S,
     ISLO_MANAGED_TOKEN_TTL_S,
@@ -276,7 +277,7 @@ def test_parse_valid_blaxel_config_builds_parameterized_factory(
 
     assert cfg is not None
     assert cfg.server_url == "https://srv.example.com"
-    assert cfg.token_ttl_s == BLAXEL_MANAGED_TOKEN_TTL_S
+    assert cfg.token_ttl_s == blaxel_managed_token_ttl_s("24h")
     assert cfg.managed_launch_supported is True
     fake = FakeSandboxLauncher()
     install_fake_blaxel_launcher(monkeypatch, fake)
@@ -302,6 +303,37 @@ def test_parse_blaxel_without_section_uses_launcher_fallbacks(
     assert fake.region is None
     assert fake.memory_mb is None
     assert fake.ttl is None
+    assert cfg.token_ttl_s == blaxel_managed_token_ttl_s()
+
+
+def test_parse_blaxel_token_ttl_tracks_configured_sandbox_ttl() -> None:
+    """
+    A managed session sized past the 24h default raises the sandbox age and
+    the launch-token lifetime together, so the token never expires while
+    Blaxel still keeps the host alive.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "blaxel",
+            "server_url": "https://s.example",
+            "blaxel": {"ttl": "7d"},
+        }
+    )
+
+    assert cfg is not None
+    assert cfg.token_ttl_s == 7 * 24 * 3600 + 3600
+    assert cfg.token_ttl_s > blaxel_managed_token_ttl_s()
+
+
+def test_parse_blaxel_rejects_malformed_sandbox_ttl() -> None:
+    with pytest.raises(ValueError, match=re.escape("sandbox.blaxel.ttl")):
+        parse_sandbox_config(
+            {
+                "provider": "blaxel",
+                "server_url": "https://s.example",
+                "blaxel": {"ttl": "forever"},
+            }
+        )
 
 
 def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(

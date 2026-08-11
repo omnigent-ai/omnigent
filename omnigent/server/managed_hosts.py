@@ -218,9 +218,11 @@ MODAL_MANAGED_TOKEN_TTL_S = 25 * 3600
 # a fresh token.
 DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
-# Blaxel sandboxes stay active while the host keep-alive process runs. Use the
-# same bounded launch-token lifetime as other long-lived managed providers.
-BLAXEL_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+# The blaxel launch-token TTL is NOT a constant: Blaxel reaps a sandbox at its
+# configured max age (sandbox.blaxel.ttl, 24h by default), so the TTL is derived
+# from that age at parse time via blaxel.managed_token_ttl_s(). It always sits
+# above the age, so a live sandbox can re-authenticate its tunnel across
+# reconnects while a token leaked from a reaped sandbox cannot.
 
 # Launch-token lifetime for the YAML boxlite path. Boxlite boxes have no
 # platform lifetime cap and persist across restarts, so the bound is policy,
@@ -873,6 +875,8 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         )
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
     elif provider == "blaxel":
+        from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s
+
         section = _parse_provider_section(raw, "blaxel")
         if section is not None:
             _reject_unknown_keys(
@@ -880,14 +884,20 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
                 {"image", "env", "region", "memory_mb", "ttl"},
                 "sandbox.blaxel",
             )
+        blaxel_ttl = _parse_provider_string(raw, "blaxel", "ttl")
         launcher_factory = _blaxel_launcher_factory(
             image=_parse_blaxel_image(raw),
             env=_parse_provider_env(raw, "blaxel"),
             region=_parse_provider_string(raw, "blaxel", "region"),
             memory_mb=_parse_provider_positive_int(raw, "blaxel", "memory_mb"),
-            ttl=_parse_provider_string(raw, "blaxel", "ttl"),
+            ttl=blaxel_ttl,
         )
-        token_ttl_s = BLAXEL_MANAGED_TOKEN_TTL_S
+        # Derived from sandbox.blaxel.ttl so the token always outlives the
+        # sandbox age at which Blaxel reaps the host.
+        try:
+            token_ttl_s = managed_token_ttl_s(blaxel_ttl)
+        except ValueError as exc:
+            raise ValueError(f"server config 'sandbox.blaxel.ttl' is invalid: {exc}") from exc
     elif provider == "boxlite":
         section = _boxlite_section(raw)
         _reject_unknown_keys(
