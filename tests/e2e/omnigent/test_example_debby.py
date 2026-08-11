@@ -67,8 +67,18 @@ def test_debby_heads_are_unpinned(debby_spec: AgentSpec) -> None:
 
 
 def test_debby_debate_skill_present(debby_spec: AgentSpec) -> None:
-    """The ``debate`` skill is discovered from skills/debate/SKILL.md."""
-    assert sorted(s.name for s in debby_spec.skills) == ["debate"]
+    """The ``debate`` and ``grill-with-docs`` skills are discovered from
+    skills/<name>/SKILL.md.
+
+    ``grill-with-docs``'s SKILL.md deliberately omits ``user-invocable:
+    false`` — see the long comment on ``test_spine_skills_present`` in
+    test_example_polly.py for why that field would invert upstream's
+    user-invoked-only intent rather than preserve it.
+    """
+    assert sorted(s.name for s in debby_spec.skills) == [
+        "debate",
+        "grill-with-docs",
+    ]
 
 
 def test_debby_has_os_env(debby_spec: AgentSpec) -> None:

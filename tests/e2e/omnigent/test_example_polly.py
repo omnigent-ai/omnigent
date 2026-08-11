@@ -137,10 +137,33 @@ def test_pi_subagent_is_headless_scaffold_worker(polly_spec: AgentSpec) -> None:
 
 
 def test_spine_skills_present(polly_spec: AgentSpec) -> None:
-    """All spine skills are discovered from skills/<name>/SKILL.md."""
+    """All spine skills are discovered from skills/<name>/SKILL.md.
+
+    ``cross-review``, ``fanout``, and ``investigate`` are the SPINE
+    skills — this test's purpose is to fail if any of them is dropped or
+    renamed (or duplicated: an exact sorted-list compare, not a set
+    compare, so a skill discovered twice still fails). ``grill-with-docs``
+    is an ADDITIONAL bundled skill (a verbatim-inlined port of an upstream
+    user-invoked skill, see its SKILL.md), not a fourth spine skill — it's
+    listed here because it's part of the exact expected set, not because
+    it's spine.
+
+    Its upstream frontmatter marks it user-invoked-only via
+    ``disable-model-invocation: true`` ("the model may not auto-invoke
+    this"). Omnigent's SkillSpec has no equivalent field: the closest
+    named ``user-invocable`` in SKILL.md frontmatter means the INVERSE
+    ("the user may not invoke this via the / menu; internal/model-only" —
+    see ``user_invocable`` in omnigent/spec/types.py and its use in
+    omnigent/spec/skill_sources.py). Setting ``user-invocable: false`` on
+    this skill would hide it from the user's slash menu while doing
+    nothing to stop model auto-invocation — the opposite of upstream's
+    intent. So the field is deliberately omitted from this port's
+    SKILL.md; do not "fix" that by adding it.
+    """
     assert sorted(s.name for s in polly_spec.skills) == [
         "cross-review",
         "fanout",
+        "grill-with-docs",
         "investigate",
     ]
 
