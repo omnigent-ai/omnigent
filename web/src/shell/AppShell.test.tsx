@@ -358,6 +358,19 @@ function renderShell(path: string, info?: ServerInfo) {
                   </>
                 }
               />
+              {/* The settings page itself renders inside the sidebar (its nav
+              replaces the session list), so the body here is irrelevant — what
+              matters is that the route is /settings, which is what AppShell
+              keys the sidebar pin off. */}
+              <Route
+                path="settings"
+                element={
+                  <>
+                    <div>settings</div>
+                    <LocationDisplay />
+                  </>
+                }
+              />
             </Route>
           </Routes>
         </MemoryRouter>
@@ -1172,6 +1185,47 @@ describe("Workspace rail maximize", () => {
     fireEvent.click(screen.getByRole("button", { name: "Exit full screen" }));
     expect(rail().className).toContain("md:shrink-0");
     expect(rail().className).not.toContain("md:absolute");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("pins the sidebar open on /settings so the Back row is reachable", () => {
+    // The settings nav replaces the session list INSIDE the sidebar, and its
+    // Back row is the only way off the page. Collapsed, that row is clipped and
+    // inert — the user is stranded with no visible exit. Entering /settings must
+    // therefore force the sidebar open.
+    mockConversations([]);
+    renderShell("/settings");
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("refuses to collapse the sidebar while on /settings", () => {
+    // The hotkey (⌘⌥[) and command palette reach the toggle without going
+    // through the title-bar button, so the guard has to live in the handler, not
+    // just in what's rendered. Opening stays allowed; only collapsing is
+    // refused, because collapsing is what removes the exit.
+    mockConversations([]);
+    renderShell("/settings");
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.keyDown(document, { key: "[", metaKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("does not restore a collapsed sidebar when /settings pins it open", () => {
+    // Deliberately one-way: the pin is NOT reversed on exit. Restoring a prior
+    // collapsed state would yank the sidebar away from someone who had just been
+    // using it, so a visible exit wins over a preserved preference. Asserted as
+    // "no stashed state to restore": once pinned, the ONLY way back to collapsed
+    // is the user's own toggle, which the /settings guard refuses — so the
+    // sidebar cannot silently re-collapse while the page is open.
+    mockConversations([]);
+    renderShell("/settings");
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    // Repeated toggles all resolve to open while on the page.
+    fireEvent.keyDown(document, { key: "[", metaKey: true, altKey: true });
+    fireEvent.keyDown(document, { key: "[", metaKey: true, altKey: true });
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
   });
 

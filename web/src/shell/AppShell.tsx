@@ -81,6 +81,7 @@ import type { ChangedSort } from "./FlatFileList";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
+import { useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
 import {
@@ -168,6 +169,25 @@ export function AppShell() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
   const [sidebarPeek, setSidebarPeek] = useState(false);
+
+  // The settings nav lives INSIDE the sidebar, and its "Back" row is the only
+  // way off the settings page. A collapsed sidebar therefore strands the user
+  // there — the row is still in the DOM but clipped and inert. So entering
+  // /settings pins the sidebar open (and drops any peek, which is a transient
+  // hover card, not somewhere to read a settings page from).
+  //
+  // Deliberately one-way: leaving /settings does NOT restore a prior collapsed
+  // state. Reversing the pin on exit would collapse the sidebar out from under
+  // someone who had just been using it, and the alternative — stashing the
+  // pre-settings state — resurrects a preference the user last expressed before
+  // a detour they may not associate with it. Visible exit beats preserved
+  // preference; the toggle is one click away on the way out.
+  const { inSettings } = useSettingsRoute();
+  useEffect(() => {
+    if (!inSettings) return;
+    setSidebarOpen(true);
+    setSidebarPeek(false);
+  }, [inSettings]);
 
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
   // tracks the live sidebar width (including a drag) rather than a guess.
@@ -935,6 +955,15 @@ export function AppShell() {
   // cleared so we never leave `sidebarOpen` and `sidebarPeek` both true (a
   // floating-card layout the rest of the shell treats as a pushing panel).
   const toggleLeftSidebar = () => {
+    // On /settings the sidebar holds the only exit (the Back row), so collapsing
+    // it — by hotkey or command palette, the paths that bypass the hidden
+    // title-bar toggle — would strand the user on the page. Opening is still
+    // fine; only the collapse direction is refused.
+    if (inSettings) {
+      setSidebarOpen(true);
+      setSidebarPeek(false);
+      return;
+    }
     setSidebarOpen(!(sidebarOpen || sidebarPeek));
     setSidebarPeek(false);
   };
@@ -1395,7 +1424,14 @@ export function AppShell() {
           inset-2 would drag them off the lights' centre line. The sidebar's own
           copy is hidden on mac by CSS; this one is positioned by
           .electron-sidebar-header-actions in index.css. */}
-            {isMacElectronShell() && (
+            {/* Hidden on /settings: the settings nav replaces the session list
+          INSIDE the sidebar, and its "Back" row is the only way out. Leaving a
+          collapse toggle up here would let the user hide the one exit and strand
+          themselves on the settings page (the row exists but is clipped and
+          inert). So on /settings the sidebar is pinned open — see
+          forceSidebarOpenInSettings — and these controls step aside rather than
+          offer an action that would break the page. */}
+            {isMacElectronShell() && !inSettings && (
               <div className="electron-sidebar-header-actions">
                 <SidebarHeaderActions
                   expanded={sidebarOpen || sidebarPeek}
