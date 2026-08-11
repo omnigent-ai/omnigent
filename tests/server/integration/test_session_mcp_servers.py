@@ -70,7 +70,7 @@ async def test_mcp_server_mutations_reset_bound_runner_agent_cache(
     ) -> None:
         calls.append((session_id, agent_id, runner_router))
 
-    monkeypatch.setattr(mcp_routes, "_reset_runner_session_agent_cache", _fake_reset)
+    monkeypatch.setattr(mcp_routes, "reset_runner_session_agent_cache", _fake_reset)
     session = await create_test_session(client, name="mcp-reset-agent")
     session_id = session["id"]
 

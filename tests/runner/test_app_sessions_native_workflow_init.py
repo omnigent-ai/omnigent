@@ -1196,6 +1196,103 @@ async def test_runner_session_tool_schemas_use_resolved_bundle_workdir(tmp_path:
     )
 
 
+@pytest.mark.asyncio
+async def test_agent_cache_reset_refreshes_session_spec_and_tool_schemas(tmp_path: Path) -> None:
+    """The reset refreshes spec/tools, not persistent claude-sdk instructions (#3558)."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bundle_dirs = [tmp_path / "v1", tmp_path / "v2"]
+    specs: list[AgentSpec] = []
+    for version, bundle_dir in enumerate(bundle_dirs, start=1):
+        tool_dir = bundle_dir / "tools" / "python"
+        tool_dir.mkdir(parents=True)
+        tool_name = f"tool_v{version}"
+        (tool_dir / f"{tool_name}.py").write_text(
+            "from omnigent_client.tools import tool\n\n"
+            "@tool\n"
+            f"def {tool_name}(text: str) -> str:\n"
+            "    return text\n"
+        )
+        specs.append(
+            AgentSpec(
+                spec_version=1,
+                name="published-agent",
+                description=f"v{version}",
+                local_tools=[
+                    LocalToolInfo(
+                        name=tool_name,
+                        path=f"tools/python/{tool_name}.py",
+                        language="python",
+                    )
+                ],
+            )
+        )
+
+    current = 0
+    resolver_calls = 0
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        nonlocal resolver_calls
+        del agent_id, session_id
+        resolver_calls += 1
+        return ResolvedSpec(spec=specs[current], workdir=bundle_dirs[current])
+
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.completed", "response": {"id": "resp_done"}})]
+    )
+    process_manager = _FakeProcessManager(harness_client)
+    app = create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        runner_workspace=workspace,
+    )
+    session_id = "c7f36aa769270cac30144784fad50acc"
+    event = {
+        "type": "message",
+        "role": "user",
+        "agent_id": "31ebfedf721b44dabd76f662cb70a400",
+        "model": "published-agent",
+        "content": [{"type": "input_text", "text": "hi"}],
+        "harness": "openai-agents",
+    }
+
+    async with _runner_client(app) as client:
+        first = await client.post(f"/v1/sessions/{session_id}/events", json=event)
+        assert first.status_code == 202
+        for _ in range(20):
+            if len(harness_client.posted_bodies) == 1:
+                break
+            await asyncio.sleep(0.05)
+
+        current = 1
+        reset = await client.post(
+            f"/v1/sessions/{session_id}/agent-cache/reset",
+            json={"agent_id": event["agent_id"]},
+        )
+        assert reset.status_code == 200
+
+        second = await client.post(f"/v1/sessions/{session_id}/events", json=event)
+        assert second.status_code == 202
+        for _ in range(20):
+            if len(harness_client.posted_bodies) == 2:
+                break
+            await asyncio.sleep(0.05)
+
+    assert resolver_calls == 2
+    assert process_manager.released == []
+    tool_names = [
+        {
+            schema.get("function", {}).get("name")
+            for schema in body.get("tools", [])
+            if isinstance(schema, dict)
+        }
+        for body in harness_client.posted_bodies
+    ]
+    assert "tool_v1" in tool_names[0] and "tool_v2" not in tool_names[0]
+    assert "tool_v2" in tool_names[1] and "tool_v1" not in tool_names[1]
+
+
 def test_resolved_workdir_for_spec_prefers_bundle_workdir(tmp_path: Path) -> None:
     """``_resolved_workdir_for_spec`` uses ``ResolvedSpec.workdir`` over fallback.
 

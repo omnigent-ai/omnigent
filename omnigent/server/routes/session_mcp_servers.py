@@ -122,7 +122,7 @@ def create_session_mcp_servers_router(
             mode="create",
             target_name=None,
         )
-        await _reset_runner_session_agent_cache(session_id, agent.id, runner_router)
+        await reset_runner_session_agent_cache(session_id, agent.id, runner_router)
         _publish_agent_changed(session_id, agent)
         return _summary_from_spec(spec, body.name)
 
@@ -142,7 +142,7 @@ def create_session_mcp_servers_router(
             mode="update",
             target_name=server_name,
         )
-        await _reset_runner_session_agent_cache(session_id, agent.id, runner_router)
+        await reset_runner_session_agent_cache(session_id, agent.id, runner_router)
         _publish_agent_changed(session_id, agent)
         return _summary_from_spec(spec, body.name)
 
@@ -164,7 +164,7 @@ def create_session_mcp_servers_router(
             mode="delete",
             target_name=server_name,
         )
-        await _reset_runner_session_agent_cache(session_id, agent.id, runner_router)
+        await reset_runner_session_agent_cache(session_id, agent.id, runner_router)
         _publish_agent_changed(session_id, agent)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -264,7 +264,7 @@ def create_session_mcp_servers_router(
     return router
 
 
-async def _reset_runner_session_agent_cache(
+async def reset_runner_session_agent_cache(
     session_id: str,
     agent_id: str,
     runner_router: RunnerRouter | None,
@@ -288,7 +288,7 @@ async def _reset_runner_session_agent_cache(
         resp.raise_for_status()
     except (ConnectionError, RuntimeError, httpx.HTTPError):
         _logger.warning(
-            "runner agent-cache reset failed after MCP edit for session=%s agent=%s",
+            "runner agent-cache reset failed after agent update for session=%s agent=%s",
             session_id,
             agent_id,
             exc_info=True,
