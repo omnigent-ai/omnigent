@@ -63,7 +63,6 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
-from omnigent.model_override import validate_model_override
 from omnigent.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
@@ -106,7 +105,7 @@ from omnigent.server.managed_hosts import (
     ManagedHostLaunch,
     ManagedLaunch,
     ManagedLaunchTracker,
-    ManagedSandboxDeployment,
+    ManagedSandboxConfig,
     RepoWorkspace,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -4596,8 +4595,6 @@ async def _get_runner_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient | N
 async def _get_runner_client_impl(
     session_id: str,
     runner_router: RunnerRouter | None,
-    *,
-    conversation: Conversation | None = None,
 ) -> httpx.AsyncClient | None:
     """
     Get an HTTP client for the runner bound to a session.
@@ -4609,7 +4606,6 @@ async def _get_runner_client_impl(
         e.g. ``"conv_abc123"``.
     :param runner_router: The ``RunnerRouter`` instance, or
         ``None`` for in-process setups.
-    :param conversation: An already-loaded conversation to reuse for routing.
     :returns: An ``httpx.AsyncClient`` pointed at the runner,
         or ``None`` if no runner is available.
     """
@@ -4617,13 +4613,9 @@ async def _get_runner_client_impl(
 
     if runner_router is not None:
         try:
-            if conversation is None:
-                routed = runner_router.client_for_session_resources(session_id)
-            else:
-                routed = runner_router.client_for_session_resources(
-                    session_id,
-                    conversation=conversation,
-                )
+            routed = runner_router.client_for_session_resources(
+                session_id,
+            )
             return routed.client
         except (LookupError, httpx.HTTPError, OmnigentError):
             _logger.debug(
@@ -4977,12 +4969,11 @@ async def _provision_managed_sandbox(
     *,
     session_id: str,
     owner: str,
-    sandbox_config: ManagedSandboxDeployment,
+    sandbox_config: ManagedSandboxConfig,
     repo: RepoWorkspace | None,
     tracker: ManagedLaunchTracker,
     host_store: HostStore,
     relaunch_host: Host | None,
-    provider: str | None = None,
     agent_name: str | None = None,
 ) -> ManagedHostLaunch | None:
     """
@@ -5001,9 +4992,6 @@ async def _provision_managed_sandbox(
     :param host_store: Persistent host registrations.
     :param relaunch_host: Existing host row for a relaunch, or
         ``None`` for a first launch.
-    :param provider: Requested sandbox provider for a first launch, or
-        ``None`` for the default. Ignored on a relaunch, which stays on
-        the host row's recorded provider.
     :param agent_name: Server-resolved built-in agent name the session
         runs, stamped as the runner Pod's ``omnigent.ai/agent`` classifier
         (Kubernetes only), or ``None`` to leave it unstamped.
@@ -5039,7 +5027,6 @@ async def _provision_managed_sandbox(
             owner=owner,
             host_store=host_store,
             repo=repo,
-            provider=provider,
             agent_name=agent_name,
             on_stage=_on_stage,
         )
@@ -5142,28 +5129,19 @@ async def _get_runner_client_for_resource_access(
 
 async def _get_runner_client_for_resource_access_impl(
     session_id: str,
-    *,
-    conversation: Conversation | None = None,
 ) -> httpx.AsyncClient | None:
     """Return the authoritative runner client for session resources.
 
     Requires the session to be bound to a runner via
     ``PATCH /v1/sessions/{id}``; raises ``conflict`` otherwise. If no
     runner router is configured (unit-test/in-process setups), callers
-    may fall back to local registries. ``conversation`` reuses the row
-    already loaded during authorization.
+    may fall back to local registries.
     """
     from omnigent.runtime import get_runner_client, get_runner_router
 
     runner_router = get_runner_router()
     if runner_router is not None:
-        if conversation is None:
-            routed_runner = runner_router.client_for_session_resources(session_id)
-        else:
-            routed_runner = runner_router.client_for_session_resources(
-                session_id,
-                conversation=conversation,
-            )
+        routed_runner = runner_router.client_for_session_resources(session_id)
         return routed_runner.client
     return cast("httpx.AsyncClient | None", get_runner_client())
 
@@ -5680,11 +5658,10 @@ async def _forward_session_change_to_runner(
 
 
 #: Forward budget for a control event the runner answers by driving the TUI.
-#: The claude-native slash-command injector's worst case is ~16s (1s tmux
-#: advertisement + 5s commit-poll + 10s submit-verify; the 4s dialog watch
-#: only runs after a fast verify), so the default 5s budget could time out on
-#: a legitimately-still-working injection and report a failure that did not
-#: happen.
+#: The claude-native ``/model`` and ``/effort`` injectors wait up to 1s for the
+#: tmux advertisement and then up to 4s for the confirmation dialog, so the
+#: default 5s budget could time out on a legitimately-still-working injection
+#: and report a failure that did not happen.
 _TUI_INJECT_FORWARD_TIMEOUT_S = 20.0
 
 
@@ -8022,20 +7999,10 @@ def _parse_session_create_metadata(metadata: str) -> SessionCreateMetadata:
             "session metadata",
             EFFORT_VALUES,
         )
-        model_override = (
-            validate_model_override(parsed.model_override)
-            if parsed.model_override is not None
-            else None
-        )
         # Bounds-check the native-terminal args; raises ValueError
         # (wrapped below) on a malformed or oversized list.
         _validate_terminal_launch_args(parsed.terminal_launch_args)
-        return parsed.model_copy(
-            update={
-                "reasoning_effort": reasoning_effort,
-                "model_override": model_override,
-            }
-        )
+        return parsed.model_copy(update={"reasoning_effort": reasoning_effort})
     except (ValidationError, ValueError) as exc:
         raise OmnigentError(
             f"invalid session metadata: {exc}",
@@ -8769,7 +8736,6 @@ def _persist_stored_session_bundle(
             title=metadata.title,
             labels=metadata.labels,
             reasoning_effort=metadata.reasoning_effort,
-            model_override=metadata.model_override,
             workspace=metadata.workspace,
             terminal_launch_args=metadata.terminal_launch_args,
             parent_conversation_id=metadata.parent_session_id,
@@ -9160,7 +9126,6 @@ def _child_session_summary_from_conversation(
         # two fields contradict each other. The decision is joined through a
         # conversation label rather than a new column.
         routed_model=conv.model_override if routing_decision_id is not None else None,
-        model_override=conv.model_override,
         reasoning_effort=conv.reasoning_effort,
         routing_decision_id=routing_decision_id,
     )
