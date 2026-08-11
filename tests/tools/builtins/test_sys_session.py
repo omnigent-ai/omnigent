@@ -423,6 +423,73 @@ def test_peek_can_request_more_than_activity_preview_limit(session_fixture: _Fix
     assert payload["items"][0]["content"] == long_review
 
 
+def test_peek_default_content_limit_matches_activity_preview(
+    session_fixture: _Fixture,
+) -> None:
+    """Omitting the content limit keeps the exact activity preview behavior."""
+    long_review = "R" * 3000
+    session_fixture.conv_store.append(
+        session_fixture.child_conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_default_review",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": long_review}],
+                    agent="researcher",
+                ),
+            )
+        ],
+    )
+
+    raw = SysSessionGetHistoryTool().invoke(
+        json.dumps(
+            {
+                "conversation_id": session_fixture.child_conv_id,
+                "tail_items": 1,
+            }
+        ),
+        session_fixture.ctx,
+    )
+
+    content = json.loads(raw)["items"][0]["content"]
+    assert content == long_review[:2000] + " [truncated]"
+
+
+def test_peek_clamps_content_limit_above_maximum(session_fixture: _Fixture) -> None:
+    """Provider input above the advertised ceiling is clamped by the handler."""
+    long_review = "R" * 13000
+    session_fixture.conv_store.append(
+        session_fixture.child_conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_clamped_review",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": long_review}],
+                    agent="researcher",
+                ),
+            )
+        ],
+    )
+
+    raw = SysSessionGetHistoryTool().invoke(
+        json.dumps(
+            {
+                "conversation_id": session_fixture.child_conv_id,
+                "tail_items": 1,
+                "content_max_chars": 50000,
+            }
+        ),
+        session_fixture.ctx,
+    )
+
+    content = json.loads(raw)["items"][0]["content"]
+    assert content == long_review[:12000] + " [truncated]"
+
+
 def test_peek_rejects_non_positive_content_limit(session_fixture: _Fixture) -> None:
     """Handler validation rejects a limit that providers let through."""
     raw = SysSessionGetHistoryTool().invoke(

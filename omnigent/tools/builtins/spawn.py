@@ -49,7 +49,11 @@ _ACTIVITY_MAX_CHARS = 2000
 # response without sending another turn.
 _HISTORY_DEFAULT_TAIL = 10
 _HISTORY_MAX_TAIL = 50
+# Six activity previews in one field can hold a substantive review while
+# keeping an explicit read bounded.
 _HISTORY_MAX_CHARS_PER_ITEM = 12000
+# The total budget intentionally follows the default preview and tail cap;
+# changing either value above also changes this budget.
 _HISTORY_MAX_TOTAL_CHARS = _HISTORY_MAX_TAIL * _ACTIVITY_MAX_CHARS
 
 # sys_session_close still rewrites the stored title internally to free
@@ -962,14 +966,14 @@ def _project_activity_item(
 
     Handles three item types: messages (user/assistant text),
     function calls (tool name + args), and function call
-    outputs (tool name + result). All content fields are
-    truncated to ``_ACTIVITY_MAX_CHARS``.
+    outputs (tool name + result). Content fields are truncated
+    to ``max_chars``, which defaults to ``_ACTIVITY_MAX_CHARS``.
 
     :param item: A conversation item from the sub-agent's
         conversation.
+    :param max_chars: Maximum characters retained in each content field.
     :returns: A compact dict with ``role``, ``type``, and
         content fields.
-    :param max_chars: Maximum characters retained in each content field.
     """
     # Convert Pydantic model to dict so .get() works uniformly
     # across all data types (MessageData, FunctionCallData, etc.).
@@ -1013,7 +1017,7 @@ def _project_activity_item(
 
 def _truncate(text: str, *, max_chars: int = _ACTIVITY_MAX_CHARS) -> str:
     """
-    Truncate text to ``_ACTIVITY_MAX_CHARS``.
+    Truncate text to ``max_chars``.
 
     :param text: The input string.
     :param max_chars: Maximum characters retained before the marker.
@@ -1432,8 +1436,9 @@ class SysSessionGetHistoryTool(Tool):
                                 "or tool result. Defaults to the compact activity "
                                 f"preview limit ({_ACTIVITY_MAX_CHARS}); clamped to "
                                 f"{_HISTORY_MAX_CHARS_PER_ITEM} and scaled down when "
-                                "needed to keep the total requested history within "
-                                f"{_HISTORY_MAX_TOTAL_CHARS} characters."
+                                "needed to keep stored content near the existing "
+                                f"~{_HISTORY_MAX_TOTAL_CHARS}-character budget. "
+                                "Truncation markers and pending prompts are extra."
                             ),
                         },
                     },
@@ -1447,9 +1452,8 @@ class SysSessionGetHistoryTool(Tool):
         """
         Look up the target sub-agent and return its recent items.
 
-        :param arguments: JSON-encoded arguments string, e.g.
-            ``'{"conversation_id": "conv_abc123", "tail_items": 5,'
-            ' "content_max_chars": 12000}'``.
+        :param arguments: JSON-encoded arguments, such as
+            ``{"conversation_id": "conv_abc123", "content_max_chars": 12000}``.
         :param ctx: Server-side execution context.
         :returns: JSON ``{"conversation_id": ..., "agent": ...,
             "title": ..., "items": [...]}`` on success;

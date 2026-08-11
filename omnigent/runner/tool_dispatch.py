@@ -3619,7 +3619,7 @@ def _truncate_activity(
     max_chars: int = _ACTIVITY_MAX_CHARS,
 ) -> str | None:
     """
-    Truncate text to ``_ACTIVITY_MAX_CHARS`` to bound peek prompt size.
+    Truncate text to ``max_chars`` to bound peek prompt size.
 
     :param text: The text to truncate, or ``None``.
     :param max_chars: Maximum characters retained before the marker.
