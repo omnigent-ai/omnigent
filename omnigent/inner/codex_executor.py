@@ -44,7 +44,7 @@ from omnigent.codex_model_vocabulary import (
 )
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG
+from omnigent.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 from omnigent.spec.types import RetryPolicy
 
@@ -71,6 +71,7 @@ from .executor import (
     ToolSpec,
     TurnComplete,
     classify_tool_result,
+    describe_exception,
 )
 from .hook_scripts.subagent_router import HOOK_TIMEOUT_HEADROOM_S as _ROUTER_HOOK_HEADROOM_S
 from .hook_scripts.subagent_router import REQUEST_TIMEOUT_S as _ROUTER_REQUEST_TIMEOUT_S
@@ -1606,36 +1607,19 @@ def _databricks_codex_base_url(host: str) -> str:
 
 
 def _databricks_codex_auth_command(host: str, profile: str | None = None) -> str:
-    """Return the legacy Databricks CLI auth helper command for Codex.
+    """Return the Databricks CLI ``auth.command`` for Codex.
 
     :param host: Databricks workspace host, e.g.
         ``"https://example.databricks.com"``.
-    :param profile: Optional ``~/.databrickscfg`` profile name, e.g.
-        ``"oss"``. Preferred over ``--host`` when known: two profiles can
-        share one host, which makes ``databricks auth token --host`` fail
-        ("Use --profile to specify which profile") → empty token → 401.
-        ``--profile`` is always unambiguous.
+    :param profile: Optional ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
+        Preferred over ``--host`` when known; see
+        :func:`~omnigent.inner.databricks_executor.databricks_bearer_token_command`,
+        which owns the command's shape for every harness.
     :returns: Shell command that prints a bearer token.
     """
-    # --profile is unambiguous; --host fails when two profiles share a host.
-    selector = (
-        f"--profile {json.dumps(profile)}" if profile else f"--host {json.dumps(host.rstrip('/'))}"
-    )
-    # `--force-refresh` proactively refreshes a still-valid cached token
-    # (guards against a mid-session 401 on long gateway connections) but
-    # only exists in Databricks CLI >= v0.296.0. Probe `--help` and pass it
-    # only when supported: older CLIs reject the unknown flag → empty token
-    # → silent 401. Plain `auth token` still auto-refreshes expired tokens.
-    return (
-        'if [ -n "${DATABRICKS_BEARER:-}" ]; then '
-        'printf "%s\\n" "$DATABRICKS_BEARER"; '
-        "else force=''; "
-        "if databricks auth token --help 2>&1 | grep -q force-refresh; "
-        "then force=--force-refresh; fi; "
-        "env -u DATABRICKS_CONFIG_PROFILE "
-        f"databricks auth token {selector} "
-        "$force --output json | jq -r '.access_token'; fi"
-    )
+    from .databricks_executor import databricks_bearer_token_command
+
+    return databricks_bearer_token_command(host, profile)
 
 
 def _databricks_codex_config_overrides(
@@ -3315,13 +3299,18 @@ class CodexExecutor(Executor):
         if self._model_provider_override is not None:
             model = None
         elif model is None:
-            provider_name = "databricks" if self._gateway_uses_databricks_profile else "openai"
-            resolution = await run_sync_on_thread(
-                model_catalog.resolve_catalog_model,
-                provider_name,
-                family="openai",
-            )
-            model = resolution.model_id
+            if self._gateway_uses_databricks_profile:
+                resolution = await run_sync_on_thread(
+                    model_catalog.resolve_catalog_model,
+                    "databricks",
+                    family="openai",
+                )
+                model = resolution.model_id
+            else:
+                # Codex's own login (ChatGPT account / API key), where codex is
+                # the vocabulary authority: the bundled OpenAI catalog's newest
+                # row is a bare family alias its backend rejects.
+                model = CODEX_DEFAULT_MODEL
         effective_cwd = (
             self._cwd or (self._os_env_spec.cwd if self._os_env_spec else None) or os.getcwd()
         )
@@ -3336,7 +3325,7 @@ class CodexExecutor(Executor):
                 cfg.extra.get("reasoning_effort"), "codex", CODEX_EFFORTS
             )
         except ValueError as exc:
-            yield ExecutorError(message=str(exc), retryable=False)
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
 
         app_session = await self._ensure_app_session(

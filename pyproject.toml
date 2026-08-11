@@ -146,6 +146,9 @@ modal = ["modal>=1.0,<2"]
 # server-managed `sandbox.provider: daytona`).
 # Same lazy-import posture as the modal extra. Pre-1.0 SDK: pin minor.
 daytona = ["daytona>=0.180,<1"]
+# Blaxel sandbox launcher (`omnigent sandbox --provider blaxel` and
+# server-managed `sandbox.provider: blaxel`).
+blaxel = ["blaxel>=0.4.1,<0.5"]
 # Boxlite sandbox launcher: server-managed `sandbox.provider: boxlite`, either
 # local embedded micro-VMs (KVM/HVF, no daemon) or a remote `boxlite serve`
 # pool. Same lazy-import posture as the modal/daytona extras. Pre-1.0 SDK: pin
@@ -494,10 +497,11 @@ extend-exclude = [
 # ``RET``      — flake8-return (consistent return statements)
 # ``C4``       — flake8-comprehensions (cleaner list/dict/set comprehensions)
 # ``PIE``      — flake8-pie (misc correctness + style)
+# ``DTZ``      — flake8-datetimez (explicit timezone-aware datetimes)
 # ``LOG``      — flake8-logging (correct exception and logger usage)
 # ``RUF``      — ruff-specific (sorted ``__all__``, dangling asyncio
 #                tasks, unused noqa, ...)
-select = ["E", "F", "I", "UP", "ARG", "BLE", "B", "SIM", "RET", "C4", "PIE", "LOG", "RUF"]
+select = ["E", "F", "I", "UP", "ARG", "BLE", "B", "SIM", "RET", "C4", "PIE", "DTZ", "LOG", "RUF"]
 ignore = [
     # ARG003 (unused class-method args): too noisy on ABC-subclass signatures
     # where the arg is required by the interface contract.
@@ -670,6 +674,12 @@ ignore_missing_imports = true
 # posture as modal above.
 [[tool.mypy.overrides]]
 module = "daytona.*"
+ignore_missing_imports = true
+
+# blaxel is an optional dep (the `blaxel` extra); same lazy-import
+# posture as modal above.
+[[tool.mypy.overrides]]
+module = "blaxel.*"
 ignore_missing_imports = true
 
 # islo is an optional dep (the `islo` extra); same lazy-import posture

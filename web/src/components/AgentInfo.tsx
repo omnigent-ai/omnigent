@@ -622,7 +622,7 @@ function AddPolicyDialog({
             </div>
           )}
           <div className="flex justify-end gap-2 pt-1">
-            <button
+            <Button
               type="button"
               onClick={() => {
                 // With a policy selected, Cancel steps back to the list so the
@@ -635,18 +635,18 @@ function AddPolicyDialog({
                   onOpenChange(false);
                 }
               }}
-              className="rounded px-3 py-1.5 text-sm hover:bg-muted"
+              variant="outline"
             >
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
               onClick={handleAdd}
-              disabled={!selected || addPolicy.isPending}
-              className="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-50"
+              loading={addPolicy.isPending}
+              disabled={!selected}
             >
-              {addPolicy.isPending ? "Adding..." : "Add"}
-            </button>
+              Add
+            </Button>
           </div>
         </div>
       </DialogContent>
@@ -1041,10 +1041,11 @@ function McpServerManagerDialog({
                 type="button"
                 size="sm"
                 onClick={handleSave}
-                disabled={saving || validateMcpForm(form) !== null}
+                loading={saving}
+                disabled={validateMcpForm(form) !== null}
               >
                 <SaveIcon className="size-3.5" />
-                {saving ? "Saving..." : "Save"}
+                Save
               </Button>
             </div>
           </div>

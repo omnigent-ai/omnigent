@@ -82,9 +82,14 @@ def ensure_agy_onboarding_complete() -> None:
     Idempotently seeds ``onboardingComplete`` (and the sibling consumer/enterprise
     flags) into agy's ``~/.gemini/antigravity-cli/cache/onboarding.json`` so the
     interactive TUI onboarding wizard does not stall a host-spawned or headless
-    ``agy`` launch that has no TTY to answer it. Call once before launching agy
-    (see :func:`omnigent.runner.app._auto_create_antigravity_terminal` and the CLI
-    ``_launch_and_record`` path).
+    ``agy`` launch that has no TTY to answer it.
+
+    .. deprecated:: 0.9.0
+        No longer called by either launch path; slated for removal in 0.10.0.
+        Both launches now scope agy to a per-session ``--gemini_dir``, where
+        :func:`seed_isolated_agy_home` writes this same marker — so seeding the
+        real ``~/.gemini`` copy only wrote the user's tree for a file agy never
+        reads. Use :func:`seed_isolated_agy_home` instead.
 
     Any unrecognised keys already in the file are preserved (the three known keys
     are merged over them), and the write is skipped entirely when all three
@@ -333,9 +338,38 @@ _AGY_ENABLED_TOOLS = [
 # of the real tree).
 _AGY_SEED_FILES = (
     Path("oauth_creds.json"),
+    # Account identity agy writes beside the credential. Without it agy can hold a
+    # valid token yet still prompt for account selection in a fresh Gemini dir,
+    # which reads as "not signed in" on a headless launch (#1477).
+    Path("google_accounts.json"),
     Path("antigravity-cli") / "antigravity-oauth-token",
     Path("installation_id"),
     Path("antigravity-cli") / "installation_id",
+)
+
+
+# agy resolves imported plugins (skills + hooks) relative to its Gemini dir, so a
+# bridge-owned ``--gemini_dir`` starts with none of the user's plugins unless they
+# are seeded. ``plugins/`` is symlinked rather than copied: the payload is a git
+# checkout per plugin, and a link keeps a mid-session ``/plugin install`` or update
+# visible instead of pinning a stale copy.
+_AGY_PLUGINS_DIR = "plugins"
+_AGY_IMPORT_MANIFEST = "import_manifest.json"
+
+
+# agy's non-plugin skill trees, relative to the Gemini dir — the "Global" and
+# "Shared" sources its ``/skills`` panel names. They are linked for the same
+# reason plugins are: :func:`~omnigent.spec.skill_sources._agy_skill_dirs`
+# enumerates them from the user's REAL home, so a session that could not resolve
+# them under ``--gemini_dir`` would offer a skill agy then fails to expand.
+#
+# The panel's other two sources need no seeding: the workspace tree
+# (``<ws>/.agents/skills``) is not under the Gemini dir at all, and agy recreates
+# ``antigravity-cli/builtin/skills`` in whatever Gemini dir it is launched with
+# (live-verified — isolated dirs carry the same builtins as the real home).
+_AGY_SKILL_DIRS = (
+    Path("antigravity-cli") / "skills",
+    Path("skills"),
 )
 
 
@@ -534,10 +568,78 @@ def seed_isolated_agy_home(
     with contextlib.suppress(OSError):
         (iso_gemini / _MCP_CONFIG_DIR / ".migrated").touch()
 
+    _seed_isolated_agy_plugins(real_home, iso_gemini)
+    _seed_isolated_agy_skills(real_home, iso_gemini)
+
     if trusted_workspace is not None:
         _seed_isolated_agy_workspace_trust(iso_gemini, Path(trusted_workspace))
 
     return {}
+
+
+def _seed_isolated_agy_plugins(real_home: Path, iso_gemini: Path) -> None:
+    """Expose the user's imported agy plugins under the isolated Gemini dir.
+
+    Links ``config/plugins`` to the real tree and copies ``import_manifest.json``
+    (agy needs both: the manifest declares which plugins are imported, the
+    directory holds their skills and hooks). Without this an omnigent-spawned
+    session lists zero plugin skills while a direct ``agy`` run lists them all.
+
+    Best-effort: a user with no plugins, or a platform that refuses symlinks,
+    simply gets a session without them rather than a failed launch.
+
+    :param real_home: The user's real home directory.
+    :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
+    """
+    real_config = real_home / ".gemini" / _MCP_CONFIG_DIR
+    iso_config = iso_gemini / _MCP_CONFIG_DIR
+
+    _link_into_isolated_gemini_dir(real_config / _AGY_PLUGINS_DIR, iso_config / _AGY_PLUGINS_DIR)
+
+    real_manifest = real_config / _AGY_IMPORT_MANIFEST
+    if real_manifest.is_file():
+        with contextlib.suppress(OSError):
+            (iso_config / _AGY_IMPORT_MANIFEST).write_bytes(real_manifest.read_bytes())
+
+
+def _seed_isolated_agy_skills(real_home: Path, iso_gemini: Path) -> None:
+    """Expose the user's Global and Shared agy skills under the isolated Gemini dir.
+
+    Links the trees in :data:`_AGY_SKILL_DIRS` back to the real home so the
+    ``/skills`` menu — which enumerates them from that same real home — cannot
+    offer a skill this session's agy would fail to expand.
+
+    Best-effort, like the plugin seed: a user with neither tree, or a platform
+    that refuses symlinks, gets a session without them rather than a failed launch.
+
+    :param real_home: The user's real home directory.
+    :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
+    """
+    for rel in _AGY_SKILL_DIRS:
+        _link_into_isolated_gemini_dir(real_home / ".gemini" / rel, iso_gemini / rel)
+
+
+def _link_into_isolated_gemini_dir(real: Path, link: Path) -> None:
+    """Symlink *link* at the isolated Gemini dir to the real tree *real*.
+
+    Linking rather than copying keeps a tree the user edits mid-session (a
+    ``/plugin install``, a newly authored skill) visible instead of pinning a
+    stale snapshot. A missing source seeds nothing.
+
+    :param real: Source directory in the user's real ``~/.gemini``.
+    :param link: Path to create under the bridge-owned ``--gemini_dir``.
+    :returns: None.
+    """
+    if not real.is_dir():
+        return
+    with contextlib.suppress(OSError):
+        # Re-seeding an existing bridge dir must not fail on the prior link;
+        # drop a stale or broken one so the target is always current.
+        if link.is_symlink() or link.is_file():
+            link.unlink()
+        if not link.exists():
+            link.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            link.symlink_to(real.resolve(), target_is_directory=True)
 
 
 # agy's periodic engagement survey ("How's the CLI experience so far?") is gated by
@@ -624,16 +726,12 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
     if data.get(_AGY_FEEDBACK_SURVEY_SETTING) is False:
         return  # already disabled — avoid a needless rewrite
     data[_AGY_FEEDBACK_SURVEY_SETTING] = False
-    # The write is atomic (mkstemp + os.replace) so a concurrent reader/writer
-    # never sees a torn file. On macOS the harness runs agy under the user's REAL
-    # ~/.gemini (the #1477 Keychain trade-off), so this file is shared across
-    # concurrent sessions and with agy itself: the atomic replace prevents
-    # corruption but not lost updates. That window is self-limiting — the
-    # idempotent short-circuit above makes every launch after the first disable
-    # read-only, so a racing agy trust/model write can only be clobbered on the
-    # one-time first disable, and the clobbered values fail safe (lost trust is
-    # re-prompted, lost model defaults). A cross-process lock is intentionally not
-    # taken (a separately-launched agy would not honor it).
+    # The write is atomic (mkstemp + os.replace) so a concurrent reader/writer never
+    # sees a torn file. Both launch paths pass the per-session isolated agy dir, so
+    # the only writer that can race here is the session's own agy; the idempotent
+    # short-circuit above makes every launch after the first disable read-only, and
+    # a clobbered value fails safe (lost trust is re-prompted, lost model defaults).
+    # A cross-process lock is intentionally not taken (agy would not honor it).
     try:
         settings_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(prefix="settings.json.", dir=str(settings_path.parent))

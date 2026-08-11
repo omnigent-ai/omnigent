@@ -11,6 +11,7 @@ from issue_duplicates import (
     extract_issue_references,
     parse_triage_output,
     rank_candidates,
+    reference_disposition,
     similarity_scores,
     validate_duplicate_decision,
 )
@@ -210,6 +211,151 @@ class IssueDuplicatesTest(unittest.TestCase):
 
         self.assertIn("it already covers", comment_for([12]))
         self.assertIn("they already cover", comment_for([12, 34]))
+
+    def test_reference_disposition_splits_closed_by_reason(self):
+        self.assertEqual(reference_disposition({"state": "OPEN"}), "open")
+        self.assertEqual(
+            reference_disposition({"state": "CLOSED", "stateReason": "COMPLETED"}), "fixed"
+        )
+        self.assertEqual(
+            reference_disposition({"state": "CLOSED", "stateReason": "NOT_PLANNED"}), "declined"
+        )
+        # `wontfix` carries the same meaning as NOT_PLANNED on older closures,
+        # which predate the state reason.
+        self.assertEqual(
+            reference_disposition(
+                {"state": "CLOSED", "stateReason": "", "labels": [{"name": "wontfix"}]}
+            ),
+            "declined",
+        )
+        # An unset reason on a closed issue is treated as fixed: completed is by
+        # far the common case, and the wording still asks rather than asserts.
+        self.assertEqual(reference_disposition({"state": "CLOSED", "stateReason": ""}), "fixed")
+
+    def test_comment_does_not_ask_a_reporter_to_close_onto_a_fixed_issue(self):
+        """A shipped fix makes this a version question, not a duplicate to merge into.
+
+        Reproduces the real #4245 comment, which pointed at #1977 — closed as
+        completed — and still asked the reporter to close their own report and add
+        details there, where nobody would read them.
+        """
+        issue = {
+            "title": "SOCKS proxy ImportError on local daemon health check",
+            "body": "Using a SOCKS proxy, the local daemon health check raises ImportError.",
+        }
+        decision = validate_duplicate_decision(
+            {
+                "duplicate_decision": "similar",
+                "similar_issues": [1977],
+                "duplicate_confidence": 0.8,
+            },
+            issue,
+            [{"number": 1977, "state": "CLOSED", "stateReason": "COMPLETED", **issue}],
+        )
+
+        comment = build_duplicate_comment(decision, close_issue=False)
+
+        self.assertEqual(decision["reference_dispositions"], {"1977": "fixed"})
+        self.assertIn("#1977", comment)
+        self.assertIn("already been fixed", comment)
+        self.assertIn("regression rather than a duplicate", comment)
+        # The two asks that made no sense against a closed issue.
+        self.assertNotIn("please close this one", comment)
+        self.assertNotIn("add your details there", comment)
+
+    def test_comment_on_a_declined_issue_never_asks_for_a_self_close(self):
+        """Nothing was planned there, so there is no discussion to move a report into."""
+        issue = {
+            "title": "Support running the daemon as a Windows service",
+            "body": "The daemon should install itself as a Windows service.",
+        }
+        decision = validate_duplicate_decision(
+            {
+                "duplicate_decision": "similar",
+                "similar_issues": [1500],
+                "duplicate_confidence": 0.8,
+            },
+            issue,
+            [{"number": 1500, "state": "CLOSED", "stateReason": "NOT_PLANNED", **issue}],
+        )
+
+        comment = build_duplicate_comment(decision, close_issue=False)
+
+        self.assertIn("closed as not planned", comment)
+        self.assertIn("was closed", comment)
+        self.assertNotIn("please close this one", comment)
+        self.assertNotIn("already been fixed", comment)
+
+    def test_a_live_reference_still_gets_the_self_close_ask(self):
+        """One open match among closed ones can still absorb the report."""
+        issue = {
+            "title": "Session sidebar loses scroll position on rename",
+            "body": "Renaming a session resets the sidebar scroll position to the top.",
+        }
+        decision = validate_duplicate_decision(
+            {
+                "duplicate_decision": "similar",
+                "similar_issues": [900, 950],
+                "duplicate_confidence": 0.8,
+            },
+            issue,
+            [
+                {"number": 900, "state": "CLOSED", "stateReason": "COMPLETED", **issue},
+                {"number": 950, "state": "OPEN", **issue},
+            ],
+        )
+
+        comment = build_duplicate_comment(decision, close_issue=False)
+
+        self.assertEqual(decision["reference_dispositions"], {"900": "fixed", "950": "open"})
+        self.assertIn("please close this one", comment)
+
+    def test_a_declined_reference_is_not_described_as_fixed(self):
+        """Mixed closures name each group: "fixed" must not absorb the declined one."""
+        comment = build_duplicate_comment(
+            {
+                "duplicate_decision": "similar",
+                "duplicate_of": None,
+                "similar_issues": [12, 34],
+                "duplicate_confidence": 0.8,
+                "reference_dispositions": {"12": "fixed", "34": "declined"},
+            },
+            close_issue=False,
+        )
+
+        self.assertIn("#12 may be related, and has already been fixed", comment)
+        self.assertIn("#34 was closed as not planned", comment)
+
+    def test_a_fixed_duplicate_is_not_asked_to_close_either(self):
+        """The `duplicate` verdict has the same closed-reference problem."""
+        decision = {
+            "duplicate_decision": "duplicate",
+            "duplicate_of": 12,
+            "similar_issues": [],
+            "duplicate_confidence": 1.0,
+            "duplicate_reasoning": "The reports describe the same behavior.",
+            "reference_dispositions": {"12": "fixed"},
+        }
+
+        comment = build_duplicate_comment(decision, close_issue=False)
+
+        self.assertIn("already been fixed", comment)
+        self.assertNotIn("please close this one", comment)
+
+    def test_a_missing_disposition_keeps_the_open_wording(self):
+        """Absent state defaults to the ask-don't-assert copy rather than crashing."""
+        comment = build_duplicate_comment(
+            {
+                "duplicate_decision": "similar",
+                "duplicate_of": None,
+                "similar_issues": [12],
+                "duplicate_confidence": 0.8,
+            },
+            close_issue=False,
+        )
+
+        self.assertIn("please close this one", comment)
+        self.assertNotIn("already been fixed", comment)
 
     def test_duplicate_comment_reflects_closure_flag(self):
         decision = {

@@ -1248,12 +1248,14 @@ async def test_runner_cold_cache_uses_resolved_message_not_stored_file_id() -> N
 @pytest.mark.asyncio
 async def test_runner_post_returns_503_when_spec_resolver_fails(
     caplog: pytest.LogCaptureFixture,
+    pinned_runner_log: Path,
 ) -> None:
     """Spec resolver failures are surfaced as structured 503 errors.
 
     :param caplog: Pytest log capture, used to confirm the raw cause is
         logged server-side (the other half of the log-and-genericize
         contract).
+    :param pinned_runner_log: The log path the detail must name.
     :returns: None.
     """
 
@@ -1289,11 +1291,13 @@ async def test_runner_post_returns_503_when_spec_resolver_fails(
 
     assert response.status_code == 503
     body = response.json()
-    # The structured error slug is preserved for the caller; the detail is a
-    # fixed client-safe string. The raw resolver exception text must not leak
-    # into the HTTP body (it is logged on the runner instead).
+    # The structured error slug is preserved for the caller; the detail names
+    # the runner log holding the cause. The raw resolver exception text must
+    # not leak into the HTTP body (it is logged on the runner instead).
     assert body["error"] == "spec_resolver_failed"
-    assert body["detail"] == "Request failed on the runner; see runner logs for details."
+    assert body["detail"] == (
+        f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+    )
     assert "spec resolver unavailable" not in body["detail"]
     # The other half of the contract: the raw cause IS logged for operators.
     # If this fails, log-and-genericize logged nothing and the detail is the
@@ -1405,6 +1409,43 @@ def test_build_spawn_env_applies_model_override(
     assert base["HARNESS_CLAUDE_SDK_MODEL"] != "claude-sonnet-4-6"
     # … and the override wins, landing in the model env var the SDK reads.
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+
+
+def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dispatch chain routes ``hermes`` to its builder.
+
+    Regression: hermes had no arm here, so this returned ``None`` and the
+    subprocess got no spawn env at all — the session's sandbox fell back to the
+    wrap's ``sandbox=none`` default and its workspace to the runner's launch
+    directory, both silently. Having the builder is not enough; the chain has
+    to reach it.
+
+    :param tmp_path: Pytest temp dir for an isolated provider config.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.delenv("OMNIGENT_HERMES_PATH", raising=False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+        os_env=OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+
+    env = _build_spawn_env_from_spec(spec, "hermes", cwd=workspace)
+
+    assert env is not None, "hermes is not routed to a spawn-env builder"
+    assert env["HARNESS_HERMES_CWD"] == str(workspace)
+    assert json.loads(env["HARNESS_HERMES_OS_ENV"])["sandbox"]["type"] == "linux_bwrap"
+    # The /model override reaches hermes through the same model env key.
+    overridden = _build_spawn_env_from_spec(spec, "hermes", model_override="hermes-4-70b")
+    assert overridden is not None
+    assert overridden["HARNESS_HERMES_MODEL"] == "hermes-4-70b"
 
 
 @pytest.mark.asyncio

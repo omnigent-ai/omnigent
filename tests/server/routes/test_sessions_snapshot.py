@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+from sqlalchemy.exc import StatementError
 
 from omnigent.entities import Conversation, ConversationItem, MessageData, PagedList
 from omnigent.server.routes import sessions as _sessions_mod
@@ -71,6 +72,47 @@ def test_model_options_wire_skips_malformed_rows_not_the_catalog() -> None:
     assert [option["id"] for option in options] == ["opus"]
 
 
+def test_snapshot_metadata_resolvers_ignore_malformed_agent_ids() -> None:
+    """A wrapped UUID bind error degrades optional snapshot metadata to unknown."""
+
+    class _MalformedAgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            raise StatementError(
+                "invalid agent id",
+                {"agent_id": agent_id},
+                ValueError("expected a UUID"),
+                False,
+            )
+
+    conv = Conversation(
+        id="legacy_session",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="legacy_session",
+        agent_id="legacy_agent",
+    )
+    agent_store = _MalformedAgentStore()
+    agent_cache = object()
+
+    assert (
+        _sessions_mod._resolve_llm_model(
+            conv,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+        )
+        is None
+    )
+    assert (
+        _sessions_mod._resolve_harness(
+            conv,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+        )
+        is None
+    )
+
+
 class _ConversationStore:
     """Minimal store that records ``list_items`` calls.
 
@@ -108,11 +150,13 @@ class _ConversationStore:
         after: str | None = None,
         kind: str | None = "default",
         root_conversation_id: str | None = None,
+        include_archived: bool = False,
     ) -> PagedList[Conversation]:
         """Return the spawn tree sharing ``root_conversation_id``.
 
         ``load_session_usage`` walks the tree via this method to sum a
-        parent's subtree usage. With an explicit graph, return every
+        parent's subtree usage, and passes ``include_archived=True`` —
+        archived conversations still hold spend. With an explicit graph, return every
         conversation sharing the root; otherwise synthesize the single
         childless conversation the legacy tests expect.
         """
@@ -253,6 +297,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
         ),
     }
     conv_store = _ConversationStore([], conversations=conversations)
+    cache_loads: list[bool] = []
 
     class _AgentStore:
         @staticmethod
@@ -261,13 +306,19 @@ async def test_session_snapshot_uses_child_spec_metadata(
             return type(
                 "StoredAgent",
                 (),
-                {"id": agent_id, "name": "advisor-row", "bundle_location": "bundle"},
+                {
+                    "id": agent_id,
+                    "name": "advisor-row",
+                    "bundle_location": "bundle",
+                    "session_id": None,
+                },
             )()
 
     class _AgentCache:
         @staticmethod
-        def load(agent_id: str, bundle_location: str) -> Any:
+        def load(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
             assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
+            cache_loads.append(expand_env)
             return type("LoadedAgent", (), {"spec": parent_spec})()
 
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
@@ -289,9 +340,12 @@ async def test_session_snapshot_uses_child_spec_metadata(
     assert parent.agent_name == "advisor"
     assert parent.llm_model == "openai-codex/gpt-5.6-sol:high"
     assert parent.context_window == 200_000
+    assert parent.harness == "codex"
     assert child.agent_name == "executor"
     assert child.llm_model == "openai-codex/gpt-5.6-sol:medium"
     assert child.context_window == 100_000
+    assert child.harness == "codex"
+    assert cache_loads == [True, True, True, True]
 
 
 @pytest.mark.asyncio
@@ -2285,3 +2339,129 @@ async def test_persist_error_labels_short_message_stored_verbatim() -> None:
         captured["d6e1678fb446a1cf5a892e0df60aaba3"]["omnigent.last_task_error_code"]
         == "runner_error"
     )
+
+
+# ── _runner_reject_detail ────────────────────────────────────────────────────
+
+
+def test_runner_reject_detail_combines_error_code_and_detail() -> None:
+    """The runner's own ``{error, detail}`` shape reads as ``code: detail``."""
+    import httpx
+
+    from omnigent.server.routes.sessions import _runner_reject_detail
+
+    resp = httpx.Response(
+        503,
+        request=httpx.Request("POST", "http://runner/v1/sessions/conv_x/events"),
+        json={"error": "harness_spawn_failed", "detail": "harness spawn failed (see log)"},
+    )
+    assert _runner_reject_detail(resp) == "harness_spawn_failed: harness spawn failed (see log)"
+
+
+def test_runner_reject_detail_falls_back_through_code_body_and_status() -> None:
+    """Each degraded body shape still yields a non-empty reason.
+
+    The reason becomes the user-visible ``last_task_error``, so an
+    error-code-only body, a non-JSON body, and an empty body must each
+    produce something better than a bare "failed".
+    """
+    import httpx
+
+    from omnigent.server.routes.sessions import _runner_reject_detail
+
+    req = httpx.Request("POST", "http://runner/v1/sessions/conv_x/events")
+
+    code_only = httpx.Response(501, request=req, json={"error": "not_implemented"})
+    assert _runner_reject_detail(code_only) == "not_implemented"
+
+    non_json = httpx.Response(400, request=req, text="bad request body")
+    assert _runner_reject_detail(non_json) == "bad request body"
+
+    empty = httpx.Response(503, request=req)
+    assert _runner_reject_detail(empty) == "runner returned status 503"
+
+
+def test_runner_reject_detail_tolerates_status_only_response_fake() -> None:
+    """A fake exposing only ``status_code`` degrades to the status line.
+
+    Runner-client stubs across the server tests return lightweight fakes
+    without ``json()``; the helper must not raise on them.
+    """
+    from omnigent.server.routes.sessions import _runner_reject_detail
+
+    class _Fake:
+        status_code = 503
+
+    assert _runner_reject_detail(_Fake()) == "runner returned status 503"  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_persist_and_project_structured_error_round_trip() -> None:
+    """Structured title/cause/remediation survive persist → project.
+
+    A classified failure stores its friendly fields as labels, and
+    ``_last_task_error_from_labels`` projects them back so a reload renders the
+    same clear card instead of just code + message.
+    """
+    from omnigent.server.routes.sessions import _last_task_error_from_labels
+    from omnigent.server.schemas import ErrorDetail
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _MockStore:
+        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
+            captured[session_id] = updates
+
+    error = ErrorDetail(
+        code="required_terminal_exited",
+        message="Claude Code can't run as root\n\n...diagnostics...",
+        title="Claude Code can't run as root",
+        cause="The agent terminal exited immediately because Claude Code refuses ...",
+        remediation="Run the host as a non-root user (uid != 0).",
+    )
+    await _persist_session_status_error_labels(
+        "aa11bb22cc33dd44ee55ff6677889900", error, _MockStore()
+    )  # type: ignore[arg-type]
+
+    labels = captured["aa11bb22cc33dd44ee55ff6677889900"]
+    projected = _last_task_error_from_labels(labels)
+    assert projected == {
+        "code": "required_terminal_exited",
+        "message": "Claude Code can't run as root\n\n...diagnostics...",
+        "title": "Claude Code can't run as root",
+        "cause": "The agent terminal exited immediately because Claude Code refuses ...",
+        "remediation": "Run the host as a non-root user (uid != 0).",
+    }
+
+
+@pytest.mark.asyncio
+async def test_persist_error_labels_clears_stale_structured_fields() -> None:
+    """An unclassified failure must not inherit a prior failure's title/cause.
+
+    The label store is upsert-only, so every persist writes all structured keys
+    (empty when absent). An error with no title/cause/remediation therefore
+    projects back to just code + message.
+    """
+    from omnigent.server.routes.sessions import _last_task_error_from_labels
+    from omnigent.server.schemas import ErrorDetail
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _MockStore:
+        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
+            captured[session_id] = updates
+
+    error = ErrorDetail(code="runner_error", message="turn setup failed")
+    await _persist_session_status_error_labels(
+        "bb22cc33dd44ee55ff66778899001122", error, _MockStore()
+    )  # type: ignore[arg-type]
+
+    labels = captured["bb22cc33dd44ee55ff66778899001122"]
+    # All structured keys are written empty so a stale value can't leak.
+    assert labels["omnigent.last_task_error_title"] == ""
+    assert labels["omnigent.last_task_error_cause"] == ""
+    assert labels["omnigent.last_task_error_remediation"] == ""
+    assert _last_task_error_from_labels(labels) == {
+        "code": "runner_error",
+        "message": "turn setup failed",
+    }

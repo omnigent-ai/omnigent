@@ -32,7 +32,8 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         provider: modal          # lakebox|modal|daytona|boxlite|cwsandbox|islo|e2b|openshell
+         # lakebox|modal|daytona|blaxel|boxlite|cwsandbox|islo|e2b|openshell|kubernetes
+         provider: modal
          server_url: https://omnigent.example.com
          host_config:             # optional; provider-agnostic. Verbatim
                                   # in-sandbox ~/.omnigent/config.yaml content,
@@ -69,6 +70,12 @@ stores into ``create_app``):
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES whose
                                              # values are injected as
                                              # sandbox env
+         blaxel:                  # optional block (provider: blaxel)
+           image: blaxel/omnigent-host:TAG  # optional fixed tag override
+           env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES
+           region: us-was-1       # optional
+           memory_mb: 4096        # optional; default: 4096
+           ttl: 24h               # optional; default maximum age: 24h
          islo:                    # optional block (provider: islo)
            image: docker.io/me/omnigent-host:latest  # default: official image
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
@@ -87,21 +94,26 @@ stores into ``create_app``):
                                              # as sandbox env
            cluster: my-gateway              # optional OpenShell gateway name
 
-   The image defaults to the official prebaked host image
-   (``ghcr.io/omnigent-ai/omnigent-host:latest``; see
-   :data:`omnigent.onboarding.sandboxes.base.DEFAULT_HOST_IMAGE` and
-   the per-provider env overrides), so ``provider`` + ``server_url``
-   is a complete config. Provider credentials are NOT in this file
+   Most providers default to a public prebaked host image, so
+   ``provider`` + ``server_url`` is a complete config. Registry-backed
+   providers use ``ghcr.io/omnigent-ai/omnigent-host:latest`` (see
+   :data:`omnigent.onboarding.sandboxes.base.DEFAULT_HOST_IMAGE`); Blaxel uses
+   ``blaxel/omnigent-host:latest``, which adds its required ``sandbox-api``.
+   Both defaults remain overridable. Use a private immutable Blaxel image when
+   a production rollout must stay on fixed image contents.
+   Provider credentials are NOT in this file
    (12-factor): the Modal launcher reads ``MODAL_TOKEN_ID`` /
    ``MODAL_TOKEN_SECRET`` (or ``~/.modal.toml``) and the Daytona
    launcher reads ``DAYTONA_API_KEY`` (plus optional
    ``DAYTONA_API_URL`` / ``DAYTONA_TARGET``), and the Islo launcher
    reads ``ISLO_API_KEY`` (plus optional ``ISLO_BASE_URL``) from the
-   server process environment. The OpenShell launcher needs no API key:
+   server process environment. The Blaxel launcher reads ``BL_WORKSPACE``
+   and ``BL_API_KEY`` or the local ``bl login`` profile. The OpenShell
+   launcher needs no API key:
    it connects to the gateway made active with ``openshell gateway
    select`` (``$OPENSHELL_GATEWAY`` / ``~/.config/openshell/active_gateway``,
    or ``sandbox.openshell.cluster``), so the server process needs
-   OpenShell gateway access. ``modal``, ``daytona``, ``cwsandbox``,
+   OpenShell gateway access. ``modal``, ``daytona``, ``blaxel``, ``cwsandbox``,
    ``islo``, and ``openshell`` have managed-launch support; ``lakebox``
    parses but rejects at launch.
 
@@ -133,16 +145,17 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import click
 from fastapi import HTTPException
 
-from omnigent.db.utils import now_epoch
+from omnigent.db.utils import builtin_agent_id, now_epoch
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxHostLauncher
+    from omnigent.stores.agent_store import AgentStore
 
 _logger = logging.getLogger(__name__)
 
@@ -157,6 +170,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "lakebox",
         "modal",
         "daytona",
+        "blaxel",
         "boxlite",
         "cwsandbox",
         "islo",
@@ -166,7 +180,17 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
     }
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell", "kubernetes"}
+    {
+        "modal",
+        "daytona",
+        "blaxel",
+        "boxlite",
+        "cwsandbox",
+        "islo",
+        "e2b",
+        "openshell",
+        "kubernetes",
+    }
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -193,6 +217,12 @@ MODAL_MANAGED_TOKEN_TTL_S = 25 * 3600
 # session past 7 days going through the dead-host relaunch path) mints
 # a fresh token.
 DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# The blaxel launch-token TTL is NOT a constant: Blaxel reaps a sandbox at its
+# configured max age (sandbox.blaxel.ttl, 24h by default), so the TTL is derived
+# from that age at parse time via blaxel.managed_token_ttl_s(). It always sits
+# above the age, so a live sandbox can re-authenticate its tunnel across
+# reconnects while a token leaked from a reaped sandbox cannot.
 
 # Launch-token lifetime for the YAML boxlite path. Boxlite boxes have no
 # platform lifetime cap and persist across restarts, so the bound is policy,
@@ -244,12 +274,87 @@ _HOST_LOG_PATH = "/tmp/omnigent-host.log"
 # genuinely slow launch.
 MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = MANAGED_HOST_ONLINE_TIMEOUT_S + 120
 
+# Server-internal sandbox lifecycle labels — currently the repository a relaunch
+# re-clones. A client seed would forge that reconstruction, so session
+# create/patch reject any client label here, closing future keys by default.
+MANAGED_SANDBOX_LABEL_NAMESPACE = "omnigent.sandbox."
+
 # Session label recording the repository-URL workspace a managed
 # session was created with (the raw ``<url>[#<branch>]`` request
 # value). ``conversations.workspace`` is overwritten with the CLONED
 # path at bind time, so this label is what a sandbox RELAUNCH parses
 # to re-clone the repository into the fresh generation's workspace.
 MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
+
+
+def resolve_managed_agent_label(
+    agent_store: AgentStore,
+    agent_id: str | None,
+    *,
+    session_id: str,
+) -> str | None:
+    """
+    Resolve the agent-classifier value for a managed runner Pod, gated to
+    genuine built-ins.
+
+    The runner Pod's ``omnigent.ai/agent`` label is what an admission policy
+    selects on to inject a privileged credential (e.g. a scoped git token).
+    That is only trustworthy for a genuine BUILT-IN (operator-seeded) agent:
+    a user can create a *session-scoped* agent whose name matches a built-in's,
+    so name alone is spoofable. The gate is ``session_id is None AND id ==
+    builtin_agent_id(name)`` — the same identity built-in seeding uses. A
+    session-scoped or user-uploaded agent (random id, and/or an owning
+    conversation) fails it and its runner gets NO agent label.
+
+    The label is an optimization, never a launch precondition: any failure to
+    resolve (no agent, unknown id, not a built-in, or a store error) returns
+    ``None`` so the caller omits the label rather than stamping something
+    unmatchable or failing the create. The decision is logged either way (the
+    "why did this runner get no credential" line).
+
+    :param agent_store: Store to resolve the agent record from.
+    :param agent_id: The session's bound agent id, or ``None``.
+    :param session_id: Session id, for log correlation only.
+    :returns: The built-in agent's registered name to stamp, or ``None`` to
+        omit the classifier.
+    """
+    if agent_id is None:
+        _logger.info("session %s: no agent label (session has no bound agent)", session_id)
+        return None
+    try:
+        agent = agent_store.get(agent_id)
+    except Exception:  # noqa: BLE001 — the label is an optimization, never a
+        # create precondition. Any store failure degrades to an unlabeled runner
+        # (the admission policy skips it) rather than 500-ing a create that has
+        # already committed and announced the session.
+        _logger.warning(
+            "session %s: agent-label resolve failed for agent %s; omitting label",
+            session_id,
+            agent_id,
+            exc_info=True,
+        )
+        return None
+    if agent is None:
+        _logger.warning(
+            "session %s: agent id %s did not resolve to an agent; omitting label",
+            session_id,
+            agent_id,
+        )
+        return None
+    if agent.session_id is not None or agent.id != builtin_agent_id(agent.name):
+        _logger.info(
+            "session %s: agent %r (%s) is not a genuine built-in; omitting agent label",
+            session_id,
+            agent.name,
+            agent.id,
+        )
+        return None
+    _logger.info(
+        "session %s: classifying runner with built-in agent label %r",
+        session_id,
+        agent.name,
+    )
+    return agent.name
 
 
 @dataclass
@@ -769,6 +874,30 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             _parse_daytona_image(raw), _parse_daytona_env(raw)
         )
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
+    elif provider == "blaxel":
+        from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s
+
+        section = _parse_provider_section(raw, "blaxel")
+        if section is not None:
+            _reject_unknown_keys(
+                section,
+                {"image", "env", "region", "memory_mb", "ttl"},
+                "sandbox.blaxel",
+            )
+        blaxel_ttl = _parse_provider_string(raw, "blaxel", "ttl")
+        launcher_factory = _blaxel_launcher_factory(
+            image=_parse_blaxel_image(raw),
+            env=_parse_provider_env(raw, "blaxel"),
+            region=_parse_provider_string(raw, "blaxel", "region"),
+            memory_mb=_parse_provider_positive_int(raw, "blaxel", "memory_mb"),
+            ttl=blaxel_ttl,
+        )
+        # Derived from sandbox.blaxel.ttl so the token always outlives the
+        # sandbox age at which Blaxel reaps the host.
+        try:
+            token_ttl_s = managed_token_ttl_s(blaxel_ttl)
+        except ValueError as exc:
+            raise ValueError(f"server config 'sandbox.blaxel.ttl' is invalid: {exc}") from exc
     elif provider == "boxlite":
         section = _boxlite_section(raw)
         _reject_unknown_keys(
@@ -975,6 +1104,48 @@ def _daytona_launcher_factory(
         return DaytonaSandboxLauncher(image=image, env=env)
 
     return _build
+
+
+def _blaxel_launcher_factory(
+    *,
+    image: str | None,
+    env: list[str] | None,
+    region: str | None,
+    memory_mb: int | None,
+    ttl: str | None,
+) -> Callable[[], SandboxHostLauncher]:
+    """Build the launcher factory for the YAML ``provider: blaxel`` path."""
+
+    def _build() -> SandboxHostLauncher:
+        """Construct the Blaxel launcher; the optional SDK remains lazy."""
+        from omnigent.onboarding.sandboxes.blaxel import BlaxelSandboxLauncher
+
+        return BlaxelSandboxLauncher(
+            image=image,
+            env=env,
+            region=region,
+            memory_mb=memory_mb,
+            ttl=ttl,
+        )
+
+    return _build
+
+
+def _parse_blaxel_image(raw: dict[str, object]) -> str | None:
+    """Extract an optional Blaxel image override for the public default."""
+    section = _parse_provider_section(raw, "blaxel")
+    if section is None:
+        return None
+    image = section.get("image")
+    if image is None:
+        return None
+    if not isinstance(image, str) or not image.strip():
+        raise ValueError(
+            "server config 'sandbox.blaxel.image' must be a non-empty Blaxel image id, "
+            "e.g. 'blaxel/omnigent-host:<tag>' (or omit it to use the "
+            "public image or OMNIGENT_BLAXEL_HOST_IMAGE override)"
+        )
+    return image.strip()
 
 
 def _parse_daytona_image(raw: dict[str, object]) -> str | None:
@@ -2124,6 +2295,7 @@ async def launch_managed_host(
     owner: str,
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
+    agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
     """
@@ -2152,6 +2324,10 @@ async def launch_managed_host(
         host image's git credential helper when the sandbox env
         carries ``GIT_TOKEN`` (injected through Modal secrets — see
         deploy/modal/README.md "Git credentials").
+    :param agent_name: Server-resolved built-in agent name the session runs,
+        stamped as the runner Pod's ``omnigent.ai/agent`` classifier by
+        providers that declare ``classifies_runner_by_agent`` (Kubernetes),
+        or ``None`` to leave it unstamped.
     :param on_stage: Progress observer invoked as the launch pipeline
         advances, with the stage just entered: ``"cloning"`` (when
         *repo* is set) then ``"starting"``. May be called from a
@@ -2187,6 +2363,7 @@ async def launch_managed_host(
         owner=owner,
         sandbox_id=sandbox_id,
         repo=repo,
+        agent_name=agent_name,
         on_stage=on_stage,
     )
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
@@ -2198,6 +2375,7 @@ async def relaunch_managed_host(
     host: Host,
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
+    agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
     """
@@ -2225,6 +2403,9 @@ async def relaunch_managed_host(
     :param host_store: Persistent host registrations.
     :param repo: Repository to re-clone as the workspace, or ``None``
         for an empty workspace.
+    :param agent_name: Server-resolved built-in agent name the session runs,
+        re-stamped as the new runner Pod's ``omnigent.ai/agent`` classifier
+        (Kubernetes only), or ``None`` to leave it unstamped.
     :param on_stage: Progress observer forwarded to
         :func:`_arm_and_start_host`; see :func:`launch_managed_host`.
         ``None`` disables progress reporting.
@@ -2263,6 +2444,7 @@ async def relaunch_managed_host(
         owner=host.user_id,
         sandbox_id=sandbox_id,
         repo=repo,
+        agent_name=agent_name,
         on_stage=on_stage,
         keep_host_on_failure=True,
     )
@@ -2281,9 +2463,34 @@ async def _start_sandbox_host(
     repo_branch: str | None,
     repo_name: str | None,
     host_config: dict[str, object] | None,
+    agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> str:
     """Start a host without sending absent optional arguments to legacy launchers."""
+    # Gated on the capability, not on the value: start_host is side-effecting and
+    # non-idempotent, so we never probe the signature by passing then retrying.
+    # `agent_name` is declared on the classifying launcher's `start_host` alone,
+    # so the abstract signature does not carry it and the call is cast: the
+    # capability is the runtime guarantee the static type cannot express. A
+    # launcher declaring it is in-tree and current, so it also takes
+    # `host_config`/`on_stage`, keeping the legacy-omission fan-out below
+    # one-dimensional.
+    if agent_name is not None and launcher.capabilities.classifies_runner_by_agent:
+        start_classified = cast(Callable[..., str], launcher.start_host)
+        return await asyncio.to_thread(
+            start_classified,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+            host_config=host_config,
+            on_stage=on_stage,
+            agent_name=agent_name,
+        )
     if host_config is None and on_stage is None:
         return await asyncio.to_thread(
             launcher.start_host,
@@ -2347,6 +2554,7 @@ async def _arm_and_start_host(
     owner: str,
     sandbox_id: str,
     repo: RepoWorkspace | None = None,
+    agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
     keep_host_on_failure: bool = False,
 ) -> str:
@@ -2374,6 +2582,10 @@ async def _arm_and_start_host(
     :param sandbox_id: The provisioned sandbox, e.g. ``"sb-a1b2c3"``.
     :param repo: Repository to clone as the workspace, or ``None``
         for an empty workspace.
+    :param agent_name: Server-resolved built-in agent name the session runs,
+        forwarded to ``start_host`` only for launchers that declare
+        ``classifies_runner_by_agent`` (Kubernetes stamps it as the runner
+        Pod's ``omnigent.ai/agent`` classifier). ``None`` leaves it unstamped.
     :param on_stage: Progress observer forwarded to the launcher's
         ``start_host``; see :func:`launch_managed_host`. ``None``
         disables progress reporting.
@@ -2412,6 +2624,7 @@ async def _arm_and_start_host(
             repo_branch=repo.branch if repo is not None else None,
             repo_name=repo.repo_name if repo is not None else None,
             host_config=config.host_config,
+            agent_name=agent_name,
             on_stage=on_stage,
         )
         await _wait_for_host_online(host_store, host_id)

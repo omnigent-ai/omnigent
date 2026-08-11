@@ -641,11 +641,13 @@ def test_the_spawn_gate_asks_on_the_ladders_own_request_budget(
     # "No opinion": the spawn runs on exactly the model it asked for.
     assert raw == ""
     assert seen == [subagent_router.REQUEST_TIMEOUT_S]
-    assert subagent_router.REQUEST_TIMEOUT_S < 10.0
+    # The budget must outlast a healthy route (catalog prep + router call) and
+    # stay at or under the owner's 15s ceiling.
+    assert subagent_router.REQUEST_TIMEOUT_S <= 15.0
     # The harness's own kill has to sit above it, or the fail-open branch above
     # never runs and the harness sees a dead hook instead of "no opinion".
     assert subagent_router.HOOK_TIMEOUT_S > subagent_router.REQUEST_TIMEOUT_S
-    assert subagent_router.HOOK_TIMEOUT_S <= 15
+    assert subagent_router.HOOK_TIMEOUT_S < 30
 
 
 def test_an_unreachable_relay_is_no_opinion_not_a_dropped_spawn(

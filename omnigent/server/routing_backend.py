@@ -9,17 +9,24 @@ candidate menu it is handed, so it serves any harness.
 Gateway backing therefore selects the SOURCE rather than hiding the surface: an
 off-gateway pane still routes, just with the built-in judge, and the decision
 records which router answered so the UI can say so.
+
+The same holds when the preferred router FAILS: :func:`route_with_fallback`
+asks the judge behind it rather than declining the call, which is what keeps a
+deployment whose workspace has no routing API on Smart Routing at all.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from omnigent.server.smart_routing import RoutingClient
+    from omnigent.server.smart_routing import RoutingClient, RoutingResult
+
+_logger = logging.getLogger(__name__)
 
 #: Which router produced a decision. ``"databricks-aigw"`` is the external
 #: ``task_v1`` service; ``"oss-llm"`` is the built-in judge.
@@ -53,6 +60,23 @@ class RoutingBackends:
         return self.external or self.local
 
 
+def usable_external(backends: RoutingBackends) -> RoutingClient | None:
+    """The external client, unless it has latched a permanent failure.
+
+    A workspace whose routing API is not enabled answers every
+    ``routes:select`` the same way, so the client latches that and this reads
+    as "no external router" from then on — the deployment's real posture for
+    the rest of the process.
+
+    :param backends: The deployment's configured clients.
+    :returns: The external client when it can still answer, else ``None``.
+    """
+    client = backends.external
+    if client is None or getattr(client, "permanently_unavailable", False):
+        return None
+    return client
+
+
 @dataclass(frozen=True)
 class RouterChoice:
     """A selected router and the source name to stamp on its decision.
@@ -79,11 +103,83 @@ def select_router(
     :returns: The chosen client plus its source, or ``None`` when neither
         backend can serve (today's "routing unavailable").
     """
-    if gateway_backed and backends.external is not None:
-        return RouterChoice(client=backends.external, source="databricks-aigw")
+    external = usable_external(backends)
+    if gateway_backed and external is not None:
+        return RouterChoice(client=external, source="databricks-aigw")
     if backends.local is not None:
         return RouterChoice(client=backends.local, source="oss-llm")
     return None
+
+
+@dataclass(frozen=True)
+class RoutedCall:
+    """The answer one routing call got, and who gave it.
+
+    :param result: The verdict, or ``None`` when nothing could answer.
+    :param source: Which router answered (or was asked last).
+    :param client: The client asked last, so the caller can read its
+        ``last_error`` for the reason behind a ``None`` *result*.
+    """
+
+    result: RoutingResult | None
+    source: RouterSource
+    client: RoutingClient
+
+
+async def route_with_fallback(
+    backends: RoutingBackends,
+    message: str,
+    available_models: dict[str, list[str]],
+    *,
+    gateway_backed: bool,
+) -> RoutedCall | None:
+    """Call the deployment's router, falling back to the judge when it fails.
+
+    The external service is still preferred wherever it can serve — that is the
+    Databricks posture and this does not change it. What it adds is that its
+    failure is no longer the end of the call: a deployment that also configures
+    the built-in judge routes with the judge instead of declining, and the
+    decision records ``oss-llm`` so the chip says who answered.
+
+    :param backends: The deployment's configured clients.
+    :param message: The task text to route on.
+    :param available_models: Harness id → candidate model ids.
+    :param gateway_backed: Whether every harness family involved resolves
+        AI-Gateway-backed inference (see :func:`select_router`).
+    :returns: The answer, or ``None`` when no backend is configured at all.
+    :raises Exception: Whatever the client that answered last raised — the
+        external one only when there is no judge to fall back to, so each
+        caller's existing fail-open handling still sees it.
+    """
+    choice = select_router(backends, gateway_backed=gateway_backed)
+    if choice is None:
+        return None
+    if choice.source != "databricks-aigw" or backends.local is None:
+        return RoutedCall(
+            result=await choice.client.route(message, available_models),
+            source=choice.source,
+            client=choice.client,
+        )
+    try:
+        result = await choice.client.route(message, available_models)
+    except Exception:  # noqa: BLE001 — the judge is the fallback for any failure
+        _logger.warning(
+            "routing: the external router raised; falling back to the built-in judge",
+            exc_info=True,
+        )
+    else:
+        if result is not None:
+            return RoutedCall(result=result, source="databricks-aigw", client=choice.client)
+        _logger.info(
+            "routing: the external router gave no verdict (%s); "
+            "falling back to the built-in judge",
+            getattr(choice.client, "last_error", None),
+        )
+    return RoutedCall(
+        result=await backends.local.route(message, available_models),
+        source="oss-llm",
+        client=backends.local,
+    )
 
 
 def reported_gateway_inference(
@@ -172,6 +268,11 @@ def _managed_llm_capability(caps: Any) -> bool:  # type: ignore[explicit-any]  #
 def routing_sources(caps: Any) -> dict[str, bool]:  # type: ignore[explicit-any]  # RuntimeCaps
     """Report which routers this deployment can answer a routing call with.
 
+    Reports what can answer NOW, not what was configured: an external client
+    that has latched a permanent failure (its workspace has no routing API)
+    reads as absent, so ``/v1/info`` stops advertising a router that will only
+    decline. Nothing about that is persisted — a restart re-probes.
+
     :param caps: A ``RuntimeCaps`` (or structural equivalent), or ``None``.
     :returns: ``{"external": ..., "oss": ...}`` — ``"external"`` is the
         workspace AI-Gateway ``task_v1`` client, ``"oss"`` the built-in judge
@@ -179,7 +280,7 @@ def routing_sources(caps: Any) -> dict[str, bool]:  # type: ignore[explicit-any]
     """
     backends = backends_from_caps(caps)
     return {
-        "external": backends.external is not None,
+        "external": usable_external(backends) is not None,
         "oss": backends.local is not None or _managed_llm_capability(caps),
     }
 

@@ -9,7 +9,7 @@ import socket
 import tempfile
 import textwrap
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -940,7 +940,10 @@ class TestToolServer(unittest.TestCase):
 
             async def executor(name, args):
                 # A dict carrying values json.dumps rejects by default.
-                return {"when": datetime(2026, 6, 18, 12, 0, 0), "tags": {1, 2, 3}}
+                return {
+                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc),
+                    "tags": {1, 2, 3},
+                }
 
             server._tool_executor = executor
 
@@ -974,7 +977,7 @@ class TestToolServer(unittest.TestCase):
         still yield a valid frame rather than re-raising the very crash the
         guard exists to prevent. The id is stringified in that envelope.
         """
-        bad_id = datetime(2026, 6, 18, 12, 0, 0)
+        bad_id = datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc)
         out = _safe_dumps({"id": bad_id, "result": {"k": "v"}}, bad_id)  # type: ignore[arg-type]
         payload = json.loads(out)
         self.assertEqual(payload["id"], str(bad_id))
@@ -995,7 +998,10 @@ class TestToolServer(unittest.TestCase):
             await server.start()
 
             async def executor(name, args):
-                return {"when": datetime(2026, 6, 18, 12, 0, 0), "tags": {1, 2, 3}}
+                return {
+                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc),
+                    "tags": {1, 2, 3},
+                }
 
             server._tool_executor = executor
             try:

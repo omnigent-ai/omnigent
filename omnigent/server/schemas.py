@@ -899,11 +899,23 @@ class ErrorDetail(BaseModel):
 
     :param code: Error code string, e.g. ``"server_error"``,
         ``"invalid_input"``.
-    :param message: Human-readable error description.
+    :param message: Human-readable error description. Always populated; older
+        clients render this verbatim.
+    :param title: Optional short headline naming what went wrong, e.g.
+        ``"Claude Code can't run as root"``. Present when the runner
+        recognized the failure (see ``omnigent.runner.launch_failure``); lets
+        the UI show a clear card title instead of the raw ``code``.
+    :param cause: Optional one/two-sentence explanation of why it failed.
+        Paired with ``title``.
+    :param remediation: Optional concrete next step to fix it, e.g. a command
+        to run. ``None`` when there is no single clear fix.
     """
 
     code: str
     message: str
+    title: str | None = None
+    cause: str | None = None
+    remediation: str | None = None
 
 
 class IncompleteDetails(BaseModel):
@@ -1696,9 +1708,6 @@ class SessionResponse(BaseModel):
         permission level on this session: ``1`` = read, ``2`` =
         edit, ``3`` = manage. ``None`` when permissions are
         disabled (single-user mode without a permission store).
-    :param can_approve: Whether the requesting user may accept
-        privileged actions for this session. ``None`` when permissions
-        are disabled.
     :param llm_model: The LLM model identifier from the bound
         agent's spec, e.g. ``"anthropic/claude-sonnet-4-6"``.
         ``None`` when the agent has no explicit ``llm:`` block or
@@ -1875,7 +1884,6 @@ class SessionResponse(BaseModel):
     reasoning_effort: str | None = None
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None
-    can_approve: bool | None = None
     sub_agent_name: str | None = None
     kind: str = "default"
     parent_session_id: str | None = None
@@ -2266,9 +2274,6 @@ class SessionListItem(BaseModel):
         permission level on this session: ``1`` = read, ``2`` =
         edit, ``3`` = manage. ``None`` when permissions are
         disabled.
-    :param can_approve: Whether the requesting user may accept
-        privileged actions for this session. ``None`` when permissions
-        are disabled.
     :param owner: The user_id of the session owner, or ``None``
         when permissions are disabled. Included so the sidebar
         can display the owner without a separate API call.
@@ -2348,7 +2353,6 @@ class SessionListItem(BaseModel):
     host_online: bool | None = None
     reasoning_effort: str | None = None
     permission_level: int | None = None
-    can_approve: bool | None = None
     owner: str | None = None
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
@@ -2470,13 +2474,10 @@ class GrantPermissionRequest(BaseModel):
         read access.
     :param level: Numeric permission level: ``1`` = read,
         ``2`` = edit, ``3`` = manage.
-    :param can_approve: Whether the owner delegates privileged-action
-        approval authority to this user.
     """
 
     user_id: str
     level: int = Field(ge=1, le=3)
-    can_approve: bool | None = None
 
 
 class PermissionObject(BaseModel):
@@ -2488,13 +2489,11 @@ class PermissionObject(BaseModel):
         ``"conv_abc123"``.
     :param level: Numeric permission level (1=read, 2=edit,
         3=manage).
-    :param can_approve: Whether this grantee may approve privileged actions.
     """
 
     user_id: str
     conversation_id: str
     level: int
-    can_approve: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -3226,17 +3225,13 @@ class OutputTextDeltaEvent(_SSEEventBase):
     :param type: Always ``"response.output_text.delta"``.
     :param delta: The text fragment for this chunk, e.g.
         ``"Hello"``.
-    :param message_id: For terminal-observed streaming (claude-native),
-        the vendor's stable per-message id, e.g.
-        ``"2ca51d97-2f0f-493a-aed7-85a5b56c5747"``. Lets the web UI scope
-        an in-flight buffer to one assistant message and reconcile it
-        against the final item. ``None`` for ordinary in-process task
-        streaming, where deltas already group by the active response.
+    :param message_id: For native terminal streaming, the provider's stable
+        per-message id, e.g. ``"2ca51d97-2f0f-493a-aed7-85a5b56c5747"``.
+        ``None`` for ordinary in-process task streaming, where deltas group
+        by the active response.
     :param index: 0-based chunk order within the message, e.g. ``3``.
-        ``None`` when not terminal-observed streaming.
-    :param final: ``True`` on the last chunk of a terminal-observed
-        message; ``None`` otherwise. Signals the web UI that no further
-        chunks for ``message_id`` will arrive.
+        Used to suppress repeated chunks; ``None`` for in-process streaming.
+    :param final: Optional provider completion marker for the message.
     """
 
     type: Literal["response.output_text.delta"]

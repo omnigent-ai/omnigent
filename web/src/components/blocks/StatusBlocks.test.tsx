@@ -71,6 +71,8 @@ describe("routing decision — harness / scope / raw pick", () => {
   // Harness + which sub-agent the decision covers: without the badge a
   // native-subagent decision is indistinguishable from a session one, and a
   // badge on a session/turn decision would invent a sub-agent that has none.
+  // Every chip also shortens the harness id: "-native" is how the pane runs,
+  // not something a chip needs to say, whatever scope took the decision.
   it.each([
     ["native_subagent", "subagent: researcher"],
     ["turn", null],
@@ -85,7 +87,8 @@ describe("routing decision — harness / scope / raw pick", () => {
         routing={{ harness: "claude-native", scope }}
       />,
     );
-    expect(screen.getByTestId("routing-decision-card")).toHaveTextContent("claude-native");
+    // Anchored: a bare "claude" would also match the unshortened id.
+    expect(screen.getByTestId("routing-decision-harness")).toHaveTextContent(/^· claude$/);
     if (badge === null) {
       expect(screen.queryByTestId("routing-decision-scope")).toBeNull();
     } else {
@@ -132,7 +135,8 @@ describe("routing decision — harness / scope / raw pick", () => {
         }}
       />,
     );
-    expect(screen.getByTestId("routing-decision-harness")).toHaveTextContent("codex-native");
+    // child_session is a sub-agent scope, so the harness id renders shortened.
+    expect(screen.getByTestId("routing-decision-harness")).toHaveTextContent("codex");
     // The badge's exact wording is pinned once, on subagentScopeLabel.
     expect(screen.getByTestId("routing-decision-scope")).toBeTruthy();
     expect(screen.getByTestId("routing-decision-raw-model")).toHaveTextContent("gpt-5-6-sol");

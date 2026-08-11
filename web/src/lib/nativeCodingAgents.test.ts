@@ -7,8 +7,11 @@ import {
   WRAPPER_LABEL_KEY,
   isFullySupportedNativeCodingAgent,
   isNativeTerminalSession,
+  isNativeWrapper,
   isRecentHarness,
+  nativeAgentHasCapability,
   nativeCodingAgentForHarness,
+  nativeCodingAgentForSubagentWrapper,
   nativeWrapperLabelsForAgent,
 } from "./nativeCodingAgents";
 
@@ -69,6 +72,20 @@ describe("nativeCodingAgentForHarness", () => {
     );
   });
 
+  // agy's only pre-emptive control is the all-or-nothing bypass, so it must
+  // declare `skipPermissions` and NOT Claude's graded `permissionMode` — the
+  // latter would emit `--permission-mode <mode>`, a flag agy does not accept.
+  it("gives antigravity-native the skipPermissions capability, not permissionMode", () => {
+    const agy = nativeCodingAgentForHarness("antigravity-native");
+    expect(agy?.capabilities).toEqual(["skipPermissions"]);
+    expect(
+      nativeAgentHasCapability({ name: "antigravity-native-ui", harness: null }, "skipPermissions"),
+    ).toBe(true);
+    expect(
+      nativeAgentHasCapability({ name: "antigravity-native-ui", harness: null }, "permissionMode"),
+    ).toBe(false);
+  });
+
   it("leaves unknown / non-native harnesses unresolved", () => {
     expect(nativeCodingAgentForHarness("claude-sdk")).toBeUndefined();
     // The in-process Antigravity SDK harness is not a native CLI wrapper.
@@ -100,6 +117,41 @@ describe("nativeWrapperLabelsForAgent", () => {
       [UI_MODE_LABEL_KEY]: UI_MODE_TERMINAL_VALUE,
       [WRAPPER_LABEL_KEY]: "opencode-native-ui",
     });
+  });
+});
+
+describe("nativeCodingAgentForSubagentWrapper", () => {
+  it("resolves the vendor that spawned a native sub-agent child", () => {
+    expect(nativeCodingAgentForSubagentWrapper("claude-code-native-ui-subagent")?.displayName).toBe(
+      "Claude Code",
+    );
+    expect(nativeCodingAgentForSubagentWrapper("codex-native-ui-subagent")?.displayName).toBe(
+      "Codex",
+    );
+    expect(nativeCodingAgentForSubagentWrapper("opencode-native-ui-subagent")?.displayName).toBe(
+      "OpenCode",
+    );
+    expect(nativeCodingAgentForSubagentWrapper("antigravity-native-ui-subagent")?.displayName).toBe(
+      "Antigravity",
+    );
+  });
+
+  it("does not resolve parent wrappers or unknown labels", () => {
+    expect(nativeCodingAgentForSubagentWrapper("claude-code-native-ui")).toBeUndefined();
+    expect(nativeCodingAgentForSubagentWrapper("pi-native-ui-subagent")).toBeUndefined();
+    expect(nativeCodingAgentForSubagentWrapper(null)).toBeUndefined();
+  });
+
+  // The two lookups stay disjoint: a sub-agent child owns no PTY and takes no
+  // input, so it must not read as a native-terminal session (which would, for
+  // one, hide Smart Routing's eligibility check behind the wrong branch).
+  it("keeps sub-agent wrappers out of the native-terminal wrapper lookup", () => {
+    expect(isNativeWrapper("claude-code-native-ui-subagent")).toBe(false);
+    expect(
+      isNativeTerminalSession({
+        labels: { [WRAPPER_LABEL_KEY]: "claude-code-native-ui-subagent" },
+      }),
+    ).toBe(false);
   });
 });
 

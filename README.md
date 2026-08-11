@@ -43,6 +43,7 @@ Omnigent lets you:
 
 - **☁️ Run agents in cloud sandboxes.** No laptop required: run sessions in
   disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
+  [Blaxel](https://blaxel.ai),
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
@@ -80,7 +81,7 @@ curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/i
 Available user-facing extras include:
 
 - **Model providers:** `databricks`, `bedrock`, `vertex`
-- **Sandbox providers:** `modal`, `daytona`, `boxlite`, `cwsandbox`, `e2b`,
+- **Sandbox providers:** `modal`, `daytona`, `blaxel`, `boxlite`, `cwsandbox`, `e2b`,
   `openshell`, `kubernetes`
 - **SDK harnesses:** `antigravity`, `copilot`, `cursor`, `agents-sdk`
 - **Storage and memory:** `s3`, `hindsight`
@@ -301,15 +302,16 @@ full pages through an MCP search server, and verifies each claim across
 independent sources. It's also the simplest example to copy from: one agent
 plus one `tools/mcp/*.yaml` server, no sub-agents.
 
-**Prefer the browser?** Start a server and register your machine as a host:
+**Prefer the browser?** One command starts the local server and registers this
+machine as a host:
 
 ```bash
-omnigent server --background   # start the local server and web UI in the background
-omnigent host           # (separate terminal) register this machine as a host
+omnigent start   # starts the local server and registers this machine as a host
 ```
 
-In the web UI, hit **New Chat**, pick your machine, and go. Check status with
-`omnigent server status`; stop everything with `omnigent stop`.
+Open the server URL it prints, hit **New Chat**, pick your machine, and go.
+Check status with `omnigent server status`; stop everything with
+`omnigent stop`.
 
 ### 3. Choose & switch models
 
@@ -423,11 +425,6 @@ and they're in. Signup is invite-only.
   ```bash
   omnigent run --fork <session_id>
   ```
-
-Shared sessions identify model-visible messages with `[account]:` labels by
-default. Set `OMNIGENT_SHARED_MESSAGE_ATTRIBUTION_ENABLED=0` to hide those
-labels. This does not change stored authors, UI avatars, or who may approve or
-run privileged actions.
 
 > [!TIP]
 > Want your team to sign in with the logins they already have (**Google,

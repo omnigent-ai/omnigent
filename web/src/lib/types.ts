@@ -69,6 +69,12 @@ export interface Usage {
 export interface ErrorInfo {
   code: string;
   message: string;
+  /** Friendly headline for a classified failure, e.g. "Claude Code can't run as root". */
+  title?: string;
+  /** One/two-sentence explanation of why it failed. Paired with `title`. */
+  cause?: string;
+  /** Concrete next step to fix it, e.g. a command to run. */
+  remediation?: string;
 }
 
 /** Details about why a response stopped early. */
@@ -351,7 +357,13 @@ export interface Session {
    * relying on the transient ``response.error`` SSE event, which may
    * have been emitted before the web client subscribed.
    */
-  lastTaskError?: { code: string; message: string } | null;
+  lastTaskError?: {
+    code: string;
+    message: string;
+    title?: string;
+    cause?: string;
+    remediation?: string;
+  } | null;
   /**
    * Outstanding `response.elicitation_request` event payloads on
    * the snapshot. Replayed into the chat as ApprovalCard blocks on
@@ -379,8 +391,6 @@ export interface Session {
    * permissively, so that's fine for unblocking interaction.
    */
   permissionLevel: number | null;
-  /** Whether this viewer may accept privileged actions for the session. */
-  canApprove?: boolean | null;
   /**
    * Parent conversation id when this session is a sub-agent (child),
    * e.g. ``"conv_parent987"``. ``null`` for top-level sessions.

@@ -26,9 +26,10 @@ from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import _server_state
 
-# Comfortably past SESSION_HISTORY_PAGE_SIZE (20 items) so the initial window
-# is a fraction of the transcript and scrolling up must fetch more.
-_TURNS = 30
+# Each turn is 2 items, so this must stay comfortably past
+# INITIAL_WINDOW_ITEMS (100) — otherwise the open loads the whole transcript,
+# nothing is left to page, and the scroll-up this test watches never happens.
+_TURNS = 80
 _NEWEST_REPLY = f"reply number {_TURNS - 1}"
 
 _VIEWPORT = {"width": 1280, "height": 480}

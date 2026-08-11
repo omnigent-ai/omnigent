@@ -15,22 +15,27 @@ Two layers:
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from omnigent.inner import acp_executor as acp_executor_module
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp, _to_acp_mcp_servers
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
+    ExecutorError,
     ReasoningChunk,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
     TurnComplete,
+    describe_exception,
 )
 
 # ---------------------------------------------------------------------------
@@ -333,6 +338,20 @@ def test_harness_wrap_builds_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ex._config.model == "gpt-5.3"
 
 
+def test_harness_wrap_reads_env_passthrough_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The wrap decodes the forwarded names, closing parent → child → spawn env."""
+    from omnigent.inner import acp_harness
+
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "grok agent stdio")
+    monkeypatch.setenv("HARNESS_ACP_ENV_PASSTHROUGH", "XAI_API_KEY, GROK_TOKEN ,")
+    monkeypatch.setenv("XAI_API_KEY", "xai-secret")
+    ex = acp_harness._build_acp_executor()
+    assert isinstance(ex, AcpExecutor)
+    assert ex._config.env_passthrough == ("XAI_API_KEY", "GROK_TOKEN")
+    # And it actually lands in the env the agent is spawned with.
+    assert ex._build_spawn_env().get("XAI_API_KEY") == "xai-secret"
+
+
 # ---------------------------------------------------------------------------
 # Hermetic end-to-end: drive a real fake ACP agent over stdio
 # ---------------------------------------------------------------------------
@@ -569,3 +588,201 @@ async def test_end_to_end_denied_permission(tmp_path: Path) -> None:
 
     # Turn still completes even though the tool was rejected.
     assert any(isinstance(e, TurnComplete) for e in events)
+
+
+# ---------------------------------------------------------------------------
+# describe_exception — never report a blank turn error (#4281)
+# ---------------------------------------------------------------------------
+
+
+def test_describe_exception_falls_back_to_repr_for_blank_message():
+    """A bare exception whose ``str()`` is empty is described by ``repr()``.
+
+    Regression for #4281: executors reported failures via ``str(exc)``, so a
+    bare ``RuntimeError()`` reached the operator as "inner executor error: "
+    with no detail. The fallback must at least name the exception type.
+    """
+    assert str(RuntimeError()) == ""  # the exact blank-message case from the bug
+    described = describe_exception(RuntimeError())
+    assert described != ""
+    assert "RuntimeError" in described
+
+
+def test_describe_exception_preserves_a_real_message():
+    """When the exception carries a message, it is used verbatim (no repr noise)."""
+    assert describe_exception(ValueError("boom: bad line")) == "boom: bad line"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [RuntimeError(), TimeoutError(), OSError(), Exception()],
+)
+def test_describe_exception_never_blank(exc: BaseException):
+    """No bare stdlib exception yields an empty description."""
+    assert describe_exception(exc).strip() != ""
+
+
+# ---------------------------------------------------------------------------
+# Spawn env: the agent must actually receive credentials (#4281)
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_env_keeps_credential_declared_on_the_agent() -> None:
+    """A name in the agent's own ``env_passthrough`` reaches the subprocess.
+
+    This is the config path a user actually has (an ``acp.agents:`` row).
+    Without it the agent starts unauthenticated and stalls during the
+    handshake, which surfaced as a turn that failed with no message at all.
+    """
+    ex = AcpExecutor(
+        AcpAgentConfig(command="agent stdio", name="Grok", env_passthrough=("XAI_API_KEY",))
+    )
+    with patch.dict(os.environ, {"XAI_API_KEY": "xai-secret"}, clear=False):
+        env = ex._build_spawn_env()
+    assert env.get("XAI_API_KEY") == "xai-secret"
+
+
+def test_spawn_env_keeps_credential_declared_on_the_spec() -> None:
+    """A spec-declared ``os_env.sandbox.env_passthrough`` name still works."""
+    os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=None,
+        sandbox=OSEnvSandboxSpec(type="none", env_passthrough=["XAI_API_KEY"]),
+        fork=False,
+    )
+    ex = AcpExecutor(AcpAgentConfig(command="agent stdio", name="Grok"), os_env=os_env)
+    with patch.dict(os.environ, {"XAI_API_KEY": "xai-secret"}, clear=False):
+        env = ex._build_spawn_env()
+    assert env.get("XAI_API_KEY") == "xai-secret"
+
+
+def test_spawn_env_unions_agent_and_spec_declarations() -> None:
+    """Both sources apply; neither shadows the other."""
+    os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=None,
+        sandbox=OSEnvSandboxSpec(type="none", env_passthrough=["FROM_SPEC"]),
+        fork=False,
+    )
+    ex = AcpExecutor(
+        AcpAgentConfig(command="agent stdio", name="A", env_passthrough=("FROM_AGENT",)),
+        os_env=os_env,
+    )
+    with patch.dict(os.environ, {"FROM_SPEC": "1", "FROM_AGENT": "2"}, clear=False):
+        env = ex._build_spawn_env()
+    assert env.get("FROM_SPEC") == "1"
+    assert env.get("FROM_AGENT") == "2"
+
+
+def test_spawn_env_still_excludes_undeclared_secret() -> None:
+    """Deny-by-default holds: an undeclared provider key is not handed over."""
+    ex = AcpExecutor(AcpAgentConfig(command="agent stdio", name="Grok"))
+    with patch.dict(os.environ, {"UNRELATED_API_KEY": "nope"}, clear=False):
+        env = ex._build_spawn_env()
+    assert "UNRELATED_API_KEY" not in env
+
+
+@pytest.mark.asyncio
+async def test_handshake_timeout_reports_a_non_blank_error(tmp_path: Path) -> None:
+    """An agent that never answers ``session/new`` yields a named error.
+
+    ``asyncio.TimeoutError`` has an empty ``str()``, so reporting the failure by
+    ``str(exc)`` produced the blank "inner executor error: " an operator can't
+    act on.
+    """
+    agent_path = tmp_path / "silent_agent.py"
+    agent_path.write_text(
+        "import sys, json\n"
+        "for line in sys.stdin:\n"
+        "    line = line.strip()\n"
+        "    if not line:\n"
+        "        continue\n"
+        "    msg = json.loads(line)\n"
+        "    if msg.get('method') == 'initialize':\n"
+        "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': msg['id'],\n"
+        "            'result': {'protocolVersion': 1, 'agentCapabilities': {}}}) + '\\n')\n"
+        "        sys.stdout.flush()\n"
+        # session/new deliberately unanswered -> the handshake RPC times out.
+    )
+    command = shlex.join([sys.executable, str(agent_path)])
+
+    ex = AcpExecutor(AcpAgentConfig(command=command, name="Silent"))
+    errors = []
+    with patch.object(acp_executor_module, "_INIT_TIMEOUT_SECONDS", 1.0):
+        try:
+            async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                if isinstance(ev, ExecutorError):
+                    errors.append(ev)
+        finally:
+            await ex.close()
+
+    assert errors, "a stalled handshake must surface an ExecutorError"
+    assert errors[0].message.strip(), "the turn error must never be blank"
+    # Names the stalled call, not just the exception type.
+    assert "session/new" in errors[0].message
+    assert "Silent" in errors[0].message
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics: the agent's own stderr must reach the operator
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_startup_failure_quotes_the_agents_stderr(tmp_path: Path) -> None:
+    """An agent that explains itself on stderr has that text in the turn error.
+
+    A stalled handshake names only the RPC that timed out. The reason usually
+    sits on the agent's stderr ("no API key"), which was drained at debug level
+    into a logger the harness child had no handler for — so it reached nobody.
+    """
+    agent_path = tmp_path / "noisy_agent.py"
+    agent_path.write_text(
+        "import sys, json, time\n"
+        "for line in sys.stdin:\n"
+        "    line = line.strip()\n"
+        "    if not line:\n"
+        "        continue\n"
+        "    msg = json.loads(line)\n"
+        "    if msg.get('method') == 'initialize':\n"
+        "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': msg['id'],\n"
+        "            'result': {'protocolVersion': 1, 'agentCapabilities': {}}}) + '\\n')\n"
+        "        sys.stdout.flush()\n"
+        "    elif msg.get('method') == 'session/new':\n"
+        "        sys.stderr.write('ERROR: XAI_API_KEY not set\\n')\n"
+        "        sys.stderr.flush()\n"
+        "        time.sleep(3600)\n"
+    )
+    command = shlex.join([sys.executable, str(agent_path)])
+
+    ex = AcpExecutor(AcpAgentConfig(command=command, name="Grok"))
+    errors = []
+    with patch.object(acp_executor_module, "_INIT_TIMEOUT_SECONDS", 1.0):
+        try:
+            async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                if isinstance(ev, ExecutorError):
+                    errors.append(ev)
+        finally:
+            await ex.close()
+
+    assert errors, "a stalled handshake must surface an ExecutorError"
+    assert "XAI_API_KEY not set" in errors[0].message
+
+
+def test_stderr_ring_is_bounded_and_lines_are_capped() -> None:
+    """A chatty agent can't grow the ring or put a huge line in a UI toast."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", name="A"))
+    for i in range(acp_executor_module._STDERR_RING_LINES * 3):
+        ex._recent_stderr.append(f"line{i}")
+    assert len(ex._recent_stderr) == acp_executor_module._STDERR_RING_LINES
+
+    ex._recent_stderr.clear()
+    ex._recent_stderr.append("x" * 10_000)
+    msg = ex._startup_error_message(TimeoutError())
+    assert len(msg) < 2_000, "a single huge stderr line must not dominate the error"
+
+
+def test_startup_error_names_the_exception_type_when_str_is_empty() -> None:
+    """No stderr and an empty ``str(exc)`` still yields something actionable."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", name="A"))
+    assert "TimeoutError" in ex._startup_error_message(TimeoutError())

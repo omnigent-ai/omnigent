@@ -1,6 +1,9 @@
 package ai.omnigent.android
 
+import android.content.Context
+import android.content.RestrictionsManager
 import android.content.res.Configuration
+import android.os.Bundle
 import android.webkit.WebView
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.test.core.app.ApplicationProvider
@@ -11,7 +14,10 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.shadow.api.Shadow
+import org.robolectric.shadows.ShadowRestrictionsManager
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -74,6 +80,24 @@ class MainActivityTest {
         activity.onConfigurationChanged(lightConfiguration)
         assertTrue(insetsController.isAppearanceLightStatusBars)
         assertTrue(insetsController.isAppearanceLightNavigationBars)
+    }
+
+    @Test
+    fun `a managed preset never overrides the server the user picked`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        ServerStore(context).connect("https://example.com")
+        val manager = context.getSystemService(RestrictionsManager::class.java)
+        Shadow
+            .extract<ShadowRestrictionsManager>(manager)
+            .setApplicationRestrictions(
+                Bundle().apply {
+                    putString(ManagedConfig.KEY_SERVER_URLS, "https://managed.example.com")
+                },
+            )
+
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+
+        assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
     }
 
     private fun MainActivity.webView(): WebView =

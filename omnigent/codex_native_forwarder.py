@@ -87,6 +87,10 @@ _REPLAY_POST_TIMEOUT_SECONDS = 5.0
 _REPLAY_DEADLINE_SECONDS = 30.0
 _DELTA_FLUSH_INTERVAL_SECONDS = 0.05
 _DELTA_FLUSH_CHAR_THRESHOLD = 64
+# A worker cancelled at loop teardown can no longer resolve its queued markers, so an
+# unbounded wait parks the caller for good. Under the runner's 10s auto-forwarder cancel
+# budget so this resolves first.
+_DELTA_MARKER_TIMEOUT_SECONDS = 5.0
 _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE = "external_reasoning_effort_change"
 # Context-compaction progress edge. Publishes the same
 # ``response.compaction.in_progress`` / ``response.compaction.completed`` SSE
@@ -1047,6 +1051,21 @@ class _DeltaChunk:
     tool_call_id: str | None = None
 
 
+def _resolve_marker(done: asyncio.Future[None]) -> None:
+    """
+    Complete a queue marker's future unless a cancelled caller already settled it.
+
+    An unguarded ``set_result`` on an already-cancelled future raises
+    ``InvalidStateError``, which kills the worker; ``_ensure_worker`` only replaces a
+    ``None`` task, so the dead one is never restarted and every later flush hangs.
+
+    :param done: Future the caller is waiting on.
+    :returns: None.
+    """
+    if not done.done():
+        done.set_result(None)
+
+
 @dataclass(frozen=True)
 class _DeltaFlushBarrier:
     """
@@ -1149,12 +1168,12 @@ class _OutputTextDeltaCoalescer:
 
         :returns: None after all earlier deltas have been posted.
         """
-        if self._worker_task is None:
+        if self._worker_task is None or self._worker_task.done():
             return
         loop = asyncio.get_running_loop()
         done: asyncio.Future[None] = loop.create_future()
         self._queue.put_nowait(_DeltaFlushBarrier(done=done))
-        await done
+        await self._await_marker(done, "flush barrier")
 
     async def close(self) -> None:
         """
@@ -1164,12 +1183,51 @@ class _OutputTextDeltaCoalescer:
         """
         if self._worker_task is None:
             return
+        # A worker that already stopped will never read the marker, so skip
+        # straight to reaping it rather than waiting out the bound.
+        if self._worker_task.done():
+            self._worker_task = None
+            return
         loop = asyncio.get_running_loop()
         done: asyncio.Future[None] = loop.create_future()
         self._queue.put_nowait(_DeltaFlushStop(done=done))
-        await done
-        await self._worker_task
+        await self._await_marker(done, "stop marker")
+        # Only reap a worker that has actually finished; awaiting a wedged one
+        # would reintroduce the unbounded wait this method exists to remove.
+        if self._worker_task.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._worker_task
         self._worker_task = None
+
+    async def _await_marker(self, done: asyncio.Future[None], marker: str) -> None:
+        """
+        Wait for the worker to resolve a queue marker.
+
+        Races the marker against the worker itself: a worker that stops will never
+        resolve it, and at loop teardown the cancellation order between the worker
+        and the caller is arbitrary, so waiting on the marker alone stalls for the
+        full bound on an ordinary shutdown.
+
+        :param done: Future the worker resolves for this marker.
+        :param marker: Marker name used in the timeout log.
+        :returns: None once resolved, once the worker stops, or once the bound elapses.
+        """
+        worker = self._worker_task
+        waiters: set[asyncio.Future[None] | asyncio.Task[None]] = {done}
+        if worker is not None:
+            waiters.add(worker)
+        await asyncio.wait(
+            waiters,
+            return_when=asyncio.FIRST_COMPLETED,
+            timeout=_DELTA_MARKER_TIMEOUT_SECONDS,
+        )
+        if not done.done() and (worker is None or not worker.done()):
+            _logger.warning(
+                "codex delta coalescer %s timed out after %.1fs (session=%s)",
+                marker,
+                _DELTA_MARKER_TIMEOUT_SECONDS,
+                self._session_id,
+            )
 
     def _ensure_worker(self) -> None:
         """
@@ -1239,10 +1297,10 @@ class _OutputTextDeltaCoalescer:
                 buffer_chunk = None
                 buffered_chars = 0
                 flush_deadline = None
-                item.done.set_result(None)
+                _resolve_marker(item.done)
                 continue
             await self._flush_buffer(buffer, chunk=buffer_chunk)
-            item.done.set_result(None)
+            _resolve_marker(item.done)
             return
 
     async def _flush_buffer(

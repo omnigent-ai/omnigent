@@ -632,6 +632,10 @@ async def _noop() -> None:
     return None
 
 
+async def _ignore_status(_client, *, session_id, status, response_id=None) -> None:
+    """Stub for tests that assert on mirrored items, not live-card status edges."""
+
+
 async def test_forward_loop_rebases_idle_count_on_compaction_repin(tmp_path, monkeypatch) -> None:
     """Compaction re-pin rebases the idle posted-count to the child's count.
 
@@ -1694,6 +1698,257 @@ async def test_forward_loop_running_edge_does_not_advance_cursor_before_item(
     # last_id must still be 0, letting a restart re-read the opening row.
     assert ("running", "hermes_turn_1") in statuses
     assert f._read_state(bridge_dir).last_id == 0
+
+
+@pytest.mark.asyncio
+async def test_forward_loop_does_not_advance_cursor_mid_row(tmp_path, monkeypatch) -> None:
+    """A failed POST partway through one row's items must NOT advance last_id past
+    that row. One assistant row expands to several items sharing a msg_id (prose +
+    a function_call per tool call); advancing the cursor after each item means an
+    earlier item's success moves last_id past the row, so _read_new_items (WHERE
+    id > last_id) skips it and the undelivered items are dropped permanently."""
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_SCHEMA)
+    con.execute(
+        "INSERT INTO sessions(id, source, cwd, started_at) VALUES (?,?,?,?)",
+        ("s1", "cli", workspace, 1000.0),
+    )
+    calls = json.dumps([{"id": "c1", "function": {"name": "search", "arguments": "{}"}}])
+    con.executemany(
+        "INSERT INTO messages"
+        "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+        " VALUES (?,?,?,?,?,?,?)",
+        [
+            # id=1: user row, delivers cleanly, so the cursor may reach 1.
+            ("s1", "user", "do it", None, None, None, 1),
+            # id=2: assistant row with BOTH prose and a tool call, expands to
+            # [message(2), function_call(2)]; the function_call POST fails below.
+            ("s1", "assistant", "I'll search", None, calls, None, 1),
+        ],
+    )
+    con.commit()
+    con.close()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    posted: list[tuple[int, str]] = []
+
+    async def _post_until_second_item_of_row_2(_client, *, session_id, item):
+        if item.msg_id == 2 and item.item_type == "function_call":
+            raise RuntimeError("simulated transient failure on row 2's second item")
+        posted.append((item.msg_id, item.item_type))
+
+    monkeypatch.setattr(f, "_post_conversation_item", _post_until_second_item_of_row_2)
+    monkeypatch.setattr(f, "_post_external_session_status", _ignore_status)
+
+    iteration = {"n": 0}
+
+    async def _sleep(_s):
+        iteration["n"] += 1
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(f.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_hermes_store_to_session(
+            base_url="http://x",
+            headers={},
+            session_id="conv_midrow",
+            bridge_dir=bridge_dir,
+            agent_name="hermes-native-ui",
+            workspace=workspace,
+            launch_epoch_s=1000.0,
+            db_path=db,
+        )
+
+    # Row 2's prose delivered before its function_call failed, so the persisted
+    # cursor must still leave row 2 reachable: a resume from it has to replay the
+    # undelivered function_call. A cursor of plain id=2 (WHERE id > 2) skips the
+    # row and drops that item permanently.
+    assert (2, "message") in posted, "row 2's prose was not attempted before the failure"
+    state = f._read_state(bridge_dir)
+    resumed = f._read_new_items(db, "s1", state.last_id, "hermes-native-ui")
+    assert [(i.msg_id, i.item_type) for i in resumed if i.item_type] == [
+        (2, "message"),
+        (2, "function_call"),
+    ], "row 2 is unreachable from the persisted cursor, so its function_call is lost"
+
+
+@pytest.mark.asyncio
+async def test_forward_loop_redelivery_skips_already_posted_items(tmp_path, monkeypatch) -> None:
+    """Re-reading a partially-delivered row must not re-POST its delivered items.
+    The cursor stays at the last fully-delivered row, so the next poll re-reads the
+    row; without per-item delivery tracking its already-posted prose would be
+    mirrored twice, duplicating the assistant message in the conversation."""
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_SCHEMA)
+    con.execute(
+        "INSERT INTO sessions(id, source, cwd, started_at) VALUES (?,?,?,?)",
+        ("s1", "cli", workspace, 1000.0),
+    )
+    calls = json.dumps([{"id": "c1", "function": {"name": "search", "arguments": "{}"}}])
+    con.execute(
+        "INSERT INTO messages"
+        "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+        " VALUES (?,?,?,?,?,?,?)",
+        ("s1", "assistant", "I'll search", None, calls, None, 1),
+    )
+    con.commit()
+    con.close()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    posted: list[tuple[int, str]] = []
+    fail = {"on": True}
+
+    async def _fail_first_attempt_at_function_call(_client, *, session_id, item):
+        if fail["on"] and item.msg_id == 1 and item.item_type == "function_call":
+            fail["on"] = False  # the retry on the next poll succeeds
+            raise RuntimeError("simulated transient failure on row 1's second item")
+        posted.append((item.msg_id, item.item_type))
+
+    monkeypatch.setattr(f, "_post_conversation_item", _fail_first_attempt_at_function_call)
+    monkeypatch.setattr(f, "_post_external_session_status", _ignore_status)
+
+    iteration = {"n": 0}
+
+    async def _sleep(_s):
+        iteration["n"] += 1
+        if iteration["n"] >= 2:  # poll 1 fails mid-row, poll 2 retries
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(f.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_hermes_store_to_session(
+            base_url="http://x",
+            headers={},
+            session_id="conv_redeliver",
+            bridge_dir=bridge_dir,
+            agent_name="hermes-native-ui",
+            workspace=workspace,
+            launch_epoch_s=1000.0,
+            db_path=db,
+        )
+
+    # Each item mirrored exactly once: the prose is not re-posted on the retry,
+    # and the function_call that failed the first time lands on the second poll.
+    assert posted == [(1, "message"), (1, "function_call")]
+    assert f._read_state(bridge_dir).last_id == 1
+
+
+def test_drop_delivered_prefix_only_trims_its_own_row() -> None:
+    """The delivered-prefix trim applies to the named row only. A row that vanished
+    before the retry (compaction soft-deletes rows) must leave the batch untouched
+    rather than trimming whichever row now happens to come first."""
+
+    def _item(msg_id: int, name: str) -> f._MirrorItem:
+        return f._MirrorItem(msg_id=msg_id, item_type=name, item_data={}, response_id="r")
+
+    batch = [_item(7, "message"), _item(7, "function_call"), _item(8, "message")]
+    # Row 7 delivered its first item: only that item is dropped.
+    assert f._drop_delivered_prefix(batch, 7, 1) == [
+        _item(7, "function_call"),
+        _item(8, "message"),
+    ]
+    # Row 7 is gone from the batch, so nothing is trimmed from rows 8+.
+    assert f._drop_delivered_prefix([_item(8, "message")], 7, 1) == [_item(8, "message")]
+    # A row shorter than the recorded offset drops entirely rather than re-posting.
+    assert f._drop_delivered_prefix([_item(7, "message")], 7, 3) == []
+
+
+@pytest.mark.asyncio
+async def test_forward_loop_partial_count_resets_when_partial_row_vanishes(
+    tmp_path, monkeypatch
+) -> None:
+    """The in-row item count must restart on a row we were not already inside.
+
+    A row that failed partway can disappear before its retry: compaction
+    soft-deletes it (``active=0``) and the child re-pin that resets the partial
+    fields is skipped when the session has no child. Carrying its count into the
+    next row would treat that row's undelivered items as already delivered and
+    drop them, the same permanent loss this cursor is meant to prevent."""
+    workspace = str(tmp_path)
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_SCHEMA)
+    con.execute(
+        "INSERT INTO sessions(id, source, cwd, started_at) VALUES (?,?,?,?)",
+        ("s1", "cli", workspace, 1000.0),
+    )
+    calls = json.dumps([{"id": "c1", "function": {"name": "search", "arguments": "{}"}}])
+    # Row 1 carries prose + a tool call, so it expands to two items; its second
+    # item's POST fails below, leaving the cursor inside row 1.
+    con.execute(
+        "INSERT INTO messages"
+        "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+        " VALUES (?,?,?,?,?,?,?)",
+        ("s1", "assistant", "I'll search", None, calls, None, 1),
+    )
+    con.commit()
+    con.close()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    posted: list[tuple[int, str]] = []
+    row_2_call_failed = {"yet": False}
+
+    async def _fail_each_row_second_item_once(_client, *, session_id, item):
+        if item.item_type == "function_call":
+            # Row 1 never retries (it is soft-deleted below); row 2 fails its
+            # first attempt so the retry has to replay it.
+            if item.msg_id == 1:
+                raise RuntimeError("simulated transient failure on row 1's second item")
+            if item.msg_id == 2 and not row_2_call_failed["yet"]:
+                row_2_call_failed["yet"] = True
+                raise RuntimeError("simulated transient failure on row 2's second item")
+        posted.append((item.msg_id, item.item_type))
+
+    monkeypatch.setattr(f, "_post_conversation_item", _fail_each_row_second_item_once)
+    monkeypatch.setattr(f, "_post_external_session_status", _ignore_status)
+
+    iteration = {"n": 0}
+
+    async def _sleep(_s):
+        iteration["n"] += 1
+        if iteration["n"] == 1:
+            # Between polls: compaction soft-deletes the partially-mirrored row 1
+            # and a fresh row 2 lands, which also carries prose + a tool call.
+            con = sqlite3.connect(db)
+            con.execute("UPDATE messages SET active = 0 WHERE id = 1")
+            con.execute(
+                "INSERT INTO messages"
+                "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
+                " VALUES (?,?,?,?,?,?,?)",
+                ("s1", "assistant", "retrying", None, calls, None, 1),
+            )
+            con.commit()
+            con.close()
+        if iteration["n"] >= 3:  # poll 2 fails on row 2, poll 3 retries it
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(f.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await f.forward_hermes_store_to_session(
+            base_url="http://x",
+            headers={},
+            session_id="conv_vanished",
+            bridge_dir=bridge_dir,
+            agent_name="hermes-native-ui",
+            workspace=workspace,
+            launch_epoch_s=1000.0,
+            db_path=db,
+        )
+
+    # Both of row 2's items land exactly once. Inheriting row 1's count would make
+    # the retry drop row 2's prose as already delivered, losing it permanently.
+    assert [m for m in posted if m[0] == 2] == [(2, "message"), (2, "function_call")]
+    assert f._read_state(bridge_dir).last_id == 2
 
 
 @pytest.mark.asyncio

@@ -667,6 +667,16 @@ export class TerminalSession {
   }
 
   /**
+   * Give the terminal keyboard focus. The WS-open handler focuses
+   * automatically, but that call is a browser no-op while the surface is
+   * hidden (a pre-warmed attach behind the chat view), so the view calls
+   * this when the surface is revealed.
+   */
+  focus(): void {
+    this.term.focus();
+  }
+
+  /**
    * Update the terminal's code font (size + family) without reconnecting —
    * mirrors {@link setTheme}, mutating options in place. A new glyph size
    * changes the character-cell dimensions, so this re-fits the grid to the

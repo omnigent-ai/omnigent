@@ -68,9 +68,6 @@ from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
 )
 from omnigent.server.routes._auth_helpers import (
-    require_approval_access as _require_approval_access,
-)
-from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
@@ -78,6 +75,7 @@ from omnigent.server.routes._sessions.common import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
     _COMPACT_TYPE,
+    _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
     _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
@@ -120,6 +118,7 @@ from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
     _apply_pending_policy_ask_writes,
     _await_settled_managed_launch,
+    _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
     _dispatch_skill_slash_command_to_runner,
@@ -160,7 +159,6 @@ from omnigent.server.routes._sessions.helpers import (
     _stop_session_host_runner,
     _stop_session_via_runner,
     _stream_live_events,
-    _subagent_delivery_status,
     _wait_for_runner_client,
 )
 from omnigent.server.routes._sessions.orchestration import (
@@ -176,6 +174,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _is_native_terminal_session,
     _maybe_relaunch_managed_sandbox,
     _maybe_wake_stale_resumable_managed_sandbox,
+    _persist_external_antigravity_subagent_start,
     _persist_external_codex_subagent_start,
     _persist_external_conversation_item,
     _persist_external_session_usage,
@@ -400,6 +399,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_TODOS_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+            _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
             _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
         ):
@@ -476,7 +476,6 @@ def register_events_routes(
                 # deny sentinel on the session stream so the
                 # client/REPL sees feedback.
                 reason = _input_verdict.get("reason", "Denied by policy")
-                _publish_status(session_id, "running")
                 _publish_policy_deny(session_id, reason)
                 await _persist_policy_deny_sentinel(
                     session_id,
@@ -485,8 +484,16 @@ def register_events_routes(
                     conversation_store,
                     agent_store,
                 )
-                # Terminal response.completed before idle so live-tail
-                # consumers (the headless ``-p`` client) unblock.
+                # Terminal ``response.completed`` renders the sentinel; the
+                # trailing ``idle`` ends the turn. A request-phase deny/refuse
+                # IS a turn boundary — the client optimistically went "working"
+                # on send — but the message never reached a harness, so nothing
+                # downstream (harness / interrupt / status file) emits the
+                # turn-end. This ``idle`` is that signal; clients that settle a
+                # turn only on a ``session.status`` edge (the REPL, the headless
+                # ``-p`` client) hang without it. No leading ``running``: the
+                # turn never dispatched, and a phantom ``running`` would fold a
+                # concurrent live bubble mid-stream.
                 _publish_input_deny_terminal(session_id, conv, reason)
                 _publish_status(session_id, "idle")
                 # Return the same shape the client expects from POST
@@ -508,7 +515,6 @@ def register_events_routes(
             )
             if _input_verdict is not None:
                 reason = _input_verdict.get("reason", "Denied by policy")
-                _publish_status(session_id, "running")
                 _publish_policy_deny(session_id, reason)
                 await _persist_policy_deny_sentinel(
                     session_id,
@@ -517,7 +523,9 @@ def register_events_routes(
                     conversation_store,
                     agent_store,
                 )
-                # Terminal response.completed before idle (see message branch).
+                # Terminal response.completed + trailing ``idle`` turn-end (see
+                # the message branch above for why the idle is required and the
+                # leading running is not).
                 _publish_input_deny_terminal(session_id, conv, reason)
                 _publish_status(session_id, "idle")
                 return {"queued": False, "denied": True, "reason": reason}
@@ -677,20 +685,6 @@ def register_events_routes(
                 pass
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
-            # Accepting authorizes a tool to run with the session owner's
-            # execution identity, so authority must be explicitly delegated.
-            # Editors may still decline/cancel to stop an unsafe or unwanted
-            # action; the route-level edit gate above already authorizes that.
-            if body.data.get("action") not in {"decline", "cancel"}:
-                await _require_approval_access(
-                    user_id, session_id, permission_store, conversation_store
-                )
-            _logger.info(
-                "approval verdict submitted: session=%s actor=%s action=%s",
-                session_id,
-                user_id,
-                body.data.get("action"),
-            )
             # Deliver the verdict through the shared resolver: it
             # sets any server-side harness Future (owner-checked),
             # clears the sidebar badge, and forwards
@@ -897,10 +891,13 @@ def register_events_routes(
             blocked_on = (
                 raw_blocked_on if isinstance(raw_blocked_on, str) and raw_blocked_on else None
             )
-            # A sub-agent's background-task ``waiting`` must deliver as ``idle``
-            # so the parent's terminal-delivery branch below fires (otherwise
-            # the orchestrator hangs); the tally still drives the child spinner.
-            effective_status = _subagent_delivery_status(status, bg_count, conv)
+            # A background-task ``waiting`` marks an ended turn, so deliver it
+            # as ``idle``: the session takes a new message now, and for a
+            # sub-agent the terminal-delivery branch below must fire (otherwise
+            # the orchestrator hangs). The tally still drives the indicator.
+            # The claude-native forwarder no longer sends ``waiting`` at all —
+            # this normalizes it for runners that predate that change.
+            effective_status = _background_task_delivery_status(status, bg_count, conv)
             if effective_status != status:
                 status = effective_status
                 body.data["status"] = status
@@ -1073,6 +1070,16 @@ def register_events_routes(
             # Returned to the claude-native forwarder so it can address
             # subsequent ``external_conversation_item`` /
             # ``external_session_status`` events to the child id.
+            return {"queued": False, "child_session_id": child_id}
+        if body.type == _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE:
+            child_id = await _persist_external_antigravity_subagent_start(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+            )
+            # Returned to the agy reader so it can mirror the child cascade's
+            # steps into this id.
             return {"queued": False, "child_session_id": child_id}
         if body.type == _EXTERNAL_CODEX_SUBAGENT_START_TYPE:
             child_id = await _persist_external_codex_subagent_start(
@@ -1495,7 +1502,6 @@ def register_events_routes(
             artifact_store=artifact_store,
             has_mcp_servers=_has_mcp_servers,
             created_by=created_by,
-            author_attribution_required=(access.level is not None and access.level < LEVEL_OWNER),
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
             # Read only for the gateway-backing check that decides which router

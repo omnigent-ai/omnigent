@@ -8,6 +8,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from issue_prioritization.bronze import BronzeIssue
+from issue_prioritization.comments import COMMENT_MARKER, build_triage_comment
 from issue_prioritization.labels import LabelManifest
 from issue_prioritization.mutations import (
     BotState,
@@ -30,6 +31,8 @@ class GitHubLabels(Protocol):
         labels_add: tuple[str, ...],
         labels_remove: tuple[str, ...],
     ) -> None: ...
+
+    def upsert_issue_comment(self, issue_number: int, body: str) -> int: ...
 
 
 class PriorityLabelHistory(Protocol):
@@ -95,6 +98,33 @@ class GitHubClient:
                 f"/issues/{issue_number}/labels/{quote(label, safe='')}",
                 None,
             )
+
+    def upsert_issue_comment(self, issue_number: int, body: str) -> int:
+        page = 1
+        while True:
+            value = self.transport(
+                "GET",
+                f"/issues/{issue_number}/comments?per_page=100&page={page}",
+                None,
+            )
+            if not isinstance(value, list):
+                raise ValueError("GitHub issue comments response must be an array")
+            for comment in value:
+                if not isinstance(comment, dict) or COMMENT_MARKER not in str(
+                    comment.get("body", "")
+                ):
+                    continue
+                comment_id = int(comment["id"])
+                if comment.get("body") != body:
+                    self.transport("PATCH", f"/issues/comments/{comment_id}", {"body": body})
+                return comment_id
+            if len(value) < 100:
+                break
+            page += 1
+        created = self.transport("POST", f"/issues/{issue_number}/comments", {"body": body})
+        if not isinstance(created, dict) or not created.get("id"):
+            raise ValueError("GitHub issue comment response must include an id")
+        return int(created["id"])
 
     def priority_label_actor(self, issue_number: int, priority: str) -> str | None:
         actor = None
@@ -201,6 +231,7 @@ class GitHubMutationSink:
 
     def apply_with_plans(self, run: PipelineRun) -> tuple[MutationPlan, ...]:
         self.client.sync_missing_labels(self.manifest)
+        ranked = {item.issue.number: item for item in run.ranked}
         states = self.states.load()
         updated = []
         applied = []
@@ -226,6 +257,17 @@ class GitHubMutationSink:
                 ):
                     updated.append(plan.next_state)
                 states[issue_number] = plan.next_state
+                labels_after = _labels_after(current_labels, plan)
+                if item := ranked.get(issue_number):
+                    self.client.upsert_issue_comment(
+                        issue_number,
+                        build_triage_comment(item, plan, labels_after),
+                    )
         finally:
             self.states.upsert(updated)
         return tuple(applied)
+
+
+def _labels_after(current: tuple[str, ...], plan: MutationPlan) -> tuple[str, ...]:
+    labels = (set(current) - set(plan.labels_remove)) | set(plan.labels_add)
+    return tuple(sorted(labels))

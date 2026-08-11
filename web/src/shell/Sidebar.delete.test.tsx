@@ -1,9 +1,10 @@
-// Tests for the async (non-blocking) delete-session flow in the
-// sidebar. The contract: clicking "Delete" in the confirm dialog fires
-// the mutation and closes the dialog *immediately* (without awaiting the
-// server), and the row then shows its own "Deleting…" / error status so
-// the user is never blocked on the page. See ConversationRow.confirmDelete
-// and DeletingRow in Sidebar.tsx.
+// Tests for the optimistic delete-session flow in the sidebar. The
+// contract: clicking "Delete" in the confirm dialog fires the mutation,
+// closes the dialog, and leaves the row alone — the mutation itself
+// splices the row out of the cached lists on the next frame (see
+// `useStopAndDeleteConversation`), so the sidebar never shows an
+// in-flight status row for a delete the way it does for an archive.
+// See ConversationRow.confirmDelete in Sidebar.tsx.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
@@ -132,7 +133,7 @@ afterEach(() => {
   cleanup();
 });
 
-describe("async delete session flow", () => {
+describe("optimistic delete session flow", () => {
   it("closes the confirm dialog immediately on Delete without awaiting the mutation", () => {
     renderSidebar();
     openDeleteDialog();
@@ -143,65 +144,49 @@ describe("async delete session flow", () => {
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
 
-    // The mutation fired with the row's id and the (unchecked) branch flag,
-    // plus an onSuccess callback for the active-session redirect.
+    // The mutation fired with the row's id and the (unchecked) branch flag.
+    // No mutate-level callbacks: the row is spliced out of the cached lists
+    // optimistically, which unmounts this component — callbacks on an
+    // unmounted observer never fire, so everything lives in the hook or runs
+    // synchronously at click time.
     expect(mocks.del.mutate).toHaveBeenCalledTimes(1);
-    expect(mocks.del.mutate).toHaveBeenCalledWith(
-      { id: "conv_1", deleteBranch: false },
-      expect.objectContaining({ onSuccess: expect.any(Function) }),
-    );
+    expect(mocks.del.mutate).toHaveBeenCalledWith({ id: "conv_1", deleteBranch: false });
 
-    // The dialog is gone even though the mutate stub never invoked
-    // onSuccess. If confirmDelete awaited the server before closing
-    // (the old blocking behavior), the dialog would still be open here.
+    // The dialog is gone even though the mutate stub never resolved. If
+    // confirmDelete awaited the server before closing (the old blocking
+    // behavior), the dialog would still be open here.
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
-  it("renders a Deleting… status row while the delete is in flight", () => {
+  it("shows no in-flight status row — the row is removed optimistically instead", () => {
+    // The real hook drops the row from the cached list in onMutate, so by
+    // the time a delete is pending the row is already gone from the sidebar.
+    // A "Deleting…" placeholder would therefore only ever appear when the
+    // splice hadn't happened — and would reintroduce the round-trip-long
+    // wait that made delete feel slower than archive.
     mocks.del.isPending = true;
     renderSidebar();
 
-    // The in-flight status row replaces the interactive row.
-    expect(screen.getByTestId("conversation-deleting")).toBeInTheDocument();
-    expect(screen.getByText("Deleting…")).toBeInTheDocument();
-    // The navigable row link is gone while deleting — the user can't
-    // re-open or re-delete a row that's mid-deletion.
-    expect(screen.queryByRole("link", { name: /My Session/ })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("conversation-deleting")).not.toBeInTheDocument();
+    expect(screen.queryByText("Deleting…")).not.toBeInTheDocument();
+    // With this mocked hook the cache is never spliced, so the row stays —
+    // and it stays fully interactive rather than being swapped for a stub.
+    expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
   });
 
-  it("shows a retryable error row when the delete fails; Retry replays the same args", () => {
+  it("keeps the row interactive when a delete fails (no error row)", () => {
+    // A failed delete restores the row and reports via a toast (fired by the
+    // hook). The row itself must come back as an ordinary, usable row — the
+    // old inline error/retry state can't survive a row that unmounted when
+    // it was spliced out.
     mocks.del.isError = true;
-    // Mirrors react-query exposing the last mutate() args; a user who
-    // opted into branch deletion must get the same on retry.
     mocks.del.variables = { id: "conv_1", deleteBranch: true };
     renderSidebar();
 
-    const failed = screen.getByTestId("conversation-delete-failed");
-    expect(within(failed).getByText(/Couldn't delete/)).toBeInTheDocument();
-    // The session label is in the *visible* text (not just a tooltip) so
-    // the user can tell which row failed when several deletes fail.
-    expect(within(failed).getByText("My Session")).toBeInTheDocument();
-
-    fireEvent.click(within(failed).getByRole("button", { name: "Retry" }));
-    // Retry replays the exact prior args (incl. deleteBranch: true), not
-    // a freshly-recomputed payload that could drop the branch flag.
-    expect(mocks.del.mutate).toHaveBeenCalledTimes(1);
-    expect(mocks.del.mutate).toHaveBeenCalledWith(
-      { id: "conv_1", deleteBranch: true },
-      expect.objectContaining({ onSuccess: expect.any(Function) }),
-    );
-  });
-
-  it("clears the error row via Dismiss (resets the mutation back to idle)", () => {
-    mocks.del.isError = true;
-    mocks.del.variables = { id: "conv_1", deleteBranch: false };
-    renderSidebar();
-
-    const failed = screen.getByTestId("conversation-delete-failed");
-    fireEvent.click(within(failed).getByRole("button", { name: /dismiss delete error/i }));
-    // Dismiss calls reset() so the next render drops back to the normal
-    // interactive row (isError → false).
-    expect(mocks.del.reset).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("conversation-delete-failed")).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
+    // No automatic replay: the restored row is the retry affordance.
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
   });
 });
 
@@ -248,13 +233,14 @@ describe("branch-name wrapping in the delete dialog", () => {
   });
 });
 
-// --- Active-session redirect on successful delete ---------------------
+// --- Active-session redirect on delete --------------------------------
 //
-// Delete is fire-and-forget, so the onSuccess redirect must key off the
-// conversation the user is viewing *when it resolves*, not the one they
-// were viewing when they clicked Delete. These tests render with a real
-// router (so useParams resolves the active id) and a probe that reports
-// the current pathname.
+// The row leaves the sidebar the moment Delete is confirmed, so the
+// redirect runs then too: if the user is viewing the session being
+// deleted, the chat surface would otherwise sit on an id that's about to
+// 404. Deleting any other row must leave them where they are. These tests
+// render with a real router (so useParams resolves the active id) and a
+// probe that reports the current pathname.
 
 const CONV_OTHER: Conversation = { ...CONV, id: "conv_2", title: "Other Session" };
 
@@ -286,48 +272,39 @@ function renderSidebarRouted(path: string) {
   );
 }
 
-/** Drive a Delete through to the captured onSuccess callback for `row`. */
+/** Confirm a Delete from `row`'s kebab menu. */
 function fireDeleteFrom(row: HTMLElement) {
   fireEvent.pointerDown(within(row).getByTestId("conversation-actions"), { button: 0 });
   fireEvent.click(screen.getByTestId("delete-conversation"));
-  fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Delete" }));
-  // del.mutate is a stub; pull the onSuccess it was handed so the test
-  // can fire it at the moment of its choosing.
-  const call = mocks.del.mutate.mock.calls.at(-1);
-  return call?.[1]?.onSuccess as () => void;
+  act(() => {
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Delete" }));
+  });
 }
 
-describe("active-session redirect on successful delete", () => {
-  it("redirects to / when the deleted conversation is still the active one", () => {
+describe("active-session redirect on delete", () => {
+  it("redirects to / when the deleted conversation is the active one", () => {
     mockConversations([CONV, CONV_OTHER]);
     renderSidebarRouted("/c/conv_1");
     expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_1");
 
-    const row = screen.getByRole("link", { name: /My Session/ }).closest("li") as HTMLElement;
-    const onSuccess = fireDeleteFrom(row);
-    act(() => onSuccess());
+    fireDeleteFrom(screen.getByRole("link", { name: /My Session/ }).closest("li") as HTMLElement);
 
-    // Still viewing conv_1 when it was deleted → bounce to / so the chat
-    // surface doesn't 404 on the missing id.
+    // Viewing conv_1 when it was deleted → bounce to / immediately, so the
+    // chat surface never sits on an id the server is about to forget. The
+    // mutate stub never resolves, proving the redirect doesn't wait on it.
     expect(screen.getByTestId("loc")).toHaveTextContent("/");
   });
 
-  it("does NOT redirect when the user navigated away before the delete resolved", () => {
+  it("does NOT redirect when deleting a row the user isn't viewing", () => {
     mockConversations([CONV, CONV_OTHER]);
-    renderSidebarRouted("/c/conv_1");
-
-    const row = screen.getByRole("link", { name: /My Session/ }).closest("li") as HTMLElement;
-    // Initiate the delete while conv_1 is active...
-    const onSuccess = fireDeleteFrom(row);
-    // ...then navigate to conv_2 before the (still-pending) delete resolves.
-    fireEvent.click(screen.getByRole("link", { name: /Other Session/ }));
+    renderSidebarRouted("/c/conv_2");
     expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_2");
 
-    act(() => onSuccess());
+    // Delete the *other* session from the sidebar while viewing conv_2.
+    fireDeleteFrom(screen.getByRole("link", { name: /My Session/ }).closest("li") as HTMLElement);
 
-    // The redirect reads the *live* active id (conv_2 ≠ conv_1), so the
-    // user stays put. The old code captured isActive=true at click time
-    // and would have yanked them to /.
+    // conv_2 is untouched, so the user stays in the chat they're reading —
+    // a redirect here would yank them out of an unrelated session.
     expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_2");
   });
 });

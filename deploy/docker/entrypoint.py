@@ -188,7 +188,11 @@ def _resolve_config() -> _ResolvedConfig:
     # kill-switch path gets the marker: an EXPLICIT
     # OMNIGENT_AUTH_PROVIDER=header deploy declared a header-injecting
     # proxy and must stay strict.
-    from omnigent.server.auth import env_var_is_truthy
+    from omnigent.server.auth import (
+        env_var_is_truthy,
+        resolve_auth_source,
+        warn_if_single_user_exposed,
+    )
 
     # Compose passes OMNIGENT_AUTH_PROVIDER as "" when unset
     # ("${VAR:-}"): empty and missing both mean "not explicitly pinned".
@@ -202,8 +206,6 @@ def _resolve_config() -> _ResolvedConfig:
     # compose up` deploy works with zero config. Gate on the *resolved*
     # selection so an explicit header/oidc deploy (or AUTH_ENABLED=0)
     # doesn't mint accounts secrets it never reads.
-    from omnigent.server.auth import resolve_auth_source
-
     if resolve_auth_source() == "accounts":
         from omnigent.server.accounts_secret import load_or_generate_cookie_secret
 
@@ -220,6 +222,11 @@ def _resolve_config() -> _ResolvedConfig:
             os.environ["OMNIGENT_ACCOUNTS_BASE_URL"] = detect_base_url(
                 os.environ, host=host, port=port
             )
+
+    # Logged, not printed: container stderr is buried in a platform log viewer.
+    _exposure = warn_if_single_user_exposed(host)
+    if _exposure:
+        logger.warning("%s", _exposure)
 
     return _ResolvedConfig(
         cfg=cfg,

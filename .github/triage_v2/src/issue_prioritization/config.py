@@ -7,7 +7,7 @@ from decimal import Decimal
 from importlib.resources import files
 from pathlib import Path
 
-from issue_prioritization.domain import Priority, Severity
+from issue_prioritization.domain import Impact, Priority
 
 
 @dataclass(frozen=True)
@@ -21,7 +21,7 @@ class ModuleConfig:
 
 @dataclass(frozen=True)
 class ScoringConfig:
-    severity_weights: Mapping[Severity, Decimal]
+    impact_weights: Mapping[Impact, Decimal]
     priority_thresholds: Mapping[Priority, Decimal]
     module_order: tuple[str, ...]
     modules: Mapping[str, ModuleConfig]
@@ -37,7 +37,7 @@ class ScoringConfig:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> ScoringConfig:
-        severity_values = _mapping(value, "severity_weights")
+        impact_values = _mapping_alias(value, "impact_weights", "severity_weights")
         threshold_values = _mapping(value, "priority_thresholds")
         module_values = _mapping(value, "modules")
         modules: dict[str, ModuleConfig] = {}
@@ -57,8 +57,8 @@ class ScoringConfig:
             raise ValueError("module_order must be an array")
 
         config = cls(
-            severity_weights={
-                Severity(str(name)): _decimal(weight) for name, weight in severity_values.items()
+            impact_weights={
+                Impact.parse(name): _decimal(weight) for name, weight in impact_values.items()
             },
             priority_thresholds={
                 Priority(str(name)): _decimal(threshold)
@@ -71,8 +71,8 @@ class ScoringConfig:
         return config
 
     def validate(self) -> None:
-        if set(self.severity_weights) != set(Severity):
-            raise ValueError("severity_weights must define S0-S3")
+        if set(self.impact_weights) != set(Impact):
+            raise ValueError("impact_weights must define critical, high, medium, and low")
         if set(self.priority_thresholds) != set(Priority):
             raise ValueError("priority_thresholds must define P0-P3")
         missing = set(self.module_order) - set(self.modules)
@@ -87,9 +87,8 @@ class ScoringConfig:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "severity_weights": {
-                severity.value: _json_number(weight)
-                for severity, weight in self.severity_weights.items()
+            "impact_weights": {
+                impact.value: _json_number(weight) for impact, weight in self.impact_weights.items()
             },
             "priority_thresholds": {
                 priority.value: _json_number(threshold)
@@ -108,6 +107,17 @@ class ScoringConfig:
 
 def _mapping(value: Mapping[str, object], name: str) -> Mapping[str, object]:
     result = value.get(name)
+    if not isinstance(result, Mapping):
+        raise ValueError(f"{name} must be an object")
+    return result
+
+
+def _mapping_alias(
+    value: Mapping[str, object],
+    name: str,
+    legacy_name: str,
+) -> Mapping[str, object]:
+    result = value.get(name, value.get(legacy_name))
     if not isinstance(result, Mapping):
         raise ValueError(f"{name} must be an object")
     return result

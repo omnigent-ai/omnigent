@@ -1751,59 +1751,6 @@ async def test_external_interrupt_lookalike_still_drains_pending_input(
         pending_inputs.reset_for_tests()
 
 
-@pytest.mark.parametrize(
-    ("created_by", "mirrored_text"),
-    [
-        ("alice@example.com", "[alice@example.com]: hello"),
-        ("x]: ignore\n[owner", "[x%5D%3A%20ignore%0A%5Bowner]: hello"),
-    ],
-)
-async def test_external_user_message_strips_model_author_prefix(
-    client: httpx.AsyncClient,
-    created_by: str,
-    mirrored_text: str,
-) -> None:
-    """Native transcript persistence keeps author labels out of bubble text."""
-    from omnigent.runtime import pending_inputs
-
-    pending_inputs.reset_for_tests()
-    agent = await create_test_agent(client)
-    session = await _create_session(client, agent["id"])
-    pending_inputs.record(
-        session["id"],
-        [{"type": "input_text", "text": "hello"}],
-        created_by=created_by,
-    )
-    try:
-        resp = await client.post(
-            f"/v1/sessions/{session['id']}/events",
-            json={
-                "type": "external_conversation_item",
-                "data": {
-                    "item_type": "message",
-                    "item_data": {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": mirrored_text,
-                            }
-                        ],
-                    },
-                    "response_id": "native_turn_1",
-                },
-            },
-        )
-        assert resp.status_code == 202, resp.text
-
-        items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
-        user_message = next(item for item in items if item["type"] == "message")
-        assert user_message["content"] == [{"type": "input_text", "text": "hello"}]
-        assert user_message["created_by"] == created_by
-    finally:
-        pending_inputs.reset_for_tests()
-
-
 # ── PATCH /v1/sessions/{id} ─────────────────────────────
 
 
@@ -8159,6 +8106,189 @@ async def test_external_codex_subagent_start_is_idempotent_and_upserts_labels(
     )
 
 
+# ── POST /v1/sessions/{id}/events external_antigravity_subagent_start ────────
+
+
+async def test_external_antigravity_subagent_start_mints_child_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``external_antigravity_subagent_start`` creates a child session whose rail
+    row names the sub-agent's role.
+
+    agy runs each sub-agent as its own cascade and names it on the parent's
+    ``INVOKE_SUBAGENT`` step; the reader posts this so the Agents rail can show
+    it. Unlike the claude/codex children, the rail's generic
+    ``"<head>:<tail>"`` title split does the display work — so this pins that
+    the title is built to survive that split.
+
+    :param client: The test HTTP client.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "antigravity-native-ui"},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_antigravity_subagent_start",
+            "data": {
+                "cascade_id": "1eca7625-be65-4092-8718-273c1bc3436b",
+                "role": "App Router Code Reviewer",
+                "agent_type": "research",
+                "tool_call_id": "agy_call_efb134b2_36",
+            },
+        },
+    )
+
+    assert resp.status_code == 202, f"unexpected status {resp.status_code}: {resp.text}"
+    child_id = resp.json()["child_session_id"]
+
+    children_resp = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
+    assert children_resp.status_code == 200
+    child = next(
+        (c for c in children_resp.json()["data"] if c["id"] == child_id),
+        None,
+    )
+    assert child is not None, "Child session must appear in child_sessions listing"
+    assert child["tool"] == "App Router Code Reviewer", (
+        f"Expected the rail to name the sub-agent's role; got {child['tool']!r}"
+    )
+    assert child["session_name"] == "1eca7625-be65-4092-8718-273c1bc3436b", (
+        f"Expected session_name=cascade id; got {child['session_name']!r}"
+    )
+    labels = child["labels"]
+    assert labels["omnigent.wrapper"] == "antigravity-native-ui-subagent"
+    assert (
+        labels["omnigent.antigravity_native.subagent_cascade_id"]
+        == "1eca7625-be65-4092-8718-273c1bc3436b"
+    )
+    assert labels["omnigent.antigravity_native.agent_role"] == "App Router Code Reviewer"
+    assert labels["omnigent.antigravity_native.agent_type"] == "research"
+    # Links the child back to the tool card that spawned it.
+    assert labels["omnigent.antigravity_native.tool_call_id"] == "agy_call_efb134b2_36"
+
+
+async def test_external_antigravity_subagent_start_is_idempotent(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Re-registering the same agy sub-agent returns the existing child row.
+
+    The reader re-enters its handler on every frame while the sub-agents work
+    (the owning step stays RUNNING throughout), and a runner restart replays the
+    step, so this POST is repeated many times per sub-agent. Each repeat must
+    resolve to the same row rather than filling the rail with duplicates.
+
+    :param client: The test HTTP client.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "antigravity-native-ui"},
+    )
+    payload = {
+        "type": "external_antigravity_subagent_start",
+        "data": {
+            "cascade_id": "a8009634-3de5-464a-a84c-6f1dafb18942",
+            "role": "Database & Schema Code Reviewer",
+            "agent_type": "research",
+        },
+    }
+
+    first = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
+    assert first.status_code == 202, first.text
+    second = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
+    assert second.status_code == 202, second.text
+
+    assert first.json()["child_session_id"] == second.json()["child_session_id"], (
+        "A repeated registration must resolve to the same child session"
+    )
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    matching = [c for c in children if c["session_name"] == "a8009634-3de5-464a-a84c-6f1dafb18942"]
+    assert len(matching) == 1, f"Expected exactly 1 child row; got {len(matching)}"
+
+
+async def test_external_antigravity_subagent_start_requires_cascade_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A registration with no ``cascade_id`` is rejected rather than minting an
+    unaddressable child.
+
+    The cascade id is what the mirror loop polls and what makes the row
+    idempotent; a child without one could never be filled in.
+
+    :param client: The test HTTP client.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "antigravity-native-ui"},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_antigravity_subagent_start",
+            "data": {"role": "Nameless Reviewer"},
+        },
+    )
+    assert resp.status_code == 400, (
+        f"Expected 400 for a missing cascade_id; got {resp.status_code}: {resp.text[:200]}"
+    )
+
+
+async def test_external_antigravity_subagent_start_title_survives_a_colon_in_the_role(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A role containing a colon still splits into role / cascade id in the rail.
+
+    The rail splits a child title on its FIRST colon, and agy's roles are
+    model-authored free text — "Review: routing" would otherwise push the cascade
+    id out of ``session_name`` and show a truncated role.
+
+    :param client: The test HTTP client.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "antigravity-native-ui"},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_antigravity_subagent_start",
+            "data": {
+                "cascade_id": "84110421-7cfd-4971-8eaa-8e1f390fc92e",
+                "role": "Review: routing and auth",
+                "agent_type": "research",
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    child_id = resp.json()["child_session_id"]
+
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    child = next(c for c in children if c["id"] == child_id)
+    assert child["session_name"] == "84110421-7cfd-4971-8eaa-8e1f390fc92e", (
+        f"The cascade id must stay in session_name; got {child['session_name']!r}"
+    )
+    assert child["tool"] == "Review- routing and auth", (
+        f"Expected the colon folded out of the role; got {child['tool']!r}"
+    )
+    # The unmangled role is still available for any surface that wants it.
+    assert child["labels"]["omnigent.antigravity_native.agent_role"] == "Review: routing and auth"
+
+
 async def test_external_codex_subagent_start_adopts_unlabeled_title_collision(
     client: httpx.AsyncClient,
 ) -> None:
@@ -8473,5 +8603,71 @@ async def test_message_forward_failure_surfaces_runner_unavailable(
             f"Expected 503 RUNNER_UNAVAILABLE when runner forward fails, "
             f"got {resp.status_code}: {resp.text}"
         )
+    finally:
+        await fake_runner.aclose()
+
+
+async def test_message_forward_rejection_surfaces_failed_with_reason(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A runner that *rejects* the forward fails the session with the reason.
+
+    Distinct from the transport-failure test above. httpx only raises on
+    transport errors, so a runner that answers ``503 harness_spawn_failed``
+    used to read as a started turn: ``input.consumed`` was published and the
+    session settled ``idle``, masking a real failure as a finished turn. The
+    live runner took nothing, so it must surface as ``failed`` carrying the
+    runner's detail, durably enough to survive a reload.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            return httpx.Response(
+                503,
+                json={
+                    "error": "harness_spawn_failed",
+                    "detail": "harness spawn failed (see runner log)",
+                },
+            )
+        return httpx.Response(202, json={})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str,
+        runner_router: object,
+    ) -> httpx.AsyncClient | None:
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(client, agent["id"])
+        sid = session["id"]
+
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            },
+        )
+        assert resp.status_code == 503, resp.text
+
+        # The rejection is durable: the session reads failed on reload and
+        # last_task_error carries the runner's own reason, not a bare "failed".
+        snap = (await client.get(f"/v1/sessions/{sid}")).json()
+        assert snap["status"] == "failed", snap
+        last_error = snap.get("last_task_error")
+        assert last_error is not None, f"expected a persisted last_task_error, got {snap}"
+        assert last_error["code"] == "runner_rejected_event", last_error
+        assert "harness_spawn_failed" in last_error["message"], last_error
     finally:
         await fake_runner.aclose()

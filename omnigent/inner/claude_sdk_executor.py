@@ -71,6 +71,7 @@ from .executor import (
     ToolSpec,
     TurnComplete,
     classify_tool_result,
+    describe_exception,
 )
 from .native_attachments import unresolved_attachment_marker
 from .sandbox import (
@@ -1047,34 +1048,19 @@ def _resolve_gateway_env(
 
 
 def _databricks_claude_auth_command(host: str, profile: str | None = None) -> str:
-    """Return the legacy Databricks CLI auth helper command for Claude.
+    """Return the Databricks CLI ``apiKeyHelper`` command for Claude.
 
     :param host: Databricks workspace host, e.g.
         ``"https://example.databricks.com"``.
-    :param profile: Optional ``~/.databrickscfg`` profile name, e.g.
-        ``"oss"``. Preferred over ``--host`` when known: two profiles can
-        share one host, which makes ``databricks auth token --host`` fail
-        ("Use --profile to specify which profile") → empty token → 401.
-        ``--profile`` is always unambiguous.
+    :param profile: Optional ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
+        Preferred over ``--host`` when known; see
+        :func:`~omnigent.inner.databricks_executor.databricks_bearer_token_command`,
+        which owns the command's shape for every harness.
     :returns: Shell command that prints a bearer token.
     """
-    # --profile is unambiguous; --host fails when two profiles share a host.
-    selector = f"--profile {json.dumps(profile)}" if profile else f"--host {json.dumps(host)}"
-    # `--force-refresh` proactively refreshes a still-valid cached token
-    # (guards against a mid-session 401 on long gateway connections) but
-    # only exists in Databricks CLI >= v0.296.0. Probe `--help` and pass it
-    # only when supported: older CLIs reject the unknown flag → empty token
-    # → silent 401. Plain `auth token` still auto-refreshes expired tokens.
-    return (
-        'if [ -n "${DATABRICKS_BEARER:-}" ]; then '
-        'printf "%s\\n" "$DATABRICKS_BEARER"; '
-        "else force=''; "
-        "if databricks auth token --help 2>&1 | grep -q force-refresh; "
-        "then force=--force-refresh; fi; "
-        "env -u DATABRICKS_CONFIG_PROFILE "
-        f"databricks auth token {selector} "
-        "$force --output json | jq -r '.access_token'; fi"
-    )
+    from .databricks_executor import databricks_bearer_token_command
+
+    return databricks_bearer_token_command(host, profile)
 
 
 def _parse_optional_int(value: str | None) -> int | None:
@@ -2376,7 +2362,7 @@ class ClaudeSDKExecutor(Executor):
                 cfg.extra.get("reasoning_effort"), "Claude Agent SDK", CLAUDE_EFFORTS
             )
         except ValueError as exc:
-            yield ExecutorError(message=str(exc), retryable=False)
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
         if reasoning_effort is not None:
             options_kwargs["effort"] = reasoning_effort

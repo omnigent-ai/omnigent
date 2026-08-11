@@ -161,3 +161,41 @@ def test_embedded_omnigent_mcp_flag_forwarded() -> None:
 def test_malformed_embedded_agent_fails_loudly(acp_agent: object) -> None:
     with pytest.raises(ValueError, match="executor acp_agent"):
         _build_acp_spawn_env(_make_spec(harness="acp:helper", acp_agent=acp_agent))
+
+
+def test_env_passthrough_names_are_forwarded(_isolate_config: Path) -> None:
+    """Declared names reach the wrap so the agent can authenticate."""
+    _write_acp_config(
+        _isolate_config,
+        agents=[
+            {
+                "name": "Grok Build",
+                "command": "grok agent stdio",
+                "env_passthrough": ["XAI_API_KEY", "GROK_TOKEN"],
+            }
+        ],
+    )
+    env = _build_acp_spawn_env(_make_spec(harness="acp:grok-build"))
+    assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == "XAI_API_KEY,GROK_TOKEN"
+
+
+def test_env_passthrough_absent_when_undeclared(_isolate_config: Path) -> None:
+    """No declaration writes no var, so the spawn env stays deny-by-default."""
+    _write_acp_config(_isolate_config)
+    env = _build_acp_spawn_env(_make_spec(harness="acp:goose"))
+    assert "HARNESS_ACP_ENV_PASSTHROUGH" not in env
+
+
+def test_embedded_agent_forwards_env_passthrough(_isolate_config: Path) -> None:
+    """A spec-embedded one-shot agent declares names the same way."""
+    _write_acp_config(_isolate_config, agents=[])
+    spec = _make_spec(
+        harness="acp:embedded",
+        acp_agent={
+            "name": "Embedded",
+            "command": "agent stdio",
+            "env_passthrough": ["XAI_API_KEY"],
+        },
+    )
+    env = _build_acp_spawn_env(spec)
+    assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == "XAI_API_KEY"

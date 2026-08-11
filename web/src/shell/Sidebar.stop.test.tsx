@@ -129,6 +129,7 @@ function openKebab() {
 beforeEach(() => {
   mocks.stop.mutate.mockReset();
   mocks.stop.reset.mockReset();
+  mocks.stop.isPending = false;
   mocks.runnerOnline.mockReset();
   mocks.runnerOnline.mockReturnValue(undefined);
 });
@@ -151,6 +152,21 @@ describe("sidebar Stop session item", () => {
     expect(mocks.stop.mutate).toHaveBeenCalledTimes(1);
     // Failure: the dialog stopped a different row's session.
     expect(mocks.stop.mutate.mock.calls[0][0]).toBe("conv_1");
+  });
+
+  it("spins the confirm button while the stop is in flight", () => {
+    // The stop can take seconds. Without the spinner the button only fades
+    // (disabled), which reads as a hang rather than work in progress.
+    mocks.stop.isPending = true;
+    mockConversations([HOST_SPAWNED]);
+    renderSidebar();
+    openKebab();
+    fireEvent.click(screen.getByTestId("stop-conversation"));
+
+    const confirm = screen.getByTestId("stop-session-confirm");
+    expect(confirm).toHaveAttribute("aria-busy", "true");
+    expect(confirm).toBeDisabled();
+    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
   });
 
   it("clears a prior stop failure when the dialog is opened", () => {

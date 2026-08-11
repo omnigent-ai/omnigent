@@ -8,6 +8,7 @@ import importlib.metadata
 import io
 import json
 import os
+import shlex
 import ssl
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -317,13 +318,89 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
             "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "123456",
             "CLAUDE_CODE_USE_GATEWAY": "1",
             "ANTHROPIC_CUSTOM_HEADERS": "x-databricks-use-coding-agent-mode: true",
-            # The gateway allowlists beta flags and 400s the whole request on
-            # an unknown one, so the CLI's experimental betas stay off.
-            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+            # No CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: this path launches in
+            # gateway mode (CLAUDE_CODE_USE_GATEWAY=1), where Claude Code
+            # negotiates the anthropic-beta set with the gateway and keeps MCP
+            # tool search on (it rides on the advanced-tool-use beta).
         },
         api_key_helper="printf token",
         model="databricks-claude-opus-test",
     )
+
+
+def _ucode_state_with_auth_command(auth_command: str) -> Any:
+    """Build a one-agent ucode workspace state carrying *auth_command*."""
+    from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
+
+    return UcodeWorkspaceState(
+        workspace_url="https://example.databricks.com",
+        agents={
+            "claude": UcodeAgentState(
+                model="databricks-claude-opus-test",
+                base_url="https://example.databricks.com/ai-gateway/anthropic",
+                auth_command=auth_command,
+            )
+        },
+    )
+
+
+def test_ucode_config_pins_the_token_helper_to_the_named_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The profile the config names is the identity the pane must authenticate as.
+
+    ucode records its own token command, and it selects the workspace however
+    ucode was configured — often by host. The server's router client instead
+    uses the ``kind: databricks`` provider's profile. Two profiles on one host
+    are two identities, so host selection is how a pane and the router end up
+    disagreeing about whether the workspace is reachable.
+
+    The preference is not exclusive: the recorded command survives as the
+    helper's last resort, for the config that names a credential-less profile.
+    """
+    recorded = (
+        'databricks auth token --host "https://example.databricks.com" '
+        "--output json | jq -r '.access_token'"
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
+        lambda profile: "https://example.databricks.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state",
+        lambda workspace_url: _ucode_state_with_auth_command(recorded),
+    )
+
+    config = claude_native._ucode_config_for_profile("agent", refresh_models=False)
+
+    assert config is not None
+    helper = config.api_key_helper
+    assert helper is not None
+    # The mint selects by profile; the only --host left is the quoted fallback.
+    assert '--profile "agent"' in helper
+    mint, _, fallback = helper.partition("eval ")
+    assert "--host" not in mint
+    assert fallback.startswith(shlex.quote(recorded))
+
+
+def test_ucode_config_leaves_a_non_databricks_token_command_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An enterprise deployment's own token command has a selector we don't know."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
+        lambda profile: "https://example.databricks.com",
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_state.read_ucode_state",
+        lambda workspace_url: _ucode_state_with_auth_command("corp-auth print-token --scope llm"),
+    )
+
+    config = claude_native._ucode_config_for_profile("agent", refresh_models=False)
+
+    assert config is not None
+    assert config.api_key_helper == "corp-auth print-token --scope llm"
 
 
 def test_ucode_config_for_profile_sets_model_tier_env_vars(
@@ -4674,6 +4751,13 @@ async def test_resolve_cold_resume_args_bootstraps_missing_local_claude_transcri
     ]
     assert records[2]["parentUuid"] == records[1]["uuid"]
     assert records[3]["message"]["content"] == [{"type": "text", "text": "TODO.md says contents"}]
+    # An item's wire "model" is the Omnigent agent name, not a Claude model
+    # id. Writing it through makes `--resume` reject it ("Session model
+    # claude-native-ui could not be restored") and silently fall back to a
+    # different model, so no record may carry one.
+    assert all("model" not in record["message"] for record in records), (
+        f"agent name leaked into Claude's model slot: {records!r}"
+    )
     assert all(record["sessionId"] == "claude-uuid-abc" for record in records)
     assert all(record["cwd"] == str(workspace.resolve()) for record in records)
     assert any("after=fc_read_1" in path for path in requested_paths), (
@@ -5832,6 +5916,7 @@ def test_fetch_external_session_id_for_redirect_uses_session_endpoint(
         :param base_url: Omnigent server base URL.
         :param headers: HTTP headers passed by the wrapper.
         :param timeout: Request timeout in seconds.
+        :param trust_env: Whether env proxy settings are honored.
         """
 
         def __init__(
@@ -5840,6 +5925,7 @@ def test_fetch_external_session_id_for_redirect_uses_session_endpoint(
             base_url: str,
             headers: dict[str, str],
             timeout: float,
+            trust_env: bool,
         ) -> None:
             """
             Capture construction arguments for later assertions.
@@ -5847,6 +5933,7 @@ def test_fetch_external_session_id_for_redirect_uses_session_endpoint(
             :param base_url: Omnigent server base URL.
             :param headers: HTTP headers passed by the wrapper.
             :param timeout: Request timeout in seconds.
+            :param trust_env: Whether env proxy settings are honored.
             :returns: None.
             """
             calls.append(
@@ -5854,6 +5941,7 @@ def test_fetch_external_session_id_for_redirect_uses_session_endpoint(
                     "base_url": base_url,
                     "headers": headers,
                     "timeout": timeout,
+                    "trust_env": trust_env,
                 }
             )
 
@@ -5911,6 +5999,9 @@ def test_fetch_external_session_id_for_redirect_uses_session_endpoint(
             "base_url": "http://ap.example",
             "headers": {"Authorization": "Bearer token"},
             "timeout": 10.0,
+            # A remote host keeps the environment's proxy — only loopback
+            # targets, which a proxy cannot reach, opt out.
+            "trust_env": True,
         },
         {"url": "/v1/sessions/conv%20with%20space"},
     ]
@@ -6501,16 +6592,21 @@ def _no_auth_claude_spec() -> Any:
     )
 
 
-def test_provider_config_for_native_claude_key_injects_base_url_and_helper() -> None:
+def test_provider_config_for_native_claude_key_injects_base_url_and_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A ``key`` provider becomes ANTHROPIC_BASE_URL + a printf apiKeyHelper.
 
     Mirrors what ucode injects, but from a configured OSS key — so a native
     Claude Code terminal routes through the provider. The static key must be
     delivered via the helper (the runner env strips ANTHROPIC_API_KEY), and
     the base_url + default model carried through. Failure means a native
-    launch would ignore the configured provider.
+    launch would ignore the configured provider. With no CLAUDE_CODE_USE_GATEWAY
+    in the ambient env the gateway-safety beta-disable flag is set.
     """
     from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
 
     entry = load_providers(
         {
@@ -6540,9 +6636,13 @@ def test_provider_config_for_native_claude_key_injects_base_url_and_helper() -> 
     assert cfg.model == "claude-sonnet-4-6"
 
 
-def test_provider_config_for_native_claude_uses_auth_command_verbatim() -> None:
+def test_provider_config_for_native_claude_uses_auth_command_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A provider ``auth_command`` is used as the apiKeyHelper verbatim."""
     from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
 
     entry = load_providers(
         {
@@ -6567,14 +6667,50 @@ def test_provider_config_for_native_claude_uses_auth_command_verbatim() -> None:
     }
 
 
-def test_bedrock_config_for_native_claude_static_key() -> None:
+def test_provider_config_for_native_claude_keeps_betas_under_use_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With CLAUDE_CODE_USE_GATEWAY=1, the beta-disable flag is NOT set.
+
+    Gateway-aware mode negotiates the anthropic-beta set with the gateway and
+    keeps MCP tool search on (it rides on the ``advanced-tool-use`` beta), so
+    disabling betas here would force every MCP tool schema to load eagerly.
+    """
+    from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.setenv("CLAUDE_CODE_USE_GATEWAY", "1")
+
+    entry = load_providers(
+        {
+            "providers": {
+                "gw": {
+                    "kind": "gateway",
+                    "anthropic": {
+                        "base_url": "https://gw.example/v1",
+                        "auth_command": "my-cli print-token",
+                    },
+                }
+            }
+        }
+    )["gw"]
+
+    cfg = claude_native._provider_config_for_native_claude(entry)
+    assert cfg is not None
+    assert cfg.env == {"ANTHROPIC_BASE_URL": "https://gw.example/v1"}
+    assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in cfg.env
+
+
+def test_bedrock_config_for_native_claude_static_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """A ``bedrock`` provider sets the Bedrock env trio and no apiKeyHelper.
 
     Bedrock mode authenticates from ``AWS_BEARER_TOKEN_BEDROCK`` in the env and
     ignores ``apiKeyHelper``, so a static key must land in the env (never a
-    helper) and the base_url maps to ``ANTHROPIC_BEDROCK_BASE_URL``.
+    helper) and the base_url maps to ``ANTHROPIC_BEDROCK_BASE_URL``. With no
+    ``CLAUDE_CODE_USE_GATEWAY`` in the ambient env the beta-disable flag is set.
     """
     from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
 
     entry = load_providers(
         {
@@ -6633,6 +6769,44 @@ def test_bedrock_config_for_native_claude_resolves_auth_command() -> None:
     assert cfg is not None
     assert cfg.env["AWS_BEARER_TOKEN_BEDROCK"] == "minted-bedrock-token"
     assert cfg.api_key_helper is None
+
+
+def test_bedrock_config_for_native_claude_keeps_betas_under_use_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bedrock-style gateway with CLAUDE_CODE_USE_GATEWAY=1 keeps betas on.
+
+    Bedrock-compatible corporate gateways can run in gateway-aware mode; when
+    CLAUDE_CODE_USE_GATEWAY=1 the beta-disable flag is skipped so MCP tool
+    search stays enabled, matching the generic gateway provider path.
+    """
+    from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.setenv("CLAUDE_CODE_USE_GATEWAY", "1")
+
+    entry = load_providers(
+        {
+            "providers": {
+                "nexus": {
+                    "kind": "bedrock",
+                    "anthropic": {
+                        "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+                        "api_key": "absk-test",
+                        "models": {"default": "us.anthropic.claude-opus-4-5-20251101-v1:0"},
+                    },
+                }
+            }
+        }
+    )["nexus"]
+
+    cfg = claude_native._bedrock_config_for_native_claude(entry)
+    assert cfg is not None
+    assert cfg.env == {
+        "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-runtime.us-east-1.amazonaws.com",
+        "AWS_BEARER_TOKEN_BEDROCK": "absk-test",
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+    }
+    assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in cfg.env
 
 
 def test_bedrock_config_for_native_claude_non_anthropic_returns_none() -> None:
@@ -6779,6 +6953,7 @@ def test_resolve_native_claude_config_ambient_key(
     routes through the detected env key. Failure means a fresh machine's
     native Claude would ignore the ambient credential.
     """
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-ambient")
 
     cfg = claude_native.resolve_native_claude_config(spec=None)
@@ -6792,6 +6967,7 @@ def test_resolve_native_claude_config_ambient_prefixed_key(
     _isolated_provider_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A prefixed Anthropic key routes native Claude without raw env exposure."""
+    monkeypatch.delenv("CLAUDE_CODE_USE_GATEWAY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setenv("OMNIGENT_ANTHROPIC_API_KEY", "sk-ant-prefixed")
 

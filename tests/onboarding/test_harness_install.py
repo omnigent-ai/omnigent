@@ -45,14 +45,13 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize(
     "key,binary,package",
     [
-        (ANTHROPIC_FAMILY, "claude", "@anthropic-ai/claude-code"),
         (OPENAI_FAMILY, "codex", "@openai/codex"),
         (hi.PI_KEY, "pi", "@earendil-works/pi-coding-agent"),
         (hi.QWEN_KEY, "qwen", "@qwen-code/qwen-code"),
     ],
 )
 def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
-    """Each known harness maps to the ucode-matching binary + npm package.
+    """Each npm-installed harness maps to the ucode-matching binary + package.
 
     A drift in binary/package (e.g. a wrong npm name) would install the wrong
     thing or check the wrong PATH entry — caught here.
@@ -62,6 +61,45 @@ def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
     assert spec.binary == binary
     assert spec.package == package
     assert hi.harness_install_command(key) == ["npm", "install", "-g", package]
+
+
+def test_claude_installs_via_anthropic_native_installer() -> None:
+    """Claude ships via Anthropic's installer, not ``npm install -g``.
+
+    ``package`` must stay ``None``: that is the flag :func:`harness_setup_hint`
+    and the runner's missing-CLI error branch on to name the vendor installer.
+    """
+    spec = hi.harness_install_spec(ANTHROPIC_FAMILY)
+    assert spec is not None
+    assert spec.binary == "claude"
+    assert spec.package is None
+    assert spec.install_hint == "curl -fsSL https://claude.ai/install.sh | bash"
+    assert hi.harness_install_command(ANTHROPIC_FAMILY) == [
+        "bash",
+        "-c",
+        spec.install_hint,
+    ]
+
+
+@pytest.mark.parametrize(
+    "key,expected",
+    [
+        (ANTHROPIC_FAMILY, "curl -fsSL https://claude.ai/install.sh | bash"),
+        (OPENAI_FAMILY, "npm install -g @openai/codex"),
+    ],
+)
+def test_install_display_hides_the_bash_c_wrapper(key: str, expected: str) -> None:
+    """The command shown to a user is runnable as-is, without the ``bash -c``
+    wrapper :func:`harness_install_command` adds for ``subprocess``."""
+    assert hi.harness_install_display(key) == expected
+
+
+def test_claude_setup_hint_names_the_native_installer() -> None:
+    """A machine missing the claude CLI is pointed at the working installer."""
+    hint = hi.harness_setup_hint("claude-native")
+    assert "claude.ai/install.sh" in hint
+    assert "npm" not in hint
+    assert "claude auth login --claudeai" in hint
 
 
 def test_kimi_install_spec_is_login_only_no_npm() -> None:
@@ -304,10 +342,13 @@ def test_setup_hint_for_native_kiro_points_at_vendor_installer(harness: str) -> 
     assert "omni setup" not in hint
 
 
-@pytest.mark.parametrize("harness", ["claude-native", "codex", "pi", "claude-sdk", None])
+@pytest.mark.parametrize("harness", ["codex", "pi", "claude-sdk", None])
 def test_setup_hint_defaults_to_omnigent_setup(harness: str | None) -> None:
     """Harnesses whose CLI ``omni setup`` installs (npm CLIs) — and the
-    SDK / unknown / ``None`` cases — route to the ``omni setup`` hint."""
+    SDK / unknown / ``None`` cases — route to the ``omni setup`` hint.
+
+    ``claude-native`` is absent: it names Anthropic's installer instead.
+    """
     hint = hi.harness_setup_hint(harness)
     assert "omni setup" in hint
 
@@ -412,7 +453,7 @@ def test_install_harness_cli_requires_npm(monkeypatch: pytest.MonkeyPatch) -> No
         raise AssertionError("subprocess.run reached despite missing npm")
 
     monkeypatch.setattr(hi.subprocess, "run", _explode)
-    assert hi.install_harness_cli(ANTHROPIC_FAMILY) is False
+    assert hi.install_harness_cli(OPENAI_FAMILY) is False
 
 
 def test_try_install_harness_cli_missing_npm(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -427,9 +468,13 @@ def test_try_install_harness_cli_missing_npm(monkeypatch: pytest.MonkeyPatch) ->
         "run",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not shell out")),
     )
-    installed, reason = hi.try_install_harness_cli(ANTHROPIC_FAMILY)
+    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
     assert installed is False
     assert reason is not None and "npm" in reason
+    # Claude's installer is bash-based, so its reason names bash, not npm.
+    installed, reason = hi.try_install_harness_cli(ANTHROPIC_FAMILY)
+    assert installed is False
+    assert reason is not None and "bash" in reason
 
 
 def test_try_install_harness_cli_manual_only() -> None:
@@ -1111,13 +1156,13 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
     [
         (hi.OPENCODE_KEY, "1.17.7", "1.18.0"),
         (hi.CURSOR_KEY, "2026.06.02", None),
-        (hi.KIMI_KEY, "1.47.0", None),
+        (hi.KIMI_KEY, "0.7.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
         (OPENAI_FAMILY, "0.137.0", None),
         (hi.PI_KEY, "0.79.0", None),
         (hi.QWEN_KEY, "0.18.1", None),
         (hi.GOOSE_KEY, "1.38.0", None),
-        (hi.HERMES_KEY, "2026.06.05", None),
+        (hi.HERMES_KEY, "0.17.0", None),
         (hi.KIRO_KEY, "2.10.0", None),
     ],
 )
@@ -1214,6 +1259,55 @@ def test_the_codex_launch_floor_accepts_the_ci_pinned_cli(
     assert hi.harness_cli_installed(OPENAI_FAMILY) is True
 
 
+def test_the_kimi_floor_accepts_the_cli_this_spec_installs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A current ``kimi-code`` build must read as installed, not too-low.
+
+    The floor tracks Moonshot's ``kimi-code`` CLI (a 0.x series, the binary
+    this spec's installer puts on PATH), not the separately numbered
+    ``kimi-cli`` project. Pinning it to a 1.x version made every shipping
+    ``kimi`` fail the range, so ``harness_is_configured`` stayed false and the
+    host refused every kimi-native launch.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv, returncode=0, stdout="0.34.0\n", stderr=""
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is True
+
+
+def test_the_hermes_floor_accepts_the_shipping_version_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hermes' semver ``--version`` line must satisfy the floor.
+
+    Hermes prints ``Hermes Agent v0.19.1 (2026.7.30)`` — a semver with the
+    build date beside it — so the parser reads ``0.19.1``. A date-shaped floor
+    could never be met by that string, which left hermes-native unlaunchable.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=0,
+                stdout="Hermes Agent v0.19.1 (2026.7.30)\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.harness_cli_installed(hi.HERMES_KEY) is True
+
+
 def test_harness_cli_installed_true_when_version_in_range(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1263,8 +1357,8 @@ def test_parse_harness_cli_version_normalizes_date_versions(raw: str, expected: 
     "key,outdated,satisfying",
     [
         (hi.CURSOR_KEY, "2026.05.24", "2026.06.22"),
-        (hi.KIMI_KEY, "1.46.0", "1.48.0"),
-        (hi.HERMES_KEY, "2026.05.29", "2026.06.19"),
+        (hi.KIMI_KEY, "0.6.0", "0.34.0"),
+        (hi.HERMES_KEY, "0.16.9", "0.19.1"),
     ],
 )
 def test_harness_cli_installed_enforces_default_post_2026_06_01_floors(

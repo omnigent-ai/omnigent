@@ -273,6 +273,27 @@ def pytest_addoption(parser):
 
 
 @pytest.fixture(autouse=True)
+def _reset_runner_catalog_cache() -> Generator[None, None, None]:
+    """
+    Clear smart routing's per-session runner-catalog cache after every test.
+
+    The cache is process-global and keyed by session id, and the suite reuses
+    a handful of fixed ids (``conv_123`` and friends) across unrelated tests —
+    so one test's catalog would answer another test's fetch and its counting
+    stub would never be called.
+
+    :returns: None.
+    """
+    yield
+    # sys.modules lookup, not an import: the spec lane blocks omnigent imports
+    # inside some tests, and a lane that never touched smart_routing should not
+    # pay for loading it in every teardown.
+    module = sys.modules.get("omnigent.server.smart_routing")
+    if module is not None:
+        module._runner_catalog_cache.clear()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_claude_native_state(
     tmp_path_factory: pytest.TempPathFactory,
     monkeypatch: pytest.MonkeyPatch,

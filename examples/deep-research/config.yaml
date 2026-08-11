@@ -7,8 +7,8 @@ description: >-
   independent sources, and returns a synthesized, cited answer.
 
 # "Brain": Claude Agent SDK. No model is pinned, so it runs on whatever
-# Claude provider is configured as the default (`omnigent setup`). The
-# bundled catalog default is claude-opus-4-8.
+# Claude provider is configured as the default (`omnigent setup`), and on
+# whichever model that provider's catalog resolves as its default.
 executor:
   type: omnigent
   config:
@@ -63,6 +63,7 @@ prompt: |
 #
 #     # Google Programmable Search:
 #     # - name: web_search
+#     #   search_provider: google
 #     #   api_key: ${GOOGLE_SEARCH_API_KEY}
 #     #   engine_id: ${GOOGLE_SEARCH_ENGINE_ID}
 #

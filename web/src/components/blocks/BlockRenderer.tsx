@@ -332,7 +332,6 @@ const FOLD_EXPAND_ANCHOR_HOLD_MS = 400;
 interface BlockRendererProps {
   items: RenderItem[];
   sessionStatus: SessionStatus;
-  canApprove?: boolean;
   /**
    * Lifecycle of the turn this bubble renders (`Bubble.lifecycle`).
    * `"streaming"` keeps the process trace expanded; any settled state
@@ -375,6 +374,103 @@ interface BlockRendererProps {
   showsWorking?: boolean;
 }
 
+/** The subset of {@link BlockRendererProps} the fold decision reads. */
+type FoldInputs = Pick<
+  BlockRendererProps,
+  | "items"
+  | "sessionStatus"
+  | "turnLifecycle"
+  | "continued"
+  | "isLastAssistant"
+  | "hasPendingElicitation"
+  | "showsWorking"
+>;
+
+/**
+ * How live a turn is, from the bubble's own lifecycle and the session's.
+ *
+ * `isOwnTurnLive` — streaming into THIS bubble; only this clears the
+ * shown-fold latch. `possiblyLive` — the last assistant bubble while the
+ * session works or parks on an elicitation MAY be the live turn even when
+ * its lifecycle reads settled (a mid-turn (re)connect can miss the edge
+ * that names the turn).
+ */
+function turnLiveness({
+  sessionStatus,
+  turnLifecycle,
+  isLastAssistant = false,
+  hasPendingElicitation = false,
+  showsWorking = false,
+}: Omit<FoldInputs, "items" | "continued">): {
+  isOwnTurnLive: boolean;
+  possiblyLive: boolean;
+  isTurnLive: boolean;
+} {
+  const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
+  const isOwnTurnLive = turnLifecycle !== undefined ? turnLifecycle === "streaming" : isAgentActive;
+  const possiblyLive =
+    isLastAssistant && (showsWorking || sessionStatus === "running" || hasPendingElicitation);
+  return { isOwnTurnLive, possiblyLive, isTurnLive: isOwnTurnLive || possiblyLive };
+}
+
+/**
+ * Whether the turn's CONTENT can fold: it did work, and either answered
+ * here or continues in a later bubble. A turn that did no work, or that
+ * dead-ends with no answer anywhere, renders expanded — there is nothing
+ * to demarcate.
+ *
+ * A `continued` bubble additionally has to have RUN something. That is
+ * the shape the flag exists for (narration + tool calls, then a yield to
+ * await sub-agents), and it keeps a stray narration- or reasoning-only
+ * fragment of a split turn from folding into a lone "Worked" row with
+ * nothing behind it.
+ *
+ * Liveness is the caller's half of the decision — `BlockRenderer` pairs
+ * this with its fold latch.
+ */
+function hasFoldableShape(
+  items: RenderItem[],
+  { process, final }: TurnPartition,
+  continued = false,
+): boolean {
+  return (
+    !isProvisionalTrace(items) &&
+    process.length > 0 &&
+    (final.length > 0 || (continued && process.some(isToolItem)))
+  );
+}
+
+/**
+ * Whether the bubble renders NOTHING but the collapsed "Worked for" row:
+ * a turn fragment that yielded mid-task, so its whole trace folds and the
+ * answer lands in a later bubble.
+ *
+ * Such a bubble has no visible content to anchor bubble-level chrome to.
+ * The copy/fork actions key off ALL the bubble's text, including text
+ * sealed inside the fold, so they would hang a row of hover-only (hence
+ * invisible) height off it — but only when the HIDDEN trace happened to
+ * narrate, leaving consecutive collapsed rows at two different gaps with
+ * nothing on screen to explain the difference.
+ *
+ * Deliberately conservative about the possibly-live last bubble: this
+ * can't see `BlockRenderer`'s fold latch, so it reports false there and
+ * the trailing bubble keeps its actions. True here always means the trace
+ * folded — never the reverse, which would strip actions off a visible
+ * answer.
+ *
+ * Shape and liveness only — no debounce. Across `BlockRenderer`'s settle
+ * window the two answers may differ for a beat; on a bubble with no
+ * answer to anchor them to, that costs nothing visible.
+ */
+export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
+  const { isOwnTurnLive, possiblyLive } = turnLiveness(inputs);
+  if (isOwnTurnLive || possiblyLive) return false;
+  const partition = partitionTurn(inputs.items);
+  return (
+    hasFoldableShape(inputs.items, partition, inputs.continued) && partition.final.length === 0
+  );
+}
+
 type ToolRunFragment =
   | {
       kind: "group";
@@ -389,7 +485,6 @@ type ToolRunFragment =
 export function BlockRenderer({
   items,
   sessionStatus,
-  canApprove = true,
   turnLifecycle,
   workedForS,
   continued = false,
@@ -398,17 +493,13 @@ export function BlockRenderer({
   lastActivityAtS,
   showsWorking = false,
 }: BlockRendererProps) {
-  const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
-  // The bubble's OWN turn is live (streaming into it). Distinct from
-  // POSSIBLY live below: only this clears the shown-fold latch.
-  const isOwnTurnLive = turnLifecycle !== undefined ? turnLifecycle === "streaming" : isAgentActive;
-  // The last assistant bubble while the session works or parks on an
-  // elicitation MAY be the live turn even when its lifecycle reads
-  // settled (a mid-turn (re)connect can miss the edge that names the
-  // turn) — treat it as live for render affordances and fold gating.
-  const possiblyLive =
-    isLastAssistant && (showsWorking || sessionStatus === "running" || hasPendingElicitation);
-  const isTurnLive = isOwnTurnLive || possiblyLive;
+  const { isOwnTurnLive, possiblyLive, isTurnLive } = turnLiveness({
+    sessionStatus,
+    turnLifecycle,
+    isLastAssistant,
+    hasPendingElicitation,
+    showsWorking,
+  });
 
   // Fold a turn that did work AND either answered here or continues in a
   // later bubble: the trace collapses behind the "Worked for" row, exempt
@@ -416,12 +507,8 @@ export function BlockRenderer({
   // one) renders last at full style. A turn that did no work, or that
   // dead-ends with no answer anywhere, renders expanded — there is
   // nothing to demarcate.
-  const { process, exempt, final, finalStart } = partitionTurn(items);
-  // A `continued` bubble additionally has to have RUN something. That is
-  // the shape the flag exists for (narration + tool calls, then a yield
-  // to await sub-agents), and it keeps a stray narration- or
-  // reasoning-only fragment of a split turn from folding into a lone
-  // "Worked" row with nothing behind it.
+  const partition = partitionTurn(items);
+  const { process, exempt, final, finalStart } = partition;
   // Once the fold has SHOWN on a settled bubble, possibly-live no
   // longer reopens it. A scheduled wake (a /loop cron or wakeup
   // firing) flips the session to running — Working shimmer included —
@@ -435,9 +522,7 @@ export function BlockRenderer({
     // Never fold a possibly-live bubble whose fold hasn't shown yet:
     // the terminal status edge is what folds it (see possiblyLive).
     (!possiblyLive || foldLatchedRef.current) &&
-    !isProvisionalTrace(items) &&
-    process.length > 0 &&
-    (final.length > 0 || (continued && process.some(isToolItem)));
+    hasFoldableShape(items, partition, continued);
 
   // Debounce fold APPEARANCE on a live bubble: transient settled reads —
   // a step-wise turn's idle edge between steps, a stray bare idle before
@@ -490,17 +575,16 @@ export function BlockRenderer({
     return (
       <>
         <TurnWorkedFold workedForS={workedForS} animateCollapse={animateCollapse}>
-          {renderSequence(process, { liveEdge: false, canApprove })}
+          {renderSequence(process, { liveEdge: false })}
         </TurnWorkedFold>
-        {exempt.map(({ item, index }) => renderItem(item, index, false, false, false, canApprove))}
-        {renderSequence(final, { liveEdge: false, canApprove, indexBase: finalStart })}
+        {exempt.map(({ item, index }) => renderItem(item, index, false, false, false))}
+        {renderSequence(final, { liveEdge: false, indexBase: finalStart })}
       </>
     );
   }
 
   return renderSequence(items, {
     liveEdge: isTurnLive,
-    canApprove,
     suppressReasoningDuration: showsWorking,
   });
 }
@@ -514,7 +598,7 @@ export function BlockRenderer({
  */
 function renderSequence(
   items: RenderItem[],
-  { liveEdge, canApprove, suppressReasoningDuration = false, indexBase = 0 }: TurnSequenceOptions,
+  { liveEdge, suppressReasoningDuration = false, indexBase = 0 }: TurnSequenceOptions,
 ): ReactNode[] {
   const rendered: ReactNode[] = [];
   let previousRenderedItemWasText = false;
@@ -576,7 +660,6 @@ function renderSequence(
         i === reasoningStreamingIdx,
         suppressReasoningDuration,
         followsText,
-        canApprove,
       ),
     );
     previousRenderedItemWasText = item.kind === "text";
@@ -587,7 +670,6 @@ function renderSequence(
 
 interface TurnSequenceOptions {
   liveEdge: boolean;
-  canApprove: boolean;
   suppressReasoningDuration?: boolean;
   indexBase?: number;
 }
@@ -910,7 +992,6 @@ function renderItem(
   isReasoningStreaming: boolean,
   suppressReasoningDuration = false,
   followsText = false,
-  canApprove = true,
 ): ReactNode {
   const key = keyFor(item, index);
   switch (item.kind) {
@@ -993,7 +1074,17 @@ function renderItem(
         />
       );
     case "error":
-      return <ErrorBanner key={key} message={item.message} source={item.source} code={item.code} />;
+      return (
+        <ErrorBanner
+          key={key}
+          message={item.message}
+          source={item.source}
+          code={item.code}
+          title={item.title}
+          cause={item.cause}
+          remediation={item.remediation}
+        />
+      );
     case "policy_denied":
       return <PolicyDeniedBanner key={key} reason={item.reason} phase={item.phase} />;
     case "retry":
@@ -1007,7 +1098,7 @@ function renderItem(
         />
       );
     case "elicitation":
-      return <ElicitationCard key={key} item={item} canApprove={canApprove} />;
+      return <ElicitationCard key={key} item={item} />;
   }
 }
 
