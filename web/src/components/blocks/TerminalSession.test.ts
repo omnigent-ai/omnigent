@@ -615,16 +615,94 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
-  it("does not trust raw pane OSC 52 clipboard writes", async () => {
+  /** Write one OSC 52 sequence into the real xterm parser and settle it. */
+  async function writeOsc52(session: TerminalSession, payload: string): Promise<void> {
+    const term = (session as unknown as { term: Terminal }).term;
+    await new Promise<void>((resolve) => {
+      term.write(`\x1b]52;${payload}\x07`, resolve);
+    });
+  }
+
+  it("routes raw pane OSC 52 writes through the consent gate", async () => {
+    // WHY: control mode forwards raw pane bytes, so a TUI's copy (pi, vim's
+    // "+ register) reaches xterm as OSC 52 with no tmux buffer behind it.
+    // It must reach the clipboard the same way a tmux selection does — via
+    // onClipboardRequest, which prompts — and never by writing directly.
     vi.spyOn(performance, "now").mockReturnValue(10_000);
     const onClipboardRequest = vi.fn();
     const { session } = makeSession(undefined, undefined, true, onClipboardRequest);
     (session as unknown as { lastUserInputAt: number }).lastUserInputAt = 9000;
-    const term = (session as unknown as { term: Terminal }).term;
 
-    await new Promise<void>((resolve) => {
-      term.write(`\x1b]52;;${btoa("pane output")}\x07`, resolve);
-    });
+    await writeOsc52(session, `c;${btoa("pane output")}`);
+
+    expect(onClipboardRequest).toHaveBeenCalledWith("pane output");
+    session.dispose();
+  });
+
+  it("never answers an OSC 52 read request", async () => {
+    // WHY: `?` asks the terminal to report the clipboard back into the pane.
+    // Serving it would give agent-controlled pane output read access to
+    // whatever the user last copied, so it must produce nothing at all --
+    // neither a consent prompt nor a reply on the wire.
+    vi.spyOn(performance, "now").mockReturnValue(10_000);
+    const onClipboardRequest = vi.fn();
+    const { session, socket } = makeSession(undefined, undefined, true, onClipboardRequest);
+    (session as unknown as { lastUserInputAt: number }).lastUserInputAt = 9000;
+    socket.open();
+    const sentBefore = socket.sent.length;
+
+    await writeOsc52(session, "c;?");
+
+    expect(onClipboardRequest).not.toHaveBeenCalled();
+    expect(socket.sent.length).toBe(sentBefore);
+    session.dispose();
+  });
+
+  it("ignores pane OSC 52 without recent input on this attachment", async () => {
+    // WHY: the same freshness gate as tmux copies. Without it, output the
+    // user never asked for -- arriving while they are reading, not typing --
+    // could still raise a prompt over the terminal.
+    vi.spyOn(performance, "now").mockReturnValue(10_000);
+    const onClipboardRequest = vi.fn();
+    const { session } = makeSession(undefined, undefined, true, onClipboardRequest);
+    (session as unknown as { lastUserInputAt: number }).lastUserInputAt = 1000;
+
+    await writeOsc52(session, `c;${btoa("stale copy")}`);
+
+    expect(onClipboardRequest).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it("ignores pane OSC 52 when terminal clipboard access is disabled", async () => {
+    vi.spyOn(performance, "now").mockReturnValue(10_000);
+    const onClipboardRequest = vi.fn();
+    const { session } = makeSession(undefined, undefined, false, onClipboardRequest);
+    (session as unknown as { lastUserInputAt: number }).lastUserInputAt = 9000;
+
+    await writeOsc52(session, `c;${btoa("blocked copy")}`);
+
+    expect(onClipboardRequest).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it("rejects OSC 52 payloads that fail the shared clipboard checks", async () => {
+    // WHY: pane OSC 52 reuses the bounded, canonical base64 decoder applied
+    // to clipboard-write frames, so a pane cannot spend memory here that it
+    // could not spend through tmux, nor smuggle a non-canonical payload.
+    vi.spyOn(performance, "now").mockReturnValue(10_000);
+    const onClipboardRequest = vi.fn();
+    const { session } = makeSession(undefined, undefined, true, onClipboardRequest);
+    (session as unknown as { lastUserInputAt: number }).lastUserInputAt = 9000;
+
+    await writeOsc52(session, "c;not!valid!base64");
+    // Non-canonical padding: decodeTerminalClipboardBase64 owns the bounded
+    // length check, exercised in its own tests above.
+    await writeOsc52(session, "c;QQ=");
+    // A cut-buffer target has no browser equivalent, so it is not a write
+    // this terminal can honor.
+    await writeOsc52(session, `7;${btoa("cut buffer")}`);
+    // No target separator at all.
+    await writeOsc52(session, btoa("malformed"));
 
     expect(onClipboardRequest).not.toHaveBeenCalled();
     session.dispose();
