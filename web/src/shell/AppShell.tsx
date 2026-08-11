@@ -174,19 +174,36 @@ export function AppShell() {
   // way off the settings page. A collapsed sidebar therefore strands the user
   // there — the row is still in the DOM but clipped and inert. So entering
   // /settings pins the sidebar open (and drops any peek, which is a transient
-  // hover card, not somewhere to read a settings page from).
+  // hover card, not somewhere to read a settings page from), and leaving it
+  // restores whatever the sidebar was before, so a collapsed sidebar stays a
+  // preference rather than being silently undone by a trip to settings.
   //
-  // Deliberately one-way: leaving /settings does NOT restore a prior collapsed
-  // state. Reversing the pin on exit would collapse the sidebar out from under
-  // someone who had just been using it, and the alternative — stashing the
-  // pre-settings state — resurrects a preference the user last expressed before
-  // a detour they may not associate with it. Visible exit beats preserved
-  // preference; the toggle is one click away on the way out.
+  // The pin is only needed WHILE on the page, so restoring on exit cannot
+  // reintroduce the trap: by then the title-bar toggle is back and the Back row
+  // is no longer the only way out. Mirrors sidebarOpenBeforeMaximizeRef, which
+  // stashes and restores the same state around the maximize flow.
   const { inSettings } = useSettingsRoute();
+  const sidebarOpenBeforeSettingsRef = useRef<boolean | null>(null);
   useEffect(() => {
-    if (!inSettings) return;
-    setSidebarOpen(true);
-    setSidebarPeek(false);
+    if (inSettings) {
+      // Stash inside the updater so it reads the CURRENT value rather than a
+      // closure captured before the pin, and so a re-render while already on
+      // /settings can't overwrite the stash with the pinned-open value.
+      setSidebarOpen((wasOpen) => {
+        if (sidebarOpenBeforeSettingsRef.current === null) {
+          sidebarOpenBeforeSettingsRef.current = wasOpen;
+        }
+        return true;
+      });
+      setSidebarPeek(false);
+      return;
+    }
+    // Leaving /settings: restore, then clear the stash so the next visit
+    // captures fresh state.
+    if (sidebarOpenBeforeSettingsRef.current !== null) {
+      setSidebarOpen(sidebarOpenBeforeSettingsRef.current);
+      sidebarOpenBeforeSettingsRef.current = null;
+    }
   }, [inSettings]);
 
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
@@ -958,7 +975,9 @@ export function AppShell() {
     // On /settings the sidebar holds the only exit (the Back row), so collapsing
     // it — by hotkey or command palette, the paths that bypass the hidden
     // title-bar toggle — would strand the user on the page. Opening is still
-    // fine; only the collapse direction is refused.
+    // fine; only the collapse direction is refused. The pre-settings state stays
+    // stashed either way, so what the user had before the visit is still what
+    // gets restored on the way out.
     if (inSettings) {
       setSidebarOpen(true);
       setSidebarPeek(false);

@@ -284,6 +284,26 @@ function LocationDisplay() {
 }
 
 /**
+ * Route-change buttons standing in for the real Settings button and the
+ * sidebar's Back row, which live in components mocked out here. Navigation is
+ * what AppShell keys the /settings sidebar pin off, so the tests need a real
+ * router transition rather than a re-render.
+ */
+function NavProbe() {
+  const navigate = useNavigate();
+  return (
+    <div>
+      <button type="button" data-testid="nav-settings" onClick={() => navigate("/settings")}>
+        to-settings
+      </button>
+      <button type="button" data-testid="nav-home" onClick={() => navigate("/")}>
+        to-home
+      </button>
+    </div>
+  );
+}
+
+/**
  * Renders the current pathname (the `/c/:conversationId` segment) so a test
  * can detect an unwanted conversation switch — a redirect shows up as a
  * pathname change, which `LocationDisplay` (search params only) can't catch.
@@ -354,6 +374,7 @@ function renderShell(path: string, info?: ServerInfo) {
                   <>
                     <TerminalFirstViewProbe />
                     <ForkDialogProbe />
+                    <NavProbe />
                     <LocationDisplay />
                   </>
                 }
@@ -361,12 +382,15 @@ function renderShell(path: string, info?: ServerInfo) {
               {/* The settings page itself renders inside the sidebar (its nav
               replaces the session list), so the body here is irrelevant — what
               matters is that the route is /settings, which is what AppShell
-              keys the sidebar pin off. */}
+              keys the sidebar pin off. The nav-* links stand in for the real
+              Settings button and the sidebar's Back row, both of which live in
+              components mocked out here. */}
               <Route
                 path="settings"
                 element={
                   <>
                     <div>settings</div>
+                    <NavProbe />
                     <LocationDisplay />
                   </>
                 }
@@ -1208,24 +1232,54 @@ describe("Workspace rail maximize", () => {
     renderShell("/settings");
 
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
-    fireEvent.keyDown(document, { key: "[", metaKey: true, altKey: true });
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
   });
 
-  it("does not restore a collapsed sidebar when /settings pins it open", () => {
-    // Deliberately one-way: the pin is NOT reversed on exit. Restoring a prior
-    // collapsed state would yank the sidebar away from someone who had just been
-    // using it, so a visible exit wins over a preserved preference. Asserted as
-    // "no stashed state to restore": once pinned, the ONLY way back to collapsed
-    // is the user's own toggle, which the /settings guard refuses — so the
-    // sidebar cannot silently re-collapse while the page is open.
+  it("keeps the sidebar pinned open for the whole /settings visit", () => {
+    // Repeated toggles all resolve to open while on the page: collapsing is what
+    // removes the only exit, so the guard refuses that direction throughout.
     mockConversations([]);
     renderShell("/settings");
 
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
-    // Repeated toggles all resolve to open while on the page.
-    fireEvent.keyDown(document, { key: "[", metaKey: true, altKey: true });
-    fireEvent.keyDown(document, { key: "[", metaKey: true, altKey: true });
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("restores a collapsed sidebar after leaving /settings", () => {
+    // A collapsed sidebar is a preference, and a trip to settings shouldn't
+    // silently undo it. The pin is only needed WHILE on the page — on the way out
+    // the title-bar toggle is back and Back is no longer the only exit — so
+    // restoring here cannot reintroduce the trap.
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    // Collapsed going in (jsdom default).
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    // Into settings: pinned open despite the collapsed preference.
+    fireEvent.click(screen.getByTestId("nav-settings"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+
+    // Back out: the collapsed state the user chose is restored.
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+  });
+
+  it("restores an open sidebar after leaving /settings", () => {
+    // The mirror case: someone who had it open keeps it open, so the restore is
+    // genuinely "put it back", not "always collapse".
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+
+    fireEvent.click(screen.getByTestId("nav-settings"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.click(screen.getByTestId("nav-home"));
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
   });
 
