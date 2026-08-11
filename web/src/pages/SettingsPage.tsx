@@ -10,7 +10,8 @@
  * Sections:
  *
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
- *   Workspace panel default for new chats, and UI/code font controls.
+ *   Workspace panel default for new chats, default Agents panel view, and
+ *   UI/code font controls.
  * - **Git** — Git behavior, e.g. the default base branch pre-filled when
  *   naming a new worktree branch in the composer.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
@@ -44,10 +45,12 @@ import {
   CheckIcon,
   KeyRoundIcon,
   LaptopMinimalIcon,
+  ListIcon,
   LogOutIcon,
   MinusIcon,
   MonitorIcon,
   MoonIcon,
+  NetworkIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
   PlusIcon,
@@ -137,6 +140,12 @@ import {
   writeWorkspacePanelDefault,
   type WorkspacePanelDefault,
 } from "@/lib/workspacePanelPreferences";
+import {
+  AGENTS_VIEW_DEFAULT,
+  readAgentsViewDefault,
+  writeAgentsViewDefault,
+  type AgentsViewMode,
+} from "@/lib/agentsViewPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import {
   DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
@@ -283,6 +292,15 @@ const workspacePanelCards: {
 }[] = [
   { value: "open", label: "Open", icon: PanelRightIcon },
   { value: "collapsed", label: "Collapsed", icon: PanelRightCloseIcon },
+];
+
+const agentsViewCards: {
+  value: AgentsViewMode;
+  label: string;
+  icon: typeof ListIcon;
+}[] = [
+  { value: "list", label: "List", icon: ListIcon },
+  { value: "graph", label: "Graph", icon: NetworkIcon },
 ];
 
 /**
@@ -572,6 +590,36 @@ function WorkspacePanelDefaultControl() {
   );
 }
 
+/** Default List vs Graph view for each new Agents panel mount. */
+function AgentsViewDefaultControl() {
+  const [value, setValue] = useState(() => readAgentsViewDefault());
+  const labelId = useId();
+  const choose = useCallback((next: AgentsViewMode) => {
+    setValue(next);
+    writeAgentsViewDefault(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Default Agents view"
+      helper="Whether the Agents panel opens in list or graph view. Switching inside the panel only lasts until it remounts."
+    >
+      <CardRadioGroup<AgentsViewMode>
+        labelledBy={labelId}
+        value={value}
+        onSelect={choose}
+        className="grid grid-cols-2 gap-3"
+        cardClassName="items-center gap-2 p-4"
+        items={agentsViewCards.map((card) => ({
+          value: card.value,
+          testId: `agents-view-default-${card.value}`,
+          body: iconCardBody(card.icon, card.label),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
 function ColorThemeControl() {
   // Render each chip in the currently-resolved mode so it matches the app now.
   const { resolvedTheme } = useTheme();
@@ -846,6 +894,8 @@ function AppearanceSection() {
 
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
 
+    writeAgentsViewDefault(AGENTS_VIEW_DEFAULT);
+
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
     applyDesktopUiFontSize(UI_FONT_SIZE_DEFAULT);
@@ -869,6 +919,7 @@ function AppearanceSection() {
           "omnigent:ui-theme-palette",
           "omnigent:custom-theme",
           "omnigent:default-workspace-panel",
+          "omnigent:default-agents-view",
           "omnigent:hide-unconfigured-harnesses",
         ]) {
           window.localStorage.removeItem(key);
@@ -911,6 +962,8 @@ function AppearanceSection() {
         {!isEmbedded && <ColorThemeControl />}
 
         <WorkspacePanelDefaultControl />
+
+        <AgentsViewDefaultControl />
 
         <HideUnconfiguredHarnessesControl />
 
