@@ -666,6 +666,16 @@ function SubagentRow({
                 {shortModelName(child.routed_model)}
               </span>
             ) : null}
+            {child.reasoning_effort ? (
+              <Badge
+                data-testid="subagent-reasoning-effort"
+                title={`Reasoning effort: ${child.reasoning_effort}`}
+                variant="outline"
+                className="h-4 shrink-0 px-1 text-[10px] font-normal capitalize"
+              >
+                {child.reasoning_effort}
+              </Badge>
+            ) : null}
             <span className="flex-1" />
             <StatusIndicator {...status} />
           </div>

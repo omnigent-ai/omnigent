@@ -57,6 +57,8 @@ export interface ChildSessionInfo {
    * not routed (routing off, or a server that predates the field).
    */
   routed_model?: string | null;
+  /** Reasoning effort persisted for this sub-agent, e.g. ``"high"``. */
+  reasoning_effort?: string | null;
 }
 
 /**
@@ -76,6 +78,7 @@ interface ChildSessionWire {
   last_message_preview?: string | null;
   pending_elicitations_count?: number;
   routed_model?: string | null;
+  reasoning_effort?: string | null;
 }
 
 interface ChildSessionsResponse {
@@ -188,6 +191,7 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
     last_message_preview: row.last_message_preview ?? null,
     pending_elicitations_count: row.pending_elicitations_count ?? 0,
     routed_model: row.routed_model ?? null,
+    reasoning_effort: row.reasoning_effort ?? null,
   }));
 }
 

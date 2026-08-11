@@ -823,6 +823,7 @@ class ChildSessionSummary(BaseModel):
     last_message_preview: str | None = None
     pending_elicitations_count: int = 0
     routed_model: str | None = None
+    reasoning_effort: str | None = None
     routing_decision_id: str | None = None
 
 
