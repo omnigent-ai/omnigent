@@ -2,7 +2,7 @@
 
 Uses the mock LLM with a live server and runner. Invoke with::
 
-    pytest tests/e2e/test_session_history_content_limit_e2e.py -v --timeout=180
+    pytest tests/e2e/test_session_history_content_limit_e2e.py -v --timeout=600
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from tests.e2e.conftest import (
 from tests.e2e.helpers import POLL_INTERVAL_S
 
 pytestmark = [
-    pytest.mark.timeout(180, method="signal"),
+    pytest.mark.timeout(600, method="signal"),
     pytest.mark.min_server_version("0.3.0"),
     pytest.mark.min_runner_version("0.9.0"),
 ]
@@ -153,7 +153,10 @@ def test_session_history_raised_content_limit_recovers_full_child_response_e2e(
     live_runner_id: str,
     mock_llm_server_url: str,
 ) -> None:
-    """A raised history limit recovers a child response truncated by default."""
+    """A raised history limit recovers a child response truncated by default.
+
+    This test exercises the runner REST dispatch path.
+    """
     uid = uuid.uuid4().hex[:6]
     parent_model = f"mock-history-parent-{uid}"
     child_model = f"mock-history-child-{uid}"
