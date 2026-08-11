@@ -449,6 +449,34 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("terminal-theme-dark")).toHaveAttribute("aria-checked", "false");
   });
 
+  it("renders the Default Agents view radiogroup with list selected by default", () => {
+    renderPage("/settings/appearance");
+    expect(screen.getByRole("radiogroup", { name: "Default Agents view" })).toBeInTheDocument();
+    expect(screen.getByTestId("agents-view-default-list")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("agents-view-default-graph")).toHaveAttribute("aria-checked", "false");
+    expect(localStorage.getItem("omnigent:default-agents-view")).toBeNull();
+  });
+
+  it("persists the Default Agents view graph choice on card click", () => {
+    renderPage("/settings/appearance");
+
+    fireEvent.click(screen.getByTestId("agents-view-default-graph"));
+    expect(localStorage.getItem("omnigent:default-agents-view")).toBe("graph");
+    expect(screen.getByTestId("agents-view-default-graph")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("agents-view-default-list")).toHaveAttribute("aria-checked", "false");
+
+    fireEvent.click(screen.getByTestId("agents-view-default-list"));
+    expect(localStorage.getItem("omnigent:default-agents-view")).toBeNull();
+    expect(screen.getByTestId("agents-view-default-list")).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("seeds Default Agents view from a stored graph preference", () => {
+    localStorage.setItem("omnigent:default-agents-view", "graph");
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("agents-view-default-graph")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("agents-view-default-list")).toHaveAttribute("aria-checked", "false");
+  });
+
   it("reflects a stored light terminal theme on mount", () => {
     localStorage.setItem("omnigent:terminal-theme", "light");
     renderPage("/settings/appearance");
@@ -710,6 +738,7 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
     fireEvent.click(screen.getByTestId("workspace-panel-default-open"));
     fireEvent.click(screen.getByTestId("workspace-tab-default-subagents"));
+    fireEvent.click(screen.getByTestId("agents-view-default-graph"));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
@@ -729,6 +758,7 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
     expect(localStorage.getItem("omnigent:default-workspace-panel")).toBe("open");
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("subagents");
+    expect(localStorage.getItem("omnigent:default-agents-view")).toBe("graph");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
@@ -755,7 +785,7 @@ describe("SettingsPage", () => {
     expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
     expect(document.documentElement.getAttribute("data-theme")).toBeNull();
 
-    // Terminal theme, transcript view, workspace defaults, and harness visibility are restored.
+    // Terminal theme, transcript view, workspace defaults, Agents view, and harness visibility reset.
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
     expect(screen.getByTestId("transcript-view-default-chat")).toHaveAttribute(
       "aria-checked",
@@ -770,6 +800,8 @@ describe("SettingsPage", () => {
       "true",
     );
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBeNull();
+    expect(screen.getByTestId("agents-view-default-list")).toHaveAttribute("aria-checked", "true");
+    expect(localStorage.getItem("omnigent:default-agents-view")).toBeNull();
     expect(screen.getByTestId("hide-unconfigured-harnesses-toggle")).toHaveAttribute(
       "aria-checked",
       "false",

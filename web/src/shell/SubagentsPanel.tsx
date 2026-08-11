@@ -39,6 +39,7 @@ import {
   SearchIcon,
   UnplugIcon,
 } from "lucide-react";
+import { type AgentsViewMode, readAgentsViewDefault } from "@/lib/agentsViewPreferences";
 import { Link, useLocation } from "@/lib/routing";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { Button } from "@/components/ui/button";
@@ -81,12 +82,12 @@ interface SubagentsPanelProps {
   rootSessionId: string;
 }
 
-type ViewMode = "list" | "graph";
-
 export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
   const { children, isLoading, error } = useChildSessions(rootSessionId);
   const [addOpen, setAddOpen] = useState(false);
-  const [viewMode, setViewMode] = useState<ViewMode>("list");
+  // Appearance "Default Agents view" seeds this mount; the toggle below only
+  // changes the current panel instance and does not write the preference.
+  const [viewMode, setViewMode] = useState<AgentsViewMode>(() => readAgentsViewDefault());
   const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
   const toggleCollapsedRow = (id: string) => {
     setCollapsedRows((current) => ({ ...current, [id]: !current[id] }));
@@ -171,8 +172,8 @@ function ViewModeToggle({
   viewMode,
   onViewModeChange,
 }: {
-  viewMode: ViewMode;
-  onViewModeChange: (mode: ViewMode) => void;
+  viewMode: AgentsViewMode;
+  onViewModeChange: (mode: AgentsViewMode) => void;
 }) {
   return (
     <div className="flex h-11 shrink-0 items-center gap-0.5 border-b px-2">
