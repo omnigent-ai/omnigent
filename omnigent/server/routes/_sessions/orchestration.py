@@ -1044,6 +1044,13 @@ def _build_session_response(
     labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
     if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL):
         labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
+    permission_mode = "default"
+    launch_args = conv.terminal_launch_args or []
+    for index, arg in enumerate(launch_args):
+        if arg.startswith("--permission-mode="):
+            permission_mode = arg.split("=", 1)[1] or "default"
+        elif arg == "--permission-mode" and index + 1 < len(launch_args):
+            permission_mode = launch_args[index + 1]
     return SessionResponse(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -1089,6 +1096,7 @@ def _build_session_response(
         last_task_error=last_task_error,
         external_session_id=conv.external_session_id,
         terminal_launch_args=conv.terminal_launch_args,
+        permission_mode=permission_mode,
         # Replay outstanding approval prompts into the snapshot.
         # The live SSE stream has no buffer, so a prompt emitted
         # before the user opened this chat would otherwise never

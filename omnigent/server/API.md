@@ -473,6 +473,12 @@ Fields:
     `PATCH /v1/sessions/{id}` (also the path the REPL's `/model`
     command uses) so the web picker and the TUI stay in sync.
 
+  permission_mode (string)
+    Effective Claude-native permission mode: `default`, `auto`,
+    `acceptEdits`, `plan`, `dontAsk`, or `bypassPermissions`. Derived from
+    `terminal_launch_args`; `default` means no launch override is active.
+    Set via `PATCH /v1/sessions/{id}`.
+
   cost_control_mode_override (string or null)
     Per-session cost-control switch: `"on"` activates the spec's
     configured cost-control mode, `"off"` disables cost control for
@@ -765,6 +771,7 @@ Content-Type: application/json
   "labels": {"env": "test"},
   "reasoning_effort": "high",
   "model_override": "claude-opus-4-7",
+  "permission_mode": "acceptEdits",
   "collaboration_mode": "plan",
   "external_session_id": "a1b2c3d4-1234-5678-9abc-def012345678"
 }
@@ -806,6 +813,13 @@ Request body:
     persisted; if no live runner or loaded Codex bridge can apply the
     change, the request fails and the stored mode is left unchanged.
 
+  permission_mode (string, optional)
+    Claude-native permission mode: `default`, `auto`, `acceptEdits`, `plan`,
+    `dontAsk`, or `bypassPermissions`. Replaces any existing
+    `--permission-mode` launch argument while preserving other arguments and
+    forwards the change to a live Claude runner. `default` clears the launch
+    override. Any other value fails with 400 `invalid_input`.
+
   cost_control_mode_override (string or null, optional)
     Per-session cost-control switch: `"on"` activates the spec's
     configured cost-control mode, `"off"` disables cost control for
@@ -826,8 +840,8 @@ Request body:
 `runner_id` set to the newly bound value when `runner_id` was present.
 
 400 Bad Request - runner is not currently registered; `collaboration_mode`
-is used on a non-Codex-native session; or `external_session_id` would
-overwrite a different existing value
+is used on a non-Codex-native session; `permission_mode` is invalid; or
+`external_session_id` would overwrite a different existing value
 404 Not Found - no session with that id
 
 This is the mutable affinity primitive for Alpha. The same endpoint

@@ -1622,6 +1622,8 @@ describe("Composer — queued-message flush gating", () => {
 });
 
 describe("Composer config gear", () => {
+  const realSetPermissionMode = useChatStore.getState().setPermissionMode;
+
   beforeEach(() => {
     useChatStore.setState({
       conversationId: "conv_test",
@@ -1631,6 +1633,7 @@ describe("Composer config gear", () => {
       llmModel: null,
       nativeVendorOwnsModel: false,
       selectedEffort: null,
+      permissionMode: "default",
       costControlModeOverride: null,
       // Opening the gear re-reads the routing switches; stub the fetch away.
       refreshSessionOverrides: vi.fn().mockResolvedValue(undefined),
@@ -1638,6 +1641,7 @@ describe("Composer config gear", () => {
   });
 
   afterEach(() => {
+    useChatStore.setState({ setPermissionMode: realSetPermissionMode });
     cleanup();
     vi.restoreAllMocks();
   });
@@ -1706,8 +1710,12 @@ describe("Composer config gear", () => {
     expect(tip.textContent).toContain("Model:");
   });
 
-  it("shows a hover summary with Harness/Model/Effort rows and no Permissions row", async () => {
-    useChatStore.setState({ selectedEffort: "high", sessionHarness: "claude-sdk" });
+  it("shows Claude's live permission mode in the hover summary", async () => {
+    useChatStore.setState({
+      selectedEffort: "high",
+      permissionMode: "acceptEdits",
+      sessionHarness: "claude-sdk",
+    });
     renderWithTooltips(
       <Composer
         {...composerProps({
@@ -1725,8 +1733,7 @@ describe("Composer config gear", () => {
     expect(tip.textContent).toContain("Harness:");
     expect(tip.textContent).toContain("Model:");
     expect(tip.textContent).toContain("Effort:");
-    // Effort is switchable in-session; permission mode is not, so it must be absent.
-    expect(tip.textContent).not.toContain("Permissions");
+    expect(tip.textContent).toContain("Permissions: Accept edits");
   });
 
   it("reflects Smart Routing in the Model row of the summary when routing is on", async () => {
@@ -1772,9 +1779,29 @@ describe("Composer config gear", () => {
     );
     fireEvent.click(gear()!);
     expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
-    // Claude native → Model + Effort selects present.
+    // Claude native → Model + Effort + Permissions selects present.
     expect(screen.getByTestId("composer-config-model")).toBeTruthy();
     expect(screen.getByTestId("composer-config-effort")).toBeTruthy();
+    expect(screen.getByTestId("composer-config-permission")).toBeTruthy();
+  });
+
+  it("applies a drafted Claude permission mode only on Save", async () => {
+    const setPermissionMode = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setPermissionMode, permissionMode: "default" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({ showEffort: false, showModels: true, modelPickerKind: "claude" })}
+      />,
+    );
+
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+    fireEvent.click(screen.getByTestId("composer-config-permission"));
+    fireEvent.click(screen.getByRole("option", { name: "Accept edits" }));
+    expect(setPermissionMode).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("composer-config-save"));
+    await waitFor(() => expect(setPermissionMode).toHaveBeenCalledWith("acceptEdits"));
   });
 
   it("uses the Default sentinel when Kiro marks no catalog row as default", async () => {

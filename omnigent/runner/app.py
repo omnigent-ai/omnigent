@@ -6379,6 +6379,40 @@ def create_runner_app(
                 )
             return Response(status_code=204)
 
+        if body_type == "permission_mode_change":
+            harness = _session_harness_name(conversation_id)
+            if harness == "claude-native":
+                permission_mode = body.get("permission_mode") if isinstance(body, dict) else None
+                if not isinstance(permission_mode, str) or not permission_mode:
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "invalid_input",
+                            "detail": "Body 'permission_mode' must be a non-empty string",
+                        },
+                    )
+                from omnigent.claude_native_bridge import (
+                    bridge_dir_for_bridge_id,
+                    update_permission_mode,
+                )
+
+                bridge_id = await _claude_native_bridge_id_for_session(
+                    server_client=server_client,
+                    session_id=conversation_id,
+                )
+                try:
+                    await asyncio.to_thread(
+                        update_permission_mode,
+                        bridge_dir_for_bridge_id(bridge_id),
+                        permission_mode,
+                    )
+                except ValueError as exc:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": "invalid_input", "detail": str(exc)},
+                    )
+            return Response(status_code=204)
+
         if body_type == "plan_mode_change":
             harness = _session_harness_name(conversation_id)
             if harness == "codex-native":

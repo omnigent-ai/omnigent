@@ -425,6 +425,25 @@ describe("runner binding", () => {
     expect(session.modelOverride).toBe("claude-opus-4-7");
   });
 
+  it("PATCHes permission_mode and parses the canonical response", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        items: [],
+        permission_mode: "acceptEdits",
+      }),
+    );
+
+    const session = await updateSession("conv_abc", { permissionMode: "acceptEdits" });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ permission_mode: "acceptEdits" });
+    expect(session.permissionMode).toBe("acceptEdits");
+  });
+
   it("PATCHes model_override='default' when modelOverride is null (matches REPL /model semantics)", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({

@@ -397,6 +397,54 @@ async def test_patch_session_empty_project_removes_label(
     assert "omni_project" not in conv.labels
 
 
+async def test_patch_session_permission_mode(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """Permission changes replace the launch flag and preserve unrelated args."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.update_conversation(
+        session_id,
+        terminal_launch_args=["--verbose", "--permission-mode=plan"],
+    )
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"permission_mode": "acceptEdits"},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["permission_mode"] == "acceptEdits"
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.terminal_launch_args == ["--verbose", "--permission-mode", "acceptEdits"]
+
+    clear_resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"permission_mode": "default"},
+        headers={"Content-Type": "application/json"},
+    )
+    assert clear_resp.status_code == 200
+    assert clear_resp.json()["permission_mode"] == "default"
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.terminal_launch_args == ["--verbose"]
+
+
+async def test_patch_session_rejects_unknown_permission_mode(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"permission_mode": "unrestricted"},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 400
+    assert "invalid permission_mode" in resp.json()["error"]["message"]
+
+
 # ── Pinned session label (omnigent.pinned) ───────────────────────────
 
 

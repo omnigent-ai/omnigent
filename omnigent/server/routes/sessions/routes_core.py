@@ -189,6 +189,10 @@ from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 
+_CLAUDE_PERMISSION_MODES = frozenset(
+    {"default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
+)
+
 
 def register_core_routes(
     router: APIRouter,
@@ -1669,6 +1673,40 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+        permission_mode = body.permission_mode
+        if permission_mode is not None:
+            if permission_mode not in _CLAUDE_PERMISSION_MODES:
+                raise OmnigentError(
+                    f"invalid permission_mode: must be one of {sorted(_CLAUDE_PERMISSION_MODES)}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if terminal_launch_args is None:
+                conv_for_permission_mode = conv_for_collaboration_mode
+                if conv_for_permission_mode is None:
+                    conv_for_permission_mode = await asyncio.to_thread(
+                        conversation_store.get_conversation,
+                        session_id,
+                    )
+                if conv_for_permission_mode is None:
+                    raise _session_not_found()
+                terminal_launch_args = list(conv_for_permission_mode.terminal_launch_args or [])
+
+            resolved_launch_args: list[str] = []
+            index = 0
+            while index < len(terminal_launch_args):
+                arg = terminal_launch_args[index]
+                if arg == "--permission-mode":
+                    index += 2
+                    continue
+                if arg.startswith("--permission-mode="):
+                    index += 1
+                    continue
+                resolved_launch_args.append(arg)
+                index += 1
+            if permission_mode != "default":
+                resolved_launch_args.extend(("--permission-mode", permission_mode))
+            terminal_launch_args = resolved_launch_args
+
         if body.runner_id is not None:
             # Empty string is the clear sentinel (None = leave unchanged);
             # used by /clear and /switch to move the runner between sessions.
@@ -1843,6 +1881,15 @@ def register_core_routes(
                     updated.model_override,
                     conversation_store,
                 )
+        if live_forward and permission_mode is not None:
+            await _forward_session_change_to_runner(
+                session_id,
+                runner_router,
+                {
+                    "type": "permission_mode_change",
+                    "permission_mode": permission_mode,
+                },
+            )
         if requested_codex_collaboration_mode is not None and live_forward:
             _codex_plan_enabled = _codex_plan_mode_enabled(requested_codex_collaboration_mode)
             _runner_result = await _forward_session_change_to_runner(

@@ -1937,6 +1937,50 @@ async def test_events_model_change_on_native_session_types_slash_command(
 
 
 @pytest.mark.asyncio
+async def test_events_permission_mode_change_updates_claude_invocation_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude-native permission events update the live invocation sidecar."""
+    captured: list[tuple[Path, str]] = []
+
+    def _fake_update(bridge_dir: Path, permission_mode: str) -> bool:
+        captured.append((bridge_dir, permission_mode))
+        return True
+
+    monkeypatch.setattr(claude_native_bridge, "update_permission_mode", _fake_update)
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    conv_id = "57c7c1acc5eeec3978c5e62043da51b0"
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "permission_mode_change", "permission_mode": "acceptEdits"},
+        )
+
+    assert resp.status_code == 204, resp.text
+    assert captured == [(bridge_dir_for_conversation_id(conv_id), "acceptEdits")]
+
+
+@pytest.mark.asyncio
 async def test_events_model_change_rejects_a_model_the_picker_cannot_spell(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

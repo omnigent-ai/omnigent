@@ -2617,6 +2617,25 @@ def test_augment_claude_args_mirrors_launch_overrides_into_settings(
     assert settings["effortLevel"] == "xhigh"
 
 
+def test_update_permission_mode_preserves_and_clears_invocation_settings(tmp_path: Path) -> None:
+    """A live permission change edits only the invocation-local permission key."""
+    args = augment_claude_args(
+        ("--model", "claude-fable-5", "--permission-mode", "plan"),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    assert claude_native_bridge.update_permission_mode(tmp_path, "acceptEdits") is True
+    settings = _load_invocation_settings(args)
+    assert settings["model"] == "claude-fable-5"
+    assert settings["permissions"] == {"defaultMode": "acceptEdits"}
+
+    assert claude_native_bridge.update_permission_mode(tmp_path, "default") is True
+    settings = _load_invocation_settings(args)
+    assert settings["model"] == "claude-fable-5"
+    assert "permissions" not in settings
+
+
 def test_augment_claude_args_mirrors_joined_model_arg_into_settings(
     tmp_path: Path,
 ) -> None:

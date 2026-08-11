@@ -145,6 +145,7 @@ interface SessionResponseWire {
   /** Effective brain harness (override-aware), e.g. ``"claude-sdk"``. */
   harness?: string | null;
   model_override?: string | null;
+  permission_mode?: string | null;
   /** Per-session cost-control switch; `null`/absent = spec default. */
   cost_control_mode_override?: "on" | "off" | null;
   /** Sub-agent routing switch; `null`/absent reads the same as `"off"` (Default). */
@@ -304,6 +305,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     llmModel: wire.llm_model,
     harness: wire.harness ?? null,
     modelOverride: wire.model_override,
+    permissionMode: wire.permission_mode,
     costControlModeOverride: wire.cost_control_mode_override,
     subagentRoutingOverride: wire.subagent_routing_override,
     contextWindow: wire.context_window,
@@ -651,7 +653,7 @@ export async function launchRunner(
 /**
  * PATCH mutable session properties.
  *
- * `null` on `reasoningEffort` / `modelOverride` sends the server's
+ * `null` on `reasoningEffort` / `modelOverride` / `permissionMode` sends the server's
  * ``"default"`` clear alias (matches the REPL's ``/effort | /model
  * default``). `null` on `costControlModeOverride` /
  * `subagentRoutingOverride` is sent as a JSON ``null`` — for those fields
@@ -670,6 +672,7 @@ export async function updateSession(
   updates: {
     reasoningEffort?: string | null;
     modelOverride?: string | null;
+    permissionMode?: string | null;
     codexPlanMode?: boolean;
     costControlModeOverride?: "on" | "off" | null;
     subagentRoutingOverride?: "on" | "off" | null;
@@ -684,6 +687,9 @@ export async function updateSession(
   }
   if ("modelOverride" in updates) {
     body.model_override = updates.modelOverride ?? "default";
+  }
+  if ("permissionMode" in updates) {
+    body.permission_mode = updates.permissionMode ?? "default";
   }
   if (updates.codexPlanMode !== undefined) {
     body.collaboration_mode = updates.codexPlanMode ? "plan" : "default";

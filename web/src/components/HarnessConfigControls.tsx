@@ -119,6 +119,34 @@ export const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
   { value: "max", label: "Max" },
 ];
 
+// Claude Code's `--permission-mode` choices. "default" sends no launch flag;
+// the remaining values are stored as `--permission-mode <value>`.
+export const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "default";
+export const CLAUDE_NATIVE_PERMISSION_MODES: {
+  value: string;
+  label: string;
+  description: string;
+}[] = [
+  { value: "default", label: "Default", description: "Prompts before edits and commands" },
+  { value: "auto", label: "Auto", description: "Auto-runs; a classifier blocks risky actions" },
+  {
+    value: "acceptEdits",
+    label: "Accept edits",
+    description: "Auto-applies file edits; commands still prompt",
+  },
+  { value: "plan", label: "Plan", description: "Plans only; makes no edits" },
+  {
+    value: "dontAsk",
+    label: "Don't ask",
+    description: "Auto-denies anything not pre-approved",
+  },
+  {
+    value: "bypassPermissions",
+    label: "Bypass permissions",
+    description: "Runs everything; no prompts or safety checks",
+  },
+];
+
 /**
  * A labeled configuration row: bold label + muted sub-description on the left,
  * the control on the right. Mirrors the "Configure …" modal layout.

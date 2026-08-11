@@ -1781,6 +1781,8 @@ class SessionResponse(BaseModel):
         ``["--dangerously-skip-permissions"]``. ``None`` for
         non-native sessions or a native session launched with none.
         Lets the launcher reproduce the command on resume.
+    :param permission_mode: Effective Claude-native permission mode derived
+        from ``terminal_launch_args``. ``"default"`` when no override is set.
     :param pending_elicitations: Outstanding approval prompts on
         this session at the moment the snapshot was built — the
         original ``response.elicitation_request`` event dicts.
@@ -1900,6 +1902,7 @@ class SessionResponse(BaseModel):
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
+    permission_mode: str | None = None
     pending_elicitations: list[dict[str, Any]] = Field(default_factory=list)
     # Un-consumed web-composer user messages on native-terminal
     # sessions at snapshot time, each ``{"pending_id", "content"}``.
@@ -1991,10 +1994,14 @@ class UpdateSessionRequest(BaseModel):
         A list (including ``[]``) replaces the stored value wholesale
         — resume is last-write-wins, never an append. Bounds (count /
         length) are validated server-side. ``None`` leaves unchanged.
+    :param permission_mode: Claude-native permission mode. A supported value
+        replaces any existing ``--permission-mode`` launch argument and is
+        forwarded to a live runner. ``"default"`` clears the launch override;
+        ``None`` leaves it unchanged.
     :param silent: When ``True``, persist metadata changes but skip
         the runner-side side effects — specifically the
-        native ``/effort`` / ``/model`` / Codex collaboration-mode
-        forwards into the live runtime. Used by automatic bind-time
+        native ``/effort`` / ``/model`` / permission-mode / Codex
+        collaboration-mode forwards into the live runtime. Used by automatic bind-time
         handoffs (web's sticky-pref apply on session switch, the
         REPL's pre-create ``/model`` snapshot) where injecting a
         visible slash command into a freshly-spawned pane would
@@ -2026,6 +2033,7 @@ class UpdateSessionRequest(BaseModel):
     subagent_routing_override: str | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
+    permission_mode: str | None = None
     archived: bool | None = None
     project_id: str | None = None
     silent: bool = False

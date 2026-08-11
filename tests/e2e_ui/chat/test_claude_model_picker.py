@@ -47,6 +47,7 @@ def _patch_session_as_claude_native(
     catalog_state: dict[str, bool] | None = None,
     model_options: list[dict] | None = None,
     llm_model: str = "system.ai.claude-sonnet-5",
+    permission_mode: str = "default",
     host_asleep: bool = False,
 ) -> list[dict]:
     """Patch the browser's session snapshot into a claude-native response.
@@ -63,16 +64,18 @@ def _patch_session_as_claude_native(
     :param catalog_state: Optional mutable readiness gate for delayed options.
     :param model_options: Catalog rows to expose; defaults to the live-alias set.
     :param llm_model: Bound model id shown for the session.
+    :param permission_mode: Effective Claude permission mode exposed in the snapshot.
     :param host_asleep: Shape the snapshot like a dormant resumable managed
         host (host-bound, resumable, aged past the startup grace); pair with
         :func:`_force_asleep_liveness` to drive the ``host_asleep`` state.
     :returns: Captured PATCH request bodies.
     """
     latest_payload: dict | None = None
+    current_permission_mode = permission_mode
     patch_bodies: list[dict] = []
 
     def _handle(route: Route) -> None:
-        nonlocal latest_payload
+        nonlocal current_permission_mode, latest_payload
         request = route.request
         parsed = urlparse(request.url)
         if parsed.path != f"/v1/sessions/{session_id}":
@@ -90,6 +93,8 @@ def _patch_session_as_claude_native(
             payload = dict(latest_payload or {})
             if "model_override" in request_body:
                 payload["model_override"] = request_body["model_override"]
+            if "permission_mode" in request_body:
+                current_permission_mode = request_body["permission_mode"]
         else:
             route.continue_()
             return
@@ -100,6 +105,7 @@ def _patch_session_as_claude_native(
         }
         payload["harness"] = "claude"
         payload["llm_model"] = llm_model
+        payload["permission_mode"] = current_permission_mode
         catalog = _MODEL_OPTIONS if model_options is None else model_options
         payload["model_options"] = (
             catalog if catalog_state is None or catalog_state["ready"] else []
@@ -263,6 +269,38 @@ def test_claude_native_alias_selection_persists(
     assert patch_bodies[-1] == {"model_override": "opus"}
     # The read-only composer label reflects the new pick.
     expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text("Opus 4.10")
+
+
+def test_claude_native_permission_mode_persists(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Changing permissions in the session config PATCHes the selected mode."""
+    base_url, session_id = seeded_session
+    patch_bodies = _patch_session_as_claude_native(page, session_id)
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible(timeout=15_000)
+    gear.click()
+    page.get_by_test_id("composer-config-permission").click()
+    page.get_by_role("option", name="Accept edits").click()
+
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == f"/v1/sessions/{session_id}"
+            and response.status == 200
+        )
+    ):
+        page.get_by_test_id("composer-config-save").click()
+
+    assert patch_bodies[-1] == {"permission_mode": "acceptEdits"}
+    gear.hover()
+    expect(page.get_by_test_id("composer-config-gear-tooltip")).to_contain_text(
+        "Permissions: Accept edits"
+    )
 
 
 def _force_asleep_liveness(page: Page, session_id: str) -> None:

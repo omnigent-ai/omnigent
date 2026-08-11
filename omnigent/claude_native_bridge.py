@@ -5890,6 +5890,40 @@ def _read_json_file(path: Path) -> _JsonObject:
     return payload if isinstance(payload, dict) else {}
 
 
+def update_permission_mode(bridge_dir: Path, permission_mode: str) -> bool:
+    """Update the invocation-local Claude permission mode.
+
+    :param bridge_dir: Claude-native bridge directory for the live session.
+    :param permission_mode: Claude permission mode, or ``"default"`` to clear
+        the override.
+    :returns: ``True`` when the invocation settings existed and were updated;
+        ``False`` when the bridge has not created them yet.
+    """
+    valid_modes = {"default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
+    if permission_mode not in valid_modes:
+        raise ValueError(f"Unsupported Claude permission mode: {permission_mode!r}")
+
+    settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
+    if not settings_path.is_file():
+        return False
+    settings = _read_json_file(settings_path)
+    permissions = settings.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
+    else:
+        permissions = dict(permissions)
+    if permission_mode == "default":
+        permissions.pop("defaultMode", None)
+    else:
+        permissions["defaultMode"] = permission_mode
+    if permissions:
+        settings["permissions"] = permissions
+    else:
+        settings.pop("permissions", None)
+    _write_json_file(settings_path, settings)
+    return True
+
+
 def _write_json_file(path: Path, payload: _JsonObject) -> None:
     """
     Atomically write a JSON object file with owner-only permissions.
