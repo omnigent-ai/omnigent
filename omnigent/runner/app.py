@@ -617,6 +617,31 @@ class _SessionSnapshot:
 
 
 @dataclasses.dataclass(frozen=True)
+class _CommentRelayBinding:
+    """A running comment relay plus the agent and bridge it was built for.
+
+    A relay advertises the tool surface of one agent spec and writes it into
+    one bridge directory. Recording both lets
+    ``_ensure_comment_relay_started`` notice that the session moved to a
+    different agent and replace the relay, instead of leaving the previous
+    agent's surface advertised to the new harness.
+
+    :param relay: The relay currently serving the session.
+    :param spec_entry: Resolved spec the advertised surface was built from,
+        compared by identity: the session spec cache hands back the same
+        object until an agent switch or an agent update evicts it, so a
+        changed object means the surface has to be rebuilt. ``None`` when
+        the spec could not be resolved and the fallback surface was used.
+    :param bridge_dir: Directory the relay wrote ``tool_relay.json`` into,
+        e.g. ``Path("/tmp/omnigent-bridge/conv_abc123")``.
+    """
+
+    relay: ClaudeNativeToolRelay
+    spec_entry: _SpecEntry | None
+    bridge_dir: Path
+
+
+@dataclasses.dataclass(frozen=True)
 class _SessionInitContext:
     """Metadata source selected before shared session initialization runs."""
 
@@ -1938,7 +1963,7 @@ def create_runner_app(
     _session_sub_agent_names: dict[str, str] = {}
     _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
-    _session_comment_relays: dict[str, ClaudeNativeToolRelay] = {}
+    _session_comment_relays: dict[str, _CommentRelayBinding] = {}
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _opencode_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -3339,8 +3364,8 @@ def create_runner_app(
         _session_fs_registries.pop(session_id, None)
         _session_agent_ids.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
-        if _relay := _session_comment_relays.pop(session_id, None):
-            _relay.close()
+        if _binding := _session_comment_relays.pop(session_id, None):
+            _binding.relay.close()
         _session_histories.pop(session_id, None)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
@@ -5053,6 +5078,24 @@ def create_runner_app(
         logger=_logger,
     )
 
+    def _discard_comment_relay(session_id: str, relay: ClaudeNativeToolRelay) -> None:
+        """Unbind and close *relay*, unless another path already replaced it.
+
+        Removal is by relay instance rather than by session id: a
+        replacement installed while the caller was working owns the entry
+        and has already closed *relay*, so popping the key would tear down
+        the newer relay instead of the intended one.
+
+        :param session_id: Session/conversation id the relay was bound to.
+        :param relay: The relay instance the caller installed.
+        :returns: None.
+        """
+        binding = _session_comment_relays.get(session_id)
+        if binding is None or binding.relay is not relay:
+            return
+        del _session_comment_relays[session_id]
+        relay.close()
+
     async def _ensure_comment_relay_started(
         session_id: str,
         *,
@@ -5061,41 +5104,64 @@ def create_runner_app(
         await_notify: bool = False,
         session_labels: Mapping[str, str] | None = None,
     ) -> None:
-        if session_id in _session_comment_relays:
-            return
-
         import json as _json
 
         from omnigent.claude_native_bridge import (
+            BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
             post_tools_changed,
             start_tool_relay,
         )
 
+        try:
+            spec_entry = await _resolve_session_spec_entry(session_id)
+        except OmnigentError:
+            spec_entry = None
+
+        # The bridge dir, when the caller pinned it down or handed over the
+        # labels it comes from. Deriving it any other way costs a server
+        # round trip, which a session whose agent has not changed must not
+        # pay on every turn.
+        known_bridge_dir: Path | None = None
         if explicit_bridge_dir is not None:
-            bridge_dir = explicit_bridge_dir
-        else:
-            if bridge_id is None:
-                bridge_id = await _claude_native_bridge_id_with_optional_labels(
+            known_bridge_dir = explicit_bridge_dir
+        elif bridge_id is not None:
+            known_bridge_dir = bridge_dir_for_bridge_id(bridge_id or session_id)
+        elif session_labels is not None:
+            known_bridge_dir = bridge_dir_for_bridge_id(
+                session_labels.get(BRIDGE_ID_LABEL_KEY) or session_id
+            )
+
+        current = _session_comment_relays.get(session_id)
+        if current is not None and current.spec_entry is spec_entry and known_bridge_dir is None:
+            return
+
+        bridge_dir = known_bridge_dir
+        if bridge_dir is None:
+            bridge_dir = bridge_dir_for_bridge_id(
+                await _claude_native_bridge_id_with_optional_labels(
                     server_client=server_client,
                     session_id=session_id,
                     session_labels=session_labels,
                 )
+                or session_id
+            )
 
-            if session_id in _session_comment_relays:
-                return
-
-            bridge_dir = bridge_dir_for_bridge_id(bridge_id or session_id)
-
-        try:
-            relay_spec = await _resolve_session_agent_spec(session_id)
-        except OmnigentError:
-            relay_spec = None
-        if session_id in _session_comment_relays:
+        # Re-read after the awaits above: a concurrent caller may have
+        # installed a relay that already matches the current agent.
+        current = _session_comment_relays.get(session_id)
+        if (
+            current is not None
+            and current.spec_entry is spec_entry
+            and current.bridge_dir == bridge_dir
+        ):
             return
+
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
-        relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(relay_spec)
+        relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(
+            _unwrap_spec_entry(spec_entry)
+        )
 
         _captured_session_id = session_id
 
@@ -5127,7 +5193,18 @@ def create_runner_app(
                 exc_info=True,
             )
             return
-        _session_comment_relays[session_id] = relay
+        superseded = _session_comment_relays.get(session_id)
+        _session_comment_relays[session_id] = _CommentRelayBinding(
+            relay=relay,
+            spec_entry=spec_entry,
+            bridge_dir=bridge_dir,
+        )
+        # Close last: the new advertisement is already written, and
+        # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
+        # still points at the relay being closed, so a shared bridge dir
+        # keeps the new file.
+        if superseded is not None:
+            superseded.relay.close()
 
         async def _notify_tools_changed() -> None:
             try:
@@ -6893,14 +6970,22 @@ def create_runner_app(
             )
         bridge_inject = bool(body.get("bridge_inject_dir"))
         bridge_id = session_id
-        relay_existed = False
+        # Set only when this launch installed the relay, so a failure rolls
+        # back what it started and leaves a relay that was already serving
+        # the session (or that another path installed meanwhile) alone.
+        launched_relay: ClaudeNativeToolRelay | None = None
         if bridge_inject:
             bridge_id = await _claude_native_bridge_id_for_session(
                 server_client=server_client,
                 session_id=session_id,
             )
-            relay_existed = session_id in _session_comment_relays
+            relay_before = _session_comment_relays.get(session_id)
             await _ensure_comment_relay_started(session_id, bridge_id=bridge_id)
+            relay_after = _session_comment_relays.get(session_id)
+            if relay_after is not None and (
+                relay_before is None or relay_before.relay is not relay_after.relay
+            ):
+                launched_relay = relay_after.relay
 
         try:
             launch_method = (
@@ -6919,10 +7004,8 @@ def create_runner_app(
                 resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
             )
         except RuntimeError as exc:
-            if bridge_inject and not relay_existed:
-                relay = _session_comment_relays.pop(session_id, None)
-                if relay is not None:
-                    relay.close()
+            if launched_relay is not None:
+                _discard_comment_relay(session_id, launched_relay)
             return JSONResponse(
                 status_code=500,
                 content={
