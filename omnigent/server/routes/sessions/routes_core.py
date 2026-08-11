@@ -102,6 +102,7 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_SUBAGENT_PROMPT_LABEL_KEY,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+    _UI_ADDED_AGENT_TITLE_PREFIX,
     _logger,
     _managed_launch_tasks,
     _session_active_response_cache,
@@ -235,6 +236,11 @@ def _promoted_session_title(conversation: Conversation, latest_items: list[Any])
         if not display_name and conversation.title:
             display_name = conversation.title.partition(":")[0]
         summary = conversation.labels.get(_CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY)
+    elif conversation.title and conversation.title.startswith(f"{_UI_ADDED_AGENT_TITLE_PREFIX}:"):
+        _, _, remainder = conversation.title.partition(":")
+        display_name, separator, summary = remainder.partition(":")
+        if not separator:
+            return None
     else:
         return None
     summary = " ".join(summary.split()) if summary else _latest_message_preview(latest_items)
@@ -2297,20 +2303,15 @@ def register_core_routes(
                 code=ErrorCode.CONFLICT,
             )
 
-        promoted_title: str | None = None
-        if (
-            _is_codex_native_subagent(conversation)
-            or _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY in conversation.labels
-        ):
-            latest_items = await asyncio.to_thread(
-                conversation_store.list_latest_message_items_for_conversations,
-                [session_id],
-                1,
-            )
-            promoted_title = _promoted_session_title(
-                conversation,
-                latest_items.get(session_id, []),
-            )
+        latest_items = await asyncio.to_thread(
+            conversation_store.list_latest_message_items_for_conversations,
+            [session_id],
+            1,
+        )
+        promoted_title = _promoted_session_title(
+            conversation,
+            latest_items.get(session_id, []),
+        )
 
         if permission_store is not None and user_id is not None:
             await asyncio.to_thread(permission_store.ensure_user, user_id)

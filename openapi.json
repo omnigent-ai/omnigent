@@ -10713,6 +10713,49 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/promote": {
+      "post": {
+        "description": "Promote an inactive child session and its descendants to a new tree.",
+        "operationId": "promote_session_v1_sessions__session_id__promote_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Promote Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/read-state": {
       "put": {
         "description": "Set the calling user's read-state for one session.\n\nRequires `LEVEL_READ` on the session in multi-user mode \u2014 you can\nonly track read-state for sessions you can see. Stores the values\nverbatim (the client enforces the baseline's monotonicity and the\nunread semantics); the server does not interpret them against\nsession status. Returns `204` \u2014 the client already has the\noptimistic state and re-reads the authoritative value on the next\n`GET /v1/sessions` poll.\n\n**Parameters**\n\n- `body` \u2014 The validated `ReadStatePutRequest`.\n\n**Returns:** An empty `204 No Content` response.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks read access.",

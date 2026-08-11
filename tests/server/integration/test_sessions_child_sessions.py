@@ -234,6 +234,29 @@ async def test_promote_claude_child_replaces_subagent_id_with_name_and_descripti
     assert updated.title == "reviewer: Review the promotion behavior"
 
 
+async def test_promote_ui_added_child_removes_internal_title_prefix(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A promoted user-added child gets a normal top-level title."""
+    parent = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    promoted = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="ui:hello_world:promotion-e2e",
+        agent_id=parent["agent_id"],
+    )
+
+    response = await client.post(f"/v1/sessions/{promoted.id}/promote")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["title"] == "hello_world: promotion-e2e"
+    updated = conv_store.get_conversation(promoted.id)
+    assert updated is not None
+    assert updated.title == "hello_world: promotion-e2e"
+
+
 @pytest.mark.parametrize("active_node", ["target", "descendant"])
 async def test_promote_session_rejects_active_tree(
     client: httpx.AsyncClient,
