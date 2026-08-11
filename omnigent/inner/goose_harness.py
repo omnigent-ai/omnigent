@@ -1,4 +1,4 @@
-"""``harness: goose`` wrap (the headless Goose ACP harness).
+"""``harness: goose`` wrap (the Goose ACP harness).
 
 Thin module exposing :func:`create_app` — the entry point the shared
 :mod:`omnigent.runtime.harnesses._runner` invokes after the parent process
@@ -6,11 +6,12 @@ resolves ``"goose"`` to this module via
 :data:`omnigent.runtime.harnesses._HARNESS_MODULES`.
 
 Wraps a :class:`omnigent.inner.goose_executor.GooseExecutor`, which drives
-``goose acp`` over the Agent Client Protocol — the chat-first, headless
-counterpart to the terminal-first ``goose-native`` TUI harness
-(:mod:`omnigent.inner.goose_native_harness`). Goose's mid-turn tool approvals
-surface as web elicitation cards (via Omnigent's TOOL_CALL policy + ``ctx.elicit``
-bridges the :class:`ExecutorAdapter` installs), mirroring the qwen wrap.
+``goose acp`` over the Agent Client Protocol. This is the only Goose harness:
+the retired ``goose-native`` TUI wrap could not gate tool calls through
+Omnigent policy (Goose exposes no pre-tool hook), so its spellings now
+canonicalize here. Goose's mid-turn tool approvals surface as web elicitation
+cards (via Omnigent's TOOL_CALL policy + ``ctx.elicit`` bridges the
+:class:`ExecutorAdapter` installs), mirroring the qwen wrap.
 
 Auth is Goose's own configuration (``goose configure`` → keyring /
 ``~/.config/goose/config.yaml``); Omnigent stores no Goose credential. A spec

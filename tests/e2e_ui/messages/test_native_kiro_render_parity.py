@@ -20,7 +20,7 @@ and asserts the same three properties:
 
 Gating
 ------
-Like cursor-/goose-native, Kiro authenticates against its own backend (``kiro``
+Like cursor-/hermes-native, Kiro authenticates against its own backend (``kiro``
 sign-in), which CI does not provision. The suite **skips** when
 ``kiro-cli``/``tmux`` are absent, and runs for real where Kiro is signed in.
 """

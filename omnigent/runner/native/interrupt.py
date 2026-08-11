@@ -11,13 +11,13 @@ Mirrors :class:`omnigent.runner.codex.goal.CodexGoalRunner`: app-scope state
 injected at construction so the class stays out of the already-large app module
 while preserving the exact behavior of the original closures.
 
-The seven uniform interrupt harnesses and six uniform stop harnesses differ
+The six uniform interrupt harnesses and five uniform stop harnesses differ
 only by bridge module, control-function name, and error label; they collapse to
 two parametrized methods driven by :data:`_UNIFORM_INTERRUPT` /
 :data:`_UNIFORM_STOP`. claude interrupt (bridge-id resolution) and codex
 interrupt (MCP-startup + app-server ``turn/interrupt``) keep dedicated methods
-(so nine interrupt handlers total); claude stop is likewise special-cased and
-codex/pi alias stop to their interrupt handler (so seven stop handlers total).
+(so eight interrupt handlers total); claude stop is likewise special-cased and
+codex/pi alias stop to their interrupt handler (so six stop handlers total).
 
 Coverage note: antigravity-native and opencode-native have no handler here and
 :meth:`interrupt` / :meth:`stop` return ``None`` for them, so the caller falls
@@ -139,7 +139,7 @@ class _UniformStop:
     display_name: str
 
 
-# The seven uniform interrupt harnesses (claude/codex are special-cased). pi uses
+# The six uniform interrupt harnesses (claude/codex are special-cased). pi uses
 # enqueue_interrupt + OSError and no timeout; the rest inject_interrupt +
 # RuntimeError + timeout_s.
 _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
@@ -157,14 +157,6 @@ _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
         "inject_interrupt",
         "cursor_native_interrupt_failed",
         "cursor-native interrupt",
-        (RuntimeError,),
-        True,
-    ),
-    "goose": _UniformInterrupt(
-        "omnigent.goose_native_bridge",
-        "inject_interrupt",
-        "goose_native_interrupt_failed",
-        "goose-native interrupt",
         (RuntimeError,),
         True,
     ),
@@ -202,7 +194,7 @@ _UNIFORM_INTERRUPT: dict[str, _UniformInterrupt] = {
     ),
 }
 
-# The six uniform stop harnesses (claude has a special stop; codex/pi have no
+# The five uniform stop harnesses (claude has a special stop; codex/pi have no
 # distinct stop — they route to interrupt, handled in ``stop``).
 _UNIFORM_STOP: dict[str, _UniformStop] = {
     "cursor": _UniformStop(
@@ -210,12 +202,6 @@ _UNIFORM_STOP: dict[str, _UniformStop] = {
         "cursor_native_stop_failed",
         "cursor-native stop",
         "Cursor",
-    ),
-    "goose": _UniformStop(
-        "omnigent.goose_native_bridge",
-        "goose_native_stop_failed",
-        "goose-native stop",
-        "Goose",
     ),
     "kiro": _UniformStop(
         "omnigent.kiro_native_bridge",

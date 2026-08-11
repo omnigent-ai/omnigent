@@ -41,10 +41,10 @@ _HOST_NAME = "e2e-host"
 _TOGGLE_KEY = "omnigent:hide-unconfigured-harnesses"
 
 # Two native harness agents: Claude Code is configured on the stubbed host,
-# Goose is not. Both are native coding agents, so both render under the
+# Qwen Code is not. Both are native coding agents, so both render under the
 # picker's "Harnesses" group — the surface the filter acts on.
 _CLAUDE_AGENT_ID = "ag_claude_e2e"
-_GOOSE_AGENT_ID = "ag_goose_e2e"
+_QWEN_AGENT_ID = "ag_qwen_e2e"
 
 
 def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
@@ -78,7 +78,7 @@ def _hosts_body() -> str:
     """Stub body for ``GET /v1/hosts``: one online host the composer picks.
 
     Its ``configured_harnesses`` marks ``claude-native`` available and
-    ``goose-native`` unconfigured — the wire shape the ``host.hello`` readiness
+    ``qwen-native`` unconfigured — the wire shape the ``host.hello`` readiness
     map produces, so the stub exercises the real availability → picker path.
     """
     return json.dumps(
@@ -91,7 +91,7 @@ def _hosts_body() -> str:
                     "status": "online",
                     "configured_harnesses": {
                         "claude-native": True,
-                        "goose-native": False,
+                        "qwen-native": False,
                     },
                 }
             ]
@@ -100,7 +100,7 @@ def _hosts_body() -> str:
 
 
 def _agents_body() -> str:
-    """Stub body for ``GET /v1/agents``: the Claude and Goose native agents."""
+    """Stub body for ``GET /v1/agents``: the Claude and Qwen native agents."""
     return json.dumps(
         {
             "data": [
@@ -113,11 +113,11 @@ def _agents_body() -> str:
                     "skills": [],
                 },
                 {
-                    "id": _GOOSE_AGENT_ID,
-                    "name": "goose-native-ui",
-                    "display_name": "Goose",
-                    "description": "Block's coding agent",
-                    "harness": "goose-native",
+                    "id": _QWEN_AGENT_ID,
+                    "name": "qwen-native-ui",
+                    "display_name": "Qwen Code",
+                    "description": "Alibaba's coding agent",
+                    "harness": "qwen-native",
                     "skills": [],
                 },
             ]
@@ -160,10 +160,10 @@ def test_hide_unconfigured_harnesses_filters_the_picker(
 ) -> None:
     """Off shows every harness; flipping the setting hides host-unconfigured ones.
 
-    1. **default (off)** — the picker lists both Claude Code and Goose, even
-       though the host reports Goose unconfigured (it's badged, not hidden).
+    1. **default (off)** — the picker lists both Claude Code and Qwen, even
+       though the host reports Qwen unconfigured (it's badged, not hidden).
     2. **toggle on** — flipping the real Settings → Appearance Switch persists
-       the preference; the picker now drops the Goose row while keeping Claude.
+       the preference; the picker now drops the Qwen row while keeping Claude.
     """
     base_url, session_id = seeded_session
     del session_id  # this flow never creates a session — only reads the picker
@@ -185,7 +185,7 @@ async def _drive(base_url: str) -> None:
                 );"""
             )
 
-            # 1. Default (toggle off): Claude lists inline; Goose is unconfigured
+            # 1. Default (toggle off): Claude lists inline; Qwen is unconfigured
             #    on the host, so it folds into the "More" submenu (badged "needs
             #    setup") but is still reachable/selectable.
             await page.goto(f"{base_url}/")
@@ -196,13 +196,13 @@ async def _drive(base_url: str) -> None:
             await expect(
                 page.get_by_test_id(f"new-chat-landing-agent-{_CLAUDE_AGENT_ID}")
             ).to_be_visible(timeout=30_000)
-            # Goose isn't inline — drill into "More" to reveal it.
+            # Qwen isn't inline — drill into "More" to reveal it.
             await expect(
-                page.get_by_test_id(f"new-chat-landing-agent-{_GOOSE_AGENT_ID}")
+                page.get_by_test_id(f"new-chat-landing-agent-{_QWEN_AGENT_ID}")
             ).to_have_count(0)
             await page.get_by_test_id("new-chat-landing-harness-more").click()
             await expect(
-                page.get_by_test_id(f"new-chat-landing-agent-{_GOOSE_AGENT_ID}")
+                page.get_by_test_id(f"new-chat-landing-agent-{_QWEN_AGENT_ID}")
             ).to_be_visible()
 
             # 2. Flip the real Settings → Appearance Switch on and confirm it
@@ -217,7 +217,7 @@ async def _drive(base_url: str) -> None:
             assert stored == "true", f"toggle did not persist (got {stored!r})"
 
             # Back on the composer, the picker remounts and re-reads the
-            # preference: Goose (unconfigured on the host) is gone; Claude stays.
+            # preference: Qwen (unconfigured on the host) is gone; Claude stays.
             await page.goto(f"{base_url}/")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
@@ -229,7 +229,7 @@ async def _drive(base_url: str) -> None:
             # count()==0 (not "not visible"): the row is conditionally rendered,
             # never just hidden.
             await expect(
-                page.get_by_test_id(f"new-chat-landing-agent-{_GOOSE_AGENT_ID}")
+                page.get_by_test_id(f"new-chat-landing-agent-{_QWEN_AGENT_ID}")
             ).to_have_count(0)
         finally:
             await browser.close()

@@ -1,7 +1,7 @@
-"""End-to-end tests: the headless ``goose`` harness drives ``goose acp``.
+"""End-to-end tests: the ``goose`` harness drives ``goose acp``.
 
-The chat-first sibling of ``test_goose_native_cli_e2e``. The ``goose`` harness
-runs Block's Goose over the Agent Client Protocol (``goose acp``):
+The live suite for Omnigent's only Goose harness, which runs Block's Goose over
+the Agent Client Protocol (``goose acp``):
 :class:`omnigent.inner.goose_executor.GooseExecutor` spawns the subprocess,
 streams ``agent_message_chunk`` updates as chat text, and routes Goose's mid-turn
 ``session/request_permission`` through Omnigent's TOOL_CALL policy + human-consent
@@ -66,8 +66,10 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / ".local" / "share"))
-    # Force per-tool approval so session/request_permission fires.
-    monkeypatch.setenv("GOOSE_MODE", "approve")
+    # GOOSE_MODE is deliberately NOT set here: the executor forces its own
+    # approval mode, so the permission assertion below proves the production
+    # gate fires without test scaffolding.
+    monkeypatch.delenv("GOOSE_MODE", raising=False)
     return tmp_path
 
 

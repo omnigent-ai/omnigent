@@ -130,10 +130,10 @@ def test_dispatch_by_runtime_opencode_native_routes_to_wrapper(
     """Opencode-native resume routes through the seam to ``run_opencode_native``.
 
     Regression for the seam's coverage expansion: the old hand-written
-    ``if native_agent.key == "<x>"`` chain covered 10 harnesses but *not*
+    ``if native_agent.key == "<x>"`` chain covered most harnesses but *not*
     ``opencode``, so an opencode-native resume fell through to the Omnigent
     REPL and double-posted each turn (the same latent bug the chat-redirect
-    path had). Routing through ``resolve_hook_for_key`` covers all 11; this
+    path had). Routing through ``resolve_hook_for_key`` covers every one; this
     pins that opencode now reaches its wrapper.
     """
     monkeypatch.setattr(

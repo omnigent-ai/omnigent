@@ -16,7 +16,7 @@ tails the same event stream the transcript forwarder uses:
 1. read a ``control_request`` / ``can_use_tool`` off ``--json-file`` (structured,
    no pane scraping),
 2. POST it to the server's generic ``native-permission-request`` hook (shared
-   with the hermes-/goose-native mirrors; ``agent="qwen"`` labels the card),
+   with the hermes-native mirror; ``agent="qwen"`` labels the card),
    which publishes the standard ``response.elicitation_request`` event and parks
    for the web verdict (the same machinery cursor-/codex-native use),
 3. on the verdict, answer qwen by appending a ``confirmation_response`` to
@@ -331,7 +331,7 @@ async def _run_one_approval(
 ) -> None:
     """Park one qwen control request on the server and answer with the verdict."""
     # Reuse the vendor-agnostic native-permission hook (shared with the hermes-
-    # and goose-native mirrors); ``agent`` labels the card and ``policy_name``
+    # mirror); ``agent`` labels the card and ``policy_name``
     # keeps the qwen flavor.
     payload = {
         "elicitation_id": elicitation_id,

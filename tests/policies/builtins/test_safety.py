@@ -140,20 +140,21 @@ def test_ask_on_os_tools_asks_for_pi_native_tools(
     ],
     ids=["shell", "write", "edit", "text_editor"],
 )
-def test_ask_on_os_tools_asks_for_goose_native_tools(
+def test_ask_on_os_tools_asks_for_goose_developer_tools(
     tool: str,
     args: dict[str, str],
     expected_preview: str,
 ) -> None:
-    """Goose's ``developer__*`` tools trigger ASK via the ``PreToolUse`` hook.
+    """Goose's ``developer__*`` tools trigger ASK at the TOOL_CALL phase.
 
-    Goose namespaces its built-in developer tools (``developer__shell`` etc.).
+    Goose namespaces its built-in developer tools (``developer__shell`` etc.),
+    and that is the name its ACP ``session/request_permission`` carries.
     Without these names the standard ``ask_on_os_tools`` policy would silently
-    fail to gate a native goose session's shell/file tools — so a card would
-    never appear. ``developer__shell`` resolves the ``command`` preview branch;
-    the file tools use Goose's ``path`` arg, matching the default branch.
+    fail to gate a goose session's shell/file tools — so a card would never
+    appear. ``developer__shell`` resolves the ``command`` preview branch; the
+    file tools use Goose's ``path`` arg, matching the default branch.
 
-    :param tool: Goose native tool name, e.g. ``"developer__shell"``.
+    :param tool: Goose developer tool name, e.g. ``"developer__shell"``.
     :param args: Tool arguments dict.
     :param expected_preview: Substring that must appear in the reason.
     """

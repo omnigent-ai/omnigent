@@ -68,6 +68,18 @@ def test_provider_env_only_sets_when_present() -> None:
     }
 
 
+def test_spawn_env_forces_an_approval_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The subprocess always gets an asking ``GOOSE_MODE``, overriding the host's.
+
+    Goose defaults to Auto, which sends no ``session/request_permission``, so
+    without this the TOOL_CALL policy gate in :meth:`_decide_permission` never
+    runs and every tool executes ungated. An ambient ``GOOSE_MODE=auto`` must
+    not be able to switch enforcement back off.
+    """
+    monkeypatch.setenv("GOOSE_MODE", "auto")
+    assert GooseExecutor()._build_spawn_env()["GOOSE_MODE"] == "smart_approve"
+
+
 # ---------------------------------------------------------------------------
 # Tool-call extraction (Goose ACP shapes)
 # ---------------------------------------------------------------------------

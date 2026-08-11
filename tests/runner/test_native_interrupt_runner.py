@@ -91,18 +91,18 @@ async def test_uniform_interrupt_injects_and_wakes_parent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A uniform interrupt calls the bridge inject fn and wakes the parent."""
-    import omnigent.goose_native_bridge as goose_bridge
+    import omnigent.kiro_native_bridge as kiro_bridge
 
     calls: list[Any] = []
 
     def _inject(bridge_dir: Any, *, timeout_s: float) -> None:
         calls.append((bridge_dir, timeout_s))
 
-    monkeypatch.setattr(goose_bridge, "bridge_dir_for_session_id", lambda conv: f"dir/{conv}")
-    monkeypatch.setattr(goose_bridge, "inject_interrupt", _inject)
+    monkeypatch.setattr(kiro_bridge, "bridge_dir_for_session_id", lambda conv: f"dir/{conv}")
+    monkeypatch.setattr(kiro_bridge, "inject_interrupt", _inject)
 
     runner, captured = _make_runner()
-    resp = await runner.interrupt("goose-native", "conv_g")
+    resp = await runner.interrupt("kiro-native", "conv_g")
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert calls == [("dir/conv_g", 1.0)]

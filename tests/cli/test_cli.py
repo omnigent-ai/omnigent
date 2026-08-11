@@ -5752,11 +5752,6 @@ def test_native_terminal_dispatch_specs_cover_registered_native_agents() -> None
             {"extra_args": (), "model": "native-model", "prompt": None},
         ),
         (
-            "goose-native",
-            "omnigent.goose_native.run_goose_native",
-            {"extra_args": ("--model", "native-model")},
-        ),
-        (
             "antigravity-native",
             "omnigent.antigravity_native.run_antigravity_native",
             {"extra_args": (), "model": "native-model"},
@@ -5922,7 +5917,6 @@ def test_dispatch_native_terminal_harness_forwards_prompt_to_claude_and_codex(
 @pytest.mark.parametrize(
     ("harness", "target", "args_param"),
     [
-        ("goose-native", "omnigent.goose_native.run_goose_native", "extra_args"),
         ("qwen-native", "omnigent.qwen_native.run_qwen_native", "extra_args"),
         ("hermes-native", "omnigent.hermes_native.run_hermes_native", "extra_args"),
     ],

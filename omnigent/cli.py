@@ -1602,7 +1602,6 @@ _HARNESS_COMMANDS: frozenset[str] = frozenset(
         "codex",
         "cursor",
         "debby",
-        "goose",
         "hermes",
         "kimi",
         "kiro",
@@ -1846,7 +1845,6 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "debug",
         "diagnose",
         "doctor",
-        "goose",
         "hermes",
         "host",
         "import",
@@ -6656,12 +6654,6 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
         args_param="extra_args",
         model_strategy="first_class",
         prompt_param="prompt",
-    ),
-    "goose": _NativeTerminalDispatchSpec(
-        module="omnigent.goose_native",
-        function="run_goose_native",
-        args_param="extra_args",
-        model_strategy="explicit_passthrough",
     ),
     "antigravity": _NativeTerminalDispatchSpec(
         module="omnigent.antigravity_native",
