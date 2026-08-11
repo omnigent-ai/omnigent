@@ -2,20 +2,22 @@
 a browse control when the session has somewhere else to go.
 
 The desktop Workspace rail renders ``FilesPanel`` in its ``frameless``
-(inline) mode. Two behaviours are pinned here:
+(inline) mode. Three behaviours are pinned here:
 
 1. The header never collapses the panel. The file list is the whole point of
    the panel, so there is nothing to collapse to. This guards against
    reintroducing the collapse chevron: the header once doubled as a collapse
    toggle carrying ``aria-expanded``, which made no sense here. A session with
    nowhere else to browse (no bound host) keeps the plain, unclickable label.
-2. When the session IS host-bound and unconfined, the working-folder path
+2. The header's eye shows hidden files by default and reads as state: plain
+   while dot-prefixed entries are listed, slashed once they are filtered out.
+3. When the session IS host-bound and unconfined, the working-folder path
    becomes a button that opens the workspace directory browser, and picking a
    directory re-roots the file tree there — through the real server, runner,
    and filesystem, not a stub.
 
-Neither sends a message — the header is rail state, not a function of any
-turn — so both stay fast, LLM-free checks.
+None of them send a message — the header is rail state, not a function of any
+turn — so they all stay fast, LLM-free checks.
 """
 
 from __future__ import annotations
@@ -63,6 +65,52 @@ def test_files_rail_working_folder_header_is_a_static_label(
     # no toggle needed. Scope is the rail tab now (Files vs Changes), not an
     # in-panel switch.
     expect(rail.get_by_role("searchbox", name="Search all files")).to_be_visible()
+
+
+def test_files_rail_shows_hidden_files_until_the_eye_is_clicked(
+    page: Page,
+    seeded_session: tuple[str, str],
+    request: pytest.FixtureRequest,
+) -> None:
+    """Dot-prefixed entries are listed without touching the eye, and the eye
+    reports the current state rather than the pending action: unslashed while
+    hidden files are visible, slashed once they are filtered out.
+
+    Agents write to ``.claude/``, ``.github/`` and friends constantly, so a
+    workspace whose dotfiles are invisible by default hides much of what a
+    turn actually changed.
+    """
+    base_url, session_id = seeded_session
+
+    env = page.request.get(f"{base_url}/v1/sessions/{session_id}/resources/environments/default")
+    assert env.status == 200, env.text()
+    root = Path(env.json()["metadata"]["root"])
+    hidden = root / ".hidden-demo"
+    hidden.mkdir(parents=True, exist_ok=True)
+    (hidden / "inside.txt").write_text("proof the dot-directory listed\n")
+    # The workspace is a real checkout shared with every other test in the
+    # shard, so this fixture directory must not outlive the test.
+    request.addfinalizer(lambda: shutil.rmtree(hidden, ignore_errors=True))
+
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name=re.compile("^Files")).click()
+
+    row = rail.get_by_role("button", name=".hidden-demo/", exact=True)
+    expect(row).to_be_visible(timeout=30_000)
+
+    # Visible state → plain eye. The class regex is anchored on whitespace
+    # because "lucide-eye" is a prefix of "lucide-eye-off".
+    toggle = rail.get_by_role("button", name="Hide hidden files")
+    expect(toggle.locator("svg")).to_have_class(re.compile(r"(^|\s)lucide-eye(\s|$)"))
+
+    toggle.click()
+
+    expect(row).to_have_count(0)
+    expect(rail.get_by_role("button", name="Show hidden files").locator("svg")).to_have_class(
+        re.compile(r"(^|\s)lucide-eye-off(\s|$)")
+    )
 
 
 def test_files_panel_double_click_opens_a_folder_as_the_working_folder(
