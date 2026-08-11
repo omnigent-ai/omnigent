@@ -32,6 +32,7 @@ class _CaptureClient:
         """Record the path + body and return a fake 202 response."""
         self._captured["path"] = path
         self._captured["body"] = json
+        self._captured.setdefault("posts", []).append((path, json))
 
         class _Resp:
             status_code = 202
@@ -49,7 +50,8 @@ def _stub_runner_client(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: A dict the test inspects after the runner POST runs;
-        contains ``path`` and ``body`` keys once the route fires.
+        contains ``path`` and ``body`` for the last POST plus a ``posts``
+        list of every ``(path, body)`` pair, once the route fires.
     """
     from omnigent.server.routes import sessions as sessions_mod
 
@@ -219,6 +221,58 @@ async def test_runner_first_event_forwards_harness_override(
         f"override; got {captured['body'].get('harness_override')!r}. The "
         f"create route did not persist harness_override before the first "
         f"turn, or the forwarding site dropped it."
+    )
+
+
+async def test_create_session_init_carries_harness_override(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The create route's runner notification must carry the override.
+
+    With ``initial_items`` the kickoff turn is forwarded before this
+    notification lands. A notification that omits the session-init envelope
+    leaves the runner resolving the harness from the spec, so init evicts the
+    override harness the kickoff turn is already streaming through.
+    """
+    from omnigent.server.routes import sessions as sessions_mod
+
+    captured = _stub_runner_client(monkeypatch)
+
+    async def _skip_relay_readiness(*_: Any, **__: Any) -> None:
+        return None
+
+    monkeypatch.setattr(sessions_mod, "_ensure_runner_relay_ready", _skip_relay_readiness)
+
+    agent = await create_test_agent(client)
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "harness_override": "pi",
+            "initial_items": [
+                {
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "kickoff"}],
+                    },
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    init_posts = [body for path, body in captured.get("posts", []) if path == "/v1/sessions"]
+    assert init_posts, (
+        "The create route never notified the runner about the new session — "
+        "check the runner-stub wiring."
+    )
+    snapshot = init_posts[-1].get("session_init", {}).get("snapshot", {})
+    assert snapshot.get("harness_override") == "pi", (
+        f"Session-init notification lost the create-time harness override; "
+        f"got {init_posts[-1]!r}. The runner then resolves the harness from "
+        f"the spec and spawns that one instead."
     )
 
 
