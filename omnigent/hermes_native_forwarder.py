@@ -69,6 +69,14 @@ from pathlib import Path
 import httpx
 
 from omnigent import hermes_native_status
+from omnigent._native_forwarder_liveness import (
+    PollFailureTracker,
+    RestartFailureTracker,
+    handle_poll_failure,
+    handle_supervisor_restart,
+    note_poll_success,
+    note_supervisor_healthy,
+)
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 
 _logger = logging.getLogger(__name__)
@@ -1120,6 +1128,7 @@ async def forward_hermes_store_to_session(
     # Omnigent server so we do it at most once per forwarder lifetime.
     _external_id_synced = False
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
+    poll_failures = PollFailureTracker()
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
@@ -1441,13 +1450,22 @@ async def forward_hermes_store_to_session(
                                 bridge_dir,
                                 completed_turns,
                             )
+                note_poll_success(poll_failures)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 _logger.exception(
                     "hermes forwarder poll failed; session=%s hermes_session=%s",
                     session_id,
                     hermes_session_id,
+                )
+                await handle_poll_failure(
+                    client=client,
+                    session_id=session_id,
+                    tracker=poll_failures,
+                    error=exc,
+                    harness="hermes-native",
+                    logger=_logger,
                 )
             await asyncio.sleep(poll_interval_s)
 
@@ -1485,6 +1503,7 @@ async def supervise_hermes_forwarder(
     :returns: Never normally returns; cancel the task to stop it.
     """
     backoff_s = _SUPERVISOR_INITIAL_BACKOFF_S
+    restart_failures = RestartFailureTracker()
     while True:
         run_started_at = _supervisor_monotonic()
         crash_exc: Exception | None = None
@@ -1512,6 +1531,7 @@ async def supervise_hermes_forwarder(
             crash_exc = exc
         if _supervisor_monotonic() - run_started_at >= _SUPERVISOR_HEALTHY_UPTIME_S:
             backoff_s = _SUPERVISOR_INITIAL_BACKOFF_S
+            note_supervisor_healthy(restart_failures)
         if crash_exc is not None:
             _logger.error(
                 "hermes forwarder crashed; restarting in %.1fs; session=%s bridge_dir=%s",
@@ -1519,6 +1539,18 @@ async def supervise_hermes_forwarder(
                 session_id,
                 bridge_dir,
                 exc_info=crash_exc,
+            )
+        timeout = httpx.Timeout(_POST_TIMEOUT_S)
+        async with httpx.AsyncClient(
+            base_url=base_url, headers=headers, auth=auth, timeout=timeout
+        ) as client:
+            await handle_supervisor_restart(
+                client=client,
+                session_id=session_id,
+                tracker=restart_failures,
+                error=crash_exc,
+                harness="hermes-native",
+                logger=_logger,
             )
         await _supervisor_sleep(backoff_s)
         backoff_s = min(backoff_s * 2.0, _SUPERVISOR_MAX_BACKOFF_S)

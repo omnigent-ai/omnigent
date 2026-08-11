@@ -16,6 +16,14 @@ from pathlib import Path
 
 import httpx
 
+from omnigent._native_forwarder_liveness import (
+    PollFailureTracker,
+    RestartFailureTracker,
+    handle_poll_failure,
+    handle_supervisor_restart,
+    note_poll_success,
+    note_supervisor_healthy,
+)
 from omnigent._native_post_delivery import (
     append_dead_letter,
     post_external_session_status,
@@ -794,6 +802,7 @@ async def forward_claude_transcript_to_session(
     task_statuses: dict[str, str] = {}
     task_order: list[str] = []
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
+    poll_failures = PollFailureTracker()
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
@@ -994,9 +1003,10 @@ async def forward_claude_transcript_to_session(
                             bridge_dir=bridge_dir,
                             dedupe=dedupe,
                         )
+                    note_poll_success(poll_failures)
             except asyncio.CancelledError:
                 raise
-            except TimeoutError:
+            except TimeoutError as exc:
                 # The deadline cancelled a stalled await mid-iteration; the
                 # traceback names it. Cursor state advances only after
                 # successful posts, so resuming retries the interrupted step.
@@ -1009,11 +1019,27 @@ async def forward_claude_transcript_to_session(
                     bridge_dir,
                     exc_info=True,
                 )
-            except Exception:
+                await handle_poll_failure(
+                    client=client,
+                    session_id=session_id,
+                    tracker=poll_failures,
+                    error=exc,
+                    harness="claude-native",
+                    logger=_logger,
+                )
+            except Exception as exc:
                 _logger.exception(
                     "Claude transcript forwarder loop failed; session=%s bridge_dir=%s",
                     session_id,
                     bridge_dir,
+                )
+                await handle_poll_failure(
+                    client=client,
+                    session_id=session_id,
+                    tracker=poll_failures,
+                    error=exc,
+                    harness="claude-native",
+                    logger=_logger,
                 )
             await asyncio.sleep(poll_interval_s)
 
@@ -1975,6 +2001,7 @@ async def supervise_forwarder(
     :returns: Never normally returns; cancel the task to stop it.
     """
     backoff_s = _SUPERVISOR_INITIAL_BACKOFF_S
+    restart_failures = RestartFailureTracker()
     while True:
         run_started_at = _supervisor_monotonic()
         crash_exc: Exception | None = None
@@ -2007,6 +2034,7 @@ async def supervise_forwarder(
         run_duration_s = _supervisor_monotonic() - run_started_at
         if run_duration_s >= _SUPERVISOR_HEALTHY_UPTIME_S:
             backoff_s = _SUPERVISOR_INITIAL_BACKOFF_S
+            note_supervisor_healthy(restart_failures)
         if crash_exc is not None:
             # Log AFTER the healthy-uptime reset so the reported delay
             # matches the sleep that actually follows.
@@ -2017,6 +2045,18 @@ async def supervise_forwarder(
                 session_id,
                 bridge_dir,
                 exc_info=crash_exc,
+            )
+        timeout = httpx.Timeout(_POST_TIMEOUT_S)
+        async with httpx.AsyncClient(
+            base_url=base_url, headers=headers, auth=auth, timeout=timeout
+        ) as client:
+            await handle_supervisor_restart(
+                client=client,
+                session_id=session_id,
+                tracker=restart_failures,
+                error=crash_exc,
+                harness="claude-native",
+                logger=_logger,
             )
         await _supervisor_sleep(backoff_s)
         backoff_s = min(backoff_s * 2.0, _SUPERVISOR_MAX_BACKOFF_S)

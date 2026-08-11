@@ -1395,6 +1395,57 @@ class SessionResourceRegistry:
             session_id_getter=_session_id_getter,
         )
 
+    def notify_pane_dead(self, session_id: str, terminal_id: str) -> None:
+        """
+        Schedule exit handling when an attach bridge sees a definitive dead pane.
+
+        Idempotent with the idle watcher's ``on_exit`` path: the first caller to
+        claim the terminal lifecycle wins, so a clean ``/quit`` (idle memo) still
+        does not publish ``failed``, and a mid-turn crash still does.
+
+        :param session_id: Omnigent session/conversation id.
+        :param terminal_id: Opaque terminal resource id, e.g. ``"terminal_claude_main"``.
+        :returns: None.
+        """
+        if self._terminal_registry is None:
+            return
+        entry = None
+        for candidate in self._terminal_registry.list_for_conversation(session_id):
+            if terminal_resource_id(candidate.terminal_name, candidate.session_key) == terminal_id:
+                entry = candidate
+                break
+        if entry is None:
+            return
+        with self._lock:
+            lifecycle = self._terminal_lifecycles.get((session_id, terminal_id))
+        if lifecycle is None:
+            return
+
+        loop = asyncio.get_running_loop()
+
+        def _schedule() -> None:
+            task = asyncio.create_task(
+                self._handle_terminal_exit(
+                    session_id=session_id,
+                    terminal_name=entry.terminal_name,
+                    session_key=entry.session_key,
+                    lifecycle=lifecycle,
+                    instance=entry.instance,
+                )
+            )
+            self._terminal_exit_tasks.add(task)
+            self._terminal_exit_scheduled.set()
+            task.add_done_callback(self._terminal_exit_tasks.discard)
+
+        try:
+            loop.call_soon_threadsafe(_schedule)
+        except RuntimeError:
+            _logger.debug(
+                "Event loop unavailable while handling pane death: session=%s terminal=%s",
+                session_id,
+                terminal_id,
+            )
+
     async def _handle_terminal_exit(
         self,
         *,

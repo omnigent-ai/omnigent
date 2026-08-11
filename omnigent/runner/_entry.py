@@ -1461,12 +1461,15 @@ async def _run_tunnel_from_env() -> None:
         """Record real runner work for the inactivity watchdog.
 
         Called by the WebSocket tunnel frame dispatcher for non-keepalive
-        request frames.
+        request frames, and by native session-status edges so a long PTY
+        turn refreshes the idle timer.
 
         :returns: None.
         """
         nonlocal last_activity_at
         last_activity_at = loop.time()
+
+    app.state.mark_activity = _mark_activity
 
     def _last_activity() -> float:
         """Return the last real runner activity time.

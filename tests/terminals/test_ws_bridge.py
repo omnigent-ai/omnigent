@@ -1501,3 +1501,54 @@ async def test_check_pane_dead_definitive_tri_state(
     # By calling with non-existent socket/target, tmux probe fails and returns None
     result = await _check_pane_dead_definitive("/nonexistent/socket", "nonexistent")
     assert result is None, "inconclusive probe should return None"
+
+
+@pytest.mark.asyncio
+async def test_bridge_calls_on_pane_dead_when_pty_ends_on_dead_pane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PTY EOF against a definitive dead pane fires ``on_pane_dead``.
+
+    Closing the websocket alone left mid-turn chats frozen; the runner wires
+    this callback into the required-terminal exit path so durable ``failed``
+    is published.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    master_fd, slave_fd = os.openpty()
+    # Closing the slave makes the master report EOF → pty_task ends first.
+    os.close(slave_fd)
+
+    monkeypatch.setattr(
+        ws_bridge,
+        "_fork_exec_pty",
+        lambda *_a, **_k: ws_bridge._SpawnedPty(pid=999_999, master_fd=master_fd),
+    )
+    monkeypatch.setattr(os, "kill", lambda *_a, **_k: None)
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/tmux")
+
+    async def _pane_dead(*_a: object, **_k: object) -> bool:
+        return True
+
+    async def _reap(*_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr(ws_bridge, "_check_pane_dead_definitive", _pane_dead)
+    monkeypatch.setattr(ws_bridge, "_reap_tmux_attach_child", _reap)
+
+    deaths: list[int] = []
+    ws = _ParkingFakeWebSocket()
+
+    await asyncio.wait_for(
+        bridge_tmux_pty_to_websocket(
+            ws,  # type: ignore[arg-type]
+            socket_path="/nonexistent.sock",
+            tmux_target="main",
+            read_only=False,
+            on_pane_dead=lambda: deaths.append(1),
+        ),
+        timeout=5.0,
+    )
+    assert deaths == [1]
+    assert ws.close_code == ws_bridge.WS_CLOSE_TERMINAL_NOT_FOUND

@@ -397,6 +397,7 @@ async def bridge_tmux_control_to_websocket(
     tmux_target: str,
     read_only: bool,
     on_client_interaction: Callable[[], None] | None = None,
+    on_pane_dead: Callable[[], None] | None = None,
     reader_done: asyncio.Event | None = None,
     forward_done: asyncio.Event | None = None,
 ) -> None:
@@ -417,6 +418,8 @@ async def bridge_tmux_control_to_websocket(
         interaction (connect, disconnect, each input/resize frame) so the
         idle watcher can discount client-driven repaints. See the PTY bridge
         for the full rationale.
+    :param on_pane_dead: Optional callback fired when the bridge observes a
+        definitive dead pane. Same contract as the PTY bridge.
     :param reader_done: Optional test-only event set once the reader has queued
         the full backlog and the ``None`` EOF sentinel, letting a test await the
         reader draining tmux instead of sleeping. Inert (never awaited) when
@@ -676,6 +679,8 @@ async def bridge_tmux_control_to_websocket(
                 if pane_dead is True or (
                     pane_dead is None and not await _tmux_session_alive(socket_path, tmux_target)
                 ):
+                    if on_pane_dead is not None:
+                        on_pane_dead()
                     await websocket.close(
                         code=WS_CLOSE_TERMINAL_NOT_FOUND,
                         reason="terminal session ended",
