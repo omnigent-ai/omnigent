@@ -2625,6 +2625,12 @@ async def _upload_config_bundle(
     title = args.get("title")
     if isinstance(title, str) and title:
         metadata["title"] = title
+    model = args.get("model")
+    if isinstance(model, str) and model:
+        metadata["model_override"] = model
+    reasoning_effort = args.get("reasoning_effort")
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        metadata["reasoning_effort"] = reasoning_effort
     try:
         resp = await server_client.post(
             "/v1/sessions",
