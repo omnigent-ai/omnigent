@@ -8,15 +8,19 @@ for ``admins`` / ``allowed_domains``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
 
 import pytest
 from PIL import Image
 
+from omnigent.server import server_config as server_config_module
 from omnigent.server.server_config import (
     BRANDING_ASSET_MAX_BYTES,
+    BRANDING_ASSET_MAX_DECODED_PIXELS,
     BRANDING_ASSET_MAX_DIMENSION,
+    BRANDING_ASSET_MAX_FRAMES,
     BRANDING_ASSETS_DIRNAME,
     branding_config,
     branding_logo_asset,
@@ -36,6 +40,65 @@ def _image_bytes(image_format: str, *, size: tuple[int, int] = (2, 2)) -> bytes:
     if image_format == "WEBP":
         save_kwargs["lossless"] = True
     image.save(output, format=image_format, **save_kwargs)
+    return output.getvalue()
+
+
+def _ico_bytes(entries: list[tuple[tuple[int, int], bytes]]) -> bytes:
+    directory_end = 6 + len(entries) * 16
+    directory = bytearray(b"\x00\x00\x01\x00" + len(entries).to_bytes(2, "little"))
+    payloads = bytearray()
+    for (width, height), payload in entries:
+        payload_offset = directory_end + len(payloads)
+        directory.extend(bytes((width if width < 256 else 0, height if height < 256 else 0, 0, 0)))
+        directory.extend(b"\x00\x00\x20\x00")
+        directory.extend(len(payload).to_bytes(4, "little"))
+        directory.extend(payload_offset.to_bytes(4, "little"))
+        payloads.extend(payload)
+    return bytes(directory + payloads)
+
+
+def _set_ico_entry_uint32(content: bytes, index: int, field_offset: int, value: int) -> bytes:
+    modified = bytearray(content)
+    start = 6 + index * 16 + field_offset
+    modified[start : start + 4] = value.to_bytes(4, "little")
+    return bytes(modified)
+
+
+def _set_ico_entry_uint16(content: bytes, index: int, field_offset: int, value: int) -> bytes:
+    modified = bytearray(content)
+    start = 6 + index * 16 + field_offset
+    modified[start : start + 2] = value.to_bytes(2, "little")
+    return bytes(modified)
+
+
+def _set_ico_entry_byte(content: bytes, index: int, field_offset: int, value: int) -> bytes:
+    modified = bytearray(content)
+    modified[6 + index * 16 + field_offset] = value
+    return bytes(modified)
+
+
+def _duplicate_ico_entry_range(content: bytes) -> bytes:
+    first_size = int.from_bytes(content[14:18], "little")
+    first_offset = int.from_bytes(content[18:22], "little")
+    modified = _set_ico_entry_uint32(content, 1, 8, first_size)
+    return _set_ico_entry_uint32(modified, 1, 12, first_offset)
+
+
+def _insert_ico_payload_gap(content: bytes, gap: bytes) -> bytes:
+    image_count = int.from_bytes(content[4:6], "little")
+    directory_end = 6 + image_count * 16
+    modified = content[:directory_end] + gap + content[directory_end:]
+    for index in range(image_count):
+        offset_start = 6 + index * 16 + 12
+        payload_offset = int.from_bytes(modified[offset_start : offset_start + 4], "little")
+        modified = _set_ico_entry_uint32(modified, index, 12, payload_offset + len(gap))
+    return modified
+
+
+def _dib_ico_bytes(*, size: tuple[int, int] = (16, 16)) -> bytes:
+    image = Image.new("RGBA", size, (25, 100, 200, 255))
+    output = BytesIO()
+    image.save(output, format="ICO", sizes=[size], bitmap_format="bmp")
     return output.getvalue()
 
 
@@ -177,6 +240,171 @@ def test_branding_logo_accepts_fully_decoded_rasters_in_assets_dir(
     assert asset.media_type == media_type
     assert asset.content == content
     assert branding_config()["logos"]["main"] == "/v1/branding/logo/main"
+
+
+def test_branding_logo_accepts_every_ico_directory_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    content = _ico_bytes(
+        [
+            ((16, 16), _image_bytes("PNG", size=(16, 16))),
+            ((32, 32), _image_bytes("PNG", size=(32, 32))),
+        ]
+    )
+    assets = _write_branding_config(monkeypatch, tmp_path, "logo.ico")
+    (assets / "logo.ico").write_bytes(content)
+
+    asset = branding_logo_asset()
+
+    assert asset is not None
+    assert asset.content == content
+
+
+def test_branding_logo_rejects_corrupt_secondary_ico_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    content = _ico_bytes(
+        [
+            ((16, 16), _image_bytes("PNG", size=(16, 16))),
+            ((32, 32), b"\x89PNG\r\n\x1a\nAPI_TOKEN=top-secret"),
+        ]
+    )
+    assets = _write_branding_config(monkeypatch, tmp_path, "logo.ico")
+    (assets / "logo.ico").write_bytes(content)
+
+    assert branding_logo_asset() is None
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda content: _set_ico_entry_uint32(content, 0, 8, 0),
+            id="zero-size",
+        ),
+        pytest.param(
+            lambda content: _set_ico_entry_uint32(content, 0, 12, 6),
+            id="offset-in-directory",
+        ),
+        pytest.param(
+            lambda content: _set_ico_entry_uint32(content, 1, 12, len(content) - 1),
+            id="out-of-bounds",
+        ),
+        pytest.param(
+            _duplicate_ico_entry_range,
+            id="duplicate-range",
+        ),
+        pytest.param(
+            lambda content: _set_ico_entry_uint32(
+                content,
+                0,
+                8,
+                int.from_bytes(content[14:18], "little") + 1,
+            ),
+            id="overlap",
+        ),
+        pytest.param(lambda content: content[:-1], id="truncated"),
+        pytest.param(
+            lambda content: _insert_ico_payload_gap(content, b"API_TOKEN=top-secret"),
+            id="hidden-gap",
+        ),
+    ],
+)
+def test_branding_logo_rejects_invalid_ico_entry_ranges(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutate: Callable[[bytes], bytes],
+) -> None:
+    content = _ico_bytes(
+        [
+            ((16, 16), _image_bytes("PNG", size=(16, 16))),
+            ((32, 32), _image_bytes("PNG", size=(32, 32))),
+        ]
+    )
+    assets = _write_branding_config(monkeypatch, tmp_path, "logo.ico")
+    (assets / "logo.ico").write_bytes(mutate(content))
+
+    assert branding_logo_asset() is None
+
+
+def test_branding_logo_rejects_hidden_bytes_inside_ico_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = _image_bytes("PNG", size=(16, 16)) + b"API_TOKEN=top-secret"
+    content = _ico_bytes([((16, 16), payload)])
+    assets = _write_branding_config(monkeypatch, tmp_path, "logo.ico")
+    (assets / "logo.ico").write_bytes(content)
+
+    assert branding_logo_asset() is None
+
+
+def test_branding_logo_rejects_ico_metadata_dimension_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    content = _ico_bytes([((32, 32), _image_bytes("PNG", size=(16, 16)))])
+    assets = _write_branding_config(monkeypatch, tmp_path, "logo.ico")
+    (assets / "logo.ico").write_bytes(content)
+
+    assert branding_logo_asset() is None
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda content: _set_ico_entry_byte(content, 0, 2, 1), id="color-count"),
+        pytest.param(lambda content: _set_ico_entry_byte(content, 0, 3, 1), id="reserved"),
+        pytest.param(lambda content: _set_ico_entry_uint16(content, 0, 4, 2), id="planes"),
+        pytest.param(lambda content: _set_ico_entry_uint16(content, 0, 6, 7), id="bit-count"),
+    ],
+)
+def test_branding_logo_rejects_invalid_ico_directory_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutate: Callable[[bytes], bytes],
+) -> None:
+    content = _ico_bytes([((16, 16), _image_bytes("PNG", size=(16, 16)))])
+    assets = _write_branding_config(monkeypatch, tmp_path, "logo.ico")
+    (assets / "logo.ico").write_bytes(mutate(content))
+
+    assert branding_logo_asset() is None
+
+
+def test_branding_logo_rejects_unsupported_ico_embedded_encoding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    assets = _write_branding_config(monkeypatch, tmp_path, "logo.ico")
+    (assets / "logo.ico").write_bytes(_dib_ico_bytes())
+
+    assert branding_logo_asset() is None
+
+
+def test_branding_logo_rejects_excessive_ico_entry_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = _image_bytes("PNG", size=(1, 1))
+    content = _ico_bytes([((1, 1), payload)] * (BRANDING_ASSET_MAX_FRAMES + 1))
+    assets = _write_branding_config(monkeypatch, tmp_path, "logo.ico")
+    (assets / "logo.ico").write_bytes(content)
+
+    assert branding_logo_asset() is None
+
+
+def test_branding_logo_rejects_excessive_ico_aggregate_pixels(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    size = (16, 16)
+    payload = _image_bytes("PNG", size=size)
+    content = _ico_bytes([(size, payload), (size, payload)])
+    monkeypatch.setattr(
+        server_config_module,
+        "BRANDING_ASSET_MAX_DECODED_PIXELS",
+        size[0] * size[1] * 2 - 1,
+    )
+    assets = _write_branding_config(monkeypatch, tmp_path, "logo.ico")
+    (assets / "logo.ico").write_bytes(content)
+
+    assert size[0] * size[1] * 2 < BRANDING_ASSET_MAX_DECODED_PIXELS
+    assert branding_logo_asset() is None
 
 
 @pytest.mark.parametrize(

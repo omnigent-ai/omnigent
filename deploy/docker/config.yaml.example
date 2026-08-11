@@ -58,5 +58,5 @@ allowed_domains:
 #   logo:                        # a bare string sets `main`; or per-variant:
 #     main: logo.png             # hero / primary mark
 #     loading: loading.webp      # working indicator (falls back to main)
-#     favicon: favicon.ico       # browser-tab icon
+#     favicon: favicon.png       # browser-tab icon
 #   powered_by: true             # "Powered by Omnigent" credit (only when branded); false to hide

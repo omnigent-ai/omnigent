@@ -318,23 +318,6 @@ def _container_ends_at_eof(image_format: str, content: bytes) -> bool:
             and content[8:12] == b"WEBP"
             and int.from_bytes(content[4:8], "little") + 8 == len(content)
         )
-    if image_format == "ICO":
-        if len(content) < 6 or content[:4] != b"\x00\x00\x01\x00":
-            return False
-        image_count = int.from_bytes(content[4:6], "little")
-        directory_end = 6 + image_count * 16
-        if image_count == 0 or directory_end > len(content):
-            return False
-        payload_ends: list[int] = []
-        for index in range(image_count):
-            entry = 6 + index * 16
-            payload_size = int.from_bytes(content[entry + 8 : entry + 12], "little")
-            payload_offset = int.from_bytes(content[entry + 12 : entry + 16], "little")
-            payload_end = payload_offset + payload_size
-            if payload_size == 0 or payload_offset < directory_end or payload_end > len(content):
-                return False
-            payload_ends.append(payload_end)
-        return max(payload_ends) == len(content)
     return False
 
 
@@ -346,17 +329,74 @@ def _valid_frame_shape(width: int, height: int) -> bool:
     )
 
 
-def _valid_ico_shapes(content: bytes) -> bool:
-    if len(content) < 6:
+@dataclass(frozen=True)
+class _IcoEntry:
+    width: int
+    height: int
+    payload_start: int
+    payload_end: int
+
+
+def _valid_ico(content: bytes) -> bool:
+    if len(content) < 6 or content[:4] != b"\x00\x00\x01\x00":
         return False
     image_count = int.from_bytes(content[4:6], "little")
-    if image_count <= 0 or 6 + image_count * 16 > len(content):
+    directory_end = 6 + image_count * 16
+    if image_count <= 0 or image_count > BRANDING_ASSET_MAX_FRAMES or directory_end > len(content):
         return False
+
+    entries: list[_IcoEntry] = []
     for index in range(image_count):
         entry = 6 + index * 16
         width = content[entry] or 256
         height = content[entry + 1] or 256
-        if not _valid_frame_shape(width, height):
+        color_count = content[entry + 2]
+        reserved = content[entry + 3]
+        planes = int.from_bytes(content[entry + 4 : entry + 6], "little")
+        bit_count = int.from_bytes(content[entry + 6 : entry + 8], "little")
+        payload_size = int.from_bytes(content[entry + 8 : entry + 12], "little")
+        payload_start = int.from_bytes(content[entry + 12 : entry + 16], "little")
+        payload_end = payload_start + payload_size
+        if (
+            color_count != 0
+            or reserved != 0
+            or planes not in {0, 1}
+            or bit_count not in {0, 32}
+            or not _valid_frame_shape(width, height)
+            or payload_size <= 0
+            or payload_start < directory_end
+            or payload_end > len(content)
+        ):
+            return False
+        entries.append(_IcoEntry(width, height, payload_start, payload_end))
+
+    cursor = directory_end
+    for entry in sorted(entries, key=lambda item: item.payload_start):
+        if entry.payload_start != cursor:
+            return False
+        cursor = entry.payload_end
+    if cursor != len(content):
+        return False
+
+    decoded_pixels = 0
+    for entry in entries:
+        payload = content[entry.payload_start : entry.payload_end]
+        if not payload.startswith(b"\x89PNG\r\n\x1a\n") or not _container_ends_at_eof(
+            "PNG", payload
+        ):
+            return False
+        with Image.open(BytesIO(payload)) as image:
+            if (
+                image.format != "PNG"
+                or image.size != (entry.width, entry.height)
+                or int(getattr(image, "n_frames", 1)) != 1
+            ):
+                return False
+            image.verify()
+        with Image.open(BytesIO(payload)) as image:
+            image.load()
+        decoded_pixels += entry.width * entry.height
+        if decoded_pixels > BRANDING_ASSET_MAX_DECODED_PIXELS:
             return False
     return True
 
@@ -369,6 +409,8 @@ def _raster_media_type(path: Path, content: bytes) -> str | None:
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error", Image.DecompressionBombWarning)
+            if expected_format == "ICO":
+                return media_type if _valid_ico(content) else None
             with Image.open(BytesIO(content)) as image:
                 if image.format != expected_format or not _valid_frame_shape(*image.size):
                     return None
@@ -378,8 +420,6 @@ def _raster_media_type(path: Path, content: bytes) -> str | None:
                     or frame_count > BRANDING_ASSET_MAX_FRAMES
                     or image.width * image.height * frame_count > BRANDING_ASSET_MAX_DECODED_PIXELS
                 ):
-                    return None
-                if image.format == "ICO" and not _valid_ico_shapes(content):
                     return None
                 image.verify()
             with Image.open(BytesIO(content)) as image:

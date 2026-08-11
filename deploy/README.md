@@ -512,14 +512,16 @@ branding:
   logo:                          # a bare string sets `main`; or per-variant:
     main: logo.png               # branding-assets/logo.png
     loading: loading.webp        # working indicator (falls back to main)
-    favicon: favicon.ico         # browser-tab icon
+    favicon: favicon.png         # browser-tab icon
   powered_by: true               # "Powered by Omnigent" credit; false to hide
 ```
 
 Logo files must live under a dedicated `branding-assets/` directory beside the
 config file (for example, `/data/branding-assets/logo.png`). PNG, JPEG, GIF,
-WebP, and ICO files up to 5 MiB are accepted only after full decoder validation;
-malformed, truncated, oversized, trailing-payload, SVG, symlinked, escaped, and
+WebP, and ICO files up to 5 MiB are accepted only after full decoder validation.
+ICO files must contain only PNG-backed entries; every directory entry is bounded
+and decoded independently, while DIB/BMP-backed entries are rejected. Malformed,
+truncated, oversized, overlapping, trailing-payload, SVG, symlinked, escaped, and
 non-image files are ignored. Images are also bounded to 4096 pixels per side,
 128 frames, 16 megapixels per frame, and 64 megapixels across all decoded frames.
 The values are served over the unauthenticated `GET /v1/info` and
