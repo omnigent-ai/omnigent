@@ -216,7 +216,12 @@ def test_codex_not_gateway_backed_for_non_databricks_provider(
     assert codex_gateway_inference_backed() is False
 
 
-def test_codex_not_gateway_backed_for_cli_login(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_codex_not_gateway_backed_for_cli_login(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _stub_codex_dismissed(monkeypatch, False)
     _stub_codex(
         monkeypatch,
         NativeCodexLaunch(config_overrides=[], model=None, profile=None),
@@ -298,11 +303,90 @@ def test_codex_not_gateway_backed_for_cli_config_missing_provider_table(
     assert codex_gateway_inference_backed() is False
 
 
-def test_codex_not_gateway_backed_for_openai_login_ignores_config(
+def _stub_codex_dismissed(monkeypatch: pytest.MonkeyPatch, dismissed: bool) -> None:
+    from omnigent.onboarding import detected
+
+    monkeypatch.setattr(detected, "codex_config_provider_dismissed", lambda _config: dismissed)
+
+
+def test_codex_gateway_backed_for_config_default_provider(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
 ) -> None:
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _stub_codex_dismissed(monkeypatch, False)
+    _write_codex_config(
+        tmp_path,
+        f'model_provider = "Databricks"\n[model_providers.Databricks]\nbase_url = "{_GATEWAY_CODEX_URL}"\n',
+    )
+    _stub_codex(
+        monkeypatch,
+        NativeCodexLaunch(config_overrides=[], model=None, profile=None),
+    )
+
+    assert codex_gateway_inference_backed() is True
+
+
+def test_codex_not_gateway_backed_for_config_default_when_dismissed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _stub_codex_dismissed(monkeypatch, True)
+    _write_codex_config(
+        tmp_path,
+        f'model_provider = "Databricks"\n[model_providers.Databricks]\nbase_url = "{_GATEWAY_CODEX_URL}"\n',
+    )
+    _stub_codex(
+        monkeypatch,
+        NativeCodexLaunch(config_overrides=[], model=None, profile=None),
+    )
+
+    assert codex_gateway_inference_backed() is False
+
+
+def test_codex_not_gateway_backed_for_explicit_openai_ignores_config_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _stub_codex_dismissed(monkeypatch, False)
+    _write_codex_config(
+        tmp_path,
+        f'model_provider = "Databricks"\n[model_providers.Databricks]\nbase_url = "{_GATEWAY_CODEX_URL}"\n',
+    )
+    _stub_codex(
+        monkeypatch,
+        NativeCodexLaunch(config_overrides=['model_provider="openai"'], model=None, profile=None),
+    )
+
+    assert codex_gateway_inference_backed() is False
+
+
+def test_codex_not_gateway_backed_for_config_default_non_databricks_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _stub_codex_dismissed(monkeypatch, False)
+    _write_codex_config(
+        tmp_path,
+        'model_provider = "OpenAI"\n[model_providers.OpenAI]\nbase_url = "https://api.openai.com/v1"\n',
+    )
+    _stub_codex(
+        monkeypatch,
+        NativeCodexLaunch(config_overrides=[], model=None, profile=None),
+    )
+
+    assert codex_gateway_inference_backed() is False
+
+
+def test_codex_not_gateway_backed_for_config_default_without_top_level_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _stub_codex_dismissed(monkeypatch, False)
     _write_codex_config(
         tmp_path,
         f'[model_providers.Databricks]\nbase_url = "{_GATEWAY_CODEX_URL}"\n',

@@ -1939,7 +1939,51 @@ def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
     # A cli-config entry pins only a provider *name*; its table (with the
     # base_url) lives in the user's shared ~/.codex/config.toml. Read that
     # file to resolve the base URL a cli-config launch actually routes through.
-    return _cli_config_provider_base_url(codex_session_meta_model_provider(launch))
+    if _launch_pins_model_provider(launch):
+        return _cli_config_provider_base_url(codex_session_meta_model_provider(launch))
+    # No provider pinned at all: the deliberate config-default path leaves
+    # overrides empty so Codex uses its own config.toml top-level
+    # ``model_provider`` default (a Databricks-wide setup). Resolve that.
+    return _config_default_provider_base_url()
+
+
+def _launch_pins_model_provider(launch: NativeCodexLaunch) -> bool:
+    """Whether a launch carries an explicit ``model_provider=`` override.
+
+    Distinguishes a launch that pins a provider name (cli-config, or the
+    literal ``model_provider="openai"`` the subscription / dismissed paths
+    set) from the empty-override config-default launch, which pins none.
+    """
+    return any(override.startswith("model_provider=") for override in launch.config_overrides)
+
+
+def _config_default_provider_base_url() -> str | None:
+    """Base URL Codex's config.toml top-level ``model_provider`` default routes to.
+
+    When omnigent pins no provider, Codex falls back to the top-level
+    ``model_provider`` in the user's shared ``config.toml`` — unless the user
+    dismissed that default, which pins Codex's built-in ``openai`` instead.
+
+    :returns: The default provider table's ``base_url``, or ``None`` when the
+        default is dismissed, absent, or unreadable.
+    """
+    import tomllib
+
+    from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+    from omnigent.onboarding.detected import codex_config_provider_dismissed
+    from omnigent.onboarding.provider_config import load_config
+
+    if codex_config_provider_dismissed(load_config()):
+        return None
+    config_path = _codex_home_config_source_from_env() / "config.toml"
+    try:
+        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        provider_name = data["model_provider"]
+    except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError):
+        return None
+    if not isinstance(provider_name, str):
+        return None
+    return _config_toml_provider_base_url(provider_name)
 
 
 def _cli_config_provider_base_url(provider_name: str) -> str | None:
@@ -1958,12 +2002,21 @@ def _cli_config_provider_base_url(provider_name: str) -> str | None:
     :returns: The provider table's ``base_url``, or ``None`` when it cannot be
         read.
     """
+    if provider_name in ("openai", "omnigent_databricks"):
+        return None
+    return _config_toml_provider_base_url(provider_name)
+
+
+def _config_toml_provider_base_url(provider_name: str) -> str | None:
+    """Read ``[model_providers.<provider_name>].base_url`` from the shared config.toml.
+
+    :param provider_name: A provider table key in the user's ``config.toml``.
+    :returns: That table's ``base_url``, or ``None`` when it cannot be read.
+    """
     import tomllib
 
     from omnigent.inner.codex_executor import _codex_home_config_source_from_env
 
-    if provider_name in ("openai", "omnigent_databricks"):
-        return None
     config_path = _codex_home_config_source_from_env() / "config.toml"
     try:
         data = tomllib.loads(config_path.read_text(encoding="utf-8"))
