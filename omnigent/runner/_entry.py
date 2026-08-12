@@ -41,7 +41,9 @@ _RUNNER_PREWARM_SPEC_PATH_ENV_VAR = "RUNNER_PREWARM_SPEC_PATH"
 # with the CLI/server/host) instead of a hard-coded placeholder.
 _RUNNER_VERSION = VERSION
 _RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
-_DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
+# Default inactivity window before an idle runner gracefully shuts down.
+# 8 hours covers a workday of intermittent use; runner.idle_timeout_s overrides.
+_DEFAULT_RUNNER_IDLE_TIMEOUT_S = 8 * 60 * 60
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0
 # The runner offloads short native-CLI/IPC ops via asyncio.to_thread. Python's
 # default executor sizes to min(32, cpu+4) threads, which on a many-core host
@@ -116,12 +118,12 @@ def _load_runner_idle_timeout_s_from_config() -> float:
     """Load the runner inactivity timeout from config.
 
     Reads ``runner.idle_timeout_s`` from the global config file. Missing
-    config or missing key defaults to 1 hour. A value of ``0`` disables the
+    config or missing key defaults to 8 hours. A value of ``0`` disables the
     inactivity watchdog. Negative, boolean, or non-numeric values fail loud
     during runner startup so the user does not get silently different
     lifecycle behavior than requested.
 
-    :returns: Idle timeout in seconds, e.g. ``3600.0``. ``0.0`` disables
+    :returns: Idle timeout in seconds, e.g. ``28800.0``. ``0.0`` disables
         the watchdog.
     :raises RuntimeError: If ``runner.idle_timeout_s`` is invalid.
     """
@@ -216,7 +218,7 @@ async def _run_inactivity_monitor(
     while an agent turn is running, the monitor keeps waiting and exits soon
     after the active work clears unless new activity resets the timer.
 
-    :param idle_timeout_s: Idle window in seconds, e.g. ``3600.0``. ``0``
+    :param idle_timeout_s: Idle window in seconds, e.g. ``28800.0``. ``0``
         disables the monitor.
     :param get_last_activity: Callback returning the most recent real
         activity time from the event loop's monotonic clock.
