@@ -470,27 +470,32 @@ describe("NewChatLandingScreen create flow", () => {
     expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo");
   });
 
-  it("does not create a session when Enter is pressed with an empty message", async () => {
-    // Host, agent and workspace all seed automatically, so the only thing
-    // gating submit is a non-empty message. The Send button is disabled in
-    // this state, but Enter calls handleCreate() directly — its guard must
-    // mirror canSubmit (the disabled condition) or this path POSTs a
-    // blank-prompt session behind the disabled button. Regression for the
-    // empty-message bug.
+  it("creates a session with an empty composer and does not stash a first message", async () => {
+    // Configuration alone is enough to start: host/agent/workspace seed
+    // automatically, and an empty prompt/files/mentions must not block
+    // Start session or invent a placeholder user message.
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_empty" }),
+    } as unknown as Response);
+
     renderLanding();
     await waitForWorkspaceSeed();
 
-    // Submit button reflects the gate: disabled while the message is empty.
-    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
-
-    // Enter on the empty textarea must be a no-op, not a create.
+    expect(screen.getByTestId("new-chat-landing-submit")).not.toBeDisabled();
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
 
-    // No POST fired and no navigation happened — the guard short-circuited.
-    // Before the fix the old guard (host/agent/workspace/creating only) let
-    // this through and created an unintended empty session.
-    expect(authenticatedFetch).not.toHaveBeenCalled();
-    expect(navigateMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.agent_id).toBe("ag_hello");
+    expect(body.initial_items).toBeUndefined();
+    expect(body.initialPrompt).toBeUndefined();
+    expect(body.smart_routing_message).toBeUndefined();
+
+    // Empty create must not queue a ChatPage auto-send (no placeholder).
+    expect(setPendingInitialPromptMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_empty"));
   });
 
   it("does not create a session when Enter confirms active IME composition", async () => {

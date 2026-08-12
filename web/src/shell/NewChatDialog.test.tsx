@@ -1117,39 +1117,39 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("enables submit only once a message, host, agent and valid workspace are set", async () => {
+  it("enables submit once host, agent and valid workspace are set, even with an empty prompt", async () => {
     renderLanding();
     const submit = screen.getByTestId("new-chat-landing-submit") as HTMLButtonElement;
     // Host (auto-selected) + agent (default) + workspace (seeded from the
-    // recent) are all present, but with no message there's no task → disabled.
+    // recent) are enough — an empty prompt must not keep Start session disabled.
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
     );
-    expect(submit.disabled).toBe(true);
+    expect(submit.disabled).toBe(false);
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "   " },
     });
-    // Whitespace-only is still empty after trim — button stays disabled.
-    expect(submit.disabled).toBe(true);
+    // Whitespace-only is still empty after trim — still enabled.
+    expect(submit.disabled).toBe(false);
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "inspect the repo" },
     });
-    // Real text + the other gates satisfied → enabled. If canSubmit regressed
-    // (e.g. dropped the workspace gate), the blank cases above would have
-    // enabled too.
+    // Non-empty prompt stays enabled; config gates still apply below.
     expect(submit.disabled).toBe(false);
   });
 
   it("keeps the disabled reason tooltip on the new-chat submit button", async () => {
+    // An empty prompt no longer disables submit, so the tooltip is proven on a
+    // reason that still gates: no host to launch on.
+    mockHosts([]);
     renderLanding();
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
-    );
     const submit = screen.getByTestId("new-chat-landing-submit");
 
     fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
 
-    expect(await screen.findByRole("tooltip")).toHaveTextContent("Enter a message to get started");
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "Please choose a host and working directory",
+    );
   });
 
   it("shows the default shortcut in the new-chat submit tooltip", async () => {
