@@ -275,31 +275,52 @@ _MIN_IMAGE_BYTES = 16
 _MAX_INVALID_IMAGE_REPLAY_CHARS = 8 * 1024
 
 
+def canonical_image_payload(data: str, media_type: str) -> str | None:
+    """
+    Return *data* as canonical base64 when it is plausibly a *media_type* image.
+
+    Producers legitimately emit line-wrapped or unpadded base64, which strict
+    decoding rejects, so ASCII whitespace is dropped and ``=`` padding restored
+    before validating. The canonical form is returned rather than the original
+    because a provider may reject the noncanonical spelling.
+
+    Validation is a declared-type magic-byte match. An invalid image block makes
+    Claude reject the resume on every launch, so the bytes must match the type we
+    declare to it. Container validation is unnecessary: a store-truncated payload
+    never parses as JSON and so never reaches here, which means a magic-valid but
+    internally corrupt payload is accepted by design.
+
+    :param data: Candidate base64 payload, possibly wrapped or unpadded.
+    :param media_type: Declared MIME type, e.g. ``"image/png"``.
+    :returns: Canonical base64, or ``None`` when the payload is unusable.
+    """
+    magic = _IMAGE_MAGIC_BY_MEDIA_TYPE.get(media_type)
+    if magic is None:
+        return None
+    compact = "".join(data.split())
+    if not compact:
+        return None
+    padded = compact + "=" * (-len(compact) % 4)
+    try:
+        decoded = base64.b64decode(padded, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(decoded) < _MIN_IMAGE_BYTES or not decoded.startswith(magic):
+        return None
+    if media_type == "image/webp" and decoded[8:12] != b"WEBP":
+        return None
+    return padded
+
+
 def _is_supported_image_payload(data: str, media_type: str) -> bool:
     """
-    Check *data* is plausibly a *media_type* image before it becomes a block.
-
-    Strict base64 plus a declared-type magic-byte match. An invalid image
-    block makes Claude reject the resume on every launch, so the bytes must
-    match the type we declare to it. Container validation is unnecessary: a
-    store-truncated payload never parses as JSON and so never reaches here,
-    which means a magic-valid but internally corrupt payload is accepted by
-    design.
+    Whether *data* is plausibly a *media_type* image.
 
     :param data: Candidate base64 payload.
     :param media_type: Declared MIME type, e.g. ``"image/png"``.
     :returns: True for a payload whose bytes match its declared type.
     """
-    magic = _IMAGE_MAGIC_BY_MEDIA_TYPE.get(media_type)
-    if magic is None:
-        return False
-    try:
-        decoded = base64.b64decode(data, validate=True)
-    except (binascii.Error, ValueError):
-        return False
-    if len(decoded) < _MIN_IMAGE_BYTES or not decoded.startswith(magic):
-        return False
-    return media_type != "image/webp" or decoded[8:12] == b"WEBP"
+    return canonical_image_payload(data, media_type) is not None
 
 
 def _image_block_from_object(value: object) -> JsonObject | None:
@@ -308,8 +329,10 @@ def _image_block_from_object(value: object) -> JsonObject | None:
 
     Accepts the Anthropic wire shape (``source`` present, kept as-is) and the
     MCP ``ImageContent`` serialization (bare ``data`` + ``mimeType``), the
-    latter only after payload validation. Anything else yields ``None`` so
-    callers keep the raw string rather than emit an API-invalid block.
+    latter only after payload validation. The emitted block carries the
+    canonical base64 spelling, so a wrapped or unpadded original does not reach
+    the provider. Anything else yields ``None`` so callers keep the raw string
+    rather than emit an API-invalid block.
 
     :param value: Decoded JSON value, e.g.
         ``{"type": "image", "data": "...", "mimeType": "image/png"}``.
@@ -322,11 +345,12 @@ def _image_block_from_object(value: object) -> JsonObject | None:
         return block
     data = block.get("data")
     mime = block.get("mimeType")
-    if not isinstance(data, str) or not data:
+    if not isinstance(data, str) or not data or not isinstance(mime, str):
         return None
-    if not isinstance(mime, str) or not _is_supported_image_payload(data, mime):
+    canonical = canonical_image_payload(data, mime)
+    if canonical is None:
         return None
-    return {"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}}
+    return {"type": "image", "source": {"type": "base64", "media_type": mime, "data": canonical}}
 
 
 def _oversized_invalid_image_placeholder(value: object) -> JsonObject | None:

@@ -548,7 +548,7 @@ def test_clear_binary_content_recurses_into_nested_provider_shapes() -> None:
             "content": [
                 {
                     "type": "input_image",
-                    "image_url": {"url": "data:image/png;base64,QUJD"},
+                    "image_url": {"url": "data:image/png;base64," + "Q" * 200},
                     "filename": "chat-completions.png",
                 },
                 {
@@ -556,7 +556,7 @@ def test_clear_binary_content_recurses_into_nested_provider_shapes() -> None:
                     "source": {
                         "type": "base64",
                         "media_type": "image/png",
-                        "data": "data:image/png;base64,REVG",
+                        "data": "data:image/png;base64," + "R" * 200,
                     },
                     "filename": "anthropic.png",
                 },

@@ -8555,6 +8555,68 @@ def _capped_mcp_image_output(
     return payload, cap_tool_output(raw)
 
 
+@pytest.mark.parametrize("spell", ["line-wrapped", "unpadded"])
+def test_wrapped_base64_image_replays_as_one_structured_copy(spell: str) -> None:
+    """A wrapped or unpadded payload replays as a real image, not a placeholder.
+
+    Strict decoding used to reject both, so a valid screenshot was replaced with
+    an omission placeholder and the image was lost for good.
+    """
+    canonical = base64.b64encode(base64.b64decode(_TINY_PNG_BASE64)).decode()
+    payload = {
+        "line-wrapped": "\n".join(canonical[i : i + 76] for i in range(0, len(canonical), 76)),
+        "unpadded": canonical.rstrip("="),
+    }[spell]
+    output = json.dumps(
+        {"type": "image", "data": payload, "mimeType": "image/png"}, separators=(",", ":")
+    )
+
+    rehydrated = trc.tool_result_content_blocks(output)
+    assert rehydrated.dropped_oversized_image is False
+    records = _image_output_records(output)
+    record = records[0]
+    content = record["message"]["content"][0]["content"]
+    assert content == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": canonical},
+        }
+    ]
+    blob = json.dumps(record)
+    # Exactly one copy, and none of it in the metadata.
+    assert blob.count(canonical) == 1
+    assert canonical not in json.dumps(json.loads(record["toolUseResult"]))
+    assert "omitted from history" not in blob
+
+
+def test_clone_repair_keeps_a_wrapped_payload_as_one_image() -> None:
+    """The clone path normalizes a wrapped payload instead of dropping it."""
+    canonical = base64.b64encode(base64.b64decode(_TINY_PNG_BASE64)).decode()
+    wrapped = "\n".join(canonical[i : i + 76] for i in range(0, len(canonical), 76))
+    content = json.dumps(
+        {"type": "image", "data": wrapped, "mimeType": "image/png"}, separators=(",", ":")
+    )
+    record: dict[str, Any] = {
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": content}],
+        },
+        "toolUseResult": json.dumps(content),
+    }
+
+    claude_native._sanitize_cloned_tool_result_record(record)
+
+    repaired = record["message"]["content"][0]["content"]
+    assert repaired == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": canonical},
+        }
+    ]
+    assert json.dumps(record).count(canonical) == 1
+    assert canonical not in json.dumps(record["toolUseResult"])
+
+
 @pytest.mark.parametrize("is_error", [False, True], ids=["ok", "error"])
 @pytest.mark.parametrize("text", [None, "took a screenshot"], ids=["lone", "mixed"])
 def test_store_capped_mcp_image_result_does_not_leak_base64(

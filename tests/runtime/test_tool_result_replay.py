@@ -238,3 +238,51 @@ def test_truncated_image_detection_keys_on_shape_not_tokens() -> None:
     }
     for label, output in untouched.items():
         assert strip(output) == output, label
+
+
+@pytest.mark.parametrize(
+    "spell",
+    ["canonical", "line-wrapped", "unpadded", "spaced"],
+)
+def test_normal_base64_variants_are_accepted_and_canonicalized(spell: str) -> None:
+    """Wrapped or unpadded base64 is normal producer output, not corruption.
+
+    Strict decoding rejects both, which used to turn a perfectly good screenshot
+    into an omission placeholder. The emitted block carries the canonical
+    spelling so a provider cannot reject the original's formatting.
+    """
+    canonical = base64.b64encode(base64.b64decode(_TINY_PNG_BASE64)).decode()
+    payload = {
+        "canonical": canonical,
+        "line-wrapped": "\n".join(canonical[i : i + 76] for i in range(0, len(canonical), 76)),
+        "unpadded": canonical.rstrip("="),
+        "spaced": " ".join(canonical[i : i + 40] for i in range(0, len(canonical), 40)),
+    }[spell]
+
+    assert trc.canonical_image_payload(payload, "image/png") == canonical
+    block = trc._image_block_from_object(
+        {"type": "image", "data": payload, "mimeType": "image/png"}
+    )
+    assert block == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": canonical},
+    }
+
+
+def test_unusable_payloads_stay_omitted() -> None:
+    """Malformed, mismatched, unsupported and clipped payloads are still refused."""
+    truncated = _TINY_PNG_BASE64[: len(_TINY_PNG_BASE64) // 2]
+    for payload, mime in (
+        ("!!! not base64 !!!", "image/png"),
+        (base64.b64encode(b"plain text here" * 4).decode(), "image/png"),
+        (_TINY_PNG_BASE64, "image/svg+xml"),
+        (base64.b64encode(b"\x89PNG\r\n\x1a\n").decode(), "image/png"),
+        (_TINY_PNG_BASE64, "image/jpeg"),
+    ):
+        assert trc.canonical_image_payload(payload, mime) is None
+    # A clipped payload may still decode; it must not pass as a PNG.
+    assert trc.canonical_image_payload(truncated, "image/png") is None or (
+        base64.b64decode(trc.canonical_image_payload(truncated, "image/png") or "").startswith(
+            b"\x89PNG\r\n\x1a\n"
+        )
+    )

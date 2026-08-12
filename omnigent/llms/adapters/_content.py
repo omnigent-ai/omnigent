@@ -20,6 +20,15 @@ _INLINE_BASE64_DATA_URI = re.compile(
 
 _Value = TypeVar("_Value")
 
+#: Standard and URL-safe base64 alphabets, plus ``=`` padding.
+_BASE64_ALPHABET_ONLY = re.compile(r"[A-Za-z0-9+/=_-]+")
+
+#: Payload length below which replacing an inline ``data:`` URI is not worth it:
+#: callers' markers run ~70-80 characters, so a shorter payload grows the text
+#: while destroying a legitimate small inline asset (an icon SVG, a 1px PNG).
+#: Real attachments are orders of magnitude larger.
+_MIN_REDACTABLE_URI_PAYLOAD = 128
+
 
 @dataclass
 class DataUriParts:
@@ -82,7 +91,11 @@ def redact_inline_data_uris(
         return cast(
             _Value,
             _INLINE_BASE64_DATA_URI.sub(
-                lambda match: marker(match.group(1), len(match.group(2))),
+                lambda match: (
+                    marker(match.group(1), len(match.group(2)))
+                    if len(match.group(2)) >= _MIN_REDACTABLE_URI_PAYLOAD
+                    else match.group(0)
+                ),
                 value,
             ),
         )
@@ -100,8 +113,26 @@ def redact_inline_data_uris(
 _BINARY_BLOCK_TYPES = frozenset({"image", "document", "file"})
 
 
+def _is_base64_payload(value: str) -> bool:
+    """Whether *value* is a base64 blob rather than ordinary prose.
+
+    Deliberately a character-set test, not a decode: a payload clipped mid-blob
+    is exactly what must still be redacted, and it no longer decodes. Prose
+    fails on its spaces and punctuation.
+
+    :param value: Candidate payload, whitespace tolerated.
+    :returns: True when every character belongs to a base64 alphabet.
+    """
+    compact = "".join(value.split())
+    return bool(compact) and bool(_BASE64_ALPHABET_ONLY.fullmatch(compact))
+
+
 def _redact_data_field(block: dict[str, object], marker: Callable[[str, int], str]) -> None:
     """Replace a block's bare base64 ``data`` field.
+
+    Only an actual base64 blob is replaced: a ``document`` or ``file`` record
+    may legitimately carry prose in ``data``, and rewriting that would corrupt
+    the history rather than shrink it.
 
     Mutates *block*, which callers only ever pass as a freshly built copy.
 
@@ -109,7 +140,7 @@ def _redact_data_field(block: dict[str, object], marker: Callable[[str, int], st
     :param marker: Builds replacement text from media type and payload length.
     """
     data = block.get("data")
-    if not isinstance(data, str) or not data:
+    if not isinstance(data, str) or not data or not _is_base64_payload(data):
         return
     media_type = block.get("media_type")
     block["data"] = marker(media_type if isinstance(media_type, str) else "", len(data))
@@ -125,6 +156,10 @@ def redact_binary_payloads(
     written as ``data:`` URIs: an Anthropic-shaped block carries bare base64
     under ``source.data``, which the URI regex never sees. Nothing is mutated
     in place, and every field other than the payload survives.
+
+    A ``source`` is only treated as binary when it says so with
+    ``type: "base64"`` — a ``document`` may carry its text under
+    ``source.type: "text"``, and that is content, not a payload.
 
     :param value: Arbitrarily nested dict/list/string content.
     :param marker: Builds replacement text from media type and payload length.
@@ -144,7 +179,8 @@ def redact_binary_payloads(
             source = block.get("source")
             if isinstance(source, dict):
                 source = dict(source)
-                _redact_data_field(source, marker)
+                if source.get("type") == "base64":
+                    _redact_data_field(source, marker)
                 block["source"] = source
         return cast(
             _Value,
