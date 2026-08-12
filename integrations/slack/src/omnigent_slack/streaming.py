@@ -16,7 +16,7 @@ from typing import Any, Protocol
 from slack_sdk.errors import SlackApiError
 
 from omnigent_slack.models import ThreadKey
-from omnigent_slack.text import truncate_for_slack
+from omnigent_slack.text import GENERIC_FAILURE_TEXT, truncate_for_slack
 
 
 class SlackStreamProtocol(Protocol):
@@ -40,17 +40,21 @@ class SlackClientProtocol(Protocol):
 
 
 # Slack streaming messages have a limited lifetime: after a stretch with no
-# activity Slack finalizes the message itself, and any further append/stop then
-# fails with this error. A long-running turn (waiting on a sub-agent, a slow
-# tool) can outlast that window, so the bot opens a fresh streaming reply and
-# continues into it rather than treating this as a turn failure.
-_STREAM_CLOSED_ERROR = "message_not_in_streaming_state"
+# activity Slack finalizes the message, and any further append/stop then fails.
+# A long-running turn (waiting on a sub-agent, a slow tool, or riding out repeated
+# proxy stream-drop reconnects) can outlast that window, so the bot opens a fresh
+# streaming reply and continues into it rather than treating this as a turn
+# failure. Slack signals the dead message two ways depending on how stale it is:
+#   ``message_not_in_streaming_state`` — finalized but still present, or
+#   ``message_not_found``             — old enough to be gone entirely.
+# Both mean "this stream is dead — reopen"; treat them identically.
+_STREAM_CLOSED_ERRORS = frozenset({"message_not_in_streaming_state", "message_not_found"})
 
 
 def _is_stream_closed_error(exc: BaseException) -> bool:
     return (
         isinstance(exc, SlackApiError)
-        and getattr(exc.response, "get", lambda _k: None)("error") == _STREAM_CLOSED_ERROR
+        and getattr(exc.response, "get", lambda _k: None)("error") in _STREAM_CLOSED_ERRORS
     )
 
 
@@ -83,10 +87,15 @@ class _LiveReply:
         # buffers until buffer_size). Lets ``flush`` skip an empty API call.
         self._pending_unflushed = False
 
+    @property
+    def has_unflushed(self) -> bool:
+        """Whether text is buffered in the SDK but not yet on screen."""
+        return self._pending_unflushed
+
     async def _open(self) -> SlackStreamProtocol:
         self._stream = await self._client.chat_stream(
             channel=self._key.channel_id,
-            thread_ts=self._key.thread_ts,
+            thread_ts=self._key.reply_ts,
             recipient_user_id=self._recipient_user_id,
             recipient_team_id=self._key.team_id,
         )
@@ -212,6 +221,15 @@ class _AnswerReply:
         self._logger = logger
         self._streamed = ""
         self._final: str | None = None
+        # The ``message_id`` of the delta stream currently being appended. Native
+        # terminal harnesses (claude-native) tag each assistant message item with a
+        # stable id, and emit several per turn (narration between tool calls). The
+        # deltas arrive back to back, so without a boundary the last sentence of one
+        # message butts directly against the first of the next ("…once more.The
+        # credentials…"). We insert a paragraph break when the id changes. ``None``
+        # (ordinary in-process streaming, where deltas already group by the active
+        # response) never triggers one — the behavior there is unchanged.
+        self._last_message_id: str | None = None
         # Text put on screen in each sealed segment this turn. Unlike
         # ``_streamed``/``_final`` (which reset at each seal), this survives
         # interruptions, so the no-delta fallback can tell whether the server's
@@ -238,14 +256,50 @@ class _AnswerReply:
     def streamed_len(self) -> int:
         return len(self._streamed)
 
-    async def add_delta(self, delta: str) -> None:
+    async def add_delta(self, delta: str, message_id: str | None = None) -> None:
         # Append the delta; the SDK buffers and only flushes to Slack once the
         # buffer fills. Clear the placeholder only on the flush that actually
         # puts content on screen — never while still buffering — so there's no
         # empty gap.
+        #
+        # A change in ``message_id`` (native terminal harnesses tag each assistant
+        # message item) marks a new message: insert a paragraph break so
+        # back-to-back messages don't run together ("…once more.The credentials…").
+        # Only between messages, never before the first, and never for id-less
+        # in-process streaming (its id stays None, so this branch never fires).
+        if (
+            message_id is not None
+            and self._last_message_id is not None
+            and message_id != self._last_message_id
+            and self._streamed
+            and not self._streamed.endswith("\n")
+        ):
+            self._streamed += "\n\n"
+            # Honor the separator's flush too: if the 2-char append is the one
+            # that crosses the SDK buffer threshold (and the following delta only
+            # buffers), this is where content first hits the screen — clear the
+            # placeholder now rather than leaving it up until the next flush.
+            if await self._reply.append("\n\n"):
+                await self._clear_ack()
+        self._last_message_id = message_id
         self._streamed += delta
         if await self._reply.append(delta):
             await self._clear_ack()
+
+    async def flush_if_buffered(self) -> None:
+        """Force buffered-but-unflushed text onto the screen NOW.
+
+        Called when the read loop detects the stream has gone idle (no new event
+        within the idle-flush window): the SDK buffers by size, so a short burst
+        that the agent then pauses after (a tool call, thinking) would otherwise
+        stay invisible until more text arrives or the turn ends. Revealing it
+        clears the placeholder too, so the thread never looks stuck. No-op when
+        nothing is buffered.
+        """
+        if not self._reply.has_unflushed:
+            return
+        await self._reply.flush()
+        await self._clear_ack()
 
     def set_final(self, text: str) -> None:
         self._final = text
@@ -267,20 +321,31 @@ class _AnswerReply:
         await self._reply.seal()
         self._streamed, self._final = "", None
 
-    async def finalize(self, *, error_text: str | None) -> bool:
+    async def finalize(self, *, errored: bool) -> bool:
         # Deliver the answer tail, then clear the placeholder only after that
         # final flush (a short buffered answer becomes visible only at stop()).
-        # Returns whether a real answer was delivered — when an error also
-        # occurred, the caller posts the failure as a separate reply so the
-        # answer stays intact; when nothing was produced, the error IS the reply.
+        # Returns whether a real answer was delivered — when the turn also errored,
+        # the caller posts the (generic) failure as a separate reply so the answer
+        # stays intact; when nothing was produced, a generic failure/empty notice
+        # IS the reply. Raw error detail is NEVER shown here (it can carry stack
+        # traces / internal paths) — only whether the turn errored is known.
         tail = self._tail()
-        delivered_answer = bool(self._streamed or tail)
-        if delivered_answer:
+        # An answer counts as delivered if THIS segment has text OR an earlier
+        # segment already showed one before a mid-turn out-of-band post sealed it
+        # off (recorded in ``_delivered_texts``). Without the latter, the common
+        # "answer streamed, then a trailing notice fired" sequence leaves the
+        # current segment empty and would wrongly post "completed without
+        # returning…" (or, when errored, suppress the separate failure reply).
+        delivered_answer = bool(self._streamed or tail or self._delivered_texts)
+        if self._streamed or tail:
             await self._reply.stop(tail or None)
+        elif self._delivered_texts:
+            # The answer already landed in a prior segment; just close silently.
+            await self._reply.stop(None)
         else:
             await self._reply.stop(
-                f"Omnigent request failed: {error_text}"
-                if error_text
+                GENERIC_FAILURE_TEXT
+                if errored
                 else "Omnigent completed without returning response text."
             )
         await self._clear_ack()
@@ -316,17 +381,19 @@ class _AnswerReply:
         self._final = text
 
     async def stop_with(self, text: str) -> None:
-        # Terminal notice (auth/unreachable/host errors, or a no-op abort): clear
-        # the placeholder, then deliver ``text`` as a plain thread reply. Empty
-        # text is a silent stop (nothing to say). A notice is not a streamed
-        # answer, so it goes via a normal message, not the streaming reply.
+        # Terminal notice (unreachable/host/stream errors, or a no-op abort): clear
+        # the placeholder, then deliver ``text`` as a normal thread message (a
+        # notice isn't a streamed answer). Empty text is a silent stop (nothing to
+        # say) — used to clear the placeholder when the reason is delivered
+        # elsewhere (e.g. the auth re-login DM).
         await self._clear_ack()
-        if text:
-            await self._client.chat_postMessage(
-                channel=self._key.channel_id,
-                thread_ts=self._key.thread_ts,
-                text=truncate_for_slack(text),
-            )
+        if not text:
+            return
+        await self._client.chat_postMessage(
+            channel=self._key.channel_id,
+            thread_ts=self._key.reply_ts,
+            text=truncate_for_slack(text),
+        )
 
     async def _clear_ack(self) -> None:
         # Best-effort, idempotent: a failed delete must not abort the turn.

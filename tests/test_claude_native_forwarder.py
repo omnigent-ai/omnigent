@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import queue
 import threading
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,6 +18,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import omnigent.claude_native_forwarder as forwarder
 from omnigent.claude_native_bridge import (
@@ -29,7 +34,16 @@ from omnigent.claude_native_bridge import (
     write_active_session_id,
 )
 from omnigent.claude_native_forwarder import (
+    CompactionForwardState,
+    _claim_standalone_completion,
+    _consume_pending_compaction,
+    _handle_compact_summary_item,
+    _note_precompact,
     _persist_native_compaction_item,
+    _PostRetryTracker,
+    _prescan_precompact_edges,
+    _read_compaction_state,
+    _reset_compaction_skip_stats,
     forward_claude_transcript_to_session,
 )
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
@@ -1166,13 +1180,10 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
         )
     )
     try:
-        # Collect the seven transcript items. This transcript's final turn is a
-        # ``!bash`` command (a ``terminal_command``, no assistant output), so
-        # ``current_response_id`` lands on a turn that runs no LLM turn and thus
-        # gets no id-bearing ``running`` edge (that would strand the web UI busy
-        # with no ``Stop`` hook to close it). The turn-start ``running`` edge is
-        # asserted for a real assistant turn in
-        # ``test_forwarder_emits_turn_start_running_with_response_id``.
+        # Collect the seven transcript items. The transcript path publishes no
+        # session status at all — Claude's status file owns the badge — which
+        # ``test_forwarder_publishes_no_status_for_assistant_output`` asserts
+        # directly.
         requests = [await _get_recorded_item_request(server) for _index in range(7)]
     finally:
         task.cancel()
@@ -1371,9 +1382,8 @@ async def test_forwarder_posts_web_injected_terminal_transcript_items(tmp_path: 
         )
     )
     try:
-        # The turn-start ``running`` status posts first (the transcript has an
-        # assistant turn), then the assistant message item.
-        running = await _get_recorded_request(server)
+        # The item posts FIRST: the transcript path publishes no status at all
+        # (Claude's status file owns the badge), so nothing precedes it.
         request = await _get_recorded_request(server)
     finally:
         task.cancel()
@@ -1383,8 +1393,6 @@ async def test_forwarder_posts_web_injected_terminal_transcript_items(tmp_path: 
         server.server_close()
         thread.join(timeout=5.0)
 
-    assert running["body"]["type"] == "external_session_status"
-    assert running["body"]["data"]["status"] == "running"
     assert request["path"] == "/v1/sessions/conv_abc/events"
     assert request["body"]["type"] == "external_conversation_item"
     assert request["body"]["data"]["item_type"] == "message"
@@ -2304,6 +2312,100 @@ async def test_forwarder_waits_for_missing_fresh_transcript_without_warning(
 
 
 @pytest.mark.asyncio
+async def test_measured_prefix_seed_keeps_a_prompt_injected_during_boot(
+    tmp_path: Path,
+) -> None:
+    """
+    Regression: a prompt Claude records while booting must still forward.
+
+    Cold resume writes the transcript prefix itself, then launches Claude. The
+    forwarder cannot seed until Claude's first hook advertises the transcript
+    path — and the executor's ``inject_user_message`` waits on the same boot,
+    so the paste routinely lands first. Seeding from a live end-offset then
+    puts the user's prompt BEHIND the cursor: visible in the TUI pane, absent
+    from the Omnigent DB, silently, for the session's lifetime.
+
+    Passing the prefix length measured before launch makes the skip exactly the
+    prefix, so the boot-window records survive however late the seed runs.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    # The synthesized prefix, complete before Claude starts.
+    transcript_path.write_text(
+        "".join(
+            json.dumps({"type": "user", "uuid": f"old{n}", "message": {"role": "user"}}) + "\n"
+            for n in range(3)
+        ),
+        encoding="utf-8",
+    )
+    prefix_bytes = transcript_path.stat().st_size
+    # Claude boots and records the freshly-injected prompt before the forwarder
+    # is scheduled to seed.
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": "boot-window-prompt",
+                    "message": {"role": "user", "content": "wake up and check the deploy"},
+                }
+            )
+            + "\n"
+        )
+
+    state = await forwarder._ensure_state_for_transcript(
+        bridge_dir=bridge_dir,
+        state=None,
+        transcript_path=transcript_path,
+        start_at_end=True,
+        session_id="conv_boot_window",
+        start_at_offset=prefix_bytes,
+    )
+
+    # The measured prefix wins over ``start_at_end``: the cursor sits at the
+    # prefix boundary, not at EOF, so the prompt is still ahead of it.
+    assert state.byte_offset == prefix_bytes
+    result = forwarder._read_transcript_items_for_state(state, "claude-native-ui", None)
+    forwarded = [
+        block.get("text")
+        for item in result.items
+        for block in (item.data.get("content") or [])
+        if isinstance(block, dict)
+    ]
+    assert "wake up and check the deploy" in forwarded
+
+
+@pytest.mark.asyncio
+async def test_measured_prefix_never_seeks_past_the_transcript_end(tmp_path: Path) -> None:
+    """
+    A prefix length larger than the file clamps to the end.
+
+    Defensive: the measurement and the seed are separated by Claude's launch,
+    so a truncated or replaced transcript would otherwise leave the cursor
+    beyond EOF, where every later read looks like a stale-cursor reset.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "user", "uuid": "only", "message": {"role": "user"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    state = await forwarder._ensure_state_for_transcript(
+        bridge_dir=bridge_dir,
+        state=None,
+        transcript_path=transcript_path,
+        start_at_end=True,
+        session_id="conv_clamp",
+        start_at_offset=10**9,
+    )
+
+    assert state.byte_offset == transcript_path.stat().st_size
+
+
+@pytest.mark.asyncio
 async def test_forwarder_skips_to_end_on_stale_byte_cursor_state(tmp_path: Path) -> None:
     """
     Stale byte-offset state skips to end of the replaced transcript.
@@ -2915,19 +3017,17 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
         )
 
     persisted = json.loads((bridge_dir / "transcript_forwarder.json").read_text("utf-8"))
-    # The turn-start ``running`` status (carrying the turn's response id) leads,
-    # then the poison item is attempted twice, then the forwarder-failed status.
+    # The poison item is attempted twice, then the forwarder-failed status. No
+    # status POST leads: the transcript path publishes none (Claude's status
+    # file owns the badge).
     assert [request["type"] for request in requests] == [
-        "external_session_status",
         "external_conversation_item",
         "external_conversation_item",
         "external_session_status",
     ]
-    # The turn-start ``running`` edge carries the turn's response id, and the
-    # failed edge carries BOTH the drop reason as ``output`` (#1113 — the
-    # server surfaces it as the failure detail) and that same response id so
+    # The failed edge carries BOTH the drop reason as ``output`` (#1113 — the
+    # server surfaces it as the failure detail) and the turn's response id so
     # it closes the streaming turn instead of leaving its tool cards spinning.
-    assert requests[0]["data"]["status"] == "running"
     assert requests[-1]["data"] == {
         "status": "failed",
         "output": "transcript item poison-item:0:message rejected",
@@ -3401,34 +3501,42 @@ async def test_forwarder_does_not_mirror_when_hook_payload_lacks_session_id(
     assert "PATCH" not in methods, f"unexpected PATCH(es): {drained}"
 
 
-def test_model_alias_for_collapses_concrete_id_to_tier_alias() -> None:
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("claude-opus-4-8", "opus"),
+        ("anthropic/claude-opus-4-7", "opus"),
+        # The default Sonnet (4.6) collapses to the generic "sonnet" alias —
+        # the row it is bound to.
+        ("databricks-claude-sonnet-4-6", "sonnet"),
+        ("claude-sonnet-4-6", "sonnet"),
+        ("claude-haiku-4-5", "haiku"),
+        # Fable (the tier above Opus) collapses to its own alias — a miss
+        # here means a TUI switch to claude-fable-5 never reaches the picker.
+        ("claude-fable-5", "fable"),
+        ("databricks-claude-fable-5", "fable"),
+        # Sonnet 5 routes to its own opt-in picker slot, not the generic
+        # "sonnet" row — both ids contain the substring "sonnet", so a miss
+        # here means a TUI switch to the newer Sonnet generation would
+        # wrongly light up the default-Sonnet row instead.
+        ("anthropic/claude-sonnet-5", "sonnet_5"),
+        ("databricks-claude-sonnet-5", "sonnet_5"),
+        # Unknown family or empty → None (don't surface an unrenderable id).
+        ("gpt-5-4-mini", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_model_alias_for_collapses_concrete_id_to_tier_alias(
+    model: str | None, expected: str | None
+) -> None:
     """
     ``_model_alias_for`` maps a concrete transcript model id to the
     picker's tier alias so a TUI ``/model`` switch lands on a picker
     row. Covers Anthropic + Databricks-gateway id shapes and the
     no-match / empty cases (caller skips the post on ``None``).
     """
-    assert forwarder._model_alias_for("claude-opus-4-8") == "opus"
-    assert forwarder._model_alias_for("anthropic/claude-opus-4-7") == "opus"
-    # The default Sonnet (4.6) collapses to the generic "sonnet" alias — the
-    # row it is bound to.
-    assert forwarder._model_alias_for("databricks-claude-sonnet-4-6") == "sonnet"
-    assert forwarder._model_alias_for("claude-sonnet-4-6") == "sonnet"
-    assert forwarder._model_alias_for("claude-haiku-4-5") == "haiku"
-    # Fable (the tier above Opus) collapses to its own alias — a miss
-    # here means a TUI switch to claude-fable-5 never reaches the picker.
-    assert forwarder._model_alias_for("claude-fable-5") == "fable"
-    assert forwarder._model_alias_for("databricks-claude-fable-5") == "fable"
-    # Sonnet 5 routes to its own opt-in picker slot, not the generic "sonnet"
-    # row — both ids contain the substring "sonnet", so a miss here means
-    # a TUI switch to the newer Sonnet generation would wrongly light up
-    # the default-Sonnet row instead.
-    assert forwarder._model_alias_for("anthropic/claude-sonnet-5") == "sonnet_5"
-    assert forwarder._model_alias_for("databricks-claude-sonnet-5") == "sonnet_5"
-    # Unknown family or empty → None (don't surface an unrenderable id).
-    assert forwarder._model_alias_for("gpt-5-4-mini") is None
-    assert forwarder._model_alias_for("") is None
-    assert forwarder._model_alias_for(None) is None
+    assert forwarder._model_alias_for(model) == expected
 
 
 @pytest.mark.asyncio
@@ -5099,6 +5207,248 @@ def test_usage_from_status_state_omits_cost_when_absent() -> None:
     assert "cumulative_cost_usd" not in result
 
 
+@pytest.fixture
+def otel_exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
+    """
+    Install a fresh TracerProvider with an in-memory exporter for one test.
+
+    Restores the previous provider on teardown so OTel's set-once
+    semantics do not leak into later tests in the same process.
+    """
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
+    previous = otel_trace._TRACER_PROVIDER  # type: ignore[attr-defined]
+    previous_done = otel_trace._TRACER_PROVIDER_SET_ONCE._done  # type: ignore[attr-defined]
+    in_mem = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(in_mem))
+    otel_trace._TRACER_PROVIDER = provider  # type: ignore[attr-defined]
+    otel_trace._TRACER_PROVIDER_SET_ONCE._done = True  # type: ignore[attr-defined]
+    try:
+        yield in_mem
+    finally:
+        in_mem.clear()
+        with contextlib.suppress(Exception):
+            provider.shutdown()
+        otel_trace._TRACER_PROVIDER = previous  # type: ignore[attr-defined]
+        otel_trace._TRACER_PROVIDER_SET_ONCE._done = previous_done  # type: ignore[attr-defined]
+
+
+def _ok_usage_client() -> httpx.AsyncClient:
+    """
+    Build a client whose ``POST /events`` always succeeds.
+
+    :returns: Client backed by a mock transport returning ``200``.
+    """
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+        base_url="http://omnigent.test",
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_session_usage_records_gen_ai_token_attributes(
+    otel_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    A native Claude usage post carries the turn's tokens as ``gen_ai.usage.*``.
+
+    A native turn runs to completion in the terminal, so the harness
+    executor's ``TurnComplete`` reports no usage and the agent span closes
+    without token attributes. This post is where the real counts are known,
+    so it must record them or the session's tokens stay invisible to
+    MLflow / any OTel backend.
+    """
+    async with _ok_usage_client() as client:
+        await forwarder._post_external_session_usage(
+            client,
+            session_id="conv_abc123",
+            usage={"context_tokens": 1773, "input_tokens": 1523, "output_tokens": 847},
+            context_window=200_000,
+            token_usage={
+                "input_tokens": 1523,
+                "output_tokens": 847,
+                "cache_read_input_tokens": 200,
+                "cache_creation_input_tokens": 50,
+            },
+        )
+
+    spans = [s for s in otel_exporter.get_finished_spans() if s.name == "claude_native.usage"]
+    assert len(spans) == 1
+    attrs = dict(spans[0].attributes or {})
+    assert attrs["gen_ai.usage.input_tokens"] == 1523
+    assert attrs["gen_ai.usage.output_tokens"] == 847
+    assert attrs["gen_ai.usage.total_tokens"] == 1523 + 847
+    assert attrs["gen_ai.usage.cache_read_input_tokens"] == 200
+    assert attrs["gen_ai.usage.cache_creation_input_tokens"] == 50
+
+
+@pytest.mark.asyncio
+async def test_post_session_usage_without_token_usage_records_no_tokens(
+    otel_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    A post with no ``token_usage`` records no token attributes.
+
+    Cost posts and context-window-only posts reach the same helper carrying
+    a usage snapshot but no new counts. Falling back to that snapshot would
+    re-record a figure already counted, or report a 0-token turn on every
+    cost tick.
+    """
+    async with _ok_usage_client() as client:
+        await forwarder._post_external_session_usage(
+            client,
+            session_id="conv_abc123",
+            usage={"cumulative_cost_usd": 0.42, "model": "claude-opus-4-8"},
+        )
+
+    spans = [s for s in otel_exporter.get_finished_spans() if s.name == "claude_native.usage"]
+    assert len(spans) == 1
+    attrs = dict(spans[0].attributes or {})
+    assert not [key for key in attrs if key.startswith("gen_ai.usage.")]
+
+
+@pytest.mark.asyncio
+async def test_forwarder_records_each_api_call_usage_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    otel_exporter: InMemorySpanExporter,
+) -> None:
+    """
+    Each assistant API call contributes exactly one usage span.
+
+    The usage POST re-fires whenever the statusLine gauge or the context
+    window moves, which happens several times per API call. Recording the
+    snapshot on each of those would make a backend that SUMS
+    ``gen_ai.usage.*`` across spans multiply-count the same prompt. Only a
+    new completed assistant record may add a span.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+
+    def _assistant(uuid: str, text: str, usage: dict[str, int]) -> str:
+        """
+        Build one assistant JSONL line carrying ``message.usage``.
+
+        :param uuid: Transcript entry uuid, e.g. ``"a1"``.
+        :param text: Assistant text content.
+        :param usage: Anthropic ``message.usage`` block for the call.
+        :returns: A JSON-encoded transcript line.
+        """
+        return json.dumps(
+            {
+                "type": "assistant",
+                "uuid": uuid,
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-opus-4-8",
+                    "content": [{"type": "text", "text": text}],
+                    "usage": usage,
+                },
+            }
+        )
+
+    # The statusLine gauge moves every poll (a streaming message's output
+    # grows, cache reads land) — the churn that used to re-record tokens.
+    status_box = {"value": {"input_tokens": 1000, "output_tokens": 10}}
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge: {"context_window_size": 200_000, "current_usage": status_box["value"]},
+    )
+
+    transcript_path.write_text(
+        _assistant("a1", "hi", {"input_tokens": 1000, "output_tokens": 50}) + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    dedupe = forwarder._ForwardDedupeState()
+    retry_tracker = forwarder._PostRetryTracker()
+
+    transport = httpx.MockTransport(lambda _request: httpx.Response(202, json={}))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+
+        async def poll() -> None:
+            """Run one forwarder poll against the shared cursor state."""
+            nonlocal state
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=retry_tracker,
+                dedupe=dedupe,
+            )
+
+        await poll()
+        # Same API call, gauge still moving: re-posts usage, records nothing.
+        status_box["value"] = {"input_tokens": 1000, "output_tokens": 40}
+        await poll()
+        status_box["value"] = {
+            "input_tokens": 1000,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 900,
+        }
+        await poll()
+
+        recorded = _recorded_token_spans(otel_exporter)
+        assert recorded == [(1000, 50)], "one completed API call must record exactly one span"
+
+        # A second API call is new usage and does add a span.
+        with transcript_path.open("a", encoding="utf-8") as fh:
+            fh.write(_assistant("a2", "more", {"input_tokens": 2200, "output_tokens": 80}) + "\n")
+        await poll()
+
+    assert _recorded_token_spans(otel_exporter) == [(1000, 50), (2200, 80)]
+    assert dedupe.recorded_token_usage == {"input_tokens": 2200, "output_tokens": 80}
+
+
+def _recorded_token_spans(exporter: InMemorySpanExporter) -> list[tuple[int, int]]:
+    """
+    Collect ``(input_tokens, output_tokens)`` from every usage span recorded.
+
+    :param exporter: In-memory exporter holding the finished spans.
+    :returns: One pair per span that carried token attributes, in order.
+    """
+    pairs: list[tuple[int, int]] = []
+    for span in exporter.get_finished_spans():
+        attrs = dict(span.attributes or {})
+        if "gen_ai.usage.input_tokens" in attrs:
+            pairs.append((attrs["gen_ai.usage.input_tokens"], attrs["gen_ai.usage.output_tokens"]))
+    return pairs
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        # The cost tag and the derived context gauge are not token counters.
+        (
+            {"context_tokens": 1773, "input_tokens": 1523, "output_tokens": 847},
+            {"input_tokens": 1523, "output_tokens": 847},
+        ),
+        ({"cumulative_cost_usd": 0.42, "model": "claude-opus-4-8"}, None),
+        ({"context_tokens": 1773}, None),
+        (None, None),
+    ],
+)
+def test_gen_ai_usage_tokens_keeps_only_token_counters(
+    usage: dict[str, float | str] | None,
+    expected: dict[str, int] | None,
+) -> None:
+    """
+    Only real input/output token counters survive into the OTel payload.
+
+    :param usage: Usage payload posted to the Sessions API.
+    :param expected: Token counts to record, or ``None`` for no recording.
+    """
+    assert forwarder._gen_ai_usage_tokens(usage) == expected
+
+
 @dataclass
 class _CapturedDeltaPost:
     """
@@ -5279,6 +5629,203 @@ def test_delta_forward_state_round_trips(tmp_path: Path) -> None:
     assert forwarder._read_delta_forward_state(bridge_dir).byte_offset == 512
 
 
+def test_transcript_forward_state_persists_settled_response_id(tmp_path: Path) -> None:
+    """
+    The turn-settle latch survives a forwarder restart via the cursor file.
+
+    A restart inside a scheduled-wake gap must still mark the wake; a
+    pre-latch state file (no ``settled_response_id`` key) loads as None.
+    """
+    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b2", workspace=tmp_path)
+    transcript = tmp_path / "session.jsonl"
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript,
+        line_cursor=3,
+        byte_offset=64,
+        current_response_id="resp_a",
+        settled_response_id="resp_a",
+        pending_settled_response_id="resp_b",
+    )
+    forwarder._write_forward_state(bridge_dir, state)
+    loaded = forwarder._read_forward_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.settled_response_id == "resp_a"
+    assert loaded.pending_settled_response_id == "resp_b"
+
+    raw = json.loads((bridge_dir / forwarder._FORWARDER_STATE_FILE).read_text("utf-8"))
+    del raw["settled_response_id"]
+    (bridge_dir / forwarder._FORWARDER_STATE_FILE).write_text(json.dumps(raw), "utf-8")
+    legacy = forwarder._read_forward_state(bridge_dir)
+    assert legacy is not None
+    assert legacy.settled_response_id is None
+
+
+def test_promote_pending_settle_waits_for_turn_quiescence() -> None:
+    """
+    A pending settle activates only once its turn has no output in flight.
+
+    The turn's final message can surface after its Stop edge — promoting
+    while that batch still
+    carries the turn's output would mis-read the tail as a scheduled
+    wake and split the answer into a phantom new turn.
+    """
+    dedupe = forwarder._ForwardDedupeState()
+    dedupe.pending_settled_response_id = "resp_a"
+    tail = ClaudeTranscriptItem(
+        source_id="s1:0:message",
+        item_type="message",
+        data={"role": "assistant", "content": [{"type": "output_text", "text": "tail"}]},
+        response_id="resp_a",
+    )
+    assert forwarder._promote_pending_settle(dedupe, [tail]) is False
+    assert dedupe.settled_response_id is None
+    assert dedupe.pending_settled_response_id == "resp_a"
+
+    # A late tool result also defers: it can surface EARLIER than the
+    # assistant tail, and promoting on it would mis-mark that tail.
+    late_result = ClaudeTranscriptItem(
+        source_id="s2:0:function_call_output",
+        item_type="function_call_output",
+        data={"call_id": "c1", "output": "done"},
+        response_id="resp_a",
+    )
+    assert forwarder._promote_pending_settle(dedupe, [late_result]) is False
+    assert dedupe.pending_settled_response_id == "resp_a"
+
+    # Items for OTHER turns don't defer; a truly quiet batch promotes.
+    other = ClaudeTranscriptItem(
+        source_id="s3:0:message",
+        item_type="message",
+        data={"role": "assistant", "content": [{"type": "output_text", "text": "hi"}]},
+        response_id="resp_b",
+    )
+    assert forwarder._promote_pending_settle(dedupe, [other]) is True
+    assert dedupe.settled_response_id == "resp_a"
+    assert dedupe.pending_settled_response_id is None
+
+    # Idempotent once promoted.
+    assert forwarder._promote_pending_settle(dedupe, []) is False
+
+
+@pytest.mark.asyncio
+async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(tmp_path: Path) -> None:
+    """
+    The full wake pipeline: settle → quiet-poll promote → marked new turn.
+
+    Poll 1 forwards a turn; its Stop edge records the pending settle
+    (covered by the status-events test — recorded directly here). Poll 2
+    is quiet and promotes the settle, persisting it. Poll 3 sees new
+    assistant entries — a cron firing writes no user entry — and must POST
+    the scheduled-wake marker ahead of the resumed output, all under a new
+    response id.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "iter-one",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Iteration 1: all green."}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """
+        Accept every forwarder POST, recording its payload.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: HTTP 202 for the mock Omnigent endpoint.
+        """
+        payload = json.loads(request.content.decode("utf-8"))
+        assert isinstance(payload, dict)
+        requests.append(payload)
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        dedupe = forwarder._ForwardDedupeState()
+        after_turn = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+        turn_one_id = after_turn.current_response_id
+        assert turn_one_id is not None
+
+        # The turn ends: the Stop edge records the pending settle.
+        dedupe.pending_settled_response_id = turn_one_id
+        quiet = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=after_turn,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+        assert dedupe.settled_response_id == turn_one_id
+        assert quiet.settled_response_id == turn_one_id
+
+        # A cron firing appends assistant output with NO user entry.
+        with transcript_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "iter-two",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Iteration 2: still green."}],
+                        },
+                    }
+                )
+                + "\n"
+            )
+        requests.clear()
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=quiet,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+
+    # No status POST: the transcript path publishes none (Claude's status file
+    # owns the badge). The wake is observable entirely in the items — a fresh
+    # turn id plus the marker ahead of the resumed output.
+    assert [request["type"] for request in requests] == ["external_conversation_item"] * len(
+        requests
+    )
+    items = [r["data"] for r in requests if r["type"] == "external_conversation_item"]
+    wake_turn_id = items[0]["response_id"]
+    assert wake_turn_id != turn_one_id
+    assert [item["item_data"]["role"] for item in items] == ["user", "assistant"]
+    assert items[0]["item_data"]["content"] == [
+        {"type": "input_text", "text": "[System: scheduled prompt fired]"}
+    ]
+    assert {item["response_id"] for item in items} == {wake_turn_id}
+
+
 async def test_post_external_output_text_delta_sends_expected_payload(tmp_path: Path) -> None:
     """
     The single-delta POST helper sends the canonical event body.
@@ -5302,497 +5849,6 @@ async def test_post_external_output_text_delta_sends_expected_payload(tmp_path: 
             },
         )
     ]
-
-
-# ── deltas-before-done ordering (assistant item hold-back) ────────────
-
-
-def _write_assistant_transcript(path: Path, uuid: str, text: str) -> None:
-    """
-    Append one assistant text record to a Claude transcript JSONL file.
-
-    :param path: Transcript file path.
-    :param uuid: Record uuid, e.g. ``"u1"``.
-    :param text: Assistant text block content, e.g. ``"Hello world"``.
-    :returns: None.
-    """
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "type": "assistant",
-                    "uuid": uuid,
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": text}],
-                    },
-                }
-            )
-            + "\n"
-        )
-
-
-def _transcript_state_for(transcript_path: Path) -> forwarder.TranscriptForwardState:
-    """
-    Build a fresh transcript cursor state for ``transcript_path``.
-
-    :param transcript_path: Transcript file the state points at.
-    :returns: A zero-cursor :class:`TranscriptForwardState`.
-    """
-    return forwarder.TranscriptForwardState(
-        transcript_path=transcript_path,
-        line_cursor=0,
-        byte_offset=0,
-        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
-    )
-
-
-@pytest.mark.asyncio
-async def test_assistant_item_held_until_its_deltas_forward(tmp_path: Path) -> None:
-    """
-    An assistant item whose deltas haven't fully forwarded is deferred.
-
-    Drives the real commit-before-delta race: with only a non-final chunk
-    forwarded the item is held (no POST, cursor unadvanced); once the final
-    chunk forwards and the joined text byte-equals the item's, it posts
-    AFTER the deltas. Posting first would dupe (committed text + a late
-    ``live:`` preview from the trailing chunks).
-    """
-    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
-    transcript_path = tmp_path / "session.jsonl"
-    _write_assistant_transcript(transcript_path, "u1", "Hello world")
-    # Only the first chunk has been written by the hook so far.
-    _write_deltas_file(
-        bridge_dir, [{"message_id": "m1", "index": 0, "final": False, "delta": "Hello "}]
-    )
-
-    ordering = forwarder._DeltaOrderingState()
-    seen_deltas: dict[tuple[str, int], None] = {}
-    captured: list[_CapturedDeltaPost] = []
-    async with _delta_capture_client(captured) as client:
-        delta_state = await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=forwarder.DeltaForwardState(),
-            seen_keys=seen_deltas,
-            ordering=ordering,
-        )
-        item_state = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=_transcript_state_for(transcript_path),
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=forwarder._ForwardDedupeState(),
-            ordering=ordering,
-        )
-        # Held: the item was NOT posted and the durable cursor did not
-        # advance past it, so the next poll re-reads it. (The turn-start
-        # ``external_session_status: running`` edge is filtered out here — this
-        # test is about delta-vs-item ordering, not the status edge.)
-        assert [
-            c.body["type"] for c in captured if c.body["type"] != "external_session_status"
-        ] == ["external_output_text_delta"]
-        assert item_state.byte_offset == 0
-        assert item_state.seen_source_ids == ()
-
-        # Next poll: the hook's final chunk lands, completing the text.
-        _write_deltas_file(
-            bridge_dir, [{"message_id": "m1", "index": 1, "final": True, "delta": "world"}]
-        )
-        await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=delta_state,
-            seen_keys=seen_deltas,
-            ordering=ordering,
-        )
-        item_state = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=item_state,
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=forwarder._ForwardDedupeState(),
-            ordering=ordering,
-        )
-
-    # The item posted AFTER both of its chunks — the ordering every
-    # downstream suppression layer assumes. Content asserted (not just
-    # counts) to prove the matched item is the right one.
-    item_posts = [c.body for c in captured if c.body["type"] == "external_conversation_item"]
-    assert len(item_posts) == 1
-    assert item_posts[0]["data"]["item_data"]["content"] == [
-        {"type": "output_text", "text": "Hello world"}
-    ]
-    assert [c.body["type"] for c in captured if c.body["type"] != "external_session_status"][
-        :2
-    ] == [
-        "external_output_text_delta",
-        "external_output_text_delta",
-    ]
-    assert item_state.byte_offset == transcript_path.stat().st_size
-    # The matched stream was consumed: a later identical-text message
-    # must match its own deltas, not this stale entry.
-    assert ordering.texts == {}
-
-
-@pytest.mark.asyncio
-async def test_assistant_item_posts_after_hold_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """
-    An item whose deltas never arrive posts once the hold timeout expires.
-
-    Deltas are best-effort (dropped chunks, multi-block messages that never
-    byte-match), so the hold must be bounded or such items would never
-    persist. Past ``_ASSISTANT_ITEM_DELTA_HOLD_S`` it posts with no match —
-    safe, since no forwarded deltas means no live preview to duplicate.
-    """
-    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
-    transcript_path = tmp_path / "session.jsonl"
-    _write_assistant_transcript(transcript_path, "u1", "Hello world")
-    # Deltas file exists (hook active) but carries an UNRELATED stream,
-    # so the item can never match by text.
-    _write_deltas_file(
-        bridge_dir, [{"message_id": "m9", "index": 0, "final": True, "delta": "other"}]
-    )
-    clock = {"now": 100.0}
-    monkeypatch.setattr(forwarder, "_hold_monotonic", lambda: clock["now"])
-
-    ordering = forwarder._DeltaOrderingState()
-    captured: list[_CapturedDeltaPost] = []
-    # Share one dedupe across polls (as the real loop does) so the turn-start
-    # ``running`` status fires once, not per call.
-    dedupe = forwarder._ForwardDedupeState()
-    async with _delta_capture_client(captured) as client:
-        await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=forwarder.DeltaForwardState(),
-            seen_keys={},
-            ordering=ordering,
-        )
-        state = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=_transcript_state_for(transcript_path),
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=dedupe,
-            ordering=ordering,
-        )
-        # Status edges (the turn-start ``running``) filtered out — this test
-        # is about the delta-then-held-item ordering.
-        assert [
-            c.body["type"] for c in captured if c.body["type"] != "external_session_status"
-        ] == ["external_output_text_delta"]
-        assert state.byte_offset == 0  # held
-
-        clock["now"] = 100.0 + forwarder._ASSISTANT_ITEM_DELTA_HOLD_S
-        state = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=state,
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=dedupe,
-            ordering=ordering,
-        )
-
-    item_posts = [c.body for c in captured if c.body["type"] == "external_conversation_item"]
-    assert len(item_posts) == 1
-    assert item_posts[0]["data"]["item_data"]["content"] == [
-        {"type": "output_text", "text": "Hello world"}
-    ]
-    assert state.byte_offset == transcript_path.stat().st_size
-
-
-@pytest.mark.asyncio
-async def test_assistant_item_not_held_without_deltas_file(tmp_path: Path) -> None:
-    """
-    A session whose MessageDisplay hook never fired is never held.
-
-    No deltas file means no live preview, hence no duplicate — holding
-    would only add latency. The item posts on the first poll.
-    """
-    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
-    transcript_path = tmp_path / "session.jsonl"
-    _write_assistant_transcript(transcript_path, "u1", "Hello world")
-
-    captured: list[_CapturedDeltaPost] = []
-    async with _delta_capture_client(captured) as client:
-        state = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=_transcript_state_for(transcript_path),
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=forwarder._ForwardDedupeState(),
-            ordering=forwarder._DeltaOrderingState(),
-        )
-
-    item_posts = [c.body for c in captured if c.body["type"] == "external_conversation_item"]
-    assert len(item_posts) == 1
-    assert state.byte_offset == transcript_path.stat().st_size
-
-
-@pytest.mark.asyncio
-async def test_assistant_item_stays_held_until_true_final_chunk(tmp_path: Path) -> None:
-    """
-    The commit stays held while a NON-final chunk lands after it.
-
-    Any chunk, not just the final one, can land after the commit (the
-    observed ``D D C D`` race). The hold must wait for the ``final`` chunk
-    to byte-match, NOT release on "another delta arrived" — else the late
-    non-final chunk builds a second ``live:`` preview after the commit.
-    """
-    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
-    transcript_path = tmp_path / "session.jsonl"
-    _write_assistant_transcript(transcript_path, "u1", "Hello big world")
-
-    ordering = forwarder._DeltaOrderingState()
-    seen: dict[tuple[str, int], None] = {}
-    delta_state = forwarder.DeltaForwardState()
-    item_state = _transcript_state_for(transcript_path)
-    captured: list[_CapturedDeltaPost] = []
-    # Share one dedupe across polls (as the real loop does) so the turn-start
-    # ``running`` status fires once, not per poll.
-    dedupe = forwarder._ForwardDedupeState()
-
-    async def _poll(client: httpx.AsyncClient) -> None:
-        nonlocal delta_state, item_state
-        delta_state = await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=delta_state,
-            seen_keys=seen,
-            ordering=ordering,
-        )
-        item_state = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=item_state,
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=dedupe,
-            ordering=ordering,
-        )
-
-    async with _delta_capture_client(captured) as client:
-        # Poll 1: only the first (non-final) chunk; the commit is ready.
-        _write_deltas_file(
-            bridge_dir, [{"message_id": "m1", "index": 0, "final": False, "delta": "Hello "}]
-        )
-        await _poll(client)
-        assert item_state.byte_offset == 0  # held — no final chunk yet
-
-        # Poll 2: a SECOND non-final chunk lands AFTER the commit — still held.
-        _write_deltas_file(
-            bridge_dir, [{"message_id": "m1", "index": 1, "final": False, "delta": "big "}]
-        )
-        await _poll(client)
-        assert item_state.byte_offset == 0  # STILL held: stream not final
-        assert not [c for c in captured if c.body["type"] == "external_conversation_item"]
-
-        # Poll 3: the true final chunk lands → byte-matches → released.
-        _write_deltas_file(
-            bridge_dir, [{"message_id": "m1", "index": 2, "final": True, "delta": "world"}]
-        )
-        await _poll(client)
-
-    # Commit posts only AFTER all three deltas — the order downstream assumes.
-    # The turn-start ``running`` status edge is filtered out (it fires once,
-    # before the deltas); this test is about delta-then-commit ordering.
-    assert [c.body["type"] for c in captured if c.body["type"] != "external_session_status"] == [
-        "external_output_text_delta",
-        "external_output_text_delta",
-        "external_output_text_delta",
-        "external_conversation_item",
-    ]
-    item = next(c.body for c in captured if c.body["type"] == "external_conversation_item")
-    assert item["data"]["item_data"]["content"] == [
-        {"type": "output_text", "text": "Hello big world"}
-    ]
-    assert item_state.byte_offset == transcript_path.stat().st_size
-
-
-@pytest.mark.asyncio
-async def test_assistant_item_held_when_final_seen_but_chunk_missing(tmp_path: Path) -> None:
-    """
-    Seeing the ``final`` chunk is not enough — the join must byte-equal.
-
-    A dropped middle chunk leaves the joined text != commit text, so the
-    item stays held despite ``final`` being seen. This is why the release
-    gate requires BOTH ``entry.final`` and the byte-equal check.
-    """
-    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
-    transcript_path = tmp_path / "session.jsonl"
-    _write_assistant_transcript(transcript_path, "u1", "Hello big world")
-    # Forward index 0 and the FINAL index 2 — but NOT the middle index 1.
-    _write_deltas_file(
-        bridge_dir,
-        [
-            {"message_id": "m1", "index": 0, "final": False, "delta": "Hello "},
-            {"message_id": "m1", "index": 2, "final": True, "delta": "world"},
-        ],
-    )
-
-    ordering = forwarder._DeltaOrderingState()
-    captured: list[_CapturedDeltaPost] = []
-    async with _delta_capture_client(captured) as client:
-        await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=forwarder.DeltaForwardState(),
-            seen_keys={},
-            ordering=ordering,
-        )
-        item_state = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=_transcript_state_for(transcript_path),
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=forwarder._ForwardDedupeState(),
-            ordering=ordering,
-        )
-
-    # final WAS seen, but join "Hello world" != commit "Hello big world".
-    assert ordering.texts["m1"].final is True
-    assert "".join(ordering.texts["m1"].parts) == "Hello world"
-    assert item_state.byte_offset == 0  # held despite the final flag
-    assert not [c for c in captured if c.body["type"] == "external_conversation_item"]
-
-
-@pytest.mark.asyncio
-async def test_two_identical_text_items_each_match_own_stream(tmp_path: Path) -> None:
-    """
-    Two assistant messages with identical text are matched by count.
-
-    Consume-once: the first commit pops one stream, the second pops the
-    other — both post, ordering ends empty. Identical text renders
-    identically, so which physical stream a commit consumes doesn't matter.
-    """
-    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
-    transcript_path = tmp_path / "session.jsonl"
-    _write_assistant_transcript(transcript_path, "u1", "OK")
-    _write_assistant_transcript(transcript_path, "u2", "OK")
-    _write_deltas_file(
-        bridge_dir,
-        [
-            {"message_id": "mA", "index": 0, "final": True, "delta": "OK"},
-            {"message_id": "mB", "index": 0, "final": True, "delta": "OK"},
-        ],
-    )
-
-    ordering = forwarder._DeltaOrderingState()
-    captured: list[_CapturedDeltaPost] = []
-    async with _delta_capture_client(captured) as client:
-        await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=forwarder.DeltaForwardState(),
-            seen_keys={},
-            ordering=ordering,
-        )
-        item_state = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=_transcript_state_for(transcript_path),
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=forwarder._ForwardDedupeState(),
-            ordering=ordering,
-        )
-
-    item_posts = [c.body for c in captured if c.body["type"] == "external_conversation_item"]
-    assert len(item_posts) == 2  # both released, neither blocked
-    assert all(
-        p["data"]["item_data"]["content"] == [{"type": "output_text", "text": "OK"}]
-        for p in item_posts
-    )
-    assert ordering.texts == {}  # both streams consumed (consume-once)
-    assert item_state.byte_offset == transcript_path.stat().st_size
-
-
-@pytest.mark.asyncio
-async def test_without_hold_commit_posts_before_final_delta(tmp_path: Path) -> None:
-    """
-    Break-the-feature guard: with the hold disabled the bug reproduces.
-
-    ``ordering=None`` (pre-fix behaviour): the commit posts immediately,
-    BEFORE the final delta — the exact order that dupes the ``live:``
-    preview. Paired with the hold-on test, this pins the hold as the fix.
-    """
-    bridge_dir = prepare_bridge_dir("conv_x", bridge_id="b1", workspace=tmp_path)
-    transcript_path = tmp_path / "session.jsonl"
-    _write_assistant_transcript(transcript_path, "u1", "Hello world")
-    _write_deltas_file(
-        bridge_dir, [{"message_id": "m1", "index": 0, "final": False, "delta": "Hello "}]
-    )
-
-    seen: dict[tuple[str, int], None] = {}
-    delta_state = forwarder.DeltaForwardState()
-    captured: list[_CapturedDeltaPost] = []
-    async with _delta_capture_client(captured) as client:
-        delta_state = await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=delta_state,
-            seen_keys=seen,
-            ordering=None,
-        )
-        await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            state=_transcript_state_for(transcript_path),
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=forwarder._ForwardDedupeState(),
-            ordering=None,
-        )
-        # Bug: with no hold the commit posts immediately, before the final
-        # chunk. The turn-start ``running`` status edge is filtered out.
-        assert [
-            c.body["type"] for c in captured if c.body["type"] != "external_session_status"
-        ] == [
-            "external_output_text_delta",
-            "external_conversation_item",
-        ]
-        _write_deltas_file(
-            bridge_dir, [{"message_id": "m1", "index": 1, "final": True, "delta": "world"}]
-        )
-        await forwarder._forward_available_deltas(
-            client=client,
-            session_id="conv_x",
-            bridge_dir=bridge_dir,
-            state=delta_state,
-            seen_keys=seen,
-            ordering=None,
-        )
-
-    # The final delta lands AFTER the commit — the inverted order that dupes.
-    types = [c.body["type"] for c in captured if c.body["type"] != "external_session_status"]
-    commit_idx = types.index("external_conversation_item")
-    final_delta_idx = max(i for i, t in enumerate(types) if t == "external_output_text_delta")
-    assert commit_idx < final_delta_idx
 
 
 # ── session cost reconciliation (max(S, C)) ───────────────────────────
@@ -6388,6 +6444,13 @@ async def test_compaction_completed_triggers_persist(tmp_path: Path) -> None:
             "transcript_path": str(transcript_path),
         },
     )
+    # PreCompact mints the pending token the completion signal consumes.
+    # A real compaction always fires PreCompact before the compact
+    # SessionStart; the hook path only persists when that token exists.
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "PreCompact", "session_id": "claude-session"},
+    )
     # Post-compaction SessionStart — the completion signal.
     record_hook_event(
         bridge_dir,
@@ -6420,8 +6483,18 @@ async def test_compaction_completed_triggers_persist(tmp_path: Path) -> None:
             )
         )
         try:
-            # Wait for the compaction status POST to arrive.
-            request = await _get_recorded_request(server)
+            # Wait for the compaction-completed status POST to arrive
+            # (the leading PreCompact in_progress edge is skipped).
+            request = None
+            for _ in range(10):
+                candidate = await _get_recorded_request(server)
+                if (
+                    candidate["body"].get("type") == "external_compaction_status"
+                    and candidate["body"]["data"].get("status") == "completed"
+                ):
+                    request = candidate
+                    break
+            assert request is not None, "compaction-completed status was never posted"
             # Wait for _persist_native_compaction_item to be called
             # (it runs right after the POST in the same await chain).
             await asyncio.wait_for(persist_called.wait(), timeout=5.0)
@@ -6433,7 +6506,7 @@ async def test_compaction_completed_triggers_persist(tmp_path: Path) -> None:
             server.server_close()
             thread.join(timeout=5.0)
 
-    # The recording server captured the compaction status POST.
+    # The recording server captured the compaction-completed status POST.
     assert request["body"]["type"] == "external_compaction_status"
     assert request["body"]["data"]["status"] == "completed"
     # _persist_native_compaction_item was called with the right session id.
@@ -6498,6 +6571,673 @@ async def test_compaction_in_progress_does_not_persist(tmp_path: Path) -> None:
     assert request["body"]["data"]["status"] == "in_progress"
     # _persist_native_compaction_item must NOT be called for in_progress.
     persist_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Durable compaction-boundary reconciliation (native resume/replay fix)
+# ---------------------------------------------------------------------------
+
+
+def _compact_summary_item(text: str = "compaction summary text") -> ClaudeTranscriptItem:
+    """
+    Build a transcript item flagged as a Claude ``isCompactSummary`` record.
+
+    :param text: The continuation-summary text carried by the item.
+    :returns: A ``ClaudeTranscriptItem`` with ``is_compact_summary=True``.
+    """
+    return ClaudeTranscriptItem(
+        source_id="summary-uuid:0:compact_summary",
+        item_type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": text}]},
+        response_id="resp_summary",
+        is_compact_summary=True,
+    )
+
+
+def _persist_mock() -> AsyncMock:
+    """
+    Build an ``AsyncMock`` standing in for ``_persist_native_compaction_item``.
+
+    :returns: An async mock that records calls and returns ``None``.
+    """
+    return AsyncMock(return_value=None)
+
+
+@pytest.mark.asyncio
+async def test_missing_compact_session_start_still_persists_from_transcript(
+    tmp_path: Path,
+) -> None:
+    """
+    A transcript ``isCompactSummary`` record persists the boundary alone.
+
+    Reproduces the core bug: the flaky ``SessionStart source=compact`` hook
+    never fires, so only the transcript summary is available. The transcript
+    path must still persist exactly one compaction boundary (carrying the
+    summary text) once a ``PreCompact`` token is pending.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path="/t/session.jsonl"
+    )
+
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_missing_hook",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item("the summary"),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_called_once()
+    assert persist.call_args[1]["session_id"] == "conv_missing_hook"
+    assert persist.call_args[1]["summary_override"] == "the summary"
+    # Boundary marked persisted; pending cleared.
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is None
+    assert 1 in state.persisted_seqs
+
+
+@pytest.mark.asyncio
+async def test_normal_hook_after_transcript_does_not_double_persist(tmp_path: Path) -> None:
+    """
+    The completion hook does not re-persist a boundary the transcript wrote.
+
+    After the transcript path persists the boundary and marks the sequence
+    done, a later ``SessionStart source=compact`` hook finds no consumable
+    pending token, so ``_consume_pending_compaction`` returns ``None`` and no
+    second boundary is written.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        # Transcript path persists first.
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_dedupe",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+    assert persist.call_count == 1
+
+    # Hook path arrives later — the token is already consumed.
+    seq = await _consume_pending_compaction(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
+    assert seq is None
+
+
+@pytest.mark.asyncio
+async def test_failed_boundary_post_is_retried_not_consumed(tmp_path: Path) -> None:
+    """
+    A hard POST failure leaves the summary unconsumed for retry.
+
+    ``_handle_compact_summary_item`` must return ``False`` (so the caller
+    holds the transcript cursor before the summary record) and must NOT mark
+    the sequence persisted, so the boundary is retried on a later poll rather
+    than silently lost — which would make resume reload the full history.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+
+    # A definitively-permanent 400 (not an ambiguous/network failure).
+    request = httpx.Request("POST", "http://x/events")
+    response = httpx.Response(400, request=request)
+    failing = AsyncMock(
+        side_effect=httpx.HTTPStatusError("bad", request=request, response=response)
+    )
+
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", failing):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_retry",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is False
+    state = _read_compaction_state(bridge_dir)
+    # Pending still set, nothing persisted — the summary will be retried.
+    assert state.pending is not None
+    assert state.pending.seq == 1
+    assert state.persisted_seqs == ()
+
+
+@pytest.mark.asyncio
+async def test_restart_reattach_does_not_repersist_completed_boundary(tmp_path: Path) -> None:
+    """
+    An already-persisted boundary is never re-persisted after a rewind.
+
+    Simulates a process restart / cursor rewind that re-reads a summary whose
+    boundary already POSTed: ``persisted_seqs`` records the sequence, so
+    ``_consume_pending_compaction`` returns ``None`` and
+    ``_handle_compact_summary_item`` drops the record without persisting.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # Durable state as it would exist after a completed compaction: seq 1
+    # persisted, but a stale pending token for the same seq lingers (e.g.
+    # crash between POST success and mark). The persisted set must win.
+    from omnigent.claude_native_forwarder import _PendingCompaction, _write_compaction_state
+
+    _write_compaction_state(
+        bridge_dir,
+        CompactionForwardState(
+            pending=_PendingCompaction(seq=1, claude_session_id="claude-1"),
+            last_seq=1,
+            persisted_seqs=(1,),
+        ),
+    )
+
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_restart",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_repeated_compactions_persist_distinct_boundaries(tmp_path: Path) -> None:
+    """
+    Two compaction cycles persist two distinct boundaries.
+
+    Each ``PreCompact`` mints a fresh monotonic sequence, so a second
+    compaction is not blocked by the first's ``persisted_seqs`` entry.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    persist = _persist_mock()
+
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        # First compaction.
+        await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_repeat",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item("first"),
+            retry_tracker=_PostRetryTracker(),
+        )
+        # Second compaction, later in the same session.
+        await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_repeat",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item("second"),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert persist.call_count == 2
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is None
+    assert set(state.persisted_seqs) == {1, 2}
+
+
+@pytest.mark.asyncio
+async def test_historical_summary_without_pending_is_skipped(tmp_path: Path) -> None:
+    """
+    An ``isCompactSummary`` record with no pending PreCompact is dropped.
+
+    On a cold resume the transcript may contain a historical compact-summary
+    record from a prior compaction with no live ``PreCompact`` token. It must
+    not persist a spurious boundary, and must not be forwarded as a user
+    bubble — ``_handle_compact_summary_item`` returns handled with no persist.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()  # no _note_precompact — no pending token
+
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_historical",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_not_called()
+    assert _read_compaction_state(bridge_dir).persisted_seqs == ()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_boundary_post_marks_persisted(tmp_path: Path) -> None:
+    """
+    An ambiguous POST failure is treated as delivered (no duplicate boundary).
+
+    Mirrors the item-forwarding rule: when the server may already have
+    committed the boundary (e.g. a dropped response on a 2xx), retrying would
+    risk a duplicate compaction bubble, so the sequence is marked persisted
+    and the record advanced.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+
+    ambiguous = AsyncMock(side_effect=httpx.ReadError("connection dropped mid-response"))
+
+    with (
+        patch("omnigent.claude_native_forwarder._persist_native_compaction_item", ambiguous),
+        patch("omnigent.claude_native_forwarder.post_may_have_been_delivered", return_value=True),
+    ):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_ambiguous",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    state = _read_compaction_state(bridge_dir)
+    assert 1 in state.persisted_seqs
+    assert state.pending is None
+
+
+@pytest.mark.asyncio
+async def test_precompact_and_summary_same_poll_persists_boundary(tmp_path: Path) -> None:
+    """
+    P1-1: a PreCompact + summary first visible in one poll persists a boundary.
+
+    The transcript forwarder (which consumes the ``isCompactSummary`` record)
+    runs before the hook forwarder (which mints the ``PreCompact`` token)
+    within a single poll. Without the pre-items prescan, a ``PreCompact`` and
+    its summary that both first appear in the same poll would lose the
+    boundary — the summary is consumed with no token yet minted.
+    ``_prescan_precompact_edges`` mints the token first, so the summary that
+    follows in the same poll finds it.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # A PreCompact hook is written but the hook cursor has NOT advanced past
+    # it yet (mirrors the same-poll ordering: hooks are forwarded AFTER items).
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "PreCompact", "session_id": "claude-1"},
+    )
+    hook_state = await forwarder._ensure_hook_state(
+        bridge_dir, start_at_end=False, session_id="conv_same_poll"
+    )
+
+    # No pending token before the prescan.
+    assert _read_compaction_state(bridge_dir).pending is None
+
+    # Prescan mints the token BEFORE the transcript summary is processed.
+    await _prescan_precompact_edges(bridge_dir, hook_state)
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is not None
+    assert state.pending.seq == 1
+
+    # The summary in the same poll now finds the token and persists once.
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_same_poll",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item("same-poll summary"),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_called_once()
+    state = _read_compaction_state(bridge_dir)
+    assert 1 in state.persisted_seqs
+    assert state.pending is None
+
+
+@pytest.mark.asyncio
+async def test_prescan_is_idempotent_with_hook_phase(tmp_path: Path) -> None:
+    """
+    P1-1: the prescan and the main hook phase mint one token per PreCompact.
+
+    Both scans see the same ``PreCompact`` record each poll. The
+    ``event_cursor`` idempotency key must keep them converging on a single
+    pending token — never two — so a re-mint cannot overwrite a token whose
+    boundary is mid-persist.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "PreCompact", "session_id": "claude-1"},
+    )
+    hook_state = await forwarder._ensure_hook_state(
+        bridge_dir, start_at_end=False, session_id="conv_idem"
+    )
+
+    # Prescan mints seq 1.
+    await _prescan_precompact_edges(bridge_dir, hook_state)
+    first = _read_compaction_state(bridge_dir)
+    assert first.pending is not None and first.pending.seq == 1
+    assert first.last_precompact_cursor == 1
+
+    # The main hook phase would note the SAME edge (same event_cursor=1).
+    # It must be a no-op: same seq, no second token.
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None, event_cursor=1
+    )
+    second = _read_compaction_state(bridge_dir)
+    assert second.pending is not None and second.pending.seq == 1
+    assert second.last_seq == 1
+
+    # A genuinely NEW PreCompact edge (higher cursor) mints the next seq.
+    await _note_precompact(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None, event_cursor=2
+    )
+    third = _read_compaction_state(bridge_dir)
+    assert third.pending is not None and third.pending.seq == 2
+    assert third.last_precompact_cursor == 2
+
+
+@pytest.mark.asyncio
+async def test_standalone_completion_hook_persists_without_pending(tmp_path: Path) -> None:
+    """
+    P1-2: a compact SessionStart with no pending token still persists a boundary.
+
+    Restores the legacy standalone-completion safety. When the
+    ``PreCompact`` hook was dropped (or the forwarder attached after it
+    fired) AND no transcript summary has persisted a boundary, the
+    ``SessionStart source=compact`` completion hook must still persist
+    exactly one boundary — otherwise resume reloads the full pre-compaction
+    history. ``_claim_standalone_completion`` mints the sequence for it.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # No _note_precompact, no persisted boundary — genuinely standalone.
+    seq = await _claim_standalone_completion(bridge_dir)
+    assert seq == 1
+    state = _read_compaction_state(bridge_dir)
+    # A pending token is installed so a later transcript summary reconciles
+    # against the same sequence instead of double-persisting.
+    assert state.pending is not None
+    assert state.pending.seq == 1
+
+    # After the caller persists and marks it done, the boundary is recorded.
+    from omnigent.claude_native_forwarder import _mark_compaction_persisted
+
+    await _mark_compaction_persisted(bridge_dir, seq)
+    final = _read_compaction_state(bridge_dir)
+    assert 1 in final.persisted_seqs
+    assert final.pending is None
+
+
+@pytest.mark.asyncio
+async def test_completion_hook_after_transcript_persist_is_absorbed(tmp_path: Path) -> None:
+    """
+    P1-2: a completion hook trailing a transcript-persisted boundary is absorbed.
+
+    The transcript ``isCompactSummary`` path and the
+    ``SessionStart source=compact`` hook are two completion signals for the
+    SAME compaction. When the transcript path persists first it arms the
+    completion-ack window; the trailing hook must be absorbed (return
+    ``None``, no new sequence) rather than persist a spurious standalone
+    boundary.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        # Transcript path persists the boundary; arms expect_completion_ack.
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_absorb",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+    assert persist.call_count == 1
+    armed = _read_compaction_state(bridge_dir)
+    assert armed.expect_completion_ack is True
+
+    # The trailing completion hook finds no pending token and is absorbed.
+    seq = await _consume_pending_compaction(
+        bridge_dir, claude_session_id="claude-1", transcript_path=None
+    )
+    assert seq is None
+    seq = await _claim_standalone_completion(bridge_dir)
+    assert seq is None  # absorbed, NOT a new standalone boundary
+    after = _read_compaction_state(bridge_dir)
+    assert after.expect_completion_ack is False
+    assert after.persisted_seqs == (1,)  # still exactly one boundary
+
+
+@pytest.mark.asyncio
+async def test_precompact_miss_is_counted_and_warned(tmp_path: Path) -> None:
+    """
+    P1-3: a summary skipped with no token and no boundary is counted as a miss.
+
+    A skipped ``isCompactSummary`` with no pending token AND no boundary ever
+    persisted is the observable ``PreCompact``-miss failure mode — it must
+    bump the ``precompact_miss`` counter (not be silently dropped). A skip
+    that follows a persisted boundary is an expected replay/dedupe and bumps
+    ``expected_skip`` instead.
+    """
+    _reset_compaction_skip_stats()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()  # no PreCompact, no persisted boundary
+
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        handled = await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_miss",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+
+    assert handled is True
+    persist.assert_not_called()
+    assert forwarder._compaction_skip_stats.precompact_miss == 1
+    assert forwarder._compaction_skip_stats.expected_skip == 0
+
+    # A skip AFTER a boundary was persisted is an expected replay, not a miss.
+    from omnigent.claude_native_forwarder import _write_compaction_state
+
+    _write_compaction_state(
+        bridge_dir,
+        CompactionForwardState(pending=None, last_seq=1, persisted_seqs=(1,)),
+    )
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_miss",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+    assert forwarder._compaction_skip_stats.precompact_miss == 1  # unchanged
+    assert forwarder._compaction_skip_stats.expected_skip == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_completion_ack_does_not_swallow_a_later_boundary(
+    tmp_path: Path,
+) -> None:
+    """
+    P2-1: a completion ack is bound to its seq and is one-shot per boundary.
+
+    The lost-boundary hazard: compaction A persists via the transcript path
+    and arms ``expect_completion_ack``; A's own ``SessionStart source=compact``
+    hook never fires (flaky), so the flag stays armed. A later compaction B's
+    ``PreCompact`` is *also* dropped, then B's completion hook fires. With a
+    bare unattributed flag, B's hook would be absorbed as A's stale ack and
+    B's boundary lost.
+
+    Binding the ack to a ``seq`` and making absorption one-shot fixes it: the
+    window is consumed exactly once (the trailing hook for A), and any
+    *further* standalone completion — B's — falls through to a fresh persist
+    instead of being swallowed.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        # Compaction A persists via the transcript path → arms the ack for A's seq.
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_p21",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+    armed = _read_compaction_state(bridge_dir)
+    assert armed.expect_completion_ack is True
+    assert armed.expect_completion_ack_seq == 1  # bound to A's seq, not a bare bool
+    assert armed.persisted_seqs == (1,)
+
+    # A's own trailing completion hook arrives late and is absorbed (one-shot).
+    absorbed = await _claim_standalone_completion(bridge_dir)
+    assert absorbed is None
+    after_absorb = _read_compaction_state(bridge_dir)
+    assert after_absorb.expect_completion_ack is False
+    assert after_absorb.expect_completion_ack_seq == 0  # window closed
+
+    # Compaction B: its PreCompact was dropped too, so B arrives as a
+    # standalone completion hook with NO pending token and NO armed ack. It
+    # must persist a fresh boundary, not be swallowed as A's stale ack.
+    b_seq = await _claim_standalone_completion(bridge_dir)
+    assert b_seq == 2, "B's boundary must be persisted, not lost to a stale ack"
+    final = _read_compaction_state(bridge_dir)
+    assert final.pending is not None
+    assert final.pending.seq == 2
+
+
+@pytest.mark.asyncio
+async def test_completion_ack_armed_for_unpersisted_seq_biases_to_persist(
+    tmp_path: Path,
+) -> None:
+    """
+    P2-1: an ack armed for a seq that is NOT persisted persists (bias-to-safe).
+
+    If durable state is somehow armed (corrupt/partial write, or a legacy
+    ``compaction_forwarder.json`` from before ``expect_completion_ack_seq``
+    existed so the seq reads back as ``0``) the standalone path cannot prove
+    the arriving hook is a duplicate. A lost boundary reloads the full
+    pre-compaction history on resume — far worse than an at-most-once
+    duplicate — so the path biases to persisting a fresh boundary rather than
+    silently absorbing the hook.
+    """
+    from omnigent.claude_native_forwarder import _write_compaction_state
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # Legacy/corrupt shape: flag armed but the seq it points at is not in
+    # persisted_seqs (here it reads back as 0, mimicking an old state file).
+    _write_compaction_state(
+        bridge_dir,
+        CompactionForwardState(
+            pending=None,
+            last_seq=1,
+            persisted_seqs=(),
+            expect_completion_ack=True,
+            expect_completion_ack_seq=0,
+        ),
+    )
+    seq = await _claim_standalone_completion(bridge_dir)
+    assert seq == 2, "bias-to-safe: persist rather than absorb an unprovable ack"
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is not None
+    assert state.pending.seq == 2
+
+
+@pytest.mark.asyncio
+async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
+    tmp_path: Path,
+) -> None:
+    """
+    P2-2: a standalone-completion persist failure holds the hook cursor.
+
+    A ``SessionStart source=compact`` with no pending token and no transcript
+    summary is a hook-only standalone compaction. If its boundary POST fails
+    transiently the forwarder must NOT advance past the hook (losing the
+    boundary, since no transcript summary will ever retry it) — it holds the
+    hook cursor and retries next poll, mirroring the transcript path. The
+    pending token minted by ``_claim_standalone_completion`` makes the retry
+    idempotent: the re-seen hook re-consumes the same seq. A later successful
+    POST persists exactly one boundary.
+    """
+    bridge_dir = tmp_path / "bridge"
+    # A lone compact SessionStart (no preceding PreCompact) — standalone.
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "source": "compact",
+            "session_id": "claude-standalone",
+        },
+    )
+    start_state = forwarder.HookForwardState(event_cursor=0, byte_offset=0)
+
+    request = httpx.Request("POST", "http://test/items")
+    response = httpx.Response(503, request=request)
+    failing = AsyncMock(
+        side_effect=httpx.HTTPStatusError("boom", request=request, response=response)
+    )
+
+    async def _run_once(state: forwarder.HookForwardState) -> forwarder.HookForwardState:
+        # The best-effort spinner status post is orthogonal to the durable
+        # persist under test; stub it so the client mock stays quiet.
+        with patch(
+            "omnigent.claude_native_forwarder._post_external_compaction_status",
+            AsyncMock(return_value=None),
+        ):
+            return await forwarder._forward_available_status_events(
+                client=AsyncMock(),
+                session_id="conv_p22",
+                bridge_dir=bridge_dir,
+                state=state,
+                retry_tracker=_PostRetryTracker(),
+                dedupe=forwarder._ForwardDedupeState(),
+                task_subjects={},
+                task_statuses={},
+                task_order=[],
+            )
+
+    # Poll 1: persist fails → cursor is held BEFORE the compaction hook record,
+    # a pending token is minted, and no boundary is marked persisted.
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", failing):
+        after_fail = await _run_once(start_state)
+    assert failing.await_count == 1
+    assert after_fail.event_cursor == start_state.event_cursor  # cursor held
+    held = _read_compaction_state(bridge_dir)
+    assert held.pending is not None  # token minted, awaiting a durable persist
+    assert not held.persisted_seqs  # nothing marked persisted on failure
+    minted_seq = held.pending.seq
+
+    # Poll 2 (retry): the same hook record is re-seen; the persist succeeds and
+    # re-consumes the SAME seq (idempotent), marking exactly one boundary.
+    ok = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", ok):
+        after_ok = await _run_once(after_fail)
+    assert ok.await_count == 1
+    persisted = _read_compaction_state(bridge_dir)
+    assert persisted.persisted_seqs == (minted_seq,)  # exactly one boundary
+    assert persisted.pending is None
+    assert after_ok.event_cursor > after_fail.event_cursor  # cursor advanced
 
 
 def test_forward_failures_escalate_to_degraded_once() -> None:
@@ -6708,16 +7448,17 @@ async def test_subagent_start_drop_writes_dead_letter(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_forwarder_posts_waiting_when_stop_has_background_tasks(
+async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
     tmp_path: Path,
 ) -> None:
     """
-    ``Stop`` with ``background_tasks`` → ``waiting`` instead of ``idle``.
+    ``Stop`` with ``background_tasks`` posts ``idle`` plus the shell count.
 
-    When Claude Code's Stop hook carries a non-empty ``background_tasks``
-    array (shells still running), the forwarder must publish ``waiting``
-    so the web UI keeps showing the spinner. Without this, the chat
-    interface shows "idle" while the terminal shows "1 shell running".
+    The turn really has ended, so the status is ``idle`` — the spinner stays
+    lit off the count instead (``showsWorking`` is ``isWorking || tally > 0``).
+    The count is the one thing Claude's status file cannot report: its
+    ``shell`` literal is a boolean and the indicator renders a number, which
+    is why this hook still posts at all.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -6771,7 +7512,7 @@ async def test_forwarder_posts_waiting_when_stop_has_background_tasks(
     assert request["path"] == "/v1/sessions/conv_abc/events"
     assert request["body"] == {
         "type": "external_session_status",
-        "data": {"status": "waiting", "background_task_count": 1},
+        "data": {"status": "idle", "background_task_count": 1},
     }
 
 
@@ -6830,6 +7571,7 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
         return httpx.Response(200, json={})
 
     transport = httpx.MockTransport(handler)
+    dedupe = forwarder._ForwardDedupeState()
     async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
         hook_state = await forwarder._ensure_hook_state(
             bridge_dir, start_at_end=False, session_id="conv_abc"
@@ -6840,11 +7582,17 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
             bridge_dir=bridge_dir,
             state=hook_state,
             retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
             task_subjects={},
             task_statuses={},
             task_order=[],
             response_id="resp_turn_1",
         )
+
+    # The posted turn-end edge records the turn as a PENDING settle for
+    # scheduled-wake detection (it activates once the transcript is quiet).
+    assert dedupe.pending_settled_response_id == "resp_turn_1"
+    assert dedupe.settled_response_id is None
 
     assert bodies == [
         {
@@ -6862,15 +7610,15 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_forwarder_emits_turn_start_running_with_response_id(tmp_path: Path) -> None:
+async def test_forwarder_publishes_no_status_for_assistant_output(tmp_path: Path) -> None:
     """
-    The first assistant output of a turn publishes ``running`` + its response id.
+    Assistant output forwards items and publishes NO session status.
 
-    Native Claude's running/idle BADGE stays PTY-derived; this id-bearing
-    ``running`` edge is the additional signal that lets ap-web open a streaming
-    ``activeResponse`` for the turn, so the forwarded tool cards (which share
-    the same response id) render LIVE rather than as static completed cards.
-    The running edge's response id must equal the forwarded items' response id.
+    Claude's ``sessions/<pid>.json`` owns the running/idle badge. A status edge
+    derived from the transcript can only fire once a poll has parsed assistant
+    output, so on a short turn it lands *after* the file's ``idle`` and
+    re-asserts ``running`` on a session that already finished — the user sees
+    idle → running → idle. The items still carry their own ``response_id``.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -6927,9 +7675,7 @@ async def test_forwarder_emits_turn_start_running_with_response_id(tmp_path: Pat
         )
     )
     try:
-        # First POST of the poll is the turn-start running status (it runs
-        # before the items in _forward_available_items); the two items follow.
-        running = await _get_recorded_request(server)
+        # Both POSTs of the poll are items — no status edge precedes them.
         item_a = await _get_recorded_request(server)
         item_b = await _get_recorded_request(server)
     finally:
@@ -6940,20 +7686,90 @@ async def test_forwarder_emits_turn_start_running_with_response_id(tmp_path: Pat
         server.server_close()
         thread.join(timeout=5.0)
 
-    assert running["body"]["type"] == "external_session_status"
-    assert running["body"]["data"]["status"] == "running"
-    running_rid = running["body"]["data"]["response_id"]
-    assert isinstance(running_rid, str) and running_rid
-    # The running edge's response id matches the ASSISTANT turn's forwarded
-    # item (the function_call), so that bubble enters the streaming lifecycle
-    # on the client. The user message carries its own distinct response id.
+    # Neither POST is a status edge — the transcript path publishes none.
+    assert [body["body"]["type"] for body in (item_a, item_b)] == [
+        "external_conversation_item",
+        "external_conversation_item",
+    ]
+    # The assistant turn's item still carries its own response id, which is
+    # what groups its bubble and its tool cards on the client.
     function_call = next(
-        body
-        for body in (item_a, item_b)
-        if body["body"]["type"] == "external_conversation_item"
-        and body["body"]["data"]["item_type"] == "function_call"
+        body for body in (item_a, item_b) if body["body"]["data"]["item_type"] == "function_call"
     )
-    assert function_call["body"]["data"]["response_id"] == running_rid
+    rid = function_call["body"]["data"]["response_id"]
+    assert isinstance(rid, str) and rid
+
+
+@pytest.mark.asyncio
+async def test_short_turn_poll_posts_items_without_a_status_edge(tmp_path: Path) -> None:
+    """
+    Regression: a short turn's poll must not re-assert ``running``.
+
+    The status file reports the turn ending the moment Claude settles, but a
+    transcript-derived edge can only fire once a poll has parsed assistant
+    output — so it arrived *after* that ``idle`` and flipped the session back to
+    ``running``, then ``Stop`` closed it again: the user saw
+    idle → running → idle on every short turn.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "u1",
+                        "message": {"role": "user", "content": "i'll keep testing"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "a1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "Sounds good."}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    posted: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """
+        Record every forwarder POST body.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: HTTP 202 for the mock Omnigent endpoint.
+        """
+        posted.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+        )
+
+    assert [body["type"] for body in posted] == ["external_conversation_item"] * 2
+    assert not [body for body in posted if body["type"] == "external_session_status"]
 
 
 @pytest.mark.asyncio
@@ -7120,3 +7936,63 @@ def test_is_subagent_delivery_not_confirmed_classifier() -> None:
     assert forwarder._is_subagent_delivery_not_confirmed(no_status) is False
     assert forwarder._is_subagent_delivery_not_confirmed(no_body) is False
     assert forwarder._is_subagent_delivery_not_confirmed(httpx.ConnectError("boom")) is False
+
+
+@pytest.mark.asyncio
+async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A stalled await inside one poll iteration is cancelled and the loop resumes.
+
+    A silent stall in any forwarding stage used to stop mirroring, status
+    events and the pane busy signal forever — with zero log output — and
+    the pane reaper then killed the live session an hour later. The
+    iteration deadline converts such a stall into a logged, bounded
+    hiccup: the stuck await is cancelled (the warning's traceback names
+    it) and the next iteration proceeds.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    monkeypatch.setattr(forwarder, "_FORWARD_LOOP_STALL_DEADLINE_S", 0.2)
+    ensure_calls: list[int] = []
+    real_ensure = forwarder._ensure_hook_state
+
+    async def _stalls_on_first_call(*args: Any, **kwargs: Any) -> Any:
+        ensure_calls.append(len(ensure_calls) + 1)
+        if len(ensure_calls) == 1:
+            await asyncio.Event().wait()
+        return await real_ensure(*args, **kwargs)
+
+    monkeypatch.setattr(forwarder, "_ensure_hook_state", _stalls_on_first_call)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.claude_native_forwarder"):
+        task = asyncio.create_task(
+            forward_claude_transcript_to_session(
+                base_url="http://127.0.0.1:9",
+                headers={},
+                session_id="conv_stall",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                start_at_end=False,
+                poll_interval_s=0.01,
+            )
+        )
+        try:
+
+            async def _second_iteration_ran() -> None:
+                while len(ensure_calls) < 2:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(_second_iteration_ran(), timeout=5.0)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    stall_warnings = [r for r in caplog.records if "iteration exceeded" in r.getMessage()]
+    assert stall_warnings, "the deadline trip must be loudly logged, never silent"
+    # The warning's traceback names the stalled await for next-time forensics.
+    assert stall_warnings[0].exc_info is not None

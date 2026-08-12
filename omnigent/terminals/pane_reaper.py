@@ -42,6 +42,12 @@ from typing import NamedTuple
 
 _logger = logging.getLogger(__name__)
 
+# A pane whose window emitted output this recently counts as busy. tmux's own
+# activity clock is evidence independent of the harness status pipeline, whose
+# silent stall must not get a live, producing terminal reaped. Two reaper scan
+# intervals, so any output between scans re-arms the idle clock.
+PANE_OUTPUT_BUSY_WINDOW_S = 120.0
+
 # Native CLI panes are keyed (conversation_id, <harness short name>, "main") in
 # the terminal registry. These short names match the ``terminal_name`` the
 # per-harness ``_auto_create_<harness>_terminal`` paths launch with. This is the
@@ -65,8 +71,8 @@ NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
 )
 
 # Default idle window before an unused native pane is reaped. Mirrors
-# ``HarnessProcessManager``'s 30-minute SDK-proxy default for consistency.
-_DEFAULT_IDLE_TIMEOUT_S = 30 * 60
+# ``HarnessProcessManager``'s 1-hour SDK-proxy default for consistency.
+_DEFAULT_IDLE_TIMEOUT_S = 60 * 60
 _DEFAULT_REAPER_INTERVAL_S = 60.0
 _IDLE_TIMEOUT_ENV = "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"
 
@@ -91,7 +97,7 @@ def resolve_native_pane_idle_timeout_s() -> float:
     """Resolve the native-pane idle window in seconds.
 
     Honors :envvar:`OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S` (``0`` disables pane
-    reaping); otherwise the 30-minute default. An unparseable or negative value
+    reaping); otherwise the 1-hour default. An unparseable or negative value
     logs a warning and falls back to the default rather than failing the runner
     at boot — an env typo shouldn't take the runner down or (worse) make the
     reaper act on a bogus window.

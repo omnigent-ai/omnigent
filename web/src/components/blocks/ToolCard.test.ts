@@ -202,9 +202,9 @@ describe("ToolGroupSummary", () => {
     } as unknown as RenderItem;
   }
 
-  it("labels the run with a pluralized step count and renders children when expanded", () => {
-    // WHY: the summary line counts the full contiguous run; ">1" pluralizes
-    // "steps", and expanding mounts each tool card.
+  it("labels unrecognized hidden tools generically and renders children when expanded", () => {
+    // WHY: several unrecognized tools get the generic "Called N tools",
+    // and expanding mounts each tool card.
     const { container } = render(
       createElement(
         TooltipProvider,
@@ -214,31 +214,46 @@ describe("ToolGroupSummary", () => {
         }),
       ),
     );
-    expect(screen.getByText("See 2 steps")).toBeInTheDocument();
+    expect(screen.getByText("Called 2 tools")).toBeInTheDocument();
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
     expect(screen.getByText("alpha_tool")).toBeInTheDocument();
     expect(screen.getByText("beta_tool")).toBeInTheDocument();
   });
 
-  it("uses the singular 'step' for one tool and honors an explicit count override", () => {
-    // WHY: n===1 drops the plural; `count` overrides tools.length so a
-    // streaming tail isn't undercounted.
-    const { rerender } = render(
+  it("uses the singular 'tool' for one hidden unrecognized tool", () => {
+    render(
       createElement(
         TooltipProvider,
         null,
         createElement(ToolGroupSummary, { tools: [toolItem("t1", "solo_tool")] }),
       ),
     );
-    expect(screen.getByText("See 1 step")).toBeInTheDocument();
+    expect(screen.getByText("Called 1 tool")).toBeInTheDocument();
+  });
+
+  it("labels recognized hidden tools with the semantic CLI-style phrase", () => {
+    // WHY: recognized tool names (Claude Code's Bash/Read) replace the
+    // bare count with the action summary the native CLI prints.
+    const { rerender } = render(
+      createElement(
+        TooltipProvider,
+        null,
+        createElement(ToolGroupSummary, {
+          tools: [toolItem("t1", "Read"), toolItem("t2", "Read")],
+        }),
+      ),
+    );
+    expect(screen.getByText("Read 2 files")).toBeInTheDocument();
 
     rerender(
       createElement(
         TooltipProvider,
         null,
-        createElement(ToolGroupSummary, { tools: [toolItem("t1", "solo_tool")], count: 5 }),
+        createElement(ToolGroupSummary, {
+          tools: [toolItem("t1", "Bash"), toolItem("t2", "Read"), toolItem("t3", "Read")],
+        }),
       ),
     );
-    expect(screen.getByText("See 5 steps")).toBeInTheDocument();
+    expect(screen.getByText("Ran 1 shell command, read 2 files")).toBeInTheDocument();
   });
 });

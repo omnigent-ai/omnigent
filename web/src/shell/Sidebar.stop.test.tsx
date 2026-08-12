@@ -5,6 +5,8 @@
 // confirms through a dialog before firing the stop mutation. See
 // ConversationRow in Sidebar.tsx.
 
+import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -29,7 +31,13 @@ vi.mock("@/hooks/useConversations", () => ({
     isPending: false,
     isError: false,
   }),
-  usePinnedConversationBackfill: () => [],
+  usePinnedConversations: () => ({
+    data: { conversations: [], filterHonored: true },
+    isSuccess: true,
+  }),
+  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
+  setConversationPinned: vi.fn(() => Promise.resolve({})),
+  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
@@ -39,12 +47,16 @@ vi.mock("@/hooks/useConversations", () => ({
   useProjects: () => ({ data: [] }),
   useMoveToProject: () => ({ mutate: vi.fn() }),
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useProjectConfig: () => ({ data: undefined, isLoading: false }),
+  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
 }));
 
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/RunnerHealthProvider")>()),
+  ...(await importOriginal<typeof RunnerHealthProviderModule>()),
   useSessionRunnerOnline: (id: string | undefined) => mocks.runnerOnline(id),
 }));
 
@@ -117,6 +129,7 @@ function openKebab() {
 beforeEach(() => {
   mocks.stop.mutate.mockReset();
   mocks.stop.reset.mockReset();
+  mocks.stop.isPending = false;
   mocks.runnerOnline.mockReset();
   mocks.runnerOnline.mockReturnValue(undefined);
 });
@@ -139,6 +152,21 @@ describe("sidebar Stop session item", () => {
     expect(mocks.stop.mutate).toHaveBeenCalledTimes(1);
     // Failure: the dialog stopped a different row's session.
     expect(mocks.stop.mutate.mock.calls[0][0]).toBe("conv_1");
+  });
+
+  it("spins the confirm button while the stop is in flight", () => {
+    // The stop can take seconds. Without the spinner the button only fades
+    // (disabled), which reads as a hang rather than work in progress.
+    mocks.stop.isPending = true;
+    mockConversations([HOST_SPAWNED]);
+    renderSidebar();
+    openKebab();
+    fireEvent.click(screen.getByTestId("stop-conversation"));
+
+    const confirm = screen.getByTestId("stop-session-confirm");
+    expect(confirm).toHaveAttribute("aria-busy", "true");
+    expect(confirm).toBeDisabled();
+    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
   });
 
   it("clears a prior stop failure when the dialog is opened", () => {
@@ -193,7 +221,12 @@ describe("sidebar Stop session item", () => {
     mockConversations([{ ...HOST_SPAWNED, owner: "other@example.com" }]);
     renderSidebar();
     // Radix Tabs triggers activate on mousedown (primary button), not click.
-    fireEvent.mouseDown(screen.getByTestId("sidebar-tab-shared"), { button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
     openKebab();
     const item = screen.getByTestId("stop-conversation");
     expect(item).toHaveAttribute("data-disabled");

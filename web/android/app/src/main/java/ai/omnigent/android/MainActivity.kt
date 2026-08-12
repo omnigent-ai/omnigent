@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.app.DownloadManager
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -21,9 +22,9 @@ import android.webkit.WebView
 import android.widget.FrameLayout
 import android.widget.PopupMenu
 import android.widget.TextView
-import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import androidx.core.graphics.Insets
@@ -31,6 +32,8 @@ import androidx.core.view.MenuCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 
@@ -42,7 +45,7 @@ import androidx.webkit.WebViewFeature
  * Server URL comes from [ServerStore]; when none is set yet, launch routes to
  * [ConnectActivity] first. Sidebar edge-swipe is intentionally absent (README).
  */
-class MainActivity : ComponentActivity() {
+class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var notifications: NativeNotificationManager
     private lateinit var blobSaver: BlobSaver
@@ -54,6 +57,8 @@ class MainActivity : ComponentActivity() {
     private var pendingNavigatePath: String? = null
     private var lastInsets: Insets? = null
     private var pageLoaded = false
+    private var bridgeTransportInstalled = false
+    private var bridgeScriptHandler: ScriptHandler? = null
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
     private var historyCleared = false // drop pre-auth/login-redirect history once
 
@@ -134,6 +139,9 @@ class MainActivity : ComponentActivity() {
                 webViewClient =
                     OmnigentWebViewClient(
                         pinnedOrigin = { pinnedOrigin },
+                        shouldInjectBridgeAtPageReady = {
+                            bridgeTransportInstalled && bridgeScriptHandler == null
+                        },
                         onPageReady = ::onPageReady,
                         onLoginRequired = ::startLogin,
                     )
@@ -178,6 +186,7 @@ class MainActivity : ComponentActivity() {
                 }
         container.addView(switchButton)
         setContentView(container)
+        applySystemBarContrast()
         installBridge()
 
         // Measure the OS safe area and push it into the page as CSS custom
@@ -271,6 +280,15 @@ class MainActivity : ComponentActivity() {
         webView.loadUrl(serverUrl)
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        applySystemBarContrast()
+        if (::webView.isInitialized) {
+            // Notify matchMedia listeners without reloading the SPA.
+            webView.dispatchConfigurationChanged(newConfig)
+        }
+    }
+
     /**
      * Install the web -> native bridge as an origin-allowlisted web message
      * listener (NOT addJavascriptInterface): the transport object reaches only
@@ -294,6 +312,30 @@ class MainActivity : ComponentActivity() {
             )
         } catch (_: IllegalArgumentException) {
             // Malformed origin rule — leave the bridge absent; the web layer falls back.
+            return
+        }
+        bridgeTransportInstalled = true
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            try {
+                bridgeScriptHandler =
+                    WebViewCompat.addDocumentStartJavaScript(
+                        webView,
+                        NativeBridgeScript.source,
+                        setOf(origin),
+                    )
+            } catch (_: IllegalArgumentException) {
+                // Keep the transport; onPageFinished will inject the facade instead.
+            }
+        }
+    }
+
+    private fun applySystemBarContrast() {
+        val isLightMode =
+            resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
+                Configuration.UI_MODE_NIGHT_YES
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            isAppearanceLightStatusBars = isLightMode
+            isAppearanceLightNavigationBars = isLightMode
         }
     }
 
@@ -439,7 +481,10 @@ class MainActivity : ComponentActivity() {
         pendingMicRequest = null
         loginManager.shutdown()
         if (::blobSaver.isInitialized) blobSaver.shutdown()
-        if (::webView.isInitialized) webView.destroy() // releases the bridge chain
+        if (::webView.isInitialized) {
+            removeBridge()
+            webView.destroy()
+        }
         super.onDestroy()
     }
 
@@ -474,14 +519,7 @@ class MainActivity : ComponentActivity() {
         serverUrl: String,
         newOrigin: String,
     ) {
-        try {
-            WebViewCompat.removeWebMessageListener(
-                webView,
-                OmnigentBridgeListener.JS_OBJECT_NAME,
-            )
-        } catch (_: Exception) {
-            // Not registered (feature unsupported, or already removed) — no-op.
-        }
+        removeBridge()
         pinnedOrigin = newOrigin
         pageLoaded = false
         historyCleared = false
@@ -491,24 +529,38 @@ class MainActivity : ComponentActivity() {
         webView.loadUrl(serverUrl)
     }
 
+    private fun removeBridge() {
+        bridgeScriptHandler?.remove()
+        bridgeScriptHandler = null
+        bridgeTransportInstalled = false
+        try {
+            WebViewCompat.removeWebMessageListener(
+                webView,
+                OmnigentBridgeListener.JS_OBJECT_NAME,
+            )
+        } catch (_: Exception) {
+            // Not registered (feature unsupported, or already removed) — no-op.
+        }
+    }
+
     /**
      * Show the server-switcher dropdown menu, mirroring the iOS `ServerSwitcher`
-     * `Menu`. Lists the current server (disabled header), other recent servers,
-     * Reload, and Connect to New Server. Tapping a recent server switches
-     * directly without leaving the app; "Connect to New Server" opens
-     * [ConnectActivity] for manual URL entry.
+     * `Menu`. Lists the current server (disabled header), the other servers on
+     * offer (organization presets, then recents), Reload, and Connect to New
+     * Server. Tapping a server switches directly without leaving the app;
+     * "Connect to New Server" opens [ConnectActivity] for manual URL entry.
      */
     private fun showServerSwitcherMenu(anchor: View) {
         val store = ServerStore(this)
         val currentUrl = store.currentServerUrl()
-        val otherServers = store.recentServers().filter { originOf(it) != pinnedOrigin }
+        val otherServers = store.offeredServers().filter { originOf(it) != pinnedOrigin }
 
         val popup = PopupMenu(this, anchor, Gravity.TOP)
         MenuCompat.setGroupDividerEnabled(popup.menu, true)
         popup.menu.apply {
             // Group 0: current server — disabled header.
             add(0, 0, 0, hostLabelOf(currentUrl)).isEnabled = false
-            // Group 1: other recent servers (divider before this group).
+            // Group 1: the other servers on offer (divider before this group).
             otherServers.forEachIndexed { i, url ->
                 add(1, 100 + i, 0, hostLabelOf(url))
             }
@@ -550,10 +602,9 @@ class MainActivity : ComponentActivity() {
         // pendingNavigatePath or push insets into a page that can't consume them.
         if (originOf(url) != pinnedOrigin) return
         // First authenticated app page: drop everything before it from the
-        // back/forward list. Otherwise Back walks into the pre-auth root and the
-        // login-redirect reload (the `loadUrl(origin)` after the cookie injection),
-        // which bounces to login or shows a blank — "back lands on the wrong
-        // screen" / "exits the app". After this the SPA builds clean history.
+        // back/forward list — the pre-auth root, any IdP pages, and the post-login
+        // reload all bounce to login or show a blank if Back reaches them. After
+        // this the SPA builds clean history.
         if (!historyCleared) {
             historyCleared = true
             webView.clearHistory()

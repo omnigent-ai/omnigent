@@ -1,21 +1,26 @@
 //! omnidev — dev tooling for Omnigent.
 //!
-//! Two independent capabilities in one binary:
+//! Three surfaces in one binary:
 //! - **pod supervisor** (bare `omnidev`): manages an isolated dev instance for
 //!   the current checkout — server/host/vite, restarting the backend on Python
 //!   changes while Vite handles frontend HMR.
 //! - **install management** (`omnidev install`/`update`/`check`/…): install and
 //!   keep a git-based omnigent up to date. These need no checkout and run
 //!   anywhere.
+//! - **omnigent passthrough** (`omnidev omnigent …`): run any omnigent command
+//!   against the current checkout's pod via pinned `uv run --python …`, with the pod's
+//!   isolated env applied. Requires a checkout, like the supervisor.
 
 mod install;
 mod lan;
 mod lock;
 mod logs;
+mod omnigent_cmd;
 mod paths;
 mod pod;
 mod ports;
 mod process;
+mod profile;
 mod shellhook;
 mod state;
 mod supervisor;
@@ -46,9 +51,57 @@ struct Args {
     run: RunArgs,
 }
 
+/// Top-level subcommands. Install management works anywhere; the `omnigent`
+/// passthrough requires a checkout (like the bare supervisor default).
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Install omnigent from git (defaults to the databricks extra, main).
+    Install {
+        /// Git ref (branch/tag/sha) to track.
+        #[arg(long, default_value = install::DEFAULT_REF)]
+        r#ref: String,
+        /// Extra to include (repeatable). Defaults to `databricks`.
+        #[arg(long = "extra")]
+        extras: Vec<String>,
+        /// Omit the default databricks extra (install with no extras).
+        #[arg(long)]
+        no_default_extra: bool,
+        /// Git repo URL.
+        #[arg(long, default_value = install::DEFAULT_REPO)]
+        repo: String,
+    },
+    /// Reinstall the latest of the tracked ref/extras.
+    Update,
+    /// Check for an omnigent update (the shell hook calls this).
+    Check {
+        /// Print nothing when already up to date.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Refresh the update-check cache from the network (usually run detached).
+    Refresh,
+    /// Print a shell snippet to eval from .zshrc/.bashrc for daily checks.
+    ShellHook,
+    /// Run an omnigent command against this checkout's pod (pinned `uv run --python …`).
+    ///
+    /// Everything after the subcommand is forwarded verbatim to omnigent. The
+    /// pod's isolated env (data dir, database, config, server URL) is applied,
+    /// so a command talks to the same pod the supervisor runs — and coexists
+    /// with a running supervisor. Use `--` to pass flags that look like
+    /// omnidev's own: `omnidev omnigent -- --verbose agent run …`.
+    Omnigent {
+        #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
 /// Flags for the default (no-subcommand) pod-supervisor run.
 #[derive(clap::Args, Debug)]
 struct RunArgs {
+    /// Process profile for an Omnigent integration with a different repository layout.
+    #[arg(long)]
+    profile: Option<PathBuf>,
+
     /// Force the backend server port (default: probe from 6767).
     #[arg(long)]
     server_port: Option<u16>,
@@ -84,42 +137,12 @@ struct RunArgs {
     debug: bool,
 }
 
-#[derive(Subcommand, Debug)]
-enum Command {
-    /// Install omnigent from git (defaults to the databricks extra, main).
-    Install {
-        /// Git ref (branch/tag/sha) to track.
-        #[arg(long, default_value = install::DEFAULT_REF)]
-        r#ref: String,
-        /// Extra to include (repeatable). Defaults to `databricks`.
-        #[arg(long = "extra")]
-        extras: Vec<String>,
-        /// Omit the default databricks extra (install with no extras).
-        #[arg(long)]
-        no_default_extra: bool,
-        /// Git repo URL.
-        #[arg(long, default_value = install::DEFAULT_REPO)]
-        repo: String,
-    },
-    /// Reinstall the latest of the tracked ref/extras.
-    Update,
-    /// Check for an omnigent update (the shell hook calls this).
-    Check {
-        /// Print nothing when already up to date.
-        #[arg(long)]
-        quiet: bool,
-    },
-    /// Refresh the update-check cache from the network (usually run detached).
-    Refresh,
-    /// Print a shell snippet to eval from .zshrc/.bashrc for daily checks.
-    ShellHook,
-}
-
 fn main() -> Result<()> {
     let args = Args::parse();
 
     // Install-management subcommands manage a global tool and must work from
-    // anywhere — dispatch them before any checkout discovery.
+    // anywhere — dispatch them before any checkout discovery. `omnigent …` is
+    // the pod-wired passthrough. No subcommand runs the pod supervisor.
     match args.command {
         Some(Command::Install {
             r#ref,
@@ -148,8 +171,41 @@ fn main() -> Result<()> {
             shellhook::print();
             Ok(())
         }
+        Some(Command::Omnigent { args: passthrough }) => run_omnigent(args.run, passthrough),
         None => run_supervisor(args.run),
     }
+}
+
+/// `omnidev omnigent …` — run an arbitrary omnigent command against this
+/// checkout's pod via pinned `uv run --python …`, with the pod's isolated env (data
+/// dir, database URI, config home, server URL) applied on top of the inherited
+/// parent env. Resolves the repo root and pod dir (same as the supervisor),
+/// ensures the pod tree exists, then spawns in the foreground inheriting stdio.
+/// Exits with omnigent's status code. Acquires no lock — it coexists with a
+/// running supervisor (the common case: server up, you run a command).
+fn run_omnigent(args: RunArgs, passthrough: Vec<String>) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let repo_root = paths::find_repo_root(&cwd, false)?;
+    let pod_dir = match &args.pod_dir {
+        Some(p) => p.clone(),
+        None => paths::default_pod_dir(&repo_root)?,
+    };
+    std::fs::create_dir_all(&pod_dir)?;
+
+    // Read persisted ports so OMNIGENT_URL points at a running supervisor's
+    // server (if any). Supervisor-only flags don't apply to the passthrough, so
+    // never override — the pod stays in sync with whatever the supervisor set.
+    let ports = Ports::resolve(&pod_dir, None, None)?;
+    let pod = Pod::create(
+        repo_root,
+        pod_dir,
+        ports,
+        args.vite_host.clone(),
+        Vec::new(),
+    )?;
+
+    let cmd = omnigent_cmd::build(&pod, &passthrough);
+    omnigent_cmd::run(cmd)
 }
 
 /// Default path: the pod supervisor for the current checkout. This is the only
@@ -157,7 +213,19 @@ fn main() -> Result<()> {
 #[tokio::main]
 async fn run_supervisor(args: RunArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let repo_root = paths::find_repo_root(&cwd)?;
+    let repo_root = paths::find_repo_root(&cwd, args.profile.is_some())?;
+    let profile = args
+        .profile
+        .as_deref()
+        .map(|path| {
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                repo_root.join(path)
+            };
+            profile::Profile::load(&path)
+        })
+        .transpose()?;
     let pod_dir = match &args.pod_dir {
         Some(p) => p.clone(),
         None => paths::default_pod_dir(&repo_root)?,
@@ -180,12 +248,13 @@ async fn run_supervisor(args: RunArgs) -> Result<()> {
     } else {
         Vec::new()
     };
-    let pod = Arc::new(Pod::create(
+    let pod = Arc::new(Pod::create_with_profile(
         repo_root,
         pod_dir,
         ports,
         args.vite_host,
         trusted_origins,
+        profile,
     )?);
 
     let shared = Shared::new(&pod);
@@ -195,7 +264,7 @@ async fn run_supervisor(args: RunArgs) -> Result<()> {
     // for the whole session.
     let _watcher = watcher::spawn(
         &pod.repo_root,
-        &pod.omnigent_dir(),
+        &pod.backend_dir(),
         shared.clone(),
         args.debug,
         cmd_tx.clone(),

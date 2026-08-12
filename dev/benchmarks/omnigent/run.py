@@ -110,6 +110,31 @@ async def _run_journey(
     return ("throughput" if as_throughput else "latency"), results
 
 
+def _thresholds_supplied(args: argparse.Namespace) -> bool:
+    """Whether the run requested any CI threshold gate."""
+    return any(getattr(args, name) is not None for name in ("min_rps", "max_p50_ms", "max_p99_ms"))
+
+
+def _skipped_block(journey: Journey, backend: str, exc: Exception) -> dict[str, object]:
+    """A journey block for a journey that errored out of measurement entirely.
+
+    Keeps the report shape consumers expect (``kind`` / ``backend`` /
+    ``needs_runner`` / empty ``runs`` + ``summary``) while flagging the skip so
+    the ETL and comparison tools can tell a skipped journey apart from a real
+    zero — an empty ``summary`` carries no metric keys, so it never counts as a
+    fast run, and ``compare.py`` treats it as having no baseline/candidate data.
+    """
+    return {
+        "kind": journey.kind,
+        "backend": backend,
+        "needs_runner": journey.needs_runner,
+        "runs": [],
+        "summary": {},
+        "skipped": True,
+        "error": f"{exc.__class__.__name__}: {exc}",
+    }
+
+
 async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
     """Run all selected journeys and build the report.
 
@@ -132,11 +157,31 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
     harness = _RUNNER_HARNESS if with_runner else _HTTP_HARNESS
 
     async with BenchEnvironment(
-        with_runner=with_runner, with_host=with_host, database_uri=args.database_uri
+        with_runner=with_runner,
+        with_host=with_host,
+        database_uri=args.database_uri,
+        network_delay_ms=args.network_delay_ms,
     ) as env:
         for journey in journeys:
             console.print(f"\n[bold]Benchmarking[/bold] {journey.name} [dim]({backend})[/dim]")
-            kind, results = await _run_journey(journey, env, args)
+            # Setup/teardown failures are already caught inside the runners and
+            # surface as failed RunResults. This guard is the outer safety net:
+            # any other unexpected error records a skipped-journey block so one
+            # broken journey never aborts the rest of the suite.
+            try:
+                kind, results = await _run_journey(journey, env, args)
+            except Exception as exc:  # noqa: BLE001 — one journey must not kill the run
+                console.print(
+                    f"  [red]SKIPPED:[/red] {journey.name} errored "
+                    f"({exc.__class__.__name__}: {exc}); excluded from summary."
+                )
+                journey_results[journey.name] = _skipped_block(journey, backend, exc)
+                # A journey that couldn't run can't confirm a requested guarantee,
+                # so a supplied threshold fails the gate; with none supplied the
+                # skip is non-fatal and the suite carries on.
+                if _thresholds_supplied(args):
+                    passed = False
+                continue
             print_results(journey.name, results)
             block = aggregate(results)
             block["kind"] = kind
@@ -164,6 +209,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
         "warmup": args.warmup,
         "with_runner": with_runner,
         "backend": backend,
+        "network_delay_ms": args.network_delay_ms,
     }
     generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     report = build_report(
@@ -233,6 +279,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=10,
         metavar="N",
         help="Warmup operations discarded before each run (default: 10).",
+    )
+    parser.add_argument(
+        "--network-delay-ms",
+        type=float,
+        default=0.0,
+        metavar="MS",
+        help="Simulated client→server network latency, in ms, injected before "
+        "each request the benchmark sends (default: 0 = loopback speed). Models "
+        "a real network hop for testing network optimizations; per-op request "
+        "counts times this delay approximate the round-trip wall cost.",
     )
     parser.add_argument(
         "--output",

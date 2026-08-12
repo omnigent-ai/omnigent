@@ -154,8 +154,8 @@ def test_mobile_fab_lists_file_surfaces_and_omits_absent_ones(
     """The FAB menu degrades gracefully to only the available surfaces.
 
     A plain ``hello_world`` session has a workspace (os_env), no child
-    agents, and is not claude-native — so the menu must list Files (the
-    single files surface; its Changed/All scope is an in-panel toggle)
+    agents, and is not claude-native — so the menu must list Files and
+    Changes (the two files surfaces — folder tree and changed-files list)
     and Agents (unconditional — the panel lists at least the main
     agent, badge "1"), and must NOT list Shells or Tasks. The session's
     only terminal is the auto-created embedded Omnigent REPL, which is
@@ -170,6 +170,9 @@ def test_mobile_fab_lists_file_surfaces_and_omits_absent_ones(
     page.get_by_role("button", name="Open session menu").click()
 
     expect(page.get_by_role("menuitem", name="Files", exact=True)).to_be_visible()
+    # Changes is a peer files surface (the changed-files list), listed
+    # alongside Files whenever the workspace is available.
+    expect(page.get_by_role("menuitem", name="Changes", exact=True)).to_be_visible()
     # Agents is always present; "1" = just the main agent. "0" means
     # the main agent was dropped from the count.
     expect(page.get_by_role("menuitem", name=re.compile(r"Agents\s*1"))).to_be_visible()
@@ -177,8 +180,7 @@ def test_mobile_fab_lists_file_surfaces_and_omits_absent_ones(
     # the inventory (reachable via the Chat/Terminal pill instead). An
     # entry here means the REPL leaked back into the FAB gating.
     expect(page.get_by_role("menuitem", name="Shells")).to_have_count(0)
-    # No separate Changes entry (merged into Files) and no todos.
-    expect(page.get_by_role("menuitem", name="Changes")).to_have_count(0)
+    # No todos on a plain hello_world session.
     expect(page.get_by_role("menuitem", name="Tasks")).to_have_count(0)
 
 
@@ -188,11 +190,12 @@ def test_mobile_shells_drawer_exposes_new_shell_before_shells_exist(
 ) -> None:
     """Shell-capable agents expose the mobile Shells drawer at zero shells.
 
-    The desktop rail shows Shells by default when the session agent declares a
-    ``terminals:`` block, because the empty state is the "+ New shell" entry
-    point. Mobile must mirror that behavior: the FAB should list Shells before
-    any user shell has been created, and selecting it should open the full-screen
-    Shells drawer containing the same "+ New shell" row.
+    Mobile has no tab-strip "+" menu, so the Shells drawer is the create entry
+    point: when the session agent declares a ``terminals:`` block, the FAB lists
+    Shells before any user shell exists, and selecting it opens the full-screen
+    drawer carrying a "+ New shell" row. (On desktop the create affordance lives
+    in the tab strip's "+" menu and the rail's Shells tab only lists existing
+    shells — see AppShell.test.tsx.)
     """
     base_url, session_id = terminal_session
     page.set_viewport_size(_MOBILE_VIEWPORT)

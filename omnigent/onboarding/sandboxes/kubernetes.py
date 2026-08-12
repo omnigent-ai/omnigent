@@ -54,7 +54,7 @@ import re
 import shlex
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import click
@@ -66,10 +66,10 @@ from omnigent.host.identity import (
 )
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
-    RemoteCommandResult,
-    SandboxLauncher,
+    SandboxHostLauncher,
     render_host_config_write_command,
 )
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -135,6 +135,18 @@ _MANAGED_BY_LABEL: str = "app.kubernetes.io/managed-by"
 _MANAGED_BY_VALUE: str = "omnigent"
 _ROLE_LABEL: str = "omnigent.ai/role"
 _ROLE_VALUE: str = "sandbox-host"
+
+# Optional classifier stamped on the runner Pod naming the resolved built-in
+# agent the session runs, so an admission policy can select managed runners by
+# agent. The value is the server-resolved agent name verbatim — a join key an
+# operator writes into a policy — never a client-supplied labels spec.
+_AGENT_LABEL: str = "omnigent.ai/agent"
+
+# Kubernetes label VALUE grammar: 1–63 chars, starting and ending alphanumeric,
+# with ``-``/``_``/``.`` allowed only in the interior. The agent name is stamped
+# only when it already satisfies this; it is never rewritten to fit.
+_LABEL_VALUE_MAX_LEN: int = 63
+_LABEL_VALUE_RE = re.compile(r"[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?")
 
 # Non-root identity the Pod runs as: the ``sandbox`` user/group baked into the
 # official host image (deploy/docker/Dockerfile, uid/gid 1000660000). It MUST be
@@ -349,6 +361,21 @@ def _new_pod_name(label: str) -> str:
     return f"omnigent-{base[:40]}-{uuid.uuid4().hex[:6]}"
 
 
+def _is_valid_label_value(value: str) -> bool:
+    """
+    Report whether *value* is already a valid Kubernetes label value.
+
+    Valid means 1–63 characters, starting and ending alphanumeric, using only
+    ``[A-Za-z0-9._-]`` in between (case-sensitive). The agent classifier is
+    echoed only when this holds — it is never coerced, because two distinct
+    names must never collapse to one value (see :func:`build_pod_manifest`).
+
+    :param value: The raw string, e.g. a server-resolved agent name.
+    :returns: ``True`` when *value* may be stamped verbatim.
+    """
+    return len(value) <= _LABEL_VALUE_MAX_LEN and _LABEL_VALUE_RE.fullmatch(value) is not None
+
+
 def _token_secret_name(pod_name: str) -> str:
     """
     Name of the per-Pod launch-token Secret for *pod_name*.
@@ -435,7 +462,9 @@ def build_token_secret_manifest(
     The token rides this Secret (referenced by the Pod's ``secretKeyRef``)
     instead of the Pod spec, so it never lands in an audit-logged surface. The
     Secret is labeled like its Pod for GC and deleted alongside it by
-    :meth:`KubernetesSandboxLauncher.terminate`.
+    :meth:`KubernetesSandboxLauncher.terminate`. It carries only the
+    ``managed-by``/``role`` GC pair — the ``omnigent.ai/agent`` classifier is
+    stamped on the Pod alone, since it is an admission selector, not a GC one.
 
     :param secret_name: The Secret name (see :func:`_token_secret_name`).
     :param namespace: Namespace the Secret is created in.
@@ -475,6 +504,9 @@ def build_pod_manifest(
     repo_branch: str | None = None,
     host_config: dict[str, object] | None = None,
     resources: dict[str, object] | None = None,
+    pvc_mounts: Sequence[Mapping[str, object]] | None = None,
+    secret_mounts: Sequence[Mapping[str, object]] | None = None,
+    agent_name: str | None = None,
 ) -> dict[str, object]:
     """
     Build the sandbox Pod manifest as a plain dict.
@@ -502,6 +534,17 @@ def build_pod_manifest(
       root filesystem stays writable (the host writes ``/tmp`` + ``~/.omnigent``).
     - ``kubernetes.io/arch: amd64`` is the default; a *node_selector* entry for
       that key overrides it (e.g. ``arm64`` — the host image is multi-arch).
+    - Operator *pvc_mounts* become ``persistentVolumeClaim`` volumes mounted on
+      the **host container only** (read-only unless opted out); the init
+      container sees only HOME, so nothing external is exposed at clone time.
+    - Operator *secret_mounts* become ``secret`` volumes mounted read-only on
+      the **host container only** — a runtime lane; clone-time credentials
+      still ride ``envFrom``. A Secret projected as a volume (no ``subPath``)
+      is refreshed in place by the kubelet, so a long-lived runner picks up a
+      rotated credential without a restart — unlike ``envFrom``, read once at
+      container start. Refresh is eventually consistent (kubelet sync, up to
+      ~1 min), so the in-sandbox consumer must re-read the file each use — a
+      value cached at start defeats the rotation.
 
     :param pod_name: DNS-label-safe Pod name (see :func:`_new_pod_name`).
     :param namespace: Namespace the Pod is created in.
@@ -530,6 +573,18 @@ def build_pod_manifest(
         the sandbox against the ``envFrom`` harness Secret), so embedding the
         content in the init container's command is as safe as the clone URL.
     :param resources: Configured resources block, or ``None`` for the defaults.
+    :param pvc_mounts: Normalized PVC mounts (``{claim_name, mount_path,
+        read_only}``) added as ``persistentVolumeClaim`` volumes on the host
+        container only, or ``None``.
+    :param secret_mounts: Normalized Secret mounts (``{secret_name,
+        mount_path}``) added as read-only ``secret`` volumes on the host
+        container only, or ``None``.
+    :param agent_name: Server-resolved built-in agent name the session runs,
+        added as the ``omnigent.ai/agent`` classifier label. Stamped verbatim
+        when it is already a valid label value, otherwise omitted (extending the
+        ``None``/empty → omit fail-safe): the value selects which credential an
+        admission policy injects, so it must equal the agent name exactly rather
+        than be coerced into a collision with a different name.
     :returns: The Pod manifest dict.
     """
     pod_resources = _resolve_pod_resources(resources)
@@ -538,6 +593,49 @@ def build_pod_manifest(
         "capabilities": {"drop": ["ALL"]},
     }
     home_mount = [{"name": "home", "mountPath": _HOME_DIR}]
+    pvc_volumes: list[dict[str, object]] = []
+    pvc_volume_mounts: list[dict[str, object]] = []
+    for i, mount in enumerate(pvc_mounts or ()):
+        # Index-based names sidestep DNS-label collisions between similar claim
+        # names and with the reserved "home" volume.
+        claim_source: dict[str, object] = {"claimName": mount["claim_name"]}
+        volume_mount: dict[str, object] = {
+            "name": f"pvc-{i}",
+            "mountPath": mount["mount_path"],
+        }
+        if mount["read_only"]:
+            # readOnly on the volume source too, so even a future second mount
+            # of the same volume cannot write through it.
+            claim_source["readOnly"] = True
+            volume_mount["readOnly"] = True
+        pvc_volumes.append({"name": f"pvc-{i}", "persistentVolumeClaim": claim_source})
+        pvc_volume_mounts.append(volume_mount)
+
+    secret_volumes: list[dict[str, object]] = []
+    secret_volume_mounts: list[dict[str, object]] = []
+    for i, mount in enumerate(secret_mounts or ()):
+        # Index-based names sidestep DNS-label collisions between similar Secret
+        # names and with the reserved "home" / pvc-* volumes.
+        secret_volumes.append(
+            {
+                "name": f"secret-{i}",
+                "secret": {
+                    "secretName": mount["secret_name"],
+                    # optional=False so a missing Secret fails the mount — the
+                    # Pod never goes Running, and the runner can't boot without
+                    # the credential it was configured to hold.
+                    "optional": False,
+                    # defaultMode 0440 so the non-root runner reads it via
+                    # fsGroup and nothing else in the container can — it is a
+                    # credential, not a world-readable file.
+                    "defaultMode": 0o440,
+                },
+            }
+        )
+        # A Secret volume is read-only regardless; readOnly makes that explicit.
+        secret_volume_mounts.append(
+            {"name": f"secret-{i}", "mountPath": mount["mount_path"], "readOnly": True}
+        )
 
     init_env = [{"name": "HOME", "value": _HOME_DIR}]
     config_home = env_literals.get("OMNIGENT_CONFIG_HOME")
@@ -603,7 +701,7 @@ def build_pod_manifest(
         "env": host_env,
         "resources": pod_resources,
         "securityContext": container_security,
-        "volumeMounts": home_mount,
+        "volumeMounts": [*home_mount, *pvc_volume_mounts, *secret_volume_mounts],
     }
     if harness_secret:
         host_container["envFrom"] = [{"secretRef": {"name": harness_secret}}]
@@ -624,17 +722,33 @@ def build_pod_manifest(
             "fsGroupChangePolicy": "OnRootMismatch",
             "seccompProfile": {"type": "RuntimeDefault"},
         },
-        "volumes": [{"name": "home", "emptyDir": {}}],
+        "volumes": [{"name": "home", "emptyDir": {}}, *pvc_volumes, *secret_volumes],
         "initContainers": [init_container],
         "containers": [host_container],
     }
+    # Reserved pair first (never overridable). The classifier is echo-or-omit:
+    # never coerced, since a lossy collision would map two agents onto one
+    # credential an admission policy injects.
+    labels = {_MANAGED_BY_LABEL: _MANAGED_BY_VALUE, _ROLE_LABEL: _ROLE_VALUE}
+    if agent_name:
+        if _is_valid_label_value(agent_name):
+            labels[_AGENT_LABEL] = agent_name
+        else:
+            # Warned, not silent: the resolve upstream already logged this agent
+            # as classified, so a quiet drop would contradict it.
+            _logger.warning(
+                "agent %r is not a valid %s value; runner Pod %s stays unclassified",
+                agent_name,
+                _AGENT_LABEL,
+                pod_name,
+            )
     return {
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": {
             "name": pod_name,
             "namespace": namespace,
-            "labels": {_MANAGED_BY_LABEL: _MANAGED_BY_VALUE, _ROLE_LABEL: _ROLE_VALUE},
+            "labels": labels,
         },
         "spec": spec,
     }
@@ -784,7 +898,7 @@ def _current_wait_reason(pod: object) -> str | None:
     return None
 
 
-class KubernetesSandboxLauncher(SandboxLauncher):
+class KubernetesSandboxLauncher(SandboxHostLauncher):
     """
     :class:`SandboxLauncher` for on-demand Kubernetes Pods.
 
@@ -798,9 +912,17 @@ class KubernetesSandboxLauncher(SandboxLauncher):
     """
 
     provider: ClassVar[str] = "kubernetes"
-    # Managed-only: no CLI bootstrap, no local→sandbox port forward.
-    supports_cli_bootstrap: ClassVar[bool] = False
-    supports_local_port_forward: ClassVar[bool] = False
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(
+            cli_bootstrap=False,
+            managed_launch=True,
+            local_port_forward=False,
+            resume_stopped=False,
+            programmatic_terminate=True,
+            classifies_runner_by_agent=True,
+        )
 
     def __init__(
         self,
@@ -814,6 +936,8 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         kubeconfig: str | None = None,
         in_cluster: bool | None = None,
         resources: dict[str, object] | None = None,
+        pvc_mounts: Sequence[Mapping[str, object]] | None = None,
+        secret_mounts: Sequence[Mapping[str, object]] | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -838,6 +962,10 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             ``False`` kubeconfig only, ``None`` to try in-cluster then fall back.
         :param resources: ``sandbox.kubernetes.resources`` block, or ``None``
             for the built-in defaults.
+        :param pvc_mounts: Normalized ``sandbox.kubernetes.pvc_mounts`` entries
+            (validated at parse time), or ``None`` for none.
+        :param secret_mounts: Normalized ``sandbox.kubernetes.secret_mounts``
+            entries (validated at parse time), or ``None`` for none.
         """
         self._image_ref = image
         self._namespace = namespace
@@ -848,6 +976,8 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         self._kubeconfig = kubeconfig
         self._in_cluster = in_cluster
         self._resources = resources
+        self._pvc_mounts = list(pvc_mounts) if pvc_mounts else None
+        self._secret_mounts = list(secret_mounts) if secret_mounts else None
         self._core: k8s_client.CoreV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
 
@@ -1071,6 +1201,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         repo_branch: str | None = None,
         repo_name: str | None = None,
         host_config: dict[str, object] | None = None,
+        agent_name: str | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """
@@ -1098,6 +1229,10 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         :param host_config: Deployment-supplied ``~/.omnigent/config.yaml``
             content the init container merges in before the host starts, or
             ``None``.
+        :param agent_name: Server-resolved built-in agent name the session runs,
+            stamped as the Pod's ``omnigent.ai/agent`` classifier, or ``None`` to
+            leave the runner unclassified. Threaded only because this provider
+            declares ``classifies_runner_by_agent``.
         :param on_stage: Progress observer; invoked with ``"starting"``.
         :returns: The absolute in-sandbox workspace path (the cloned repository
             directory when *repo_url* is set).
@@ -1143,6 +1278,9 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     repo_branch=repo_branch,
                     host_config=host_config,
                     resources=self._resources,
+                    pvc_mounts=self._pvc_mounts,
+                    secret_mounts=self._secret_mounts,
+                    agent_name=agent_name,
                 )
                 # Secret before Pod so the Pod's secretKeyRef resolves
                 # immediately — a Pod referencing a missing Secret would sit in
@@ -1503,20 +1641,4 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             f"{_POD_DELETE_MAX_ATTEMPTS} attempts ({reason}); it may still exist "
             "and carries the omnigent managed-by/role labels for GC.",
             err=True,
-        )
-
-    # ── unsupported: no exec transport (the host is the Pod entrypoint) ──
-
-    def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
-        """
-        Unsupported: the host runs as the Pod's entrypoint, so there is no
-        exec-in transport.
-
-        :param sandbox_id: Unused.
-        :param command: Unused.
-        :param check: Unused.
-        :raises SandboxCapabilityError: Always.
-        """
-        raise self._capability_error(
-            "run a command via exec — the host runs as the Pod entrypoint"
         )

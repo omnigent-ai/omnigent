@@ -19,6 +19,9 @@ export interface BaseItem {
   type: string;
   response_id: string;
   status: string;
+  /** Server-side creation time (unix epoch seconds). Drives the
+   *  completed-turn "Worked for" duration for reloaded history. */
+  created_at?: number;
 }
 
 export interface MessageItem extends BaseItem {
@@ -59,6 +62,19 @@ export interface ErrorItem extends BaseItem {
   source: string;
   code: string;
   message: string;
+  /** Friendly headline for a classified failure. Present when the runner classified it. */
+  title?: string;
+  /** One/two-sentence explanation of why it failed. Paired with `title`. */
+  cause?: string;
+  /** Concrete next step to fix it, e.g. a command to run. */
+  remediation?: string;
+}
+
+export interface ReasoningItem extends BaseItem {
+  type: "reasoning";
+  model: string;
+  summary: { type: string; text: string }[];
+  content?: { type: string; text: string }[];
 }
 
 /** The provider-native tool item types the runtime persists today. */
@@ -158,6 +174,7 @@ export type ConversationItem =
   | FunctionCallItem
   | FunctionCallOutputItem
   | ErrorItem
+  | ReasoningItem
   | NativeToolItem
   | CompactionItem
   | SlashCommandItem
@@ -179,6 +196,10 @@ export function isFunctionCallOutputItem(item: ConversationItem): item is Functi
 
 export function isErrorItem(item: ConversationItem): item is ErrorItem {
   return item.type === "error";
+}
+
+export function isReasoningItem(item: ConversationItem): item is ReasoningItem {
+  return item.type === "reasoning";
 }
 
 export function isNativeToolItem(item: ConversationItem): item is NativeToolItem {

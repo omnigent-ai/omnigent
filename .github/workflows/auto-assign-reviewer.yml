@@ -83,9 +83,14 @@ jobs:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          ROUTER_MODEL: ${{ vars.OMNIGENT_CI_FAST_ANTHROPIC_MODEL }}
         run: |
           if [ -z "${LLM_API_KEY:-}" ] || [ -z "${GATEWAY_BASE_URL:-}" ]; then
             echo "::notice::No LLM credentials; reviewer ranking skipped (load-balanced fallback)."
+            exit 0
+          fi
+          if [ -z "${ROUTER_MODEL:-}" ]; then
+            echo "::warning::Repository variable OMNIGENT_CI_FAST_ANTHROPIC_MODEL is empty; reviewer ranking skipped (load-balanced fallback)."
             exit 0
           fi
           # Skip maintainer-authored PRs: the assign step (auto-assign-reviewer.js)
@@ -141,7 +146,7 @@ jobs:
           # /anthropic/messages + x-api-key path 401s / 400s on this gateway.)
           url = os.environ["GATEWAY_BASE_URL"].rstrip("/") + "/chat/completions"
           payload = json.dumps({
-              "model": "databricks-claude-sonnet-4-6",
+              "model": os.environ["ROUTER_MODEL"],
               "max_tokens": 512,
               "temperature": 0,
               "messages": [

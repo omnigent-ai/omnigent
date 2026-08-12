@@ -38,6 +38,7 @@ import contextlib
 import logging
 import re
 import secrets
+from collections.abc import Callable
 from types import TracebackType
 from typing import TYPE_CHECKING
 
@@ -75,7 +76,7 @@ _RUNNER_PATH_RE = re.compile(r"^/v1/sessions/(?P<conv>[^/?]+)/resources/terminal
 def make_tunnel_ws_factory(
     router: RunnerRouter,
     registry: TunnelRegistry,
-):
+) -> Callable[[str], _TunneledWSConn]:
     """Build a ``ws_factory`` callable that opens tunneled WS channels.
 
     Install via :func:`omnigent.runtime.set_runner_ws_factory`. The

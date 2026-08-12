@@ -1,6 +1,6 @@
 """Background-daemon lifecycle for CLI-managed integration processes.
 
-Backs ``omni integration slack [start|status|stop|logs]``. A single daemon
+Backs ``omni integration slack [--background|status|stop|logs]``. A single daemon
 per machine is tracked by a small JSON record (PID + log path + start time)
 under the runtime data dir. The daemon itself is an ordinary subprocess (e.g.
 ``python -m omnigent_slack``); this module only owns spawning it detached,
@@ -171,10 +171,7 @@ class IntegrationDaemon:
         # stdout+stderr to the log file. Mirrors the host daemon spawn.
         try:
             with child_logging_popen_kwargs(env) as logging_kwargs:
-                # spawn_kwargs()/logging_kwargs are dict[str, object] splats, so
-                # mypy can't resolve a Popen overload; the runtime kwargs are
-                # valid (matches the host-daemon spawn).
-                proc = subprocess.Popen(  # type: ignore[call-overload]
+                proc = subprocess.Popen(
                     argv,
                     env=env,
                     cwd=str(cwd) if cwd is not None else None,

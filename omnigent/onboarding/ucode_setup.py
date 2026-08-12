@@ -34,9 +34,11 @@ def model_gateway_workspace_urls() -> list[str]:
     :returns: Gateway workspace URLs, each stripped of a trailing slash.
     """
     # Lazy import: internal-beta workspace list, excluded from the OSS build.
-    from omnigent.onboarding.internal_beta import DEFAULT_PROFILES
+    import omnigent.onboarding.internal_beta as internal_beta  # type: ignore[import-not-found]
 
-    return [spec.host.rstrip("/") for spec in DEFAULT_PROFILES if spec.is_model_gateway]
+    return [
+        spec.host.rstrip("/") for spec in internal_beta.DEFAULT_PROFILES if spec.is_model_gateway
+    ]
 
 
 def build_ucode_configure_command(

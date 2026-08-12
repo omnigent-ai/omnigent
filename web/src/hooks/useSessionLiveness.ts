@@ -40,6 +40,13 @@ export type LivenessRow = Pick<Conversation, "host_id" | "permission_level" | "c
    * `host_offline` split (row 3). Absent ⇒ treated `false`.
    */
   host_resumable?: boolean;
+  /**
+   * Conversation kind. ``"sub_agent"`` sessions have no host binding and
+   * recover via their parent's runner — they must never be classified as
+   * ``local_stranded`` (which blocks the composer and shows the CLI
+   * reconnect modal). Absent ⇒ treated as ``"default"``.
+   */
+  kind?: "default" | "sub_agent";
 };
 
 /**
@@ -54,7 +61,7 @@ export type LivenessRow = Pick<Conversation, "host_id" | "permission_level" | "c
  */
 export function livenessRowFromSession(
   session:
-    | Pick<Session, "hostId" | "permissionLevel" | "createdAt" | "hostResumable">
+    | Pick<Session, "hostId" | "permissionLevel" | "createdAt" | "hostResumable" | "kind">
     | null
     | undefined,
 ): LivenessRow | null {
@@ -64,6 +71,7 @@ export function livenessRowFromSession(
     permission_level: session.permissionLevel,
     created_at: session.createdAt,
     host_resumable: session.hostResumable ?? false,
+    kind: session.kind,
   };
 }
 
@@ -182,12 +190,16 @@ function isOwner(conv: Pick<Conversation, "permission_level"> | null | undefined
  *   When the runner is down but the host is up, this upgrades the idle
  *   `runner_asleep` state to `starting` — the relaunch is happening now,
  *   so the user sees a "Connecting…" intermediate instead of a silent gap.
+ * @param opts.launchedAt Epoch ms when this client last asked a host to
+ *   launch a runner outside the send path (a host switch). Extends the
+ *   startup grace to that launch, so the move shows "Starting up…" rather
+ *   than an idle `runner_asleep` with no indicator at all.
  * @returns The single active liveness variant.
  */
 export function useSessionLiveness(
   sessionId: string | undefined,
   conv: LivenessRow | null | undefined,
-  opts?: { turnActive?: boolean },
+  opts?: { turnActive?: boolean; launchedAt?: number | null },
 ): SessionLiveness {
   const runnerOnline = useSessionRunnerOnline(sessionId);
   const hostOnline = useSessionHostOnline(sessionId);
@@ -236,6 +248,16 @@ export function useSessionLiveness(
     return { kind: "starting" };
   }
 
+  // 2'. Same grace for a runner this client just asked a host to launch
+  // outside the send path (a host switch). Deliberately NOT gated on
+  // `runnerEverOnline`: the point of a switch is that the previous runner
+  // WAS online and is now gone, so the session genuinely re-enters cold
+  // boot. Epoch ms, unlike `created_at`.
+  const launchedAt = opts?.launchedAt;
+  if (typeof launchedAt === "number" && Date.now() - launchedAt < STARTING_GRACE_S * 1000) {
+    return { kind: "starting" };
+  }
+
   // 3. A host-bound session whose host is confirmed offline. If the host is
   // a resumable managed host, the server wakes the sandbox on the next
   // message (the send-message relaunch path calls resume_managed_host). A
@@ -272,6 +294,13 @@ export function useSessionLiveness(
   // `host_online === undefined`): don't guess host-down — fall through to
   // `unknown` rather than asserting.
   if (hostId) return { kind: "unknown" };
+
+  // 7a. Sub-agent with dead runner. Sub-agents have no host binding and
+  // can't be relaunched from a CLI command — they recover via their
+  // parent's live runner (server-side heal on message send). Keep the
+  // composer open so the send reaches the server; never show the CLI
+  // reconnect modal for these.
+  if (conv?.kind === "sub_agent") return { kind: "runner_asleep" };
 
   // 7. Not host-bound. `host_online` is `null` for these (no host to be
   // online); once the runner is known-down there's no host to relaunch

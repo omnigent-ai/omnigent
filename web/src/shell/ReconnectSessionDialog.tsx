@@ -1,3 +1,5 @@
+import { useState } from "react";
+
 import {
   Dialog,
   DialogContent,
@@ -5,9 +7,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { ForkSessionForm } from "./ForkSessionDialog";
+import { SwitchHostDialog } from "./SwitchHostDialog";
 
 const CLAUDE_NATIVE_WRAPPER = "claude-code-native-ui";
 
@@ -138,6 +142,7 @@ export function ReconnectSessionDialog({
   sourceHostId?: string | null;
   sourceGitBranch?: string | null;
 }) {
+  const [switchOpen, setSwitchOpen] = useState(false);
   const isHostReconnect = state === "host_offline";
   // A non-owner can't reach the host machine to reconnect it, so the
   // CLI command is useless to them. Owners of both states, and anyone
@@ -153,61 +158,96 @@ export function ReconnectSessionDialog({
       : HOST_VIEWER_DESCRIPTION
     : RUN_DESCRIPTION;
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        data-testid="reconnect-session-dialog"
-        className="flex max-h-[85vh] flex-col gap-4 sm:max-w-lg"
-      >
-        <DialogHeader>
-          <DialogTitle>{title}</DialogTitle>
-          {/* The visible per-tab text lives inside the tab panels; this
-              keeps the dialog described for screen readers. */}
-          <DialogDescription className="sr-only">{description}</DialogDescription>
-        </DialogHeader>
-        {/* Uncontrolled tabs: DialogContent unmounts on close, so the
-            default re-applies on every open. */}
-        <Tabs
-          defaultValue={showCommand ? "reconnect" : "clone"}
-          className="flex min-h-0 flex-1 flex-col gap-4"
+    <>
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent
+          data-testid="reconnect-session-dialog"
+          className="flex max-h-[85vh] flex-col gap-4 sm:max-w-lg"
         >
-          <TabsList className="w-full">
-            <TabsTrigger value="reconnect" data-testid="reconnect-session-tab-reconnect">
-              Reconnect
-            </TabsTrigger>
-            <TabsTrigger value="clone" data-testid="reconnect-session-tab-clone">
-              Clone
-            </TabsTrigger>
-          </TabsList>
-          <TabsContent value="reconnect" className="flex flex-col gap-4">
-            <p
-              className="text-sm text-muted-foreground"
-              data-testid="reconnect-session-description"
-            >
-              {description}
-            </p>
-            {showCommand && <CliCommandBlock command={command} testIdPrefix="reconnect-session" />}
-          </TabsContent>
-          {/* forceMount keeps the fork form's state (notably the
+          <DialogHeader>
+            <DialogTitle>{title}</DialogTitle>
+            {/* The visible per-tab text lives inside the tab panels; this
+              keeps the dialog described for screen readers. */}
+            <DialogDescription className="sr-only">{description}</DialogDescription>
+          </DialogHeader>
+          {/* Uncontrolled tabs: DialogContent unmounts on close, so the
+            default re-applies on every open. */}
+          <Tabs
+            defaultValue={showCommand ? "reconnect" : "clone"}
+            className="flex min-h-0 flex-1 flex-col gap-4"
+          >
+            <TabsList className="w-full">
+              <TabsTrigger value="reconnect" data-testid="reconnect-session-tab-reconnect">
+                Reconnect
+              </TabsTrigger>
+              <TabsTrigger value="clone" data-testid="reconnect-session-tab-clone">
+                Clone
+              </TabsTrigger>
+            </TabsList>
+            <TabsContent value="reconnect" className="flex flex-col gap-4">
+              <p
+                className="text-ui text-muted-foreground"
+                data-testid="reconnect-session-description"
+              >
+                {description}
+              </p>
+              {showCommand && (
+                <CliCommandBlock command={command} testIdPrefix="reconnect-session" />
+              )}
+              {/* Waiting on a machine that may not come back is a dead end, so
+                offer the move as the way out. Owners only — binding a runner
+                elsewhere is not something a viewer can do. */}
+              {isHostReconnect && isOwner && (
+                <div className="flex flex-col gap-2 border-t pt-4">
+                  <p className="text-ui text-muted-foreground">
+                    Can't bring that machine back? Move the session to another one instead.
+                  </p>
+                  <Button
+                    variant="outline"
+                    className="self-start"
+                    data-testid="reconnect-session-switch-host"
+                    onClick={() => {
+                      setSwitchOpen(true);
+                      onOpenChange(false);
+                    }}
+                  >
+                    Switch host
+                  </Button>
+                </div>
+              )}
+            </TabsContent>
+            {/* forceMount keeps the fork form's state (notably the
               created-fork ref after a failed launch) across tab switches —
               losing it would re-fork on retry. The explicit hidden class is
               required: `flex` would otherwise override the native [hidden]
               display:none that Radix puts on the inactive panel. */}
-          <TabsContent
-            value="clone"
-            forceMount
-            className="flex min-h-0 flex-1 flex-col gap-4 data-[state=inactive]:hidden"
-          >
-            <ForkSessionForm
-              sourceSessionId={conversationId}
-              sourceTitle={sourceTitle}
-              sourceWorkspace={sourceWorkspace}
-              sourceHostId={sourceHostId}
-              sourceGitBranch={sourceGitBranch}
-              onClose={() => onOpenChange(false)}
-            />
-          </TabsContent>
-        </Tabs>
-      </DialogContent>
-    </Dialog>
+            <TabsContent
+              value="clone"
+              forceMount
+              className="flex min-h-0 flex-1 flex-col gap-4 data-[state=inactive]:hidden"
+            >
+              <ForkSessionForm
+                sourceSessionId={conversationId}
+                sourceTitle={sourceTitle}
+                sourceWorkspace={sourceWorkspace}
+                sourceHostId={sourceHostId}
+                sourceGitBranch={sourceGitBranch}
+                onClose={() => onOpenChange(false)}
+              />
+            </TabsContent>
+          </Tabs>
+        </DialogContent>
+      </Dialog>
+      {/* Sibling of the dialog above, not a child: the switch opens as the
+          reconnect dialog closes, and a child would unmount with it. */}
+      {switchOpen && (
+        <SwitchHostDialog
+          open
+          onOpenChange={setSwitchOpen}
+          sessionId={conversationId}
+          currentHostId={sourceHostId ?? null}
+        />
+      )}
+    </>
   );
 }

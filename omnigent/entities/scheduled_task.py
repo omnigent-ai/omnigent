@@ -6,6 +6,14 @@ session on a recurring schedule (``rrule``). A
 :class:`ScheduledTaskRun` records one firing of a task (its run history). This
 module holds the plain dataclasses the store converts ORM rows into; the store
 owns the JSON (de)serialization of the Text-backed columns.
+
+Naming: the user-facing product name for this feature is "Automations"
+(web UI display copy only). The domain model, DB tables
+(``scheduled_tasks`` / ``scheduled_task_runs``), stores, REST paths
+(``/v1/scheduled-tasks``), agent tools (``sys_scheduled_task_*``), and
+these types deliberately keep the name "scheduled task". Keep code,
+comments, and schema on "scheduled task"; only presentation strings say
+"Automations".
 """
 
 from __future__ import annotations
@@ -27,7 +35,7 @@ class ScheduledTask:
     :param rrule: The required RFC 5545 recurrence rule for the recurring
         trigger, e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``. Evaluated in
         ``timezone``.
-    :param owner_user_id: User the spawned session's ``LEVEL_OWNER`` grant is
+    :param user_id: User the spawned session's ``LEVEL_OWNER`` grant is
         written for, e.g. ``"alice@example.com"``. ``None`` in single-user mode.
     :param agent_id: The agent bound to this task, e.g. ``"ag_..."``.
     :param timezone: IANA timezone the trigger is evaluated in,
@@ -59,7 +67,7 @@ class ScheduledTask:
     name: str
     prompt: str
     rrule: str
-    owner_user_id: str | None
+    user_id: str | None
     agent_id: str
     timezone: str
     created_at: int

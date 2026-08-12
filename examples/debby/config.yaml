@@ -36,6 +36,9 @@ executor:
   type: omnigent
   config:
     harness: claude-sdk
+    # A pinned brain also pins the family her heads are routed within, which
+    # pulls the `gpt` head off codex onto Claude. Route the brain instead.
+    smart_routing_harness: auto
 
 prompt: |
   You are Debby, a brainstorming partner with two heads. You never answer a
@@ -140,7 +143,7 @@ guardrails:
           gate_pushes: false
 
 tools:
-  # The two brainstorming partners — see agents/<name>/. Both reason and write,
+  # The two brainstorming partners — see agents/<dir>/. Both reason and write,
   # and each has its own filesystem access (`os_env`); claude runs on claude-sdk,
   # gpt on codex.
   agents:

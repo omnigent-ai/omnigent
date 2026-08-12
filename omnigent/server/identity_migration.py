@@ -23,7 +23,7 @@ User-id-bearing columns rewritten (the full set as of this schema):
 - ``account_tokens.user_id`` and ``account_tokens.created_by``
 - ``comments.created_by``
 - ``policies.created_by``
-- ``hosts.owner`` (PK part)
+- ``hosts.user_id`` (unique-constraint part)
 
 Ordering within a mapping is load-bearing: the new ``users`` row is
 created first (so FK-bearing children can point at it), children are
@@ -35,8 +35,10 @@ grants we still need).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import cast
 
 from sqlalchemy import Engine, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import (
@@ -48,6 +50,7 @@ from omnigent.db.db_models import (
     SqlUser,
     current_workspace_id,
 )
+from omnigent.db.query_context import query_name_scope
 from omnigent.server.auth import _RESERVED_USERS
 
 
@@ -100,7 +103,10 @@ def build_domain_mapping(engine: Engine, domain: str) -> dict[str, str]:
     """
     domain = domain.lstrip("@").strip().lower()
     mapping: dict[str, str] = {}
-    with Session(engine) as session:
+    with (
+        query_name_scope("omnigent.identity_migration.build_domain_mapping"),
+        Session(engine) as session,
+    ):
         ids = (
             session.execute(
                 select(SqlUser.id).where(SqlUser.workspace_id == current_workspace_id())
@@ -149,7 +155,10 @@ def remap_identities(
     """
     report = RemapReport(mapping=dict(mapping))
 
-    with Session(engine) as session:
+    with (
+        query_name_scope("omnigent.identity_migration.remap_identities"),
+        Session(engine) as session,
+    ):
         for old_id, new_id in mapping.items():
             if old_id == new_id:
                 continue
@@ -211,35 +220,41 @@ def remap_identities(
                 (SqlComment, SqlComment.created_by),
                 (SqlPolicy, SqlPolicy.created_by),
             ):
-                result = session.execute(
-                    update(model)
-                    .where(model.workspace_id == current_workspace_id(), column == old_id)
-                    .values(created_by=new_id)
+                result = cast(
+                    CursorResult[tuple[object]],
+                    session.execute(
+                        update(model)
+                        .where(model.workspace_id == current_workspace_id(), column == old_id)
+                        .values(created_by=new_id)
+                    ),
                 )
                 report._bump(model.__tablename__, result.rowcount or 0)
 
             # account_tokens has two id columns to repoint.
             for column_name in ("user_id", "created_by"):
                 column = getattr(SqlAccountToken, column_name)
-                result = session.execute(
-                    update(SqlAccountToken)
-                    .where(
-                        SqlAccountToken.workspace_id == current_workspace_id(),
-                        column == old_id,
-                    )
-                    .values(**{column_name: new_id})
+                result = cast(
+                    CursorResult[tuple[object]],
+                    session.execute(
+                        update(SqlAccountToken)
+                        .where(
+                            SqlAccountToken.workspace_id == current_workspace_id(),
+                            column == old_id,
+                        )
+                        .values(**{column_name: new_id})
+                    ),
                 )
                 report._bump(SqlAccountToken.__tablename__, result.rowcount or 0)
 
-            # ── hosts.owner is a PK part (owner, name); a collision with
-            # an existing (new, name) host would violate the PK, so guard
-            # per-row. Rare in OSS (hosts are a Databricks-connect
-            # feature), but correctness over assumption.
+            # ── hosts.user_id is a unique-constraint part (user_id, name); a
+            # collision with an existing (new, name) host would violate the
+            # constraint, so guard per-row. Rare in OSS (hosts are a
+            # Databricks-connect feature), but correctness over assumption.
             old_hosts = (
                 session.execute(
                     select(SqlHost).where(
                         SqlHost.workspace_id == current_workspace_id(),
-                        SqlHost.owner == old_id,
+                        SqlHost.user_id == old_id,
                     )
                 )
                 .scalars()
@@ -247,19 +262,19 @@ def remap_identities(
             )
             for host in old_hosts:
                 # Check if the new owner already has a host with the same name
-                # (collision on the uq_hosts_workspace_owner_name unique constraint).
+                # (collision on the uq_hosts_workspace_user_id_name unique constraint).
                 # PK is now (workspace_id, host_id) so we SELECT by the unique key.
                 clash = session.execute(
                     select(SqlHost).where(
                         SqlHost.workspace_id == current_workspace_id(),
-                        SqlHost.owner == new_id,
+                        SqlHost.user_id == new_id,
                         SqlHost.name == host.name,
                     )
                 ).scalar_one_or_none()
                 if clash is not None:
                     session.delete(host)  # new owner already has this host name
                 else:
-                    host.owner = new_id
+                    host.user_id = new_id
                 report._bump("hosts")
             session.flush()
 

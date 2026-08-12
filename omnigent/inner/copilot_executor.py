@@ -63,7 +63,7 @@ import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, Protocol, TypeAlias
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import COPILOT_EFFORTS, validate_effort
@@ -97,6 +97,15 @@ ToolExecutor: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[Any]]  # typ
 # honors (``copilot login --help``): a fine-grained PAT with the "Copilot
 # Requests" permission, or an OAuth token from the gh / Copilot CLI app.
 GITHUB_TOKEN_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+
+# The Copilot CLI's GHE hostname override (``copilot help environment``). Spelled
+# here rather than imported from ``omnigent.onboarding.copilot_auth``: onboarding
+# pulls in the secret store / keyring, which this path imports lazily. A test
+# pins the two spellings equal.
+COPILOT_HOST_ENV_VAR = "COPILOT_GH_HOST"
+
+# The user's ambient host, captured before we ever write the var ourselves.
+_AMBIENT_HOST = os.environ.get(COPILOT_HOST_ENV_VAR) or None
 
 # Upper bound (seconds) on one ``send_and_wait``. The SDK default is 60s, far
 # too short for an agentic turn (sub-agent dispatches, long tool calls), so we
@@ -233,7 +242,7 @@ def _build_copilot_prompt(messages: list[Message], *, is_first_turn: bool) -> st
 # ---------------------------------------------------------------------------
 
 
-def _encode_tool_result(result: Any) -> Any:  # type: ignore[explicit-any]
+def _encode_tool_result(result: object) -> object:
     """Encode a bridged-tool result as a :class:`copilot.ToolResult`.
 
     A dict carrying a truthy ``error`` or ``blocked`` is a dispatch failure or a
@@ -261,12 +270,25 @@ def _encode_tool_result(result: Any) -> Any:  # type: ignore[explicit-any]
 # ---------------------------------------------------------------------------
 
 
+class _CopilotSession(Protocol):
+    """SDK session methods used by the executor."""
+
+    def on(self, callback: Callable[[object], None]) -> Callable[[], None]:
+        pass
+
+    async def send_and_wait(self, prompt: str, *, timeout: float) -> object:
+        pass
+
+    async def abort(self) -> object:
+        pass
+
+
 @dataclass
 class _CopilotSessionState:
     """Per-Omnigent-conversation SDK session state."""
 
-    client: Any = None  # copilot.CopilotClient
-    session: Any = None  # copilot.CopilotSession
+    client: object | None = None
+    session: _CopilotSession | None = None
     system_prompt: str | None = None
     model: str | None = None
     reasoning_effort: str | None = None
@@ -287,6 +309,7 @@ class CopilotExecutor(Executor):
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
         github_token: str | None = None,
+        github_host: str | None = None,
         bundle_dir: Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
@@ -301,7 +324,10 @@ class CopilotExecutor(Executor):
             gateway-routed id or ``None`` falls back to Copilot's auto-select.
         :param github_token: GitHub token carrying Copilot access. ``None``
             falls back to ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` /
-            ``GITHUB_TOKEN`` in the environment.
+            ``GITHUB_TOKEN`` in the environment, then the ``gh`` CLI login.
+        :param github_host: GitHub Enterprise hostname (e.g. ``"acme.ghe.com"``)
+            to authenticate against. ``None`` falls back to the configured
+            ``copilot.github_host``, then Copilot's default ``github.com``.
         :param bundle_dir: Reserved for future skill wiring; unused in v1.
         :param agent_name: Optional agent name (reserved for parity).
         :param skills_filter: Accepted for parity; copilot has no skill
@@ -310,7 +336,9 @@ class CopilotExecutor(Executor):
         self._cwd = cwd or (os_env.cwd if os_env is not None else None)
         self._os_env_spec = os_env
         self._model_override = model
-        self._github_token = github_token or _ambient_github_token()
+        # Resolved before the token: a GHE user's token must come from that host.
+        self._github_host = github_host or _configured_github_host()
+        self._github_token = github_token or _ambient_github_token(self._github_host)
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
@@ -321,11 +349,13 @@ class CopilotExecutor(Executor):
         # Installed by the runtime adapter; evaluates PHASE_LLM_REQUEST /
         # PHASE_LLM_RESPONSE policies (the same round-trip pi / claude-sdk /
         # cursor use). ``None`` on single-process / pre-turn paths (no-op).
-        self._policy_evaluator: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None
+        self._policy_evaluator: Callable[[str, dict[str, object]], Awaitable[object]] | None = None
         # Installed by the runtime adapter; surfaces native-tool calls to the
         # user via the web-UI elicitation approval card. ``None`` when no
         # handler is wired (single-process / test paths → default approve).
-        self._elicitation_handler: Callable[[str, dict[str, Any]], Awaitable[bool]] | None = None
+        self._elicitation_handler: Callable[[str, dict[str, object]], Awaitable[bool]] | None = (
+            None
+        )
 
     def supports_streaming(self) -> bool:
         return True
@@ -423,7 +453,11 @@ class CopilotExecutor(Executor):
 
     # -- session lifecycle --------------------------------------------------
 
-    async def _on_permission_request(self, request: Any, _invocation: dict[str, str]) -> Any:  # type: ignore[explicit-any]
+    async def _on_permission_request(
+        self,
+        request: object,
+        _invocation: dict[str, str],
+    ) -> object:
         """Gate a Copilot NATIVE-tool permission request through policy + elicitation.
 
         Installed as ``create_session(on_permission_request=...)``. The SDK awaits
@@ -500,6 +534,16 @@ class CopilotExecutor(Executor):
         # must be absolute"), and a spec / os_env can hand us a relative cwd
         # (e.g. ``.``), so always resolve to an absolute path.
         cwd = os.path.abspath(self._cwd or os.getcwd())
+        # A GHE hostname reaches the bundled CLI only as an env var; the SDK has
+        # no host parameter. Set it in our own environment rather than passing
+        # ``env=`` — the SDK inherits ``os.environ`` only when ``env`` is None,
+        # so handing it a dict would strip everything else from the subprocess.
+        # Assign both ways so a hostless executor can't inherit a host another
+        # one left behind.
+        if self._github_host:
+            os.environ[COPILOT_HOST_ENV_VAR] = self._github_host
+        else:
+            os.environ.pop(COPILOT_HOST_ENV_VAR, None)
         client = CopilotClient(
             github_token=self._github_token,
             working_directory=cwd,
@@ -599,6 +643,7 @@ class CopilotExecutor(Executor):
 
         state.has_sent_prompt = True
         session = state.session
+        assert session is not None
 
         # Stream the session's events into a queue from the SDK's ``on`` callback
         # (invoked in the SDK loop), then drain-and-translate them here while the
@@ -826,13 +871,38 @@ class CopilotExecutor(Executor):
 # ---------------------------------------------------------------------------
 
 
-def _ambient_github_token() -> str | None:
-    """Return the first set ambient GitHub token, in CLI precedence order."""
+def _ambient_github_token(host: str | None = None) -> str | None:
+    """Return an ambient GitHub token: env vars first, then the ``gh`` CLI login.
+
+    The env vars come first because the Copilot CLI honors them in this same
+    precedence. The ``gh`` fallback covers the common "I ran ``gh auth login``"
+    case: Copilot only picks a ``gh`` login up by reading ``oauth_token`` from
+    ``~/.config/gh/hosts.yml``, which is absent whenever ``gh`` stores the token
+    in an OS keychain instead (the default on macOS).
+
+    :param host: GHE hostname whose ``gh`` token to fetch; ``None`` resolves the
+        configured host, so a GHE user's token comes from their own instance.
+    """
     for var in GITHUB_TOKEN_ENV_VARS:
         value = os.environ.get(var)
         if value:
             return value
-    return None
+    from omnigent.onboarding.copilot_auth import gh_cli_github_token
+
+    return gh_cli_github_token(host if host is not None else _configured_github_host())
+
+
+def _configured_github_host() -> str | None:
+    """Return the configured GHE hostname: env var first, then the config block.
+
+    Reads the *ambient* env var captured at import, not the live one — the
+    executor writes ``COPILOT_HOST_ENV_VAR`` to hand the host to the bundled CLI,
+    and reading that back would let one executor's host leak into a later
+    hostless one.
+    """
+    from omnigent.onboarding.copilot_auth import copilot_github_host
+
+    return _AMBIENT_HOST or copilot_github_host()
 
 
 def _coerce_args(raw: Any) -> dict[str, Any]:  # type: ignore[explicit-any]

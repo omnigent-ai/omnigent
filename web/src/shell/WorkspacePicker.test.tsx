@@ -573,3 +573,68 @@ describe("WorkspacePicker new folder", () => {
     expect(mutateAsync).toHaveBeenCalledWith({ hostId: "host_1", path: "~/fresh" });
   });
 });
+
+describe("WorkspacePicker back-to-workspace", () => {
+  it("is absent when no workspace is supplied", () => {
+    // The new-session / fork / project dialogs are *choosing* a workspace, so
+    // there is nothing to go back to and Home (~) is the only anchor. This is
+    // why the button is its own control rather than a repurposed Home.
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("app", "/Users/corey/projects/app")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+
+    render(<WorkspacePicker hostId="host_1" />);
+
+    expect(screen.queryByTestId("workspace-picker-workspace")).toBeNull();
+    expect(screen.getByTestId("workspace-picker-home")).toBeInTheDocument();
+  });
+
+  it("returns to the workspace in one click after wandering off", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("Music", "/Users/corey/Music")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+    const onNavigate = vi.fn();
+
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey"
+        workspacePath="/Users/corey/repo"
+        onNavigate={onNavigate}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("workspace-picker-workspace"));
+
+    expect(onNavigate).toHaveBeenCalledWith("/Users/corey/repo");
+  });
+
+  it("is disabled once the workspace is already showing", () => {
+    // Same treatment as Up at the filesystem root: kept in place but inert,
+    // so the header does not reflow as the user navigates.
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("src", "/Users/corey/repo/src")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey/repo"
+        workspacePath="/Users/corey/repo"
+      />,
+    );
+
+    expect(screen.getByTestId("workspace-picker-workspace")).toBeDisabled();
+  });
+});

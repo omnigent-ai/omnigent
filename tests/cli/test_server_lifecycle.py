@@ -1,4 +1,5 @@
-"""Tests for the server-lifecycle CLI: ``server start/stop/status`` and top-level ``stop``."""
+"""Tests for the server-lifecycle CLI: ``server`` (``--background``,
+``stop``, ``status``) and top-level ``stop``."""
 
 from __future__ import annotations
 
@@ -150,11 +151,78 @@ def test_server_status_session_count_failure_is_graceful(monkeypatch: pytest.Mon
     assert "live sessions:" not in result.output  # count omitted on fetch failure
 
 
-# ── server start ───────────────────────────────────────────────────
+# ── server --background ────────────────────────────────────────────
 
 
-def test_server_start_spawns(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``server start`` reports the URL and exact log file of a spawned server."""
+def test_server_background_spawns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``server --background`` reports the URL and exact log file of a spawned server."""
+    monkeypatch.setattr(
+        "omnigent.cli.ensure_local_omnigent_server",
+        lambda: LocalServerStartup(
+            url="http://127.0.0.1:8123",
+            spawned=True,
+            log_path=Path.home() / ".omnigent" / "logs" / "server" / "server-ab12.log",
+        ),
+    )
+
+    result = CliRunner().invoke(cli, ["server", "--background"])
+
+    assert result.exit_code == 0, result.output
+    assert "Started background server at http://127.0.0.1:8123" in result.output
+    # The exact captured-log file is surfaced so the detached server isn't a
+    # black box — collapsed to ``~`` for readability.
+    assert "log: ~/.omnigent/logs/server/server-ab12.log" in result.output
+
+
+def test_server_background_reuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``server --background`` reports reuse and the reused server's log file."""
+    monkeypatch.setattr(
+        "omnigent.cli.ensure_local_omnigent_server",
+        lambda: LocalServerStartup(
+            url="http://127.0.0.1:8123",
+            spawned=False,
+            log_path=Path.home() / ".omnigent" / "logs" / "server" / "server-cd34.log",
+        ),
+    )
+
+    result = CliRunner().invoke(cli, ["server", "--background"])
+
+    assert result.exit_code == 0, result.output
+    assert "already running at http://127.0.0.1:8123" in result.output
+    # Even a reused server (one this invocation didn't spawn) names its log,
+    # read back from the sidecar.
+    assert "log: ~/.omnigent/logs/server/server-cd34.log" in result.output
+
+
+def test_server_background_omits_log_when_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No log line when the running server has no captured-log file.
+
+    A foreground ``omnigent server`` streams logs to its terminal, so a
+    reuse of it carries ``log_path=None`` and ``server --background`` must not
+    print a bogus or empty ``log:`` line.
+    """
+    monkeypatch.setattr(
+        "omnigent.cli.ensure_local_omnigent_server",
+        lambda: LocalServerStartup(url="http://127.0.0.1:8123", spawned=False, log_path=None),
+    )
+
+    result = CliRunner().invoke(cli, ["server", "--background"])
+
+    assert result.exit_code == 0, result.output
+    assert "log:" not in result.output
+
+
+def test_server_start_alias_still_starts_background_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deprecated ``server start`` alias behaves like ``--background``.
+
+    Desktop clients built before v0.7.0 shell out to ``omni server start`` and
+    parse the URL off stdout. Removing the subcommand broke every such client
+    against a newer CLI (#3578) — the app updates on its own channel, so the
+    version skew is a normal steady state. Guards that the alias exists and
+    that its stdout contract is byte-identical to the flag's.
+    """
     monkeypatch.setattr(
         "omnigent.cli.ensure_local_omnigent_server",
         lambda: LocalServerStartup(
@@ -167,38 +235,16 @@ def test_server_start_spawns(monkeypatch: pytest.MonkeyPatch) -> None:
     result = CliRunner().invoke(cli, ["server", "start"])
 
     assert result.exit_code == 0, result.output
-    assert "Started background server at http://127.0.0.1:8123" in result.output
-    # The exact captured-log file is surfaced so the detached server isn't a
-    # black box — collapsed to ``~`` for readability.
-    assert "log: ~/.omnigent/logs/server/server-ab12.log" in result.output
+    assert "Started background server at http://127.0.0.1:8123" in result.stdout
+    assert "log: ~/.omnigent/logs/server/server-ab12.log" in result.stdout
 
 
-def test_server_start_reuses(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``server start`` reports reuse and the reused server's log file."""
-    monkeypatch.setattr(
-        "omnigent.cli.ensure_local_omnigent_server",
-        lambda: LocalServerStartup(
-            url="http://127.0.0.1:8123",
-            spawned=False,
-            log_path=Path.home() / ".omnigent" / "logs" / "server" / "server-cd34.log",
-        ),
-    )
+def test_server_start_alias_warns_on_stderr_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The deprecation notice goes to stderr, never into the parsed stdout.
 
-    result = CliRunner().invoke(cli, ["server", "start"])
-
-    assert result.exit_code == 0, result.output
-    assert "already running at http://127.0.0.1:8123" in result.output
-    # Even a reused server (one this invocation didn't spawn) names its log,
-    # read back from the sidecar.
-    assert "log: ~/.omnigent/logs/server/server-cd34.log" in result.output
-
-
-def test_server_start_omits_log_when_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No log line when the running server has no captured-log file.
-
-    A foreground ``omnigent server`` streams logs to its terminal, so a
-    reuse of it carries ``log_path=None`` and ``server start`` must not print
-    a bogus or empty ``log:`` line.
+    The desktop reads stdout to find the server URL, so a notice printed there
+    would be a second breakage dressed as a fix. Interactive users still see
+    the migration hint.
     """
     monkeypatch.setattr(
         "omnigent.cli.ensure_local_omnigent_server",
@@ -208,7 +254,22 @@ def test_server_start_omits_log_when_unknown(monkeypatch: pytest.MonkeyPatch) ->
     result = CliRunner().invoke(cli, ["server", "start"])
 
     assert result.exit_code == 0, result.output
-    assert "log:" not in result.output
+    assert "deprecated" in result.stderr
+    assert "server --background" in result.stderr
+    assert "deprecated" not in result.stdout
+
+
+def test_server_start_alias_is_hidden_from_help() -> None:
+    """``server --help`` documents only the flag, not the compat alias.
+
+    The alias exists for old binaries, not for new users — surfacing it in
+    help would re-establish the spelling #3105 set out to remove.
+    """
+    result = CliRunner().invoke(cli, ["server", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--background" in result.output
+    assert "\n  start" not in result.output
 
 
 # ── server stop ────────────────────────────────────────────────────

@@ -44,7 +44,7 @@ the unit tests.
 
 ```bash
 cd /path/to/omnigent
-.venv/bin/omni server --port 7788 --no-open    # foreground; or `omni server start` for detached
+.venv/bin/omni server --port 7788 --no-open    # foreground; or `omni server --background` for detached
 curl -s http://127.0.0.1:7788/health           # {"status":"ok"}
 ```
 

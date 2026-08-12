@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
@@ -517,6 +518,16 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         the literal string ``"inherit"`` on inline-AgentTool
         sub-specs. Empty dict for other executor types.
 
+        Native-harness autonomy pass-through: for server-spawned
+        sub-agents the session-create path reads ``"yolo"`` (bool or a
+        ``"true"``/``"false"`` string matched case-insensitively, with
+        no whitespace tolerance on the enabling value; enables
+        codex/cursor/kimi bypass flags, opt-out for codex/cursor and
+        opt-in for kimi) and ``"permission_mode"`` (exact-match string;
+        ``bypassPermissions`` maps to the claude-native /
+        antigravity-native skip flags) into the session's
+        ``terminal_launch_args``.
+
         🚨 **TECH DEBT — REMOVE WHEN OMNIGENT COMPAT ENDS.**
         This field exists *solely* to carry harness / profile /
         os_env data for the Omnigent integration (see
@@ -773,19 +784,25 @@ class SandboxConfig:
     :param docker_image: Deprecated alias for ``container_image``.
         If both are set, ``container_image`` takes precedence.
     :param container_runtime: The container CLI to use, either
-        ``"docker"`` (default) or ``"podman"``.
+        ``"docker"`` (default) or ``"podman"``.  Can also be set
+        via the ``OMNIGENT_CONTAINER_RUNTIME`` environment variable;
+        the constructor argument takes precedence.
     """
+
+    _ENV_VAR = "OMNIGENT_CONTAINER_RUNTIME"
+    ALLOWED_RUNTIMES = frozenset({"docker", "podman"})
+    _DEFAULT_RUNTIME: ClassVar[str] = "docker"
 
     container_image: str | None = None
     docker_image: str | None = None
-    container_runtime: Literal["docker", "podman"] = "docker"
-
-    _ALLOWED_RUNTIMES = frozenset({"docker", "podman"})
+    container_runtime: Literal["docker", "podman"] | None = None
 
     def __post_init__(self) -> None:
-        if self.container_runtime not in self._ALLOWED_RUNTIMES:
+        if self.container_runtime is None:
+            self.container_runtime = os.environ.get(self._ENV_VAR, self._DEFAULT_RUNTIME)  # type: ignore[assignment]
+        if self.container_runtime not in self.ALLOWED_RUNTIMES:
             raise ValueError(
-                f"container_runtime must be one of {sorted(self._ALLOWED_RUNTIMES)}, "
+                f"container_runtime must be one of {sorted(self.ALLOWED_RUNTIMES)}, "
                 f"got {self.container_runtime!r}"
             )
         # Resolve the deprecated docker_image alias: if only
@@ -803,8 +820,10 @@ class ToolsConfig:
     Declared tool references from config.yaml.
 
     :param agents: Names of sub-agents this agent can delegate to,
-        e.g. ``["summarizer", "code-reviewer"]``. Each name must
-        match a directory under ``agents/``.
+        e.g. ``["summarizer", "code-reviewer"]``. Each name must be
+        the declared ``name`` of a sub-agent under ``agents/``; the
+        directory it was parsed from may differ (see
+        :attr:`AgentSpec.source_rel_dir`).
     :param builtins: Built-in tools to enable, e.g.
         ``[BuiltinToolConfig(name="web_search")]``. Each
         entry carries the tool name and optional config fields
@@ -831,10 +850,14 @@ class ToolsConfig:
 @dataclass
 class SkillSpec:
     """
-    A parsed skill from ``skills/<name>/SKILL.md``.
+    A parsed skill from ``skills/<dir>/SKILL.md``.
+
+    The directory name is provenance only — it is recorded in
+    :attr:`skill_dir` and need not equal :attr:`name`.
 
     :param name: Lowercase kebab-case skill identifier, e.g.
-        ``"code-review"``. Must match ``[a-z0-9-]+``.
+        ``"code-review"``. Must match ``[a-z0-9-]+``. Taken from the
+        frontmatter, not from the directory name.
     :param description: Human-readable summary of what the skill
         does (max 1024 characters).
     :param content: The body of the SKILL.md file after the YAML
@@ -1400,13 +1423,13 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``{"max_retries": 3, "style": "concise"}``.
     :param instructions: Agent system prompt, typically from
         ``AGENTS.md``. ``None`` if no instructions file is present.
-    :param skills: Parsed skills from ``skills/<name>/SKILL.md``.
+    :param skills: Parsed skills from ``skills/<dir>/SKILL.md``.
     :param mcp_servers: MCP server declarations from
         ``tools/mcp/<name>.yaml``.
     :param local_tools: Discovered local tool files from
         ``tools/python/`` and ``tools/typescript/``.
     :param sub_agents: Recursively parsed child agents from
-        ``agents/<name>/``.
+        ``agents/<dir>/``.
     :param executor: Executor configuration (type, task timeout,
         max iterations). ``executor.type`` is the
         discriminator for the entire spec's validity.
@@ -1543,3 +1566,4 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     timers: bool = False
     spawn: bool = False
     agent_session_sharing: SharePolicy = SharePolicy.NONE
+    source_rel_dir: str | None = field(default=None, compare=False)

@@ -10,10 +10,8 @@ import {
   getConversationIconKind,
   getConversationAgentType,
   migratePinnedConversationIds,
-  normalizePinnedConversationIds,
-  orderByPinnedSequence,
+  orderByPinnedTimestamp,
   resolveSidebarDrop,
-  togglePinnedConversationId,
 } from "./sidebarNav";
 
 function conversation(
@@ -103,24 +101,6 @@ describe("computeNextActiveOverride", () => {
   });
 });
 
-describe("pin helpers", () => {
-  it("toggles pinned ids without duplicating them", () => {
-    expect(togglePinnedConversationId(["conv_a"], "conv_b")).toEqual(["conv_b", "conv_a"]);
-    expect(togglePinnedConversationId(["conv_b", "conv_a"], "conv_b")).toEqual(["conv_a"]);
-  });
-
-  it("drops stale and duplicate pinned ids", () => {
-    const conversations = [
-      conversation("conv_a", "A", new Date(2026, 4, 14, 9)),
-      conversation("conv_b", "B", new Date(2026, 4, 14, 8)),
-    ];
-
-    expect(
-      normalizePinnedConversationIds(["conv_a", "missing", "conv_a", "conv_b"], conversations),
-    ).toEqual(["conv_a", "conv_b"]);
-  });
-});
-
 describe("bareConversationId", () => {
   const hex = "0123456789abcdef0123456789abcdef";
 
@@ -170,43 +150,45 @@ describe("dedupeConversationsById", () => {
   });
 });
 
-describe("orderByPinnedSequence", () => {
-  it("puts the newest pin last, ignoring updated_at", () => {
-    // conv_a leads the ids list (the most recent pin) AND has the newest
-    // updated_at, yet it must render LAST: pinned order is oldest-pin-first
-    // (newest pin at the bottom) and never follows updated_at.
-    const convA = conversation("conv_a", "A", new Date(2026, 4, 14, 9), {
-      updatedAt: new Date(2026, 4, 14, 23),
-    });
-    const convB = conversation("conv_b", "B", new Date(2026, 4, 14, 8), {
-      updatedAt: new Date(2026, 4, 14, 9),
+describe("orderByPinnedTimestamp", () => {
+  const pinned = (id: string, pinnedAt: number | undefined, updatedAt: Date) =>
+    conversation(id, id, new Date(2026, 4, 14, 8), {
+      updatedAt,
+      labels: pinnedAt === undefined ? {} : { "omnigent.pinned": String(pinnedAt) },
     });
 
-    // ids are most-recently-pinned-first: conv_a pinned last, conv_b earlier.
-    expect(orderByPinnedSequence([convA, convB], ["conv_a", "conv_b"]).map((c) => c.id)).toEqual([
-      "conv_b",
-      "conv_a",
-    ]);
+  it("orders oldest pin first, ignoring updated_at", () => {
+    // conv_a pinned LATER (larger value) but is the most recently active; it
+    // must still render below conv_b, which was pinned earlier.
+    const convA = pinned("conv_a", 2000, new Date(2026, 4, 14, 23));
+    const convB = pinned("conv_b", 1000, new Date(2026, 4, 14, 9));
+    expect(orderByPinnedTimestamp([convA, convB]).map((c) => c.id)).toEqual(["conv_b", "conv_a"]);
   });
 
   it("holds a pinned row's slot when its updated_at is bumped", () => {
-    const convA = conversation("conv_a", "A", new Date(2026, 4, 14, 9));
-    const convB = conversation("conv_b", "B", new Date(2026, 4, 14, 8));
-    const ids = ["conv_a", "conv_b"];
-
-    const before = orderByPinnedSequence([convA, convB], ids).map((c) => c.id);
+    const convA = pinned("conv_a", 1000, new Date(2026, 4, 14, 9));
+    const convB = pinned("conv_b", 2000, new Date(2026, 4, 14, 8));
+    const before = orderByPinnedTimestamp([convA, convB]).map((c) => c.id);
     // conv_b gets a new message (latest updated_at) — its slot must not move.
     const bumped = { ...convB, updated_at: Math.floor(new Date(2026, 4, 14, 23).getTime() / 1000) };
-    const after = orderByPinnedSequence([convA, bumped], ids).map((c) => c.id);
-    expect(after).toEqual(before);
+    expect(orderByPinnedTimestamp([convA, bumped]).map((c) => c.id)).toEqual(before);
+  });
+
+  it("sinks a missing/unparseable pin value to the bottom, stably", () => {
+    const withTime = pinned("conv_a", 1000, new Date(2026, 4, 14, 9));
+    const noLabel = pinned("conv_b", undefined, new Date(2026, 4, 14, 8));
+    expect(orderByPinnedTimestamp([noLabel, withTime]).map((c) => c.id)).toEqual([
+      "conv_a",
+      "conv_b",
+    ]);
   });
 
   it("does not mutate the input array", () => {
-    const convA = conversation("conv_a", "A", new Date(2026, 4, 14, 9));
-    const convB = conversation("conv_b", "B", new Date(2026, 4, 14, 8));
-    const input = [convB, convA];
-    orderByPinnedSequence(input, ["conv_a", "conv_b"]);
-    expect(input.map((c) => c.id)).toEqual(["conv_b", "conv_a"]);
+    const convA = pinned("conv_a", 2000, new Date(2026, 4, 14, 9));
+    const convB = pinned("conv_b", 1000, new Date(2026, 4, 14, 8));
+    const input = [convA, convB];
+    orderByPinnedTimestamp(input);
+    expect(input.map((c) => c.id)).toEqual(["conv_a", "conv_b"]);
   });
 });
 

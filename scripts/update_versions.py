@@ -1,15 +1,18 @@
 """
 Bump the omnigent project version across all packages in lockstep.
 
-The three distributions in this repo release together at a single
+The four distributions in this repo release together at a single
 version:
 
 - ``omnigent``         — root ``pyproject.toml``
 - ``omnigent-client``  — ``sdks/python-client/pyproject.toml``
 - ``omnigent-ui-sdk``  — ``sdks/ui/pyproject.toml``
+- ``omnigent-slack``   — ``integrations/slack/pyproject.toml``
 
-Each declares its own ``[project].version`` and ``==``-pins its
-siblings — the lockstep contract that
+Each declares its own ``[project].version``. The first three ``==``-pin
+their siblings in ``[project].dependencies``; the root ``omnigent``
+package also ``==``-pins ``omnigent-slack`` in the ``slack`` optional
+dependency extra — the lockstep contract that
 ``.github/workflows/release-omnigent.yml`` verifies at tag time. This
 script rewrites every one of those locations at once so they never
 drift.
@@ -20,10 +23,14 @@ so unrelated version literals (host/runner wire-protocol versions,
 docstring examples, third-party dependency floors like
 ``databricks-mcp>=0.9.0``) are left untouched.
 
-``web/package.json`` (a ``0.0.0`` sentinel for the private SPA) and
-``web/electron/package.json`` (the desktop app's independent
-version) are intentionally OUT of scope: neither is part of the
-release-validated Python lockstep.
+The desktop app (``web/electron/package.json``) co-versions with the
+lockstep too, stamped with the *semver translation* of the version —
+npm and electron-builder reject PEP 440 spellings (``0.6.0rc1`` ->
+``0.6.0-rc.1``, ``0.7.0.dev0`` -> ``0.7.0-dev.0``; finals unchanged).
+
+``web/package.json`` (a ``0.0.0`` sentinel for the private SPA) is
+intentionally OUT of scope: it is not part of the release-validated
+lockstep.
 
 After editing the ``pyproject.toml`` files, regenerate the lockfile so
 the embedded sibling specifiers track the new version::
@@ -48,6 +55,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -83,13 +91,13 @@ def packages(root: Path) -> list[Package]:
     Return the lockstep packages with their paths rooted at *root*.
 
     :param root: Repo root, e.g. ``Path("/repo")``.
-    :returns: The three :class:`Package` entries.
+    :returns: The four :class:`Package` entries.
     """
     return [
         Package(
             "omnigent",
             root / "pyproject.toml",
-            ("omnigent-client", "omnigent-ui-sdk"),
+            ("omnigent-client", "omnigent-ui-sdk", "omnigent-slack"),
         ),
         Package(
             "omnigent-client",
@@ -101,6 +109,17 @@ def packages(root: Path) -> list[Package]:
             root / "sdks" / "ui" / "pyproject.toml",
             ("omnigent-client",),
         ),
+        # omnigent-slack is deliberately decoupled from omnigent core (it
+        # drives the server over HTTP, never imports ``omnigent``), so it
+        # pins no siblings. The root ``omnigent`` package ``==``-pins it in
+        # the ``slack`` optional-dependency extra; the pin lives in
+        # [project.optional-dependencies] rather than [project.dependencies],
+        # so check() scans both sections for it.
+        Package(
+            "omnigent-slack",
+            root / "integrations" / "slack" / "pyproject.toml",
+            (),
+        ),
     ]
 
 
@@ -110,6 +129,41 @@ _VERSION_LINE = re.compile(r'^version = "[^"]*"$', re.MULTILINE)
 # ``VERSION = "..."`` on its own line — the runtime constant in
 # ``omnigent/version.py`` that mirrors the canonical [project].version.
 _VERSION_CONSTANT = re.compile(r'^VERSION = "[^"]*"$', re.MULTILINE)
+
+# ``"version": "..."`` in ``web/electron/package.json`` (the desktop app).
+_ELECTRON_VERSION_LINE = re.compile(r'^(?P<indent>\s*)"version": "[^"]*",$', re.MULTILINE)
+
+
+def _electron_package_json(root: Path) -> Path:
+    """Return the path to the desktop app's ``package.json``."""
+    return root / "web" / "electron" / "package.json"
+
+
+def semver_of(version: str) -> str:
+    """
+    Translate a PEP 440 lockstep version to its semver equivalent.
+
+    npm and electron-builder reject PEP 440 pre-release spellings, so the
+    desktop app is stamped with the translation: ``0.6.0rc1`` ->
+    ``0.6.0-rc.1``, ``0.7.0.dev0`` -> ``0.7.0-dev.0``, finals unchanged.
+    Semver orders the results the way PEP 440 does (dev < rc < final), so
+    the desktop auto-updater's comparisons stay correct. Post-releases
+    would NOT order correctly (semver sorts every prerelease below the
+    final); the release pipeline never mints them.
+
+    :param version: PEP 440 version, e.g. ``"0.7.0.dev0"``.
+    :returns: The semver string, e.g. ``"0.7.0-dev.0"``.
+    """
+    v = Version(version)
+    out = ".".join(str(n) for n in v.release)
+    ids: list[str] = []
+    if v.pre is not None:
+        ids += [v.pre[0], str(v.pre[1])]
+    if v.post is not None:
+        ids += ["post", str(v.post)]
+    if v.dev is not None:
+        ids += ["dev", str(v.dev)]
+    return out + (f"-{'.'.join(ids)}" if ids else "")
 
 
 def _version_py(root: Path) -> Path:
@@ -207,6 +261,16 @@ def set_version(root: Path, new_version: str) -> list[Path]:
     version_py.write_text(version_text)
     changed.append(version_py)
 
+    electron = _electron_package_json(root)
+    electron_text = _sub_exactly_once(
+        _ELECTRON_VERSION_LINE,
+        rf'\g<indent>"version": "{semver_of(new_version)}",',
+        electron.read_text(),
+        f"version field in {electron}",
+    )
+    electron.write_text(electron_text)
+    changed.append(electron)
+
     return changed
 
 
@@ -264,7 +328,13 @@ def check(root: Path, expect: str | None = None) -> str:
     for pkg in packages(root):
         project = tomllib.loads(pkg.pyproject.read_text())["project"]
         versions[pkg.name] = project["version"]
-        deps = project.get("dependencies", [])
+        # Sibling == pins may live in [project.dependencies] (the three
+        # SDK packages) or in [project.optional-dependencies] extras (the
+        # root ``omnigent`` package pins ``omnigent-slack`` in the ``slack``
+        # extra). Collect both so the check covers every pin location.
+        deps = list(project.get("dependencies", []))
+        for extra_deps in project.get("optional-dependencies", {}).values():
+            deps.extend(extra_deps)
         for sibling in pkg.sibling_pins:
             pin = f"{sibling}=={project['version']}"
             if pin not in deps:
@@ -277,6 +347,13 @@ def check(root: Path, expect: str | None = None) -> str:
     if Version(constant) != Version(resolved):
         raise ValueError(
             f"omnigent/version.py VERSION {constant!r} != [project].version {resolved!r}"
+        )
+    electron = _electron_package_json(root)
+    desktop = json.loads(electron.read_text())["version"]
+    if desktop != semver_of(resolved):
+        raise ValueError(
+            f"{electron}: desktop version {desktop!r} != {semver_of(resolved)!r} "
+            f"(the semver translation of {resolved!r})"
         )
     if expect is not None and Version(resolved) != Version(expect):
         raise ValueError(f"resolved version {resolved} != expected {expect}")

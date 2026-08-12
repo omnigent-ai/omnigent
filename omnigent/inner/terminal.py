@@ -1000,6 +1000,11 @@ class TerminalInstance:
     # not read as agent activity. ``-inf`` until the first interaction.
     _last_client_interaction_at: float = field(default=float("-inf"), repr=False)
     _last_pane_snapshot: str | None = field(default=None, repr=False)
+    # Exit status of the pane's inner process, captured from tmux
+    # ``#{pane_dead_status}`` the first time a dead pane is observed (only
+    # meaningful with ``keep_alive_after_exit`` / ``remain-on-exit``). ``None``
+    # until the process exits or when tmux reports no numeric status.
+    _last_exit_status: int | None = field(default=None, repr=False)
 
     @property
     def tmux_target(self) -> str:
@@ -1043,6 +1048,32 @@ class TerminalInstance:
     def _remember_pane_snapshot(self, snapshot: str) -> None:
         """Store a pane capture for later exit diagnostics."""
         self._last_pane_snapshot = snapshot
+
+    def last_exit_status(self) -> int | None:
+        """Return the inner process's exit code, if the pane has died.
+
+        Captured from tmux ``#{pane_dead_status}`` when a dead pane is first
+        observed (see :meth:`_pane_is_dead` / :meth:`_pane_is_dead_async`).
+        Only meaningful for terminals launched with ``keep_alive_after_exit``
+        (``remain-on-exit``); ``None`` otherwise or before exit.
+        """
+        return self._last_exit_status
+
+    def _remember_exit_status(self, fields: str) -> None:
+        """Record the exit code from a ``#{pane_dead} #{pane_dead_status}`` row.
+
+        A managed terminal is single-pane by construction (:attr:`tmux_target`
+        is always ``"main"``), so ``list-panes`` returns exactly one row and its
+        two fields describe that pane: ``pane_dead`` (``1`` once the inner
+        process exits) and ``pane_dead_status`` (the wait-status, empty while
+        alive). Reading only the first two whitespace tokens is therefore
+        unambiguous. Parsed best-effort — a missing or non-numeric status just
+        leaves the code unset.
+        """
+        parts = fields.split()
+        if len(parts) >= 2 and parts[0] == "1":
+            with contextlib.suppress(ValueError):
+                self._last_exit_status = int(parts[1])
 
     def _tmux_base_cmd(self) -> list[str]:
         """
@@ -1506,6 +1537,7 @@ class TerminalInstance:
         *,
         on_activity: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
+        on_tick: Callable[[], None] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
@@ -1544,6 +1576,12 @@ class TerminalInstance:
         :param on_exit: Optional sync callback invoked when the watcher
             observes that tmux has disappeared. Same non-blocking contract
             as *on_idle*.
+        :param on_tick: Optional sync callback invoked once per poll tick
+            (after the exit check, before the pane diff), regardless of
+            whether the pane changed. Lets a caller drive an out-of-band
+            status source — e.g. the claude-native watcher reading Claude's
+            ``sessions/<pid>.json`` — on the same cadence without a second
+            thread. Same non-blocking contract as *on_idle*.
         :param idle_threshold_s: Per-watcher diff-track idle threshold in
             seconds passed to :class:`_IdleDetector`, e.g. ``1.0`` for the
             claude-native status watcher. ``None`` uses the module
@@ -1559,11 +1597,11 @@ class TerminalInstance:
         """
         if not self.running:
             raise RuntimeError("Cannot start idle watcher before launch")
-        if on_idle is None and on_activity is None and on_exit is None:
+        if on_idle is None and on_activity is None and on_exit is None and on_tick is None:
             raise ValueError(
                 "start_idle_watcher_thread requires at least one of "
-                "on_idle / on_activity / on_exit — a watcher with none would poll "
-                "tmux forever with no effect."
+                "on_idle / on_activity / on_exit / on_tick — a watcher with none "
+                "would poll tmux forever with no effect."
             )
         if self._idle_thread is not None and self._idle_thread.is_alive():
             if not replace:
@@ -1578,6 +1616,7 @@ class TerminalInstance:
                 "on_idle": on_idle,
                 "on_activity": on_activity,
                 "on_exit": on_exit,
+                "on_tick": on_tick,
                 "idle_threshold_s": idle_threshold_s,
                 "poll_interval_s": poll_interval_s,
             },
@@ -1593,6 +1632,7 @@ class TerminalInstance:
         on_idle: Callable[[], None] | None = None,
         on_activity: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
+        on_tick: Callable[[], None] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
     ) -> None:
@@ -1615,6 +1655,9 @@ class TerminalInstance:
             tick the pane content changed. Skipped when ``None``.
         :param on_exit: Optional callback fired when tmux disappears.
             Skipped when ``None``.
+        :param on_tick: Optional per-tick callback fired every poll after
+            the exit check (see :meth:`start_idle_watcher_thread`); skipped
+            when ``None``.
         :param idle_threshold_s: Per-watcher diff-track idle threshold in
             seconds forwarded to :class:`_IdleDetector`, e.g. ``1.0``.
             ``None`` uses the module default.
@@ -1653,6 +1696,12 @@ class TerminalInstance:
                 self.running = False
                 if on_exit is not None:
                     self._fire_watch_callback(on_exit, "exit")
+                return
+            # Per-tick out-of-band status hook (e.g. claude-native reading
+            # Claude's sessions/<pid>.json). Fired after the exit checks so
+            # it never runs for a dead pane, and before the pane diff so an
+            # authoritative file status can preempt the PTY-derived edge.
+            if on_tick is not None and not self._fire_watch_callback(on_tick, "tick"):
                 return
             # A pane change that lands within the recent-interaction window
             # is a client-driven repaint (attach/detach reflow, focus,
@@ -1710,11 +1759,36 @@ class TerminalInstance:
         """
         try:
             out = self._tmux_output_sync(
-                "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead}"
+                "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead} #{pane_dead_status}"
             )
         except RuntimeError:
             return False
-        return "1" in out.split()
+        self._remember_exit_status(out)
+        return out.split()[:1] == ["1"]
+
+    def pane_pid_sync(self) -> int | None:
+        """Return the pid of the pane's foreground process, or ``None``.
+
+        This is the pid tmux ``exec``'d into the pane — for a native agent
+        terminal that's the agent CLI itself (e.g. ``claude``). Used by the
+        claude-native status watcher to key Claude's ``sessions/<pid>.json``
+        metadata file. Synchronous sibling of the other ``*_sync`` probes so
+        the threaded watcher can call it without an event loop.
+
+        :returns: The pane pid, or ``None`` when tmux fails or reports no
+            usable value (server gone, pane dead).
+        """
+        try:
+            out = self._tmux_output_sync("list-panes", "-t", self.tmux_target, "-F", "#{pane_pid}")
+        except RuntimeError:
+            return None
+        first = out.split()
+        if not first:
+            return None
+        try:
+            return int(first[0])
+        except ValueError:
+            return None
 
     def _fire_watch_callback(self, callback: Callable[[], None], kind: str) -> bool:
         """
@@ -1820,11 +1894,12 @@ class TerminalInstance:
         """
         try:
             out = await self._tmux_output(
-                "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead}"
+                "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead} #{pane_dead_status}"
             )
         except RuntimeError:
             return False
-        return "1" in out.split()
+        self._remember_exit_status(out)
+        return out.split()[:1] == ["1"]
 
     async def _tmux(self, *args: str) -> None:
         """Run a tmux command against this instance's server."""

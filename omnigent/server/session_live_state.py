@@ -47,6 +47,7 @@ from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 
 if TYPE_CHECKING:
     from omnigent.stores import ConversationStore
+    from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
 
@@ -58,6 +59,10 @@ _logger = logging.getLogger(__name__)
 _KNOWN_LIVE_STATUSES: frozenset[str] = frozenset(SESSION_LIVE_STATUS)
 
 _store: ConversationStore | None = None
+# Scheduled-task store for the event-driven run-completion hook. Wired
+# alongside ``_store`` by :func:`configure`; ``None`` disables the hook (the
+# runner process and unit tests that never configure it are unaffected).
+_scheduled_task_store: ScheduledTaskStore | None = None
 # Single worker => writes apply in submission order (see module docstring).
 _executor: ThreadPoolExecutor | None = None
 # Last status seen per session, for dedupe — the value whose write was
@@ -69,15 +74,22 @@ _last_status: dict[str, str] = {}
 _last_pending: dict[str, int] = {}
 
 
-def configure(store: ConversationStore | None) -> None:
+def configure(
+    store: ConversationStore | None,
+    scheduled_task_store: ScheduledTaskStore | None = None,
+) -> None:
     """
-    Wire (or clear) the conversation store live-state writes go to.
+    Wire (or clear) the stores live-state writes go to.
 
     :param store: The server's conversation store, or ``None`` to
         disable persistence (tests / non-server processes).
+    :param scheduled_task_store: The server's scheduled-task store, enabling
+        the event-driven run-completion hook
+        (:func:`persist_scheduled_run_completion`); ``None`` disables it.
     """
-    global _store
+    global _store, _scheduled_task_store
     _store = store
+    _scheduled_task_store = scheduled_task_store
     _last_status.clear()
     _last_pending.clear()
 
@@ -162,6 +174,67 @@ def persist_live_status(session_id: str, status: str) -> None:
             _last_status.pop(session_id, None)
 
     _submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
+
+
+def persist_scheduled_run_completion(
+    conversation_id: str,
+    run_status: str,
+    *,
+    error_code: str | None = None,
+    error: str | None = None,
+) -> None:
+    """Transition a scheduled-task run to terminal when its turn ends.
+
+    The event-driven completion mechanism: called from ``_publish_status``
+    wherever a session reaches a durable terminal edge (``idle`` = the turn
+    completed, ``failed`` = it errored/disconnected). Most conversations are
+    not scheduled-task fires, so the reverse lookup returns ``None`` and this
+    is a cheap no-op; only a fired conversation with a still-``running`` run
+    gets transitioned.
+
+    Runs on the SAME ordered single-worker executor as
+    :func:`persist_live_status`, inside a copy of the caller's ``contextvars``
+    (see :func:`_submit`). This is load-bearing: the store filters every query
+    on ``current_workspace_id()``, and the reverse lookup + ``update_run`` must
+    resolve to the fired run's workspace — the relay call site's
+    ``workspace_scope`` reaches the worker thread exactly as it does for the
+    ``live_status`` mirror. A bare executor would run at workspace 0 and match
+    no rows on a multi-tenant replica.
+
+    Idempotent by construction: ``update_run`` is conditional on
+    ``WHERE status = running``, so a run already terminal (a fire-time
+    ``skipped``/``failed``, or the startup/lazy backstop) is never clobbered
+    and a terminal edge seen twice transitions at most once. Best-effort like
+    the other writes here — a failure logs and is dropped; the backstop
+    (startup sweep / lazy-on-read) is the durability guarantee for the rare
+    dropped-write or restart-in-flight case.
+
+    :param conversation_id: The fired conversation whose turn just ended.
+    :param run_status: Terminal run status to set — ``"succeeded"`` (turn
+        completed) or ``"failed"`` (turn errored/cancelled/disconnected).
+    :param error_code: Short failure classification when ``run_status`` is
+        ``"failed"`` (e.g. the conversation's ``last_task_error_code``).
+    :param error: Optional human-readable failure detail for ``"failed"``.
+    """
+    store = _scheduled_task_store
+    if store is None:
+        return
+
+    def _transition() -> None:
+        run = store.get_running_run_by_conversation(conversation_id)
+        if run is None:
+            # Not a scheduled fire, or its run is already terminal — nothing to
+            # do. This is the common case (interactive sessions).
+            return
+        store.update_run(
+            run.id,
+            status=run_status,
+            finished_at=int(time.time()),
+            error=error,
+            error_code=error_code,
+        )
+
+    _submit("scheduled_run_completion", _transition)
 
 
 def persist_pending_count(conversation_id: str, count: int) -> None:

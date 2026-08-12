@@ -52,7 +52,7 @@ function emptyMCPEntry(key: number): MCPFormEntry {
   };
 }
 
-/** Parse "KEY=VAL" lines into a Record. */
+/** Parse "KEY=VAL" or "KEY: VAL" lines into a Record. */
 function parseKVLines(text: string): Record<string, string> | undefined {
   const lines = text
     .split("\n")
@@ -61,9 +61,15 @@ function parseKVLines(text: string): Record<string, string> | undefined {
   if (lines.length === 0) return undefined;
   const result: Record<string, string> = {};
   for (const line of lines) {
+    // Support both KEY=VALUE (env-var style) and KEY: VALUE (HTTP header style).
     const eq = line.indexOf("=");
-    if (eq > 0) {
-      result[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+    const colon = line.indexOf(":");
+    let sep = -1;
+    if (eq > 0 && colon > 0) sep = Math.min(eq, colon);
+    else if (eq > 0) sep = eq;
+    else if (colon > 0) sep = colon;
+    if (sep > 0) {
+      result[line.slice(0, sep).trim()] = line.slice(sep + 1).trim();
     }
   }
   return Object.keys(result).length > 0 ? result : undefined;
@@ -193,7 +199,7 @@ export function CreateAgentDialog({
           <div className="flex flex-col gap-1.5">
             <label
               htmlFor="create-agent-name"
-              className="text-xs font-medium text-muted-foreground"
+              className="text-sm font-medium text-muted-foreground"
             >
               Name <span className="text-destructive">*</span>
             </label>
@@ -211,7 +217,7 @@ export function CreateAgentDialog({
           <div className="flex flex-col gap-1.5">
             <label
               htmlFor="create-agent-description"
-              className="text-xs font-medium text-muted-foreground"
+              className="text-sm font-medium text-muted-foreground"
             >
               Description
             </label>
@@ -226,7 +232,7 @@ export function CreateAgentDialog({
 
           {/* Harness */}
           <div className="flex flex-col gap-1.5">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label className="text-sm font-medium text-muted-foreground">
               Harness <span className="text-destructive">*</span>
             </label>
             <Select value={harness} onValueChange={setHarness}>
@@ -247,7 +253,7 @@ export function CreateAgentDialog({
           <div className="flex flex-col gap-1.5">
             <label
               htmlFor="create-agent-model"
-              className="text-xs font-medium text-muted-foreground"
+              className="text-sm font-medium text-muted-foreground"
             >
               Model <span className="text-destructive">*</span>
             </label>
@@ -264,7 +270,7 @@ export function CreateAgentDialog({
           <div className="flex flex-col gap-1.5">
             <label
               htmlFor="create-agent-instructions"
-              className="text-xs font-medium text-muted-foreground"
+              className="text-sm font-medium text-muted-foreground"
             >
               System instructions
             </label>
@@ -281,14 +287,14 @@ export function CreateAgentDialog({
           {/* MCP Servers */}
           <div className="flex flex-col gap-2">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-muted-foreground">MCP Tools</span>
+              <span className="text-sm font-medium text-muted-foreground">MCP Tools</span>
               <Button
                 type="button"
                 variant="ghost"
                 size="sm"
                 onClick={addMCPServer}
                 data-testid="create-agent-add-mcp"
-                className="h-6 gap-1 px-2 text-xs text-muted-foreground"
+                className="h-6 gap-1 px-2 text-sm text-muted-foreground"
               >
                 <PlusIcon className="size-3" />
                 Add server
@@ -384,7 +390,7 @@ function MCPServerRow({
             value={entry.env}
             onChange={(e) => onChange({ env: e.target.value })}
             placeholder={"Environment variables (KEY=VALUE per line)\ne.g. GITHUB_TOKEN=ghp_..."}
-            className="min-h-[60px] font-mono text-xs"
+            className="min-h-[60px] font-mono text-sm"
           />
         </>
       ) : (
@@ -399,8 +405,8 @@ function MCPServerRow({
             data-testid="create-agent-mcp-headers"
             value={entry.headers}
             onChange={(e) => onChange({ headers: e.target.value })}
-            placeholder={"HTTP headers (KEY=VALUE per line)\ne.g. Authorization=Bearer tok_..."}
-            className="min-h-[60px] font-mono text-xs"
+            placeholder={"HTTP headers (one per line)\ne.g. Authorization: Bearer tok_..."}
+            className="min-h-[60px] font-mono text-sm"
           />
         </>
       )}

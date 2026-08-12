@@ -67,15 +67,18 @@ adds native niceties:
   OS-level mic gate is open too (packaged builds ship
   `NSMicrophoneUsageDescription`).
 
-  > **Caveat — Web Speech may still not transcribe in Electron.** Granting the
+  > **Caveat — Web Speech does not transcribe in Electron.** Granting the
   > mic clears the _permission_ gate, but `SpeechRecognition` also depends on
   > Google's cloud speech backend keyed to official Google Chrome builds, which
-  > Electron's bundled Chromium does **not** ship. So recognition can still
-  > fail (typically a `network` error) even with the mic allowed. The web app
-  > degrades gracefully (the button shows "Dictation unavailable" rather than
-  > crashing). Fully reliable in-app dictation would require a MediaRecorder
-  > capture + a server-side transcription endpoint (e.g. Whisper) wired to the
-  > composer's existing `onAudioRecorded` fallback — not yet implemented.
+  > Electron's bundled Chromium does **not** ship. Electron therefore uses the
+  > **server-side dictation fallback** instead: when the connected server has
+  > the `dictation` extra and models installed (`GET /v1/info` reports
+  > `dictation_available`), a take that fails with Web Speech's `network`
+  > error falls back to streaming audio to `WS /v1/dictation/stream` and
+  > transcribing on the server — no cloud, no Chrome dependency. See
+  > `designs/server-dictation.md`. Without the server extra, the button still
+  > renders (the constructor exists) but shows "Dictation unavailable" when
+  > clicked, as before.
 
 ## How it works (zero UI duplication)
 
@@ -343,7 +346,7 @@ app open?" error rather than hanging.
 
 ## Prerequisites
 
-- **Node** 22.x + npm (already used by `web`).
+- **Node** 22.x + pnpm (already used by `web`).
 - Electron ships its own Chromium/Node, so no system webview libs are needed
   on Linux for _running_ the built app, though packaging tools may pull a few
   build deps.
@@ -353,8 +356,8 @@ app open?" error rather than hanging.
 From the `web/electron/` directory:
 
 ```bash
-npm install     # installs electron + electron-builder
-npm start        # launches the Electron shell
+pnpm install     # installs electron + electron-builder
+pnpm start        # launches the Electron shell
 ```
 
 The shell opens on the bundled setup page. Point it at a running Omnigent
@@ -362,18 +365,18 @@ server (see below), Connect, and you're in.
 
 > Note: this loads the UI from whatever server URL you give it — it does
 > **not** run the Vite dev server. To develop the web UI itself with hot
-> reload, run `npm run dev` (plain Vite in a browser) from `web/` as usual.
+> reload, run `pnpm run dev` (plain Vite in a browser) from `web/` as usual.
 
 ## Build a distributable
 
 From `web/electron/`:
 
 ```bash
-npm run build             # current platform
-npm run build:mac         # .dmg + .zip (signed if an identity is available, not notarized)
-npm run build:mac:release # .dmg + .zip, signed + notarized (requires credentials, see below)
-npm run build:linux       # AppImage + .deb
-npm run build:win         # NSIS installer
+pnpm run build             # current platform
+pnpm run build:mac         # .dmg + .zip (signed if an identity is available, not notarized)
+pnpm run build:mac:release # .dmg + .zip, signed + notarized (requires credentials, see below)
+pnpm run build:linux       # AppImage + .deb
+pnpm run build:win         # NSIS installer
 ```
 
 Output lands in `electron/dist/` (the DMG is named
@@ -401,7 +404,7 @@ Create it at <https://developer.apple.com/account/resources/certificates>
 (or via Xcode → Settings → Accounts → Manage Certificates), then either:
 
 - **Keychain (local builds):** install the cert + private key into your
-  login keychain. electron-builder auto-discovers it — `npm run build:mac`
+  login keychain. electron-builder auto-discovers it — `pnpm run build:mac`
   just works. Verify with
   `security find-identity -v -p codesigning` (you should see
   `Developer ID Application: <Your Name> (<TEAMID>)`).
@@ -414,7 +417,7 @@ Create it at <https://developer.apple.com/account/resources/certificates>
   ```
 
 To force an **unsigned** build even when a cert is present (faster dev
-iteration): `CSC_IDENTITY_AUTO_DISCOVERY=false npm run build:mac`.
+iteration): `CSC_IDENTITY_AUTO_DISCOVERY=false pnpm run build:mac`.
 
 ### 2. Notarize (release builds)
 
@@ -440,7 +443,7 @@ export APPLE_TEAM_ID=<TEAMID>
 then:
 
 ```bash
-npm run build:mac:release
+pnpm run build:mac:release
 ```
 
 This is the same build with `mac.notarize=true` switched on; expect the
@@ -517,7 +520,7 @@ to a **remote** server never needs the CLI — only "Start locally" and hosting 
 
 ### Start locally
 
-**"Start a server on this machine"** runs `omnigent server start` (idempotent —
+**"Start a server on this machine"** runs `omnigent server --background` (idempotent —
 reuses a healthy one) and then connects this window to its
 `http://127.0.0.1:<port>` URL through the normal connect flow. It does not
 connect this machine as a runner — that stays an explicit step in the app.

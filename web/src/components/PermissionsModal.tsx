@@ -172,8 +172,8 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
         {publicSharingEnabled && (
           <div className="flex items-center justify-between rounded-lg border px-3 py-2">
             <div>
-              <p className="text-sm font-medium">Public access</p>
-              <p className="text-xs text-muted-foreground">Anyone can view this session</p>
+              <p className="text-ui font-medium">Public access</p>
+              <p className="text-sm text-muted-foreground">Anyone can view this session</p>
             </div>
             <Switch
               checked={isPublic}
@@ -188,17 +188,17 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
             track's min-content and pushes every row past the dialog edge. */}
         <div className="min-w-0" data-testid="share-grants">
           {isLoading ? (
-            <p className="text-sm text-muted-foreground py-2">Loading…</p>
+            <p className="text-ui text-muted-foreground py-2">Loading…</p>
           ) : userGrants.length === 0 ? (
-            <p className="text-sm text-muted-foreground py-2">No grants yet.</p>
+            <p className="text-ui text-muted-foreground py-2">No grants yet.</p>
           ) : (
             <>
               {/* Column headers */}
               <div className="flex items-center gap-2 px-2 pb-0.5">
-                <span className="flex-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                <span className="flex-1 text-sm font-medium uppercase tracking-wide text-muted-foreground">
                   Name
                 </span>
-                <span className="w-28 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                <span className="w-28 text-sm font-medium uppercase tracking-wide text-muted-foreground">
                   Permission
                 </span>
                 <span className="size-7 shrink-0" aria-hidden="true" />
@@ -222,13 +222,13 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
         {/* Add grant form */}
         <form onSubmit={handleGrant} className="flex items-end gap-2">
           <div className="flex-1">
-            <label htmlFor="perm-user" className="text-xs font-medium text-muted-foreground">
+            <label htmlFor="perm-user" className="text-sm font-medium text-muted-foreground">
               User ID
             </label>
             <AddUserField value={newUserId} onChange={setNewUserId} />
           </div>
           <div>
-            <label htmlFor="perm-level" className="text-xs font-medium text-muted-foreground">
+            <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
               Level
             </label>
             <Select value={newLevel} onValueChange={setNewLevel}>
@@ -242,13 +242,13 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
               </SelectContent>
             </Select>
           </div>
-          <Button type="submit" size="sm" disabled={!newUserId.trim() || grant.isPending}>
+          <Button type="submit" size="sm" loading={grant.isPending} disabled={!newUserId.trim()}>
             <UserPlusIcon className="mr-1 size-3.5" />
             Grant
           </Button>
         </form>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <p className="text-sm text-destructive">{error}</p>}
 
         <DialogFooter className="flex-row justify-between sm:justify-between">
           <div className="flex items-center gap-2">
@@ -405,11 +405,11 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
       />
       {isOpen && (
         // Wider than the (narrow) field so suggested emails aren't truncated.
-        <div className="absolute left-0 top-full z-50 mt-1 w-96 rounded-lg border bg-popover p-1 text-popover-foreground shadow-md">
+        <div className="absolute left-0 top-full z-50 mt-1 w-96 rounded-[12px] border border-border bg-popover p-2 text-popover-foreground shadow-menu">
           {isLoading ? (
-            <div className="py-6 text-center text-sm text-muted-foreground">Searching…</div>
+            <div className="py-6 text-center text-ui text-muted-foreground">Searching…</div>
           ) : suggestions.length === 0 ? (
-            <div className="py-6 text-center text-sm text-muted-foreground">No matches</div>
+            <div className="py-6 text-center text-ui text-muted-foreground">No matches</div>
           ) : (
             <div ref={listRef} id={listId} role="listbox" className="max-h-72 overflow-y-auto">
               {suggestions.map((s, index) => (
@@ -424,8 +424,8 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
                     commit(index);
                   }}
                   className={cn(
-                    "flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm",
-                    index === activeIndex && "bg-muted",
+                    "flex cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-ui",
+                    index === activeIndex && "bg-muted dark:bg-muted/50",
                   )}
                 >
                   {/* Primary label fills the row and truncates. When the host
@@ -434,7 +434,7 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
                       distinct display name to pair it with. */}
                   <span className="min-w-0 flex-1 truncate">{s.displayName ?? s.userId}</span>
                   {s.displayName && s.displayName !== s.userId && (
-                    <span className="ml-2 shrink-0 truncate text-xs text-muted-foreground">
+                    <span className="ml-2 shrink-0 truncate text-sm text-muted-foreground">
                       {s.userId}
                     </span>
                   )}
@@ -589,11 +589,11 @@ function GrantRow({
       {/* Tail truncation keeps the local part — the distinguishing half when
           every grantee shares one company domain — and the title tooltip
           carries the full id. */}
-      <span className="flex-1 truncate text-sm" title={permission.user_id}>
+      <span className="flex-1 truncate text-ui" title={permission.user_id}>
         {permission.user_id}
       </span>
       {fixedLevel ? (
-        <span className="flex h-8 w-28 items-center px-3 text-sm text-muted-foreground">
+        <span className="flex h-8 w-28 items-center px-3 text-ui text-muted-foreground">
           {LEVEL_LABELS[permission.level] ?? "Read"}
         </span>
       ) : (

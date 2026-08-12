@@ -14,11 +14,11 @@ from pathlib import Path
 from omnigent.kimi_native_forwarder import (
     _discover_wire,
     _ForwardState,
-    _read_new_items,
     _read_state,
     _row_to_item,
     _write_state,
     clear_kimi_bridge_state,
+    read_kimi_wire_items,
 )
 
 
@@ -77,6 +77,35 @@ class TestRowToItem:
         ):
             assert _row_to_item(0, row) is None
 
+    def test_step_end_with_end_turn_is_turn_end(self) -> None:
+        """``end_turn`` is the edge that reports terminal status to the parent."""
+        row = {
+            "type": "context.append_loop_event",
+            "event": {
+                "type": "step.end",
+                "turnId": "0",
+                "step": 3,
+                "finishReason": "end_turn",
+            },
+        }
+        item = _row_to_item(28, row)
+        assert item is not None
+        assert item.kind == "turn_end"
+        assert item.response_id == "kimi:turn_end:28"
+
+    def test_step_end_with_tool_use_is_skipped(self) -> None:
+        """A step that stopped to call a tool is mid-turn, not a completion."""
+        row = {
+            "type": "context.append_loop_event",
+            "event": {
+                "type": "step.end",
+                "turnId": "0",
+                "step": 1,
+                "finishReason": "tool_use",
+            },
+        }
+        assert _row_to_item(12, row) is None
+
     def test_non_user_turn_prompt_skipped(self) -> None:
         row = {
             "type": "turn.prompt",
@@ -113,18 +142,18 @@ class TestReadNewItems:
         return p
 
     def test_parses_user_and_assistant_only(self, tmp_path: Path) -> None:
-        items = _read_new_items(self._wire(tmp_path), 0)
+        items = read_kimi_wire_items(self._wire(tmp_path), 0)
         assert [(i.role, i.text) for i in items] == [("user", "hi"), ("assistant", "hello!")]
 
     def test_offset_skips_already_seen(self, tmp_path: Path) -> None:
         wire = self._wire(tmp_path)
         # last_line past the user prompt (line 1) → only the assistant text (line 3).
-        items = _read_new_items(wire, 2)
+        items = read_kimi_wire_items(wire, 2)
         assert [(i.role, i.text) for i in items] == [("assistant", "hello!")]
         assert items[0].line_no == 3
 
     def test_missing_file_is_empty(self, tmp_path: Path) -> None:
-        assert _read_new_items(tmp_path / "nope.jsonl", 0) == []
+        assert read_kimi_wire_items(tmp_path / "nope.jsonl", 0) == []
 
 
 class TestState:

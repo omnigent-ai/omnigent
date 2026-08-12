@@ -104,8 +104,14 @@ _POLICY_EVAL_TIMEOUT_S = 86400.0
 # ``run_turn`` becomes ``response.failed`` (vs heartbeating forever).
 # Every non-heartbeat ``ctx.emit`` resets the deadline (see
 # ``_guarded_run_turn``), so a long-but-active turn is never killed.
+# The window must clear the longest single progress-free ``await`` a
+# healthy turn can make — notably context compaction, whose summarizing
+# LLM call runs as one long ``await`` emitting no non-heartbeat events
+# (see ``runtime/compaction.py``). On a near-full context that call can
+# exceed the old 240s cap, tripping the watchdog and wedging the session
+# in a "Prompt is too long" → compaction → 240s-timeout loop.
 # Env var name kept for the ops knob; ``<= 0`` disables.
-_TURN_IDLE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_TIMEOUT_S", "240"))
+_TURN_IDLE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_TIMEOUT_S", "600"))
 
 # Absolute per-turn ceiling: a hard cap on TOTAL turn duration, backstop
 # to the idle watchdog above. The idle watchdog never trips a turn that
@@ -1248,6 +1254,13 @@ class HarnessApp:
                     code=ErrorCode.CONFLICT,
                 )
 
+            model = request.model
+            if model is None:
+                raise OmnigentError(
+                    "model is required when starting a new turn",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+
             response_id = f"resp_{uuid.uuid4().hex[:24]}"
             event_queue: asyncio.Queue[HarnessStreamEvent | None] = asyncio.Queue()
             cancelled = asyncio.Event()
@@ -1260,12 +1273,12 @@ class HarnessApp:
             self._active_turn_ctx = ctx
 
         return StreamingResponse(
-            self._stream_turn(request, ctx),
+            self._stream_turn(request, ctx, model),
             media_type="text/event-stream",
         )
 
     async def _stream_turn(
-        self, request: CreateResponseRequest, ctx: TurnContext
+        self, request: CreateResponseRequest, ctx: TurnContext, model: str
     ) -> AsyncIterator[bytes]:
         """
         Drive ``run_turn`` and yield SSE-formatted events.
@@ -1288,9 +1301,7 @@ class HarnessApp:
             HTTP response.
         """
         sequence = 0
-        for initial_event in self._initial_envelope_events(
-            ctx, model=request.model, start_seq=sequence
-        ):
+        for initial_event in self._initial_envelope_events(ctx, model=model, start_seq=sequence):
             yield _format_sse_event(initial_event)
             sequence += 1
 
@@ -1334,7 +1345,7 @@ class HarnessApp:
                 sequence += 1
                 yield _format_sse_event(event)
             terminal = await self._build_terminal_event(
-                ctx, model=request.model, run_task=run_task, sequence=sequence
+                ctx, model=model, run_task=run_task, sequence=sequence
             )
             # Clear before yielding the terminal event so the next
             # request (continuation turn) sees _active_turn_ctx as

@@ -84,6 +84,7 @@ class _PostSink:
 
     def __init__(self) -> None:
         self.posts: list[tuple[str, dict[str, object]]] = []
+        self.urls: list[str] = []
 
     async def __call__(
         self,
@@ -100,6 +101,7 @@ class _PostSink:
     ) -> httpx.Response:
         data = payload.get("data")
         self.posts.append((event_type, cast(dict[str, object], data)))
+        self.urls.append(url)
         return httpx.Response(200, json={"ok": True})
 
     def item_types(self) -> list[str]:
@@ -659,7 +661,6 @@ async def test_single_in_flight_guard_skips_second_interaction() -> None:
     """While one interaction is handled off-loop, a second (e.g. agy's higher-index
     WAITING retry) is NOT fired again — the in-flight bridge owns the retries."""
     state = reader._ReaderState(
-        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
         seen=set(),
         interacted=set(),
         port=_PORT,
@@ -704,7 +705,6 @@ async def test_interaction_done_callback_clears_slot(monkeypatch: pytest.MonkeyP
     # so this test stays focused on slot-clearing + the manual re-fire.
     monkeypatch.setattr(reader, "get_trajectory_steps", lambda _port, _cascade_id: [])
     state = reader._ReaderState(
-        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
         seen=set(),
         interacted=set(),
         port=_PORT,
@@ -773,7 +773,6 @@ async def test_clear_slot_resurfaces_deferred_gate(monkeypatch: pytest.MonkeyPat
     path no further frame carries it, so the clear's re-scan is what surfaces it.
     """
     state = reader._ReaderState(
-        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
         seen=set(),
         interacted=set(),
         port=_PORT,
@@ -821,7 +820,6 @@ async def test_clear_slot_rescan_empty_then_stream_frame_surfaces(
     single-shot re-scan does not strand a gate that arrives after it runs.
     """
     state = reader._ReaderState(
-        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
         seen=set(),
         interacted=set(),
         port=_PORT,
@@ -885,7 +883,6 @@ async def test_rescan_skips_auto_allowed_step_and_surfaces_next_gate(
     where not every chained command is permission-gated.
     """
     state = reader._ReaderState(
-        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
         seen=set(),
         interacted=set(),
         port=_PORT,
@@ -948,7 +945,6 @@ async def test_resurface_pending_interaction_swallows_poll_error(
     monkeypatch.setattr(reader, "get_trajectory_steps", _boom)
     monkeypatch.setattr(reader, "_sleep", _noop_sleep)  # no real backoff in the test
     state = reader._ReaderState(
-        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
         seen=set(),
         interacted=set(),
         port=_PORT,
@@ -993,7 +989,6 @@ async def test_resurface_pending_interaction_retries_transient_poll_error(
     monkeypatch.setattr(reader, "get_trajectory_steps", _flaky)
     monkeypatch.setattr(reader, "_sleep", _noop_sleep)  # no real backoff in the test
     state = reader._ReaderState(
-        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
         seen=set(),
         interacted=set(),
         port=_PORT,
@@ -1265,7 +1260,6 @@ async def test_withdraw_helper_pops_and_posts_once_directly() -> None:
         waiting["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"],
     )
     state = reader._ReaderState(
-        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
         seen=set(),
         interacted=set(),
         port=_PORT,
@@ -1302,7 +1296,6 @@ async def test_withdraw_helper_noop_while_still_waiting() -> None:
         waiting["metadata"]["sourceTrajectoryStepInfo"]["stepIndex"],
     )
     state = reader._ReaderState(
-        allocator=reader._ToolCallIdAllocator(conversation_id=_CASCADE_ID),
         seen=set(),
         interacted=set(),
         port=_PORT,
@@ -1641,6 +1634,344 @@ async def test_stream_done_emits_one_committed_message_after_deltas(
     item_data = cast(dict[str, Any], messages[0]["item_data"])
     content = cast(list[dict[str, Any]], item_data["content"])
     assert content[0]["text"] == full
+
+
+@pytest.mark.asyncio
+async def test_stream_done_closes_the_live_block_with_a_final_delta(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A committed planner step closes its stream with ``final=True``.
+
+    The server retires a native in-flight message only when it has seen a
+    ``final: true`` delta AND the joined deltas are byte-equal to the committed
+    text (``omnigent.runtime.inflight_text``). agy emitted neither: every delta
+    was ``final=False``, and the last growth increment before DONE was never
+    sent, so the buffered text stayed truncated.
+
+    The entry therefore lived forever and was replayed to EVERY new subscriber —
+    a page load or the next turn re-rendered a stale, cut-off copy of an earlier
+    answer beside the current one (the duplicated + truncated responses).
+
+    So on commit the reader must flush the remaining suffix and mark the stream
+    final, leaving the buffered text byte-equal to what it commits.
+    """
+    full = "Hello there, friend."
+    frames = [
+        # The last GENERATING frame is BEHIND the committed text — the real
+        # trajectory shape, and the reason the buffer stayed truncated.
+        _frame([_generating_planner("Hello there,")]),
+        _frame([_done_planner(full)]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    deltas = sink.deltas()
+    assert deltas, "expected deltas"
+    # The stream is closed exactly once, and only by the last delta.
+    finals = [d for d in deltas if d.get("final") is True]
+    assert len(finals) == 1, f"expected exactly one final delta, got {len(finals)}"
+    assert deltas[-1].get("final") is True
+    # Byte-equality with the committed text is the server's other retirement
+    # condition, so the closing delta must carry the missing suffix.
+    assert "".join(cast(str, d["delta"]) for d in deltas) == full
+    # Still exactly one committed message, still after the deltas.
+    assert sink.item_types() == ["message"]
+    types = sink.event_types()
+    assert max(i for i, t in enumerate(types) if t == "external_output_text_delta") < types.index(
+        "external_conversation_item"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_transient_shrink_does_not_duplicate_text_or_strand_the_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A rewrite that shrinks and then RE-GROWS still streams the answer exactly.
+
+    The prefix tracker is the reader's record of what it already put on the wire,
+    and the closing delta computes its suffix from it. Re-anchoring it on a frame
+    that emitted NOTHING breaks that: the tracker moves to text the server never
+    received, so the next real delta is cut from the wrong offset and repeats the
+    overlap — the live block renders duplicated text, and the joined deltas no
+    longer equal the committed message, which is one of the server's two
+    retirement conditions, so the preview is replayed to every later subscriber.
+
+    Companion to the shrink-to-a-non-prefix case below: that one the producer
+    cannot fully close (published deltas cannot be unsent), this one it can — the
+    text re-grows past what was sent, so tracking sent-so-far is exactly enough.
+    """
+    from omnigent.runtime import inflight_text
+
+    full = "The plan is complete."
+    frames = [
+        _frame([_generating_planner("The plan is ")]),
+        # Moderation momentarily replaces the partial with a SHORTER one, then
+        # the answer grows past it again.
+        _frame([_generating_planner("The plan ")]),
+        _frame([_generating_planner(full)]),
+        _frame([_done_planner(full)]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    streamed = "".join(cast(str, d["delta"]) for d in sink.deltas())
+    assert streamed == full, (
+        f"the streamed text must equal the committed answer, not repeat an "
+        f"overlap; got {streamed!r}"
+    )
+
+    inflight_text.reset_for_tests()
+    conv = "conv_transient_shrink"
+    for event_type, data in sink.posts:
+        if event_type == "external_output_text_delta":
+            inflight_text.record_publish(conv, {"type": "response.output_text.delta", **data})
+        elif event_type == "external_conversation_item":
+            item = cast(dict[str, Any], data.get("item_data") or {})
+            if item.get("role") == "assistant":
+                inflight_text.record_publish(
+                    conv,
+                    {
+                        "type": "response.output_item.done",
+                        "item": {
+                            "id": "ap_1",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": item.get("content"),
+                        },
+                    },
+                )
+
+    leftover = [
+        s
+        for s in inflight_text.snapshot_for(conv)
+        if s.get("type") == "response.output_text.delta"
+    ]
+    assert leftover == [], f"stale text would be replayed to the next subscriber: {leftover}"
+
+
+@pytest.mark.asyncio
+async def test_a_shrinking_rewrite_mid_stream_still_closes_the_live_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A rewrite that SHRINKS the answer still delivers the closing delta.
+
+    agy can replace a growing ``modifiedResponse`` with a shorter, non-prefix
+    rewrite. The reader emits no delta for it (there is no new suffix) but does
+    re-anchor its tracker to the new text, so an index derived from the forwarded
+    byte count MOVES BACKWARDS — and the server drops any chunk whose index does
+    not exceed the last accepted one. The closing ``final`` chunk was therefore
+    discarded and the block never closed. Indices are a per-step chunk count for
+    exactly this reason: growth cannot make a counter go backwards.
+
+    Scoped to what the producer controls. The server ALSO retires only on text
+    byte-equal to the commit, and deltas already published cannot be unsent, so a
+    shrink still leaves a stale preview — that half needs a reset signal in
+    ``inflight_text`` and is not fixable from here.
+    """
+    rewritten = "Redacted."
+    frames = [
+        _frame([_generating_planner("The answer is ")]),
+        _frame([_generating_planner("The answer is quite long ")]),
+        # Moderation replaces the answer: shorter, and not a prefix of it.
+        _frame([_generating_planner(rewritten)]),
+        _frame([_done_planner(rewritten)]),
+    ]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(frames),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    deltas = sink.deltas()
+    indices = [cast(int, d["index"]) for d in deltas]
+    assert indices == sorted(set(indices)), (
+        f"indices must strictly increase across a rewrite, got {indices}"
+    )
+    # The closer is what marks the block retirable, so it must survive the
+    # server's index check rather than being silently dropped.
+    finals = [d for d in deltas if d.get("final") is True]
+    assert len(finals) == 1, f"expected exactly one final delta, got {len(finals)}"
+    assert deltas[-1] is finals[0], "the final delta must be the last one sent"
+    assert cast(int, finals[0]["index"]) > max(
+        cast(int, d["index"]) for d in deltas if d.get("final") is not True
+    ), "the closing chunk must outrank every chunk before it or the server drops it"
+
+
+@pytest.mark.asyncio
+async def test_multi_chunk_answer_leaves_nothing_in_flight_on_the_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """A long answer streamed over MANY frames still retires server-side.
+
+    The production shape: agy grows ``modifiedResponse`` across many frames, so
+    the message is several chunks. Every chunk carried ``index: 0``, and the
+    server drops any chunk whose index does not exceed the last accepted one —
+    so only the FIRST survived. The buffer kept a truncated prefix, the
+    ``final`` chunk was discarded, and the message was replayed to every later
+    subscriber as a cut-off duplicate of the answer just committed.
+
+    A single-chunk answer hid this: its one chunk IS the whole text.
+    """
+    from omnigent.runtime import inflight_text
+
+    growth = ["Kyoto ", "Kyoto Studio ", "Kyoto Studio is ", "Kyoto Studio is a studio app."]
+    full = growth[-1]
+    sink = _PostSink()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(
+            [_frame([_generating_planner(t)]) for t in growth] + [_frame([_done_planner(full)])]
+        ),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    # More than one chunk, and every index strictly increases.
+    deltas = sink.deltas()
+    assert len(deltas) > 1, "expected a multi-chunk stream"
+    indices = [cast(int, d["index"]) for d in deltas]
+    assert indices == sorted(set(indices)), f"indices must strictly increase, got {indices}"
+
+    inflight_text.reset_for_tests()
+    conv = "conv_multi_chunk"
+    for event_type, data in sink.posts:
+        if event_type == "external_output_text_delta":
+            inflight_text.record_publish(conv, {"type": "response.output_text.delta", **data})
+        elif event_type == "external_conversation_item":
+            item = cast(dict[str, Any], data.get("item_data") or {})
+            if item.get("role") == "assistant":
+                inflight_text.record_publish(
+                    conv,
+                    {
+                        "type": "response.output_item.done",
+                        "item": {
+                            "id": "ap_1",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": item.get("content"),
+                        },
+                    },
+                )
+
+    leftover = [
+        s
+        for s in inflight_text.snapshot_for(conv)
+        if s.get("type") == "response.output_text.delta"
+    ]
+    assert leftover == [], f"stale text would be replayed to the next subscriber: {leftover}"
+
+
+@pytest.mark.asyncio
+async def test_committed_turn_leaves_nothing_in_flight_on_the_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """After a committed turn the server has NOTHING left to replay.
+
+    This is the invariant behind the duplicated/cut-off responses: the server
+    replays any un-retired in-flight message to every new subscriber, so a
+    leftover entry re-renders a stale copy of an earlier answer beside the
+    current one on the next page load or turn.
+
+    Asserted end-to-end by feeding the reader's own emitted events through
+    ``inflight_text`` — the real consumer — rather than by counting deltas,
+    because the reader commits from two paths (stream frames and the poll loop)
+    and their interleaving is not fixed. Whatever the order, nothing may
+    survive the turn.
+    """
+    from omnigent.runtime import inflight_text
+
+    full = "apple banana cherry"
+    sink = _PostSink()
+
+    class _DeltaThenDrop:
+        """Streams a partial, then drops — the reader falls back to polling,
+        which is where the commit lands. This interleaving is the one that
+        regressed: the close lived only in the stream handler."""
+
+        def __call__(self, port: int, conversation_id: str) -> AsyncIterator[dict[str, object]]:
+            async def _gen() -> AsyncIterator[dict[str, object]]:
+                yield _frame([_generating_planner("apple banana")])
+                raise httpx.ReadError("mid-stream drop")
+
+            return _gen()
+
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_DeltaThenDrop(),
+        poll_steps=_StepScript([[_done_planner(full)], [_done_planner(full)]]),
+        monkeypatch=monkeypatch,
+        iterations=2,
+    )
+
+    inflight_text.reset_for_tests()
+    conv = "conv_under_test"
+    for event_type, data in sink.posts:
+        if event_type == "external_output_text_delta":
+            # Pass the emitted payload VERBATIM. Reconstructing it by hand is
+            # what hid this bug: omitting ``index`` skipped the server's
+            # strictly-increasing-index check, so the test retired messages the
+            # real server would never retire.
+            inflight_text.record_publish(
+                conv,
+                {"type": "response.output_text.delta", **data},
+            )
+        elif event_type == "external_conversation_item":
+            item = cast(dict[str, Any], data.get("item_data") or {})
+            if item.get("role") == "assistant":
+                inflight_text.record_publish(
+                    conv,
+                    {
+                        "type": "response.output_item.done",
+                        "item": {
+                            "id": "ap_1",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": item.get("content"),
+                        },
+                    },
+                )
+
+    leftover = [
+        s
+        for s in inflight_text.snapshot_for(conv)
+        if s.get("type") == "response.output_text.delta"
+    ]
+    assert leftover == [], f"stale text would be replayed to the next subscriber: {leftover}"
 
 
 @pytest.mark.asyncio
@@ -2181,8 +2512,12 @@ async def test_stream_error_midway_falls_back_without_losing_prior_deltas(
         iterations=2,
     )
 
-    # The pre-error delta was forwarded.
-    assert [d["delta"] for d in sink.deltas()] == [full]
+    # The pre-error delta was forwarded, and the poll-path commit CLOSED the
+    # live block: it flushes the missing suffix and marks the stream final.
+    # Without that the server holds a truncated entry in flight for the rest of
+    # the session and replays it to every later subscriber.
+    assert [d["delta"] for d in sink.deltas()] == [full, ", now complete."]
+    assert sink.deltas()[-1]["final"] is True
     # The poll fallback delivered the committed message.
     assert sink.item_types() == ["message"]
 
@@ -2801,14 +3136,105 @@ def test_turn_close_true_for_error_planner() -> None:
     assert reader._is_turn_close_step(error_planner) is True
 
 
-def test_turn_close_true_for_done_planner_no_text_no_tools() -> None:
-    """A DONE planner with neither text nor tool calls is a degenerate close."""
+@pytest.mark.asyncio
+async def test_a_streamed_tool_turn_stays_running_until_the_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """
+    REGRESSION: the spinner must not clear when agy dispatches a tool.
+
+    The whole streamed turn, in the live order: the user's prompt, the planner
+    that dispatches a tool, the tool's result, then the answering planner. IDLE
+    belongs at the END of that sequence — one edge, after the answer.
+
+    The predicate test below pins the cause; this pins the symptom the user
+    actually saw, which is what the suite was missing: the dispatching planner
+    fired IDLE, so the session showed idle while its tools kept running, and
+    RUNNING could not re-open (it is gated on USER_INPUT).
+    """
+    sink = _PostSink()
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(
+            [
+                _frame([_load("user_input")]),
+                _frame([_load("stream_planner_tool_call")]),
+                _frame([_load("stream_run_command_done")]),
+                _frame([_load("stream_planner_text_done")]),
+            ]
+        ),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+
+    assert sink.statuses() == ["running", "idle"], (
+        f"the turn must open once and close once; got {sink.statuses()}"
+    )
+    # WHERE the idle edge lands is the whole point — the count alone is
+    # identical whether it fires at dispatch or after the answer, because the
+    # second close is deduped by ``turn_active``. Assert its position.
+    timeline = [
+        f"status:{data['status']}"
+        if event_type == "external_session_status"
+        else f"item:{data.get('item_type')}"
+        for event_type, data in sink.posts
+        if event_type in ("external_session_status", "external_conversation_item")
+    ]
+    assert timeline.index("status:idle") > timeline.index("item:function_call_output"), (
+        f"IDLE fired before the tool finished — the spinner cleared mid-turn: {timeline}"
+    )
+
+
+def test_turn_close_false_for_streamed_planner_that_dispatched_a_tool() -> None:
+    """
+    REGRESSION: a STREAMED tool dispatch must not fire the IDLE edge.
+
+    The stream projection strips ``plannerResponse.toolCalls`` (the premise of
+    this whole mapper rewrite), so a dispatching planner arrives DONE with
+    neither tool calls nor text. Keying "did this dispatch?" on ``toolCalls``
+    therefore read it as a degenerate close and fired IDLE the moment agy called
+    a tool: the spinner cleared mid-turn and RUNNING could not re-open (it is
+    gated on USER_INPUT), so the session read idle while the tools still ran.
+
+    Uses the verbatim live stream frame rather than a hand-built dict — the
+    hand-built poll shape below is exactly what let the bug through.
+    """
+    dispatched = _load("stream_planner_tool_call")
+    # Pin the premise, so this test fails loudly if a future capture regains the
+    # field rather than silently passing for the wrong reason.
+    assert "toolCalls" not in dispatched["plannerResponse"], (
+        "fixture no longer models the stripped stream projection"
+    )
+    assert reader._is_turn_close_step(dispatched) is False
+
+
+def test_turn_close_true_for_streamed_planner_that_answered() -> None:
+    """The streamed ANSWER still closes the turn — text is the close signal."""
+    answered = _load("stream_planner_text_done")
+    assert reader._is_turn_close_step(answered) is True
+
+
+def test_turn_close_false_for_done_planner_no_text_no_tools() -> None:
+    """
+    A DONE planner with neither text nor tool calls does NOT close the turn.
+
+    This shape is byte-identical to a streamed tool dispatch, so it cannot be
+    read as a close without stranding every streamed tool turn (see above). A
+    genuinely degenerate turn is instead reconciled by the idle backstop
+    (``_close_turn_if_stranded``), which closes on agy's OWN cascade status —
+    authoritative where this shape is ambiguous, at the cost of one detector
+    interval.
+    """
     empty_done = {
         "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
         "status": "CORTEX_STEP_STATUS_DONE",
         "plannerResponse": {},
     }
-    assert reader._is_turn_close_step(empty_done) is True
+    assert reader._is_turn_close_step(empty_done) is False
 
 
 def test_turn_close_false_for_done_planner_with_tool_calls() -> None:
@@ -2992,6 +3418,114 @@ def test_detect_rotation_older_sibling_returns_none() -> None:
         _OTHER_CASCADE: _summary(last_user_input_time="2026-06-23T17:34:54.152668Z"),
     }
     assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) is None
+
+
+def _child_summary(
+    *,
+    parent_cascade_id: str,
+    last_user_input_time: str = "2026-08-01T10:48:37.887431Z",
+    include_parent_id: bool = True,
+) -> dict[str, Any]:
+    """Build a real agy SUBAGENT summary (live capture, agy 1.1.9).
+
+    Captured from a live ``GetAllCascadeTrajectories`` while agy ran a subagent:
+    the child is typed ``CORTEX_TRAJECTORY_TYPE_CASCADE`` — byte-identical to its
+    parent — and is distinguishable ONLY by ``trajectoryMetadata``, which carries
+    ``parentConversationId`` / a foreign ``rootConversationId`` / ``nestingDepth``
+    / ``subagentSpec``.
+
+    :param parent_cascade_id: The parent (root) conversation id this child hangs off.
+    :param include_parent_id: When ``False``, omit ``parentConversationId`` so the
+        foreign ``rootConversationId`` is the only remaining child signal.
+    """
+    metadata: dict[str, Any] = {
+        "createdAt": "2026-08-01T09:34:51.639408Z",
+        "initializationStateId": "11e484d0-0000-4000-8000-000000000000",
+        "rootConversationId": parent_cascade_id,
+        "nestingDepth": 1,
+        "subagentSpec": {"typeName": "self", "role": "Task 4 Reviewer", "inherit": True},
+    }
+    if include_parent_id:
+        metadata["parentConversationId"] = parent_cascade_id
+    return {
+        "trajectoryId": "82e9fb54-9f16-46eb-88d7-a84fd40deec3",
+        "status": "CASCADE_RUN_STATUS_IDLE",
+        # NOT a distinct type — the same value a real root cascade reports.
+        "trajectoryType": "CORTEX_TRAJECTORY_TYPE_CASCADE",
+        "lastUserInputTime": last_user_input_time,
+        "summary": "MetricsStore Implementation Code Review",
+        "trajectoryMetadata": metadata,
+    }
+
+
+def test_detect_rotation_subagent_child_is_never_a_rotation_target() -> None:
+    """A running agy SUBAGENT must never be rotated onto.
+
+    agy spawns each subagent as a child conversation that reports the SAME
+    ``trajectoryType`` as a real root, and is always more recently active than the
+    parent it is working for. Rotating onto it promotes a sub-conversation to a
+    new top-level Omnigent session (and drags the tmux pane with it), which is
+    what made a single subagent fan-out explode into a session per agent.
+    """
+    summaries = {
+        _BOUND_CASCADE: _summary(last_user_input_time="2026-08-01T10:49:38.660037Z"),
+        _OTHER_CASCADE: _child_summary(
+            parent_cascade_id=_BOUND_CASCADE,
+            # Strictly newer than the parent — the subagent is mid-turn while the
+            # parent sits idle waiting for it, so activity alone always favours it.
+            last_user_input_time="2026-08-01T10:50:00.000000Z",
+        ),
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) is None
+
+
+def test_detect_rotation_child_detected_without_explicit_parent_id() -> None:
+    """A foreign ``rootConversationId`` alone marks a child, with no parent field."""
+    summaries = {
+        _BOUND_CASCADE: _summary(last_user_input_time="2026-08-01T10:49:38.660037Z"),
+        _OTHER_CASCADE: _child_summary(
+            parent_cascade_id=_BOUND_CASCADE,
+            last_user_input_time="2026-08-01T10:50:00.000000Z",
+            include_parent_id=False,
+        ),
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) is None
+
+
+def test_detect_rotation_child_of_a_third_cascade_is_also_excluded() -> None:
+    """A subagent of some OTHER root is still a child — not a rotation target.
+
+    The child test must not degenerate into "is it my own child": a subagent
+    belonging to a different root is equally not the user's top-level conversation.
+    """
+    summaries = {
+        _BOUND_CASCADE: _summary(last_user_input_time="2026-08-01T10:49:38.660037Z"),
+        _OTHER_CASCADE: _child_summary(
+            parent_cascade_id="ffffffff-1111-4222-8333-444444444444",
+            last_user_input_time="2026-08-01T10:50:00.000000Z",
+        ),
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) is None
+
+
+def test_detect_rotation_real_clear_mint_still_rotates_with_self_root_metadata() -> None:
+    """A genuine /clear rotation still fires when metadata is self-referential.
+
+    The live capture shows a real root carries ``rootConversationId == <its own
+    key>``, so the child test must not swallow the /clear case this detector
+    exists for.
+    """
+    other = dict(_summary(last_user_input_time="2026-08-01T10:50:00.000000Z"))
+    other["trajectoryMetadata"] = {
+        "createdAt": "2026-08-01T10:49:34.181600Z",
+        "initializationStateId": "87966e34-057b-4b63-afa2-a437cd67ea9d",
+        "rootConversationId": _OTHER_CASCADE,
+    }
+    summaries = {
+        _BOUND_CASCADE: _summary(last_user_input_time="2026-08-01T10:49:38.660037Z"),
+        _OTHER_CASCADE: other,
+    }
+    assert reader._detect_rotated_cascade(summaries, _BOUND_CASCADE) == _OTHER_CASCADE
 
 
 def test_detect_rotation_non_cascade_sibling_returns_none() -> None:
@@ -3780,3 +4314,640 @@ async def test_supervise_reader_external_cancel_propagates_not_rotation(
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Quiescence backstop (agy's own CASCADE_RUN_STATUS)
+# ---------------------------------------------------------------------------
+
+
+def test_cascade_is_idle_reads_agys_own_run_status() -> None:
+    """
+    The bound cascade's own ``CASCADE_RUN_STATUS`` is the quiescence signal.
+
+    agy publishes this per cascade in ``GetAllCascadeTrajectories``. It reports
+    ``RUNNING`` both while working AND while parked on a permission gate
+    (live-verified against agy 1.1.8 over a 75s gate), so IDLE genuinely means the
+    turn is over — never "waiting for the human".
+    """
+    idle = {_BOUND_CASCADE: {"status": "CASCADE_RUN_STATUS_IDLE"}}
+    running = {_BOUND_CASCADE: {"status": "CASCADE_RUN_STATUS_RUNNING"}}
+    assert reader._cascade_is_idle(idle, _BOUND_CASCADE)
+    assert not reader._cascade_is_idle(running, _BOUND_CASCADE)
+    # An absent / malformed entry is never treated as idle: closing a turn on
+    # missing information would be worse than leaving the accelerator to do it.
+    assert not reader._cascade_is_idle({}, _BOUND_CASCADE)
+    assert not reader._cascade_is_idle({_BOUND_CASCADE: "nope"}, _BOUND_CASCADE)
+    assert not reader._cascade_is_idle({_BOUND_CASCADE: {}}, _BOUND_CASCADE)
+
+
+@pytest.mark.asyncio
+async def test_watch_for_rotation_signals_quiescence_only_after_consecutive_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Quiescence is reported only after CONSECUTIVE idle observations.
+
+    A single idle reading can catch the gap between a turn being delivered and
+    agy starting it, which would close a turn that is about to run. Requiring two
+    in a row makes the backstop conservative — it exists to guarantee no session
+    is stranded, not to race the step-based close.
+    """
+    calls: list[int] = []
+
+    async def _on_quiescent() -> None:
+        calls.append(1)
+
+    idle = {"trajectorySummaries": {_BOUND_CASCADE: {"status": "CASCADE_RUN_STATUS_IDLE"}}}
+    busy = {"trajectorySummaries": {_BOUND_CASCADE: {"status": "CASCADE_RUN_STATUS_RUNNING"}}}
+    # idle, busy (resets), idle, idle -> exactly one signal, on the 4th tick.
+    script = [idle, busy, idle, idle]
+    seen = {"n": 0}
+
+    def _fetch(port: int) -> dict[str, object]:
+        i = seen["n"]
+        seen["n"] += 1
+        if i >= len(script):
+            raise asyncio.CancelledError()
+        return script[i]
+
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", _fetch)
+
+    async def _noop_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(reader, "_sleep", _noop_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await reader._watch_for_rotation(
+            port=_PORT,
+            bound_cascade_id=_BOUND_CASCADE,
+            interval_s=0.0,
+            skip_cascade_ids=frozenset(),
+            on_rotation=_fail_rotation,
+            on_quiescent=_on_quiescent,
+        )
+
+    assert calls == [1], "expected exactly one quiescence signal, after two idle ticks"
+
+
+# ---------------------------------------------------------------------------
+# Sub-agents: agy runs each as its own cascade, mirrored into a child session
+# ---------------------------------------------------------------------------
+
+
+async def _no_sleep(_seconds: float) -> None:
+    """Collapse the mirror's poll delay so a multi-poll test runs instantly."""
+    return
+
+
+async def _never_returns(**_kwargs: Any) -> None:
+    """Stand in for the mirror loop: stays pending until cancelled."""
+    await asyncio.Event().wait()
+
+
+async def _cancel_mirrors(state: reader._ReaderState) -> None:
+    """Cancel every mirror task a test started so none leaks past it."""
+    for task in state.subagent_mirrors.values():
+        task.cancel()
+    for task in state.subagent_mirrors.values():
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+def _invoke_subagent_step(
+    *,
+    status: str = "CORTEX_STEP_STATUS_RUNNING",
+    results: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """
+    An INVOKE_SUBAGENT step naming two sub-agents.
+
+    Shaped after the live frame: ``results`` is filled positionally against
+    ``subagents`` and a child's ``conversationId`` appears as soon as that child
+    exists, while the step itself stays RUNNING until every child finishes.
+    """
+    if results is None:
+        results = [{"conversationId": "child-aaa"}, {"conversationId": "child-bbb"}]
+    return {
+        "type": "CORTEX_STEP_TYPE_INVOKE_SUBAGENT",
+        "status": status,
+        "metadata": {
+            "toolAction": "Dispatching reviewers",
+            "toolSummary": "Review the codebase",
+            "sourceTrajectoryStepInfo": {"trajectoryId": _CASCADE_ID, "stepIndex": 36},
+        },
+        "invokeSubagent": {
+            "subagents": [
+                {"typeName": "research", "role": "App Router Reviewer"},
+                {"typeName": "research", "role": "Database Reviewer"},
+            ],
+            "results": results,
+        },
+    }
+
+
+def _subagent_client(
+    child_ids: list[str] | None = None,
+) -> tuple[httpx.AsyncClient, list[dict[str, Any]]]:
+    """A client whose registration POSTs answer with successive child ids."""
+    captured: list[dict[str, Any]] = []
+    remaining = list(child_ids if child_ids is not None else ["conv_child_a", "conv_child_b"])
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        captured.append(body)
+        if body.get("type") == "external_antigravity_subagent_start":
+            minted = remaining.pop(0) if remaining else "conv_child_x"
+            return httpx.Response(200, json={"queued": False, "child_session_id": minted})
+        return httpx.Response(200, json={"ok": True})
+
+    client = httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(_handler))
+    return client, captured
+
+
+def _registrations(captured: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the ``data`` of every sub-agent registration POST, in order."""
+    return [
+        body["data"]
+        for body in captured
+        if body.get("type") == "external_antigravity_subagent_start"
+    ]
+
+
+def test_subagent_pairs_skips_a_child_agy_has_not_named_yet() -> None:
+    """
+    A result slot with no ``conversationId`` is not yet mirrorable.
+
+    agy fills the results list positionally as children spawn, so an early frame
+    carries a placeholder slot; registering it would mint a child row keyed on
+    nothing.
+    """
+    step = _invoke_subagent_step(results=[{"conversationId": "child-aaa"}, {}])
+    pairs = reader._subagent_pairs(step)
+    assert [child_id for _spec, child_id in pairs] == ["child-aaa"]
+
+
+def test_subagent_pairs_ignores_a_non_subagent_step() -> None:
+    """An ordinary tool step names no children."""
+    assert reader._subagent_pairs(_load("run_command_done")) == []
+
+
+async def test_each_subagent_is_registered_once_across_repeated_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    REGRESSION: the owning step is re-sent on every frame while sub-agents work.
+
+    ``_maybe_mirror_subagents`` runs unconditionally (the step is not ``seen``
+    until it settles), so without the ``subagent_mirrors`` guard each frame would
+    register the same children again and stack duplicate mirror tasks against
+    them.
+    """
+    monkeypatch.setattr(reader, "_mirror_subagent_cascade", _never_returns)
+    client, captured = _subagent_client()
+    state = reader._ReaderState(seen=set(), interacted=set(), port=4242)
+
+    async with client:
+        for _ in range(3):
+            await reader._maybe_mirror_subagents(
+                _invoke_subagent_step(),
+                client=client,
+                session_id=_SESSION_ID,
+                cascade_id=_CASCADE_ID,
+                state=state,
+            )
+        registrations = _registrations(captured)
+        assert [r["cascade_id"] for r in registrations] == ["child-aaa", "child-bbb"], (
+            f"Each child must register exactly once; got {registrations}"
+        )
+        assert sorted(state.subagent_mirrors) == ["child-aaa", "child-bbb"]
+        await _cancel_mirrors(state)
+
+
+async def test_registration_carries_the_role_type_and_spawning_tool_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The rail names the sub-agent, and the row links back to its tool card.
+
+    ``tool_call_id`` is the INVOKE_SUBAGENT step's own mirrored call id, so the
+    child and the tool card that spawned it share one identity.
+    """
+    monkeypatch.setattr(reader, "_mirror_subagent_cascade", _never_returns)
+    client, captured = _subagent_client()
+    state = reader._ReaderState(seen=set(), interacted=set(), port=4242)
+
+    async with client:
+        await reader._maybe_mirror_subagents(
+            _invoke_subagent_step(),
+            client=client,
+            session_id=_SESSION_ID,
+            cascade_id=_CASCADE_ID,
+            state=state,
+        )
+        first = _registrations(captured)[0]
+        assert first["role"] == "App Router Reviewer"
+        assert first["agent_type"] == "research"
+        assert first["tool_call_id"] == f"agy_call_{_CASCADE_ID}_36"
+        await _cancel_mirrors(state)
+
+
+async def test_a_rejected_registration_starts_no_mirror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A server that will not mint a child leaves nothing polling for it.
+
+    Without this the mirror would poll a cascade forever with nowhere to post.
+    """
+    monkeypatch.setattr(reader, "_mirror_subagent_cascade", _never_returns)
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "nope"})
+
+    client = httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(_handler))
+    state = reader._ReaderState(seen=set(), interacted=set(), port=4242)
+
+    async with client:
+        await reader._maybe_mirror_subagents(
+            _invoke_subagent_step(),
+            client=client,
+            session_id=_SESSION_ID,
+            cascade_id=_CASCADE_ID,
+            state=state,
+        )
+    assert state.subagent_mirrors == {}
+
+
+async def test_a_settled_invoke_step_does_not_stop_its_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    REGRESSION: ``invoke_subagent`` is fire-and-forget, not a wait.
+
+    Its step reaches DONE the moment the child is spawned while the child runs on
+    for minutes (live-verified: a child kept working 23s past its spawning step's
+    ``completedAt`` and accumulated 35 steps). Treating that DONE as "the
+    sub-agents finished" mirrored only each child's opening prompt and left every
+    row spinning, so the handler must not read the step's status at all.
+    """
+    monkeypatch.setattr(reader, "_mirror_subagent_cascade", _never_returns)
+    client, _captured = _subagent_client()
+    state = reader._ReaderState(seen=set(), interacted=set(), port=4242)
+
+    async with client:
+        await reader._maybe_mirror_subagents(
+            _invoke_subagent_step(status="CORTEX_STEP_STATUS_DONE"),
+            client=client,
+            session_id=_SESSION_ID,
+            cascade_id=_CASCADE_ID,
+            state=state,
+        )
+        mirrors = list(state.subagent_mirrors.values())
+        assert len(mirrors) == 2, "both children must still be mirrored"
+        assert not any(task.done() for task in mirrors), (
+            "a DONE invoke step must not stop the mirrors it started"
+        )
+        await _cancel_mirrors(state)
+
+
+# Hang guard for the mirror-loop tests. Deliberately far above any healthy run
+# (these poll a patched transport — milliseconds locally): a shared CI runner can
+# be an order of magnitude slower, and a budget tight enough to catch that is a
+# flake, not a signal. Termination is asserted by the loop RETURNING; this only
+# stops a genuine hang from wedging the suite.
+_MIRROR_HANG_GUARD_S = 60
+
+# Polls a "still working" child answers before it finishes, in the quiescence
+# test. With the timer patched to 2, this is enough for the status veto to fire
+# twice — the behaviour under test — without needing a long loop, which is what
+# made the first version of this test time out on CI.
+_QUIET_POLLS_BEFORE_FINISHING = 5
+
+
+def _child_transcript() -> list[dict[str, Any]]:
+    """A finished sub-agent's steps: its prompt, a tool call, its closing reply."""
+    return [
+        _load("user_input"),
+        _load("run_command_done"),
+        _done_planner("Task complete.", step_index=9),
+    ]
+
+
+async def test_mirror_posts_the_child_cascade_into_the_child_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A sub-agent's own steps reach its child session, and the mirror then stops.
+
+    A sub-agent cascade is an ordinary cascade on the same agy port, so mirroring
+    is the committed-only poll path pointed at the child. A child that finished
+    between two polls delivers its whole transcript in ONE pass — opening and
+    closing its turn before the poll returns — so the turn-open check has to run
+    per step, not per poll, or the mirror never notices it ended.
+    """
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda _p, _c: _child_transcript())
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    client, _captured = _subagent_client()
+    async with client:
+        await asyncio.wait_for(
+            reader._mirror_subagent_cascade(
+                port=4242,
+                child_cascade_id="child-aaa",
+                client=client,
+                child_session_id="conv_child_a",
+            ),
+            timeout=_MIRROR_HANG_GUARD_S,
+        )
+
+    assert sink.item_types() == ["message", "function_call", "function_call_output", "message"], (
+        f"the child's whole transcript must be mirrored; got {sink.item_types()}"
+    )
+    assert set(sink.urls) == {"/v1/sessions/conv_child_a/events"}, (
+        f"the child's work must post to the CHILD session; got {set(sink.urls)}"
+    )
+    # The closing step fires the child's own IDLE edge, clearing the rail badge.
+    assert sink.statuses() == ["running", "idle"], (
+        f"Expected the child's turn to open then close; got {sink.statuses()}"
+    )
+
+
+async def test_mirror_keeps_polling_while_the_child_is_still_working(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    REGRESSION: the mirror must outlive the child's opening prompt.
+
+    The bug that shipped stopped every mirror as soon as the spawning step went
+    DONE, so each child recorded exactly its ``USER_INPUT`` prompt — one item
+    against the 16-101 steps the sub-agents actually ran. Here the child's later
+    steps only appear on the third poll; a mirror that gives up early misses
+    them.
+    """
+    working = [_load("user_input")]  # turn open, still working
+    finished = _child_transcript()
+    polls = 0
+
+    def _steps(_port: int, _cascade: str) -> list[dict[str, Any]]:
+        nonlocal polls
+        polls += 1
+        return working if polls < 3 else finished
+
+    monkeypatch.setattr(reader, "get_trajectory_steps", _steps)
+    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    client, _captured = _subagent_client()
+    async with client:
+        await asyncio.wait_for(
+            reader._mirror_subagent_cascade(
+                port=4242,
+                child_cascade_id="child-aaa",
+                client=client,
+                child_session_id="conv_child_a",
+            ),
+            timeout=_MIRROR_HANG_GUARD_S,
+        )
+
+    assert polls >= 3, f"the mirror stopped after {polls} polls, before the child finished"
+    assert "function_call" in sink.item_types(), (
+        f"the child's later work must be mirrored; got {sink.item_types()}"
+    )
+
+
+async def test_a_child_that_goes_quiet_without_closing_is_closed_from_agy_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A sub-agent whose turn never closes still clears its rail badge.
+
+    The child's own closing step is the ordinary signal, but a transcript that
+    ends without a recognizable one would leave the mirror polling for the rest
+    of the session and the row spinning forever. agy's run status is the
+    authority for that stall.
+    """
+    monkeypatch.setattr(reader, "get_trajectory_steps", lambda _p, _c: [_load("user_input")])
+    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+    monkeypatch.setattr(reader, "_SUBAGENT_QUIESCENT_POLLS", 2)
+    monkeypatch.setattr(
+        reader,
+        "get_all_cascade_trajectories",
+        lambda _port: {
+            "trajectorySummaries": {"child-aaa": {"status": "CASCADE_RUN_STATUS_IDLE"}}
+        },
+    )
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    client, _captured = _subagent_client()
+    async with client:
+        await asyncio.wait_for(
+            reader._mirror_subagent_cascade(
+                port=4242,
+                child_cascade_id="child-aaa",
+                client=client,
+                child_session_id="conv_child_a",
+            ),
+            timeout=_MIRROR_HANG_GUARD_S,
+        )
+
+    assert sink.statuses() == ["running", "idle"], (
+        f"a stalled child must still be closed out; got {sink.statuses()}"
+    )
+
+
+async def test_a_quiet_child_agy_still_reports_running_is_not_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Quiet is not finished: a sub-agent mid-build produces no steps for minutes.
+
+    Closing on quiescence alone would truncate its transcript, so the status
+    check must be able to veto — this pins that a non-idle cascade keeps the
+    mirror alive rather than being closed on the timer.
+    """
+    working = [_load("user_input")]
+    finished = _child_transcript()  # what it returns once the child is done
+    polls = 0
+    idle_checks = 0
+
+    def _steps(_port: int, _cascade: str) -> list[dict[str, Any]]:
+        nonlocal polls
+        polls += 1
+        return working if polls <= _QUIET_POLLS_BEFORE_FINISHING else finished
+
+    def _still_running(_port: int) -> dict[str, Any]:
+        nonlocal idle_checks
+        idle_checks += 1
+        return {"trajectorySummaries": {"child-aaa": {"status": "CASCADE_RUN_STATUS_RUNNING"}}}
+
+    monkeypatch.setattr(reader, "get_trajectory_steps", _steps)
+    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+    monkeypatch.setattr(reader, "_SUBAGENT_QUIESCENT_POLLS", 2)
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", _still_running)
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    client, _captured = _subagent_client()
+    async with client:
+        await asyncio.wait_for(
+            reader._mirror_subagent_cascade(
+                port=4242,
+                child_cascade_id="child-aaa",
+                client=client,
+                child_session_id="conv_child_a",
+            ),
+            timeout=_MIRROR_HANG_GUARD_S,
+        )
+
+    # The veto is the point: the timer fired, agy's status overruled it, and the
+    # mirror was still alive to see the child finish.
+    assert idle_checks >= 1, f"the quiescence timer should have fired; got {idle_checks}"
+    assert polls > _QUIET_POLLS_BEFORE_FINISHING, "the mirror gave up before the child finished"
+    assert sink.statuses() == ["running", "idle"], (
+        f"the child closed on its own step, not the timer; got {sink.statuses()}"
+    )
+
+
+async def test_the_quiescence_recheck_backs_off_after_agy_vetoes_a_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A child agy never calls idle is re-checked ever less often, not every window.
+
+    agy answering "still running" can only veto the close, so the window is a
+    repeating re-check rather than a one-shot grace period. Left flat it would
+    re-ask at the same cadence for the life of the session; doubling keeps a
+    long-lived quiet child cheap while a stalled one is still caught.
+    """
+    polls = 0
+    idle_checks = 0
+
+    def _steps(_port: int, _cascade: str) -> list[dict[str, Any]]:
+        nonlocal polls
+        polls += 1
+        return [_load("user_input")]  # turn open, never another step
+
+    def _still_running(_port: int) -> dict[str, Any]:
+        nonlocal idle_checks
+        idle_checks += 1
+        return {"trajectorySummaries": {"child-aaa": {"status": "CASCADE_RUN_STATUS_RUNNING"}}}
+
+    monkeypatch.setattr(reader, "get_trajectory_steps", _steps)
+    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+    monkeypatch.setattr(reader, "_SUBAGENT_QUIESCENT_POLLS", 2)
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", _still_running)
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    client, _captured = _subagent_client()
+    async with client:
+        mirror = asyncio.create_task(
+            reader._mirror_subagent_cascade(
+                port=4242,
+                child_cascade_id="child-aaa",
+                client=client,
+                child_session_id="conv_child_a",
+            )
+        )
+        deadline = 0
+        while polls < 30 and deadline < 10_000:
+            deadline += 1
+            await asyncio.sleep(0)
+        mirror.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await mirror
+
+    assert polls >= 30, f"the mirror should have kept polling a vetoed child; got {polls}"
+    # Windows of 2, 4, 8, 16 reach poll 30 in four checks; a flat window would
+    # have asked ~15 times by now.
+    assert idle_checks <= 5, (
+        f"the re-check should back off, not repeat every window; got {idle_checks} "
+        f"checks over {polls} polls"
+    )
+    assert sink.statuses() == ["running"], (
+        f"a child agy still calls running must not be closed; got {sink.statuses()}"
+    )
+
+
+async def test_a_finished_child_takes_its_own_grandchild_mirrors_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A nested sub-agent's mirror is reachable at teardown, not orphaned.
+
+    A child's steps run the same ``_process_committed_step`` path as the
+    parent's, so a nested ``INVOKE_SUBAGENT`` registers a grandchild mirror into
+    the CHILD's tracker. The reader's drain only walks the parent's, so without
+    the child cleaning up its own, a depth-2 mirror holds no reachable reference
+    and keeps polling a cascade whose agy is going away.
+    """
+    grandchild_polls = 0
+
+    def _steps(_port: int, cascade: str) -> list[dict[str, Any]]:
+        if cascade == "grand-ccc":
+            nonlocal grandchild_polls
+            grandchild_polls += 1
+            return [_load("user_input")]  # never closes: polls until cancelled
+        return [
+            _load("user_input"),
+            _invoke_subagent_step(results=[{"conversationId": "grand-ccc"}]),
+            _done_planner("Child done.", step_index=9),
+        ]
+
+    monkeypatch.setattr(reader, "get_trajectory_steps", _steps)
+    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+    # agy reports the grandchild still working, so nothing but cancellation can
+    # end its mirror — the quiescence backstop must not be what stops it here.
+    monkeypatch.setattr(
+        reader,
+        "get_all_cascade_trajectories",
+        lambda _port: {
+            "trajectorySummaries": {"grand-ccc": {"status": "CASCADE_RUN_STATUS_RUNNING"}}
+        },
+    )
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+
+    client, captured = _subagent_client(child_ids=["conv_grandchild"])
+    async with client:
+        await asyncio.wait_for(
+            reader._mirror_subagent_cascade(
+                port=4242,
+                child_cascade_id="child-aaa",
+                client=client,
+                child_session_id="conv_child_a",
+            ),
+            timeout=_MIRROR_HANG_GUARD_S,
+        )
+        assert _registrations(captured), "the nested sub-agent should have been registered"
+        settled = grandchild_polls
+        # A live mirror polls in a tight loop (its delay is collapsed), so a real
+        # pause is what makes an orphan visible; a cancelled one cannot advance.
+        await asyncio.sleep(0.05)
+
+    assert grandchild_polls == settled, (
+        f"the grandchild mirror kept polling after its parent ended "
+        f"({settled} → {grandchild_polls} polls)"
+    )
+
+
+async def test_subagent_idle_check_failure_keeps_mirroring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An RPC hiccup during the idle check must not truncate a sub-agent.
+
+    Fail-safe: a wrong "idle" ends the mirror and loses the rest of the child's
+    transcript, while a wrong "still running" costs only another poll.
+    """
+
+    def _raise(_port: int) -> dict[str, Any]:
+        raise httpx.ConnectError("agy went away")
+
+    monkeypatch.setattr(reader, "get_all_cascade_trajectories", _raise)
+    assert await reader._subagent_cascade_is_idle(4242, "child-aaa") is False

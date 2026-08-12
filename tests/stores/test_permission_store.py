@@ -276,13 +276,14 @@ def test_list_for_session_returns_all_grants(
     store.grant("alice@test.com", conv_id, level=1)
     store.grant("bob@test.com", conv_id, level=3)
 
-    grants = store.list_for_session(conv_id)
+    grants, next_cursor = store.list_for_session(conv_id)
 
     # Both grants must be present.
     assert len(grants) == 2, (
         f"Expected 2 grants for session, got {len(grants)}. "
         "list_for_session is not returning all grants."
     )
+    assert next_cursor is None
     user_ids = {g.user_id for g in grants}
     assert user_ids == {"alice@test.com", "bob@test.com"}, (
         f"Expected users alice and bob, got {user_ids}"
@@ -297,9 +298,10 @@ def test_list_for_session_empty(store: SqlAlchemyPermissionStore, db_uri: str) -
     """``list_for_session`` returns [] for a session with no grants."""
     conv_id = _create_conversation(db_uri)
 
-    result = store.list_for_session(conv_id)
+    grants, next_cursor = store.list_for_session(conv_id)
 
-    assert result == [], f"Expected [] for a session with no grants, got {result!r}"
+    assert grants == [], f"Expected [] for a session with no grants, got {grants!r}"
+    assert next_cursor is None
 
 
 def test_list_for_session_isolation(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
@@ -313,11 +315,37 @@ def test_list_for_session_isolation(store: SqlAlchemyPermissionStore, db_uri: st
 
     store.grant("alice@test.com", conv_a, level=2)
 
-    b_grants = store.list_for_session(conv_b)
+    b_grants, next_cursor = store.list_for_session(conv_b)
     assert b_grants == [], (
         f"Expected no grants for conv_b, got {b_grants}. "
         "Grants are leaking across session boundaries."
     )
+    assert next_cursor is None
+
+
+def test_list_for_session_pagination(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """``list_for_session`` pages through grants via the user_id cursor."""
+    conv_id = _create_conversation(db_uri)
+    # Zero-padded so lexical order is deterministic and predictable.
+    user_ids = [f"user{i:02d}@test.com" for i in range(5)]
+    for uid in user_ids:
+        _ensure_user(store, uid)
+        store.grant(uid, conv_id, level=1)
+
+    # First page: limit=2 → 2 grants + a cursor (the last returned user_id).
+    page1, cursor1 = store.list_for_session(conv_id, limit=2)
+    assert [g.user_id for g in page1] == user_ids[:2]
+    assert cursor1 == user_ids[1]
+
+    # Second page continues after the cursor.
+    page2, cursor2 = store.list_for_session(conv_id, limit=2, after_user_id=cursor1)
+    assert [g.user_id for g in page2] == user_ids[2:4]
+    assert cursor2 == user_ids[3]
+
+    # Final page returns the remainder with a null cursor.
+    page3, cursor3 = store.list_for_session(conv_id, limit=2, after_user_id=cursor2)
+    assert [g.user_id for g in page3] == user_ids[4:]
+    assert cursor3 is None
 
 
 # ── list_for_user ────────────────────────────────────────────────────────────

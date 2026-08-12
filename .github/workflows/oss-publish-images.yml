@@ -50,8 +50,10 @@ permissions:
   contents: read
 
 concurrency:
-  # Key by SHA so back-to-back merges each build; don't cancel mid-push.
-  group: oss-publish-images-${{ github.sha }}
+  # One build at a time: rc and final tags land minutes apart at a release cut,
+  # and built concurrently they race each other's layer cache cold and blow the
+  # job timeout. Serialized, the later build reuses the earlier one's layers.
+  group: oss-publish-images
   cancel-in-progress: false
 
 jobs:
@@ -67,9 +69,10 @@ jobs:
     runs-on: ubuntu-latest
     # Multi-arch: the linux/arm64 leg cross-builds under QEMU emulation on this
     # amd64 runner, which roughly doubles the host-image build time (emulated
-    # npm/pip native steps). 30m was tight for two native amd64 builds; give the
-    # four-variant (server+host × amd64+arm64) build headroom.
-    timeout-minutes: 60
+    # npm/pip native steps). A cold-cache four-variant (server+host × amd64+
+    # arm64) build can exceed 60m, and hitting the timeout loses the release's
+    # images silently — give it real headroom.
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0

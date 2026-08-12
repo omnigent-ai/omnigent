@@ -16,6 +16,14 @@ final class SettingsStore: ObservableObject {
   init(defaults: UserDefaults = .standard) {
     self.defaults = defaults
     #if DEBUG
+      // UI tests pass `--omnigent-reset-state` to start each case with NO
+      // saved/recent server, so a deep link to `localhost:8000` always hits the
+      // unknown-server consent path (not the in-place route for a known server).
+      if ProcessInfo.processInfo.arguments.contains("--omnigent-reset-state") {
+        for key in [Keys.serverURL, Keys.recentServers, Keys.allowedProtocols] {
+          defaults.removeObject(forKey: key)
+        }
+      }
       serverURL =
         ProcessInfo.processInfo.omnigentArgumentValue(after: "--omnigent-server-url")
         ?? ProcessInfo.processInfo.environment["OMNIGENT_SCREENSHOT_APP_URL"]
@@ -74,7 +82,7 @@ final class SettingsStore: ObservableObject {
 
 #if DEBUG
   extension ProcessInfo {
-    fileprivate func omnigentArgumentValue(after argumentName: String) -> String? {
+    func omnigentArgumentValue(after argumentName: String) -> String? {
       guard let index = arguments.firstIndex(of: argumentName) else { return nil }
       let valueIndex = arguments.index(after: index)
       guard arguments.indices.contains(valueIndex) else { return nil }

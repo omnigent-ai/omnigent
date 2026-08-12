@@ -8,19 +8,24 @@
 
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ConnectionState } from "./TerminalSession";
 import {
   SHIFT_ENTER_CSI_U,
   SYNC_ECHO_MAX_BYTES,
   SYNC_ECHO_WINDOW_MS,
   TerminalSession,
+  WHEEL_REPORTS_MAX_PER_EVENT,
   applyTerminalCopy,
   isUnexpectedTerminalClose,
   loadWebglRenderer,
   openTerminalLink,
+  sgrWheelReports,
   shouldEchoSynchronously,
   terminalTheme,
   terminalKeyEventPayload,
+  type ConnectionState,
+  wheelReportPayload,
+  type WheelMouseState,
+  type WheelScreenMetrics,
 } from "./TerminalSession";
 
 describe("openTerminalLink", () => {
@@ -243,6 +248,157 @@ describe("isUnexpectedTerminalClose", () => {
   });
 });
 
+describe("sgrWheelReports", () => {
+  it("encodes wheel-up as button 64 and wheel-down as 65, one report per line", () => {
+    expect(sgrWheelReports(-2, 5, 7)).toBe("\x1b[<64;5;7M\x1b[<64;5;7M");
+    expect(sgrWheelReports(1, 1, 1)).toBe("\x1b[<65;1;1M");
+  });
+
+  it("emits nothing for zero lines", () => {
+    expect(sgrWheelReports(0, 5, 7)).toBe("");
+  });
+});
+
+describe("wheelReportPayload", () => {
+  const sgrModes: WheelMouseState = { mouseTrackingMode: "vt200", sgrEncoding: true };
+  const screen: WheelScreenMetrics = {
+    left: 0,
+    top: 0,
+    cellWidth: 8,
+    cellHeight: 16,
+    cols: 80,
+    rows: 24,
+  };
+
+  /** Count occurrences of an SGR report prefix without a control-char regex. */
+  function countReports(data: string, prefix: string): number {
+    return data.split(prefix).length - 1;
+  }
+
+  function wheelEvent(
+    deltaY: number,
+    over: Partial<Pick<WheelEvent, "deltaMode" | "shiftKey" | "clientX" | "clientY">> = {},
+  ) {
+    return {
+      deltaY,
+      deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+      shiftKey: false,
+      clientX: 100,
+      clientY: 100,
+      ...over,
+    };
+  }
+
+  it("defers to xterm and resets the carry when mouse tracking is off", () => {
+    // WHY: with no app tracking (a plain shell on the control transport) the
+    // wheel must scroll xterm's native scrollback, and a stale fraction from a
+    // previous tracking-on scroll must not leak into the next one.
+    const result = wheelReportPayload(
+      wheelEvent(-40),
+      { mouseTrackingMode: "none", sgrEncoding: true },
+      screen,
+      0.9,
+    );
+    expect(result).toEqual({ consume: false, data: "", partial: 0 });
+  });
+
+  it("defers to xterm when the program did not request SGR encoding", () => {
+    // WHY: synthesized reports are SGR-formatted; a program tracking the
+    // mouse with the legacy default encoding could not parse them.
+    const result = wheelReportPayload(
+      wheelEvent(-40),
+      { mouseTrackingMode: "vt200", sgrEncoding: false },
+      screen,
+      0,
+    );
+    expect(result.consume).toBe(false);
+  });
+
+  it("defers on shift-wheel, zero delta, and unmeasurable layout, keeping the carry", () => {
+    // WHY: shift-wheel mirrors xterm's built-in escape hatch; deltaY 0 is a
+    // horizontal-only tick; null screen means layout isn't measurable yet. None
+    // of these should destroy accumulated fractional scroll.
+    for (const [ev, scr] of [
+      [wheelEvent(-40, { shiftKey: true }), screen],
+      [wheelEvent(0), screen],
+      [wheelEvent(-40), null],
+    ] as const) {
+      expect(wheelReportPayload(ev, sgrModes, scr, 0.4)).toEqual({
+        consume: false,
+        data: "",
+        partial: 0.4,
+      });
+    }
+  });
+
+  it("accumulates small trackpad deltas across events into whole-line reports", () => {
+    // WHY: this is the macOS-trackpad regression this helper exists for —
+    // xterm's own conversion damps sub-50px deltas to nearly nothing. Ten 4px
+    // ticks over a 16px cell are 2.5 lines and must yield exactly 2 reports,
+    // with the remaining half line carried, and every event consumed so
+    // xterm's damped path never double-fires.
+    let partial = 0;
+    let reports = "";
+    for (let i = 0; i < 10; i++) {
+      const result = wheelReportPayload(wheelEvent(4), sgrModes, screen, partial);
+      expect(result.consume).toBe(true);
+      partial = result.partial;
+      reports += result.data;
+    }
+    expect(countReports(reports, "\x1b[<65")).toBe(2);
+    expect(partial).toBeCloseTo(0.5);
+  });
+
+  it("converts a discrete wheel notch to one report per whole line, carrying the rest", () => {
+    const result = wheelReportPayload(wheelEvent(-120), sgrModes, screen, 0);
+    expect(countReports(result.data, "\x1b[<64")).toBe(7); // 120/16 = 7.5
+    expect(result.partial).toBeCloseTo(-0.5);
+  });
+
+  it("honors line and page delta modes", () => {
+    const line = wheelReportPayload(
+      wheelEvent(3, { deltaMode: WheelEvent.DOM_DELTA_LINE }),
+      sgrModes,
+      screen,
+      0,
+    );
+    expect(countReports(line.data, "\x1b[<65")).toBe(3);
+
+    const page = wheelReportPayload(
+      wheelEvent(1, { deltaMode: WheelEvent.DOM_DELTA_PAGE }),
+      sgrModes,
+      screen,
+      0,
+    );
+    expect(countReports(page.data, "\x1b[<65")).toBe(screen.rows);
+  });
+
+  it("caps the reports for one event and discards the excess", () => {
+    // WHY: the cap bounds the input burst; discarding (not banking) the excess
+    // keeps a pathological delta from continuing to scroll long after the
+    // gesture ended.
+    const result = wheelReportPayload(wheelEvent(16 * 1000), sgrModes, screen, 0);
+    expect(countReports(result.data, "\x1b[<65")).toBe(WHEEL_REPORTS_MAX_PER_EVENT);
+    expect(result.partial).toBe(0);
+  });
+
+  it("places the report at the pointer's cell, clamped to the grid", () => {
+    // clientX 100 / 8px = col 13 (1-based); clientY 100 / 16px = row 7.
+    const at = wheelReportPayload(wheelEvent(16), sgrModes, screen, 0);
+    expect(at.data).toBe("\x1b[<65;13;7M");
+
+    // Pointer outside the grid clamps to the edges instead of emitting
+    // coordinates tmux/the app would reject.
+    const clamped = wheelReportPayload(
+      wheelEvent(16, { clientX: -50, clientY: 99999 }),
+      sgrModes,
+      screen,
+      0,
+    );
+    expect(clamped.data).toBe("\x1b[<65;1;24M");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // TerminalSession class — wired up against a fake WebSocket + ResizeObserver.
 // The real xterm Terminal runs (it already does in jsdom for loadWebglRenderer
@@ -253,15 +409,17 @@ describe("isUnexpectedTerminalClose", () => {
 class FakeWebSocket {
   static OPEN = 1;
   static CLOSED = 3;
+  static instances: FakeWebSocket[] = [];
   readyState = 0;
   binaryType = "blob";
-  sent: Array<string | Uint8Array> = [];
+  sent: (string | Uint8Array)[] = [];
   closed = false;
-  private listeners: Record<string, Array<(ev: unknown) => void>> = {};
+  private listeners: Record<string, ((ev: unknown) => void)[]> = {};
   url: string;
 
   constructor(url: string) {
     this.url = url;
+    FakeWebSocket.instances.push(this);
   }
 
   addEventListener(type: string, fn: (ev: unknown) => void) {
@@ -305,20 +463,10 @@ class FakeResizeObserver {
 }
 
 describe("TerminalSession", () => {
-  let lastSocket: FakeWebSocket | null = null;
-
   beforeEach(() => {
-    lastSocket = null;
+    FakeWebSocket.instances = [];
     FakeResizeObserver.instances = [];
-    vi.stubGlobal(
-      "WebSocket",
-      class extends FakeWebSocket {
-        constructor(url: string) {
-          super(url);
-          lastSocket = this;
-        }
-      },
-    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
     vi.stubGlobal("ResizeObserver", FakeResizeObserver);
   });
 
@@ -339,7 +487,7 @@ describe("TerminalSession", () => {
       onActivity,
       onInput,
     );
-    return { session, states, container, socket: lastSocket as unknown as FakeWebSocket };
+    return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
   }
 
   it("reports 'connected' and sends an initial resize on socket open", () => {

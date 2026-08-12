@@ -14,7 +14,7 @@ use crate::paths;
 pub const DEFAULT_REPO: &str = "https://github.com/omnigent-ai/omnigent.git";
 pub const DEFAULT_REF: &str = "main";
 pub const DEFAULT_EXTRA: &str = "databricks";
-const PYTHON_VERSION: &str = "3.12";
+pub const PYTHON_VERSION: &str = "3.12";
 
 /// Durable record of how the user wants omnigent installed. Persisted so
 /// `update` reinstalls the same repo/ref/extras without re-specifying them.
@@ -73,16 +73,17 @@ impl InstallConfig {
 }
 
 /// Fail early with a clear message if the toolchain a git install needs is
-/// missing. Installing from git builds the web UI from source (Node/npm),
+/// missing. Installing from git builds the web UI from source (Node/pnpm),
 /// unlike the PyPI wheel which ships it prebuilt.
 fn preflight() -> Result<()> {
     if which("uv").is_none() {
         bail!("`uv` is not on PATH. Install it first: https://docs.astral.sh/uv/");
     }
-    if which("npm").is_none() {
+    if which("pnpm").is_none() {
         bail!(
-            "`npm` is not on PATH. Installing omnigent from git builds the web UI \
-             from source and needs Node 22+/npm. Install Node, then retry."
+            "`pnpm` is not on PATH. Installing omnigent from git builds the web UI \
+             from source and needs Node 22+/pnpm. Install Node (pnpm is \
+             available via `corepack enable` or `npm install -g pnpm`), then retry."
         );
     }
     Ok(())

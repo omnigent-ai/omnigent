@@ -21,7 +21,7 @@ module importable for testing / tooling without a live database.
 Configuration is via environment variables:
 
   DATABASE_URL          Required. SQLAlchemy URL. Both PaaS-style URLs
-                        (``postgresql://user:pw@host:5432/db``,
+                        (``postgresql://<user>:<password>@host:5432/db``,
                         ``postgres://...``) and the explicit psycopg3
                         form (``postgresql+psycopg://...``) are accepted;
                         the prefix is normalized automatically.
@@ -188,7 +188,11 @@ def _resolve_config() -> _ResolvedConfig:
     # kill-switch path gets the marker: an EXPLICIT
     # OMNIGENT_AUTH_PROVIDER=header deploy declared a header-injecting
     # proxy and must stay strict.
-    from omnigent.server.auth import env_var_is_truthy
+    from omnigent.server.auth import (
+        env_var_is_truthy,
+        resolve_auth_source,
+        warn_if_single_user_exposed,
+    )
 
     # Compose passes OMNIGENT_AUTH_PROVIDER as "" when unset
     # ("${VAR:-}"): empty and missing both mean "not explicitly pinned".
@@ -202,8 +206,6 @@ def _resolve_config() -> _ResolvedConfig:
     # compose up` deploy works with zero config. Gate on the *resolved*
     # selection so an explicit header/oidc deploy (or AUTH_ENABLED=0)
     # doesn't mint accounts secrets it never reads.
-    from omnigent.server.auth import resolve_auth_source
-
     if resolve_auth_source() == "accounts":
         from omnigent.server.accounts_secret import load_or_generate_cookie_secret
 
@@ -220,6 +222,11 @@ def _resolve_config() -> _ResolvedConfig:
             os.environ["OMNIGENT_ACCOUNTS_BASE_URL"] = detect_base_url(
                 os.environ, host=host, port=port
             )
+
+    # Logged, not printed: container stderr is buried in a platform log viewer.
+    _exposure = warn_if_single_user_exposed(host)
+    if _exposure:
+        logger.warning("%s", _exposure)
 
     return _ResolvedConfig(
         cfg=cfg,
@@ -252,6 +259,49 @@ def _select_artifact_store(resolved_config: _ResolvedConfig) -> ArtifactStore:
 
         return S3ArtifactStore(resolved_config.artifact_store_uri)
     return LocalArtifactStore(str(resolved_config.artifact_dir))
+
+
+def _build_local_llm_routing_client(
+    server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
+) -> Any | None:  # type: ignore[explicit-any]  # LLMRoutingClient | None
+    if server_llm is None:
+        return None
+    from omnigent.runtime.policies.builder import (
+        _build_policy_llm_client,
+        _resolve_server_llm_connection,
+    )
+
+    conn = _resolve_server_llm_connection(server_llm)
+    policy_client = _build_policy_llm_client(server_llm, conn)
+    if policy_client is None:
+        return None
+    from omnigent.server.smart_routing import LLMRoutingClient
+
+    return LLMRoutingClient(policy_client)
+
+
+def _build_routing(
+    cfg: dict[str, Any],
+    server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
+) -> tuple[Any, Any]:  # type: ignore[explicit-any]  # (RoutingClient | None, RoutingSettings)
+    """Build the routing client and settings from the ``routing:`` block.
+
+    Reuses the CLI's parser and builder so a Docker deployment honours the
+    same ``routing.*`` keys (router name, selection model, model prefixes) a
+    local server does.
+
+    :param cfg: The parsed server config mapping.
+    :param server_llm: The parsed server-level ``LLMConfig``, used for the
+        built-in judge when no external router is configured.
+    :returns: ``(routing_client, routing_settings)`` for ``RuntimeCaps``.
+    """
+    from omnigent.cli import _build_external_routing_client, parse_routing_settings
+
+    routing_cfg = cfg.get("routing")
+    settings = parse_routing_settings(routing_cfg)
+    if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
+        return _build_external_routing_client(routing_cfg, settings), settings
+    return _build_local_llm_routing_client(server_llm), settings
 
 
 def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
@@ -290,6 +340,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         SqlAlchemyPermissionStore,
     )
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
@@ -304,6 +355,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     host_store = HostStore(database_url)
     policy_store = SqlAlchemyPolicyStore(database_url)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(database_url)
+    project_store = SqlAlchemyProjectStore(database_url)
     # Fail startup loud on a malformed `sandbox:` section (an operator
     # typo should not surface as a runtime 502 on the first managed
     # session); the startup catch-all below logs it.
@@ -315,9 +367,22 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         cache_dir=artifact_dir / ".cache",
     )
 
+    from omnigent.spec import parse_default_policies, parse_server_llm
+
+    server_llm = parse_server_llm(cfg.get("llm"))
+
+    routing_client, routing_settings = _build_routing(cfg, server_llm)
+
+    caps = RuntimeCaps(
+        default_policies=parse_default_policies(cfg.get("policies")),
+        llm=server_llm,
+        routing_client=routing_client,
+        routing_settings=routing_settings,
+    )
+
     init_runtime(
         agent_cache=agent_cache,
-        caps=RuntimeCaps(),
+        caps=caps,
         agent_store=agent_store,
         file_store=file_store,
         conversation_store=conversation_store,
@@ -353,6 +418,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         policy_store=policy_store,
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
+        project_store=project_store,
         auth_provider=auth_provider,
         account_store=account_store,
         # Non-secret auth settings from the config file (admins are the

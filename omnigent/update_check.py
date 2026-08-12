@@ -43,9 +43,12 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import tomllib
 
 if TYPE_CHECKING:
     # Imported only for type hints; the heavy/optional imports remain lazy
@@ -167,6 +170,9 @@ class _InstalledWheelInfo:
         for picking the upgrade command — same as ``installer`` for
         most cases, but ``"pipx"`` when the pipx venv path heuristic
         fires even though ``INSTALLER`` says ``"pip"``.
+    :param extras: Optional extras recorded by the installer, e.g.
+        ``["all"]``. Empty when the installer does not preserve them
+        (e.g. ``pip``) or when none were requested.
     """
 
     install_time_epoch: float
@@ -176,6 +182,7 @@ class _InstalledWheelInfo:
     is_editable: bool
     package_version: str
     detected_installer: str | None
+    extras: tuple[str, ...] = ()
 
 
 def maybe_show_update_notice() -> None:
@@ -289,7 +296,7 @@ def _run_installed_wheel_check() -> None:
         cache is not None
         and cache.kind == "wheel"
         and cache.latest_version
-        and _is_newer(cache.latest_version, info.package_version)
+        and _should_notify_release(cache.latest_version, info.package_version)
         and cache.latest_version != cache.last_notified_version
     ):
         _print_pypi_notice(info.package_version, cache.latest_version)
@@ -330,6 +337,31 @@ def _is_newer(latest: str, current: str) -> bool:
         return parse(latest) > parse(current)
     except InvalidVersion:
         return latest != current and bool(latest)
+
+
+def _should_notify_release(latest: str, current: str) -> bool:
+    """Return whether the passive update notice should report *latest*.
+
+    A development build is already on its corresponding release line, so
+    the notice stays quiet for that line's final release. Later releases and
+    post-releases still produce a notice.
+    """
+    from packaging.version import InvalidVersion, parse
+
+    try:
+        latest_version = parse(latest)
+        current_version = parse(current)
+    except InvalidVersion:
+        return _is_newer(latest, current)
+
+    if (
+        current_version.is_devrelease
+        and latest_version.epoch == current_version.epoch
+        and latest_version.release == current_version.release
+        and not latest_version.is_postrelease
+    ):
+        return False
+    return latest_version > current_version
 
 
 def _resolve_index_url() -> str:
@@ -409,13 +441,14 @@ def _index_from_uv_config() -> str:
         indexes = data.get("index")
         if isinstance(indexes, list):
             for entry in indexes:
+                url = entry.get("url") if isinstance(entry, dict) else None
                 if (
                     isinstance(entry, dict)
                     and entry.get("default") is True
-                    and isinstance(entry.get("url"), str)
-                    and entry["url"].strip()
+                    and isinstance(url, str)
+                    and url.strip()
                 ):
-                    return entry["url"].strip().rstrip("/")
+                    return url.strip().rstrip("/")
     return ""
 
 
@@ -685,7 +718,9 @@ def _find_repo_root() -> Path | None:
     """
     package_dir = Path(__file__).resolve().parent  # <candidate>/omnigent/
     candidate = package_dir.parent
-    if (candidate / ".git").is_dir() and (candidate / "pyproject.toml").is_file():
+    # ``.git`` may be a directory (a normal clone) or a file (a git
+    # worktree), so check for existence rather than requiring a dir.
+    if (candidate / ".git").exists() and (candidate / "pyproject.toml").is_file():
         return candidate
     return None
 
@@ -938,7 +973,7 @@ def _read_build_info() -> tuple[float, str] | None:
         without ``git``); the caller treats that as "no commit info".
     """
     try:
-        from omnigent import _build_info  # type: ignore[attr-defined]
+        from omnigent import _build_info
     except ImportError:
         return None
     try:
@@ -1102,9 +1137,9 @@ def _read_installed_wheel_info() -> _InstalledWheelInfo | None:
             uv_data = None
         if isinstance(uv_data, dict):
             if install_time_epoch is None:
-                ts = uv_data.get("timestamp")
-                if isinstance(ts, dict):
-                    secs = ts.get("secs_since_epoch")
+                timestamp_data = uv_data.get("timestamp")
+                if isinstance(timestamp_data, dict):
+                    secs = timestamp_data.get("secs_since_epoch")
                     if isinstance(secs, (int, float)):
                         install_time_epoch = float(secs)
             if commit_sha is None:
@@ -1131,6 +1166,17 @@ def _read_installed_wheel_info() -> _InstalledWheelInfo | None:
     if installer == "pip" and _looks_like_pipx_install():
         detected_installer = "pipx"
 
+    # Read requested extras from installer-specific receipts when available.
+    extras: list[str] = []
+    if detected_installer == "uv":
+        uv_extras = _read_uv_tool_extras()
+        if uv_extras is not None:
+            extras = uv_extras
+    elif detected_installer == "pipx":
+        pipx_extras = _read_pipx_extras()
+        if pipx_extras is not None:
+            extras = pipx_extras
+
     return _InstalledWheelInfo(
         install_time_epoch=install_time_epoch,
         installer=installer,
@@ -1139,6 +1185,7 @@ def _read_installed_wheel_info() -> _InstalledWheelInfo | None:
         is_editable=is_editable,
         package_version=dist.version,
         detected_installer=detected_installer,
+        extras=tuple(extras),
     )
 
 
@@ -1219,6 +1266,146 @@ def _looks_like_pipx_install() -> bool:
     return "pipx/venvs" in sys.prefix.replace(os.sep, "/")
 
 
+def _uv_tool_receipt_path() -> Path | None:
+    """Locate ``uv-receipt.toml`` for a uv tool install of ``omnigent``.
+
+    uv tool installs create a per-tool venv. The receipt sits in the
+    venv root, next to ``bin/`` and ``lib/``. The running interpreter
+    is ``<tool-dir>/<pkg>/bin/python``, so its grandparent is the venv
+    root.
+
+    We deliberately do *not* resolve symlinks: uv's ``bin/python`` is a
+    symlink to a shared interpreter, and resolving it would point at the
+    uv Python install directory instead of the tool venv.
+
+    :returns: Path to ``uv-receipt.toml`` if it exists, otherwise ``None``.
+    """
+    if not sys.executable:
+        return None
+    try:
+        exe = Path(sys.executable)
+    except OSError:
+        return None
+    receipt = exe.parents[1] / "uv-receipt.toml"
+    if receipt.is_file():
+        return receipt
+    tool_dir = os.environ.get("UV_TOOL_DIR")
+    if tool_dir:
+        receipt = Path(tool_dir) / _DIST_NAME / "uv-receipt.toml"
+        if receipt.is_file():
+            return receipt
+    return None
+
+
+def _read_uv_tool_extras() -> list[str] | None:
+    """Read requested extras from the uv tool receipt.
+
+    :returns: A list of extras when a receipt for ``omnigent`` is found.
+        An empty list means the receipt exists but no extras were
+        requested. ``None`` means no receipt was found or it could not
+        be parsed.
+    """
+    receipt_path = _uv_tool_receipt_path()
+    if receipt_path is None:
+        return None
+    try:
+        data = tomllib.loads(receipt_path.read_text())
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    tool = data.get("tool")
+    if not isinstance(tool, dict):
+        return None
+    requirements = tool.get("requirements")
+    if not isinstance(requirements, list):
+        return None
+    for req in requirements:
+        if not isinstance(req, dict) or req.get("name") != _DIST_NAME:
+            continue
+        raw_extras = req.get("extras")
+        if not isinstance(raw_extras, list):
+            return []
+        return [
+            str(extra).strip() for extra in raw_extras if isinstance(extra, str) and extra.strip()
+        ]
+    return []
+
+
+def _pipx_metadata_path() -> Path | None:
+    """Locate pipx's venv metadata file for a pipx install of ``omnigent``.
+
+    :returns: Path to ``pipx_metadata.json`` if the running interpreter
+        is inside a pipx venv, otherwise ``None``.
+    """
+    if not sys.prefix:
+        return None
+    prefix = Path(sys.prefix)
+    if "pipx/venvs" not in str(prefix).replace(os.sep, "/"):
+        return None
+    candidate = prefix / "pipx_metadata.json"
+    return candidate if candidate.is_file() else None
+
+
+def _parse_extras_from_spec(spec: str) -> list[str]:
+    """Parse extras out of a PEP 508 package spec string.
+
+    Examples: ``"omnigent[all,server]"`` → ``["all", "server"]``.
+
+    :param spec: A package spec, possibly containing extras.
+    :returns: The list of extra names (preserving order, deduplicated).
+    """
+    import re
+
+    match = re.search(r"\[([^\]]+)\]", spec)
+    if not match:
+        return []
+    seen: set[str] = set()
+    extras: list[str] = []
+    for raw in match.group(1).split(","):
+        extra = raw.strip()
+        if extra and extra not in seen:
+            seen.add(extra)
+            extras.append(extra)
+    return extras
+
+
+def _read_pipx_extras() -> list[str] | None:
+    """Read requested extras from pipx's venv metadata.
+
+    :returns: A list of extras parsed from ``main_package.package_or_url``.
+        An empty list means metadata was found but the spec had no
+        extras. ``None`` means the metadata could not be read.
+    """
+    metadata_path = _pipx_metadata_path()
+    if metadata_path is None:
+        return None
+    try:
+        data = json.loads(metadata_path.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    main = data.get("main_package")
+    if not isinstance(main, dict):
+        return None
+    spec = main.get("package_or_url")
+    if not isinstance(spec, str):
+        return []
+    return _parse_extras_from_spec(spec)
+
+
+def _extras_str(extras: Collection[str]) -> str:
+    """Format extras as a PEP 508 extra suffix.
+
+    :param extras: Iterable of extra names.
+    :returns: ``"[a,b]"`` if extras is non-empty, otherwise ``""``.
+    """
+    if not extras:
+        return ""
+    return f"[{','.join(sorted(extras))}]"
+
+
 @dataclass
 class _UpgradeSuggestion:
     """A suggested upgrade command for the user's install shape.
@@ -1281,8 +1468,27 @@ def _pip_invocation() -> str:
     return f"{shlex.quote(sys.executable)} -m pip"
 
 
+def _package_spec(*, version: str | None = None, extras: Collection[str] = ()) -> str:
+    """Build a PEP 508 package spec for ``omnigent``.
+
+    :param version: Optional pinned version, e.g. ``"0.2.0"``.
+    :param extras: Optional extras to append.
+    :returns: ``"omnigent"``, ``"omnigent[all]"``, ``"omnigent==0.2.0[all]"``,
+        etc., depending on which arguments were provided.
+    """
+    spec = _DIST_NAME
+    if version:
+        spec += f"=={version}"
+    spec += _extras_str(extras)
+    return spec
+
+
 def _build_upgrade_suggestion(
-    info: _InstalledWheelInfo, *, allow_prerelease: bool = False
+    info: _InstalledWheelInfo,
+    *,
+    allow_prerelease: bool = False,
+    extra_overrides: tuple[str, ...] = (),
+    target_version: str | None = None,
 ) -> _UpgradeSuggestion:
     """Build the right upgrade command for the user's install shape.
 
@@ -1294,6 +1500,11 @@ def _build_upgrade_suggestion(
         the installer's allow-pre-releases flag (uv ``--prerelease allow``,
         pip ``--pre``, pipx ``--pip-args=--pre``) so the upgrade can land on
         a release candidate. A no-op for installers without a known flag.
+    :param extra_overrides: Extras supplied by the user with
+        ``omni upgrade --extra``. These take precedence over installer
+        metadata.
+    :param target_version: Pin the upgrade to a specific version instead
+        of resolving the latest release.
     :returns: A :class:`_UpgradeSuggestion` whose ``command`` is the
         line printed in the nag panel and whose ``runnable`` flag
         tells the caller whether the line is an actual invocation
@@ -1302,46 +1513,180 @@ def _build_upgrade_suggestion(
     """
     installer = info.detected_installer or info.installer
     pre = _PRERELEASE_FLAG.get(installer or "", "") if allow_prerelease else ""
+    extras = sorted(set(info.extras) | set(extra_overrides))
 
     if info.vcs_url:
         # VCS install — we know the exact source URL.
+        vcs_url_with_extras = info.vcs_url
+        if extras:
+            # Strip any existing fragment and append an egg spec with extras.
+            base = vcs_url_with_extras.split("#", 1)[0]
+            vcs_url_with_extras = f"{base}#egg={_package_spec(extras=extras)}"
         if installer == "uv":
             return _UpgradeSuggestion(
-                command=f"uv tool install --reinstall {info.vcs_url}{pre}",
+                command=f"uv tool install --reinstall {vcs_url_with_extras}{pre}",
                 runnable=True,
             )
         if installer == "pipx":
+            if extras:
+                return _UpgradeSuggestion(
+                    command=f"pipx install --force {vcs_url_with_extras}",
+                    runnable=True,
+                )
             # pipx tracks the original spec; ``reinstall`` re-pulls it.
             return _UpgradeSuggestion(command=f"pipx reinstall {_DIST_NAME}{pre}", runnable=True)
         if installer in ("pip", None):
             return _UpgradeSuggestion(
-                command=f"{_pip_invocation()} install --force-reinstall {info.vcs_url}{pre}",
+                command=(
+                    f"{_pip_invocation()} install --force-reinstall {vcs_url_with_extras}{pre}"
+                ),
                 runnable=True,
             )
         if installer == "poetry":
-            return _UpgradeSuggestion(command=f"poetry add --force {info.vcs_url}", runnable=True)
+            return _UpgradeSuggestion(
+                command=f"poetry add --force {vcs_url_with_extras}", runnable=True
+            )
         # Unknown installer with a known URL — fall through to a
         # generic suggestion that names the URL so the user can wire
         # it into their own tool. Not runnable.
         return _UpgradeSuggestion(
-            command=f"reinstall {_DIST_NAME} from {info.vcs_url}", runnable=False
+            command=f"reinstall {_DIST_NAME} from {vcs_url_with_extras}", runnable=False
         )
 
     # Registry install — no VCS URL recorded.
+    registry_spec = _package_spec(version=target_version, extras=extras)
     if installer == "uv":
+        if target_version or extras:
+            # ``uv tool upgrade`` accepts only a tool name (and optional
+            # version), not extras. Reinstall with the full PEP 508 spec
+            # to preserve the extras the user originally requested.
+            return _UpgradeSuggestion(
+                command=f"uv tool install --reinstall {registry_spec}{pre}",
+                runnable=True,
+            )
         return _UpgradeSuggestion(command=f"uv tool upgrade {_DIST_NAME}{pre}", runnable=True)
     if installer == "pipx":
+        if target_version or extras:
+            # ``pipx upgrade`` does not accept extras / version specs.
+            # ``pipx install --force`` does.
+            return _UpgradeSuggestion(
+                command=f"pipx install --force {registry_spec}",
+                runnable=True,
+            )
         return _UpgradeSuggestion(command=f"pipx upgrade {_DIST_NAME}{pre}", runnable=True)
     if installer == "pip":
         return _UpgradeSuggestion(
-            command=f"{_pip_invocation()} install -U {_DIST_NAME}{pre}", runnable=True
+            command=f"{_pip_invocation()} install -U {registry_spec}{pre}",
+            runnable=True,
         )
     if installer == "poetry":
+        # Poetry update does not accept extras on the command line.
         return _UpgradeSuggestion(command=f"poetry update {_DIST_NAME}", runnable=True)
     return _UpgradeSuggestion(
         command=f"reinstall {_DIST_NAME} from your original source",
         runnable=False,
     )
+
+
+# Canonical public repo for nightly builds. Nightlies are git tags consumed
+# straight from GitHub (they never reach an index), so the channel lives
+# upstream by definition: fork installs also upgrade onto upstream nightlies.
+_NIGHTLY_REPO_URL = "https://github.com/omnigent-ai/omnigent"
+
+
+def _newest_nightly_version(ls_remote_output: str) -> str | None:
+    """Pick the newest nightly version from ``git ls-remote --tags`` output.
+
+    Nightly tags are strictly ``vX.Y.Z.devYYYYMMDD``; the 8-digit datestamp
+    requirement screens out legacy ``.dev0``-style tags, and rc/final tags
+    and annotated-tag peel lines (``^{}``) never match. Ordering is PEP 440,
+    so the first nightly after a main version bump outranks all older ones.
+
+    :param ls_remote_output: Raw ``git ls-remote`` stdout (tab-separated
+        ``<sha> refs/tags/<name>`` lines).
+    :returns: The newest nightly version without the leading ``v`` (e.g.
+        ``"0.8.0.dev20260804"``), or ``None`` when no nightly tag exists.
+    """
+    import re
+
+    from packaging.version import InvalidVersion, Version
+
+    pattern = re.compile(r"^v(\d+\.\d+\.\d+\.dev\d{8})$")
+    versions: list[Version] = []
+    for line in ls_remote_output.splitlines():
+        match = pattern.match(line.rpartition("refs/tags/")[2].strip())
+        if match is None:
+            continue
+        with contextlib.suppress(InvalidVersion):
+            versions.append(Version(match.group(1)))
+    return str(max(versions)) if versions else None
+
+
+def _latest_nightly_version(repo_url: str = _NIGHTLY_REPO_URL) -> str | None:
+    """Resolve the newest nightly version from the repo's tags, or ``None``.
+
+    Best-effort ``git ls-remote`` with a tight timeout, like
+    ``_remote_git_head``: any failure (offline, missing ``git``, no nightly
+    tags yet) yields ``None`` so the caller prints an actionable message
+    instead of crashing.
+
+    :param repo_url: Repo to list tags from; defaults to the canonical repo.
+    :returns: e.g. ``"0.8.0.dev20260804"``, or ``None``.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "--tags", repo_url, "refs/tags/v*.dev*"],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+            check=True,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return _newest_nightly_version(result.stdout)
+
+
+def _build_nightly_upgrade_suggestion(
+    info: _InstalledWheelInfo,
+    nightly_version: str,
+    *,
+    extra_overrides: tuple[str, ...] = (),
+) -> _UpgradeSuggestion:
+    """Build the command that moves this install onto a nightly tag.
+
+    Nightlies are git tags, not index releases, so every installer gets a
+    git-pinned spec for the canonical repo. That includes registry installs
+    (this is how an index install hops onto the nightly channel) and VCS
+    installs of a fork (nightly tags only exist upstream). Extras follow
+    the same union rule as :func:`_build_upgrade_suggestion`; the CLI
+    refuses the registry install shapes that cannot record extras (pip /
+    ``uv pip``) before building.
+
+    :param info: Metadata from ``_read_installed_wheel_info``.
+    :param nightly_version: Target version without the leading ``v``.
+    :param extra_overrides: Extras supplied with ``omni upgrade --extra``.
+    :returns: See :func:`_build_upgrade_suggestion`.
+    """
+    extras = sorted(set(info.extras) | set(extra_overrides))
+    spec = f"git+{_NIGHTLY_REPO_URL}@v{nightly_version}"
+    if extras:
+        # Same egg-fragment shape the VCS upgrade path uses for extras.
+        spec = f"{spec}#egg={_package_spec(extras=extras)}"
+    installer = info.detected_installer or info.installer
+    if installer == "uv":
+        # --force: replacing a registry install with a git-sourced one (or
+        # hopping between tags) is an overwrite, not an upgrade, in uv's model.
+        return _UpgradeSuggestion(command=f"uv tool install --force {spec}", runnable=True)
+    if installer == "pipx":
+        return _UpgradeSuggestion(command=f"pipx install --force {spec}", runnable=True)
+    if installer == "pip" or (installer is None and info.vcs_url is not None):
+        return _UpgradeSuggestion(
+            command=f"{_pip_invocation()} install --force-reinstall {spec}", runnable=True
+        )
+    if installer == "poetry":
+        return _UpgradeSuggestion(command=f"poetry add --force {spec}", runnable=True)
+    # Unknown installer on a registry install: don't guess the tool.
+    return _UpgradeSuggestion(command=f"install {_DIST_NAME} from {spec}", runnable=False)
 
 
 def _run_upgrade_command(command: str, console: Console) -> int:

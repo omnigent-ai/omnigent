@@ -81,6 +81,9 @@ deploy/
 │   ├── src/index.js      server deploy target. See its README.md.
 │   └── README.md
 │
+├── blaxel/            ← Blaxel sandbox-provider guide + managed-host config;
+│   └── README.md         NOT a server deploy target.
+│
 ├── islo/              ← Islo sandbox-provider guide (gateway credential
 │   └── README.md         injection); NOT a server deploy target.
 │
@@ -180,6 +183,39 @@ remote DB.
 256 MB default does not, so the Fly config pins a 1 GB machine, and the
 Modal app pins `memory=1024` for the same reason.
 
+## Serving: put an HTTP/2 proxy in front for many concurrent views
+
+Each open session in the web UI holds a long-lived streaming HTTP
+response (`GET /v1/sessions/{id}/stream`, `text/event-stream`) for as
+long as the view is on screen. Over **HTTP/1.1 browsers cap concurrent
+connections at ~6 per origin**, and every open stream occupies one of
+those slots. Open a handful of windows or tabs against the same server
+and the pool fills with held-open streams — then every *other* request
+the UI makes (sending a message, the session list, `/health`, auth)
+queues behind the cap and never fires. The symptom is the whole UI
+appearing to freeze across all windows while the server itself is idle;
+in DevTools → Network the stuck requests sit in **Stalled/Queued**, not
+"waiting for server".
+
+**Fix: serve over HTTP/2.** HTTP/2 multiplexes every stream over one
+connection, so the per-origin cap stops mattering. `uvicorn` (the
+server's ASGI server) speaks HTTP/1.1 only, so HTTP/2 comes from a
+reverse proxy that terminates TLS in front of it — which most real
+deploys already have:
+
+- **The bundled Caddy overlay** (`docker/docker-compose.https.yaml`)
+  gives you this for free — Caddy negotiates HTTP/2 (and HTTP/3) over
+  TLS via ALPN with no extra config. See
+  [`docker/README.md`](docker/README.md#multi-user-mode-oidc).
+- **The one-click platforms** (Render, Railway, Fly, Cloudflare) and
+  managed **Databricks** terminate TLS with HTTP/2 at their edge, so
+  they're already covered.
+
+The gap is only when you expose the raw `:8000` HTTP/1.1 port directly
+to browsers (e.g. `docker compose up` with no proxy, reached over
+plain HTTP). That's fine for a single window; put a proxy in front once
+you or your team routinely open several.
+
 ## Execution model
 
 Omnigent runs in two pieces that talk to each other over a
@@ -232,13 +268,10 @@ omnigent run path/to/agent.yaml --server https://your-host
 
 Don't want a laptop to be the host? Run the host in a cloud sandbox instead.
 
-**From the CLI (Modal, Daytona, Islo, or E2B).** Install the provider extra when
-needed (`pip install 'omnigent[modal]'`, `'omnigent[daytona]'`, or
-`'omnigent[e2b]'`; Islo uses the built-in HTTP client), authenticate
-(`modal token new`, `DAYTONA_API_KEY`, `ISLO_API_KEY`, or `E2B_API_KEY`), then:
+**From the CLI (Modal, Daytona, Blaxel, Islo, or E2B).** Install the provider extra when needed (`pip install 'omnigent[modal]'`, `'omnigent[daytona]'`, `'omnigent[blaxel]'`, or `'omnigent[e2b]'`; Islo uses the built-in HTTP client). Authenticate with `modal token new`, `DAYTONA_API_KEY`, Blaxel's `BL_WORKSPACE` and `BL_API_KEY`, `ISLO_API_KEY`, or `E2B_API_KEY`. Then run:
 
 ```bash
-omnigent sandbox create --provider modal     # or --provider daytona / islo / e2b
+omnigent sandbox create --provider modal     # or --provider daytona / blaxel / islo / e2b
 omnigent sandbox connect --provider modal --sandbox-id <id> --server https://your-host
 ```
 
@@ -251,7 +284,7 @@ omnigent sandbox connect --provider modal --sandbox-id <id> --server https://you
 > rather than a registry image — build it once first; see
 > [`e2b/README.md`](e2b/README.md).
 
-**Server-managed (Modal, Daytona, Islo, or E2B).** With *managed hosts*, creating a
+**Server-managed (Modal, Daytona, Blaxel, Islo, or E2B).** With *managed hosts*, creating a
 session with `"host_type": "managed"` (e.g.
 `POST /v1/sessions {"agent_id": ..., "host_type": "managed"}`) makes the
 server provision a sandbox, start a host in it, and run the session there.
@@ -267,19 +300,11 @@ sandbox:
 
 Modal credentials come from the server's environment (`MODAL_TOKEN_ID` /
 `MODAL_TOKEN_SECRET`, or a mounted `~/.modal.toml`), not the config file.
-Daytona reads `DAYTONA_API_KEY`; Islo reads `ISLO_API_KEY` (and optional
-`ISLO_BASE_URL`); E2B reads `E2B_API_KEY` from the server environment.
+Daytona reads `DAYTONA_API_KEY`. Blaxel reads `BL_WORKSPACE` and `BL_API_KEY`. Islo reads `ISLO_API_KEY` and optional `ISLO_BASE_URL`. E2B reads `E2B_API_KEY` from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
 
-**The host image.** Sandboxes boot from the official prebaked host image
-(`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host`
-target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in
-seconds instead of installing Omnigent at boot. The image ships the
-coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`), so agents on any harness run
-in the sandbox with nothing extra to install. To run sandboxes from your own
-image instead (a fork, or extra tooling baked in), build the same `host`
-target and point the config at it:
+**The host image.** Most sandboxes boot from the official prebaked host image (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host` target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in seconds instead of installing Omnigent at boot. The image ships the coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`). Blaxel uses `blaxel/omnigent-host:latest`, which combines this host runtime with Blaxel's required `sandbox-api`. E2B uses its provider template. To use a custom image instead, build the same `host` target and point the provider config at it:
 
 ```bash
 docker build -f docker/Dockerfile --target host \
@@ -295,11 +320,7 @@ sandbox:
     image: docker.io/<you>/omnigent-host:latest
 ```
 
-For private registries, set `OMNIGENT_MODAL_REGISTRY_SECRET` on the server
-to the name of a Modal secret holding `REGISTRY_USERNAME` /
-`REGISTRY_PASSWORD`; for CLI-launched sandboxes, `OMNIGENT_MODAL_HOST_IMAGE`
-(or `OMNIGENT_DAYTONA_HOST_IMAGE` / `OMNIGENT_ISLO_HOST_IMAGE`) overrides the
-image ref.
+For private registries, set `OMNIGENT_MODAL_REGISTRY_SECRET` on the server to the name of a Modal secret holding `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`. For CLI-launched sandboxes, `OMNIGENT_MODAL_HOST_IMAGE`, `OMNIGENT_DAYTONA_HOST_IMAGE`, `OMNIGENT_BLAXEL_HOST_IMAGE`, or `OMNIGENT_ISLO_HOST_IMAGE` overrides the image.
 
 **LLM credentials for managed sessions.** A fresh sandbox has no API keys.
 Park your provider credentials in a [Modal secret](https://modal.com/secrets)
@@ -327,9 +348,7 @@ sandbox:
     secrets: [omnigent-llm]
 ```
 
-For Daytona and Islo, list server environment variable names under
-`sandbox.daytona.env` or `sandbox.islo.env`; the launcher copies the current
-server env values into each sandbox:
+For Daytona, Blaxel, and Islo, list server environment variable names under `sandbox.daytona.env`, `sandbox.blaxel.env`, or `sandbox.islo.env`. The launcher copies the current server values into each sandbox:
 
 ```yaml
 sandbox:
@@ -354,11 +373,7 @@ a Modal secret (GitLab: add `GIT_USERNAME=oauth2`). The host image's git
 credential helper picks it up for the clone and for the agent's later
 fetch/push.
 
-The full Modal guide (CLI sandboxes, custom images, LLM and git credentials,
-troubleshooting) lives at [`modal/README.md`](modal/README.md); the Daytona
-guide lives at [`daytona/README.md`](daytona/README.md); the Islo guide
-(including its gateway credential-injection model) lives at
-[`islo/README.md`](islo/README.md).
+See the [`modal`](modal/README.md), [`daytona`](daytona/README.md), [`blaxel`](blaxel/README.md), and [`islo`](islo/README.md) guides for provider setup and troubleshooting.
 
 ## Auth
 

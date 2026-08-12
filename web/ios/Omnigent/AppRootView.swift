@@ -3,6 +3,7 @@ import SwiftUI
 struct AppRootView: View {
   @EnvironmentObject private var settings: SettingsStore
   @EnvironmentObject private var router: AppRouter
+  @StateObject private var theme = ThemeController.shared
   @State private var mode: Mode
 
   /// A deep link to a server the user has never connected to, awaiting the
@@ -41,12 +42,14 @@ struct AppRootView: View {
           // Record the CLEAN server URL (no /c/<id>) — the conversation path
           // lives only in the load URL, never in recents, so a later deep link
           // resolves against an un-polluted server identity.
-          loadSucceeded: { _ in
+          loadSucceeded: {
             settings.rememberRecentServer(serverURL)
           }
         )
       }
     }
+    .environmentObject(theme)
+    .preferredColorScheme(theme.source.colorScheme)
     .task {
       guard shouldAutoOpenSavedServer else { return }
       // A deep link that arrived before this task ran already moved us off the
@@ -60,6 +63,23 @@ struct AppRootView: View {
       }
     }
     .onOpenURL { url in handleDeepLink(url) }
+    // DEBUG-only test seam: a UI test can't reliably deliver a custom-scheme
+    // URL to the app under test on this toolchain (`XCUIApplication.open` drops
+    // custom schemes; a host-driven `simctl openurl` can't be invoked from the
+    // iOS test bundle). So a launch argument routes the URL through the REAL
+    // `handleDeepLink`/`DeepLink.parse` path — the same code `.onOpenURL` calls
+    // — deterministically, in CI, with no simulator URL delivery. Compiled out
+    // of Release, so it can never affect production behavior. The value is the
+    // raw link (e.g. `omnigent://host/c/<id>`), exactly what the system would
+    // hand `onOpenURL`.
+    #if DEBUG
+      .task {
+        guard let url = ProcessInfo.processInfo.omnigentOpenURLArgument else { return }
+        // Defer one runloop tick so the view is fully mounted before the consent
+        // alert / navigation is driven, mirroring a warm `onOpenURL` arrival.
+        DispatchQueue.main.async { handleDeepLink(url) }
+      }
+    #endif
     .alert(
       "Open this Omnigent link?",
       isPresented: $showDeepLinkConsent
@@ -99,6 +119,20 @@ struct AppRootView: View {
   }
 }
 
+#if DEBUG
+  extension ProcessInfo {
+    /// The `--omnigent-open-url <url>` DEBUG-only launch argument, used by UI
+    /// tests to drive a deep link through the real handler (see the `.task` seam
+    /// in `AppRootView`). Nil if absent or unparseable.
+    fileprivate var omnigentOpenURLArgument: URL? {
+      guard let index = arguments.firstIndex(of: "--omnigent-open-url"),
+        arguments.indices.contains(index + 1)
+      else { return nil }
+      return URL(string: arguments[index + 1])
+    }
+  }
+#endif
+
 // MARK: Deep links
 
 extension AppRootView {
@@ -114,7 +148,19 @@ extension AppRootView {
   ///     grant; the workspace-mount probe runs only AFTER consent, so a link to
   ///     an attacker-chosen host makes no pre-consent network request.
   private func handleDeepLink(_ url: URL) {
-    guard let deepLink = DeepLink.parse(url) else { return }
+    guard let deepLink = DeepLink.parse(url) else {
+      #if DEBUG
+        if ProcessInfo.processInfo.environment["OMNIGENT_DEEPLINK_TRACE"] != nil {
+          NSLog("[DeepLink] REJECTED \(url.absoluteString)")
+        }
+      #endif
+      return
+    }
+    #if DEBUG
+      if ProcessInfo.processInfo.environment["OMNIGENT_DEEPLINK_TRACE"] != nil {
+        NSLog("[DeepLink] ACCEPTED origin=\(deepLink.origin) path=\(deepLink.path)")
+      }
+    #endif
     let targetOrigin = deepLink.origin
 
     if currentWebOrigin == targetOrigin {
@@ -144,7 +190,7 @@ extension AppRootView {
 
   /// Consent was given for an unknown server — discover the workspace mount
   /// (the only network request, AFTER consent), then switch. The origin is
-  /// unchanged by the probe (it only appends `/ml/omnigents` under it), so the
+  /// unchanged by the probe (it only appends the SPA mount path under it), so the
   /// consent decision stands. Recording the server happens on load success
   /// (loadSucceeded), so a server that fails to load isn't remembered.
   private func confirmUnknownDeepLink() {
@@ -168,7 +214,8 @@ extension AppRootView {
   }
 
   /// Join a basename-less SPA path (`/c/<id>`) onto a server URL that may carry
-  /// a workspace mount (`/ml/omnigents`). The path lives UNDER the mount, so it
+  /// a workspace mount (`WorkspaceURLExpander.workspaceUIPath`). The path lives
+  /// UNDER the mount, so it
   /// is string-concatenated (not URL-resolved, which would anchor against the
   /// origin and drop the mount) — mirroring the desktop's `resolveServerPath`.
   private func conversationURL(for serverURL: URL, path: String) -> URL {

@@ -196,15 +196,20 @@ def test_tools_registered_without_spec_optin() -> None:
     assert names >= _ALL_NAMES
 
 
-def test_create_tool_schema_matches_connected_host_scope() -> None:
+def test_create_tool_schema_makes_workspace_and_host_optional() -> None:
     from omnigent.tools.builtins.scheduled_tasks import SysScheduledTaskCreateTool
 
     schema = SysScheduledTaskCreateTool().get_schema()["function"]["parameters"]
     properties = schema["properties"]
+    # workspace / host_id stay available as optional properties (a task that
+    # does code work still pins them), but are no longer required — a
+    # no-workspace research / summary / chat-only task omits both.
     assert "workspace" in properties
     assert "host_id" in properties
     assert "base_branch" not in properties
-    assert set(schema["required"]) >= {"workspace", "host_id"}
+    assert "workspace" not in schema["required"]
+    assert "host_id" not in schema["required"]
+    assert set(schema["required"]) == {"name", "prompt", "rrule", "agent_id"}
 
 
 def test_update_tool_schema_allows_connected_host_changes() -> None:

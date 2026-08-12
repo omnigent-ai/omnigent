@@ -14,11 +14,15 @@ stubs.
 Pages covered:
 
 - **Empty landing (`/`)** — the open left sidebar plus the `NewChatLandingScreen`
-  ("What should we do?") hero and composer.
+  ("What should we build?") hero and composer.
   [`test_landing_snapshot.py`](test_landing_snapshot.py)
 - **Chat conversation (`/c/{id}`)** — a fully-mocked one-turn transcript (user
   question + assistant markdown reply) rendered as message bubbles, with the
   composer below. [`test_chat_snapshot.py`](test_chat_snapshot.py)
+- **Multi-turn chat with TurnRail (`/c/{id}`)** — a fully-mocked several-turn
+  transcript that mounts the left-edge tick minimap (the rail only renders for
+  two or more turns), guarding the spacing between the transcript column and the
+  rail. [`test_chat_turn_rail_snapshot.py`](test_chat_turn_rail_snapshot.py)
 
 Baselines are committed under `snapshots/<test_module>/<test_name>/<name>[chromium][linux].png`.
 
@@ -42,11 +46,11 @@ it.
 
 ## Is this check merge-blocking?
 
-The check **`UI Snapshot (visual baselines)`** blocks merges only if it's listed in
-the repo's required-checks set (branch protection / `.github/scripts/merge-ready`,
-which is generated and synced separately). Until it's added there it's an
-**advisory** red check — visible, but not enforced. Registering it as required is
-a one-line change to that synced config, outside this directory.
+The check **`UI Snapshot (visual baselines)`** is **merge-blocking**: it's listed
+in the repo's required-checks set (`.github/scripts/merge-ready/required.sh`, in
+both `REQUIRED` and `ALLOW_SKIP`). A drift against the committed baseline fails
+the check and blocks the merge until the baseline is regenerated (label the PR —
+see below) or the UI change is reverted.
 
 It's **safe to register as required**: a PR that touches none of the render
 inputs skips the render via the `detect` job's `if` gate, and a job skipped by
@@ -169,7 +173,8 @@ baseline and break CI. Use the Docker path above to produce a committable PNG.
 ```bash
 uv sync --extra all --extra dev
 uv run playwright install --with-deps chromium
-cd web && npm ci --legacy-peer-deps && npm run build && cd ..
+pnpm install --frozen-lockfile --filter web
+pnpm --filter web run build
 # First run with no baseline creates one (and fails); subsequent runs compare:
 uv run pytest tests/e2e_ui/visual -m visual --ui-skip-build
 ```

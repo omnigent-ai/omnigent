@@ -10,6 +10,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -27,17 +28,8 @@ from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
-    ANTIGRAVITY_NATIVE_CODING_AGENT,
-    CLAUDE_NATIVE_CODING_AGENT,
-    CODEX_NATIVE_CODING_AGENT,
-    CURSOR_NATIVE_CODING_AGENT,
-    GOOSE_NATIVE_CODING_AGENT,
-    HERMES_NATIVE_CODING_AGENT,
-    KIMI_NATIVE_CODING_AGENT,
-    KIRO_NATIVE_CODING_AGENT,
-    OPENCODE_NATIVE_CODING_AGENT,
-    PI_NATIVE_CODING_AGENT,
-    QWEN_NATIVE_CODING_AGENT,
+    NativeHarnessProvider,
+    native_provider_for_key,
 )
 from omnigent.resources import examples as _examples_resources
 from omnigent.runtime import (
@@ -51,6 +43,10 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import session_live_state
 from omnigent.server.auth import AuthProvider, SharingMode
+from omnigent.server.background_session_titles import (
+    BackgroundSessionTitleCoordinator,
+    RunnerBackgroundTitleGenerator,
+)
 from omnigent.server.managed_hosts import ManagedSandboxConfig
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
@@ -65,9 +61,11 @@ from omnigent.server.performance_metrics import (
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
+from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
+from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
@@ -76,10 +74,13 @@ from omnigent.server.routes.sessions import (
     SessionLiveness,
     announce_hosts_changed,
     create_sessions_router,
+    set_server_host_registry,
     set_server_runner_router,
 )
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
+from omnigent.server.routes.usage import create_usage_router
+from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
@@ -93,6 +94,7 @@ from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
+from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
@@ -128,10 +130,6 @@ def _register_web_mimetypes() -> None:
         (".map", "application/json"),
         (".wasm", "application/wasm"),
         (".svg", "image/svg+xml"),
-        # Python's mimetypes DB has no ``.webmanifest`` entry, so without this
-        # Starlette serves the PWA manifest as ``application/octet-stream`` and
-        # browsers silently refuse to install the app.
-        (".webmanifest", "application/manifest+json"),
     ):
         mimetypes.add_type(ctype, ext)
 
@@ -153,19 +151,18 @@ _API_ONLY_LANDING_HTML = Path(__file__).parent / "static" / "api_only_landing.ht
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
-_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1"})
+_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1", ".well-known"})
+
+# Envelope version of GET /.well-known/omnigent.json (see the route for the
+# full contract). Bump ONLY for a change a client cannot absorb by ignoring
+# what it doesn't recognize: a removed/renamed field, or a changed meaning for
+# an existing one. Adding a new field is invisible to older clients and must
+# NOT bump this — they read the fields they know and skip the rest.
+#
+# Clients gate on `>=`, never `==`: a newer server must keep working with an
+# older desktop shell.
+WELL_KNOWN_MANIFEST_VERSION = 1
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
-_CLAUDE_NATIVE_AGENT_NAME = CLAUDE_NATIVE_CODING_AGENT.agent_name
-_CODEX_NATIVE_AGENT_NAME = CODEX_NATIVE_CODING_AGENT.agent_name
-_PI_NATIVE_AGENT_NAME = PI_NATIVE_CODING_AGENT.agent_name
-_OPENCODE_NATIVE_AGENT_NAME = OPENCODE_NATIVE_CODING_AGENT.agent_name
-_CURSOR_NATIVE_AGENT_NAME = CURSOR_NATIVE_CODING_AGENT.agent_name
-_KIRO_NATIVE_AGENT_NAME = KIRO_NATIVE_CODING_AGENT.agent_name
-_GOOSE_NATIVE_AGENT_NAME = GOOSE_NATIVE_CODING_AGENT.agent_name
-_HERMES_NATIVE_AGENT_NAME = HERMES_NATIVE_CODING_AGENT.agent_name
-_ANTIGRAVITY_NATIVE_AGENT_NAME = ANTIGRAVITY_NATIVE_CODING_AGENT.agent_name
-_QWEN_NATIVE_AGENT_NAME = QWEN_NATIVE_CODING_AGENT.agent_name
-_KIMI_NATIVE_AGENT_NAME = KIMI_NATIVE_CODING_AGENT.agent_name
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
@@ -285,6 +282,43 @@ def _request_status_code_for_metrics(
     if failed:
         return 500
     return None
+
+
+def _load_debug_routers(
+    module_paths: list[str] | None,
+) -> list[tuple[Any, str, list[str]]]:
+    """Import each dotted module and collect its ``DEBUG_ROUTERS`` entries.
+
+    Mirrors the ``policy_modules`` load-by-name pattern: a module that fails to
+    import (e.g. an out-of-tree ``dev/`` module absent from a production
+    install) or lacks a ``DEBUG_ROUTERS`` list is logged and skipped, never
+    raised — a stray config key must not take the server down.
+
+    :param module_paths: Dotted module paths naming modules that expose a
+        ``DEBUG_ROUTERS`` list of ``(router, prefix, tags)`` tuples. ``None``
+        or empty yields no routers.
+    :returns: The flattened ``(router, prefix, tags)`` tuples to mount.
+    """
+    routers: list[tuple[Any, str, list[str]]] = []
+    for module_path in module_paths or []:
+        try:
+            mod = import_module(module_path)
+        except ImportError:
+            _logger.warning(
+                "Failed to import debug router module %s; skipping",
+                module_path,
+                exc_info=True,
+            )
+            continue
+        entries = getattr(mod, "DEBUG_ROUTERS", None)
+        if not isinstance(entries, list):
+            _logger.warning(
+                "Module %s has no DEBUG_ROUTERS list; skipping",
+                module_path,
+            )
+            continue
+        routers.extend(entries)
+    return routers
 
 
 # MCP startup warming moved to runner; see designs/RUNNER_MCP.md.
@@ -442,17 +476,7 @@ def _ensure_default_agents(
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    _ensure_default_claude_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_codex_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_pi_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_opencode_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_cursor_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_kiro_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_goose_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_hermes_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_antigravity_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_qwen_agent(agent_store, artifact_store, agent_cache)
-    _ensure_default_kimi_native_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_native_agents(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
@@ -527,434 +551,76 @@ def _ensure_extra_builtin_agents(
         _logger.info("Registered extra built-in agent %r from %s", name, source)
 
 
-def _build_claude_native_bundle() -> bytes:
+def _build_native_bundle(provider: NativeHarnessProvider) -> bytes:
     """
-    Build a gzipped tarball of the claude-native-ui agent spec.
+    Materialize a built-in native agent's spec and tar it (registry-driven).
 
+    Replaces the 11 hand-written ``_build_<x>_native_bundle`` functions: resolves
+    the provider's ``materialize_agent_spec`` hook (``_materialize_<key>_agent_spec``)
+    and runs the same materialize -> bundle -> tar dance they all shared. The
+    per-harness ``model`` variance (codex/kiro/opencode take a keyword-only
+    ``model``; the rest take just ``tmpdir``) is bridged by signature inspection,
+    so the produced bytes are byte-identical to the pre-loop builders (which all
+    passed ``model=None`` where accepted).
+
+    :param provider: The native harness provider row.
     :returns: Gzipped tarball bytes suitable for the artifact store.
     """
+    import inspect
     import tempfile
 
-    from omnigent.claude_native import _materialize_claude_agent_spec
+    from omnigent.native_dispatch import resolve_hook
     from omnigent.spec import materialize_bundle
 
+    materialize = resolve_hook(provider, "materialize_agent_spec")
+    if materialize is None:
+        raise OmnigentError(f"native provider {provider.key!r} has no materialize_agent_spec hook")
     with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_claude_agent_spec(Path(tmpdir))
+        # The bridge understands only the ``model`` axis: pass ``model=None`` iff
+        # the materializer declares that parameter, else call it bare. A future
+        # harness whose materializer needs a *different* required kwarg will fail
+        # loud here (missing-argument TypeError at seed time) rather than route —
+        # add that axis explicitly if/when it appears.
+        kwargs = {"model": None} if "model" in inspect.signature(materialize).parameters else {}
+        spec_path = materialize(Path(tmpdir), **kwargs)
         bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
         return _tar_gz_dir(bundle_dir)
 
 
-def _ensure_default_claude_agent(
+def _ensure_default_native_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
     agent_cache: Any,
 ) -> None:
     """
-    Register or refresh the claude-native-ui agent.
+    Register or refresh every built-in native-CLI agent (claude/codex/pi/...).
 
-    Called during server lifespan startup so the Web UI can create
-    host-launched sessions without requiring a prior CLI-initiated
-    session. Content-aware via :func:`_ensure_builtin_agent`: a new
-    wheel with a changed spec refreshes the row in place rather than
-    being ignored.
+    Iterates :data:`NATIVE_CODING_AGENTS` (each carries both ``key`` and
+    ``agent_name``), resolves the matching provider, and seeds it content-aware
+    via :func:`_ensure_builtin_agent`. The agent name is unchanged
+    (``NativeCodingAgent.agent_name``), so :func:`builtin_agent_id` — a pure hash
+    of the name — stays byte-identical and a redeploy does not orphan persisted
+    ``conversation.agent_id`` rows.
 
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_CLAUDE_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_claude_native_bundle(),
-    )
-
-
-def _build_codex_native_bundle() -> bytes:
-    """
-    Build a gzipped tarball of the codex-native-ui agent spec.
-
-    :returns: Gzipped tarball bytes suitable for the artifact store.
-    """
-    import tempfile
-
-    from omnigent.codex_native import _materialize_codex_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_codex_agent_spec(Path(tmpdir), model=None)
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_codex_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """
-    Register or refresh the codex-native-ui agent.
-
-    Called during server lifespan startup so the Web UI can offer
-    Codex as a built-in agent alongside Claude. Content-aware via
-    :func:`_ensure_builtin_agent`: a new wheel with a changed spec
-    refreshes the row in place rather than being ignored.
-
-    :param agent_store: Store for agent metadata.
-    :param artifact_store: Store for agent bundles.
-    :param agent_cache: Cache for loaded agent specs.
-    """
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_CODEX_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_codex_native_bundle(),
-    )
-
-
-def _build_opencode_native_bundle() -> bytes:
-    """
-    Build a gzipped tarball of the opencode-native-ui agent spec.
-
-    :returns: Gzipped tarball bytes suitable for the artifact store.
-    """
-    import tempfile
-
-    from omnigent.opencode_native import _materialize_opencode_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_opencode_agent_spec(Path(tmpdir), model=None)
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_opencode_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """
-    Register or refresh the opencode-native-ui agent.
-
-    Called during server lifespan startup so the Web UI can offer OpenCode
-    as a built-in agent alongside Claude / Codex / Pi. Content-aware via
-    :func:`_ensure_builtin_agent`: a new wheel with a changed spec refreshes
-    the row in place rather than being ignored.
-
-    :param agent_store: Store for agent metadata.
-    :param artifact_store: Store for agent bundles.
-    :param agent_cache: Cache for loaded agent specs.
-    """
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_OPENCODE_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_opencode_native_bundle(),
-    )
-
-
-def _build_pi_native_bundle() -> bytes:
-    """
-    Build a gzipped tarball of the pi-native-ui agent spec.
-
-    :returns: Gzipped tarball bytes suitable for the artifact store.
-    """
-    import tempfile
-
-    from omnigent.pi_native import _materialize_pi_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_pi_agent_spec(Path(tmpdir))
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_pi_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """
-    Register or refresh the pi-native-ui agent.
-
-    Called during server lifespan startup so the Web UI can offer Pi as a
-    built-in native-terminal agent. Content-aware via
-    :func:`_ensure_builtin_agent`: a new wheel with a changed spec refreshes
-    the row in place rather than being ignored.
-
-    :param agent_store: Store for agent metadata.
-    :param artifact_store: Store for agent bundles.
-    :param agent_cache: Cache for loaded agent specs.
-    """
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_PI_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_pi_native_bundle(),
-    )
-
-
-def _build_cursor_native_bundle() -> bytes:
-    """
-    Build a gzipped tarball of the cursor-native-ui agent spec.
-
-    :returns: Gzipped tarball bytes suitable for the artifact store.
-    """
-    import tempfile
-
-    from omnigent.cursor_native import _materialize_cursor_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_cursor_agent_spec(Path(tmpdir))
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_cursor_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """
-    Register or refresh the cursor-native-ui agent.
-
-    Called during server lifespan startup so the Web UI offers Cursor as a
-    built-in native-terminal agent on every deployment (not only after the
-    ``omnigent cursor`` CLI first registers it). Content-aware via
-    :func:`_ensure_builtin_agent`.
-
-    :param agent_store: Store for agent metadata.
-    :param artifact_store: Store for agent bundles.
-    :param agent_cache: Cache for loaded agent specs.
-    """
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_CURSOR_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_cursor_native_bundle(),
-    )
-
-
-def _build_kiro_native_bundle() -> bytes:
-    """Build a gzipped tarball of the kiro-native-ui agent spec."""
-    import tempfile
-
-    from omnigent.kiro_native import _materialize_kiro_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_kiro_agent_spec(Path(tmpdir), model=None)
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_kiro_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """Register or refresh the kiro-native-ui agent."""
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_KIRO_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_kiro_native_bundle(),
-    )
-
-
-def _build_goose_native_bundle() -> bytes:
-    """Build a gzipped tarball of the goose-native-ui agent spec."""
-    import tempfile
-
-    from omnigent.goose_native import _materialize_goose_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_goose_agent_spec(Path(tmpdir))
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_goose_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """Register or refresh the goose-native-ui agent."""
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_GOOSE_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_goose_native_bundle(),
-    )
-
-
-def _build_hermes_native_bundle() -> bytes:
-    """Build a gzipped tarball of the hermes-native-ui agent spec."""
-    import tempfile
-
-    from omnigent.hermes_native import _materialize_hermes_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_hermes_agent_spec(Path(tmpdir))
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_hermes_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """Register or refresh the hermes-native-ui agent."""
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_HERMES_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_hermes_native_bundle(),
-    )
-
-
-def _ensure_default_antigravity_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """
-    Register or refresh the antigravity-native-ui agent.
-
-    Called during server lifespan startup so the Web UI can offer Antigravity
-    as a built-in native-terminal agent (the ``agy`` TUI), alongside Claude
-    Code / Codex / Pi. Content-aware via :func:`_ensure_builtin_agent`: a new
-    wheel with a changed spec refreshes the row in place rather than being
-    ignored.
-
-    :param agent_store: Store for agent metadata.
-    :param artifact_store: Store for agent bundles.
-    :param agent_cache: Cache for loaded agent specs.
-    """
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_ANTIGRAVITY_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_antigravity_native_bundle(),
-    )
-
-
-def _build_antigravity_native_bundle() -> bytes:
-    """
-    Build a gzipped tarball of the antigravity-native-ui agent spec.
-
-    :returns: Gzipped tarball bytes suitable for the artifact store.
-    """
-    import tempfile
-
-    from omnigent.antigravity_native import _materialize_antigravity_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_antigravity_agent_spec(Path(tmpdir))
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _build_qwen_native_bundle() -> bytes:
-    """
-    Build a gzipped tarball of the qwen-native-ui agent spec.
-
-    :returns: Gzipped tarball bytes suitable for the artifact store.
-    """
-    import tempfile
-
-    from omnigent.qwen_native import _materialize_qwen_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_qwen_agent_spec(Path(tmpdir))
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_qwen_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """
-    Register or refresh the qwen-native-ui agent.
-
-    Called during server lifespan startup so the Web UI offers Qwen Code as a
-    built-in native-terminal agent on every deployment (not only after the
-    ``omnigent qwen`` CLI first registers it). Content-aware via
-    :func:`_ensure_builtin_agent`.
-
-    :param agent_store: Store for agent metadata.
-    :param artifact_store: Store for agent bundles.
-    :param agent_cache: Cache for loaded agent specs.
-    """
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_QWEN_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_qwen_native_bundle(),
-    )
-
-
-def _build_kimi_native_bundle() -> bytes:
-    """
-    Build a gzipped tarball of the kimi-native-ui agent spec.
-
-    :returns: Gzipped tarball bytes suitable for the artifact store.
-    """
-    import tempfile
-
-    from omnigent.kimi_native import _materialize_kimi_agent_spec
-    from omnigent.spec import materialize_bundle
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        spec_path = _materialize_kimi_agent_spec(Path(tmpdir))
-        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
-        return _tar_gz_dir(bundle_dir)
-
-
-def _ensure_default_kimi_native_agent(
-    agent_store: AgentStore,
-    artifact_store: ArtifactStore,
-    agent_cache: Any,
-) -> None:
-    """
-    Register or refresh the kimi-native-ui agent.
-
-    Called during server lifespan startup so the Web UI offers Kimi as a
-    built-in native-terminal agent on every deployment (not only after the
-    ``omnigent kimi`` CLI first registers it). Content-aware via
-    :func:`_ensure_builtin_agent`.
-
-    :param agent_store: Store for agent metadata.
-    :param artifact_store: Store for agent bundles.
-    :param agent_cache: Cache for loaded agent specs.
-    """
-    _ensure_builtin_agent(
-        agent_store,
-        artifact_store,
-        agent_cache,
-        name=_KIMI_NATIVE_AGENT_NAME,
-        bundle_bytes=_build_kimi_native_bundle(),
-    )
+    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+
+    for agent in NATIVE_CODING_AGENTS:
+        provider = native_provider_for_key(agent.key)
+        if provider is None:
+            raise OmnigentError(
+                f"native coding agent {agent.key!r} has no provider row to seed from"
+            )
+        _ensure_builtin_agent(
+            agent_store,
+            artifact_store,
+            agent_cache,
+            name=agent.agent_name,
+            bundle_bytes=_build_native_bundle(provider),
+        )
 
 
 def _build_debby_bundle() -> bytes:
@@ -1083,11 +749,13 @@ def create_app(
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
+    project_store: ProjectStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
     extra_routers: list[tuple[Any, str, list[str]]] | None = None,
     policy_modules: list[str] | None = None,
+    debug_router_modules: list[str] | None = None,
     admins: list[str] | None = None,
     allowed_domains: list[str] | None = None,
     sandbox_config: ManagedSandboxConfig | None = None,
@@ -1127,6 +795,9 @@ def create_app(
         starts an :class:`ScheduledTaskScheduler` that arms a timer per
         active task and fires the injected ``on_fire`` callback on
         schedule. ``None`` disables the scheduler entirely.
+    :param project_store: Store for first-class projects (owner-private
+        containers that group sessions). ``None`` disables the
+        ``/v1/projects`` CRUD endpoints.
     :param auth_provider: Pre-constructed auth provider for
         identity resolution. ``None`` disables auth (anonymous
         access). **Required** when ``permission_store`` is
@@ -1141,6 +812,15 @@ def create_app(
         ``["myorg.policies.safety"]``. Sourced from the server
         config's ``policy_modules`` key. ``None`` scans only
         the built-in modules.
+    :param debug_router_modules: Dotted module paths to import and
+        scan for a ``DEBUG_ROUTERS`` list of ``(router, prefix,
+        tags)`` tuples, mounted alongside ``extra_routers``. Sourced
+        from the server config's ``debug_router_modules`` key. Exists
+        for out-of-tree diagnostic routers (e.g. the benchmark
+        harness's request-counter endpoint under ``dev/``); a module
+        that fails to import is logged and skipped, so a config key
+        naming an absent module is a no-op. Production config leaves
+        this unset. ``None`` mounts no debug routers.
     :param admins: Admin identities from the server config's
         ``admins:`` key, e.g. ``["alice@example.com"]``. Union'd with
         the runtime-editable ``<data_dir>/admins`` file; a matching
@@ -1213,6 +893,8 @@ def create_app(
             from omnigent.server.accounts_bootstrap import bootstrap_admin
 
             _accounts_cfg = auth_provider._accounts_config
+            if _accounts_cfg is None:
+                raise ValueError("accounts auth provider requires accounts_config")
             _bootstrap_result = bootstrap_admin(
                 account_store,
                 init_admin_password=_accounts_cfg.init_admin_password,
@@ -1229,6 +911,14 @@ def create_app(
     runner_router = RunnerRouter(
         registry=tunnel_registry,
         conversation_store=conversation_store,
+    )
+    runner_session_initializer = RunnerSessionInitializer(
+        tunnel_registry,
+        server_version=_server_version(),
+    )
+    background_title_coordinator = BackgroundSessionTitleCoordinator(
+        conversation_store,
+        RunnerBackgroundTitleGenerator(runner_router),
     )
     host_registry = HostRegistry()
     # Shared between the host tunnel (which records ``host.runner_exited``
@@ -1384,23 +1074,27 @@ def create_app(
         # the run — all fire-and-forget so the timer re-arms immediately.
         scheduled_task_scheduler: ScheduledTaskScheduler | None = None
         if scheduled_task_store is not None:
-            from omnigent.server.scheduled.fire import FireDeps, build_on_fire
+            from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
 
-            on_fire = build_on_fire(
-                FireDeps(
-                    scheduled_task_store=scheduled_task_store,
-                    agent_store=agent_store,
-                    conversation_store=conversation_store,
-                    permission_store=permission_store,
-                    host_store=host_store,
-                    host_registry=host_registry,
-                    agent_cache=agent_cache,
-                    runner_router=runner_router,
-                    tunnel_registry=tunnel_registry,
-                    file_store=file_store,
-                    artifact_store=artifact_store,
-                )
+            fire_deps = FireDeps(
+                scheduled_task_store=scheduled_task_store,
+                agent_store=agent_store,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                host_store=host_store,
+                host_registry=host_registry,
+                agent_cache=agent_cache,
+                runner_router=runner_router,
+                tunnel_registry=tunnel_registry,
+                file_store=file_store,
+                artifact_store=artifact_store,
             )
+            on_fire = build_on_fire(fire_deps)
+            # The manual "run now" trigger reuses the same fire path (dispatch /
+            # preflight / in-flight guard) as the scheduler; it only differs in
+            # allowing a paused task to fire. Exposed on app.state for the
+            # POST /v1/scheduled-tasks/{id}/run route.
+            app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
             scheduled_task_scheduler = ScheduledTaskScheduler(
                 store=scheduled_task_store,
                 on_fire=on_fire,
@@ -1418,9 +1112,19 @@ def create_app(
                     exc,
                 )
 
+            # Run completion is event-driven (persist_scheduled_run_completion
+            # fires from _publish_status the instant a fired conversation's turn
+            # ends — no poll). The only orphan backstop is a lazy-on-read
+            # force-fail of stale ``running`` runs on the scheduled-task read
+            # endpoints (see routes/scheduled_tasks.py); there is no startup
+            # sweep and no periodic reconcile.
+
         try:
             yield
         finally:
+            # Run completion is event-driven (the _publish_status hook) plus a
+            # lazy-on-read stale backstop — there is no run-reconciler task to
+            # cancel. Only the per-job scheduler holds timers that need stopping.
             if scheduled_task_scheduler is not None:
                 scheduled_task_scheduler.stop()
             metrics_publish_task.cancel()
@@ -1433,6 +1137,7 @@ def create_app(
             from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
             await cancel_managed_launch_tasks()
+            await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
             set_runner_ws_factory(None)
@@ -1456,8 +1161,11 @@ def create_app(
     # and WSTunnelTransport to the same session registry.
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
+    app.state.runner_session_initializer = runner_session_initializer
+    app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
+    app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
@@ -1547,10 +1255,17 @@ def create_app(
     # request/route closure) the runner router so it can reach the bound
     # runner.
     set_server_runner_router(runner_router)
+    # Same pattern for the host registry: asleep claude-native sessions
+    # refill their model catalog from the session's host, from background
+    # tasks with no request in scope.
+    set_server_host_registry(host_registry)
     # Mirror per-session live state (turn status, pending-approval count,
     # runner liveness) onto the conversations row so replicas that don't
-    # hold a session's runner tunnel serve the same sidebar fields.
-    session_live_state.configure(conversation_store)
+    # hold a session's runner tunnel serve the same sidebar fields. The
+    # scheduled-task store additionally enables the event-driven
+    # run-completion hook (persist_scheduled_run_completion) fired from
+    # _publish_status when a fired conversation's turn reaches terminal.
+    session_live_state.configure(conversation_store, scheduled_task_store)
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
 
     @app.middleware("http")
@@ -1600,6 +1315,10 @@ def create_app(
             )
             set_request_duration_for_access_log(duration_seconds)
             route = request_route_template_for_metrics(request)
+            # Per-route tally (low-cardinality template key) for offline
+            # request-breakdown analysis, e.g. the benchmark harness's
+            # per-journey network appendix. Cheap; independent of the OTel path.
+            server_metrics.record_route(request.method, route)
             metrics_status_code = _request_status_code_for_metrics(
                 status_code,
                 failed=failed,
@@ -1625,7 +1344,7 @@ def create_app(
         :returns: A JSON response with the error code and message.
         """
         if exc.http_status >= 500:
-            _logger.error("Internal error: %s", exc.message, exc_info=True)
+            _logger.error("Internal error: %s", exc.message, exc_info=exc)
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
             _logger.warning(
                 "Policy evaluate rejected 400 on %s: %s", request.url.path, exc.message
@@ -1663,7 +1382,7 @@ def create_app(
                 status_code=404,
                 content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
             )
-        _logger.error("Database error: %s", exc, exc_info=True)
+        _logger.error("Database error: %s", exc, exc_info=exc)
         return JSONResponse(
             status_code=500,
             content={
@@ -1688,7 +1407,7 @@ def create_app(
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
-        _logger.error("Unhandled exception: %s", exc, exc_info=True)
+        _logger.error("Unhandled exception: %s", exc, exc_info=exc)
         return JSONResponse(
             status_code=500,
             content={
@@ -1942,8 +1661,13 @@ def create_app(
         # Missing ids default to reachable / no-host, matching the bulk
         # lookup's own missing-row terminal.
         _missing = SessionLiveness(runner_online=True, host_online=None)
+
+        def _liveness_or_missing(sid: str) -> SessionLiveness:
+            found = liveness.get(sid)
+            return found if found is not None else _missing
+
         if session_id is not None:
-            single = liveness.get(session_id, _missing)
+            single = _liveness_or_missing(session_id)
             result["session"] = {
                 "id": session_id,
                 "runner_online": single.runner_online,
@@ -1953,7 +1677,7 @@ def create_app(
         if session_ids is not None:
             result["sessions"] = {
                 sid: {
-                    "runner_online": (sl := liveness.get(sid, _missing)).runner_online,
+                    "runner_online": (sl := _liveness_or_missing(sid)).runner_online,
                     "host_online": sl.host_online,
                     "host_version": sl.host_version,
                 }
@@ -1973,8 +1697,69 @@ def create_app(
         """
         return {"version": _server_version()}
 
+    @app.get("/.well-known/omnigent.json")
+    async def well_known_manifest() -> dict[str, object]:
+        """Version manifest for NON-BROWSER clients — chiefly the desktop shell.
+
+        The desktop shell ships and updates on its own cadence, so any
+        installed build can meet any server version. The shell is the side
+        that must adapt (the user may not update it for months), and to adapt
+        it first has to know what it is talking to. This endpoint is that
+        answer, fetched BEFORE the SPA loads — unlike ``/v1/info``, which the
+        SPA reads after boot and which is therefore useless to the shell when
+        deciding how to open a window in the first place.
+
+        Contract, in the order a client should apply it:
+
+        1. ``manifest_version`` (int) versions this ENVELOPE. Clients gate on
+           ``>=``, never ``==``, so a newer server keeps working with an older
+           shell. See :data:`WELL_KNOWN_MANIFEST_VERSION` for when it bumps —
+           adding a field never does.
+        2. ``server_version`` (str) is the installed omnigent package version,
+           the same value as ``/api/version`` and ``/v1/info.server_version``.
+           Informational: for display and bug reports, NOT for gating. Gate on
+           the fields below, which state capability directly rather than making
+           every client hardcode "which release added X".
+        3. ``min_desktop_version`` (str | null) is the oldest desktop build this
+           server still supports. Null means no floor — the overwhelmingly
+           common case, and what every shipped shell must treat as "fine".
+           A server sets it only to signal a genuinely breaking change.
+        4. Everything else is additive detail an older client may ignore
+           wholesale. ``ui`` describes where server-driven chrome lives, so a
+           shell can place its own window furniture without guessing from the
+           version number: ``server_picker`` is ``"sidebar"`` on builds that
+           dock the picker at the sidebar's bottom (it was ``"titlebar"``,
+           centered in the macOS title-bar strip, before this).
+
+        Unknown fields MUST be ignored, and a missing manifest (404 — every
+        server older than this route) MUST be treated as the pre-manifest
+        baseline, not an error: the shell falls back to its current behavior.
+        That is what makes an old shell + new server and a new shell + old
+        server both work.
+
+        Authentication: intentionally UNAUTHED, like ``/v1/info``. A client
+        must be able to read this before it holds a session cookie — the whole
+        point is to consult it before loading the app. It exposes only the
+        version already public via ``/api/version`` plus coarse UI-shape
+        strings, so there is nothing here to leak.
+
+        Served under ``/.well-known/`` (RFC 8615) so it sits at a fixed,
+        guessable path that never collides with an SPA client route.
+
+        :returns: The manifest described above.
+        """
+        return {
+            "manifest_version": WELL_KNOWN_MANIFEST_VERSION,
+            "server_version": _server_version(),
+            # No floor today: every desktop build in the wild works against
+            # this server. Kept present-but-null so clients can rely on the
+            # key existing and exercise the "no floor" path from day one.
+            "min_desktop_version": None,
+            "ui": {"server_picker": "sidebar"},
+        }
+
     @app.get("/v1/info")
-    async def info() -> dict[str, bool | str | None]:
+    async def info() -> dict[str, bool | str | list[str] | dict[str, bool] | None]:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -1993,9 +1778,10 @@ def create_app(
         source, the login URL, whether first-run admin setup is
         still pending (``needs_setup``), coarse capability
         booleans (``databricks_features``,
-        ``managed_sandboxes_enabled``, ``single_user``), the short
-        sandbox provider name (``sandbox_provider``) the web UI labels
-        the new-session sandbox option with, and the installed
+        ``managed_sandboxes_enabled``, ``dictation_available``,
+        ``single_user``), the short sandbox provider name
+        (``sandbox_provider``) the web UI labels the new-session
+        sandbox option with, and the installed
         ``server_version`` (already public via ``/api/version``).
         """
         from omnigent.server.auth import UnifiedAuthProvider, local_single_user_enabled
@@ -2036,16 +1822,17 @@ def create_app(
         # config is wired AND its provider can actually serve a managed
         # launch (staged providers parse but reject at launch — they
         # must not advertise the option).
-        managed_sandboxes_enabled = (
-            sandbox_config is not None and sandbox_config.managed_launch_supported
-        )
         # sandbox_provider names the backing provider (e.g. "modal",
         # "islo") so the web UI can label the option per provider
         # ("Modal Sandbox" / "Islo Sandbox") instead of the
         # generic "New Sandbox". Only surfaced when the option is
         # actually offered; None when no provider is named (embedding
         # configs may leave it unset) so the UI keeps the generic label.
-        sandbox_provider = sandbox_config.provider if managed_sandboxes_enabled else None
+        managed_sandboxes_enabled = False
+        sandbox_provider = None
+        if sandbox_config is not None and sandbox_config.managed_launch_supported:
+            managed_sandboxes_enabled = True
+            sandbox_provider = sandbox_config.provider
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
         # control (off) or restrict it to read-only (read_only) in lockstep
@@ -2058,19 +1845,54 @@ def create_app(
         # server_version is the installed omnigent package version (same
         # source as /api/version), surfaced so the web UI can show it in the
         # session info popover alongside the per-session host version.
-        # smart_routing_enabled: true when the server can route — either
-        # a RoutingClient is explicitly configured (OMNIGENT_SMART_ROUTING=1
-        # + llm: config) or the managed deployment registered a
-        # policy_llm_connection_factory (which means it has LLM capability
-        # and will supply its own RoutingClient).
+        # smart_routing_enabled: true when the server can route from ANY source
+        # — a configured RoutingClient (a server llm: block, routing.provider=
+        # external, or an explicit routing_backends pair) or a managed
+        # deployment's policy_llm_connection_factory.
+        # smart_routing_sources names WHICH router can answer: "external" is the
+        # workspace AI-Gateway task_v1 client, "oss" the built-in judge. A
+        # harness whose inference is not gateway-backed can only be served by
+        # the built-in one, so the SPA and the CLI read this to pick a source
+        # instead of hiding the surface.
+        # Both come from one helper, so the flag can never claim routing is off
+        # for a deployment whose sources say a router would answer.
         try:
             from omnigent.runtime._globals import _caps
+            from omnigent.server.routing_backend import routing_available, routing_sources
 
-            smart_routing_enabled = _caps is not None and (
-                _caps.routing_client is not None or _caps.policy_llm_connection_factory is not None
-            )
+            smart_routing_enabled = routing_available(_caps)
+            smart_routing_sources = routing_sources(_caps)
         except ImportError:
             smart_routing_enabled = False
+            smart_routing_sources = {"external": False, "oss": False}
+        # harness_install_enabled gates the web UI's "Install" action for a
+        # missing, npm-installable harness on a connected host. Off by default
+        # (OMNIGENT_HARNESS_INSTALL_ENABLED=1 opts in) while the feature rolls
+        # out; when false the SPA keeps the prior "run omnigent setup" hint.
+        # Read live so flipping the env var takes effect without a rebuild.
+        # The env-var name is shared with the install route so the flag the UI
+        # sees and the flag the route enforces can never drift apart.
+        from omnigent.process_logging import env_truthy
+        from omnigent.server.routes.hosts import HARNESS_INSTALL_ENABLED_ENV
+
+        harness_install_enabled = env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV))
+        # installable_harnesses: the exact harness ids the install route accepts
+        # (bare ids + native spellings resolving to an npm-installable family),
+        # so the SPA offers setup only where it will succeed and never has to
+        # duplicate the server's allowlist. Empty when the feature is off, so a
+        # disabled flag also blanks the set the UI keys off of.
+        from omnigent.onboarding.harness_install import ui_installable_harnesses
+
+        installable_harnesses = (
+            sorted(ui_installable_harnesses()) if harness_install_enabled else []
+        )
+        # dictation_available gates the composer mic button's server
+        # speech-to-text fallback (designs/server-dictation.md). Checks
+        # config presence only (extra installed + models on disk) — no
+        # model is loaded here.
+        from omnigent.server.dictation import engine_availability
+
+        dictation_available, _ = engine_availability()
         return {
             "accounts_enabled": accounts_enabled,
             "single_user": single_user,
@@ -2083,6 +1905,10 @@ def create_app(
             "public_sharing_enabled": public_sharing_enabled,
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
+            "smart_routing_sources": smart_routing_sources,
+            "harness_install_enabled": harness_install_enabled,
+            "installable_harnesses": installable_harnesses,
+            "dictation_available": dictation_available,
         }
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
@@ -2158,6 +1984,10 @@ def create_app(
             # workspace over the host tunnel when the runner is offline
             # (the file panel stays live without waking the agent).
             host_registry=host_registry,
+            # Validates target-project ownership when PATCH /v1/sessions/{id}
+            # files a session into a project (owner-private membership).
+            project_store=project_store,
+            background_title_coordinator=background_title_coordinator,
         ),
         prefix="/v1",
         tags=["sessions"],
@@ -2171,6 +2001,16 @@ def create_app(
         ),
         prefix="/v1",
         tags=["imports"],
+    )
+    # Per-user LLM cost report (omni usage). User-scoped, not session-scoped,
+    # so it gets its own router rather than living under /sessions.
+    app.include_router(
+        create_usage_router(
+            conversation_store,
+            auth_provider=auth_provider,
+        ),
+        prefix="/v1",
+        tags=["usage"],
     )
     # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
     # Successor to the removed GET /api/agents list; lists only
@@ -2188,6 +2028,14 @@ def create_app(
         create_harnesses_router(auth_provider=auth_provider),
         prefix="/v1",
         tags=["harnesses"],
+    )
+    # Server-side speech-to-text behind the composer mic button
+    # (designs/server-dictation.md). Availability is probed lazily, so
+    # registering unconditionally is free for servers without the extra.
+    app.include_router(
+        create_dictation_router(auth_provider=auth_provider),
+        prefix="/v1",
+        tags=["dictation"],
     )
     app.include_router(
         create_terminal_attach_router(
@@ -2272,25 +2120,103 @@ def create_app(
         tags=["sharing"],
     )
 
+    # First-class projects (owner-private session containers). Mounted only
+    # when a project store is wired; the endpoints self-scope to the caller.
+    if project_store is not None:
+        app.include_router(
+            create_projects_router(
+                project_store=project_store,
+                auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+            tags=["projects"],
+        )
+
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
+
+    # Pending per-runner grace timers: a disconnect schedules the
+    # failed-marking after RUNNER_DISCONNECT_GRACE_S instead of doing it
+    # immediately, so transient tunnel drops (ingress recycles,
+    # sleep-wake reconnects) that re-register within the grace never
+    # flap their sessions to failed.
+    _disconnect_grace_tasks: dict[str, asyncio.Task[None]] = {}
+
+    def _cancel_disconnect_grace(runner_id: str) -> None:
+        """Cancel and forget the pending disconnect-grace timer, if any."""
+        pending = _disconnect_grace_tasks.pop(runner_id, None)
+        if pending is not None and not pending.done():
+            pending.cancel()
+
+    async def _mark_disconnected_runner_failed(runner_id: str) -> None:
+        """Reconcile a dropped runner's sessions once the grace expires.
+
+        A runner that re-registered inside the grace makes this a no-op
+        via the live-tunnel re-check (the same newest-wins rule the
+        immediate path used); one still gone hands its bound sessions to
+        :func:`_mark_runner_sessions_offline`, which fails only the
+        interrupted turns and stamps the disconnect cause.
+
+        :param runner_id: The disconnected runner's id.
+        """
+        from omnigent.server.routes.sessions import (
+            RUNNER_DISCONNECT_GRACE_S,
+            _mark_runner_sessions_offline,
+        )
+        from omnigent.server.schemas import ErrorDetail
+
+        await asyncio.sleep(RUNNER_DISCONNECT_GRACE_S)
+        if tunnel_registry.get(runner_id) is not None:
+            _logger.info(
+                "Runner %s reconnected within the disconnect grace; skipping offline-marking",
+                runner_id,
+            )
+            return
+        # Direct by-runner lookup: read-after-write consistent (the
+        # listing path may be served from an eventually-consistent
+        # search index in alternate store backends) and
+        # O(sessions-on-this-runner) instead of a 500-row scan.
+        # Archived sessions are included by construction — an archived
+        # session can still be runner-bound, and skipping it here would
+        # leave it stuck "running" forever.
+        affected = await asyncio.to_thread(
+            conversation_store.list_conversations_by_runner_id, runner_id
+        )
+        _logger.warning(
+            "Runner %s disconnected; reconciling %d bound session(s)",
+            runner_id,
+            len(affected),
+        )
+        await _mark_runner_sessions_offline(
+            affected,
+            ErrorDetail(
+                code="runner_disconnected",
+                message="Runner disconnected unexpectedly.",
+            ),
+            conversation_store,
+        )
+
     async def _on_runner_disconnect(runner_id: str) -> None:
-        """Mark sessions pinned to *this* runner as offline.
+        """Schedule offline-marking for the turns *this* runner interrupted.
 
         Filters by ``runner_id`` against ``conversation_store`` so a
         disconnect on one runner does not flip every cached session
         (e.g. sessions owned by other runners on the same server, or
         sessions left in the module-level cache by earlier tests on
-        the same xdist worker) to ``"failed"``. The cache is updated
-        in lockstep with the publish so the list endpoint stays
-        coherent.
+        the same xdist worker) to ``"failed"``.
+        :func:`_mark_runner_sessions_offline` then narrows that set to
+        the sessions actually mid-turn and stamps the disconnect cause
+        on them, so idle sub-agents keep their finished state and the
+        interrupted ones read as a recoverable disconnect.
+
+        The user-visible failed flip waits out a reconnect grace
+        (``RUNNER_DISCONNECT_GRACE_S``): transient drops re-register
+        well inside it and the timer's live-tunnel re-check turns them
+        into no-ops, so routine recycles never flap sessions to failed.
+        Runner invalidation and liveness clearing stay immediate so
+        reconnect re-initialization still happens.
 
         :param runner_id: The disconnected runner's id.
         """
-        from omnigent.server.routes.sessions import (
-            _publish_status,
-            _session_status_cache,
-        )
-
         # Newest-wins guard: a superseded tunnel's teardown fires this
         # hook after a fresh tunnel for the same ``runner_id`` already
         # registered (``TunnelRegistry.register`` retires the old
@@ -2309,31 +2235,25 @@ def create_app(
                 runner_id,
             )
             return
+        runner_session_initializer.invalidate_runner(runner_id)
         # Graceful disconnect: clear the persisted liveness stamp so other
         # replicas flip offline immediately rather than after the TTL.
         session_live_state.clear_runner_liveness(runner_id)
 
-        # Direct by-runner lookup: read-after-write consistent (the
-        # listing path may be served from an eventually-consistent
-        # search index in alternate store backends) and
-        # O(sessions-on-this-runner) instead of a 500-row scan.
-        # Archived sessions are included by construction — an archived
-        # session can still be runner-bound, and skipping it here would
-        # leave it stuck "running" forever.
-        affected = [
-            c.id
-            for c in await asyncio.to_thread(
-                conversation_store.list_conversations_by_runner_id, runner_id
-            )
-        ]
-        _logger.warning(
-            "Runner %s disconnected; marking %d session(s) offline",
-            runner_id,
-            len(affected),
+        # Replace any pending timer so a rapid drop-reconnect-drop gives
+        # each outage a full grace window.
+        _cancel_disconnect_grace(runner_id)
+        task = asyncio.create_task(
+            _mark_disconnected_runner_failed(runner_id),
+            name=f"runner-disconnect-grace-{runner_id}",
         )
-        for session_id in affected:
-            _session_status_cache[session_id] = "failed"
-            _publish_status(session_id, "failed")
+        _disconnect_grace_tasks[runner_id] = task
+
+        def _clear_grace_slot(t: asyncio.Task[None]) -> None:
+            if _disconnect_grace_tasks.get(runner_id) is t:
+                _disconnect_grace_tasks.pop(runner_id, None)
+
+        task.add_done_callback(_clear_grace_slot)
 
     async def _on_runner_exited(runner_id: str, error: str) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.
@@ -2344,34 +2264,37 @@ def create_app(
         never fires for it). Mirrors that callback's by-runner lookup,
         but carries the daemon-composed error onto the ``session.status:
         failed`` event so the open view surfaces the cause immediately
-        instead of spinning on "starting" until a timeout.
+        instead of spinning on "starting" until a timeout. An idle
+        top-level session is included for exactly that reason; an idle
+        sub-agent is not, since its work finished on a runner that was
+        already live.
 
         :param runner_id: The crashed runner's id.
         :param error: Human-readable cause from the daemon (exit code +
             log tail), e.g. ``"runner process exited with code 1 ..."``.
         """
-        from omnigent.server.routes.sessions import (
-            _publish_status,
-            _session_status_cache,
-        )
+        from omnigent.server.routes.sessions import _mark_runner_sessions_offline
         from omnigent.server.schemas import ErrorDetail
 
-        affected = [
-            c.id
-            for c in await asyncio.to_thread(
-                conversation_store.list_conversations_by_runner_id, runner_id
-            )
-        ]
+        # The crash report is authoritative and carries the richer cause;
+        # cancel any pending disconnect-grace timer so it can't re-run the
+        # disconnect reconciliation on top of it.
+        _cancel_disconnect_grace(runner_id)
+        affected = await asyncio.to_thread(
+            conversation_store.list_conversations_by_runner_id, runner_id
+        )
         _logger.warning(
-            "Runner %s reported crashed; marking %d session(s) failed: %s",
+            "Runner %s reported crashed; reconciling %d bound session(s): %s",
             runner_id,
             len(affected),
             error,
         )
-        detail = ErrorDetail(code="runner_failed_to_start", message=error)
-        for session_id in affected:
-            _session_status_cache[session_id] = "failed"
-            _publish_status(session_id, "failed", error=detail)
+        await _mark_runner_sessions_offline(
+            affected,
+            ErrorDetail(code="runner_failed_to_start", message=error),
+            conversation_store,
+            fail_idle_top_level=True,
+        )
 
     async def _on_runner_connect(runner_id: str) -> None:
         """Re-assign sessions and restart SSE relays on reconnect.
@@ -2387,6 +2310,7 @@ def create_app(
         from omnigent.server.routes.sessions import (
             _ensure_runner_relay,
             _publish_runner_recovered_status,
+            prefetch_session_routing_catalogs,
         )
 
         # Stamp liveness immediately so other replicas see the runner
@@ -2437,12 +2361,9 @@ def create_app(
                 )
             else:
                 try:
-                    await routed.client.post(
-                        "/v1/sessions",
-                        json={
-                            "session_id": conv.id,
-                            "agent_id": conv.agent_id,
-                        },
+                    await runner_session_initializer.initialize(
+                        conv,
+                        routed.client,
                         timeout=10.0,
                     )
                 except Exception:
@@ -2456,6 +2377,12 @@ def create_app(
                 routed.client,
                 conversation_store,
             )
+            # The session's terminal exists as of the handshake above, so its
+            # model catalogs are answerable now. Warming them here is what
+            # keeps the first routed message off the runner round trip. The
+            # helper self-gates on routing state, so the plain sessions in this
+            # loop (and any archived row) cost nothing.
+            prefetch_session_routing_catalogs(conv.id, conv, routed.client)
             # Reconcile the persisted pending-elicitation count with this
             # pod's live index. A runner that crashed with prompts parked
             # leaves a stale row (no decrement is ever written on a crash),
@@ -2479,14 +2406,12 @@ def create_app(
             )
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
-        """Owner for a server-managed sandbox runner, by its bound session.
+        """Owner for a delegated runner, by its bound session.
 
-        Managed runners authenticate with a server-minted binding token,
-        not a user session, so the runner tunnel cannot resolve their
-        owner from the handshake. The server wrote ``runner_id`` onto the
-        session row at launch (``replace_runner_id``), so the bound
-        conversation's owner is authoritative — the runner-side analog of
-        the host tunnel's ``resolve_launch_token``.
+        Host-launched and managed-sandbox runners authenticate with a binding
+        token instead of inheriting the host user's credential. The server
+        wrote ``runner_id`` onto the session row before launch, so the bound
+        conversation's owner is authoritative.
 
         :param runner_id: Token-bound runner id from the tunnel handshake.
         :returns: The session owner's user id, or ``None`` when no session
@@ -2584,7 +2509,7 @@ def create_app(
                 prefix="/auth",
                 tags=["auth"],
             )
-        else:
+        elif isinstance(auth_provider, UnifiedAuthProvider):
             from omnigent.server.routes.auth import create_auth_router
 
             # OIDC invites are opt-in (OMNIGENT_OIDC_ALLOW_INVITES) and
@@ -2614,6 +2539,11 @@ def create_app(
                 prefix="/auth",
                 tags=["auth"],
             )
+        else:
+            _logger.debug(
+                "Skipping built-in auth routes for custom provider %s",
+                type(auth_provider).__name__,
+            )
 
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
         # OMNIGENT_DEVICE_GRANT_ENABLED, and accounts-mode only. OIDC delegates
@@ -2639,6 +2569,21 @@ def create_app(
                 tags=["oauth"],
             )
             _logger.info("device-grant: /oauth/* routes enabled")
+            # Multi-user server with a PUBLIC device-authorize endpoint: without
+            # the shared client secret, anyone who can reach the server can
+            # initiate a device flow, so the only phishing defense is the
+            # consent-page warning + short TTL. Warn loudly so an operator opts
+            # into OMNIGENT_DEVICE_CLIENT_SECRET (which closes initiation to
+            # unauthorized callers) rather than leaving it off unknowingly. See
+            # designs/DEVICE_AUTH.md § "Device-code phishing".
+            if not os.environ.get("OMNIGENT_DEVICE_CLIENT_SECRET", "").strip():
+                _logger.warning(
+                    "device-grant: OMNIGENT_DEVICE_CLIENT_SECRET is not set — the "
+                    "/oauth/device/authorize endpoint is PUBLIC (any caller may "
+                    "initiate a login flow). Set OMNIGENT_DEVICE_CLIENT_SECRET on "
+                    "the server and its trusted client(s) to restrict initiation "
+                    "to authorized clients. See designs/DEVICE_AUTH.md.",
+                )
 
     # Mount the built web SPA at "/" if a build is present. The SPA is
     # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite
@@ -2655,11 +2600,13 @@ def create_app(
     # ``index.html`` for the literal root and directory paths, so a
     # refresh on ``/c/abc`` would 404.
     # Extra routers injected by callers (e.g. test fixtures that
-    # mount legacy routes). Registered BEFORE the SPA static-files
+    # mount legacy routes) plus any debug routers loaded by dotted
+    # module path from config. Registered BEFORE the SPA static-files
     # mount so FastAPI resolves them before the catch-all fallback.
-    if extra_routers:
-        for router, prefix, tags in extra_routers:
-            app.include_router(router, prefix=prefix, tags=tags)
+    all_extra_routers = list(extra_routers or [])
+    all_extra_routers.extend(_load_debug_routers(debug_router_modules))
+    for router, prefix, tags in all_extra_routers:
+        app.include_router(router, prefix=prefix, tags=[*tags])
 
     web_ui_dist = _WEB_UI_DIST
     web_ui_present = web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file()
@@ -2717,12 +2664,20 @@ class _SPAStaticFiles(StaticFiles):
             return
         await super().__call__(scope, receive, send)
 
-    async def get_response(self, path: str, scope: Scope) -> Response:  # type: ignore[override]
+    async def get_response(self, path: str, scope: Scope) -> Response:
         served_path = path
         try:
             response = await super().get_response(path, scope)
         except StarletteHTTPException as exc:
-            if exc.status_code == 404 and _is_web_ui_api_fallback_path(path):
+            # StaticFiles only serves GET/HEAD, so it answers every other
+            # method with 405, which reads as "this endpoint exists, wrong
+            # method" and sends a client pointed at the wrong base URL
+            # hunting a server bug instead. Nothing reaching this catch-all
+            # exists, and a non-GET is never an SPA navigation, so answer
+            # 404 whatever the path looks like.
+            if exc.status_code == 405 or (
+                exc.status_code == 404 and _is_web_ui_api_fallback_path(path)
+            ):
                 return JSONResponse(
                     status_code=404,
                     content={
@@ -2812,10 +2767,10 @@ def _apply_web_ui_cache_headers(response: Response, path: str) -> Response:
     media_type = content_type.partition(";")[0].lower() if content_type is not None else None
     if path.startswith("assets/"):
         response.headers["Cache-Control"] = _WEB_UI_ASSET_CACHE_CONTROL
-    elif path in {"sw.js", "version.json"}:
-        # The service worker and the version sentinel it precaches must
-        # revalidate on every load, or the HTTP cache could mask a deploy for up
-        # to an hour and defeat prompt-to-reload.
+    elif path == "sw.js":
+        # Keep this exemption even after the tombstone worker is deleted in
+        # 0.11.0: a cached ``sw.js`` must never shadow a service worker served at
+        # this path later, or the stale script would win for up to an hour.
         response.headers["Cache-Control"] = _WEB_UI_HTML_CACHE_CONTROL
     elif media_type == "text/html" or path in {"", ".", "index.html"}:
         response.headers["Cache-Control"] = _WEB_UI_HTML_CACHE_CONTROL

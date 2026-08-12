@@ -18,7 +18,9 @@ Default view inside the sandbox:
   ``/etc/ld.so.cache``, ``/etc/ld.so.conf``,
   ``/etc/ld.so.conf.d``, ``/etc/ssl``, ``/etc/ca-certificates``,
   ``/etc/pki``) bound read-only via ``--ro-bind-try``.
-- Fresh ``/proc``, ``/dev``, and ``/tmp``.
+- Fresh ``/proc`` (bind-mounted from the host on outer sandboxes that
+  forbid a fresh procfs mount, e.g. Lakebox — see
+  :func:`_should_bind_host_proc`), ``/dev``, and ``/tmp``.
 - Cwd bind-mounted read-only by default; explicit
   ``write_paths: ["."]`` flips it to read-write. Top-level
   dotfiles / dotdirs in cwd are tmpfs-masked unless their name is
@@ -67,7 +69,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from ._cwd_scan import scan_cwd_mask_entries
+from ._cwd_scan import MaskedEntry, MaskKind, merge_scan_roots, scan_cwd_mask_entries
 from ._seccomp import (
     SCMP_CMP_EQ,
     SCMP_CMP_GE,
@@ -128,14 +130,17 @@ _DEFAULT_ETC_FILES = (
 )
 
 # Read-only directory binds for the multi-file /etc subtrees — linker
-# search paths and TLS trust stores. Bound as directories so adding /
-# updating cert bundles on the host stays transparent inside the
-# sandbox.
+# search paths, TLS trust stores, and the update-alternatives symlink
+# hub (so generic names like awk/python3/editor resolve through
+# /etc/alternatives to their real binaries under the mounted /usr).
+# Bound as directories so host-side changes stay transparent inside
+# the sandbox.
 _DEFAULT_ETC_DIRS = (
     "/etc/ld.so.conf.d",
     "/etc/ssl",
     "/etc/ca-certificates",
     "/etc/pki",
+    "/etc/alternatives",
 )
 
 # Linux ``CLONE_NEW*`` flag bits. Any of these set in arg 0 of
@@ -173,6 +178,86 @@ _ALLOWED_SOCKET_FAMILIES = (
     2,  # AF_INET  — IPv4
     10,  # AF_INET6 — IPv6
 )
+
+
+# ---------------------------------------------------------------------------
+# Nested-sandbox /proc handling
+# ---------------------------------------------------------------------------
+
+# Outer sandbox backends whose microVM/container permits binding the
+# existing ``/proc`` but forbids mounting a FRESH procfs under
+# ``--unshare-pid`` (masked ``/proc`` overmounts make ``mount proc``
+# return EPERM). On these backends the bwrap wrap binds the host
+# ``/proc`` instead of emitting ``--proc /proc``.
+#
+# Why an explicit allow-list rather than a "fresh-proc mount failed, retry
+# with a bind" fallback: binding the existing ``/proc`` is a security
+# DOWNGRADE. It exposes the outer process list plus the world-readable
+# per-process files (``cmdline`` / ``comm`` / ``stat`` / ``status``) to the
+# sandboxed helper. It does NOT expose the ptrace-gated files (``environ``
+# / ``mem`` / ``maps`` / ``fd``): the retained user namespace keeps those
+# blocked even for same-uid targets and even as namespaced root, and
+# ``--unshare-pid`` still contains signalling. That leak is acceptable on a
+# single-tenant dev microVM (Lakebox) but not on an arbitrary host, so the
+# downgrade is only taken for vetted backends. Add entries here as more
+# backends are verified safe.
+_PROC_BIND_HOST_BACKENDS: frozenset[str] = frozenset({"lakebox"})
+
+# Env var an outer launcher may set to name the host's outer sandbox
+# backend (e.g. ``lakebox``). Authoritative when present; otherwise the
+# backend is autodetected (see ``_detect_host_sandbox_backend``). Note it
+# must survive ``SandboxPolicy.spawn_env_allowlist`` pruning to be visible
+# on the re-exec launcher path — the marker autodetect below is the
+# prune-proof fallback that lakebox relies on today.
+_HOST_SANDBOX_BACKEND_ENV = "OMNIGENT_HOST_SANDBOX_BACKEND"
+
+# Marker directory the Databricks Lakebox runtime seeds inside every
+# microVM. Used to autodetect lakebox when the launcher hasn't declared the
+# backend via ``_HOST_SANDBOX_BACKEND_ENV``.
+_LAKEBOX_MARKER = Path("/run/lakebox")
+
+
+def _detect_host_sandbox_backend() -> str | None:
+    """
+    Identify the outer sandbox backend this host process runs under.
+
+    Prefers the explicit ``OMNIGENT_HOST_SANDBOX_BACKEND`` env var (set by
+    the launcher that provisioned this host); otherwise falls back to
+    lakebox autodetection via the :data:`_LAKEBOX_MARKER` directory. Runs
+    in the host/parent process — never inside the agent's sandbox — so the
+    signals it reads cannot be forged from within the sandbox.
+
+    :returns: Lower-cased backend name (e.g. ``"lakebox"``), or ``None``
+        when the host is not running under a recognised outer sandbox.
+    """
+    declared = os.environ.get(_HOST_SANDBOX_BACKEND_ENV)
+    if declared and declared.strip():
+        return declared.strip().lower()
+    try:
+        if _LAKEBOX_MARKER.is_dir():
+            return "lakebox"
+    except OSError:
+        # A stat() failure on the marker (permissions, a racing unmount)
+        # is not fatal: fall through to "no recognised backend" and keep
+        # the fresh-proc default rather than the proc-bind downgrade.
+        _LOGGER.debug("lakebox marker probe failed for %s", _LAKEBOX_MARKER, exc_info=True)
+    return None
+
+
+def _should_bind_host_proc() -> bool:
+    """
+    Whether the bwrap wrap should bind the existing ``/proc`` instead of
+    mounting a fresh procfs.
+
+    ``True`` only when the host runs under an outer sandbox backend in
+    :data:`_PROC_BIND_HOST_BACKENDS` (lakebox today). On every other host
+    the fresh-proc mount is kept, so ordinary hosts — and their fail-closed
+    behaviour when a fresh procfs mount is denied — are unchanged.
+
+    :returns: ``True`` to emit ``--bind /proc /proc``; ``False`` to emit
+        ``--proc /proc``.
+    """
+    return _detect_host_sandbox_backend() in _PROC_BIND_HOST_BACKENDS
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +345,12 @@ class BwrapSandboxBackend(SandboxBackend):
             else list(_DEFAULT_CWD_ALLOW_HIDDEN)
         )
 
+        mask_paths = (
+            [_resolve_root(cwd, path) for path in sandbox_spec.mask_paths]
+            if sandbox_spec.mask_paths
+            else None
+        )
+
         return SandboxPolicy(
             backend_type=self.type_name,
             active=True,
@@ -270,6 +361,8 @@ class BwrapSandboxBackend(SandboxBackend):
             cwd_allow_hidden=cwd_allow_hidden,
             cwd_hidden_scan_max_entries=sandbox_spec.cwd_hidden_scan_max_entries,
             cwd_hidden_scan_overflow=sandbox_spec.cwd_hidden_scan_overflow,
+            cwd_hidden_scan_recursive=sandbox_spec.cwd_hidden_scan_recursive,
+            mask_paths=mask_paths,
             env_passthrough=(
                 list(sandbox_spec.env_passthrough)
                 if sandbox_spec.env_passthrough is not None
@@ -344,9 +437,18 @@ class BwrapSandboxBackend(SandboxBackend):
         # /proc, /dev (filtered by bwrap to a safe minimal device set),
         # and a private /tmp so the agent's writes there don't pollute
         # the host.
+        #
+        # ``--proc`` mounts a FRESH procfs tied to the new PID namespace so
+        # the helper sees only its own processes. Some nested outer
+        # sandboxes (Lakebox) forbid that mount under ``--unshare-pid``
+        # (masked ``/proc`` overmounts -> ``mount proc: EPERM``), so there
+        # we bind the host ``/proc`` instead. See ``_should_bind_host_proc``
+        # for the gate and the security trade-off.
+        if _should_bind_host_proc():
+            bwrap_args += ["--bind", "/proc", "/proc"]
+        else:
+            bwrap_args += ["--proc", "/proc"]
         bwrap_args += [
-            "--proc",
-            "/proc",
             "--dev",
             "/dev",
             "--tmpfs",
@@ -394,9 +496,9 @@ class BwrapSandboxBackend(SandboxBackend):
             for root in policy.read_roots:
                 bwrap_args += ["--ro-bind-try", str(root), str(root)]
 
-        # Mask dotfiles anywhere under cwd OR under any ``read_paths``
-        # root that aren't on the allowlist, plus any symlink (at any
-        # depth) whose target escapes the sandbox mount set
+        # Mask dotfiles anywhere under cwd OR under any ``read_paths`` /
+        # ``write_paths`` root that aren't on the allowlist, plus any
+        # symlink (at any depth) whose target escapes the sandbox mount set
         # (host-relative dereference defense). The walker prunes at
         # masked dot-directories so ``.git/objects`` etc. don't count
         # toward the cap.
@@ -1037,8 +1139,8 @@ def _dotfile_and_symlink_mask_args(
 ) -> list[str]:
     """
     Build the bwrap mount args needed to mask dotfile / escaping
-    entries the helper must not see, across BOTH cwd and every
-    spec-supplied ``read_paths`` root.
+    entries the helper must not see, across cwd and every spec-supplied
+    ``read_paths`` / ``write_paths`` root.
 
     Thin emitter over :func:`omnigent.inner._cwd_scan.scan_cwd_mask_entries`:
     the shared walker decides *which* paths to mask (dotfiles by
@@ -1059,12 +1161,15 @@ def _dotfile_and_symlink_mask_args(
       may vanish between the scan and the ``bwrap`` exec; the
       ``-try`` variant silently skips the mount instead of aborting.
 
-    S5 (security): the walk covers each ``read_paths`` root in
-    addition to ``cwd`` so a broad grant like ``read_paths: ["~/"]``
-    does NOT leave ``~/.aws``, ``~/.ssh``, ``~/.config/gcloud`` etc.
-    readable just because the dotfile masker used to be cwd-only.
-    Roots that live under ``cwd`` are skipped — the cwd pass already
-    covered them. Per-path dedup runs across both passes.
+    S5 (security): the walk covers each ``read_paths`` AND
+    ``write_paths`` root in addition to ``cwd`` so a broad grant like
+    ``read_paths: ["~/"]`` — or a ``write_paths`` dir outside cwd — does
+    NOT leave ``~/.aws``, ``~/.ssh``, ``~/.config/gcloud`` etc. readable
+    (or writable) just because the dotfile masker used to be cwd-only.
+    :func:`omnigent.inner._cwd_scan.merge_scan_roots` folds both grant
+    lists into one deduplicated set: roots under ``cwd`` are dropped (the
+    cwd pass covered them) and a root nested under another kept root is
+    walked once. Per-path dedup runs across all passes.
 
     See :mod:`omnigent.inner._cwd_scan` for the masking-decision
     semantics, walk-cap behaviour, and the
@@ -1096,16 +1201,23 @@ def _dotfile_and_symlink_mask_args(
         safe_roots=safe_roots,
         max_entries=policy.cwd_hidden_scan_max_entries,
         overflow=policy.cwd_hidden_scan_overflow,
+        recursive=policy.cwd_hidden_scan_recursive,
         logger_name=__name__,
     )
     for entry in entries:
         seen_mask_paths.add(str(entry.path))
-    # Extend the mask to every read_paths root that the cwd scan
-    # didn't already cover (skip roots that live under cwd — those
-    # were walked in the cwd pass).
-    for root in policy.read_roots or []:
-        if _is_within(root, cwd):
-            continue
+    # Extend the mask to every read_paths AND write_paths root that the
+    # cwd scan didn't already cover. ``merge_scan_roots`` folds both
+    # grant lists into one deduplicated, ancestor-first set (dropping
+    # roots under cwd and roots nested under another kept root) so an
+    # overlapping or doubly-granted path is walked once, not per-lever.
+    for root in merge_scan_roots(
+        cwd,
+        policy.read_roots,
+        policy.write_roots,
+        recursive=policy.cwd_hidden_scan_recursive,
+        skip_roots=policy.mask_scan_skip_roots,
+    ):
         try:
             extra = scan_cwd_mask_entries(
                 root,
@@ -1113,18 +1225,19 @@ def _dotfile_and_symlink_mask_args(
                 safe_roots=safe_roots,
                 max_entries=policy.cwd_hidden_scan_max_entries,
                 overflow=policy.cwd_hidden_scan_overflow,
+                recursive=policy.cwd_hidden_scan_recursive,
                 logger_name=__name__,
-                scope_label="read_paths",
+                scope_label="read_paths/write_paths",
             )
         except OSError as err:
-            # Re-raise with read_paths-specific advice, forwarding the
+            # Re-raise with grant-specific advice, forwarding the
             # walker's own message verbatim — it already names the
             # overflowed root (passed as the walk's scope) and the
             # unfinished directories, so we don't want to drop that
             # detail by rewriting the text from scratch.
             raise OSError(
-                f"dotfile mask scan overflowed while walking read_paths root "
-                f"{root}. Narrow the grant or tune the scan limits. {err}"
+                f"dotfile mask scan overflowed while walking read_paths/write_paths "
+                f"root {root}. Narrow the grant or tune the scan limits. {err}"
             ) from err
         for entry in extra:
             key = str(entry.path)
@@ -1132,6 +1245,19 @@ def _dotfile_and_symlink_mask_args(
                 continue
             seen_mask_paths.add(key)
             entries.append(entry)
+    # Explicit operator-declared masks: hide these regardless of name
+    # or depth, on top of the dotfile walk. Kind is decided by a stat
+    # so a directory tmpfs-masks and a file /dev/null-masks; a missing
+    # path is dropped by the re-stat below. ``is_dir`` follows symlinks
+    # (unlike the walker's ``follow_symlinks=False``), so a symlink to a
+    # directory tmpfs-masks at the link location.
+    for mask_path in policy.mask_paths or []:
+        key = str(mask_path)
+        if key in seen_mask_paths:
+            continue
+        seen_mask_paths.add(key)
+        kind: MaskKind = "dir" if mask_path.is_dir() else "file"
+        entries.append(MaskedEntry(path=mask_path, kind=kind))
     args: list[str] = []
     for entry in entries:
         # Re-stat just before emitting: a mask overlays onto an EXISTING
@@ -1141,6 +1267,15 @@ def _dotfile_and_symlink_mask_args(
         # target is safe — persistent host dotfiles still exist and are
         # still masked.
         if not _path_exists_lstat(entry.path):
+            continue
+        # Symlinks are skipped: bwrap resolves a mount destination through
+        # the final symlink, so both mask shapes abort the whole namespace
+        # ("Can't create file at <link>" / "Can't mount tmpfs on <link>")
+        # and kill the launcher at spawn. Skipping is safe because the mount
+        # namespace already confines symlink resolution — the link is
+        # followed inside the sandbox view, where an escaping target is
+        # either unmounted or independently masked.
+        if entry.path.is_symlink():
             continue
         if entry.kind == "dir":
             args.extend(["--tmpfs", str(entry.path)])

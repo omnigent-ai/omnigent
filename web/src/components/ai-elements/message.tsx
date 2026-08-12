@@ -35,7 +35,8 @@ export type MessageProps = HTMLAttributes<HTMLDivElement> & {
 export const Message = ({ className, from, ...props }: MessageProps) => (
   <div
     className={cn(
-      "group flex w-full max-w-[95%] flex-col gap-2",
+      // min-w-0 lets this flex item shrink below its content's intrinsic width instead of widening the column.
+      "group flex w-full min-w-0 max-w-[95%] flex-col gap-2",
       from === "user" ? "is-user ml-auto justify-end" : "is-assistant",
       className,
     )}
@@ -48,11 +49,10 @@ export type MessageContentProps = HTMLAttributes<HTMLDivElement>;
 export const MessageContent = ({ children, className, ...props }: MessageContentProps) => (
   <div
     className={cn(
-      // 15px text / 24px line-height at the 16px desktop root, in rem so the
-      // mobile root-font-size bump (index.css) still scales both. User and
-      // assistant prose share this wrapper, so they stay in lockstep.
-      "is-user:dark flex w-fit min-w-0 max-w-full flex-col gap-2 overflow-hidden text-[0.9375rem] leading-6 tracking-[-0.01em]",
-      "group-[.is-user]:ml-auto group-[.is-user]:rounded-2xl group-[.is-user]:bg-muted group-[.is-user]:px-4 group-[.is-user]:py-3 group-[.is-user]:text-foreground group-[.is-user]:ring-1 group-[.is-user]:ring-border/60",
+      // User and assistant prose share the settings-driven interface text
+      // token, so their size and line-height stay in lockstep.
+      "is-user:dark flex w-fit min-w-0 max-w-full flex-col gap-2 text-ui",
+      "group-[.is-user]:ml-auto group-[.is-user]:overflow-hidden group-[.is-user]:rounded-2xl group-[.is-user]:bg-muted group-[.is-user]:px-3 group-[.is-user]:py-2 group-[.is-user]:text-foreground group-[.is-user]:ring-1 group-[.is-user]:ring-border/60",
       // Tighter than the user bubble's gap-2 so muted single-line tool
       // ("See N steps") / reasoning rows don't look orphaned between prose.
       "group-[.is-assistant]:gap-1.5 group-[.is-assistant]:text-foreground",
@@ -67,7 +67,7 @@ export const MessageContent = ({ children, className, ...props }: MessageContent
 export type MessageActionsProps = ComponentProps<"div">;
 
 export const MessageActions = ({ className, children, ...props }: MessageActionsProps) => (
-  <div className={cn("flex items-center gap-1", className)} {...props}>
+  <div className={cn("flex items-center gap-3", className)} {...props}>
     {children}
   </div>
 );
@@ -81,12 +81,19 @@ export const MessageAction = ({
   tooltip,
   children,
   label,
+  className,
   variant = "ghost",
   size = "icon-sm",
   ...props
 }: MessageActionProps) => {
   const button = (
-    <Button size={size} type="button" variant={variant} {...props}>
+    <Button
+      size={size}
+      type="button"
+      variant={variant}
+      className={cn("text-muted-foreground hover:text-foreground", className)}
+      {...props}
+    >
       {children}
       <span className="sr-only">{label || tooltip}</span>
     </Button>
@@ -434,7 +441,11 @@ export const MessageResponse = memo(
 
     return (
       <Streamdown
-        className={cn("size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0", className)}
+        // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+        className={cn(
+          "size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+          className,
+        )}
         plugins={STREAMDOWN_PLUGINS}
         // Let links open on a plain click (and cmd/ctrl-click in a new tab)
         // instead of Streamdown's default "Open external link?" modal.
@@ -447,8 +458,6 @@ export const MessageResponse = memo(
       />
     );
   },
-  (prevProps, nextProps) =>
-    prevProps.children === nextProps.children && nextProps.isAnimating === prevProps.isAnimating,
 );
 
 MessageResponse.displayName = "MessageResponse";

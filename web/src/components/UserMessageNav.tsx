@@ -29,7 +29,9 @@ export function UserMessageNav({
     <TooltipProvider>
       <div
         className={cn(
-          "pointer-events-none absolute right-4 bottom-4 flex flex-col gap-1",
+          // bottom clears the composer's growth (0 elsewhere), which overlaps
+          // the bottom of the transcript it's anchored to.
+          "pointer-events-none absolute right-4 bottom-[calc(1rem+var(--composer-growth,0px))] flex flex-col gap-1",
           className,
         )}
       >

@@ -59,6 +59,8 @@ interface NativeShellApi {
    * ignore it.
    */
   setBadgeCount: (count: number, activation?: BadgeActivation) => void;
+  /** Tell the shell which theme source the user selected. */
+  setColorScheme?: (scheme: "light" | "dark" | "system") => void;
   /** Fire an OS notification; resolves true when it was shown. */
   notify: (params: NativeNotifyParams) => Promise<boolean>;
   // Optional: a shell older than this SPA may lack notification-click routing,
@@ -115,6 +117,8 @@ interface NativeShellApi {
   onNativeInsets?: (callback: (insets: NativeInsets) => void) => () => void;
 }
 
+export type ThemeSource = "light" | "dark" | "system";
+
 /** Footprints (CSS px) of the native floating bars, reported by the shell. */
 export interface NativeInsets {
   /** Server switcher pill height + its top padding. */
@@ -143,7 +147,14 @@ export interface NativeViewModeParams {
  */
 interface ElectronDesktopApi extends NativeShellApi {
   kind: "electron";
-  /** Desktop auto-update bridge, absent on shells older than the updater work. */
+  /**
+   * Desktop auto-update bridge — CONFIG ONLY on current shells. Update
+   * notifications are shell-owned (native corner overlay + Server menu); this
+   * bridge is used for update preferences (mode, auto-install) + check. The
+   * shell delivers it "banner-safe": status values that would trigger the
+   * in-page UpdateBanner (available/downloaded/error-security) are collapsed to
+   * idle, so the web never shows a (duplicate) banner. Absent on older shells.
+   */
   updates?: ElectronUpdateBridge;
   /** Current server origin + recent servers, or null on a foreign page. */
   getServerPicker?: () => Promise<ServerPickerInfo | null>;
@@ -172,6 +183,13 @@ interface ElectronDesktopApi extends NativeShellApi {
     bounds?: unknown,
     opts?: { force?: boolean; agent?: boolean },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  /**
+   * Hide/show the active embedded browser view while a DOM overlay is open.
+   * The native view paints above the renderer, so this is how overlays
+   * (dialogs, menus, tooltips, toasts) avoid being covered. Absent on shells
+   * predating the feature — callers must optional-chain.
+   */
+  browserSetSuppressed?: (suppressed: boolean) => Promise<{ ok: boolean; error?: string }>;
 }
 
 /** A lifecycle action for the host daemon. */
@@ -257,6 +275,72 @@ export interface ServerPickerInfo {
   currentOrigin: string;
   /** Recently-connected server URLs, most recent first. */
   recentServers: string[];
+  /**
+   * The connected server's version manifest (`/.well-known/omnigent.json`),
+   * forwarded by the shell. Optional: shells older than the manifest simply
+   * don't send it — see {@link serverManifestOf}, which supplies the
+   * pre-manifest baseline so callers never handle `undefined`.
+   */
+  serverManifest?: ServerManifest;
+}
+
+/**
+ * The server's version manifest, as forwarded by the desktop shell from
+ * `GET /.well-known/omnigent.json`.
+ *
+ * Read it through {@link serverManifestOf} and gate on `manifestVersion >= N`,
+ * never `=== N`: a newer server must keep working with an older client, which
+ * is the entire point of the document.
+ */
+export interface ServerManifest {
+  /**
+   * Envelope version. `0` is the pre-manifest baseline — a server older than
+   * the manifest route, or one the shell could not read — so the ordinary
+   * `>= 1` gate excludes it without callers testing for null.
+   */
+  manifestVersion: number;
+  /** Installed omnigent package version. Display only, never gate on it. */
+  serverVersion: string | null;
+  /** Oldest supported desktop build, or null for no floor (the normal case). */
+  minDesktopVersion: string | null;
+  /**
+   * Where server-driven chrome lives. `server_picker` is `"sidebar"` on builds
+   * that dock the picker at the sidebar's bottom, `"titlebar"` on older ones.
+   * Loosely typed on purpose: unknown keys are the extension point, so a newer
+   * server can add shapes this build has never heard of.
+   */
+  ui: Record<string, unknown>;
+}
+
+/**
+ * The pre-manifest baseline: what a server implies when it has no manifest —
+ * every server older than the route — or when the shell is too old to forward
+ * one. `manifestVersion: 0` fails every `>= 1` gate, so callers fall back to
+ * existing behavior without distinguishing "absent" from "unreadable".
+ */
+export const PRE_MANIFEST_BASELINE: ServerManifest = {
+  manifestVersion: 0,
+  serverVersion: null,
+  minDesktopVersion: null,
+  ui: {},
+};
+
+/**
+ * The manifest carried by a picker payload, or the pre-manifest baseline.
+ *
+ * Use this rather than reading `info.serverManifest` directly: the field is
+ * absent on older shells, and this collapses that case into a real manifest so
+ * every caller can gate on `manifestVersion` unconditionally.
+ *
+ * @param info A payload from {@link getServerPicker}, or null off-shell.
+ */
+export function serverManifestOf(info: ServerPickerInfo | null): ServerManifest {
+  const manifest = info?.serverManifest;
+  // Validate rather than trust: this crosses the IPC boundary from a shell
+  // whose version is unknown, so a malformed/partial object degrades to the
+  // baseline instead of yielding NaN comparisons downstream.
+  if (!manifest || typeof manifest.manifestVersion !== "number") return PRE_MANIFEST_BASELINE;
+  return manifest;
 }
 
 /** The Electron preload bridge, or undefined outside the Electron shell. */
@@ -272,6 +356,18 @@ function nativeApi(): NativeShellApi | undefined {
   const api = (window as unknown as { omnigentNative?: NativeShellApi }).omnigentNative;
   if (api?.kind === "ios" || api?.kind === "android" || api?.kind === "electron") return api;
   return electronApi();
+}
+
+function callSetColorScheme(scheme: ThemeSource): boolean {
+  const native = nativeApi();
+  if (!native?.setColorScheme) return false;
+  try {
+    native.setColorScheme(scheme);
+  } catch (err) {
+    console.warn("[nativeBridge] setColorScheme failed:", err);
+    return false;
+  }
+  return true;
 }
 
 /** True when running inside the Electron desktop shell. */
@@ -453,6 +549,15 @@ export function onNativeSidebarDrag(
  * tray notification: it makes that notification open a target and show
  * descriptive text. Electron/iOS have a real icon badge and ignore it.
  */
+/**
+ * Tell the native shell which theme source the user selected. The shell drives
+ * its own OS-level night mode so that native chrome and the WebView agree.
+ * No-op outside supported shells. Fire-and-forget.
+ */
+export function setThemeSource(themeSource: ThemeSource): void {
+  callSetColorScheme(themeSource);
+}
+
 export async function setBadgeCount(count: number, activation?: BadgeActivation): Promise<void> {
   const native = nativeApi();
   if (!native) return;

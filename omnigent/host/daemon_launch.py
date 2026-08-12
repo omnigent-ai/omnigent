@@ -20,6 +20,7 @@ import click
 import httpx
 
 from omnigent.claude_native_bridge import url_component
+from omnigent.process_logging import display_log_path, process_log_dir
 
 # Poll cadence while waiting for a daemon-spawned runner to connect its
 # tunnel or for a resource to appear.
@@ -159,7 +160,7 @@ async def wait_for_runner_online(
     message = f"Runner {runner_id!r} did not connect within {timeout_s:.0f}s."
     if last_error is not None:
         message += f" Last connection error: {last_error!r}."
-    message += " Check the runner logs under ~/.omnigent/logs/runner/."
+    message += f" Check the runner logs under {display_log_path(process_log_dir('runner'))}/."
     raise click.ClickException(message)
 
 
@@ -169,6 +170,7 @@ async def launch_or_reuse_daemon_runner(
     host_id: str,
     session_id: str,
     workspace: str,
+    fresh: bool = False,
 ) -> str:
     """
     Ensure the session is bound to a daemon-spawned runner; return its id.
@@ -183,11 +185,19 @@ async def launch_or_reuse_daemon_runner(
     :param session_id: Session to bind, e.g. ``"conv_abc123"``.
     :param workspace: Absolute host path for the runner cwd, e.g.
         ``"/Users/me/proj"``.
+    :param fresh: When ``True``, skip the ``GET /v1/sessions/{id}``
+        runner-binding check and go straight to launching a new runner.
+        Safe to set when the session was just created in this same startup
+        sequence — a brand-new session can't have a runner bound yet, so
+        the read would always return empty and only add latency (~2-3s).
     :returns: The bound runner id, e.g. ``"runner_abc123"``.
     :raises click.ClickException: If the launch request fails.
     """
-    snap = await client.get(f"/v1/sessions/{url_component(session_id)}")
-    existing = _json_body(snap).get("runner_id") if snap.status_code == 200 else None
+    if fresh:
+        existing = None
+    else:
+        snap = await client.get(f"/v1/sessions/{url_component(session_id)}")
+        existing = _json_body(snap).get("runner_id") if snap.status_code == 200 else None
     if isinstance(existing, str) and existing:
         if await runner_is_online(client, existing):
             return existing

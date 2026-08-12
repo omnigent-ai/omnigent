@@ -21,9 +21,26 @@ const { readFileSync } = require("node:fs");
 const path = require("node:path");
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
+const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+
+describe("setup clipboard IPC wiring", () => {
+  it("exposes a narrow copy action through the setup bridge", () => {
+    assert.match(
+      preloadSource,
+      /copyText:\s*\(text\)\s*=>\s*ipcRenderer\.invoke\("omnigent:copy-setup-text",\s*text\)/,
+    );
+  });
+
+  it("checks the setup-page sender before writing to the clipboard", () => {
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:copy-setup-text",[\s\S]{0,200}!isSetupPageSender\(event\)[\s\S]{0,300}clipboard\.writeText\(text\)/,
+    );
+  });
+});
 
 describe("workspace chrome injection wiring (src/main.js)", () => {
   it("invokes registerWorkspaceChromeHide(win.webContents) as live code", () => {
@@ -323,6 +340,39 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
         "expandDatabricksWorkspaceUrl reappeared in the pre-decision section of",
         "handleDeepLink, reopening the pre-consent SSRF. The probe must run only after",
         "confirmOpenDeepLink (in the consent-unknown branch), not before chooseDeepLinkStrategy.",
+      ].join(" "),
+    );
+  });
+});
+
+// pinWindow is the one chokepoint every "leave this server" path routes through
+// (Connect to new server, Change Server…, switch-server, did-fail-load fallback).
+// Those navigations tear down the renderer WITHOUT running BrowserPane's unmount
+// detach, so pinWindow must close the window's browser registry when the origin
+// changes — else the native WebContentsView dangles over the setup/welcome page.
+describe("browser-view teardown on server change (src/main.js)", () => {
+  it("closes the window's browserRegistry when pinWindow changes origin", () => {
+    assert.match(
+      liveCode,
+      /function pinWindow\(win,\s*origin\)\s*\{[\s\S]{0,600}browserRegistry\?\.closeAll\(/,
+      [
+        "pinWindow no longer closes the window's embedded-browser views when the",
+        "origin changes. Leaving a server (Connect to new server / Change Server / switch)",
+        "navigates the window away and tears down the renderer WITHOUT running",
+        "BrowserPane's unmount detach, so the native WebContentsView keeps painting over",
+        "the setup/welcome page. Restore the closeAll call in pinWindow.",
+      ].join(" "),
+    );
+  });
+
+  it("guards the teardown so the initial cold-connect pin doesn't fire it", () => {
+    assert.match(
+      liveCode,
+      /function pinWindow\(win,\s*origin\)\s*\{[\s\S]{0,600}state\.origin\s*!=\s*null[\s\S]{0,120}browserRegistry\?\.closeAll\(/,
+      [
+        "The closeAll in pinWindow is no longer guarded on a prior origin. Without the",
+        "state.origin != null guard the initial pin (setup→first connect) would try to",
+        "close a registry with nothing open. Keep the guard.",
       ].join(" "),
     );
   });

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
 
 import omnigent.onboarding.harness_install as hi
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+from omnigent.harness_availability import HARNESS_VERSION_TOO_LOW
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
@@ -29,6 +32,11 @@ def _isolate_cursor_credential(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
     for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(var, raising=False)
+    # Copilot also accepts a ``gh auth login`` session as a token, so a developer's
+    # real gh login would otherwise flip their verdict here too.
+    import omnigent.onboarding.copilot_auth as _ca
+
+    monkeypatch.setattr(_ca, "gh_cli_github_token", lambda host=None: None)
     # Codex readiness resolves the binary via resolve_cli_binary, which honors
     # an OMNIGENT_CODEX_PATH override and probes on-disk global install dirs.
     # Clear the override and stub the fallback dirs so a developer's real codex
@@ -47,6 +55,34 @@ def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
     # Follow test_harness_install.py's convention: patch the module's
     # shutil.which (reverted by monkeypatch after the test).
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    # Some harnesses (OpenCode) now validate the CLI's ``--version``. Stub a
+    # satisfying version so tests that simply need "binary present" are not
+    # tripped up by an unexpected subprocess probe.
+    def _stub_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            # OpenCode's declared range is [1.17.7, 1.18.0); Cursor uses calendar
+            # versions and needs a build after 2026-06-01; everything else is
+            # fine with a generous semver placeholder.
+            if argv[0].endswith("opencode"):
+                version = "1.17.7\n"
+            elif argv[0].endswith("cursor-agent") or argv[0].endswith("hermes"):
+                version = "2026.07.01\n"
+            else:
+                version = "9.9.9\n"
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout=version, stderr="")
+        if argv[:3] == ["gh", "auth", "token"]:
+            # Copilot readiness falls back to the ``gh`` CLI login when no token
+            # is configured. Report "logged out" so these tests stay about CLI
+            # presence; the fallback itself is covered in test_copilot_auth.py.
+            return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="")
+        raise AssertionError(f"unexpected subprocess during readiness tests: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _stub_run)
+    # Auth-aware native harnesses (now including Cursor native) check login state
+    # in the picker map. Treat them as logged in when the test just needs
+    # "binary present".
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda _key, **_kw: True)
 
 
 def _no_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -106,6 +142,13 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "goose-native",
         "native-goose",
         "hermes",
+        # Builtin ACP CLI harnesses gate on their vendor binary; every catalog
+        # row (and alias) joins automatically.
+        *sorted(
+            spelling
+            for name, row in ACP_CLI_HARNESSES.items()
+            for spelling in (name, *row.aliases)
+        ),
     ],
 )
 def test_cli_harness_configured_only_when_binary_installed(
@@ -123,6 +166,123 @@ def test_cli_harness_configured_only_when_binary_installed(
     assert harness_is_configured(harness) is True
     _no_clis_installed(monkeypatch)
     assert harness_is_configured(harness) is False
+
+
+def test_auth_aware_native_harness_reports_binary_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """claude-native / opencode-native report ``binary-missing`` when absent.
+
+    These now carry a two-step signal in the picker map (install, then auth),
+    mirroring Codex — so a missing binary is ``"binary-missing"``, not a bare
+    ``False``.
+    """
+    _no_clis_installed(monkeypatch)
+    result = configured_harness_map()
+    assert result["claude-native"] == "binary-missing"
+    assert result["opencode-native"] == "binary-missing"
+
+
+def test_auth_aware_native_harness_needs_auth_when_installed_not_signed_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Installed but not signed in AND no provider → ``needs-auth``.
+
+    Claude is ready via a configured provider OR a CLI login; this pins the
+    both-absent case. The autouse fixture points config home at an empty tmp
+    dir, so no provider is configured — but stub it explicitly so the verdict
+    can't depend on ambient config.
+    """
+    _all_clis_installed(monkeypatch)
+    # claude: no provider configured AND `claude auth status` not-logged-in.
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: False
+    )
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key, **_kw: False)
+    # opencode: no stored/env provider.
+    import omnigent.onboarding.opencode_auth as oc
+
+    monkeypatch.setattr(
+        oc,
+        "opencode_auth_summary",
+        lambda: oc.OpenCodeAuthSummary(installed=True, stored_providers=(), env_providers=()),
+    )
+    result = configured_harness_map()
+    assert result["claude-native"] == "needs-auth"
+    assert result["opencode-native"] == "needs-auth"
+
+
+def test_claude_ready_via_configured_provider_without_cli_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude with an omnigent provider (API key) but NO CLI login reads ready.
+
+    A user who set an ANTHROPIC API key (a ``key``-kind provider) must go green
+    even though ``claude auth status`` — the subscription login — reports
+    not-logged-in. Checking the provider first also avoids the status subprocess
+    on this common path.
+    """
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
+    )
+
+    def _must_not_probe(_key: str, **_kw: object) -> bool:
+        raise AssertionError("CLI login probed despite a configured provider")
+
+    monkeypatch.setattr(hi, "harness_cli_logged_in", _must_not_probe)
+    assert configured_harness_map()["claude-native"] is True
+
+
+def test_family_provider_configured_excludes_subscription(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``subscription``-kind default is NOT counted as a provider credential.
+
+    Subscription auth lives in the harness CLI's own login (judged by
+    ``harness_cli_logged_in``); counting it here would double-count that path
+    and mask a genuine "installed but no key" state. Only non-subscription kinds
+    (key/gateway/…) satisfy the provider check.
+    """
+    import omnigent.onboarding.harness_readiness as hrmod
+    from omnigent.onboarding.provider_config import KEY_KIND, SUBSCRIPTION_KIND
+
+    class _Provider:
+        def __init__(self, kind: str) -> None:
+            self.kind = kind
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness.default_provider_for_harness",
+        lambda _cfg, _h: _Provider(SUBSCRIPTION_KIND),
+    )
+    assert hrmod._family_provider_configured("claude-native") is False
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness.default_provider_for_harness",
+        lambda _cfg, _h: _Provider(KEY_KIND),
+    )
+    assert hrmod._family_provider_configured("claude-native") is True
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness.default_provider_for_harness",
+        lambda _cfg, _h: None,
+    )
+    assert hrmod._family_provider_configured("claude-native") is False
+
+
+def test_auth_aware_native_harness_launch_gate_stays_binary_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The LAUNCH gate must not gain the auth check — only the picker map does.
+
+    ``harness_is_configured`` drives whether a runner may spawn; gating it on
+    login state would wrongly block a launch whose auth resolves at run time.
+    So with the binary present it stays ``True`` even when not signed in.
+    """
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key, **_kw: False)
+    assert harness_is_configured("claude-native") is True
+    assert harness_is_configured("opencode-native") is True
 
 
 def test_configured_harness_map_covers_all_spellings(
@@ -199,6 +359,13 @@ def test_configured_harness_map_covers_all_spellings(
         # Generic ACP harness — config-gated (≥1 agent in the acp: block), no CLI
         # binary of its own; the acp:<slug> picks are config-derived, not keyed here.
         "acp",
+        # Builtin ACP CLI harnesses: every catalog row + alias, derived so a new
+        # row never needs to touch this list.
+        *(
+            spelling
+            for name, row in ACP_CLI_HARNESSES.items()
+            for spelling in (name, *row.aliases)
+        ),
     }
     assert set(result) == expected_keys
 
@@ -234,12 +401,7 @@ def test_configured_harness_map_gates_only_cli_harnesses(
     # antigravity-native is also gated (it wraps the ``agy`` CLI); with no
     # binary it reads False before its credential check is even reached.
     for cli in (
-        "claude-native",
-        "native-claude",
-        "pi",
         "kimi",
-        "cursor-native",
-        "native-cursor",
         "kiro-native",
         "native-kiro",
         "antigravity-native",
@@ -248,10 +410,46 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "native-goose",
         "qwen",
         "hermes",
+        *sorted(ACP_CLI_HARNESSES),
     ):
-        assert result[cli] is False, f"{cli} should be gated on its CLI binary"
-    for codex in ("codex", "codex-native", "native-codex"):
-        assert result[codex] == "binary-missing", f"{codex} should name the missing Codex binary"
+        assert result[cli] is not True, f"{cli} should be gated on its CLI binary"
+    # Auth-aware harnesses (codex, claude, opencode, cursor, pi) carry a
+    # two-step signal in the picker map, so a missing binary is the structured
+    # ``"binary-missing"`` (step 1 to-do), not a bare ``False``. Cursor joined
+    # this group — it is now auth-aware like the other native CLI harnesses, so
+    # its missing binary surfaces as ``"binary-missing"`` too. Pi is also here —
+    # it reports the credential axis (no CLI login; its credential is a provider).
+    for missing in (
+        "codex",
+        "codex-native",
+        "native-codex",
+        "claude-native",
+        "native-claude",
+        "opencode-native",
+        "cursor-native",
+        "native-cursor",
+        "pi",
+        "pi-native",
+    ):
+        assert result[missing] == "binary-missing", f"{missing} should name the missing CLI binary"
+
+
+def test_copilot_ready_via_gh_cli_login_without_stored_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``gh auth login`` session alone makes copilot ready.
+
+    Without this, a logged-in user is told to paste a token that ``gh`` already
+    holds — and on macOS ``gh`` keeps it in the keychain, where the Copilot CLI
+    (which only reads ``oauth_token`` out of ``hosts.yml``) can't see it.
+    """
+    import omnigent.onboarding.copilot_auth as _ca
+
+    _all_clis_installed(monkeypatch)
+    assert configured_harness_map()["copilot"] is False
+
+    monkeypatch.setattr(_ca, "gh_cli_github_token", lambda host=None: "gho_from_gh")
+    assert configured_harness_map()["copilot"] is True
 
 
 def test_configured_harness_map_all_true_with_clis(
@@ -263,10 +461,12 @@ def test_configured_harness_map_all_true_with_clis(
     The CLI harnesses pass their binary check, the SDK harnesses are ungated,
     cursor (key-gated) is satisfied by a ``CURSOR_API_KEY``, copilot
     (token-gated) by a ``GH_TOKEN``, antigravity-native (binary + credential
-    gated) by a detected Gemini OAuth credential, and the generic ACP harness
+    gated) by a detected Gemini OAuth credential, kimi (binary + credential
+    gated) by a detected ``kimi login`` credential, and the generic ACP harness
     (config-gated) by a registered agent — so nothing is reported unconfigured.
     """
     import omnigent.onboarding.gemini_auth as _ga
+    import omnigent.onboarding.kimi_auth as _ka
 
     _all_clis_installed(monkeypatch)
     monkeypatch.setattr(
@@ -276,7 +476,14 @@ def test_configured_harness_map_all_true_with_clis(
     monkeypatch.setenv("CURSOR_API_KEY", "crsr_ready")
     # antigravity-native also needs a credential (not just the ``agy`` binary).
     monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
+    # kimi also needs a credential (not just the ``kimi`` binary).
+    monkeypatch.setattr(_ka, "kimi_login_detected", lambda: True)
     monkeypatch.setenv("GH_TOKEN", "gho_ready")
+    # claude / pi are auth-aware on the credential axis now: satisfy the provider
+    # check deterministically (don't depend on the dev machine's real config).
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
+    )
     # The generic ACP harness is config-gated (≥1 registered agent), not
     # CLI-gated — satisfy it so it isn't the lone unconfigured entry here.
     monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda config=None: [object()])
@@ -308,21 +515,33 @@ def test_configured_harness_map_probes_codex_readiness_once(
     assert result["native-codex"] == "needs-auth"
 
 
-def test_kimi_readiness_keys_off_binary(
+def test_kimi_readiness_keys_off_binary_and_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Kimi is configured iff the ``kimi`` binary is on PATH.
+    """Kimi is configured iff the ``kimi`` binary is on PATH AND a login exists.
 
     Kimi authenticates against Moonshot AI's backend via ``kimi login`` (OAuth
-    or a Moonshot API key), which the daemon cannot inspect — so readiness
-    keys off binary presence, and the alias ``kimi-code`` resolves to the
-    same verdict via canonicalization.
+    or a Moonshot API key), which writes a credential file. Like agy, the
+    daemon has no CLI login-status probe, so readiness is binary presence PLUS
+    a subprocess-free credential check (``kimi_login_detected``). The alias
+    ``kimi-code`` resolves to the same verdict via canonicalization.
     """
+    import omnigent.onboarding.kimi_auth as _ka
+
+    # No binary → not configured regardless of credential.
     _no_clis_installed(monkeypatch)
+    monkeypatch.setattr(_ka, "kimi_login_detected", lambda: True)
     assert harness_is_configured("kimi") is False
     assert harness_is_configured("kimi-code") is False
 
+    # Binary present but no login → still not configured.
     _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(_ka, "kimi_login_detected", lambda: False)
+    assert harness_is_configured("kimi") is False
+    assert harness_is_configured("kimi-code") is False
+
+    # Binary present and login detected → configured.
+    monkeypatch.setattr(_ka, "kimi_login_detected", lambda: True)
     assert harness_is_configured("kimi") is True
     assert harness_is_configured("kimi-code") is True
 
@@ -380,3 +599,49 @@ def test_native_cursor_keys_off_binary_not_api_key(
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
     assert harness_is_configured("cursor-native") is True
     assert harness_is_configured("native-cursor") is True
+
+
+def test_configured_harness_map_reports_version_too_low_for_outdated_clis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An outdated CLI for major native harnesses is flagged ``version-too-low``.
+
+    This exercises the readiness-layer wiring, which is where the binary is
+    on ``PATH`` but does not satisfy the declared ``min_version`` of the spec.
+    The core promise of the feature is that users see an upgrade prompt instead
+    of being told the binary is missing.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(hi, "harness_cli_installed", lambda _key, **_kw: False)
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda _key, **_kw: True)
+    result = configured_harness_map()
+    for harness in (
+        "claude-native",
+        "native-claude",
+        "opencode-native",
+        "native-opencode",
+        "cursor-native",
+        "native-cursor",
+        "kiro-native",
+        "native-kiro",
+    ):
+        assert result[harness] == HARNESS_VERSION_TOO_LOW, (
+            f"{harness} should report version-too-low, not binary-missing"
+        )
+
+
+def test_antigravity_native_requires_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``antigravity-native`` needs both the ``agy`` binary and a stored credential."""
+    import omnigent.onboarding.gemini_auth as _ga
+
+    _all_clis_installed(monkeypatch)
+    # Binary installed but no credential → not ready.
+    monkeypatch.setattr(_ga, "gemini_login_detected", lambda: False)
+    assert harness_is_configured("antigravity-native") is False
+    assert harness_is_configured("native-antigravity") is False
+    # Stored credential present → ready.
+    monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
+    assert harness_is_configured("antigravity-native") is True
+    assert harness_is_configured("native-antigravity") is True

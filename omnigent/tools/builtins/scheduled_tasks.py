@@ -39,9 +39,13 @@ class SysScheduledTaskCreateTool(Tool):
         return (
             "Create a scheduled task: a saved prompt that runs an agent session "
             "on a recurring schedule (RRULE). Provide the agent to run, the "
-            "prompt to send it, the recurrence rule, a connected host, and an "
-            "existing workspace on that host. The task fires automatically on "
-            "its schedule until deleted."
+            "prompt to send it, and the recurrence rule. The workspace is always "
+            "optional and defaults to the launch host's home directory (fine for "
+            "MCP-only / chat tasks that touch no code directory). Optionally PIN "
+            "a connected host and/or a workspace on it; with no pinned host it "
+            "runs on your live host at fire time (the owner must have an online "
+            "host then, else the run is recorded as failed). The task fires "
+            "automatically on its schedule until deleted."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -91,16 +95,23 @@ class SysScheduledTaskCreateTool(Tool):
                         },
                         "workspace": {
                             "type": "string",
-                            "description": "Existing absolute path where the run's runner starts.",
+                            "description": (
+                                "Optional existing absolute path where the run's runner "
+                                "starts. Omit to default to the launch host's home "
+                                "directory (whether the host is pinned or resolved)."
+                            ),
                         },
                         "host_id": {
                             "type": "string",
                             "description": (
-                                "Connected host to run on, from the current workspace's host list."
+                                "Optional PIN of a connected host to run on, from the "
+                                "current workspace's host list. Omit to run on the owner's "
+                                "online host at fire time; a failed run is recorded if none "
+                                "is online."
                             ),
                         },
                     },
-                    "required": ["name", "prompt", "rrule", "agent_id", "workspace", "host_id"],
+                    "required": ["name", "prompt", "rrule", "agent_id"],
                     "additionalProperties": False,
                 },
             },

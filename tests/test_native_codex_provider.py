@@ -16,7 +16,9 @@ import pytest
 import yaml
 
 from omnigent.codex_native_app_server import resolve_native_codex_launch
+from omnigent.errors import OmnigentError
 from omnigent.inner.codex_executor import _provider_codex_config_overrides
+from omnigent.spec.types import AgentSpec, ExecutorSpec, ProviderAuth
 
 
 @pytest.fixture()
@@ -436,3 +438,184 @@ def test_resolve_native_codex_launch_undismissed_config_provider_routes_via_pin(
 
     assert launch.config_overrides == ['model_provider="Databricks"']
     assert launch.profile is None
+
+
+# ── Spec-level credentials (issue #2744) ────────────────────────────────────
+
+
+def _spec(*, auth: ProviderAuth | None = None, profile: str | None = None) -> AgentSpec:
+    """Build a minimal codex-native agent spec carrying spec-level credentials."""
+    config: dict[str, object] = {"harness": "codex-native"}
+    if profile is not None:
+        config["profile"] = profile
+    return AgentSpec(
+        spec_version=1,
+        name="test-codex-native",
+        instructions="You are a test agent.",
+        executor=ExecutorSpec(type="omnigent", config=config, model=None, auth=auth),
+        llm=None,
+        os_env=None,
+    )
+
+
+def test_spec_provider_auth_routes_when_machine_has_nothing(_isolated: Path) -> None:
+    """A spec naming a provider routes natively with zero machine-level config.
+
+    The #2744 repro: no machine provider, no global auth, codex not logged in.
+    Pre-fix the launch fell through to "Codex CLI login" and the TUI parked on
+    the sign-in screen; the spec's named provider must route instead.
+    """
+    _seed(
+        _isolated,
+        {
+            "vendor-spec": {
+                "kind": "key",
+                "openai": {
+                    "base_url": "https://spec.example.com/v1",
+                    "api_key": "sk-spec",
+                    "models": {"default": "spec-model"},
+                },
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(
+        model=None, spec=_spec(auth=ProviderAuth(name="vendor-spec"))
+    )
+
+    joined = "\n".join(launch.config_overrides)
+    assert 'base_url="https://spec.example.com/v1"' in joined
+    assert "printf %s sk-spec" in joined
+    assert launch.model == "spec-model"
+    assert "Codex CLI login" not in launch.summary
+
+
+def test_spec_provider_auth_beats_machine_default(_isolated: Path) -> None:
+    """A spec-named provider wins over the machine-level default provider."""
+    _seed(
+        _isolated,
+        {
+            "machine-default": {
+                "kind": "key",
+                "default": True,
+                "openai": {
+                    "base_url": "https://default.example.com/v1",
+                    "api_key": "sk-default",
+                },
+            },
+            "vendor-spec": {
+                "kind": "key",
+                "openai": {
+                    "base_url": "https://spec.example.com/v1",
+                    "api_key": "sk-spec",
+                },
+            },
+        },
+    )
+
+    launch = resolve_native_codex_launch(
+        model=None, spec=_spec(auth=ProviderAuth(name="vendor-spec"))
+    )
+
+    joined = "\n".join(launch.config_overrides)
+    assert 'base_url="https://spec.example.com/v1"' in joined
+    assert "default.example.com" not in joined
+
+
+def test_spec_legacy_profile_routes_ucode(_isolated: Path) -> None:
+    """A legacy ``executor.config.profile`` resolves to the ucode profile path."""
+    launch = resolve_native_codex_launch(model=None, spec=_spec(profile="spec-prof"))
+
+    assert launch.profile == "spec-prof"
+
+
+def test_spec_without_auth_keeps_machine_resolution(_isolated: Path) -> None:
+    """A spec with no spec-level credential leaves machine flows untouched."""
+    _seed(
+        _isolated,
+        {
+            "openai": {
+                "kind": "key",
+                "default": True,
+                "openai": {
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "sk-oai-default",
+                },
+            }
+        },
+    )
+
+    with_spec = resolve_native_codex_launch(model=None, spec=_spec())
+    without_spec = resolve_native_codex_launch(model=None)
+
+    assert with_spec == without_spec
+    assert 'base_url="https://api.openai.com/v1"' in "\n".join(with_spec.config_overrides)
+
+
+def test_spec_provider_auth_undeclared_fails_loud(_isolated: Path) -> None:
+    """A spec naming an undeclared provider raises instead of a silent timeout."""
+    with pytest.raises(OmnigentError, match="does-not-exist"):
+        resolve_native_codex_launch(
+            model=None, spec=_spec(auth=ProviderAuth(name="does-not-exist"))
+        )
+
+
+def _write_codex_home_login(root: Path, *, logged_in: bool) -> Path:
+    """Write an explicit ``CODEX_HOME`` with a logged-in/out ``auth.json``."""
+    codex_home = root / "codex-home"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    content = '{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-codex-login"}' if logged_in else "{}"
+    (codex_home / "auth.json").write_text(content, encoding="utf-8")
+    return codex_home
+
+
+def test_spec_subscription_logged_out_does_not_substitute(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec-named subscription never silently routes a different provider.
+
+    The machine-DEFAULT subscription path falls through to the first other
+    routable provider when Codex is logged out (a safety net for defaults).
+    For an explicit spec declaration that substitution would run the agent
+    against a credential its author never named, so the launch must surface
+    Codex's own login instead.
+    """
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=False)))
+    _seed(
+        _isolated,
+        {
+            "codex-sub": {"kind": "subscription", "cli": "codex"},
+            "other": {
+                "kind": "key",
+                "openai": {
+                    "base_url": "https://other.example.com/v1",
+                    "api_key": "sk-other",
+                },
+            },
+        },
+    )
+
+    launch = resolve_native_codex_launch(
+        model=None, spec=_spec(auth=ProviderAuth(name="codex-sub"))
+    )
+
+    assert launch.config_overrides == ['model_provider="openai"']
+    assert "codex-sub" in launch.summary
+    assert "other.example.com" not in "\n".join(launch.config_overrides)
+
+
+def test_spec_subscription_logged_in_uses_cli_login(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec-named subscription with a live Codex login defers to it."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=True)))
+    _seed(_isolated, {"codex-sub": {"kind": "subscription", "cli": "codex"}})
+
+    launch = resolve_native_codex_launch(
+        model=None, spec=_spec(auth=ProviderAuth(name="codex-sub"))
+    )
+
+    assert launch.config_overrides == ['model_provider="openai"']
+    assert launch.profile is None
+    assert "codex-sub" in launch.summary
+    assert "Codex is logged in" in launch.summary

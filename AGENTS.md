@@ -9,6 +9,17 @@ Run the `pre-commit` hook before committing (`pre-commit run --all-files`, or
 let it run on staged files via `git commit`). Fix any issues it reports so the
 commit lands clean — CI runs the same checks.
 
+## Local development shortcuts
+
+Use `just` for common tasks; run `just --list` for grouped recipes.
+
+- `just ensure` — install/check prerequisites
+- `just run-ios` / `just run-android` — build/run mobile apps
+- `just dev` / `just dev-mobile` — start the omnigent dev pod
+- `just electron-dev` / `just electron-build` — Electron desktop shell
+- `just lint` / `just lint-all` — run pre-commit
+- `just normalize-locks` — rewrite lockfile registries to PyPI/npmjs.org
+
 ## Pull requests
 
 When you open a pull request, fill in the repo's PR template at
@@ -34,8 +45,10 @@ sections.
 
 When you finish a task, print instructions to the user on how to test it: the
 commands to run, the inputs to provide, or the steps to reproduce so they can
-verify the result themselves. Don't leave the user guessing how to confirm the
-work — tell them exactly what to do.
+verify the result themselves. Prefer verification that is best performed by a
+human, such as concrete manual behavior checks, rather than only listing unit
+test commands. Don't leave the user guessing how to confirm the work — tell
+them exactly what to do.
 
 ## Deprecating features
 
@@ -55,6 +68,15 @@ Keep comments short and focused on the code, not on the change history.
   *why* it exists, in terms a future reader needs. Don't reference PR numbers,
   issue numbers, or ticket IDs (e.g. `#1646`, `fixes JIRA-123`); the scenario
   should be clear without chasing external links.
+
+## Database query names
+
+Application stores use `make_named_managed_session_maker` and give every
+session a stable semantic operation name. The session-level name must describe
+the caller's intent rather than repeat SQL syntax; use a nested
+`query_name_scope` only when one transaction needs distinct names for important
+subqueries. Because the named session covers implicit flush and commit, don't
+add an explicit `flush()` only to make a query name observable.
 
 ## Framework-owned instructions
 

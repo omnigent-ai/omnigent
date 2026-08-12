@@ -26,6 +26,8 @@ from omnigent.host.frames import (
     HostHelloFrame,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostModelOptionsFrame,
+    HostModelOptionsResultFrame,
     decode_host_frame,
     encode_host_frame,
 )
@@ -175,6 +177,22 @@ async def fs_setup(
             if not isinstance(text, str):
                 continue
             frame = decode_host_frame(text)
+            if isinstance(frame, HostModelOptionsFrame):
+                reply = replies.get(f"model:{frame.harness}", {})
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostModelOptionsResultFrame(
+                                request_id=frame.request_id,
+                                status=reply.get("status", "ok"),
+                                models=reply.get("models", []),
+                                error=reply.get("error"),
+                            )
+                        ),
+                    }
+                )
+                continue
             if not isinstance(frame, HostListDirFrame):
                 continue
             reply = replies.get(frame.path)
@@ -213,6 +231,44 @@ async def fs_setup(
 
 
 # ── Happy path ──────────────────────────────────────────
+
+
+async def test_host_model_options_returns_prelaunch_catalog(
+    fs_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    """The REST endpoint proxies the selected host's launch catalog."""
+    app, _reg, _comm, replies, _drain = fs_setup
+    replies["model:claude-native"] = {
+        "models": [
+            {
+                "id": "sonnet",
+                "model": "system.ai.claude-sonnet-4-6[1m]",
+                "displayName": "Sonnet 4.6",
+            }
+        ]
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/v1/hosts/{_HOST_ID}/harnesses/claude-native/model-options",
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "models": [
+            {
+                "id": "sonnet",
+                "model": "system.ai.claude-sonnet-4-6[1m]",
+                "displayName": "Sonnet 4.6",
+            }
+        ]
+    }
 
 
 async def test_list_filesystem_returns_paginated_entries(
@@ -381,7 +437,7 @@ async def test_list_filesystem_offline_host_returns_409(
     host_store.upsert_on_connect(
         host_id="3d9665477127e41f42de3f4109418173",
         name="offline-host",
-        owner="local",
+        user_id="local",
     )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get("/v1/hosts/3d9665477127e41f42de3f4109418173/filesystem")
@@ -521,7 +577,7 @@ async def test_list_filesystem_owner_check_blocks_other_users(
     host_store.upsert_on_connect(
         host_id="f54bb9272002938a3a934bfcb6bb228a",
         name="alice-laptop",
-        owner="alice@example.com",
+        user_id="alice@example.com",
     )
 
     async with AsyncClient(

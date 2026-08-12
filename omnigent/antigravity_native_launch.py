@@ -137,8 +137,9 @@ def resolve_native_antigravity_launch(
     """
     if not gemini_auth_has_credential():
         _logger.warning(
-            "No agy OAuth credential found under ~/.gemini (checked "
-            "oauth_creds.json and antigravity-cli/antigravity-oauth-token); "
+            "No agy OAuth credential found (checked ~/.gemini/oauth_creds.json "
+            "and ~/.gemini/antigravity-cli/antigravity-oauth-token, plus "
+            "`agy models` on macOS for a Keychain-stored login); "
             "agy will prompt for login on first run."
         )
     return NativeAntigravityLaunch(auth_mode="subscription", model=model)
