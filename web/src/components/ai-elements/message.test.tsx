@@ -93,12 +93,6 @@ describe("MessageResponse", () => {
   });
 
   it("gives prose a break opportunity for an unbroken run (OMNI-2900)", () => {
-    // wrap-anywhere (overflow-wrap: anywhere) is inherited from this root, so
-    // a long unbroken token — a hash, an id, a long inline-code span — wraps
-    // inside the fixed-width chat column instead of overflowing it. Asserted
-    // as a class contract, not geometry: jsdom has no layout engine, so this
-    // is what actually pins the behavior (see index.css.test.ts + the live
-    // browser verification in the PR description for the geometry proof).
     const { container } = render(<MessageResponse>same text</MessageResponse>);
 
     expect(container.firstElementChild).toHaveClass("wrap-anywhere");

@@ -185,18 +185,7 @@ describe("index.css table link wrapping rule", () => {
   });
 });
 
-/* Regression test for OMNI-2900: chat overflow at narrow viewports.
- *
- * message.tsx now sets `wrap-anywhere` on the chat prose root so ordinary
- * text/inline-code get a break opportunity instead of overflowing the
- * fixed-width column. Inherited into a table cell that has the same
- * column-collapsing effect the link rule above exists to prevent, but for
- * EVERY cell, not just linked ones: `anywhere` shrinks a cell's min-content
- * to ~1 char, so one long-word cell can squeeze every other column. index.css
- * resets table cells back to `break-word`; this pins the selector so the
- * override applies to the cells themselves (and everything they inherit
- * into), and never leaks into prose outside a table.
- */
+/* Pins the table-cell `overflow-wrap: break-word` override so it applies to the cells and never leaks into prose outside a table. */
 describe("index.css table cell wrapping rule", () => {
   const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find(
     (block) =>
@@ -236,8 +225,6 @@ describe("index.css table cell wrapping rule", () => {
   });
 
   it("is declared after the link-in-cell rule, consistent with it rather than fighting it", () => {
-    // Same override, same reasoning, for the cell itself instead of just an
-    // inner link — keep them adjacent so a future edit sees both at once.
     const linkRuleIndex = cssSource.indexOf(
       '[data-streamdown="table-cell"], [data-streamdown="table-header-cell"])\n  [data-streamdown="link"]',
     );
