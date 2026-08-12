@@ -82,6 +82,14 @@ interface TerminalViewProps {
    * behavior the UI renders for.
    */
   transport?: "control" | "pty";
+  /**
+   * False while the surface is mounted but hidden (a pre-warmed attach
+   * kept alive behind the chat view). The session stays connected either
+   * way; on the hidden→visible edge the terminal takes keyboard focus —
+   * the WS-open auto-focus is a browser no-op on a hidden element.
+   * Default true.
+   */
+  active?: boolean;
 }
 
 export function TerminalView({
@@ -94,6 +102,7 @@ export function TerminalView({
   onResume,
   resumePending = false,
   transport,
+  active = true,
 }: TerminalViewProps) {
   // Control mode: xterm owns the buffer + mouse, so plain drag selects and
   // the normal copy gesture works — no forced-selection modifier, no hint bar.
@@ -228,6 +237,30 @@ export function TerminalView({
   useEffect(() => {
     sessionRef.current?.setTheme(isDark);
   }, [isDark]);
+
+  // On the hidden→visible edge of a pre-warmed surface: focus the
+  // terminal (the session's WS-open focus is a no-op while the element is
+  // hidden — visibility:hidden elements aren't focusable), and if the
+  // transport dropped while the surface sat in the background — possibly
+  // exhausting the reconnect budget with nobody watching — retry
+  // immediately with a fresh budget. Reveal is a user signal, exactly
+  // like the visibilitychange redial for frozen tabs. Deliberate closes
+  // (4xxx) keep the dead-end overlay as ever.
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const wasActiveRef = useRef(active);
+  useEffect(() => {
+    if (active && !wasActiveRef.current) {
+      sessionRef.current?.focus();
+      const current = stateRef.current;
+      if (current.kind === "closed" && isUnexpectedTerminalClose(current.code)) {
+        reconnectAttemptsRef.current = 0;
+        disposeActiveSession();
+        setConnectAttempt((attempt) => attempt + 1);
+      }
+    }
+    wasActiveRef.current = active;
+  }, [active, disposeActiveSession]);
 
   // Push code-font changes (Settings → Appearance) into the live session the
   // same way — xterm is a fixed-pixel widget, so it can't follow a CSS variable

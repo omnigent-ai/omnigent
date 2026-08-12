@@ -2974,3 +2974,154 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_doc")).to_be_visible()
         finally:
             await browser.close()
+
+
+def test_start_session_agy_skip_permissions(seeded_session: tuple[str, str]) -> None:
+    """Arming agy's DANGEROUS permission bypass rides along to the create.
+
+    ``--dangerously-skip-permissions`` is agy's only pre-emptive permission
+    control and is all-or-nothing: once armed, Omnigent cannot re-gate
+    individual tools, because agy fires no pre-tool hook for it to intercept.
+    The red banner is therefore the only guardrail between the user and an
+    agent that edits any file and runs any command without asking — so this
+    covers both that the warning appears while the option is selected and that
+    the flag actually reaches ``POST /v1/sessions`` as
+    ``terminal_launch_args: ["--dangerously-skip-permissions"]``.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_agy_skip_permissions(base_url, session_id))
+
+
+async def _drive_agy_skip_permissions(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_antigravity_native_agents_body(),
+            )
+
+            # Neutralize agent discovery so only the stubbed agy agent feeds
+            # the picker.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            # agy auto-selects (only agent); its permission toggle lives in the
+            # gear-icon config modal.
+            await _open_entry_config(page, "ag_antigravity_e2e")
+            skip = page.get_by_test_id("new-chat-landing-config-agy-skip")
+            await expect(skip).to_be_visible()
+
+            banner = page.get_by_test_id("new-chat-landing-agy-skip-banner")
+            # Nothing is bypassed until the user opts in, so the warning must
+            # not be showing on open — otherwise it reads as noise and stops
+            # carrying weight when it matters.
+            await expect(banner).not_to_be_visible()
+
+            # agy has exactly two states: its own prompt, or no prompt at all.
+            await skip.click()
+            for label in ("Ask every time", "Skip permissions"):
+                await expect(page.get_by_role("option", name=label, exact=True)).to_be_visible()
+            await page.get_by_role("option", name="Skip permissions", exact=True).click()
+
+            await expect(skip).to_contain_text("Skip permissions")
+            await expect(banner).to_be_visible()
+            await expect(banner).to_contain_text("Danger")
+            await _save_config(page)
+
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_antigravity_e2e", body
+            assert body["host_id"] == _HOST_ID, body
+            assert body["workspace"] == "/work/repo", body
+            assert body.get("terminal_launch_args") == ["--dangerously-skip-permissions"], body
+        finally:
+            await browser.close()
+
+
+def test_start_session_agy_default_sends_no_permission_flag(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Leaving agy's permission toggle alone launches it with no extra flags.
+
+    The default must stay agy's own request-review prompt: a session that
+    silently inherited the bypass would strip every confirmation without the
+    user ever choosing it. Pins that the untouched toggle sends NO
+    ``terminal_launch_args`` at all, not an empty-string or default-valued one.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_agy_default_permissions(base_url, session_id))
+
+
+async def _drive_agy_default_permissions(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page,
+                created_session_id=session_id,
+                create_bodies=create_bodies,
+                agents_body=_antigravity_native_agents_body(),
+            )
+
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            await _open_entry_config(page, "ag_antigravity_e2e")
+            skip = page.get_by_test_id("new-chat-landing-config-agy-skip")
+            await expect(skip).to_be_visible()
+            await expect(skip).to_contain_text("Ask every time")
+            await _save_config(page)
+
+            await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["agent_id"] == "ag_antigravity_e2e", body
+            assert not body.get("terminal_launch_args"), body
+        finally:
+            await browser.close()

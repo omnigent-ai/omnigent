@@ -21,15 +21,21 @@ leaving ``title`` unindexed would let the planner fall back to scanning
 
 Postgres-only. SQLite (dev/tests) keeps its FTS5 virtual table and small tables,
 so the substring scan there is a non-issue; this migration is a no-op on any
-non-Postgres dialect. Plain ``CREATE INDEX`` (not ``CONCURRENTLY``) because the
-Alembic runner wraps every migration in a transaction, where ``CONCURRENTLY`` is
-illegal — matching every other index migration in this chain.
+non-Postgres dialect. The indexes are built with ``CREATE INDEX CONCURRENTLY``
+so a large ``conversation_items`` table never blocks writers for the duration of
+the GIN build. ``CONCURRENTLY`` is illegal inside a transaction block, so the
+builds run in Alembic's ``autocommit_block``, which commits the migration
+transaction up to that point — safe here because everything before the block is
+idempotent. A concurrent build that fails mid-flight leaves an INVALID index
+behind that ``IF NOT EXISTS`` would silently keep, so any such leftover is
+dropped before (re)creating each index.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
+import sqlalchemy as sa
 from alembic import op
 
 revision: str = "d5e9f1a2b3c4"
@@ -45,6 +51,29 @@ def _is_postgres() -> bool:
     return op.get_bind().dialect.name == "postgresql"
 
 
+def _drop_index_if_invalid(index_name: str) -> None:
+    """
+    Drop *index_name* if a previously failed ``CONCURRENTLY`` build left it
+    INVALID — ``IF NOT EXISTS`` would otherwise keep the unusable leftover.
+
+    :param index_name: Name of the index to check, e.g.
+        ``"ix_conversations_title_trgm"``.
+    """
+    invalid = (
+        op.get_bind()
+        .execute(
+            sa.text(
+                "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+                "WHERE c.relname = :name AND NOT i.indisvalid"
+            ),
+            {"name": index_name},
+        )
+        .scalar()
+    )
+    if invalid:
+        op.execute(f"DROP INDEX {index_name}")
+
+
 def upgrade() -> None:
     """
     Enable ``pg_trgm`` and add GIN trigram indexes on the lowercased search
@@ -55,14 +84,19 @@ def upgrade() -> None:
     # IF NOT EXISTS so a deployment that already enabled the extension (or
     # pre-created an index) migrates cleanly.
     op.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-    op.execute(
-        f"CREATE INDEX IF NOT EXISTS {_ITEMS_INDEX} "
-        "ON conversation_items USING gin (LOWER(search_text) gin_trgm_ops)"
-    )
-    op.execute(
-        f"CREATE INDEX IF NOT EXISTS {_TITLE_INDEX} "
-        "ON conversations USING gin (LOWER(title) gin_trgm_ops)"
-    )
+    # CONCURRENTLY cannot run inside a transaction block; the autocommit block
+    # commits the migration transaction so far and runs each statement in
+    # autocommit mode, letting writers proceed while the indexes build.
+    with op.get_context().autocommit_block():
+        for index_name, table, expression in (
+            (_ITEMS_INDEX, "conversation_items", "LOWER(search_text)"),
+            (_TITLE_INDEX, "conversations", "LOWER(title)"),
+        ):
+            _drop_index_if_invalid(index_name)
+            op.execute(
+                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name} "
+                f"ON {table} USING gin ({expression} gin_trgm_ops)"
+            )
 
 
 def downgrade() -> None:

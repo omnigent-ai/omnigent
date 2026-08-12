@@ -23,6 +23,7 @@ from omnigent.runner._entry import (
     _agent_cache_dest,
     _InitialAuthTokenFactory,
     _install_crash_logging,
+    _install_signal_handlers,
     _load_runner_idle_timeout_s_from_config,
     _make_auth_token_factory,
     _make_managed_mint_factory,
@@ -2319,3 +2320,29 @@ def test_agent_cache_dest_normal_id_round_trips(tmp_path: Path) -> None:
     dest = _agent_cache_dest(cache_root, "ag_abc123", "3")
 
     assert dest == cache_root / "ag_abc123-v3"
+
+
+@pytest.mark.asyncio
+async def test_install_signal_handlers_degrades_when_wakeup_fd_unusable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken signal wakeup fd must degrade, not crash the runner.
+
+    Zygote-forked runners crash-looped when the loop's wakeup fd came up
+    in blocking mode ("the fd 6 must be in non-blocking mode"): the
+    RuntimeError from ``add_signal_handler`` escaped ``main``. Handler
+    registration must warn and stop after the first failure instead.
+    """
+    loop = asyncio.get_running_loop()
+    attempts: list[int] = []
+
+    def _broken_add_signal_handler(sig: int, *args: Any) -> None:
+        attempts.append(sig)
+        raise RuntimeError("the fd 6 must be in non-blocking mode")
+
+    monkeypatch.setattr(loop, "add_signal_handler", _broken_add_signal_handler)
+
+    _install_signal_handlers(asyncio.Event())
+
+    # First failure marks the loop degraded; SIGTERM is skipped, not retried.
+    assert attempts == [signal.SIGINT]

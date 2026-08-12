@@ -118,7 +118,19 @@ def test_trgm_indexes_present_on_postgres(db_uri: str) -> None:
                 {"items": _ITEMS_INDEX, "title": _TITLE_INDEX},
             ).fetchall()
         )
+        invalid = conn.execute(
+            sa.text(
+                "SELECT c.relname FROM pg_index i "
+                "JOIN pg_class c ON c.oid = i.indexrelid "
+                "WHERE c.relname IN (:items, :title) AND NOT i.indisvalid"
+            ),
+            {"items": _ITEMS_INDEX, "title": _TITLE_INDEX},
+        ).fetchall()
     assert set(defs) == {_ITEMS_INDEX, _TITLE_INDEX}, defs
     for definition in defs.values():
         lowered = definition.lower()
         assert "gin" in lowered and "gin_trgm_ops" in lowered and "lower(" in lowered, definition
+    # The indexes are built with CREATE INDEX CONCURRENTLY; a failed concurrent
+    # build leaves an INVALID (planner-ignored) index that would still pass the
+    # structural checks above, so assert both builds actually completed.
+    assert not invalid, invalid

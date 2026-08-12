@@ -81,15 +81,15 @@ from omnigent.antigravity_native_rpc import (
     stream_agent_state_updates,
 )
 
-# ``OutboundEvent`` + ``_ToolCallIdAllocator`` live in the mapper module since the
-# Task 12 cutover (relocated from the retired transcript forwarder). The reader
-# reuses the SAME event shape and allocator so the mapped events post identically.
+# ``OutboundEvent`` lives in the mapper module since the Task 12 cutover
+# (relocated from the retired transcript forwarder). The reader reuses the SAME
+# event shape so the mapped events post identically.
 from omnigent.antigravity_native_steps import (
     OutboundEvent,
     PendingInteraction,
     _execution_discriminator,
     _step_index,
-    _ToolCallIdAllocator,
+    _tool_call_id,
     _trajectory_id,
     map_step_to_events,
     output_reasoning_delta_event,
@@ -106,6 +106,24 @@ _logger = logging.getLogger(__name__)
 # and steps finalize only at DONE (no token streaming), so a sub-second cadence
 # keeps the mirror responsive without hammering the loopback server.
 _DEFAULT_POLL_INTERVAL_S = 0.25
+
+# Sub-agent mirrors poll their own cascade. Slower than the parent's tick because
+# a session can run twenty-odd of them at once (live-verified: 23), and none of
+# them streams — they are committed-only, so a sub-second tick buys nothing.
+_SUBAGENT_POLL_INTERVAL_S = 1.0
+
+# Consecutive no-new-step polls before a sub-agent whose turn never closed is
+# checked against agy's own run status. Generous: a child running a long build
+# produces no steps meanwhile, and cutting it short would truncate its
+# transcript. The cost of waiting is only how long a stuck badge lingers.
+_SUBAGENT_QUIESCENT_POLLS = 60
+
+# Ceiling for that window. agy answering "still running" does not end the mirror
+# — a wrong "idle" truncates a transcript, so the status check can only ever
+# veto — which makes the window a repeating re-check rather than one grace
+# period. It doubles after each veto so a child that never reports idle settles
+# to one cheap check every few minutes instead of one a minute all session.
+_SUBAGENT_QUIESCENT_POLLS_MAX = 480
 
 # Default seconds between Task T-G ``/clear``-rotation checks
 # (``GetAllCascadeTrajectories``). Coarse on purpose: a ``/clear`` is a rare,
@@ -169,10 +187,11 @@ _STATUS_FAILED = "failed"
 _TYPE_USER_INPUT = "CORTEX_STEP_TYPE_USER_INPUT"
 _TYPE_PLANNER_RESPONSE = "CORTEX_STEP_TYPE_PLANNER_RESPONSE"
 
-# Root-cascade trajectory type in ``GetAllCascadeTrajectories`` summaries. Only a
-# root cascade is a rotation candidate — a subagent/child trajectory carries a
-# different ``trajectoryType`` and must never be rotated to (its turns are not the
-# user's top-level conversation). Live-verified value (agy 1.0.10; see the
+# Cascade trajectory type in ``GetAllCascadeTrajectories`` summaries. This filters
+# non-cascade trajectories out of rotation; it does NOT separate roots from
+# children — a subagent reports this same value byte-for-byte, and
+# :func:`_summary_is_child_trajectory` (a ``trajectoryMetadata`` test) is what
+# excludes children. Live-verified value (agy 1.0.10; see the
 # ``get_all_cascade_trajectories`` capture).
 _TRAJECTORY_TYPE_CASCADE = "CORTEX_TRAJECTORY_TYPE_CASCADE"
 
@@ -436,6 +455,43 @@ def _cascade_is_idle(summaries: dict[str, object], bound_cascade_id: str) -> boo
     return summary.get("status") == _CASCADE_RUN_STATUS_IDLE
 
 
+def _summary_is_child_trajectory(cascade_id: str, summary: dict[str, object]) -> bool:
+    """
+    Whether a cascade summary describes a SUBAGENT (child) conversation.
+
+    agy spawns each subagent as its own conversation that reports
+    ``trajectoryType == CORTEX_TRAJECTORY_TYPE_CASCADE`` — byte-identical to a real
+    root — so the type alone cannot tell them apart (live-verified, agy 1.1.9).
+    The distinction lives in ``trajectoryMetadata``, where a child carries a
+    ``parentConversationId`` and a ``rootConversationId`` pointing at its PARENT,
+    while a root's ``rootConversationId`` is its own id::
+
+        root:  {"rootConversationId": "<self>"}
+        child: {"parentConversationId": "<parent>", "rootConversationId": "<parent>",
+                "nestingDepth": 1, "subagentSpec": {...}}
+
+    This matters because a subagent is ALWAYS more recently active than the parent
+    idling while it works, so without this test every spawned subagent looks like a
+    ``/clear`` rotation — promoting a sub-conversation to a new top-level session
+    and dragging the agy pane onto it.
+
+    Fail-open: a summary with no (or malformed) metadata is NOT treated as a child,
+    so a genuine ``/clear`` on an agy build that omits these fields still rotates.
+
+    :param cascade_id: The summary's own key (its conversation id).
+    :param summary: One ``trajectorySummaries`` entry.
+    :returns: ``True`` when the entry is a subagent/child trajectory.
+    """
+    metadata = summary.get("trajectoryMetadata")
+    if not isinstance(metadata, dict):
+        return False
+    parent = metadata.get("parentConversationId")
+    if isinstance(parent, str) and parent:
+        return True
+    root = metadata.get("rootConversationId")
+    return isinstance(root, str) and bool(root) and root != cascade_id
+
+
 def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str) -> str | None:
     """
     Return the id of a newer-active root cascade than the bound one, else ``None``.
@@ -447,10 +503,12 @@ def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str)
 
     Selection:
 
-    * Consider ONLY root cascades (``trajectoryType ==
-      CORTEX_TRAJECTORY_TYPE_CASCADE``) — a subagent/child trajectory is never a
-      rotation target (rotating to it would mirror a sub-conversation, not the
-      user's top-level one).
+    * Consider ONLY root cascades. Two independent filters get there: the
+      ``trajectoryType`` test drops non-cascade trajectories, and
+      :func:`_summary_is_child_trajectory` drops subagents — which report the
+      SAME ``trajectoryType`` as a root and are told apart by their
+      ``trajectoryMetadata``. A child is never a rotation target (rotating to it
+      would mirror a sub-conversation, not the user's top-level one).
     * The "current" cascade is the one with the newest activity timestamp
       (:func:`_summary_activity`: ``lastUserInputTime`` preferred, else
       ``lastModifiedTime``). An entry with NO parseable activity (a bare ``/clear``
@@ -487,7 +545,9 @@ def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str)
         if not isinstance(summary, dict):
             continue
         if summary.get("trajectoryType") != _TRAJECTORY_TYPE_CASCADE:
-            continue  # never rotate to a subagent/child trajectory
+            continue  # never rotate to a non-cascade trajectory
+        if _summary_is_child_trajectory(cascade_id, summary):
+            continue  # a subagent works FOR the bound cascade; it is not a new one
         if cascade_id == bound_cascade_id:
             continue
         activity = _summary_activity(summary)
@@ -568,10 +628,15 @@ def _is_assistant_text_close_step(step: dict[str, object]) -> bool:
 
     The RPC equivalent of the transcript forwarder's
     :func:`_is_assistant_text_step`: a PLANNER_RESPONSE that carries assistant
-    text (``modifiedResponse`` or ``response``) and issues NO tool calls is the
-    closing edge of a turn — agy answered and stopped. A planner step that only
-    invokes a tool does not close the turn (the tool result, and possibly more
-    planner steps, follow).
+    text (``modifiedResponse`` or ``response``) is the closing edge of a turn —
+    agy answered and stopped. A planner step that only invokes a tool does not
+    close the turn (the tool result, and possibly more planner steps, follow).
+
+    The TEXT is what separates the two: a dispatching planner carries none, in
+    either RPC shape. The ``toolCalls`` test below is a poll-shape-only
+    belt-and-braces guard for a planner that somehow carried both — it cannot
+    fire on the stream, where the field is stripped (see
+    :func:`_is_turn_close_step`).
 
     :param step: One RPC step dict.
     :returns: ``True`` when the step is a DONE PLANNER_RESPONSE with non-empty
@@ -601,23 +666,31 @@ def _is_turn_close_step(step: dict[str, object]) -> bool:
     """
     Return whether a step ends the current turn (fire the IDLE edge).
 
-    A turn opens on USER_INPUT and stays open until agy stops working. The
-    canonical close is a DONE PLANNER_RESPONSE that carries assistant text and
-    dispatches no further tool calls (:func:`_is_assistant_text_close_step`).
-    But a turn can also END without that clean closing text step, and those
-    paths must fire IDLE too — otherwise ``turn_active`` sticks True forever:
-    the spinner never clears AND the next turn's USER_INPUT can't re-open
-    RUNNING (it is gated on ``not turn_active``). The additional closes:
+    A turn opens on USER_INPUT and stays open until agy stops working. Exactly
+    two steps close it:
 
+    * a DONE PLANNER_RESPONSE carrying assistant text
+      (:func:`_is_assistant_text_close_step`) — agy answered and stopped; and
     * a terminal-ERROR PLANNER_RESPONSE — agy's model step failed, so no tool
-      result or recovery planner follows; and
-    * a DONE PLANNER_RESPONSE that dispatches no tool call and carries no usable
-      text — a degenerate end with nothing more to do.
+      result or recovery planner follows.
 
-    A PLANNER_RESPONSE that DOES dispatch a tool call is never a close: the tool
-    result (and possibly more planner steps) follow. Non-planner steps never
-    close a turn here (a tool result is followed by a recovery/answer planner;
-    closing on it would pre-empt that planner).
+    **Assistant text is the close signal, not the absence of ``toolCalls``.**
+    Text is the one discriminator that holds in BOTH RPC shapes: a planner that
+    dispatches a tool carries no text on the poll shape *or* the stream shape,
+    while an answering planner carries text on both. ``toolCalls`` exists only
+    on the poll shape (the stream strips it, as does ``metadata.toolCall``), so
+    a "closes unless it dispatched" rule read a STREAMED dispatch — DONE, no
+    toolCalls, no text — as a degenerate close and fired IDLE the moment agy
+    called a tool, clearing the spinner for the rest of the turn.
+
+    A DONE planner with neither text nor a dispatch is therefore NOT treated as
+    a close: that shape is indistinguishable from a streamed dispatch, and
+    guessing wrong strands every streamed tool turn. The genuinely degenerate
+    turn is reconciled by the idle backstop (``_close_turn_if_stranded``), which
+    closes on agy's own cascade status one detector interval later.
+
+    Non-planner steps never close a turn here (a tool result is followed by a
+    recovery/answer planner; closing on it would pre-empt that planner).
 
     :param step: One RPC step dict.
     :returns: ``True`` when this step ends the turn.
@@ -626,15 +699,7 @@ def _is_turn_close_step(step: dict[str, object]) -> bool:
         return True
     if step.get("type") != _TYPE_PLANNER_RESPONSE:
         return False
-    status = step.get("status")
-    if status == _STATUS_ERROR:
-        return True
-    if status != _STATUS_DONE:
-        return False
-    # A DONE planner that dispatches a tool call is a continuation, not a close.
-    planner = step.get("plannerResponse")
-    tool_calls = planner.get("toolCalls") if isinstance(planner, dict) else None
-    return not (isinstance(tool_calls, list) and tool_calls)
+    return step.get("status") == _STATUS_ERROR
 
 
 def _status_event(status: str) -> OutboundEvent:
@@ -905,9 +970,9 @@ async def supervise_reader(
 
     De-dup is by ``(trajectory_id, step_index)`` identity in an in-memory
     seen-set (no durable cursor — retired in Task 12), so re-reading the same
-    snapshot posts nothing. A single :class:`_ToolCallIdAllocator` is reused
-    across polls so fallback ids stay stable; real agy tool-call ids (used by the
-    mapper) make invocation↔output pairing order-independent regardless.
+    snapshot posts nothing. Tool-call ids are derived from each step's own
+    ``(trajectory, step)`` identity by the mapper, so a re-read or a fallback to
+    a different RPC re-derives the same id rather than re-keying the pair.
 
     Error handling: an RPC failure on a poll — ``httpx.HTTPError`` (transport AND
     non-2xx both raise it) or a ``ValueError`` (a non-JSON 200 body) — is logged
@@ -960,11 +1025,10 @@ async def supervise_reader(
         return None
     cascade_id, port = discovered
 
-    # One allocator + one set of cross-poll/cross-frame trackers per reader run,
-    # shared by BOTH the stream path and the poll fallback so a fall-through after
-    # a partial stream does not re-post already-mirrored steps or re-open turns.
+    # One set of cross-poll/cross-frame trackers per reader run, shared by BOTH
+    # the stream path and the poll fallback so a fall-through after a partial
+    # stream does not re-post already-mirrored steps or re-open turns.
     state = _ReaderState(
-        allocator=_ToolCallIdAllocator(conversation_id=cascade_id),
         seen=set(),
         interacted=set(),
         port=port,
@@ -1114,7 +1178,14 @@ async def supervise_reader(
             await asyncio.sleep(0)
             inflight = [
                 pending
-                for pending in (state.interaction_task, *state.interaction_rescans)
+                for pending in (
+                    state.interaction_task,
+                    *state.interaction_rescans,
+                    # Sub-agent mirrors poll until their parent step settles; a
+                    # reader teardown mid-flight must not leave them polling a
+                    # cascade whose agy is going away.
+                    *state.subagent_mirrors.values(),
+                )
                 if pending is not None and not pending.done()
             ]
             if not inflight:
@@ -1145,18 +1216,23 @@ class _ReaderState:
     mirrored over the stream is not re-posted by the poll loop, and an open turn
     is not re-opened.
 
-    :param allocator: Per-run fallback tool-call id allocator (real agy ids are
-        preferred by the mapper; this only covers resume-mid-turn results that
-        lack ``metadata.toolCall.id``).
     :param seen: :func:`_step_key` identities whose COMMITTED items have been
         posted, so the on-connect snapshot replay (and steady-state re-reads)
         post nothing.
     :param interacted: Identities whose WAITING interaction was already handed to
         the bridge, so a re-sent WAITING frame does not re-fire it.
-    :param prefixes: Per-PLANNER ``step_index`` → the length of ``modifiedResponse``
-        already forwarded as deltas, so each frame emits only the NEW suffix.
-        Cleared for a step when its committed ``message`` is posted (stream path
-        only; the poll path never populates it).
+    :param prefixes: Per-PLANNER ``step_index`` → the ``modifiedResponse`` text
+        actually SENT as deltas so far, so each frame emits only the NEW suffix.
+        Advanced only when a delta goes out: it mirrors the server's buffer, and
+        anchoring it to text that was never sent would cut the next delta from
+        the wrong offset. Cleared for a step when its committed ``message`` is
+        posted (stream path only; the poll path never populates it).
+    :param delta_chunks: Per-PLANNER ``step_index`` → how many text deltas have
+        been emitted for it, which is the delta ``index`` the server orders on.
+        A counter rather than the forwarded byte offset because agy can replace
+        a partial with a SHORTER post-moderation rewrite: the offset would then
+        move backwards and the server would drop the closing ``final`` chunk,
+        leaving the message in flight to be replayed. Cleared with ``prefixes``.
     :param reasoning_prefixes: Per-PLANNER ``step_index`` → the ``thinking`` text
         already forwarded as reasoning deltas, mirroring ``prefixes`` for the
         reasoning stream (design §10.2). A step's first entry doubles as the
@@ -1197,12 +1273,18 @@ class _ReaderState:
     :param interaction_rescans: In-flight re-scan tasks scheduled by a bridge's
         done-callback to surface a WAITING gate deferred while the bridge ran.
         Held as strong refs so they are not GC'd mid-run; cancelled on teardown.
+    :param subagent_mirrors: agy child cascade id → the task mirroring that
+        cascade into its own Omnigent child session. One per sub-agent, started
+        when the parent's ``INVOKE_SUBAGENT`` step first names the child and
+        held as a strong ref so it is not GC'd mid-run; cancelled on teardown.
+        Doubles as the start-once guard — a re-sent step re-enters the handler
+        every frame while the sub-agents work.
     """
 
-    allocator: _ToolCallIdAllocator
     seen: set[_StepKey]
     interacted: set[_StepKey]
     prefixes: dict[int, str] = field(default_factory=dict)
+    delta_chunks: dict[int, int] = field(default_factory=dict)
     reasoning_prefixes: dict[int, str] = field(default_factory=dict)
     turn_active: bool = False
     posted_model_enum: str | None = None
@@ -1214,6 +1296,7 @@ class _ReaderState:
     interaction_task: asyncio.Task[None] | None = None
     surfaced_elicitations: dict[_StepKey, str] = field(default_factory=dict)
     interaction_rescans: set[asyncio.Task[None]] = field(default_factory=set)
+    subagent_mirrors: dict[str, asyncio.Task[None]] = field(default_factory=dict)
 
 
 async def _poll_loop(
@@ -1429,12 +1512,24 @@ async def _process_committed_step(
     if key not in state.seen:
         if _is_settled(step):
             state.seen.add(key)
+        # Close any live block for this step BEFORE its committed item. Done
+        # here rather than in the stream handler because the poll loop commits
+        # through this same function: closing in only one path leaves every
+        # poll-committed step permanently in-flight, and the server then
+        # replays it to each later subscriber as a stale duplicate.
+        await _close_planner_delta_stream(
+            step,
+            client=client,
+            session_id=session_id,
+            cascade_id=cascade_id,
+            prefixes=state.prefixes,
+            delta_chunks=state.delta_chunks,
+        )
         state.turn_active = await _emit_step(
             step,
             client=client,
             session_id=session_id,
             cascade_id=cascade_id,
-            allocator=state.allocator,
             turn_active=state.turn_active,
         )
         # Telemetry: model-change detection on USER_INPUT (design §10.4).
@@ -1471,6 +1566,326 @@ async def _process_committed_step(
         session_id=session_id,
         state=state,
     )
+    # Sub-agents: an INVOKE_SUBAGENT step names its children as soon as they are
+    # spawned, long before the step settles. Runs unconditionally (like the
+    # interaction handoff above) so the rail fills WHILE they work rather than
+    # when they all finish; the dedup lives in ``subagent_mirrors``.
+    await _maybe_mirror_subagents(
+        step,
+        client=client,
+        session_id=session_id,
+        cascade_id=cascade_id,
+        state=state,
+    )
+
+
+def _subagent_pairs(step: dict[str, object]) -> list[tuple[dict[str, object], str]]:
+    """
+    Pair an INVOKE_SUBAGENT step's specs with the child cascade ids they spawned.
+
+    agy fills ``invokeSubagent.results[]`` positionally against
+    ``invokeSubagent.subagents[]``, and populates a result's ``conversationId``
+    as soon as that child exists — the step itself stays RUNNING until every
+    child finishes. A spec whose result has no id yet is skipped and picked up on
+    a later frame.
+
+    :param step: A step dict, of any type.
+    :returns: ``(spec, child cascade id)`` pairs, empty for a non-subagent step.
+    """
+    body = step.get("invokeSubagent")
+    if not isinstance(body, dict):
+        return []
+    specs = body.get("subagents")
+    results = body.get("results")
+    if not isinstance(specs, list) or not isinstance(results, list):
+        return []
+    pairs: list[tuple[dict[str, object], str]] = []
+    for spec, result in zip(specs, results, strict=False):
+        if not isinstance(spec, dict) or not isinstance(result, dict):
+            continue
+        child_id = result.get("conversationId")
+        if isinstance(child_id, str) and child_id:
+            pairs.append((spec, child_id))
+    return pairs
+
+
+async def _register_subagent_child(
+    *,
+    client: httpx.AsyncClient,
+    session_id: str,
+    spec: dict[str, object],
+    child_cascade_id: str,
+    tool_call_id: str,
+) -> str | None:
+    """
+    Register one agy sub-agent with the server and return its child session id.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: PARENT Omnigent conversation id.
+    :param spec: One ``invokeSubagent.subagents[]`` entry.
+    :param child_cascade_id: The child's agy conversation id.
+    :param tool_call_id: The INVOKE_SUBAGENT step's mirrored call id, so the
+        child links back to the tool card that spawned it.
+    :returns: The minted child conversation id, or ``None`` when the server
+        rejected the registration (logged; the sub-agent is simply not mirrored).
+    """
+    role = spec.get("role")
+    agent_type = spec.get("typeName")
+    payload: dict[str, object] = {
+        "type": "external_antigravity_subagent_start",
+        "data": {
+            "cascade_id": child_cascade_id,
+            "role": role if isinstance(role, str) else "",
+            "agent_type": agent_type if isinstance(agent_type, str) else "",
+            "tool_call_id": tool_call_id,
+        },
+    }
+    try:
+        response = await client.post(
+            f"/v1/sessions/{url_component(session_id)}/events", json=payload
+        )
+        response.raise_for_status()
+        body = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        _logger.warning(
+            "agy sub-agent registration failed; not mirroring it: parent=%s child=%s error=%r",
+            session_id,
+            child_cascade_id,
+            exc,
+        )
+        return None
+    child_session_id = body.get("child_session_id") if isinstance(body, dict) else None
+    if not isinstance(child_session_id, str) or not child_session_id:
+        _logger.warning(
+            "agy sub-agent registration returned no child_session_id: parent=%s child=%s",
+            session_id,
+            child_cascade_id,
+        )
+        return None
+    return child_session_id
+
+
+async def _subagent_cascade_is_idle(port: int, child_cascade_id: str) -> bool:
+    """
+    Ask agy whether a sub-agent cascade has stopped running.
+
+    The authoritative completion signal, used only to break a stall: a child that
+    has gone quiet without a recognizable closing step. Fail-safe on any RPC
+    trouble — reporting "not idle" keeps mirroring, where a wrong "idle" would
+    truncate a sub-agent mid-run.
+
+    :param port: agy connect-RPC port.
+    :param child_cascade_id: The sub-agent's agy conversation id.
+    :returns: ``True`` only on an explicit idle status for that cascade.
+    """
+    try:
+        body = await asyncio.to_thread(get_all_cascade_trajectories, port)
+    except (httpx.HTTPError, ValueError) as exc:
+        _logger.warning(
+            "agy sub-agent idle check failed; still mirroring: child=%s error=%r",
+            child_cascade_id,
+            exc,
+        )
+        return False
+    summaries = body.get("trajectorySummaries")
+    if not isinstance(summaries, dict):
+        return False
+    return _cascade_is_idle(summaries, child_cascade_id)
+
+
+async def _mirror_subagent_cascade(
+    *,
+    port: int,
+    child_cascade_id: str,
+    client: httpx.AsyncClient,
+    child_session_id: str,
+) -> None:
+    """
+    Mirror one sub-agent cascade into its Omnigent child session until it ends.
+
+    A sub-agent cascade is an ordinary cascade on the SAME agy RPC port, so this
+    is the committed-only poll path pointed at the child — the same mapper, the
+    same status edges. Its ``_ReaderState`` is private to the child so its
+    de-dup and turn flag cannot collide with the parent's.
+
+    **The parent's step is not the finish signal.** ``invoke_subagent`` is
+    fire-and-forget: its step reaches DONE the moment the child is spawned, while
+    the child runs on for minutes afterwards (live-verified — a child kept
+    working 23s past its spawning step's ``completedAt``, and accumulated 35
+    steps). Stopping on it mirrored only the child's opening prompt and left the
+    rail spinning forever, so the child's OWN turn decides:
+
+    * the turn opened and then closed — the ordinary path, and the close is what
+      posts the child's IDLE edge;
+    * the turn is open but the child has gone quiet for
+      :data:`_SUBAGENT_QUIESCENT_POLLS` polls AND agy reports the cascade idle —
+      its closing step was not recognizable, so IDLE is posted here instead.
+      Without this a child whose turn never closes polls for the whole session
+      and shows as running forever. A "still running" answer only vetoes the
+      close, so the window then widens toward
+      :data:`_SUBAGENT_QUIESCENT_POLLS_MAX` rather than re-asking at the same
+      cadence forever.
+
+    Sub-agents are headless (they never raise an interaction), so the pending
+    handler is a no-op rather than the parent's bridge.
+
+    Runs until one of those two ends; the caller cancels it on reader teardown.
+    Whichever way it ends, it takes its own nested mirrors down with it.
+
+    :param port: agy connect-RPC port (shared with the parent).
+    :param child_cascade_id: The sub-agent's agy conversation id.
+    :param client: HTTP client for Omnigent event posts.
+    :param child_session_id: The Omnigent child conversation to mirror into.
+    :returns: None.
+    """
+
+    async def _no_interaction(_cascade: str, _port: int, _pending: PendingInteraction) -> None:
+        """A sub-agent has no terminal to prompt in; nothing to bridge."""
+        return
+
+    child_state = _ReaderState(seen=set(), interacted=set(), port=port)
+    turn_opened = False
+    quiet_polls = 0
+    quiescent_window = _SUBAGENT_QUIESCENT_POLLS
+    try:
+        while True:
+            try:
+                steps = await asyncio.to_thread(get_trajectory_steps, port, child_cascade_id)
+            except (httpx.HTTPError, ValueError) as exc:
+                _logger.warning(
+                    "agy sub-agent poll failed; retrying: child=%s error=%r",
+                    child_cascade_id,
+                    exc,
+                )
+                await _sleep(_SUBAGENT_POLL_INTERVAL_S)
+                continue
+            mirrored_before = len(child_state.seen)
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                await _process_committed_step(
+                    step,
+                    client=client,
+                    session_id=child_session_id,
+                    cascade_id=child_cascade_id,
+                    state=child_state,
+                    on_pending_interaction=_no_interaction,
+                )
+                # Checked per step, not per poll: a child that finishes between two
+                # polls delivers its whole transcript in ONE pass, opening and
+                # closing the turn before the poll returns.
+                if child_state.turn_active:
+                    turn_opened = True
+            if turn_opened and not child_state.turn_active:
+                return
+            if len(child_state.seen) != mirrored_before:
+                quiet_polls = 0
+                quiescent_window = _SUBAGENT_QUIESCENT_POLLS
+                continue
+            quiet_polls += 1
+            if turn_opened and quiet_polls >= quiescent_window:
+                if await _subagent_cascade_is_idle(port, child_cascade_id):
+                    _logger.info(
+                        "agy sub-agent went quiet with its turn open and agy reports it "
+                        "idle; closing it: child=%s session=%s",
+                        child_cascade_id,
+                        child_session_id,
+                    )
+                    await _post_event(client, child_session_id, _status_event(_STATUS_IDLE))
+                    return
+                # agy says it is still working, so keep mirroring — but a child
+                # that never reports idle would otherwise re-ask every window for
+                # the life of the session, so widen it geometrically.
+                quiet_polls = 0
+                quiescent_window = min(quiescent_window * 2, _SUBAGENT_QUIESCENT_POLLS_MAX)
+            await _sleep(_SUBAGENT_POLL_INTERVAL_S)
+    finally:
+        # A child's steps run this same path, so a NESTED ``INVOKE_SUBAGENT``
+        # registers its grandchild here rather than in the parent's tracker,
+        # which the reader's teardown drain is the only thing that walks. Each
+        # mirror therefore takes its own descendants down with it.
+        await _cancel_subagent_mirrors(child_state)
+
+
+async def _cancel_subagent_mirrors(state: _ReaderState) -> None:
+    """
+    Cancel and await every sub-agent mirror *state* owns.
+
+    Suppresses all exceptions (including ``CancelledError``) so one failing
+    mirror cannot abort the drain and leave its siblings polling.
+
+    :param state: The reader/child state whose ``subagent_mirrors`` to drain.
+    :returns: None.
+    """
+    mirrors = [task for task in state.subagent_mirrors.values() if not task.done()]
+    for task in mirrors:
+        task.cancel()
+    for task in mirrors:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+async def _maybe_mirror_subagents(
+    step: dict[str, object],
+    *,
+    client: httpx.AsyncClient,
+    session_id: str,
+    cascade_id: str,
+    state: _ReaderState,
+) -> None:
+    """
+    Start a mirror for each sub-agent an INVOKE_SUBAGENT step has spawned.
+
+    agy runs each sub-agent as its own cascade rather than inlining it in the
+    parent transcript, so without this the parent shows one opaque tool call and
+    the Agents rail stays empty — the sub-agents' work is invisible in the web UI
+    even though agy hands us their ids.
+
+    Idempotent: a child already being mirrored is skipped, so a re-read of the
+    step starts nothing new. The step's own status is deliberately NOT consulted:
+    ``invoke_subagent`` is fire-and-forget, reaching DONE while the child it
+    spawned is still working, so each mirror decides for itself when its child is
+    finished.
+
+    :param step: One RPC step dict, of any type.
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: PARENT Omnigent conversation id.
+    :param cascade_id: PARENT agy cascade id.
+    :param state: Per-run trackers holding the mirror tasks.
+    :returns: None.
+    """
+    pairs = _subagent_pairs(step)
+    if not pairs:
+        return
+    tool_call_id = _tool_call_id(step, cascade_id)
+    for spec, child_cascade_id in pairs:
+        if child_cascade_id in state.subagent_mirrors:
+            continue
+        child_session_id = await _register_subagent_child(
+            client=client,
+            session_id=session_id,
+            spec=spec,
+            child_cascade_id=child_cascade_id,
+            tool_call_id=tool_call_id,
+        )
+        if child_session_id is None:
+            continue
+        task = asyncio.create_task(
+            _mirror_subagent_cascade(
+                port=state.port,
+                child_cascade_id=child_cascade_id,
+                client=client,
+                child_session_id=child_session_id,
+            )
+        )
+        state.subagent_mirrors[child_cascade_id] = task
+        _logger.info(
+            "agy sub-agent mirroring started: parent=%s child_cascade=%s child_session=%s role=%r",
+            session_id,
+            child_cascade_id,
+            child_session_id,
+            spec.get("role"),
+        )
 
 
 def _is_settled(step: dict[str, object]) -> bool:
@@ -1544,9 +1959,12 @@ async def _process_stream_step(
             session_id=session_id,
             cascade_id=cascade_id,
             prefixes=state.prefixes,
+            delta_chunks=state.delta_chunks,
         )
         return
 
+    # ``_process_committed_step`` closes the live block before committing, on
+    # both this path and the poll loop's.
     await _process_committed_step(
         step,
         client=client,
@@ -1561,7 +1979,112 @@ async def _process_stream_step(
     idx = _step_index(step)
     if idx is not None:
         state.prefixes.pop(idx, None)
+        state.delta_chunks.pop(idx, None)
         state.reasoning_prefixes.pop(idx, None)
+
+
+def _committed_planner_text(step: dict[str, object]) -> str | None:
+    """
+    Return a DONE planner step's committed text, or ``None`` when it has none.
+
+    Mirrors the mapper's precedence — ``modifiedResponse`` (post-moderation) over
+    ``response`` — so the closing delta leaves the server's buffered text
+    byte-equal to the item the mapper commits.
+
+    :param step: One RPC step dict.
+    :returns: The committed assistant text, or ``None`` for a non-planner step or
+        one carrying no text (an intermediate planner that only made tool calls).
+    """
+    if step.get("type") != _TYPE_PLANNER_RESPONSE:
+        return None
+    planner = step.get("plannerResponse")
+    if not isinstance(planner, dict):
+        return None
+    for key in ("modifiedResponse", "response"):
+        text = planner.get(key)
+        if isinstance(text, str) and text:
+            return text
+    return None
+
+
+async def _close_planner_delta_stream(
+    step: dict[str, object],
+    *,
+    client: httpx.AsyncClient,
+    session_id: str,
+    cascade_id: str,
+    prefixes: dict[int, str],
+    delta_chunks: dict[int, int],
+) -> None:
+    """
+    Flush a committed planner step's remaining suffix as a ``final=True`` delta.
+
+    agy's last GENERATING frame usually lags the committed text, so the streamed
+    prefix is a truncated version of what commits. Emitting the difference here —
+    and marking the stream final — satisfies both of the server's retirement
+    conditions, letting the in-flight entry be dropped instead of replayed to
+    every later subscriber.
+
+    No-ops for a step that never streamed (no prefix tracker) and carries no
+    committed text, so intermediate tool-call-only planner steps stay silent.
+    A step whose stream is already byte-complete still gets the empty closing
+    delta, because ``final`` is what marks it retirable.
+
+    :param step: The committed step being processed.
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id to mirror into.
+    :param cascade_id: agy cascade id (namespaces the message id).
+    :param prefixes: Per-step forwarded-text trackers.
+    :param delta_chunks: Per-step emitted-chunk counters (see
+        :func:`_next_delta_index`).
+    """
+    idx = _step_index(step)
+    if idx is None:
+        return
+    text = _committed_planner_text(step)
+    if text is None:
+        return
+    forwarded = prefixes.get(idx)
+    if forwarded is None:
+        # Never streamed (committed straight from a poll frame): the committed
+        # item stands alone, so there is no live block to close.
+        return
+    suffix = text[len(forwarded) :] if text.startswith(forwarded) else text
+    await _post_event(
+        client,
+        session_id,
+        output_text_delta_event(
+            conversation_id=cascade_id,
+            step_idx=idx,
+            delta=suffix,
+            final=True,
+            index=_next_delta_index(delta_chunks, idx),
+        ),
+    )
+    # What the server's buffer now holds — which is the committed text only when
+    # the stream was a true prefix of it. Keeps the tracker's meaning intact for
+    # the poll path, which does not clear it per step.
+    prefixes[idx] = forwarded + suffix
+
+
+def _next_delta_index(delta_chunks: dict[int, int], idx: int) -> int:
+    """
+    Return the next text-delta ``index`` for planner step *idx*, and count it.
+
+    The server orders a message's chunks by this value and drops any that does
+    not exceed the last one it accepted, so it must only ever go up. A plain
+    per-step counter is the only thing that guarantees that: the forwarded byte
+    offset does not, because a shorter post-moderation rewrite re-anchors the
+    prefix tracker downwards, and the closing ``final`` chunk that follows would
+    then be dropped — leaving the message un-retired and replayed.
+
+    :param delta_chunks: Per-``step_index`` emitted-chunk counter (mutated here).
+    :param idx: The planner step's trajectory index.
+    :returns: The index to stamp on this chunk, starting at 0 per step.
+    """
+    current = delta_chunks.get(idx, 0)
+    delta_chunks[idx] = current + 1
+    return current
 
 
 def _is_generating_planner(step: dict[str, object]) -> bool:
@@ -1623,6 +2146,7 @@ async def _emit_partial_delta(
     session_id: str,
     cascade_id: str,
     prefixes: dict[int, str],
+    delta_chunks: dict[int, int],
 ) -> None:
     """
     Emit the NEW suffix of a GENERATING planner step's partial text as a delta.
@@ -1640,6 +2164,8 @@ async def _emit_partial_delta(
     :param session_id: Omnigent conversation id to mirror into.
     :param cascade_id: agy cascade id (namespaces the stable message id).
     :param prefixes: Per-``step_index`` forwarded-prefix tracker (mutated here).
+    :param delta_chunks: Per-``step_index`` emitted-chunk counter (mutated here;
+        see :func:`_next_delta_index`).
     :returns: None.
     """
     idx = _step_index(step)
@@ -1649,10 +2175,14 @@ async def _emit_partial_delta(
     if text is None:
         return
     forwarded = prefixes.get(idx, "")
+    # Register the step as streaming even when this frame yields nothing, so the
+    # committed close still knows there is a live block of ours to retire.
+    prefixes.setdefault(idx, "")
     # Only forward growth that extends what we already sent. A frame that does not
-    # start with the forwarded prefix (an unexpected non-monotonic rewrite) or
-    # that has not grown yields no delta; we still re-anchor the tracker to the
-    # latest cumulative text so we never re-emit the overlap.
+    # start with the forwarded prefix (a non-monotonic rewrite) or that has not
+    # grown yields no delta — and MUST NOT move the tracker: it records what the
+    # server has actually received, so re-anchoring it to text we never sent would
+    # cut the next delta from the wrong offset and repeat the overlap.
     if text.startswith(forwarded) and len(text) > len(forwarded):
         suffix = text[len(forwarded) :]
         await _post_event(
@@ -1663,9 +2193,10 @@ async def _emit_partial_delta(
                 step_idx=idx,
                 delta=suffix,
                 final=False,
+                index=_next_delta_index(delta_chunks, idx),
             ),
         )
-    prefixes[idx] = text
+        prefixes[idx] = text
 
 
 async def _emit_partial_reasoning_delta(
@@ -1682,7 +2213,8 @@ async def _emit_partial_reasoning_delta(
     cumulative snapshot per frame, so the reader prefix-diffs against the suffix
     already forwarded for this step's ``step_index`` and emits only the growth.
     A no-growth re-send (or a non-extending rewrite) emits nothing; the tracker
-    still advances so deltas never overlap and concatenate to the full reasoning.
+    still advances, which is where this deliberately diverges from the text
+    path — see the comment on the re-anchor below.
 
     The step's FIRST reasoning delta carries ``started=True`` (keyed off the
     prefix tracker being absent for the step) so the server precedes it with one
@@ -1708,10 +2240,7 @@ async def _emit_partial_reasoning_delta(
     # Absent ⇒ this is the step's first reasoning delta (carries ``started``).
     started = idx not in reasoning_prefixes
     forwarded = reasoning_prefixes.get(idx, "")
-    # Mirror the text path: only forward growth that extends the forwarded prefix.
-    # A no-growth / non-extending frame emits nothing but still re-anchors the
-    # tracker. ``started`` is only consumed when an actual delta is emitted, so a
-    # first frame with empty ``thinking`` does not waste the marker.
+    # As on the text path, only forward growth that extends the forwarded prefix.
     if text.startswith(forwarded) and len(text) > len(forwarded):
         suffix = text[len(forwarded) :]
         await _post_event(
@@ -1723,9 +2252,13 @@ async def _emit_partial_reasoning_delta(
                 started=started,
             ),
         )
-    # Re-anchor unconditionally (mirrors the text path's ``prefixes[idx] = text``):
-    # a non-monotonic rewrite emits no delta but must still advance the tracker, or
-    # reasoning deltas freeze permanently for this step once a rewrite occurs.
+    # Re-anchored unconditionally, DELIBERATELY unlike the text path (which only
+    # advances on an emitted delta). Reasoning has no committed close to flush the
+    # remainder, so freezing the tracker on a rewrite would drop the rest of the
+    # thinking outright; the text path can freeze safely because
+    # ``_close_planner_delta_stream`` sends whatever is left. The cost here is that
+    # a rewrite can repeat an overlap in the reasoning block — cosmetic, and not
+    # part of the message the server retires by byte-equality.
     reasoning_prefixes[idx] = text
 
 
@@ -1735,7 +2268,6 @@ async def _emit_step(
     client: httpx.AsyncClient,
     session_id: str,
     cascade_id: str,
-    allocator: _ToolCallIdAllocator,
     turn_active: bool,
 ) -> bool:
     """
@@ -1750,7 +2282,6 @@ async def _emit_step(
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id to mirror into.
     :param cascade_id: agy cascade id (namespaces response/call ids).
-    :param allocator: Per-run tool-call id allocator (fallback ids only).
     :param turn_active: Whether a turn is currently considered open on entry.
     :returns: The updated ``turn_active`` flag after this step.
     """
@@ -1758,7 +2289,7 @@ async def _emit_step(
         turn_active = True
         await _post_event(client, session_id, _status_event(_STATUS_RUNNING))
 
-    for event in map_step_to_events(step, conversation_id=cascade_id, allocator=allocator):
+    for event in map_step_to_events(step, conversation_id=cascade_id):
         await _post_event(client, session_id, event)
 
     if _is_turn_close_step(step) and turn_active:

@@ -584,10 +584,14 @@ def _fetch_search_snippets(
     # workspace_id leads the (workspace_id, conversation_id, position) index.
     # Both the aggregate and the join-back below must include it or Postgres
     # can't use that index and falls back to a full table scan of every item.
+    # ILIKE on the raw column rather than ``lower(search_text) LIKE`` for the
+    # same reason as the content match in ``list_conversations``: the lower()
+    # form matches the pg_trgm index expression, and the planner then scans the
+    # whole workspace even though this is already scoped to one page of ids.
     match_pred = and_(
         SqlConversationItem.workspace_id == workspace_id,
         SqlConversationItem.conversation_id.in_(conversation_ids),
-        func.lower(SqlConversationItem.search_text).like(pattern),
+        SqlConversationItem.search_text.ilike(pattern),
     )
     # Earliest matching position per conversation — a small (conv_id, position)
     # aggregate, no bodies materialized.
@@ -2390,13 +2394,28 @@ class SqlAlchemyConversationStore(ConversationStore):
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
-                content_match = SqlConversation.id.in_(
+                # Correlated EXISTS rather than ``id IN (SELECT ...)``: the IN
+                # form is uncorrelated, so the match set is built for the WHOLE
+                # workspace before the outer query discards every row the caller
+                # cannot see. Correlating on conversation_id keeps each probe on
+                # the (workspace_id, conversation_id) index and lets it stop at
+                # the first matching item per conversation.
+                # ``ILIKE`` on the raw column, NOT ``lower(search_text) LIKE``:
+                # the latter matches the ``lower(search_text)`` pg_trgm index
+                # expression, and the planner then prefers that index — scanning
+                # every item in the workspace out of a multi-GB index that does
+                # not fit in shared_buffers. ILIKE is the same case-insensitive
+                # match but cannot use that index, so the probe stays on the
+                # (workspace_id, conversation_id) btree above. Do not "simplify"
+                # this back to lower(...) LIKE; see the covering test.
+                content_match = (
                     select(SqlConversationItem.conversation_id)
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
-                        func.lower(SqlConversationItem.search_text).like(pattern),
+                        SqlConversationItem.conversation_id == SqlConversation.id,
+                        SqlConversationItem.search_text.ilike(pattern),
                     )
-                    .distinct()
+                    .exists()
                 )
                 stmt = stmt.where(or_(title_match, content_match))
             if project is not None:

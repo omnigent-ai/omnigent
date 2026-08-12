@@ -194,6 +194,8 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
 # primitives) live in _sessions.helpers.
 from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
+    _antigravity_subagent_labels_from_body,
+    _antigravity_subagent_title,
     _await_settled_managed_launch,
     _build_new_item,
     _build_policy_engine_from_spec,
@@ -202,6 +204,7 @@ from omnigent.server.routes._sessions.helpers import (
     _coerce_cumulative_field,
     _collect_descendant_conversation_ids,
     _consume_pre_resolved_harness_elicitation,
+    _create_and_publish_antigravity_child,
     _create_and_publish_codex_child,
     _create_session_worktree,
     _delete_stored_session_bundle_after_failure,
@@ -213,6 +216,7 @@ from omnigent.server.routes._sessions.helpers import (
     _extract_user_text_for_routing,
     _extract_user_text_from_event,
     _find_codex_native_subagent_child,
+    _find_subagent_child_by_title,
     _flush_relay_text,
     _forward_approval_to_runner,
     _forward_session_change_to_runner,
@@ -1946,6 +1950,69 @@ async def _hold_native_ask_gate_impl(
             with contextlib.suppress(ConversationNotFoundError):
                 engine.apply_state_updates(result.state_updates)
     return approved
+
+
+async def _persist_external_antigravity_subagent_start(
+    parent_id: str,
+    parent_conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> str:
+    """
+    Mint or update a child Conversation for an agy sub-agent.
+
+    agy spawns each sub-agent as its own cascade and names them on the parent's
+    ``INVOKE_SUBAGENT`` step; the reader posts one of these per named child so
+    the Agents rail can show it. Unlike claude (which is discovered from an
+    on-disk ``subagents/`` directory) the child already has a stable id of its
+    own, so that id is both the label and the title's unique half.
+
+    Idempotent: a redelivered start for the same ``cascade_id`` resolves to the
+    existing row and upserts labels rather than minting a duplicate.
+
+    :param parent_id: Parent antigravity-native conversation id, e.g.
+        ``"conv_parent987"``.
+    :param parent_conv: Pre-fetched parent row.
+    :param body: POST event body. Required ``data.cascade_id``; optional
+        ``role``, ``agent_type``, ``tool_call_id``.
+    :param conversation_store: Store for reading/creating child rows.
+    :returns: Child conversation id, e.g. ``"conv_child456"``.
+    :raises OmnigentError: 400 if ``cascade_id`` is missing, or the parent has
+        no bound agent.
+    """
+    cascade_id = body.data.get("cascade_id")
+    if not isinstance(cascade_id, str) or not cascade_id:
+        raise OmnigentError(
+            "external_antigravity_subagent_start requires non-empty data.cascade_id",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if parent_conv.agent_id is None:
+        raise OmnigentError(
+            f"parent session {parent_id!r} has no agent_id; cannot "
+            "create an antigravity-native sub-agent child",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    role = body.data.get("role")
+    agent_type = body.data.get("agent_type")
+    title = _antigravity_subagent_title(
+        role if isinstance(role, str) else "",
+        cascade_id,
+    )
+    labels = _antigravity_subagent_labels_from_body(cascade_id, body)
+    existing = await asyncio.to_thread(
+        _find_subagent_child_by_title, conversation_store, parent_id, title
+    )
+    if existing is not None:
+        await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
+        return existing.id
+    return await _create_and_publish_antigravity_child(
+        parent_id,
+        parent_conv,
+        title,
+        agent_type if isinstance(agent_type, str) else "",
+        labels,
+        conversation_store,
+    )
 
 
 async def _persist_external_codex_subagent_start(
@@ -9109,6 +9176,7 @@ __all__ = [
     "_maybe_wake_stale_resumable_managed_sandbox",
     "_native_subagent_wrapper_labels",
     "_native_terminal_runtime",
+    "_persist_external_antigravity_subagent_start",
     "_persist_external_codex_subagent_start",
     "_persist_external_conversation_item",
     "_persist_external_session_usage",

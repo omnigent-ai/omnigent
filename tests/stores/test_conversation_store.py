@@ -1414,6 +1414,99 @@ def test_list_conversations_no_search_skips_statement_timeout(
     assert not any("statement_timeout" in s.lower() for s in statements), statements
 
 
+def test_list_conversations_search_content_match_is_correlated(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    The content-search predicate is a correlated ``EXISTS``, not an
+    uncorrelated ``id IN (SELECT DISTINCT ...)``.
+
+    The IN form materializes the match set for the entire workspace before the
+    outer query discards the rows the caller cannot see, so on a large
+    ``conversation_items`` table it scans everything regardless of how few
+    conversations the caller can actually access. Correlating on
+    ``conversation_id`` keeps each probe on the
+    ``(workspace_id, conversation_id)`` index. Asserted on the emitted SQL
+    because the difference is a query-plan property, not an observable result
+    difference — the two forms return identical rows.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_corr1",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "fix the deployment pipeline"}],
+                ),
+            ),
+        ],
+    )
+
+    statements = _captured_sql(
+        conversation_store,
+        lambda: conversation_store.list_conversations(search_query="deployment"),
+    )
+    select_sql = " ".join(s for s in statements if "conversation_items" in s).lower()
+    assert "exists" in select_sql, select_sql
+    assert "conversation_items.conversation_id = conversations.id" in select_sql, select_sql
+    # The uncorrelated form is what this guards against.
+    assert "distinct conversation_items.conversation_id" not in select_sql, select_sql
+
+
+def test_search_predicate_avoids_the_trigram_index_expression(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Content search matches with ``ILIKE`` on the raw column, never
+    ``lower(search_text) LIKE``.
+
+    ``lower(search_text)`` is exactly the expression the pg_trgm index
+    (migration ``d5e9f1a2b3c4``) is built on. Writing the predicate that way
+    makes the planner prefer that index, which scans every item in the
+    workspace out of a multi-GB index rather than probing the handful of
+    conversations the query is scoped to. ILIKE is the same case-insensitive
+    substring match but cannot match the index expression, so the scoped btree
+    probe wins. Covers both the list predicate and the snippet lookup, since
+    both run on a search request.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_ilike1",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "fix the DEPLOYMENT pipeline"}],
+                ),
+            ),
+        ],
+    )
+
+    # Case-insensitivity is the behavioural contract and holds on every dialect
+    # (row stored as "DEPLOYMENT", queried as "deployment").
+    page = conversation_store.list_conversations(search_query="deployment")
+    assert conv.id in {c.id for c in page.data}
+
+    # The SQL-shape guarantee is Postgres-specific: SQLAlchemy emits native
+    # ILIKE there, while SQLite (which has no trigram index to avoid) compiles
+    # ILIKE down to lower(...) LIKE lower(...).
+    if conversation_store._conv_engine.dialect.name != "postgresql":
+        return
+
+    statements = _captured_sql(
+        conversation_store,
+        lambda: conversation_store.list_conversations(search_query="deployment"),
+    )
+    item_sql = " ".join(s for s in statements if "conversation_items" in s).lower()
+    assert "ilike" in item_sql, item_sql
+    assert "lower(conversation_items.search_text)" not in item_sql, item_sql
+
+
 def test_list_conversations_search_snippet_uses_earliest_match(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

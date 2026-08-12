@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import re
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from httpx import ASGITransport, AsyncClient
 from omnigent.db.utils import builtin_agent_id, generate_agent_id, now_epoch
 from omnigent.entities.agent import Agent
 from omnigent.onboarding.sandboxes.base import render_host_config_write_command
+from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s as blaxel_managed_token_ttl_s
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -48,6 +50,7 @@ from omnigent.stores.host_store import HostStore
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
+    install_fake_blaxel_launcher,
     install_fake_boxlite_launcher,
     install_fake_daytona_launcher,
     install_fake_e2b_launcher,
@@ -253,6 +256,84 @@ def test_parse_daytona_without_section_defaults(
     assert cfg.launcher_factory() is fake
     assert fake.image is None
     assert fake.env is None
+
+
+def test_parse_valid_blaxel_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = parse_sandbox_config(
+        {
+            "provider": "blaxel",
+            "server_url": "https://srv.example.com/",
+            "blaxel": {
+                "image": "blaxel/omnigent-host:test-tag",
+                "env": ["OPENAI_API_KEY"],
+                "region": "us-test-1",
+                "memory_mb": 8192,
+                "ttl": "24h",
+            },
+        }
+    )
+
+    assert cfg is not None
+    assert cfg.server_url == "https://srv.example.com"
+    assert cfg.token_ttl_s == blaxel_managed_token_ttl_s("24h")
+    assert cfg.managed_launch_supported is True
+    fake = FakeSandboxLauncher()
+    install_fake_blaxel_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image == "blaxel/omnigent-host:test-tag"
+    assert fake.env == ["OPENAI_API_KEY"]
+    assert fake.region == "us-test-1"
+    assert fake.memory_mb == 8192
+    assert fake.ttl == "24h"
+
+
+def test_parse_blaxel_without_section_uses_launcher_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = parse_sandbox_config({"provider": "blaxel", "server_url": "https://s.example"})
+
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_blaxel_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image is None
+    assert fake.env is None
+    assert fake.region is None
+    assert fake.memory_mb is None
+    assert fake.ttl is None
+    assert cfg.token_ttl_s == blaxel_managed_token_ttl_s()
+
+
+def test_parse_blaxel_token_ttl_tracks_configured_sandbox_ttl() -> None:
+    """
+    A managed session sized past the 24h default raises the sandbox age and
+    the launch-token lifetime together, so the token never expires while
+    Blaxel still keeps the host alive.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "blaxel",
+            "server_url": "https://s.example",
+            "blaxel": {"ttl": "7d"},
+        }
+    )
+
+    assert cfg is not None
+    assert cfg.token_ttl_s == 7 * 24 * 3600 + 3600
+    assert cfg.token_ttl_s > blaxel_managed_token_ttl_s()
+
+
+def test_parse_blaxel_rejects_malformed_sandbox_ttl() -> None:
+    with pytest.raises(ValueError, match=re.escape("sandbox.blaxel.ttl")):
+        parse_sandbox_config(
+            {
+                "provider": "blaxel",
+                "server_url": "https://s.example",
+                "blaxel": {"ttl": "forever"},
+            }
+        )
 
 
 def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
@@ -1205,6 +1286,24 @@ def test_parse_kubernetes_secret_mounts_allows_same_secret_at_two_paths() -> Non
             {"provider": "daytona", "server_url": "https://s", "daytona": {"env": ["", "X"]}},
             "sandbox.daytona.env",
         ),
+        # blaxel section present but malformed.
+        ({"provider": "blaxel", "server_url": "https://s", "blaxel": "x"}, "sandbox.blaxel"),
+        (
+            {"provider": "blaxel", "server_url": "https://s", "blaxel": {"image": " "}},
+            "OMNIGENT_BLAXEL_HOST_IMAGE",
+        ),
+        (
+            {"provider": "blaxel", "server_url": "https://s", "blaxel": {"memory_mb": 0}},
+            "sandbox.blaxel.memory_mb",
+        ),
+        (
+            {"provider": "blaxel", "server_url": "https://s", "blaxel": {"region": " "}},
+            "sandbox.blaxel.region",
+        ),
+        (
+            {"provider": "blaxel", "server_url": "https://s", "blaxel": {"timeout": 10}},
+            "unknown key",
+        ),
         # boxlite section present but malformed.
         ({"provider": "boxlite", "server_url": "https://s", "boxlite": "x"}, "sandbox.boxlite"),
         (
@@ -1528,6 +1627,8 @@ def _capability_probe_app(
         # Launch-capable provider configured → the web UI may offer the
         # sandbox option, labeled with the provider name ("Modal Sandbox").
         ({"provider": "modal", "server_url": "https://s.example.com"}, True, "modal"),
+        # Blaxel supports managed launch and must be exposed to the web UI.
+        ({"provider": "blaxel", "server_url": "https://s.example.com"}, True, "blaxel"),
         # No `sandbox:` section → a managed create would 400; the option
         # must not be advertised and no provider is named.
         (None, False, None),

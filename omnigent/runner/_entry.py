@@ -1649,16 +1649,46 @@ def _install_signal_handlers(
             record_reason(f"received {signal.Signals(sig).name}")
         stop_event.set()
 
+    degraded = False
+
+    def _try_add_handler(sig: int, callback: Callable[..., None], *args: object) -> None:
+        """Register one handler; degrade instead of crashing the runner.
+
+        ``add_signal_handler`` raises RuntimeError when the loop's signal
+        wakeup fd is unusable — observed in zygote-forked runners whose
+        wakeup fd ended up in blocking mode ("the fd N must be in
+        non-blocking mode"), crash-looping every fork of the session.
+        Graceful-shutdown handlers are a nicety: a runner without them
+        still serves sessions and still exits via the parent-death
+        backstop, so warn once and continue instead of dying.
+
+        :param sig: Signal number to register.
+        :param callback: Handler invoked when the signal arrives.
+        :param args: Positional arguments passed to ``callback``.
+        :returns: None.
+        """
+        nonlocal degraded
+        if degraded:
+            return
+        try:
+            with contextlib.suppress(NotImplementedError):
+                loop.add_signal_handler(sig, callback, *args)
+        except RuntimeError:
+            degraded = True
+            _logger.warning(
+                "Signal handler registration failed; continuing without "
+                "graceful-shutdown signal handling",
+                exc_info=True,
+            )
+
     for sig in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, _handle_shutdown_signal, sig)
+        _try_add_handler(sig, _handle_shutdown_signal, sig)
     if adopted_event is not None:
         from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
 
         if RUNNER_ADOPT_SIGNAL is None:
             return
-        with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(RUNNER_ADOPT_SIGNAL, adopted_event.set)
+        _try_add_handler(RUNNER_ADOPT_SIGNAL, adopted_event.set)
 
 
 def _install_crash_logging() -> None:

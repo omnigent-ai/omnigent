@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "omnigent"
 # Keep in sync with omnigent/version.py's VERSION constant.
-version = "0.9.0.dev0"
+version = "0.10.0.dev0"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,8 +26,8 @@ dependencies = [
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the
     # release tag). Local/editable installs still resolve via tool.uv.sources.
-    "omnigent-client==0.9.0.dev0",
-    "omnigent-ui-sdk==0.9.0.dev0",
+    "omnigent-client==0.10.0.dev0",
+    "omnigent-ui-sdk==0.10.0.dev0",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
     # OpenClaw stores its wrapped acpx registry as JSON5.
@@ -87,11 +87,8 @@ dependencies = [
     # PostgreSQL, and MySQL rather than depending on each backend's storage engine.
     "zstandard>=0.22,<1",
     "tiktoken>=0.7,<1",
-    "opentelemetry-exporter-otlp-proto-grpc>=1.20,<2",
-    "opentelemetry-exporter-otlp-proto-http>=1.20,<2",
-    "opentelemetry-instrumentation-fastapi>=0,<1",
-    "opentelemetry-instrumentation-httpx>=0,<1",
-    "opentelemetry-instrumentation-sqlalchemy>=0,<1",
+    # Server performance metrics use the no-op API even when tracing is off.
+    "opentelemetry-api>=1.20,<2",
     # The Claude Code and OpenAI Agents harnesses are part of the
     # baseline install — every CUJ command in the README depends on at
     # least one of them, so making them optional just forces every user
@@ -126,11 +123,17 @@ dependencies = [
 # working; the underlying packages are now default deps above.
 claude-sdk = []
 openai-agents = []
-# `all` additionally carries databricks-sdk: the SDK moved out of the
-# default install (it now lives in the `databricks` extra), but internal
-# CI / dev installs use `--extra all` and the test suite, deploy tooling,
-# and databricks_mcps servers import it.
-all = ["databricks-sdk>=0.56.0,<1"]
+# `all` carries dependencies moved out of the default install that internal
+# CI / dev workflows still exercise.
+all = [
+    "databricks-sdk>=0.56.0,<1",
+    "opentelemetry-sdk>=1.20,<2",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.20,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.20,<2",
+    "opentelemetry-instrumentation-fastapi>=0,<1",
+    "opentelemetry-instrumentation-httpx>=0,<1",
+    "opentelemetry-instrumentation-sqlalchemy>=0,<1",
+]
 # From omnigent.
 bedrock = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 # S3-compatible artifact store (AWS S3, Cloudflare R2, MinIO, …). Selected
@@ -146,6 +149,9 @@ modal = ["modal>=1.0,<2"]
 # server-managed `sandbox.provider: daytona`).
 # Same lazy-import posture as the modal extra. Pre-1.0 SDK: pin minor.
 daytona = ["daytona>=0.180,<1"]
+# Blaxel sandbox launcher (`omnigent sandbox --provider blaxel` and
+# server-managed `sandbox.provider: blaxel`).
+blaxel = ["blaxel>=0.4.1,<0.5"]
 # Boxlite sandbox launcher: server-managed `sandbox.provider: boxlite`, either
 # local embedded micro-VMs (KVM/HVF, no daemon) or a remote `boxlite serve`
 # pool. Same lazy-import posture as the modal/daytona extras. Pre-1.0 SDK: pin
@@ -173,11 +179,16 @@ openshell = ["openshell>=0.0.88,<1"]
 # package and imports the official client lazily, so only users of the
 # provider need this extra.
 kubernetes = ["kubernetes>=36,<37"]
-# The tracing extra is now a no-op shim kept for backwards compatibility.
-# Tracing is built on OpenTelemetry directly (opentelemetry-exporter-otlp-*
-# are in the default install). `omnigent[tracing]` still works — it just
-# no longer pulls in the heavy mlflow dependency.
-tracing = []
+# OpenTelemetry tracing is opt-in so the exporters and automatic
+# instrumentors do not inflate the default install.
+tracing = [
+    "opentelemetry-sdk>=1.20,<2",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.20,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.20,<2",
+    "opentelemetry-instrumentation-fastapi>=0,<1",
+    "opentelemetry-instrumentation-httpx>=0,<1",
+    "opentelemetry-instrumentation-sqlalchemy>=0,<1",
+]
 agents-sdk = [
     "openai-agents>=0.1,<1",
     "opentelemetry-instrumentation-openai-agents-v2>=0.1",
@@ -239,7 +250,7 @@ nimble = ["nimble-python>=1.2.0,<2"]
 # (`omnigent-client`, `omnigent-ui-sdk`) and the sub-package's own
 # `[project].version` in `integrations/slack/pyproject.toml`.
 slack = [
-    "omnigent-slack==0.9.0.dev0",
+    "omnigent-slack==0.10.0.dev0",
 ]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
@@ -671,6 +682,12 @@ ignore_missing_imports = true
 # posture as modal above.
 [[tool.mypy.overrides]]
 module = "daytona.*"
+ignore_missing_imports = true
+
+# blaxel is an optional dep (the `blaxel` extra); same lazy-import
+# posture as modal above.
+[[tool.mypy.overrides]]
+module = "blaxel.*"
 ignore_missing_imports = true
 
 # islo is an optional dep (the `islo` extra); same lazy-import posture

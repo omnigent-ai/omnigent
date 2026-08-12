@@ -240,6 +240,33 @@ const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; descriptio
   },
 ];
 
+// Antigravity (agy) permission control. agy exposes exactly ONE pre-emptive
+// knob — `--dangerously-skip-permissions`, an all-or-nothing bypass — with no
+// per-tool equivalent of acceptEdits/plan, so this is a two-value toggle rather
+// than Claude's graded selector. "default" sends no flags and leaves agy's own
+// request-review prompt in place. Keep in sync with `agy --help`.
+const AGY_NATIVE_DEFAULT_SKIP_MODE = "default";
+const AGY_NATIVE_SKIP_VALUE = "skip";
+const AGY_NATIVE_SKIP_MODES: {
+  value: string;
+  label: string;
+  description: string;
+  args: string[];
+}[] = [
+  {
+    value: AGY_NATIVE_DEFAULT_SKIP_MODE,
+    label: "Ask every time",
+    description: "Prompts before each tool runs",
+    args: [],
+  },
+  {
+    value: AGY_NATIVE_SKIP_VALUE,
+    label: "Skip permissions",
+    description: "Runs everything; no prompts or safety checks",
+    args: ["--dangerously-skip-permissions"],
+  },
+];
+
 // The Auto Harness's Permissions vocabulary: Default only. No cross-harness
 // permission mapping exists, so the row stays locked and the create call sends
 // no override — each CLI keeps the machine's own configuration.
@@ -1355,6 +1382,7 @@ function HarnessConfigModal({
   permissionMode,
   approvalMode,
   cursorExecMode,
+  agySkipMode,
   bypassSandbox,
   pickedModel,
   claudeModelOptions,
@@ -1367,6 +1395,7 @@ function HarnessConfigModal({
   setPermissionMode,
   setApprovalMode,
   setCursorExecMode,
+  setAgySkipMode,
   setBypassSandbox,
   setPickedModel,
   setPickedEffort,
@@ -1383,6 +1412,7 @@ function HarnessConfigModal({
   permissionMode: string;
   approvalMode: string;
   cursorExecMode: string;
+  agySkipMode: string;
   bypassSandbox: boolean;
   pickedModel: string;
   claudeModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
@@ -1395,6 +1425,7 @@ function HarnessConfigModal({
   setPermissionMode: (mode: string) => void;
   setApprovalMode: (mode: string) => void;
   setCursorExecMode: (mode: string) => void;
+  setAgySkipMode: (mode: string) => void;
   setBypassSandbox: (enabled: boolean) => void;
   setPickedModel: (model: string) => void;
   setPickedEffort: (effort: string) => void;
@@ -1408,6 +1439,7 @@ function HarnessConfigModal({
   const hasPermission = nativeAgentHasCapability(agent, "permissionMode");
   const hasApproval = nativeAgentHasCapability(agent, "approvalMode");
   const hasCursor = nativeAgentHasCapability(agent, "cursorMode");
+  const hasAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
   const isCodex = entryHarness === "codex-native";
   const modelOptions = isCodex ? codexModelOptions : claudeModelOptions;
   const modelsLoading = isCodex ? codexModelsLoading : claudeModelsLoading;
@@ -1421,6 +1453,7 @@ function HarnessConfigModal({
   const [draftPermission, setDraftPermission] = useState(permissionMode);
   const [draftApproval, setDraftApproval] = useState(approvalMode);
   const [draftCursor, setDraftCursor] = useState(cursorExecMode);
+  const [draftAgySkip, setDraftAgySkip] = useState(agySkipMode);
   const [draftBypass, setDraftBypass] = useState(bypassSandbox);
   const [draftHarness, setDraftHarness] = useState<string | null>(pickedHarness);
   const [draftRouting, setDraftRouting] = useState<CostControlMode>(costControlMode);
@@ -1432,6 +1465,7 @@ function HarnessConfigModal({
     setDraftPermission(permissionMode);
     setDraftApproval(approvalMode);
     setDraftCursor(cursorExecMode);
+    setDraftAgySkip(agySkipMode);
     setDraftBypass(bypassSandbox);
     setDraftHarness(pickedHarness);
     setDraftRouting(costControlMode);
@@ -1518,6 +1552,9 @@ function HarnessConfigModal({
     } else if (hasCursor) {
       setCursorExecMode(draftCursor);
       if (entryHarness) writeHarnessOption(entryHarness, { mode: draftCursor });
+    } else if (hasAgySkip) {
+      setAgySkipMode(draftAgySkip);
+      if (entryHarness) writeHarnessOption(entryHarness, { mode: draftAgySkip });
     } else if (brainDefault) {
       // Picking the spec default clears the override so the session tracks it.
       setPickedHarness(draftHarness === brainDefault ? null : draftHarness, agent.id);
@@ -1697,10 +1734,40 @@ function HarnessConfigModal({
             </ConfigRow>
           )}
 
+          {!autoRouting && hasAgySkip && (
+            <>
+              <ConfigRow label="Permissions" description="What the agent can do without asking">
+                <DescribedSelect
+                  value={draftAgySkip}
+                  onValueChange={setDraftAgySkip}
+                  options={AGY_NATIVE_SKIP_MODES}
+                  testId="new-chat-landing-config-agy-skip"
+                  ariaLabel="Permissions"
+                />
+              </ConfigRow>
+              {/* Persistent danger banner while the bypass is selected. agy has
+                  no firing pre-tool hook, so Omnigent cannot re-gate individual
+                  tools once this is on — the warning is the only guardrail. */}
+              {draftAgySkip === AGY_NATIVE_SKIP_VALUE && (
+                <div
+                  role="alert"
+                  data-testid="new-chat-landing-agy-skip-banner"
+                  className="flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium leading-relaxed text-destructive"
+                >
+                  <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+                  <span>
+                    Danger: this session runs Antigravity with all tool permission prompts disabled.
+                    It can edit any file and run any command without asking.
+                  </span>
+                </div>
+              )}
+            </>
+          )}
+
           {/* Stays rendered while Smart Routing is the pick: it is the control
           that selected it, so hiding it would strand the choice with no way to
           read it back or switch away without cancelling. */}
-          {!hasPermission && !hasApproval && !hasCursor && brainDefault && (
+          {!hasPermission && !hasApproval && !hasCursor && !hasAgySkip && brainDefault && (
             <ConfigRow label="Agent Harness" description="Underlying coding harness">
               <Select value={draftHarness ?? brainDefault} onValueChange={setDraftHarness}>
                 <SelectTrigger
@@ -1806,6 +1873,7 @@ interface LandingDraft {
   approvalMode: string;
   bypassSandbox: boolean;
   cursorExecMode: string;
+  agySkipMode: string;
   pickedHarness: string | null;
   pickedModel: string;
   pickedEffort: string;
@@ -2088,6 +2156,11 @@ export function NewChatLandingScreen() {
   const [cursorExecMode, setCursorExecMode] = useState<string>(
     () => landingDraft?.cursorExecMode ?? CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   );
+  // agy's all-or-nothing `--dangerously-skip-permissions` toggle. Only
+  // meaningful for the antigravity-native wrapper; ignored otherwise.
+  const [agySkipMode, setAgySkipMode] = useState<string>(
+    () => landingDraft?.agySkipMode ?? AGY_NATIVE_DEFAULT_SKIP_MODE,
+  );
   // Per-session brain-harness override for bundle agents (polly / debby).
   // null = the agent spec's declared harness (no override sent). On agent
   // switch, seeded from the user's last stored pick for that agent.
@@ -2163,6 +2236,7 @@ export function NewChatLandingScreen() {
     approvalMode,
     bypassSandbox,
     cursorExecMode,
+    agySkipMode,
     pickedHarness,
     pickedModel,
     pickedEffort,
@@ -2537,6 +2611,7 @@ export function NewChatLandingScreen() {
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
+  const supportsAgySkipPermissions = nativeAgentHasCapability(selectedAgent, "skipPermissions");
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
   // The selected native harness, used to persist/seed its option knobs (mode /
   // model / effort), which are harness-specific. null for non-native agents,
@@ -2578,6 +2653,7 @@ export function NewChatLandingScreen() {
     supportsPermissionMode ||
     supportsApprovalMode ||
     supportsCursorMode ||
+    supportsAgySkipPermissions ||
     smartRoutingEligible ||
     (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll);
   // Label/value pairs summarizing the selected agent's current run-config, for
@@ -2658,6 +2734,11 @@ export function NewChatLandingScreen() {
         CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.label ?? cursorExecMode;
       return [{ label: "Mode", value: modeValue }, ...routingRow];
     }
+    if (supportsAgySkipPermissions) {
+      const skipValue =
+        AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.label ?? agySkipMode;
+      return [{ label: "Permissions", value: skipValue }, ...routingRow];
+    }
     if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll) {
       const active = pickedHarness ?? selectedAgent.harness;
       return [
@@ -2671,6 +2752,7 @@ export function NewChatLandingScreen() {
     supportsPermissionMode,
     supportsApprovalMode,
     supportsCursorMode,
+    supportsAgySkipPermissions,
     selectedAgent,
     brainHarnessLabelsAll,
     routingOn,
@@ -2682,6 +2764,7 @@ export function NewChatLandingScreen() {
     approvalMode,
     bypassSandbox,
     cursorExecMode,
+    agySkipMode,
     pickedHarness,
   ]);
   // Reset per-agent-instance run-config that must not carry across an agent
@@ -2763,6 +2846,8 @@ export function NewChatLandingScreen() {
       if (storedRoutingOn) setPickedEffort("");
     } else if (supportsCursorMode) {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
+    } else if (supportsAgySkipPermissions) {
+      setAgySkipMode(resolve(AGY_NATIVE_SKIP_MODES, AGY_NATIVE_DEFAULT_SKIP_MODE));
     }
     // Reseed on harness changes and when the selected host's catalog resolves;
     // capability flags are derived from the same harness and stay omitted.
@@ -3455,6 +3540,7 @@ export function NewChatLandingScreen() {
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
+      const agentSupportsAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
       // Smart Routing — server-side. The fully-auto harness always routes
       // (harness + model), so send "on" to keep the persisted state consistent
       // with the lit routing icon. Otherwise only send it when routing is
@@ -3616,7 +3702,9 @@ export function NewChatLandingScreen() {
                   ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
                   : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
                     ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
-                    : undefined,
+                    : agentSupportsAgySkip && agySkipMode !== AGY_NATIVE_DEFAULT_SKIP_MODE
+                      ? (AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.args ?? [])
+                      : undefined,
             // Model + reasoning effort, persisted on the session row before
             // the runner launches. Claude and Codex read model_override at
             // terminal launch; an unselected ("") knob is omitted so the
@@ -4183,6 +4271,7 @@ export function NewChatLandingScreen() {
                     permissionMode={permissionMode}
                     approvalMode={approvalMode}
                     cursorExecMode={cursorExecMode}
+                    agySkipMode={agySkipMode}
                     bypassSandbox={bypassSandbox}
                     pickedModel={pickedModel}
                     claudeModelOptions={claudeModelOptions}
@@ -4199,6 +4288,7 @@ export function NewChatLandingScreen() {
                     setPermissionMode={setPermissionMode}
                     setApprovalMode={setApprovalMode}
                     setCursorExecMode={setCursorExecMode}
+                    setAgySkipMode={setAgySkipMode}
                     setBypassSandbox={setBypassSandbox}
                     setPickedModel={setPickedModel}
                     setPickedEffort={setPickedEffort}

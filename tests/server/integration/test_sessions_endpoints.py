@@ -8106,6 +8106,189 @@ async def test_external_codex_subagent_start_is_idempotent_and_upserts_labels(
     )
 
 
+# ── POST /v1/sessions/{id}/events external_antigravity_subagent_start ────────
+
+
+async def test_external_antigravity_subagent_start_mints_child_session(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    ``external_antigravity_subagent_start`` creates a child session whose rail
+    row names the sub-agent's role.
+
+    agy runs each sub-agent as its own cascade and names it on the parent's
+    ``INVOKE_SUBAGENT`` step; the reader posts this so the Agents rail can show
+    it. Unlike the claude/codex children, the rail's generic
+    ``"<head>:<tail>"`` title split does the display work — so this pins that
+    the title is built to survive that split.
+
+    :param client: The test HTTP client.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "antigravity-native-ui"},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_antigravity_subagent_start",
+            "data": {
+                "cascade_id": "1eca7625-be65-4092-8718-273c1bc3436b",
+                "role": "App Router Code Reviewer",
+                "agent_type": "research",
+                "tool_call_id": "agy_call_efb134b2_36",
+            },
+        },
+    )
+
+    assert resp.status_code == 202, f"unexpected status {resp.status_code}: {resp.text}"
+    child_id = resp.json()["child_session_id"]
+
+    children_resp = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
+    assert children_resp.status_code == 200
+    child = next(
+        (c for c in children_resp.json()["data"] if c["id"] == child_id),
+        None,
+    )
+    assert child is not None, "Child session must appear in child_sessions listing"
+    assert child["tool"] == "App Router Code Reviewer", (
+        f"Expected the rail to name the sub-agent's role; got {child['tool']!r}"
+    )
+    assert child["session_name"] == "1eca7625-be65-4092-8718-273c1bc3436b", (
+        f"Expected session_name=cascade id; got {child['session_name']!r}"
+    )
+    labels = child["labels"]
+    assert labels["omnigent.wrapper"] == "antigravity-native-ui-subagent"
+    assert (
+        labels["omnigent.antigravity_native.subagent_cascade_id"]
+        == "1eca7625-be65-4092-8718-273c1bc3436b"
+    )
+    assert labels["omnigent.antigravity_native.agent_role"] == "App Router Code Reviewer"
+    assert labels["omnigent.antigravity_native.agent_type"] == "research"
+    # Links the child back to the tool card that spawned it.
+    assert labels["omnigent.antigravity_native.tool_call_id"] == "agy_call_efb134b2_36"
+
+
+async def test_external_antigravity_subagent_start_is_idempotent(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Re-registering the same agy sub-agent returns the existing child row.
+
+    The reader re-enters its handler on every frame while the sub-agents work
+    (the owning step stays RUNNING throughout), and a runner restart replays the
+    step, so this POST is repeated many times per sub-agent. Each repeat must
+    resolve to the same row rather than filling the rail with duplicates.
+
+    :param client: The test HTTP client.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "antigravity-native-ui"},
+    )
+    payload = {
+        "type": "external_antigravity_subagent_start",
+        "data": {
+            "cascade_id": "a8009634-3de5-464a-a84c-6f1dafb18942",
+            "role": "Database & Schema Code Reviewer",
+            "agent_type": "research",
+        },
+    }
+
+    first = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
+    assert first.status_code == 202, first.text
+    second = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
+    assert second.status_code == 202, second.text
+
+    assert first.json()["child_session_id"] == second.json()["child_session_id"], (
+        "A repeated registration must resolve to the same child session"
+    )
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    matching = [c for c in children if c["session_name"] == "a8009634-3de5-464a-a84c-6f1dafb18942"]
+    assert len(matching) == 1, f"Expected exactly 1 child row; got {len(matching)}"
+
+
+async def test_external_antigravity_subagent_start_requires_cascade_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A registration with no ``cascade_id`` is rejected rather than minting an
+    unaddressable child.
+
+    The cascade id is what the mirror loop polls and what makes the row
+    idempotent; a child without one could never be filled in.
+
+    :param client: The test HTTP client.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "antigravity-native-ui"},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_antigravity_subagent_start",
+            "data": {"role": "Nameless Reviewer"},
+        },
+    )
+    assert resp.status_code == 400, (
+        f"Expected 400 for a missing cascade_id; got {resp.status_code}: {resp.text[:200]}"
+    )
+
+
+async def test_external_antigravity_subagent_start_title_survives_a_colon_in_the_role(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A role containing a colon still splits into role / cascade id in the rail.
+
+    The rail splits a child title on its FIRST colon, and agy's roles are
+    model-authored free text — "Review: routing" would otherwise push the cascade
+    id out of ``session_name`` and show a truncated role.
+
+    :param client: The test HTTP client.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "antigravity-native-ui"},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_antigravity_subagent_start",
+            "data": {
+                "cascade_id": "84110421-7cfd-4971-8eaa-8e1f390fc92e",
+                "role": "Review: routing and auth",
+                "agent_type": "research",
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    child_id = resp.json()["child_session_id"]
+
+    children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
+    child = next(c for c in children if c["id"] == child_id)
+    assert child["session_name"] == "84110421-7cfd-4971-8eaa-8e1f390fc92e", (
+        f"The cascade id must stay in session_name; got {child['session_name']!r}"
+    )
+    assert child["tool"] == "Review- routing and auth", (
+        f"Expected the colon folded out of the role; got {child['tool']!r}"
+    )
+    # The unmangled role is still available for any surface that wants it.
+    assert child["labels"]["omnigent.antigravity_native.agent_role"] == "Review: routing and auth"
+
+
 async def test_external_codex_subagent_start_adopts_unlabeled_title_collision(
     client: httpx.AsyncClient,
 ) -> None:

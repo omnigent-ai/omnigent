@@ -51,7 +51,6 @@ import {
   consumePendingInitialPrompt,
   handleSessionEvent,
   isStaleCompletedResponse,
-  reviveStrayCompletedResponse,
   initChatStore,
   pumpStreamEvents,
   setPendingInitialPrompt,
@@ -2303,45 +2302,16 @@ describe("chatStore — send while streaming (queueing)", () => {
       error: null,
     });
 
-    // The server's deny short-circuit still publishes a session-level
-    // running→idle pair for the denied out-of-band input, and the client
-    // trusts `session.status` 1:1 — so this stray idle flips
-    // `sessionStatus` AND finalizes the streaming turn (a bare terminal
-    // edge is the NORMAL turn-end shape for id-less emitters like the
-    // PTY-activity relay, so it must settle the bubble; see the bare-idle
-    // tests below). The deny corner is healed by the live-delta revive:
-    // the still-streaming turn's next delta reopens it
-    // (reviveStrayCompletedResponse), so the misread is a brief flicker,
-    // not a mid-turn fold.
-    handleSessionEvent({
-      type: "session_status",
-      conversationId: "conv_abc",
-      status: "idle",
-    });
-    const afterIdle = useChatStore.getState();
-    expect(afterIdle.sessionStatus).toBe("idle");
-    expect(afterIdle.status).toBe("idle");
-    expect(afterIdle.activeResponse).toEqual({
-      responseId: "resp_in_flight",
-      state: "completed",
-      error: null,
-      completedAt: expect.any(Number),
-    });
-
-    // The turn was actually still live — its next delta revives it, and
-    // the session's busy signal comes back with it: leaving
-    // sessionStatus "idle" let a mid-turn send bypass shouldQueueSend's
-    // queue gate. Local `status` stays "idle" — this client sent
-    // nothing, so no local send is in flight.
-    reviveStrayCompletedResponse(useChatStore.setState);
-    expect(useChatStore.getState().activeResponse).toEqual({
+    // The deny publishes no session-status pair at all: the agent never ran,
+    // so there is no turn to report. The live turn streaming alongside it is
+    // therefore untouched — no stray idle to fold its bubble, and no
+    // client-side revive needed to undo one.
+    expect(state.sessionStatus).toBe("running");
+    expect(state.activeResponse).toEqual({
       responseId: "resp_in_flight",
       state: "streaming",
       error: null,
-      completedAt: expect.any(Number),
     });
-    expect(useChatStore.getState().sessionStatus).toBe("running");
-    expect(useChatStore.getState().status).toBe("idle");
   });
 
   it("finalizes a streaming turn on a bare idle edge (no response id)", () => {
@@ -2386,7 +2356,7 @@ describe("chatStore — send while streaming (queueing)", () => {
 
   it("preserves a cancelled turn across a bare idle edge", () => {
     // The user's interrupt verdict must survive the trailing idle the
-    // teardown publishes — and the revive must never resurrect it.
+    // teardown publishes.
     useChatStore.setState({
       conversationId: "conv_abc",
       status: "idle",
@@ -2398,8 +2368,6 @@ describe("chatStore — send while streaming (queueing)", () => {
       conversationId: "conv_abc",
       status: "idle",
     });
-    expect(useChatStore.getState().activeResponse?.state).toBe("cancelled");
-    reviveStrayCompletedResponse(useChatStore.setState);
     expect(useChatStore.getState().activeResponse?.state).toBe("cancelled");
   });
 
@@ -2441,54 +2409,6 @@ describe("chatStore — send while streaming (queueing)", () => {
       error: null,
     });
     expect(state.status).toBe("streaming");
-  });
-
-  it("revive is a no-op for failed and absent responses", () => {
-    useChatStore.setState({
-      conversationId: "conv_abc",
-      sessionStatus: "idle",
-      activeResponse: { responseId: "resp_a", state: "failed", error: "boom" },
-    });
-    reviveStrayCompletedResponse(useChatStore.setState);
-    expect(useChatStore.getState().activeResponse?.state).toBe("failed");
-    expect(useChatStore.getState().sessionStatus).toBe("idle");
-
-    useChatStore.setState({ activeResponse: null });
-    reviveStrayCompletedResponse(useChatStore.setState);
-    expect(useChatStore.getState().activeResponse).toBeNull();
-    expect(useChatStore.getState().sessionStatus).toBe("idle");
-  });
-
-  it("gates the revive to a window after the finalize", () => {
-    // A scheduled wake's first deltas stream ahead of the batch that
-    // names the new turn; reviving the minutes-old finished turn
-    // popped its "Worked for" fold open at every /loop iteration. A
-    // finalize moments ago is a plausible stray idle and still revives.
-    useChatStore.setState({
-      conversationId: "conv_abc",
-      sessionStatus: "idle",
-      activeResponse: {
-        responseId: "resp_prev_iter",
-        state: "completed",
-        error: null,
-        completedAt: Date.now() - 60_000,
-      },
-    });
-    reviveStrayCompletedResponse(useChatStore.setState);
-    expect(useChatStore.getState().activeResponse?.state).toBe("completed");
-    expect(useChatStore.getState().sessionStatus).toBe("idle");
-
-    useChatStore.setState({
-      activeResponse: {
-        responseId: "resp_live",
-        state: "completed",
-        error: null,
-        completedAt: Date.now() - 1_000,
-      },
-    });
-    reviveStrayCompletedResponse(useChatStore.setState);
-    expect(useChatStore.getState().activeResponse?.state).toBe("streaming");
-    expect(useChatStore.getState().sessionStatus).toBe("running");
   });
 
   it("isStaleCompletedResponse: only an old finalize is stale", () => {
@@ -3390,12 +3310,11 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       // sessionStatus tracks the server's session-level status 1:1 — a server
       // idle means idle, and the "Working…" indicator (which reads only
       // sessionStatus) must turn off. The bubble lifecycle settles on the
-      // same edge: a bare (id-less) idle is the NORMAL turn-end shape for
-      // the PTY-activity relay and orchestration teardown, and leaving the
-      // turn "streaming" hid its "Worked for" fold and Fork action until a
-      // reload. A stray idle for a turn that is actually still live (the
-      // policy-deny short-circuit) is healed by the live-delta revive —
-      // see reviveStrayCompletedResponse.
+      // same edge: a bare (id-less) idle is the NORMAL turn-end shape for the
+      // status file and orchestration teardown, and leaving the turn
+      // "streaming" hid its "Worked for" fold and Fork action until a reload.
+      // Every idle that reaches here is a real turn end — control signals no
+      // longer publish status.
       expect(state.sessionStatus).toBe("idle");
       expect(state.status).toBe("idle");
       expect(state.activeResponse).toEqual({
@@ -4215,6 +4134,133 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(state.pendingUserMessages).toEqual([
         { tempId: "pend_2", content: [{ type: "input_text", text: "second" }] },
       ]);
+    });
+
+    it("clears the pending echo without re-appending when the committed item already rendered", () => {
+      // Native-terminal race: the forwarder-mirrored user item reached
+      // `blocks` (via the stream or a snapshot merge) BEFORE this
+      // consumed event. Pre-fix, the handler bailed on the committed-item
+      // guard without dropping the optimistic bubble, stranding a
+      // duplicate user bubble at the transcript tail forever.
+      const committed: AnyBlock = {
+        type: "user_message",
+        ctx: {
+          agent: null,
+          depth: 0,
+          turn: 0,
+          timestamp: 0,
+          responseId: "resp_1",
+          itemId: "msg_already_committed",
+        },
+        content: [{ type: "input_text", text: "hello" }],
+      } as unknown as AnyBlock;
+      useChatStore.setState({
+        blocks: [committed],
+        pendingUserMessages: [
+          { tempId: "pend_1", content: [{ type: "input_text", text: "hello" }], posted: true },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_already_committed",
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "hello" }] },
+      });
+
+      const state = useChatStore.getState();
+      // No second copy appended — the committed block stands alone.
+      expect(state.blocks).toHaveLength(1);
+      expect(state.blocks[0]).toBe(committed);
+      // And the optimistic echo is acked away, not stranded.
+      expect(state.pendingUserMessages).toEqual([]);
+    });
+
+    it("drops the exact named pending entry when the committed item already rendered", () => {
+      // Same race, but the server names the drained entry via
+      // clearedPendingId — the precise match must win over FIFO.
+      const committed: AnyBlock = {
+        type: "user_message",
+        ctx: {
+          agent: null,
+          depth: 0,
+          turn: 0,
+          timestamp: 0,
+          responseId: "resp_1",
+          itemId: "msg_committed_2",
+        },
+        content: [{ type: "input_text", text: "second" }],
+      } as unknown as AnyBlock;
+      useChatStore.setState({
+        blocks: [committed],
+        pendingUserMessages: [
+          { tempId: "pend_a", content: [{ type: "input_text", text: "first" }] },
+          { tempId: "pend_b", content: [{ type: "input_text", text: "second" }] },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_committed_2",
+        itemType: "message",
+        clearedPendingId: "pend_b",
+        data: { role: "user", content: [{ type: "input_text", text: "second" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.blocks).toHaveLength(1);
+      expect(state.pendingUserMessages).toEqual([
+        { tempId: "pend_a", content: [{ type: "input_text", text: "first" }] },
+      ]);
+    });
+
+    it("holds the pending head back when the committed item is a mirrored interrupt marker", () => {
+      // Claude's own `[Request interrupted by user]` record owns no
+      // pending entry and arrives with clearedPendingId unset. A snapshot
+      // merge can commit it into `blocks` before its consumed event, so it
+      // lands on the committed-item branch. A genuine queued message sits
+      // at the pending head — dropping it here (the FIFO fallback without a
+      // marker guard) would make the user's in-flight bubble vanish. The
+      // marker must not steal that slot, matching the promote path below.
+      const committedMarker: AnyBlock = {
+        type: "user_message",
+        ctx: {
+          agent: null,
+          depth: 0,
+          turn: 0,
+          timestamp: 0,
+          responseId: "resp_1",
+          itemId: "msg_interrupt",
+        },
+        content: [{ type: "input_text", text: "[Request interrupted by user]" }],
+      } as unknown as AnyBlock;
+      useChatStore.setState({
+        blocks: [committedMarker],
+        pendingUserMessages: [
+          { tempId: "pend_real", content: [{ type: "input_text", text: "still sending" }] },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_interrupt",
+        itemType: "message",
+        // No clearedPendingId — the server never drains a pending entry for
+        // the CLI's synthetic interrupt record.
+        data: {
+          role: "user",
+          content: [{ type: "input_text", text: "[Request interrupted by user]" }],
+        },
+      });
+
+      const state = useChatStore.getState();
+      // The real message's optimistic bubble survives.
+      expect(state.pendingUserMessages).toEqual([
+        { tempId: "pend_real", content: [{ type: "input_text", text: "still sending" }] },
+      ]);
+      // No second copy appended — the committed marker stands alone.
+      expect(state.blocks).toHaveLength(1);
+      expect(state.blocks[0]).toBe(committedMarker);
     });
 
     it("threads the event's createdBy onto the promoted committed block", () => {
@@ -6970,7 +7016,10 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
 
     expect(opens).toBe(11); // 1 initial open + 10 retries, then gives up
-    expect(useChatStore.getState().sessionStatus).toBe("failed");
+    // Giving up on OUR stream says nothing about what the agent is doing, so
+    // the session's own status is left alone — only the server may declare a
+    // session failed. The dropped stream surfaces as offline liveness.
+    expect(useChatStore.getState().sessionStatus).toBe("running");
     expect(useChatStore.getState().abortController).toBeNull();
   });
 
@@ -7433,8 +7482,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const previews = livePreviews();
     // Exactly one preview holding exactly the replayed text.
     // "Hello worHello world!" = the pre-fix bug: the pre-drop preview
-    // survived the reconnect and the fresh pump (whose high-water index
-    // map starts empty) appended the cumulative replay onto it.
+    // survived the reconnect and the fresh pump appended the cumulative
+    // replay onto it.
     expect(previews.map((b) => b.fullText)).toEqual(["Hello world!"]);
     expect(previews[0]!.ctx.itemId).toBe("live:m1");
 
@@ -7459,8 +7508,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync();
     expect(livePreviews().map((b) => b.fullText)).toEqual(["Hello world!"]);
 
-    // The message commits while the socket is dead: the server retires
-    // it from the replay index (no replay on the next connection) and
+    // The message commits while the socket is dead: the server removes
+    // it from reconnect replay (no replay on the next connection) and
     // it lands in the items store instead.
     seedSessionItems("conv_native_commit", [assistantMessage("resp_n", "Hello world!")]);
     sinks[0]!.error();
@@ -7672,10 +7721,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
 
   it("keeps the synthetic response id when no turn is tracked", async () => {
     // A preview that lands before any turn id is known keeps its own id, so
-    // it can't be grouped into an unrelated bubble. (A `completed` turn does
-    // NOT hit this path: a live delta proves that turn is still running, so
-    // `reviveStrayCompletedResponse` reopens it first and the preview
-    // correctly joins it.)
+    // it can't be grouped into an unrelated bubble.
     useChatStore.setState({
       conversationId: "conv_live_norid",
       blocks: [],
@@ -7694,7 +7740,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     controller.abort();
   });
 
-  it("replaces the provisional in place with the authoritative item", async () => {
+  it("drops the provisional before processing the authoritative item", async () => {
     useChatStore.setState({
       conversationId: "conv_live2",
       blocks: [],
@@ -7711,7 +7757,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     await tick();
 
     // The provisional is gone and the authoritative text_done (real item
-    // id) is the only assistant text — no duplicate. If the replacement
+    // id) is the only assistant text — no duplicate. If the cleanup
     // regressed, both live:m1 and ci_1 would render.
     expect(provisional()).toBeUndefined();
     const dones = useChatStore
@@ -7719,6 +7765,59 @@ describe("chatStore — live delta streaming (claude-native)", () => {
       .blocks.filter((b): b is Extract<AnyBlock, { type: "text_done" }> => b.type === "text_done");
     expect(dones).toHaveLength(1);
     expect(dones[0]!.ctx.itemId).toBe("ci_1");
+    expect(dones[0]!.fullText).toBe("Hello world");
+
+    controller.abort();
+  });
+
+  it("removes the provisional preview when the authoritative item was already committed", async () => {
+    // Race: a snapshot merge (reconnect/rebind) inserts the real
+    // assistant item into `blocks` while its `live:*` preview is still
+    // on screen. When the authoritative output_item.done then arrives on
+    // the stream, the generic item-id dedup skips it — pre-fix, the
+    // replacement path never ran and BOTH the real item and the preview
+    // stayed rendered (duplicate assistant text, preview at the tail).
+    useChatStore.setState({
+      conversationId: "conv_live3",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller } = startPump("conv_live3");
+
+    sink.push(sse("response.created", { id: "resp_l", status: "in_progress", output: [] }));
+    sink.push(nativeDelta("m1", 0, "Hello world", true));
+    await tick();
+    expect(provisional()?.ctx.itemId).toBe("live:m1");
+
+    // Snapshot merge lands the committed copy while the preview renders.
+    useChatStore.setState((s) => ({
+      blocks: [
+        ...s.blocks,
+        {
+          type: "text_done",
+          ctx: {
+            agent: null,
+            depth: 0,
+            turn: 0,
+            timestamp: 0,
+            responseId: "resp_l",
+            itemId: "ci_1",
+          },
+          fullText: "Hello world",
+          hasCodeBlocks: false,
+        },
+      ],
+    }));
+
+    sink.push(messageDone("ci_1", "resp_l", "Hello world"));
+    await tick();
+
+    // Exactly one rendering: the committed item. The preview is removed.
+    expect(provisional()).toBeUndefined();
+    const dones = useChatStore
+      .getState()
+      .blocks.filter((b): b is Extract<AnyBlock, { type: "text_done" }> => b.type === "text_done");
+    expect(dones.map((b) => b.ctx.itemId)).toEqual(["ci_1"]);
     expect(dones[0]!.fullText).toBe("Hello world");
 
     controller.abort();
@@ -7765,7 +7864,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     sink.push(messageDone("msg_real", "pi-turn-0", "PONG"));
     await tick();
 
-    // The provisional preview must be retired and replaced — exactly one
+    // The provisional preview must be removed — exactly one
     // assistant text bubble, not the preview AND the authoritative item.
     expect(provisional()).toBeUndefined();
     const dones = useChatStore
@@ -7843,9 +7942,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     controller.abort();
   });
 
-  it("keeps streamed text ABOVE an elicitation that arrives mid-stream", async () => {
-    // The user-reported bug: text streams, then a tool-permission card
-    // arrives and must render BELOW the text that preceded it (not above).
+  it("removes the preview and handles its done item in normal arrival order", async () => {
     useChatStore.setState({
       conversationId: "conv_live3",
       blocks: [],
@@ -7870,21 +7967,20 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     // Streamed text precedes the elicitation in block (== render) order.
     expect(previewIdx).toBeLessThan(elicitIdx);
 
-    // When the authoritative item commits, it replaces the preview IN
-    // PLACE — so the committed text STAYS above the elicitation rather
-    // than appending after it (where the slow transcript item would land).
+    // The committed item follows the normal reducer path after the preview
+    // is removed, so its position reflects the done event's arrival.
     sink.push(messageDone("ci_1", "resp_l", "Let me check that."));
     await tick();
     const textIdx = idxOf((b) => b.ctx.itemId === "ci_1");
     const elicitIdx2 = idxOf((b) => b.type === "elicitation");
     expect(textIdx).toBeGreaterThanOrEqual(0);
-    expect(textIdx).toBeLessThan(elicitIdx2);
+    expect(textIdx).toBeGreaterThan(elicitIdx2);
     expect(provisional()).toBeUndefined();
 
     controller.abort();
   });
 
-  it("replaces each message's preview in place across a multi-message turn", async () => {
+  it("reconciles each preview independently across a multi-message turn", async () => {
     useChatStore.setState({
       conversationId: "conv_live4",
       blocks: [],
@@ -7903,7 +7999,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     sink.push(nativeDelta("m2", 0, "second", false));
     await tick();
 
-    // m2 is the only in-flight preview (FIFO replacement took m1, not m2).
+    // m2 is the only in-flight preview (FIFO cleanup took m1, not m2).
     expect(provisional()?.ctx.itemId).toBe("live:m2");
     expect(provisional()?.fullText).toBe("second");
     const dones = useChatStore
@@ -7937,60 +8033,6 @@ describe("chatStore — live delta streaming (claude-native)", () => {
 
     // The dangling preview is dropped — no forever-streaming bubble.
     expect(provisional()).toBeUndefined();
-
-    controller.abort();
-  });
-
-  it("appends in-order chunks and ignores a duplicate index", async () => {
-    useChatStore.setState({
-      conversationId: "conv_live6",
-      blocks: [],
-      isNativeTerminalSession: true,
-    });
-    const { sink, controller } = startPump("conv_live6");
-
-    sink.push(sse("response.created", { id: "resp_l", status: "in_progress", output: [] }));
-    sink.push(nativeDelta("m1", 0, "Hello ", false));
-    sink.push(nativeDelta("m1", 1, "world", true));
-    // A replayed chunk at an already-applied index is a no-op.
-    sink.push(nativeDelta("m1", 1, "world", true));
-    await tick();
-
-    expect(provisional()?.fullText).toBe("Hello world");
-
-    controller.abort();
-  });
-
-  it("drops a trailing chunk that arrives after the message was finalized", async () => {
-    // Regression: the forwarder can emit a message's last chunk just
-    // AFTER its authoritative text_done (the chunk was written to the
-    // deltas file moments before the transcript flushed). Replaying it
-    // would re-create the finalized message's preview as a duplicate,
-    // stale bubble that also sits below any later elicitation card.
-    useChatStore.setState({
-      conversationId: "conv_live7",
-      blocks: [],
-      isNativeTerminalSession: true,
-    });
-    const { sink, controller } = startPump("conv_live7");
-
-    sink.push(sse("response.created", { id: "resp_l", status: "in_progress", output: [] }));
-    sink.push(nativeDelta("m1", 0, "Hello ", false));
-    await tick();
-    // The authoritative final text commits and replaces + retires m1.
-    sink.push(messageDone("ci_1", "resp_l", "Hello world"));
-    await tick();
-    expect(provisional()).toBeUndefined();
-
-    // The trailing chunk for the already-finalized m1 arrives late.
-    sink.push(nativeDelta("m1", 1, "world", true));
-    await tick();
-
-    // It is dropped: no re-created provisional (which would duplicate the
-    // committed text and linger below later cards).
-    expect(provisional()).toBeUndefined();
-    const dones = useChatStore.getState().blocks.filter((b) => b.type === "text_done");
-    expect(dones).toHaveLength(1);
 
     controller.abort();
   });
@@ -8706,11 +8748,9 @@ describe("chatStore — policy deny renders once", () => {
 
   it("keeps the deny visible on a native-terminal session", async () => {
     // Same server sequence as the non-native case, but on a native-terminal
-    // session the committed `text_done` reconciles via a DIFFERENT branch:
-    // it replaces the `live:` provisional IN PLACE (and retires the live
-    // message id) rather than appending and letting the terminal sweep drop
-    // the provisional. Both paths must yield exactly one durable, itemId-keyed
-    // deny block.
+    // session the committed `text_done` first removes the `live:` provisional,
+    // then follows the normal committed-item path. Both paths must yield
+    // exactly one durable, itemId-keyed deny block.
     const sentinel = "[Denied by policy: over budget]";
     useChatStore.setState({
       conversationId: "conv_deny3",

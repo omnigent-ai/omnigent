@@ -3,7 +3,7 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   MemoryRouter,
   Route,
@@ -61,9 +61,18 @@ vi.mock("@/hooks/useAgents", () => ({
 }));
 
 vi.mock("./Sidebar", () => ({
-  // Reflect the open prop so tests can assert sidebar collapse/expand.
-  Sidebar: ({ open }: { open: boolean }) => (
-    <div data-testid="sidebar" data-open={open ? "true" : "false"} />
+  // Reflect the open/peek props so tests can assert sidebar collapse/expand and
+  // whether it is peeking (a floating hover card rather than a docked panel).
+  // Rendered as aside.conversations-sidebar like the real one, so the
+  // peek-dismiss logic (which treats that selector as "inside the card") sees
+  // the same shape here as in the app.
+  Sidebar: ({ open, peek }: { open: boolean; peek?: boolean }) => (
+    <aside
+      className="conversations-sidebar"
+      data-testid="sidebar"
+      data-open={open ? "true" : "false"}
+      data-peek={peek ? "true" : "false"}
+    />
   ),
 }));
 vi.mock("./FilesPanel", () => ({
@@ -76,11 +85,17 @@ vi.mock("./FilesPanel", () => ({
   FilesPanel: ({
     onFileSelect,
     flatView,
+    showHidden,
   }: {
     onFileSelect: (path: string) => void;
     flatView: boolean;
+    showHidden: boolean;
   }) => (
-    <div data-testid="files-panel" data-flat-view={String(flatView)}>
+    <div
+      data-testid="files-panel"
+      data-flat-view={String(flatView)}
+      data-show-hidden={String(showHidden)}
+    >
       <button
         type="button"
         aria-label="files: select README.md"
@@ -284,6 +299,26 @@ function LocationDisplay() {
 }
 
 /**
+ * Route-change buttons standing in for the real Settings button and the
+ * sidebar's Back row, which live in components mocked out here. Navigation is
+ * what AppShell keys the /settings sidebar pin off, so the tests need a real
+ * router transition rather than a re-render.
+ */
+function NavProbe() {
+  const navigate = useNavigate();
+  return (
+    <div>
+      <button type="button" data-testid="nav-settings" onClick={() => navigate("/settings")}>
+        to-settings
+      </button>
+      <button type="button" data-testid="nav-home" onClick={() => navigate("/")}>
+        to-home
+      </button>
+    </div>
+  );
+}
+
+/**
  * Renders the current pathname (the `/c/:conversationId` segment) so a test
  * can detect an unwanted conversation switch — a redirect shows up as a
  * pathname change, which `LocationDisplay` (search params only) can't catch.
@@ -354,6 +389,23 @@ function renderShell(path: string, info?: ServerInfo) {
                   <>
                     <TerminalFirstViewProbe />
                     <ForkDialogProbe />
+                    <NavProbe />
+                    <LocationDisplay />
+                  </>
+                }
+              />
+              {/* The settings page itself renders inside the sidebar (its nav
+              replaces the session list), so the body here is irrelevant — what
+              matters is that the route is /settings, which is what AppShell
+              keys the sidebar pin off. The nav-* links stand in for the real
+              Settings button and the sidebar's Back row, both of which live in
+              components mocked out here. */}
+              <Route
+                path="settings"
+                element={
+                  <>
+                    <div>settings</div>
+                    <NavProbe />
                     <LocationDisplay />
                   </>
                 }
@@ -1175,6 +1227,112 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
   });
 
+  it("pins the sidebar open on /settings so the Back row is reachable", () => {
+    // The settings nav replaces the session list INSIDE the sidebar, and its
+    // Back row is the only way off the page. Collapsed, that row is clipped and
+    // inert — the user is stranded with no visible exit. Entering /settings must
+    // therefore force the sidebar open.
+    mockConversations([]);
+    renderShell("/settings");
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("refuses to collapse the sidebar while on /settings", () => {
+    // The hotkey (⌘⌥[) and command palette reach the toggle without going
+    // through the title-bar button, so the guard has to live in the handler, not
+    // just in what's rendered. Opening stays allowed; only collapsing is
+    // refused, because collapsing is what removes the exit.
+    mockConversations([]);
+    renderShell("/settings");
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("dismisses a peeking sidebar once the pointer moves elsewhere", async () => {
+    // The card closes itself on its own pointerleave, which only covers a peek
+    // armed from INSIDE it. Armed from the title-bar trigger (outside), a pointer
+    // that never crosses the card leaves it with no pointerenter and therefore no
+    // pointerleave, so the card used to sit open indefinitely.
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    fireEvent.pointerEnter(screen.getByRole("button", { name: /open sidebar/i }));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true"));
+
+    // Pointer over something that is not the card, the trigger, or a popper.
+    fireEvent.pointerMove(screen.getByTestId("url-params"));
+    await waitFor(() =>
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "false"),
+    );
+  });
+
+  it("keeps peeking while the pointer is over the card itself", async () => {
+    // The other half: dismissal must not be so eager that moving onto the card —
+    // the entire point of peeking — closes it.
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    fireEvent.pointerEnter(screen.getByRole("button", { name: /open sidebar/i }));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true"));
+
+    fireEvent.pointerMove(screen.getByTestId("sidebar"));
+    await new Promise((resolve) => {
+      // Past the 200ms dismiss grace, so "still peeking" is a real result.
+      setTimeout(resolve, 350);
+    });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true");
+  });
+
+  it("keeps the sidebar pinned open for the whole /settings visit", () => {
+    // Repeated toggles all resolve to open while on the page: collapsing is what
+    // removes the only exit, so the guard refuses that direction throughout.
+    mockConversations([]);
+    renderShell("/settings");
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("restores a collapsed sidebar after leaving /settings", () => {
+    // A collapsed sidebar is a preference, and a trip to settings shouldn't
+    // silently undo it. The pin is only needed WHILE on the page — on the way out
+    // the title-bar toggle is back and Back is no longer the only exit — so
+    // restoring here cannot reintroduce the trap.
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    // Collapsed going in (jsdom default).
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    // Into settings: pinned open despite the collapsed preference.
+    fireEvent.click(screen.getByTestId("nav-settings"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+
+    // Back out: the collapsed state the user chose is restored.
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+  });
+
+  it("restores an open sidebar after leaving /settings", () => {
+    // The mirror case: someone who had it open keeps it open, so the restore is
+    // genuinely "put it back", not "always collapse".
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+
+    fireEvent.click(screen.getByTestId("nav-settings"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
   it("keeps the sidebar collapsed after exiting full screen if it was collapsed before", () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
@@ -1867,6 +2025,39 @@ describe("FilesPanel visibility", () => {
 
     expect(screen.queryByTestId("files-panel")).toBeNull();
     expect(screen.queryByTestId("files-panel-drawer")).toBeNull();
+  });
+
+  it("shows hidden files by default, on load and after a session switch", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_abc", permission_level: null },
+      { id: "conv_xyz", permission_level: null },
+    ]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_abc"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route path="c/:conversationId" element={<SessionNavButton to="/c/conv_xyz" />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-show-hidden", "true");
+
+    // The conversation-switch reset must land on the same default, otherwise
+    // dotfiles would disappear the moment the user moves between sessions.
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-show-hidden", "true");
   });
 });
 

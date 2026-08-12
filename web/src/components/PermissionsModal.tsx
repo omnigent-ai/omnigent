@@ -242,7 +242,7 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
               </SelectContent>
             </Select>
           </div>
-          <Button type="submit" size="sm" disabled={!newUserId.trim() || grant.isPending}>
+          <Button type="submit" size="sm" loading={grant.isPending} disabled={!newUserId.trim()}>
             <UserPlusIcon className="mr-1 size-3.5" />
             Grant
           </Button>

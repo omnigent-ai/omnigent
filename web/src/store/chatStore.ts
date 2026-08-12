@@ -531,6 +531,17 @@ export interface ChatState {
    */
   terminalPending: boolean;
   /**
+   * Epoch ms when this client last asked a host to launch a runner for the
+   * open session outside the send path — today, a host switch. The runner
+   * is coming up but nothing on the wire says so yet: the session is not
+   * newly created, so the liveness startup grace doesn't apply, and no turn
+   * is in flight, so it would otherwise read as idle `runner_asleep` and
+   * show nothing at all. Feeds `useSessionLiveness` as a `starting` nudge
+   * and self-expires after `STARTING_GRACE_S`. `null` when no such launch
+   * is outstanding.
+   */
+  runnerLaunchedAt: number | null;
+  /**
    * Users currently viewing this session (presence circles in the
    * chat header). Replaced wholesale by every `session.presence` SSE
    * event — the wire protocol is full-state, never deltas — and
@@ -701,6 +712,9 @@ export interface ChatState {
   addComposerAttachment: (attachment: ComposerAttachment) => void;
   /** Drain the queued composer attachments (called by the composer). */
   clearPendingComposerAttachments: () => void;
+  /** Stamp {@link ChatState.runnerLaunchedAt} now — call right after a
+   *  successful `launchRunner` for the open session. */
+  markRunnerLaunched: () => void;
   /**
    * Compact the active session's context. Posts a ``compact`` event to the
    * server, which summarises the conversation history in-place. No-ops when
@@ -1094,6 +1108,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   skills: [],
   codexModelOptions: [],
   terminalPending: false,
+  runnerLaunchedAt: null,
   viewers: [],
   sandboxStatus: null,
   mcpStartup: null,
@@ -1820,6 +1835,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // session's composer (which drains the store on mount). Same reset
         // discipline as ``viewers`` above.
         pendingComposerAttachments: [],
+        runnerLaunchedAt: null,
         sandboxStatus: null,
         mcpStartup: null,
         abortController: null,
@@ -1899,6 +1915,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   clearPendingComposerAttachments: () => set({ pendingComposerAttachments: [] }),
+
+  markRunnerLaunched: () => set({ runnerLaunchedAt: Date.now() }),
 
   compact: async () => {
     const { conversationId } = get();
@@ -2838,9 +2856,8 @@ function nextReconnectDelay(failedOpens: number): number {
  *   the drop.
  * - Native live previews (`live:<message_id>` provisional blocks): the
  *   replay is one CUMULATIVE delta per in-flight message (the joined
- *   text so far at its highest index), and the fresh pump has no
- *   high-water index for the old preview — appending the replay to a
- *   surviving copy would double the text. A message that committed
+ *   text so far). Appending that replay to a surviving preview would
+ *   double the text. A message that committed
  *   during the gap is excluded from the replay entirely; its preview
  *   must vanish too, or it would double-render beside the committed
  *   item the reconnect backfill splices in. So previews are dropped
@@ -3360,12 +3377,16 @@ export async function startStreamPump(
           // Release the unconsumed error-response body so the underlying fetch
           // connection is freed promptly rather than lingering across retries.
           void streamRes.body?.cancel().catch(() => {});
-          // 401/403 won't fix themselves by retrying — give up and mark the
-          // session failed so the user isn't left on a silent spinner.
+          // 401/403 won't fix themselves by retrying — give up and settle the
+          // local send lifecycle so the user isn't left on a silent spinner.
+          // `sessionStatus` is NOT touched: losing our stream says nothing
+          // about what the agent is doing (it may well still be mid-turn), and
+          // only the server may declare a session failed. The dropped stream
+          // surfaces as offline liveness via ConnectionIndicator.
           if (streamRes.status === 401 || streamRes.status === 403) {
             console.warn(`Session ${id}: stream unavailable (${streamRes.status}), giving up`);
             finalizeActive(set, "failed", `stream unavailable (${streamRes.status})`, null);
-            set({ sessionStatus: "failed", status: "idle" });
+            set({ status: "idle" });
             break;
           }
           // A reverse proxy routinely serves 404 for the stream route while
@@ -3378,8 +3399,10 @@ export async function startStreamPump(
               console.warn(
                 `Session ${id}: stream unavailable (404) after ${consecutive404s} attempts, giving up`,
               );
+              // Local lifecycle only — see the 401/403 branch above for why
+              // `sessionStatus` is left to the server.
               finalizeActive(set, "failed", "stream unavailable (404)", null);
-              set({ sessionStatus: "failed", status: "idle" });
+              set({ status: "idle" });
               break;
             }
             console.warn(
@@ -3536,7 +3559,7 @@ function isLiveProvisionalBlock(b: AnyBlock): boolean {
  *
  * Shaped like a finalized `text_done` so the existing renderer draws it
  * as assistant text, and keyed with a synthetic `live:<messageId>` id
- * that drives in-place replacement when the authoritative item lands.
+ * so it can be removed when the authoritative item lands.
  *
  * `responseId` is the LIVE TURN's id whenever one is streaming, so the
  * preview groups into that turn's bubble (`walkBubbles` groups by
@@ -3577,34 +3600,18 @@ function makeLiveTextBlock(itemId: string, text: string, responseId: string): Te
  *
  * The streamed text lives in `blocks` (not a separate lane) as a
  * provisional `text_done` block keyed `live:<messageId>`, inserted at the
- * position the first chunk arrived. Keeping it in `blocks` means a later
- * committed block (a tool card, an elicitation) renders BELOW it in
- * arrival order — see `walkBubbles`. When the authoritative `text_done`
- * arrives it replaces this block in place (`pumpStreamEvents`),
- * preserving that position.
+ * position the first chunk arrived. The authoritative `text_done` removes
+ * this provisional block before following the normal committed-item path.
  *
- * Chunks for a message arrive in `index` order (the forwarder tails the
- * deltas file sequentially and dedupes by `(message_id, index)`), so each
- * new chunk's text is appended; a chunk at or below the high-water index
- * is ignored, making a duplicate/replayed chunk a no-op.
+ * The server reconciles and deduplicates chunks, so each received delta is
+ * appended directly.
  *
  * :param set: store setter.
  * :param messageId: vendor's stable per-message id.
- * :param index: 0-based chunk order within the message.
  * :param delta: incremental text for this chunk, e.g. ``"Hello "``.
- * :param lastIndex: per-message high-water index, mutated in place.
  * :returns: nothing; mutates `blocks` in the store.
  */
-function applyLiveDelta(
-  set: Setter,
-  messageId: string,
-  index: number,
-  delta: string,
-  lastIndex: Map<string, number>,
-): void {
-  const prev = lastIndex.get(messageId);
-  if (prev !== undefined && index <= prev) return;
-  lastIndex.set(messageId, index);
+function applyLiveDelta(set: Setter, messageId: string, delta: string): void {
   const itemId = LIVE_ITEM_PREFIX + messageId;
   set((s) => {
     const at = s.blocks.findIndex((b) => b.ctx.itemId === itemId);
@@ -3645,7 +3652,7 @@ function applyLiveToolOutputDelta(set: Setter, callId: string, delta: string): v
 /**
  * Wrap a parsed event stream, diverting terminal-observed live deltas.
  *
- * A `text_delta` carrying a `messageId` is claude-native live streaming:
+ * A `text_delta` carrying a `messageId` is native live streaming:
  * it is folded into its provisional preview block in `blocks` (see
  * `applyLiveDelta`) and NOT yielded downstream, because the `BlockStream`
  * reducer's response-scoped text path would otherwise emit a stray bubble
@@ -3653,20 +3660,11 @@ function applyLiveToolOutputDelta(set: Setter, callId: string, delta: string): v
  * as a separate committed item). Every other event passes through
  * untouched.
  *
- * Deltas whose `messageId` has been retired (its preview already
- * superseded by the authoritative `text_done`) are dropped: a message's
- * trailing chunk can arrive just after its done event, and replaying it
- * would re-create a finalized message's preview as a duplicate, stale
- * bubble. See the `text_done` branch of `pumpStreamEvents`.
- *
  * :param events: upstream parsed events (already session-tapped).
  * :param id: the conversation this pump is bound to; a late delta from a
  *     switched-away stream is dropped rather than mutating state.
- * :param retired: message ids whose preview has been finalized; their
- *     late deltas are ignored. Shared with the pump loop, which adds to
- *     it when it replaces a preview.
- * :param lastIndex: per-message high-water chunk index, shared with
- *     `applyLiveDelta` for duplicate suppression.
+ * :param ignored: message ids suppressed because their scheduled-wake
+ *     deltas arrived before the new turn was named.
  * :param set: store setter.
  * :param get: store getter.
  * :returns: events with native live deltas removed.
@@ -3674,59 +3672,37 @@ function applyLiveToolOutputDelta(set: Setter, callId: string, delta: string): v
 async function* tapLiveDeltas(
   events: AsyncIterable<StreamEvent>,
   id: string,
-  retired: Set<string>,
-  lastIndex: Map<string, number>,
+  ignored: Set<string>,
   set: Setter,
   get: Getter,
 ): AsyncIterable<StreamEvent> {
   for await (const ev of events) {
     if (ev.type === "text_delta" && ev.messageId !== undefined) {
-      if (get().conversationId === id && !retired.has(ev.messageId)) {
+      if (get().conversationId === id && !ignored.has(ev.messageId)) {
         // A scheduled wake streams its first deltas ahead of the batch
         // that names the new turn. They must not preview into the
         // PREVIOUS turn's bubble (anonymous blocks glue to the trailing
         // group — killing its fold and inflating its worked-for span):
-        // retire the message so its text renders only via the
+        // ignore the rest of the message so its text renders only via the
         // authoritative item, which lands in the new turn's bubble.
         if (isStaleCompletedResponse(get())) {
-          retired.add(ev.messageId);
+          ignored.add(ev.messageId);
           continue;
         }
-        reviveStrayCompletedResponse(set);
-        applyLiveDelta(set, ev.messageId, ev.index ?? 0, ev.delta, lastIndex);
+        applyLiveDelta(set, ev.messageId, ev.delta);
       }
       continue;
     }
     if (ev.type === "tool_output_delta") {
       if (get().conversationId === id && !isStaleCompletedResponse(get())) {
-        reviveStrayCompletedResponse(set);
         applyLiveToolOutputDelta(set, ev.callId, ev.delta);
       }
       continue;
-    }
-    if (
-      (ev.type === "text_delta" || ev.type === "reasoning_delta") &&
-      get().conversationId === id
-    ) {
-      reviveStrayCompletedResponse(set);
     }
     yield ev;
   }
 }
 
-/**
- * Reopen a turn that a stray terminal status edge finalized too early.
- *
- * Deltas only ever flow mid-turn (a reconnect replay is a replay OF a
- * mid-turn state), so a delta arriving while `activeResponse` reads
- * `completed` proves the turn is still live — the finalize came from a
- * response-id-less edge that wasn't about this turn (e.g. the server's
- * policy-deny short-circuit publishing running→idle for a denied
- * out-of-band input). Flip it back to `streaming` so the bubble's
- * process trace stays expanded; the turn's own real terminal edge
- * re-finalizes it. `failed` / `cancelled` are user-visible verdicts and
- * are never revived.
- */
 /**
  * Attribute the trailing run of turn-id-less blocks to a just-started turn.
  *
@@ -3754,12 +3730,11 @@ export function adoptTrailingUnattributedBlocks(
   return next;
 }
 
-// How long after a terminal edge a delta still revives the turn. A
-// STRAY mid-turn idle is contradicted by the still-flowing stream
-// within seconds; a scheduled wake (cron / wakeup fires at 60s
-// minimum) streams its FIRST deltas ahead of the transcript batch that
-// names the new turn — reviving the finished turn then popped its
-// "Worked for" fold open at the start of every /loop iteration.
+// How long after a terminal edge a delta still belongs to the finished
+// turn. A scheduled wake (cron / wakeup fires at 60s minimum) streams
+// its FIRST deltas ahead of the transcript batch that names the new
+// turn; attributing those to the previous turn popped its "Worked for"
+// fold open at the start of every /loop iteration.
 const REVIVE_WINDOW_MS = 15_000;
 
 /**
@@ -3772,23 +3747,6 @@ export function isStaleCompletedResponse(s: { activeResponse: ActiveResponse | n
     s.activeResponse.completedAt !== undefined &&
     Date.now() - s.activeResponse.completedAt > REVIVE_WINDOW_MS
   );
-}
-
-export function reviveStrayCompletedResponse(set: Setter): void {
-  set((s) => {
-    if (s.activeResponse?.state !== "completed") return {};
-    if (isStaleCompletedResponse(s)) return {};
-    // The delta also proves the SESSION is mid-turn: restore the busy
-    // signal the stray idle edge cleared, so send gating
-    // (shouldQueueSend) queues instead of firing into the live turn and
-    // the Working indicator comes back before the next running edge.
-    // Local `status` stays untouched — it means "this client's send is
-    // in flight", which is false for cross-client and TUI-typed turns.
-    return {
-      activeResponse: { ...s.activeResponse, state: "streaming" },
-      sessionStatus: "running",
-    };
-  });
 }
 
 /**
@@ -3832,21 +3790,10 @@ export async function pumpStreamEvents(
   // to the BlockStream reducer. The reducer is intentionally pure
   // (block factory) — session-scoped state lives on the store, not in
   // the reducer's internal state. See migration plan §5.3.
-  // Message ids whose live preview has been finalized by its
-  // authoritative `text_done`. Lives for the whole connection (a new
-  // session rebinds a fresh pump) so a message's trailing chunk that
-  // arrives after its done event can't re-create the preview.
-  const retiredLiveMessages = new Set<string>();
-  // Per-message high-water chunk index, for delta duplicate suppression.
-  const liveLastIndex = new Map<string, number>();
-  const events = tapLiveDeltas(
-    tapSessionEvents(rawEvents, id),
-    id,
-    retiredLiveMessages,
-    liveLastIndex,
-    set,
-    get,
-  );
+  // A scheduled wake can stream before its new turn id arrives. Ignore the
+  // rest of that message so it cannot attach to the completed prior turn.
+  const ignoredWakeMessages = new Set<string>();
+  const events = tapLiveDeltas(tapSessionEvents(rawEvents, id), id, ignoredWakeMessages, set, get);
 
   // Blocks awaiting their coalesced flush; `seenItemIds` dedupes against
   // both committed and still-buffered blocks. Lives for the whole stream
@@ -3916,6 +3863,33 @@ export async function pumpStreamEvents(
           status: "streaming",
         });
         continue;
+      }
+
+      // Native preview cleanup must run before the generic dedup below:
+      // when a snapshot merge (reconnect/rebind) inserted this
+      // authoritative item while its `live:*` preview was still on
+      // screen, the dedup alone would drop the event and strand the
+      // preview as a trailing duplicate of the assistant text. Remove
+      // the oldest preview, then fall through so the dedup skips the
+      // event as before.
+      if (
+        block.type === "text_done" &&
+        block.ctx.itemId &&
+        get().isNativeTerminalSession &&
+        (seenItemIds.has(block.ctx.itemId) ||
+          get().blocks.some((b) => b.ctx.itemId === block.ctx.itemId))
+      ) {
+        const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
+        if (provIdx !== -1) {
+          flush();
+          set((s) => {
+            const at = s.blocks.findIndex(isLiveProvisionalBlock);
+            if (at === -1) return {};
+            const next = s.blocks.slice();
+            next.splice(at, 1);
+            return { blocks: next };
+          });
+        }
       }
 
       // Stream → snapshot dedup: skip if this itemId is already committed
@@ -3990,28 +3964,18 @@ export async function pumpStreamEvents(
       if (block.type === "text_done" && get().isNativeTerminalSession) {
         const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
         if (provIdx !== -1) {
-          // The authoritative final text for the oldest in-flight message
-          // just arrived. Replace that provisional preview IN PLACE so the
-          // committed text keeps the position it streamed into — above any
-          // tool/elicitation card that arrived after it. FIFO: claude-
-          // native finishes one message before the next begins, and
-          // `message_id` is absent from the transcript, so the oldest open
-          // preview is the one this item finalizes. Retire its id so a
-          // trailing chunk arriving after this event can't re-create it.
-          const provItemId = get().blocks[provIdx]!.ctx.itemId!;
-          retiredLiveMessages.add(provItemId.slice(LIVE_ITEM_PREFIX.length));
-          // Commit any buffered reducer blocks first (preserve their order),
-          // then splice the authoritative text into the preview's slot.
+          // The done item has no message id. Native messages are sequential,
+          // so remove the oldest preview and let the committed item follow
+          // the normal reducer path.
           flush();
           set((s) => {
             const at = s.blocks.findIndex(isLiveProvisionalBlock);
-            if (at === -1) return { blocks: [...s.blocks, block] };
+            if (at === -1) return {};
             const next = s.blocks.slice();
-            next[at] = block;
+            next.splice(at, 1);
             return { blocks: next };
           });
-          paintedFirstContent = true;
-          continue;
+          paintedFirstContent = false;
         }
       }
 
@@ -4630,17 +4594,14 @@ export function handleSessionEvent(event: StreamEvent): void {
             }
           } else {
             // Terminal edge without a matching response id. This is the
-            // NORMAL turn-end shape for most emitters — the PTY-activity
-            // relay's bare `idle`, orchestration teardown, and mismatched
-            // Stop-hook `waiting` all carry none — so a still-streaming
-            // turn is finalized here rather than left "streaming" forever
-            // (which hid the settled turn's "Worked for" fold and Fork
-            // action until a reload re-derived lifecycle from the
-            // snapshot). The one edge this can misread — the server's
-            // policy-deny short-circuit publishing a stray running→idle
-            // pair while a real turn streams — is healed by
-            // `reviveStrayCompletedResponse`: the live turn's next delta
-            // reopens it. A `cancelled` turn is preserved as-is.
+            // NORMAL turn-end shape for most emitters — the status file's
+            // bare `idle` and orchestration teardown carry none — so a
+            // still-streaming turn is finalized here rather than left
+            // "streaming" forever (which hid the settled turn's "Worked for"
+            // fold and Fork action until a reload re-derived lifecycle from
+            // the snapshot). Every terminal edge that reaches this point is
+            // now a real turn end: control signals (policy deny, compaction)
+            // no longer publish status. A `cancelled` turn is preserved as-is.
             patch.status = "idle";
             if (s.activeResponse?.state === "streaming") {
               patch.activeResponse = {
@@ -4776,7 +4737,34 @@ export function handleSessionEvent(event: StreamEvent): void {
       //      committed bubble (TUI-typed message, marker, or another
       //      client).
       useChatStore.setState((s) => {
-        if (hasCommittedItem(s.blocks, event.itemId)) return {};
+        if (hasCommittedItem(s.blocks, event.itemId)) {
+          // The committed copy is already in `blocks` — the forwarder-
+          // mirrored item beat this event through the stream, or a
+          // snapshot merge inserted it. Still ack the optimistic
+          // bubble: returning without dropping it strands a duplicate
+          // user bubble at the transcript tail. Same precision order
+          // as below (named entry, then FIFO head), minus the append.
+          const cleared = event.clearedPendingId;
+          const at = cleared ? s.pendingUserMessages.findIndex((p) => p.tempId === cleared) : -1;
+          if (at >= 0) {
+            return {
+              pendingUserMessages: [
+                ...s.pendingUserMessages.slice(0, at),
+                ...s.pendingUserMessages.slice(at + 1),
+              ],
+            };
+          }
+          // FIFO-head fallback — same marker guard as the promote path
+          // below. A mirrored system marker (the vendor CLI's own
+          // `[Request interrupted by user]` record) is synthesized by the
+          // CLI, owns no pending entry, and arrives with clearedPendingId
+          // unset; dropping the head would steal a real queued message's
+          // bubble. Hold the head back for a marker.
+          const eventContent = userContentFromEvent(event);
+          if (eventContent !== null && isSystemUserContent(eventContent)) return {};
+          if (s.pendingUserMessages.length === 0) return {};
+          return { pendingUserMessages: s.pendingUserMessages.slice(1) };
+        }
 
         // 1. Drop by id when the server names the drained entry.
         const cleared = event.clearedPendingId;

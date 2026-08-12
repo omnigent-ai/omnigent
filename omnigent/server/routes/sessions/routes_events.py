@@ -75,6 +75,7 @@ from omnigent.server.routes._sessions.common import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
     _COMPACT_TYPE,
+    _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
     _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
@@ -114,6 +115,7 @@ from omnigent.server.routes._sessions.common import (
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import (
+    _TUI_INJECT_FORWARD_TIMEOUT_S,
     SessionLiveness,
     _apply_pending_policy_ask_writes,
     _await_settled_managed_launch,
@@ -173,6 +175,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _is_native_terminal_session,
     _maybe_relaunch_managed_sandbox,
     _maybe_wake_stale_resumable_managed_sandbox,
+    _persist_external_antigravity_subagent_start,
     _persist_external_codex_subagent_start,
     _persist_external_conversation_item,
     _persist_external_session_usage,
@@ -397,6 +400,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_TODOS_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+            _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
             _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
         ):
@@ -473,7 +477,6 @@ def register_events_routes(
                 # deny sentinel on the session stream so the
                 # client/REPL sees feedback.
                 reason = _input_verdict.get("reason", "Denied by policy")
-                _publish_status(session_id, "running")
                 _publish_policy_deny(session_id, reason)
                 await _persist_policy_deny_sentinel(
                     session_id,
@@ -482,8 +485,16 @@ def register_events_routes(
                     conversation_store,
                     agent_store,
                 )
-                # Terminal response.completed before idle so live-tail
-                # consumers (the headless ``-p`` client) unblock.
+                # Terminal ``response.completed`` renders the sentinel; the
+                # trailing ``idle`` ends the turn. A request-phase deny/refuse
+                # IS a turn boundary — the client optimistically went "working"
+                # on send — but the message never reached a harness, so nothing
+                # downstream (harness / interrupt / status file) emits the
+                # turn-end. This ``idle`` is that signal; clients that settle a
+                # turn only on a ``session.status`` edge (the REPL, the headless
+                # ``-p`` client) hang without it. No leading ``running``: the
+                # turn never dispatched, and a phantom ``running`` would fold a
+                # concurrent live bubble mid-stream.
                 _publish_input_deny_terminal(session_id, conv, reason)
                 _publish_status(session_id, "idle")
                 # Return the same shape the client expects from POST
@@ -505,7 +516,6 @@ def register_events_routes(
             )
             if _input_verdict is not None:
                 reason = _input_verdict.get("reason", "Denied by policy")
-                _publish_status(session_id, "running")
                 _publish_policy_deny(session_id, reason)
                 await _persist_policy_deny_sentinel(
                     session_id,
@@ -514,7 +524,9 @@ def register_events_routes(
                     conversation_store,
                     agent_store,
                 )
-                # Terminal response.completed before idle (see message branch).
+                # Terminal response.completed + trailing ``idle`` turn-end (see
+                # the message branch above for why the idle is required and the
+                # leading running is not).
                 _publish_input_deny_terminal(session_id, conv, reason)
                 _publish_status(session_id, "idle")
                 return {"queued": False, "denied": True, "reason": reason}
@@ -740,10 +752,15 @@ def register_events_routes(
             # attached) is surfaced as an error rather than silently
             # falling through to AP-side compaction, which would be
             # wrong for a terminal-owned session.
+            # TUI budget, not the 5s default: the claude-native handler
+            # drives a delivery-verified slash-command inject, and a timeout
+            # here falls through to AP-side compaction on top of the
+            # terminal's own still-running /compact.
             runner_result = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
                 {"type": _COMPACT_TYPE},
+                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
             if runner_result is not None and runner_result.status_code == 200:
                 return {"queued": False}
@@ -883,7 +900,9 @@ def register_events_routes(
             # A background-task ``waiting`` marks an ended turn, so deliver it
             # as ``idle``: the session takes a new message now, and for a
             # sub-agent the terminal-delivery branch below must fire (otherwise
-            # the orchestrator hangs). The tally still drives the spinner.
+            # the orchestrator hangs). The tally still drives the indicator.
+            # The claude-native forwarder no longer sends ``waiting`` at all —
+            # this normalizes it for runners that predate that change.
             effective_status = _background_task_delivery_status(status, bg_count, conv)
             if effective_status != status:
                 status = effective_status
@@ -1057,6 +1076,16 @@ def register_events_routes(
             # Returned to the claude-native forwarder so it can address
             # subsequent ``external_conversation_item`` /
             # ``external_session_status`` events to the child id.
+            return {"queued": False, "child_session_id": child_id}
+        if body.type == _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE:
+            child_id = await _persist_external_antigravity_subagent_start(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+            )
+            # Returned to the agy reader so it can mirror the child cascade's
+            # steps into this id.
             return {"queued": False, "child_session_id": child_id}
         if body.type == _EXTERNAL_CODEX_SUBAGENT_START_TYPE:
             child_id = await _persist_external_codex_subagent_start(

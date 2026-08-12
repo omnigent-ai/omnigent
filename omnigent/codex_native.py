@@ -43,6 +43,7 @@ from omnigent.codex_native_app_server import (
     client_for_transport,
     codex_session_meta_model_provider,
     codex_terminal_env,
+    native_codex_launch_base_url,
     normalize_codex_permission_launch_args,
     preload_codex_thread_for_resume,
     resolve_native_codex_launch,
@@ -252,7 +253,9 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     try:
         launch = resolve_native_codex_launch(model=None)
         routes_through_provider = (
-            launch.profile is not None or codex_session_meta_model_provider(launch) != "openai"
+            launch.profile is not None
+            or codex_session_meta_model_provider(launch) != "openai"
+            or native_codex_launch_base_url(launch) is not None
         )
     except Exception:  # noqa: BLE001 - readiness must never raise; fail onto auth.json.
         _logger.debug("codex readiness: launch resolve failed; using auth.json", exc_info=True)

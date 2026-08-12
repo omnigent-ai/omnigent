@@ -1,6 +1,11 @@
 import { renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { type LivenessRow, livenessRowFromSession, useSessionLiveness } from "./useSessionLiveness";
+import {
+  STARTING_GRACE_S,
+  type LivenessRow,
+  livenessRowFromSession,
+  useSessionLiveness,
+} from "./useSessionLiveness";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import type { Session } from "@/lib/types";
 
@@ -42,7 +47,7 @@ function derive(
   runner: boolean | undefined,
   host: boolean | null | undefined,
   c: LivenessRow | null,
-  opts?: { turnActive?: boolean },
+  opts?: { turnActive?: boolean; launchedAt?: number | null },
 ) {
   runnerMock.mockReturnValue(runner);
   hostMock.mockReturnValue(host);
@@ -172,6 +177,49 @@ describe("useSessionLiveness — derivation truth table", () => {
     });
     expect(derive(false, false, conv({ host_id: null, kind: "sub_agent" }))).toEqual({
       kind: "runner_asleep",
+    });
+  });
+
+  describe("host-switch launch grace", () => {
+    it("starting while a just-launched runner has not registered yet", () => {
+      // A switch binds a runner on the new host, but nothing on the wire
+      // says so: the session is old (no created_at grace) and no turn is in
+      // flight. Steady-state with these inputs is runner_asleep, which
+      // renders NO indicator — the move would land on a silent empty chat.
+      expect(derive(false, true, conv({ host_id: "h2" }), { launchedAt: Date.now() })).toEqual({
+        kind: "starting",
+      });
+    });
+
+    it("applies even though a runner was previously online", () => {
+      // Deliberately not gated on "ever online": the whole point of a switch
+      // is that the old runner WAS up and is now gone, so the session
+      // genuinely re-enters cold boot. Same-mount rerender so the hook's
+      // ever-online ref carries the earlier `true`.
+      const c = conv({ host_id: "h2" });
+      hostMock.mockReturnValue(true);
+      runnerMock.mockReturnValue(true);
+      const launchedAt = Date.now();
+      const { result, rerender } = renderHook(
+        (props: { launchedAt: number | null }) =>
+          useSessionLiveness(SID, c, { launchedAt: props.launchedAt }),
+        { initialProps: { launchedAt: null as number | null } },
+      );
+      expect(result.current).toEqual({ kind: "online" });
+
+      runnerMock.mockReturnValue(false);
+      rerender({ launchedAt });
+      expect(result.current).toEqual({ kind: "starting" });
+    });
+
+    it("expires so a launch that never lands still reaches its real state", () => {
+      // The marker is a grace, not a latch — a runner that never registers
+      // must fall through to the actionable state instead of spinning
+      // forever.
+      const stale = Date.now() - (STARTING_GRACE_S + 1) * 1000;
+      expect(derive(false, true, conv({ host_id: "h2" }), { launchedAt: stale })).toEqual({
+        kind: "runner_asleep",
+      });
     });
   });
 
