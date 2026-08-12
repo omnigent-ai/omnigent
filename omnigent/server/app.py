@@ -32,6 +32,7 @@ from omnigent.harness_plugins import (
     native_provider_for_key,
 )
 from omnigent.resources import examples as _examples_resources
+from omnigent.runner.transports.ws_tunnel.registry import TunnelRecyclingError
 from omnigent.runtime import (
     get_terminal_registry,
     pending_elicitations,
@@ -98,6 +99,37 @@ from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
+
+
+def build_tunnel_recycling_response(retry_after_s: float) -> JSONResponse:
+    """Build the retryable 503 for a request aborted by a planned recycle.
+
+    A :class:`~omnigent.runner.transports.ws_tunnel.registry.TunnelRecyclingError`
+    means an in-flight request relayed to a runner was aborted because the
+    runner tunnel was closed for a *planned* recycle (server-issued
+    ``host.stop_runner`` / managed runner-token TTL expiry / graceful
+    shutdown). The request never completed, but a retry succeeds against the
+    replacement runner generation — so return a retryable ``503`` with the
+    machine-readable ``runner_recycling`` code and a ``Retry-After`` header,
+    not an opaque ``500``.
+
+    :param retry_after_s: Suggested client backoff, in seconds.
+    :returns: A 503 JSON response carrying a ``Retry-After`` header.
+    """
+    retry_after = max(1, round(retry_after_s))
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "code": ErrorCode.RUNNER_RECYCLING,
+                "message": (
+                    "The runner is recycling (planned restart); the request "
+                    "was not completed. Retry after a short delay."
+                ),
+            },
+        },
+        headers={"Retry-After": str(retry_after)},
+    )
 
 
 def _server_version() -> str:
@@ -1392,6 +1424,35 @@ def create_app(
                 },
             },
         )
+
+    @app.exception_handler(TunnelRecyclingError)
+    async def _handle_tunnel_recycling(
+        request: Request,  # noqa: ARG001 — FastAPI signature; we only use exc
+        exc: TunnelRecyclingError,
+    ) -> JSONResponse:
+        """Surface a *planned* runner recycle as a retryable 503.
+
+        A runner recycle (server-issued ``host.stop_runner`` / managed
+        runner-token TTL expiry / graceful shutdown) closes the tunnel and
+        aborts any in-flight relayed request. Without this handler the bare
+        ``ConnectionError`` fell through to the catch-all below as an opaque
+        ``500 internal_error`` — indistinguishable from a real fault, so
+        callers could not know to retry. Because a recycle fires on a
+        schedule (a new runner generation roughly every 15 min), that 500
+        was systematic, not a rare race. Return ``503 runner_recycling``
+        with a ``Retry-After`` header so callers retry against the
+        replacement generation. Scoped to the planned-recycle path only:
+        abnormal tunnel drops keep the plain ``ConnectionError`` / 500.
+
+        :param request: The incoming request (unused — FastAPI signature).
+        :param exc: The recycling error carrying the retry hint.
+        :returns: A retryable 503 JSON response with ``Retry-After``.
+        """
+        _logger.info(
+            "Runner recycling aborted an in-flight relayed request; "
+            "returning retryable 503 (runner_recycling)"
+        )
+        return build_tunnel_recycling_response(exc.retry_after_s)
 
     @app.exception_handler(Exception)
     async def _handle_unhandled_exception(

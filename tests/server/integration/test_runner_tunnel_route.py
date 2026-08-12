@@ -29,13 +29,38 @@ from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.serve import dispatch_via_asgi
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
-from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
+from omnigent.server.routes.runner_tunnel import (
+    _is_planned_recycle_close,
+    create_runner_tunnel_router,
+)
 from tests.runner.helpers import NullServerClient
 
 pytestmark = pytest.mark.asyncio
 
 _RUNNER_ID = "runner-route-test-1"
 _TUNNEL_PATH = f"/v1/runners/{_RUNNER_ID}/tunnel"
+
+
+@pytest.mark.parametrize(
+    "code,planned",
+    [
+        (1000, True),  # normal closure
+        (1001, True),  # "going away" — the code an orderly runner shutdown sends
+        (1012, True),  # "service restart"
+        (1006, False),  # abnormal closure — a genuine drop
+        (1011, False),  # internal error
+        (4004, False),  # a server-issued fatal app code
+        (None, False),  # helper task ended without a close code
+    ],
+)
+async def test_is_planned_recycle_close_covers_recycle_taxonomy(
+    code: object, planned: bool
+) -> None:
+    """A planned recycle closes with 1000/1001/1012; anything else is an
+    abnormal drop. Gating on 1000 alone would miss 1001, the common
+    orderly-shutdown code, so its in-flight requests must abort retryably
+    (503) rather than as an opaque 500 (Polly review, PR #2281)."""
+    assert _is_planned_recycle_close(code) is planned
 
 
 @dataclass(frozen=True)

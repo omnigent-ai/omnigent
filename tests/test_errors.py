@@ -53,6 +53,8 @@ def test_omnigent_error_with_harness_violation_code_returns_500() -> None:
         (ErrorCode.CONFLICT, 409),
         (ErrorCode.INTERNAL_ERROR, 500),
         (ErrorCode.HARNESS_PROTOCOL_VIOLATION, 500),
+        (ErrorCode.RUNNER_UNAVAILABLE, 503),
+        (ErrorCode.RUNNER_RECYCLING, 503),
     ],
 )
 def test_all_error_codes_have_http_status_mapping(code: str, expected_status: int) -> None:
@@ -65,3 +67,22 @@ def test_all_error_codes_have_http_status_mapping(code: str, expected_status: in
     default.
     """
     assert _CODE_TO_HTTP_STATUS[code] == expected_status
+
+
+def test_runner_recycling_string_value() -> None:
+    """The wire string is a contract clients dispatch on to decide to retry."""
+    assert ErrorCode.RUNNER_RECYCLING == "runner_recycling"
+
+
+def test_runner_recycling_maps_to_503() -> None:
+    """A planned recycle aborted an in-flight relayed request — retryable 503,
+    not an opaque 500. If this drifts, clients stop retrying a recoverable
+    condition (or retry an unrecoverable one)."""
+    assert _CODE_TO_HTTP_STATUS[ErrorCode.RUNNER_RECYCLING] == 503
+
+
+def test_omnigent_error_with_runner_recycling_code_returns_503() -> None:
+    """End-to-end status resolution for the recycling code."""
+    err = OmnigentError("runner recycling", code=ErrorCode.RUNNER_RECYCLING)
+    assert err.http_status == 503
+    assert err.code == ErrorCode.RUNNER_RECYCLING

@@ -34,6 +34,14 @@ class ErrorCode:
         §Elicitation completion invariant.
     :cvar RUNNER_UNAVAILABLE: No online runner can serve the
         requested dispatch (HTTP 503).
+    :cvar RUNNER_RECYCLING: An in-flight request relayed to a runner
+        over its tunnel was aborted because the tunnel was closed for a
+        *planned* recycle (a server-issued ``host.stop_runner``, a
+        managed runner-token TTL expiry, or a graceful shutdown). The
+        request never completed, but a retry succeeds against the
+        replacement runner generation — so this is a retryable HTTP 503
+        (paired with a ``Retry-After`` header) rather than an opaque
+        500. Distinct from RUNNER_UNAVAILABLE (no runner online at all).
     :cvar UNAUTHORIZED: No valid authentication credentials (HTTP 401).
     :cvar FORBIDDEN: Authenticated but insufficient permissions (HTTP 403).
     :cvar RUNNER_CAPABILITY_MISMATCH: The selected runner cannot
@@ -56,6 +64,7 @@ class ErrorCode:
     INTERNAL_ERROR = "internal_error"
     HARNESS_PROTOCOL_VIOLATION = "harness_protocol_violation"
     RUNNER_UNAVAILABLE = "runner_unavailable"
+    RUNNER_RECYCLING = "runner_recycling"
     RUNNER_CAPABILITY_MISMATCH = "runner_capability_mismatch"
     # Keep the string equal to frames.HARNESS_NOT_CONFIGURED_ERROR_CODE —
     # the host's wire error code passes through as the API error code.
@@ -76,6 +85,10 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # can fix them; investigation needed in the harness wrap).
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: 500,
     ErrorCode.RUNNER_UNAVAILABLE: 503,
+    # A planned runner recycle aborted an in-flight relayed request:
+    # retryable against the replacement generation (the HTTP boundary
+    # pairs this with a Retry-After header).
+    ErrorCode.RUNNER_RECYCLING: 503,
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: 503,
     # 412 Precondition Failed: the request is well-formed but the host
     # can't satisfy it until the user runs `omnigent setup` there —
