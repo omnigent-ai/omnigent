@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
 
-from omnigent.codex_native_app_server import client_for_transport
+from omnigent.codex_native_app_server import CodexAppServerClient, client_for_transport
 from omnigent.codex_native_bridge import (
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
@@ -105,6 +105,7 @@ class CodexNativeExecutor(Executor):
             )
             await client.connect()
             try:
+                input_items = await _expand_explicit_skill_command(client, input_items)
                 response = await client.request(
                     "turn/steer",
                     {
@@ -264,6 +265,7 @@ class CodexNativeExecutor(Executor):
                 )
                 await client.connect()
                 try:
+                    input_items = await _expand_explicit_skill_command(client, input_items)
                     if goal_objective is not None:
                         await client.request(
                             "thread/goal/set",
@@ -482,6 +484,54 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
     if content is None:
         return []
     return [{"type": "text", "text": json.dumps(content, ensure_ascii=True)}]
+
+
+async def _expand_explicit_skill_command(
+    client: CodexAppServerClient,
+    items: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Resolve a leading ``/skill`` through Codex's skill registry."""
+    if not items:
+        return items
+    first = items[0]
+    text = first.get("text") if first.get("type") == "text" else None
+    if not isinstance(text, str):
+        return items
+    parts = text.split(maxsplit=1)
+    command = parts[0]
+    if not command.startswith("/") or len(command) == 1:
+        return items
+    name = command[1:]
+    try:
+        response = await client.request("skills/list", {"cwds": []})
+    except Exception:  # noqa: BLE001 - unsupported lookup leaves input literal.
+        _logger.warning("Codex native skills/list failed", exc_info=True)
+        return items
+    result = _json_object(response.get("result"))
+    data = result.get("data") if result is not None else None
+    if not isinstance(data, list):
+        return items
+    for entry in data:
+        entry_obj = _json_object(entry)
+        skills = entry_obj.get("skills") if entry_obj is not None else None
+        if not isinstance(skills, list):
+            continue
+        for skill in skills:
+            skill_obj = _json_object(skill)
+            if (
+                skill_obj is None
+                or skill_obj.get("name") != name
+                or skill_obj.get("enabled") is not True
+            ):
+                continue
+            path = skill_obj.get("path")
+            if not isinstance(path, str) or not path:
+                return items
+            expanded: list[dict[str, object]] = [{"type": "skill", "name": name, "path": path}]
+            if len(parts) == 2:
+                expanded.append({"type": "text", "text": parts[1]})
+            return [*expanded, *items[1:]]
+    return items
 
 
 def _file_block_to_input_item(

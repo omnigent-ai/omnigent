@@ -48,6 +48,7 @@ class _FakeCodexNativeClient:
 
     requests: list[tuple[str, dict[str, Any]]] = []
     created: list[tuple[Path | None, str | None, str]] = []
+    skill_entries: list[dict[str, Any]] = []
     next_turn = 1
 
     def __init__(
@@ -102,6 +103,18 @@ class _FakeCodexNativeClient:
             return {"result": {"turn": {"id": turn_id}}}
         if method == "turn/steer":
             return {"result": {"turnId": "turn_steered"}}
+        if method == "skills/list":
+            return {
+                "result": {
+                    "data": [
+                        {
+                            "cwd": "/workspace",
+                            "skills": type(self).skill_entries,
+                            "errors": [],
+                        }
+                    ]
+                }
+            }
         return {"result": {}}
 
     async def iter_events(self) -> Any:
@@ -191,6 +204,62 @@ def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(
                 "input": [{"type": "text", "text": "first"}],
             },
         )
+    ]
+
+
+def test_explicit_slash_skill_uses_structured_codex_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A slash-invoked skill stays outside ambient context but reaches Codex."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    skill_path = tmp_path / "skills" / "ask-matt" / "SKILL.md"
+    monkeypatch.setattr(
+        _FakeCodexNativeClient,
+        "skill_entries",
+        [
+            {
+                "name": "ask-matt",
+                "path": str(skill_path),
+                "enabled": True,
+                "description": "Find the right skill or workflow",
+                "scope": "user",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "/ask-matt verify this service")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    assert _FakeCodexNativeClient.requests == [
+        ("skills/list", {"cwds": []}),
+        (
+            "turn/start",
+            {
+                "threadId": "thread_123",
+                "input": [
+                    {"type": "skill", "name": "ask-matt", "path": str(skill_path)},
+                    {"type": "text", "text": "verify this service"},
+                ],
+            },
+        ),
     ]
 
 
