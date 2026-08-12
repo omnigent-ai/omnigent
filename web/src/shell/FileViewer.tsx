@@ -279,6 +279,8 @@ interface FileViewerProps {
   open: boolean;
   conversationId: string;
   path: string;
+  /** Stable attached-directory/environment identity. */
+  environmentId?: string;
   onClose: () => void;
 
   /** Called when the user navigates to a different file via the prev/next buttons. */
@@ -330,6 +332,7 @@ function FileViewerBody({
   open,
   conversationId,
   path,
+  environmentId = "default",
   onClose,
   onCloseTab,
   onNavigateTo,
@@ -370,9 +373,9 @@ function FileViewerBody({
   // visible. No-op off iOS / with the keyboard closed. Not needed frameless
   // (embedded in the desktop aside, never a fixed overlay).
   const keyboardInset = useIOSNativeKeyboardInset(!frameless && open);
-  const fileQuery = useFileContent(conversationId, path);
-  const diffQuery = useFileDiff(conversationId, path);
-  const changedFiles = useWorkspaceChangedFiles(conversationId);
+  const fileQuery = useFileContent(conversationId, path, environmentId);
+  const diffQuery = useFileDiff(conversationId, path, environmentId);
+  const changedFiles = useWorkspaceChangedFiles(conversationId, { environmentId });
 
   // Build the navigable file list from all changed files (including deleted),
   // sorted the same way FilesPanel sorts its flat view so the "X/N" index
@@ -1389,7 +1392,7 @@ function FileViewerBody({
                 {/* key={path} remounts per file so onMount re-runs (EOL + comment
                   wiring re-applied) and `ready` resets while the new grammar loads. */}
                 <MonacoDiffViewer
-                  key={path}
+                  key={`${environmentId}:${path}`}
                   before={diffQuery.data.before}
                   after={diffQuery.data.after}
                   path={path}
@@ -1408,6 +1411,7 @@ function FileViewerBody({
             <CodeViewer
               conversationId={conversationId}
               path={path}
+              environmentId={environmentId}
               fileQuery={fileQuery}
               onDirtyChange={setIsEditorDirty}
               onSaveStatusChange={setSaveStatus}

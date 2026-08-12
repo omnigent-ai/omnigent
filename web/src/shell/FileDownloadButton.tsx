@@ -17,6 +17,8 @@ interface FileDownloadButtonProps {
   conversationId: string;
   /** Workspace-relative file path, e.g. ``"src/main.py"``. */
   path: string;
+  /** Stable attached-directory id. */
+  environmentId?: string;
 }
 
 /**
@@ -32,7 +34,11 @@ interface FileDownloadButtonProps {
  * :param conversationId: Session ID used to fetch file content from the API.
  * :param path: Workspace-relative path of the file to download.
  */
-export function FileDownloadButton({ conversationId, path }: FileDownloadButtonProps) {
+export function FileDownloadButton({
+  conversationId,
+  path,
+  environmentId,
+}: FileDownloadButtonProps) {
   const [downloading, setDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState(false);
   const errorTimerRef = useRef<number>(0);
@@ -50,7 +56,7 @@ export function FileDownloadButton({ conversationId, path }: FileDownloadButtonP
     setDownloading(true);
     setDownloadError(false);
     try {
-      await downloadWorkspaceFile(conversationId, path);
+      await downloadWorkspaceFile(conversationId, path, environmentId);
     } catch {
       setDownloadError(true);
       window.clearTimeout(errorTimerRef.current);

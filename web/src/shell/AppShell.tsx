@@ -54,9 +54,14 @@ import {
   useTerminals,
 } from "@/hooks/useTerminals";
 import {
-  useWorkspaceChangedFiles,
+  useAllWorkspaceChangedFiles,
   useWorkspaceEnvironment,
 } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  DEFAULT_WORKSPACE_ENVIRONMENT_ID,
+  parseWorkspaceFileKey,
+  workspaceFileKey,
+} from "@/lib/workspaceFiles";
 import { cn } from "@/lib/utils";
 import {
   isNativeWrapper as isNativeWrapperLabel,
@@ -334,6 +339,7 @@ export function AppShell() {
   const panelOpen = panelInitialKey !== null;
   const executionLogsOpen = executionLogsKey !== null;
   const fileViewerOpen = selectedFilePath !== null;
+  const selectedFileIdentity = selectedFilePath ? parseWorkspaceFileKey(selectedFilePath) : null;
   // Drives the Terminal-pill spinner for terminal-first sessions while
   // the runner is auto-creating the terminal. Surfaced via
   // TerminalFirstContext below.
@@ -733,14 +739,20 @@ export function AppShell() {
   // can tell BlockRenderer which inline code spans are real workspace files.
   // We use the changed-files list (not the flat top-level directory listing)
   // because it contains full relative paths like `web/src/shell/Foo.tsx`.
-  const changedFilesQuery = useWorkspaceChangedFiles(conversationId);
+  const changedFilesQuery = useAllWorkspaceChangedFiles(conversationId);
   const changedFilePaths = useMemo(
-    () => new Set(changedFilesQuery.data?.data.map((f) => f.path) ?? []),
+    () =>
+      new Set(
+        changedFilesQuery.data?.data.map((file) =>
+          workspaceFileKey(file.environment_id ?? DEFAULT_WORKSPACE_ENVIRONMENT_ID, file.path),
+        ) ?? [],
+      ),
     [changedFilesQuery.data],
   );
   const changedCount = changedFilesQuery.data?.data.length ?? 0;
   const isChangedPath = useCallback(
-    (path: string) => changedFilePaths.has(path),
+    (path: string, environmentId = DEFAULT_WORKSPACE_ENVIRONMENT_ID) =>
+      changedFilePaths.has(workspaceFileKey(environmentId, path)),
     [changedFilePaths],
   );
 
@@ -803,7 +815,9 @@ export function AppShell() {
     // URL ?file= param: a deep-link selects (and, if absent, opens) that file
     // without discarding the other remembered tabs.
     const fileParam = searchParams.get("file");
-    const urlFile = fileParam === null || fileParam === "" ? null : fileParam;
+    const directoryParam = searchParams.get("directory") || DEFAULT_WORKSPACE_ENVIRONMENT_ID;
+    const urlFile =
+      fileParam === null || fileParam === "" ? null : workspaceFileKey(directoryParam, fileParam);
     const persistedFiles = persisted.openFiles ?? [];
     const nextOpenFiles =
       urlFile && !persistedFiles.includes(urlFile) ? [...persistedFiles, urlFile] : persistedFiles;
@@ -873,15 +887,20 @@ export function AppShell() {
   }, []);
 
   const openFileViewer = useCallback(
-    (path: string) => {
-      setSelectedFilePath(path);
+    (pathOrKey: string, environmentId = DEFAULT_WORKSPACE_ENVIRONMENT_ID) => {
+      const identity =
+        environmentId === DEFAULT_WORKSPACE_ENVIRONMENT_ID
+          ? parseWorkspaceFileKey(pathOrKey)
+          : { environmentId, path: pathOrKey };
+      const key = workspaceFileKey(identity.environmentId, identity.path);
+      setSelectedFilePath(key);
       // A file and a shell tab can't both own the rail's content slot —
       // opening a file deselects any active shell tab (its tab stays in the
       // strip).
       setSelectedTerminalKey(null);
       // Add the path to the open tabs if it isn't already open; activating an
       // already-open tab just re-selects it (no duplicate).
-      setOpenFiles((prev) => (prev.includes(path) ? prev : [...prev, path]));
+      setOpenFiles((prev) => (prev.includes(key) ? prev : [...prev, key]));
       // Close the terminal drawer so the file viewer is unobscured —
       // but only in non-terminal-first sessions, where opening a file
       // and viewing the terminal compete for the same rail slot. In
@@ -915,7 +934,12 @@ export function AppShell() {
       setSearchParams(
         (prev) => {
           const next = new URLSearchParams(prev);
-          next.set("file", path);
+          next.set("file", identity.path);
+          if (identity.environmentId === DEFAULT_WORKSPACE_ENVIRONMENT_ID) {
+            next.delete("directory");
+          } else {
+            next.set("directory", identity.environmentId);
+          }
           next.delete("comment"); // stale comment belongs to the previous file
           return next;
         },
@@ -929,18 +953,23 @@ export function AppShell() {
   // ``setSearchParams`` so it always closes over react-router's *current*
   // ``navigate`` — which is bound to the live ``locationPathname`` — rather
   // than a stale one captured at first mount (see ``showScopeView`` below).
-  const clearFileViewerUrl = useCallback(() => {
-    setSearchParams(
-      (prev) => {
-        const next = new URLSearchParams(prev);
-        next.delete("file");
-        next.delete("diff");
-        next.delete("comment");
-        return next;
-      },
-      { replace: true },
-    );
-  }, [setSearchParams]);
+  const clearFileViewerUrl = useCallback(
+    (includeView = false) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.delete("file");
+          next.delete("directory");
+          next.delete("diff");
+          next.delete("comment");
+          if (includeView) next.delete("view");
+          return next;
+        },
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
 
   // Toggle the right (Workspace) sidebar — shared by the header's collapse
   // button and the ⌘⌥]/Ctrl+Alt+] hotkey so they can't drift. Beyond flipping the
@@ -962,7 +991,13 @@ export function AppShell() {
         setSearchParams(
           (prev) => {
             const params = new URLSearchParams(prev);
-            params.set("file", selectedFilePath);
+            const identity = parseWorkspaceFileKey(selectedFilePath);
+            params.set("file", identity.path);
+            if (identity.environmentId === DEFAULT_WORKSPACE_ENVIRONMENT_ID) {
+              params.delete("directory");
+            } else {
+              params.set("directory", identity.environmentId);
+            }
             return params;
           },
           { replace: true },
@@ -1165,10 +1200,16 @@ export function AppShell() {
             return null;
           }
           const neighbor = next[idx - 1] ?? next[idx] ?? next[0];
+          const identity = parseWorkspaceFileKey(neighbor);
           setSearchParams(
             (sp) => {
               const params = new URLSearchParams(sp);
-              params.set("file", neighbor);
+              params.set("file", identity.path);
+              if (identity.environmentId === DEFAULT_WORKSPACE_ENVIRONMENT_ID) {
+                params.delete("directory");
+              } else {
+                params.set("directory", identity.environmentId);
+              }
               params.delete("comment");
               return params;
             },
@@ -1348,6 +1389,7 @@ export function AppShell() {
   // Sourced from the same environment query that gates the files panel.
   const workspaceRoot = environmentQuery.data?.root ?? null;
   const workspaceHome = environmentQuery.data?.home ?? null;
+  const workspaceRoots = changedFilesQuery.environments;
   const fileViewerContextValue = useMemo(
     () => ({
       openFile: openFileViewer,
@@ -1355,8 +1397,9 @@ export function AppShell() {
       conversationId,
       workspaceRoot,
       workspaceHome,
+      workspaceRoots,
     }),
-    [openFileViewer, isChangedPath, conversationId, workspaceRoot, workspaceHome],
+    [openFileViewer, isChangedPath, conversationId, workspaceRoot, workspaceHome, workspaceRoots],
   );
 
   // Context for descendants — ChatPage's ConnectionIndicator reads
@@ -1798,14 +1841,17 @@ export function AppShell() {
                 </MobilePanelDrawer>
               )}
               {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}
-              {conversationId && selectedFilePath !== null && (
+              {conversationId && selectedFileIdentity !== null && (
                 <div className="md:hidden">
                   <FileViewer
                     open
                     conversationId={conversationId}
-                    path={selectedFilePath}
+                    path={selectedFileIdentity.path}
+                    environmentId={selectedFileIdentity.environmentId}
                     onClose={closeFileViewer}
-                    onNavigateTo={openFileViewer}
+                    onNavigateTo={(path) =>
+                      openFileViewer(path, selectedFileIdentity.environmentId)
+                    }
                     permissionLevel={permissionLevel}
                     sort={filesPanelSort}
                   />

@@ -23,6 +23,8 @@ export interface ProjectConfig {
   host_id?: string;
   /** Default working directory / repo path on that host. */
   workspace?: string;
+  /** Additional directory roots attached to each new session. */
+  directories?: ProjectDirectoryDefault[];
   /** Default agent id for new sessions. */
   agent_id?: string;
   /**
@@ -39,6 +41,51 @@ export interface ProjectConfig {
    * is never stored (treated the same as unset).
    */
   base_branch?: string;
+}
+
+/** One additional directory stored as a project default. */
+export interface ProjectDirectoryDefault {
+  path: string;
+}
+
+/** Session creation accepts at most fifteen roots in addition to the workspace. */
+export const MAX_PROJECT_ADDITIONAL_DIRECTORIES = 15;
+
+/**
+ * Normalize project directory defaults before storing or applying them.
+ *
+ * Project config is intentionally an opaque server-side JSON object, so data
+ * read from it still needs a defensive client boundary. Invalid and duplicate
+ * paths are dropped, the primary workspace is excluded, and the result is
+ * capped to the session-create limit.
+ */
+export function normalizeProjectDirectories(
+  directories: unknown,
+  workspace?: string,
+): ProjectDirectoryDefault[] {
+  if (!Array.isArray(directories)) return [];
+
+  const normalizePath = (value: unknown): string | null => {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    if (!trimmed.startsWith("/")) return null;
+    const stripped = trimmed.replace(/\/+$/, "");
+    return stripped === "" ? "/" : stripped;
+  };
+
+  const primary = normalizePath(workspace);
+  const seen = new Set<string>();
+  const normalized: ProjectDirectoryDefault[] = [];
+  for (const value of directories) {
+    const path = normalizePath(
+      value && typeof value === "object" ? (value as { path?: unknown }).path : undefined,
+    );
+    if (path === null || path === primary || seen.has(path)) continue;
+    seen.add(path);
+    normalized.push({ path });
+    if (normalized.length === MAX_PROJECT_ADDITIONAL_DIRECTORIES) break;
+  }
+  return normalized;
 }
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */

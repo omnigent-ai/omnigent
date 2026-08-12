@@ -5077,31 +5077,35 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       await vi.advanceTimersByTimeAsync(750);
 
       expect(spy).toHaveBeenCalledWith({
-        queryKey: ["workspace-changed-files", "conv_abc"],
+        queryKey: ["workspace-changed-files", "conv_abc", "default"],
       });
       expect(spy).toHaveBeenCalledWith({
-        queryKey: ["workspace-all-files", "conv_abc"],
+        queryKey: ["workspace-all-files", "conv_abc", "default"],
       });
       expect(spy).toHaveBeenCalledWith({
-        queryKey: ["workspace-dir", "conv_abc"],
+        queryKey: ["workspace-dir", "conv_abc", "default"],
         refetchType: "none",
       });
       expect(spy).toHaveBeenCalledWith({
-        queryKey: ["workspace-dir-listing", "conv_abc"],
+        queryKey: ["workspace-dir-listing", "conv_abc", "default"],
         refetchType: "none",
+      });
+      expect(spy).toHaveBeenCalledWith({
+        queryKey: ["workspace-environment", "conv_abc", "default"],
+      });
+      expect(spy).toHaveBeenCalledWith({
+        queryKey: ["workspace-environments", "conv_abc"],
       });
       // Environment availability refetches too (default refetchType, so the
       // active AppShell query re-runs): the post-switch runner reset
       // publishes this event after closing the old agent's env, and this
       // invalidation is what flips the Files tab across an os_env-boundary
       // agent switch. Missing → the tab stays stale for the 60 s staleTime.
-      expect(spy).toHaveBeenCalledWith({
-        queryKey: ["workspace-environment", "conv_abc"],
-      });
-      // 5 = the four filesystem-view keys + workspace-environment, all from
+      // 6 = the four filesystem-view keys + the root-specific environment
+      // and aggregate environment list, all from
       // ONE debounced flush (the two events above coalesced). 10 would mean
       // the debounce broke and each event flushed separately.
-      expect(spy).toHaveBeenCalledTimes(5);
+      expect(spy).toHaveBeenCalledTimes(6);
       spy.mockRestore();
     });
   });

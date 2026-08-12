@@ -8,6 +8,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AddAgentDialog } from "./AddAgentDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { createSession } from "@/lib/sessionsApi";
+import { useSession } from "@/hooks/useSession";
 
 const navigateMock = vi.fn();
 vi.mock("react-router-dom", async (importOriginal) => {
@@ -19,9 +20,16 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
   prefetchAvailableAgentDetails: vi.fn(),
 }));
 vi.mock("@/lib/sessionsApi", () => ({ createSession: vi.fn() }));
+vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
 
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
 const createSessionMock = vi.mocked(createSession);
+const useSessionMock = vi.mocked(useSession);
+
+const PARENT_DIRECTORIES = [
+  { id: "default", path: "/repo/main", name: "main" },
+  { id: "dir_00000000000000000000000000000001", path: "/repo/shared", name: "shared" },
+];
 
 const AGENTS: AvailableAgent[] = [
   {
@@ -65,6 +73,11 @@ beforeEach(() => {
   useAvailableAgentsMock.mockReset();
   createSessionMock.mockReset();
   navigateMock.mockReset();
+  useSessionMock.mockReturnValue({
+    session: { directories: PARENT_DIRECTORIES },
+    isLoading: false,
+    error: null,
+  } as unknown as ReturnType<typeof useSession>);
   mockAgents(AGENTS);
 });
 
@@ -130,6 +143,46 @@ describe("AddAgentDialog", () => {
       subAgentName: null,
       title: "ui:codex:reviewer",
     });
+  });
+
+  it("sends a narrowed directory scope for the child", async () => {
+    createSessionMock.mockResolvedValue({
+      id: "conv_child",
+    } as unknown as Awaited<ReturnType<typeof createSession>>);
+    renderDialog("conv_parent");
+
+    fireEvent.click(screen.getByTestId("agent-card-ag_codex"));
+    fireEvent.change(screen.getByTestId("add-agent-name-input"), {
+      target: { value: "reviewer" },
+    });
+    fireEvent.click(screen.getByTestId("add-agent-directory-dir_00000000000000000000000000000001"));
+    fireEvent.click(screen.getByTestId("add-agent-submit"));
+
+    await waitFor(() => expect(createSessionMock).toHaveBeenCalledTimes(1));
+    expect(createSessionMock).toHaveBeenCalledWith("ag_codex", [], {
+      parentSessionId: "conv_parent",
+      subAgentName: null,
+      title: "ui:codex:reviewer",
+      directoryIds: ["default"],
+    });
+  });
+
+  it("sends an empty directory scope for a scratch-only child", async () => {
+    createSessionMock.mockResolvedValue({
+      id: "conv_child",
+    } as unknown as Awaited<ReturnType<typeof createSession>>);
+    renderDialog("conv_parent");
+
+    fireEvent.click(screen.getByTestId("agent-card-ag_codex"));
+    fireEvent.change(screen.getByTestId("add-agent-name-input"), {
+      target: { value: "scratch" },
+    });
+    fireEvent.click(screen.getByTestId("add-agent-directory-default"));
+    fireEvent.click(screen.getByTestId("add-agent-directory-dir_00000000000000000000000000000001"));
+    fireEvent.click(screen.getByTestId("add-agent-submit"));
+
+    await waitFor(() => expect(createSessionMock).toHaveBeenCalledTimes(1));
+    expect(createSessionMock.mock.calls[0][2]).toMatchObject({ directoryIds: [] });
   });
 
   // A planned feature wants the user to task the newly-added Codex reviewer at

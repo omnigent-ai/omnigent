@@ -58,12 +58,19 @@ describe("projectPrefill config seeding", () => {
     expect(step!.writes.hostId).toBeUndefined();
   });
 
-  it("seeds host + workspace from config", () => {
+  it("seeds host, workspace, and additional directories from config", () => {
     const { state, writes } = runToDone(
-      inputs({ config: { hostId: "host_2", workspace: "/repo/beta" } }),
+      inputs({
+        config: {
+          hostId: "host_2",
+          workspace: "/repo/beta",
+          directories: ["/repo/shared", "/repo/docs"],
+        },
+      }),
     );
     expect(writes.hostId).toBe("host_2");
     expect(writes.workspace).toBe("/repo/beta");
+    expect(writes.directories).toEqual(["/repo/shared", "/repo/docs"]);
     expect(state.phase).toBe("settled");
     expect(state.agentSeeded).toBe(true);
   });
@@ -82,10 +89,15 @@ describe("projectPrefill config seeding", () => {
   });
 
   it("silently drops a config host that is offline / missing", () => {
-    const { writes } = runToDone(inputs({ config: { hostId: "host_off", workspace: "/x" } }));
+    const { writes } = runToDone(
+      inputs({
+        config: { hostId: "host_off", workspace: "/x", directories: ["/repo/shared"] },
+      }),
+    );
     // The offline config host is ignored; the generic host default takes over.
     expect(writes.hostId).toBeUndefined();
     expect(writes.workspace).toBeUndefined();
+    expect(writes.directories).toBeUndefined();
   });
 
   it("does not seed a config host the user has already switched away from", () => {

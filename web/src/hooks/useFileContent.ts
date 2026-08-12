@@ -10,10 +10,11 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import { useWorkspaceServeable } from "@/hooks/useWorkspaceChangedFiles";
 import { useChatStore } from "@/store/chatStore";
+import { DEFAULT_WORKSPACE_ENVIRONMENT_ID } from "@/lib/workspaceFiles";
 
 // The primary workspace environment is always "default".  This hook targets
 // the primary workspace; pass a different id if terminal environments are needed.
-const DEFAULT_ENVIRONMENT_ID = "default";
+const DEFAULT_ENVIRONMENT_ID = DEFAULT_WORKSPACE_ENVIRONMENT_ID;
 
 export interface FileContentResponse {
   object: "session.environment.filesystem.file_content";
@@ -28,12 +29,13 @@ export interface FileContentResponse {
 export async function fetchFileContent(
   conversationId: string,
   path: string,
+  environmentId = DEFAULT_ENVIRONMENT_ID,
 ): Promise<FileContentResponse> {
   // Encode each path segment individually so slashes remain structural.
   const encodedPath = path.split("/").map(encodeURIComponent).join("/");
   const url =
     `/v1/sessions/${encodeURIComponent(conversationId)}` +
-    `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}`;
+    `/resources/environments/${encodeURIComponent(environmentId)}/filesystem/${encodedPath}`;
   const res = await authenticatedFetch(url);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as FileContentResponse;
@@ -91,8 +93,12 @@ export function triggerBrowserDownload(blob: Blob, filename: string): void {
  * :param conversationId: The session/conversation ID, e.g. ``"sess_abc123"``.
  * :param path: Workspace-relative file path, e.g. ``"src/main.py"``.
  */
-export async function downloadWorkspaceFile(conversationId: string, path: string): Promise<void> {
-  const data = await fetchFileContent(conversationId, path);
+export async function downloadWorkspaceFile(
+  conversationId: string,
+  path: string,
+  environmentId = DEFAULT_ENVIRONMENT_ID,
+): Promise<void> {
+  const data = await fetchFileContent(conversationId, path, environmentId);
   if (data.truncated) {
     console.warn(
       `[web] File "${path}" was truncated by the server — downloaded content may be incomplete.`,
@@ -113,7 +119,11 @@ export async function downloadWorkspaceFile(conversationId: string, path: string
  * once at end-of-turn, avoiding continuous refetches that would reset the
  * editor's scroll and cursor position.
  */
-export function useFileContent(conversationId: string | undefined, path: string | null) {
+export function useFileContent(
+  conversationId: string | undefined,
+  path: string | null,
+  environmentId = DEFAULT_ENVIRONMENT_ID,
+) {
   const focusedId = useChatStore((s) => s.conversationId);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const sessionActive =
@@ -136,14 +146,14 @@ export function useFileContent(conversationId: string | undefined, path: string 
     prevRef.current = { id: conversationId, active: sessionActive };
     if (justWentIdle && conversationId && path) {
       void queryClient.invalidateQueries({
-        queryKey: ["file-content", conversationId, path],
+        queryKey: ["file-content", conversationId, environmentId, path],
       });
     }
-  }, [conversationId, path, sessionActive, queryClient]);
+  }, [conversationId, environmentId, path, sessionActive, queryClient]);
 
   return useQuery({
-    queryKey: ["file-content", conversationId, path],
-    queryFn: () => fetchFileContent(conversationId!, path!),
+    queryKey: ["file-content", conversationId, environmentId, path],
+    queryFn: () => fetchFileContent(conversationId!, path!, environmentId),
     enabled: !!conversationId && !!path && serveable !== false,
     staleTime: 5_000,
   });

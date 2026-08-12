@@ -164,17 +164,18 @@ function buildTree(files: WorkspaceFile[], sort: ChangedSort = "alpha"): TreeNod
  * Module-level cache that survives component unmount/remount within a JS
  * session (e.g. when the user opens the FileViewer and navigates back).
  *
- * Keyed by conversation AND browse location: node paths are relative to the
- * browsed root, so a set captured at one root describes different directories
- * at another. Carrying it across a re-root would collapse the new tree (its
- * paths match nothing) and could expand an unrelated same-named folder.
- * Keying by both also means navigating back restores what was open there.
+ * Keyed by conversation, attached environment, and browse location: node paths
+ * are relative to the browsed root, so state cannot be shared across roots.
  */
 const expandedPathsCache = new Map<string, Set<string>>();
 
-/** Cache key for one conversation's tree at one browsed root. */
-function expandedCacheKey(conversationId: string, browseLocation: string): string {
-  return `${conversationId}\u0000${browseLocation}`;
+/** Cache key for one conversation's attached directory at one browsed root. */
+function expandedCacheKey(
+  conversationId: string,
+  environmentId: string,
+  browseLocation: string,
+): string {
+  return `${conversationId}\u0000${environmentId}\u0000${browseLocation}`;
 }
 
 /** Compute the default open set: all non-lazy dirs start expanded. */
@@ -216,6 +217,7 @@ export function FolderTree({
   searchError = null,
   browseLocation = "",
   onNavigateDir,
+  environmentId = "default",
 }: {
   files: WorkspaceFile[] | undefined;
   isLoading: boolean;
@@ -256,10 +258,14 @@ export function FolderTree({
    * matching Finder; a single click still just expands in place.
    */
   onNavigateDir?: (relativePath: string) => void;
+  /** Stable attached-directory id used for lazy reads and downloads. */
+  environmentId?: string;
 }) {
   // Initialise from the module-level cache so expanded state survives
   // unmount/remount (e.g. opening the FileViewer and navigating back).
-  const cacheKey = conversationId ? expandedCacheKey(conversationId, browseLocation) : null;
+  const cacheKey = conversationId
+    ? expandedCacheKey(conversationId, environmentId, browseLocation)
+    : null;
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => {
     if (!cacheKey) return new Set();
     const cached = expandedPathsCache.get(cacheKey);
@@ -383,6 +389,7 @@ export function FolderTree({
               onFileSelect={onFileSelect}
               conversationId={conversationId}
               changedFileMap={changedFileMap}
+              environmentId={environmentId}
             />
           ))}
         </ul>
@@ -438,6 +445,7 @@ export function FolderTree({
             sort={sort}
             browseLocation={browseLocation}
             onNavigateDir={onNavigateDir}
+            environmentId={environmentId}
           />
         ))}
       </ul>
@@ -467,6 +475,7 @@ function FileRowItem({
   bytes,
   onFileSelect,
   conversationId,
+  environmentId,
 }: {
   /** Canonical workspace-relative path, used for the download button and title. */
   path: string;
@@ -482,6 +491,7 @@ function FileRowItem({
   bytes: number | null;
   onFileSelect: (path: string) => void;
   conversationId: string | undefined;
+  environmentId: string;
 }) {
   const isDeleted = fileStatus === "deleted";
   const fileColorClass =
@@ -556,7 +566,11 @@ function FileRowItem({
           )}
           <span className="absolute inset-0 flex items-center justify-end gap-0.5">
             {!isDeleted && conversationId ? (
-              <FileDownloadButton conversationId={conversationId} path={path} />
+              <FileDownloadButton
+                conversationId={conversationId}
+                path={path}
+                environmentId={environmentId}
+              />
             ) : (
               <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
             )}
@@ -578,11 +592,13 @@ function SearchResultRow({
   onFileSelect,
   conversationId,
   changedFileMap,
+  environmentId,
 }: {
   file: WorkspaceFile;
   onFileSelect: (path: string) => void;
   conversationId: string | undefined;
   changedFileMap: Map<string, WorkspaceChangedFile["status"]>;
+  environmentId: string;
 }) {
   return (
     <FileRowItem
@@ -593,6 +609,7 @@ function SearchResultRow({
       bytes={file.bytes}
       onFileSelect={onFileSelect}
       conversationId={conversationId}
+      environmentId={environmentId}
     />
   );
 }
@@ -607,12 +624,14 @@ function TreeFileRow({
   onFileSelect,
   conversationId,
   fileStatus,
+  environmentId,
 }: {
   node: FileNode;
   depth: number;
   onFileSelect: (path: string) => void;
   conversationId: string | undefined;
   fileStatus: WorkspaceChangedFile["status"] | undefined;
+  environmentId: string;
 }) {
   return (
     <FileRowItem
@@ -623,6 +642,7 @@ function TreeFileRow({
       bytes={node.file.bytes}
       onFileSelect={onFileSelect}
       conversationId={conversationId}
+      environmentId={environmentId}
     />
   );
 }
@@ -644,6 +664,7 @@ function TreeNodeRow({
   sort,
   browseLocation,
   onNavigateDir,
+  environmentId,
 }: {
   node: TreeNode;
   depth: number;
@@ -659,6 +680,7 @@ function TreeNodeRow({
   browseLocation: string;
   /** Re-root onto a directory (double-click), path relative to the root. */
   onNavigateDir?: (relativePath: string) => void;
+  environmentId: string;
 }) {
   const open = node.type === "dir" && expandedPaths.has(node.path);
   const isLazyDir = node.type === "dir" && node.lazy === true;
@@ -668,6 +690,7 @@ function TreeNodeRow({
     conversationId,
     isLazyDir && open ? node.path : null,
     browseLocation,
+    environmentId,
   );
 
   if (node.type === "file") {
@@ -678,6 +701,7 @@ function TreeNodeRow({
         onFileSelect={onFileSelect}
         conversationId={conversationId}
         fileStatus={changedFileMap.get(node.file.path)}
+        environmentId={environmentId}
       />
     );
   }
@@ -811,6 +835,7 @@ function TreeNodeRow({
               sort={sort}
               browseLocation={browseLocation}
               onNavigateDir={onNavigateDir}
+              environmentId={environmentId}
             />
           ))}
         </ul>

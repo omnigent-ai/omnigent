@@ -63,6 +63,23 @@ describe("useWriteFileContent", () => {
     );
   });
 
+  it("writes through the selected attached-directory environment", async () => {
+    fetchMock.mockResolvedValue(okResponse());
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const { result } = renderHook(
+      () => useWriteFileContent("sess_1", "dir_00000000000000000000000000000001"),
+      { wrapper: wrapper(qc) },
+    );
+
+    await act(async () => {
+      await result.current.mutateAsync({ path: "README.md", content: "shared" });
+    });
+
+    expect(fetchMock.mock.calls[0][0]).toContain(
+      "/environments/dir_00000000000000000000000000000001/filesystem/README.md",
+    );
+  });
+
   it("invalidates file-content and workspace-changed-files on success", async () => {
     fetchMock.mockResolvedValue(okResponse());
     const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
@@ -74,10 +91,10 @@ describe("useWriteFileContent", () => {
     });
 
     expect(invalidateSpy).toHaveBeenCalledWith({
-      queryKey: ["file-content", "sess_2", "README.md"],
+      queryKey: ["file-content", "sess_2", "default", "README.md"],
     });
     expect(invalidateSpy).toHaveBeenCalledWith({
-      queryKey: ["workspace-changed-files", "sess_2"],
+      queryKey: ["workspace-changed-files", "sess_2", "default"],
     });
   });
 
@@ -85,7 +102,7 @@ describe("useWriteFileContent", () => {
     fetchMock.mockResolvedValue(okResponse());
     const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     // Seed the cache with the pre-save content.
-    qc.setQueryData(["file-content", "sess_2", "README.md"], {
+    qc.setQueryData(["file-content", "sess_2", "default", "README.md"], {
       object: "session.environment.filesystem.file_content",
       path: "README.md",
       content_type: "text/markdown",
@@ -99,7 +116,9 @@ describe("useWriteFileContent", () => {
       await result.current.mutateAsync({ path: "README.md", content: "new content" });
     });
 
-    const cached = qc.getQueryData(["file-content", "sess_2", "README.md"]) as { content: string };
+    const cached = qc.getQueryData(["file-content", "sess_2", "default", "README.md"]) as {
+      content: string;
+    };
     expect(cached.content).toBe("new content");
   });
 

@@ -46,8 +46,9 @@ import {
   useFileViewerConversationId,
   useIsChangedPath,
   useWorkspacePaths,
+  useWorkspaceRoots,
 } from "@/shell/FileViewerContext";
-import { toWorkspaceRelativePath, useWorkspaceFileExists } from "@/hooks/useWorkspaceChangedFiles";
+import { resolveWorkspaceFilePath, useWorkspaceFileExists } from "@/hooks/useWorkspaceChangedFiles";
 import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
@@ -88,27 +89,37 @@ function WorkspacePathInlineCode({
   const isChangedPath = useIsChangedPath();
   const conversationId = useFileViewerConversationId();
   const { root, home } = useWorkspacePaths();
+  const workspaceRoots = useWorkspaceRoots();
   const text = typeof codeChildren === "string" ? codeChildren : "";
 
   // Collapse absolute / "~"-relative forms onto a workspace-relative path so
   // they match the changed-files list and the filesystem API. null = absolute
   // or "~" path outside the workspace (or the root itself) → never a link.
-  const linkPath = text ? toWorkspaceRelativePath(text, root, home) : null;
+  const roots =
+    workspaceRoots.length > 0
+      ? workspaceRoots
+      : [{ id: "default", name: "default", available: root !== null, root, home }];
+  const link = text ? resolveWorkspaceFilePath(text, roots) : null;
   // "Trusted" means we resolved an absolute/"~" form against the root, so the
   // result is known workspace-relative even if it's a bare basename (no
   // interior slash) that the existence check's path-shape heuristic rejects.
-  const trusted = linkPath !== null && linkPath !== text;
+  const trusted = link !== null && link.path !== text;
 
-  const isChanged = !!linkPath && isChangedPath(linkPath);
+  const isChanged = !!link && isChangedPath(link.path, link.environmentId);
   // Only hit the filesystem for path-shaped spans that aren't already known
   // changes; passing null disables the query (keeps hook order stable).
   const existsOnDisk = useWorkspaceFileExists(
     conversationId,
-    openFile && linkPath && !isChanged ? linkPath : null,
+    openFile && link && !isChanged ? link.path : null,
     trusted,
+    link?.environmentId,
   );
 
-  if (openFile && linkPath && (isChanged || existsOnDisk)) {
+  if (openFile && link && (isChanged || existsOnDisk)) {
+    const openResolvedFile = () => {
+      if (link.environmentId === "default") openFile(link.path);
+      else openFile(link.path, link.environmentId);
+    };
     // Rendered as an inline <code> (not a <button>): a button is laid out as
     // an atomic inline-block, so a long path can't break across lines and
     // drops below the list marker as a whole unit. An inline <code> flows and
@@ -126,11 +137,11 @@ function WorkspacePathInlineCode({
           "font-mono text-ui underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer",
           className,
         )}
-        onClick={() => openFile(linkPath)}
+        onClick={openResolvedFile}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
-            openFile(linkPath);
+            openResolvedFile();
           }
         }}
         {...codeProps}

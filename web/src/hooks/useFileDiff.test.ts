@@ -57,11 +57,15 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function renderDiff(conversationId: string | undefined, path: string | null) {
+function renderDiff(
+  conversationId: string | undefined,
+  path: string | null,
+  environmentId?: string,
+) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client: queryClient }, children);
-  return renderHook(() => useFileDiff(conversationId, path), { wrapper });
+  return renderHook(() => useFileDiff(conversationId, path, environmentId), { wrapper });
 }
 
 describe("useFileDiff — enable gate", () => {
@@ -172,6 +176,23 @@ describe("useFileDiff — request URL", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(fetchMock.mock.calls[0][0]).toBe(
       "/v1/sessions/conv%20with%20space/resources/environments/default/diff/src/a%20b.ts",
+    );
+  });
+
+  it("uses the selected attached-directory environment", async () => {
+    setHooks({ serveable: true, changedPaths: ["README.md"] });
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        object: "session.environment.filesystem.file_diff",
+        path: "README.md",
+        before: "old",
+        after: "new",
+      }),
+    );
+    const { result } = renderDiff("conv_1", "README.md", "dir_00000000000000000000000000000001");
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchMock.mock.calls[0][0]).toContain(
+      "/environments/dir_00000000000000000000000000000001/diff/README.md",
     );
   });
 });

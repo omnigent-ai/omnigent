@@ -430,3 +430,31 @@ async def test_create_failure_rolls_back_omnigent_created_worktree(
     assert len(cap.remove) == 1, f"expected a create-rollback remove frame, got {cap.remove}"
     assert cap.remove[0].branch == "feature/orphan"
     assert cap.remove[0].delete_branch is True
+
+
+async def test_directory_set_failure_rolls_back_omnigent_created_worktree(
+    register_worktree_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """A post-worktree directory collision cannot leave an orphan worktree."""
+    cap = register_worktree_host()
+    agent = await create_test_agent(client, name="wt-directory-rollback-agent")
+    worktree_path = f"{_SOURCE_REPO}-worktrees/feature-collision"
+
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "directories": [{"path": worktree_path}],
+            "git": {"branch_name": "feature/collision"},
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert "paths must be unique" in response.text
+    assert len(cap.create) == 1, cap.create
+    assert len(cap.remove) == 1, cap.remove
+    assert cap.remove[0].worktree_path == worktree_path
+    assert cap.remove[0].branch == "feature/collision"

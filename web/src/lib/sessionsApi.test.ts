@@ -161,6 +161,33 @@ describe("createSession", () => {
     });
   });
 
+  it("forwards an explicit child directory scope, including scratch-only", async () => {
+    fetchMock.mockResolvedValue(
+      mockJsonResponse({
+        id: "conv_child",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        parent_session_id: "conv_parent",
+      }),
+    );
+
+    await createSession("agent_xyz", [], {
+      parentSessionId: "conv_parent",
+      directoryIds: [],
+    });
+    let body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(body.directory_ids).toEqual([]);
+
+    fetchMock.mockClear();
+    await createSession("agent_xyz", [], {
+      parentSessionId: "conv_parent",
+      directoryIds: ["default", "dir_00000000000000000000000000000001"],
+    });
+    body = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(body.directory_ids).toEqual(["default", "dir_00000000000000000000000000000001"]);
+  });
+
   it("omits the optional fields entirely when no options are passed", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
@@ -709,6 +736,35 @@ describe("getSession", () => {
     );
     const session = await getSession("conv_child");
     expect(session.parentSessionId).toBe("conv_parent");
+  });
+
+  it("maps stable attached directories from the wire", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_multi",
+        agent_id: "ag",
+        status: "idle",
+        created_at: 0,
+        workspace: "/repo/main",
+        directories: [
+          { id: "default", path: "/repo/main", name: "main" },
+          {
+            id: "dir_00000000000000000000000000000001",
+            path: "/repo/shared",
+            name: "shared",
+          },
+        ],
+      }),
+    );
+    const session = await getSession("conv_multi");
+    expect(session.directories).toEqual([
+      { id: "default", path: "/repo/main", name: "main" },
+      {
+        id: "dir_00000000000000000000000000000001",
+        path: "/repo/shared",
+        name: "shared",
+      },
+    ]);
   });
 
   it("maps title from the wire to the camelCase Session", async () => {

@@ -75,7 +75,7 @@ function FileListItem({
 }: {
   file: WorkspaceChangedFile;
   isDeleted: boolean;
-  onFileSelect: (path: string) => void;
+  onFileSelect: (path: string, environmentId?: string) => void;
   conversationId: string | undefined;
 }) {
   const { handlers, tooltip } = useCursorTooltip(file.path);
@@ -97,7 +97,7 @@ function FileListItem({
             "flex min-w-0 flex-1 items-baseline gap-1.5 text-left",
             isDeleted ? "cursor-default" : "cursor-pointer",
           )}
-          onClick={() => !isDeleted && onFileSelect(file.path)}
+          onClick={() => !isDeleted && onFileSelect(file.path, file.environment_id)}
           disabled={isDeleted}
         >
           <FileIcon className="size-3.5 shrink-0 self-center text-muted-foreground" />
@@ -153,7 +153,11 @@ function FileListItem({
           </span>
           <span className="absolute inset-0 flex items-center justify-end gap-0.5">
             {hasDownload && conversationId ? (
-              <FileDownloadButton conversationId={conversationId} path={file.path} />
+              <FileDownloadButton
+                conversationId={conversationId}
+                path={file.path}
+                environmentId={file.environment_id}
+              />
             ) : (
               <span className={cn("shrink-0", ROW_ACTION_SIZE_CLASS)} aria-hidden />
             )}
@@ -183,7 +187,7 @@ export function FlatFileList({
   isLoading: boolean;
   isError: boolean;
   error: Error | null;
-  onFileSelect: (path: string) => void;
+  onFileSelect: (path: string, environmentId?: string) => void;
   showHidden: boolean;
   onShowHidden: () => void;
   searchQuery: string;
@@ -273,7 +277,7 @@ export function FlatFileList({
             const isDeleted = file.status === "deleted";
             return (
               <FileListItem
-                key={file.path}
+                key={`${file.environment_id}:${file.path}`}
                 file={file}
                 isDeleted={isDeleted}
                 onFileSelect={onFileSelect}

@@ -21,10 +21,12 @@ a real parent→child link, not just a client-side navigation.
 
 from __future__ import annotations
 
+import json
 import re
+from urllib.parse import urlparse
 
 import httpx
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.conftest import open_right_rail
 
@@ -70,9 +72,53 @@ def test_add_subagent_from_dialog(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Add-agent dialog → pick agent → name → submit → child session is created."""
+    """Pick an agent and a directory subset, then create the child session."""
     base_url, session_id = seeded_session
     agent_id = _picker_hello_world_id(base_url, session_id)
+    attached_directory_id = "dir_00000000000000000000000000004620"
+    create_bodies: list[dict] = []
+
+    def patch_parent_snapshot(route: Route) -> None:
+        request = route.request
+        if request.method != "GET" or urlparse(request.url).path != f"/v1/sessions/{session_id}":
+            route.continue_()
+            return
+        response = route.fetch()
+        payload = response.json()
+        payload["directories"] = [
+            {"id": "default", "path": "/home/e2e/repo", "name": "repo"},
+            {
+                "id": attached_directory_id,
+                "path": "/home/e2e/shared",
+                "name": "shared",
+            },
+        ]
+        route.fulfill(
+            status=200,
+            headers={**response.headers, "content-type": "application/json"},
+            body=json.dumps(payload),
+        )
+
+    def capture_create(route: Route) -> None:
+        request = route.request
+        if request.method == "POST" and urlparse(request.url).path == "/v1/sessions":
+            body = request.post_data_json
+            create_bodies.append(body)
+            # The shared seeded_session fixture has no persisted directories;
+            # the browser snapshot above adds them to exercise the dialog.
+            # Strip that synthetic selection before forwarding so the real
+            # server can still create and link the child used below.
+            forwarded_body = dict(body)
+            forwarded_body.pop("directory_ids", None)
+            route.continue_(post_data=json.dumps(forwarded_body))
+            return
+        route.continue_()
+
+    page.route(re.compile(r"/v1/sessions(?:\?|$)"), capture_create)
+    page.route(
+        re.compile(rf"/v1/sessions/{re.escape(session_id)}(?:\?|$)"),
+        patch_parent_snapshot,
+    )
     page.goto(f"{base_url}/c/{session_id}")
 
     # The Add-agent button lives in the Agents rail panel, so open the rail and
@@ -98,6 +144,14 @@ def test_add_subagent_from_dialog(
     expect(name_input).to_be_visible()
     name_input.fill(child_name)
 
+    # Parent folders start selected. Remove the attached root so this child is
+    # intentionally restricted to the primary repository.
+    primary_directory = dialog.get_by_test_id("add-agent-directory-default")
+    attached_directory = dialog.get_by_test_id(f"add-agent-directory-{attached_directory_id}")
+    expect(primary_directory).to_be_checked()
+    expect(attached_directory).to_be_checked()
+    attached_directory.uncheck()
+
     dialog.locator(_ADD_AGENT_SUBMIT).click()
 
     # The SPA navigates into the freshly-created child session — a different
@@ -106,6 +160,8 @@ def test_add_subagent_from_dialog(
     child_url = page.url
     child_id = child_url.rsplit("/c/", 1)[1]
     assert child_id != session_id, f"expected to land on a child, still on parent {session_id}"
+    assert len(create_bodies) == 1, create_bodies
+    assert create_bodies[0]["directory_ids"] == ["default"], create_bodies[0]
 
     # The server recorded a real parent→child link under the dialog's
     # ``ui:<agent>:<name>`` title sentinel.

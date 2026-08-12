@@ -44,6 +44,7 @@ import type { monaco } from "./monacoSetup";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
 import { attachEditorScrollRestore } from "./useScrollRestore";
 import "./monacoCodeEditor.css";
+import { DEFAULT_WORKSPACE_ENVIRONMENT_ID, workspaceFileKey } from "@/lib/workspaceFiles";
 
 type EditorOptions = EditorProps["options"];
 
@@ -77,6 +78,7 @@ interface MonacoCodeEditorProps extends CommentProps {
   content: string;
   conversationId: string;
   path: string;
+  environmentId?: string;
   /** True once the file query has settled (fileQuery.isSuccess). */
   isSettled: boolean;
   /**
@@ -115,6 +117,7 @@ export function MonacoCodeEditor({
   content,
   conversationId,
   path,
+  environmentId = DEFAULT_WORKSPACE_ENVIRONMENT_ID,
   isSettled,
   truncated = false,
   onDirtyChange,
@@ -142,7 +145,13 @@ export function MonacoCodeEditor({
     dismissExternalUpdate,
     markSaved,
     reconcileServerContent,
-  } = useMarkdownEditorSync({ content, path, isSettled, onDirtyChange, setContentRef });
+  } = useMarkdownEditorSync({
+    content,
+    path: workspaceFileKey(environmentId, path),
+    isSettled,
+    onDirtyChange,
+    setContentRef,
+  });
 
   return (
     <MonacoCodeEditorInner
@@ -150,6 +159,7 @@ export function MonacoCodeEditor({
       content={content}
       conversationId={conversationId}
       path={path}
+      environmentId={environmentId}
       canEdit={canEdit}
       truncated={truncated}
       isDirty={isDirty}
@@ -175,6 +185,7 @@ interface InnerProps extends CommentProps {
   content: string;
   conversationId: string;
   path: string;
+  environmentId: string;
   canEdit: boolean;
   truncated: boolean;
   isDirty: boolean;
@@ -202,6 +213,7 @@ function MonacoCodeEditorInner({
   content,
   conversationId,
   path,
+  environmentId,
   canEdit,
   truncated,
   isDirty,
@@ -272,6 +284,7 @@ function MonacoCodeEditorInner({
   const { autoSave, saveDisabled, writeFile } = useEditorAutoSave({
     conversationId,
     path,
+    environmentId,
     canEdit,
     isDirty,
     setDirty,

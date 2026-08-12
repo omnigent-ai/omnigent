@@ -42,8 +42,16 @@ function Wrap({ children }: { children: ReactNode }) {
   return <QueryClientProvider client={qc}>{children}</QueryClientProvider>;
 }
 
-function Probe({ id, path }: { id: string | undefined; path: string | null }) {
-  useFileContent(id, path);
+function Probe({
+  id,
+  path,
+  environmentId,
+}: {
+  id: string | undefined;
+  path: string | null;
+  environmentId?: string;
+}) {
+  useFileContent(id, path, environmentId);
   return null;
 }
 
@@ -348,6 +356,26 @@ describe("useFileContent gating", () => {
 
     expect(fetchMock.mock.calls[0][0]).toBe(
       "/v1/sessions/conv_live/resources/environments/default/filesystem/src/a.txt",
+    );
+  });
+
+  it("uses the selected attached-directory environment", async () => {
+    onlineMock.mockReturnValue(true);
+    stubChatStore();
+
+    render(
+      <Wrap>
+        <Probe
+          id="conv_live"
+          path="README.md"
+          environmentId="dir_00000000000000000000000000000001"
+        />
+      </Wrap>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    expect(fetchMock.mock.calls[0][0]).toContain(
+      "/environments/dir_00000000000000000000000000000001/filesystem/README.md",
     );
   });
 

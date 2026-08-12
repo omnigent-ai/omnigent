@@ -3,16 +3,17 @@
 // → BlockRenderer → ToolCard.
 
 import { createContext, useContext } from "react";
+import type { WorkspaceEnvironment } from "@/hooks/useWorkspaceChangedFiles";
 
 interface FileViewerContextType {
-  openFile: (path: string) => void;
+  openFile: (path: string, environmentId?: string) => void;
   /**
    * Returns true when `path` is a known workspace file (present in the
    * session's changed-files list). Used as the synchronous fast path for
    * clickable file-path links in the chat; paths not in this list are
    * verified against the filesystem API via the session id below.
    */
-  isChangedPath: (path: string) => boolean;
+  isChangedPath: (path: string, environmentId?: string) => boolean;
   /**
    * The focused session id, so chat consumers can verify whether an
    * arbitrary referenced path exists in the workspace (not just the
@@ -30,6 +31,8 @@ interface FileViewerContextType {
    * against {@link workspaceRoot}. Null when unknown.
    */
   workspaceHome: string | null;
+  /** Every filesystem root attached to the focused session. */
+  workspaceRoots?: WorkspaceEnvironment[];
 }
 
 export const FileViewerContext = createContext<FileViewerContextType | null>(null);
@@ -38,7 +41,7 @@ export const FileViewerContext = createContext<FileViewerContextType | null>(nul
  * Returns the `openFile` callback when rendered inside AppShell, or
  * `null` when used outside of it (tests, Storybook, etc.).
  */
-export function useFileViewer(): ((path: string) => void) | null {
+export function useFileViewer(): ((path: string, environmentId?: string) => void) | null {
   return useContext(FileViewerContext)?.openFile ?? null;
 }
 
@@ -51,7 +54,7 @@ const ALWAYS_FALSE = () => false;
  * a function that always returns `false` when used outside of it
  * (tests, Storybook, etc.).
  */
-export function useIsChangedPath(): (path: string) => boolean {
+export function useIsChangedPath(): (path: string, environmentId?: string) => boolean {
   return useContext(FileViewerContext)?.isChangedPath ?? ALWAYS_FALSE;
 }
 
@@ -73,4 +76,9 @@ export function useFileViewerConversationId(): string | undefined {
 export function useWorkspacePaths(): { root: string | null; home: string | null } {
   const ctx = useContext(FileViewerContext);
   return { root: ctx?.workspaceRoot ?? null, home: ctx?.workspaceHome ?? null };
+}
+
+/** Return all attached filesystem roots for resolving agent-mentioned paths. */
+export function useWorkspaceRoots(): WorkspaceEnvironment[] {
+  return useContext(FileViewerContext)?.workspaceRoots ?? [];
 }

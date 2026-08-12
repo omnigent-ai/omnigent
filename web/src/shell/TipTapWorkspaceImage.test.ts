@@ -181,7 +181,7 @@ describe("markdown round-trip", () => {
     // without <> would truncate the path at the space on re-parse.
     expect(editor.getMarkdown().trim()).toBe(md);
     // The node view still resolves/fetches the decoded path.
-    expect(fetchFileContent).toHaveBeenCalledWith("conv_test1", "docs/my file.png");
+    expect(fetchFileContent).toHaveBeenCalledWith("conv_test1", "docs/my file.png", "default");
   });
 
   it("keeps balanced-paren destinations bare (byte-faithful)", () => {
@@ -225,7 +225,7 @@ describe("node view", () => {
     vi.mocked(fetchFileContent).mockResolvedValue(PNG_RESPONSE);
     editor = makeEditor("![logo](images/logo.png)", "docs/guide.md");
     // Resolution happened relative to the open file's directory.
-    expect(fetchFileContent).toHaveBeenCalledWith("conv_test1", "docs/images/logo.png");
+    expect(fetchFileContent).toHaveBeenCalledWith("conv_test1", "docs/images/logo.png", "default");
     const img = editor.view.dom.querySelector("img");
     expect(img).not.toBeNull();
     // The src must be the exact URL createObjectURL handed back for the blob.
@@ -331,7 +331,7 @@ describe("node view", () => {
     // src change must decline update(): the view is recreated and the new
     // path fetched. One call total would mean the stale image kept showing.
     await vi.waitFor(() => expect(fetchFileContent).toHaveBeenCalledTimes(2));
-    expect(fetchFileContent).toHaveBeenLastCalledWith("conv_test1", "other.png");
+    expect(fetchFileContent).toHaveBeenLastCalledWith("conv_test1", "other.png", "default");
     await vi.waitFor(() => expect(newImg!.getAttribute("src")).not.toBe(firstUrl));
     // The replaced view's blob URL was revoked — otherwise each src change
     // leaks one object URL for the session's lifetime.

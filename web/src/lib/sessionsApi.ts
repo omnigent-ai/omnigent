@@ -133,6 +133,7 @@ interface SessionResponseWire {
   labels?: Record<string, string>;
   /** Canonical working directory; ``null`` when unbound. */
   workspace?: string | null;
+  directories?: { id: string; path: string; name: string }[];
   /** Worktree branch; ``null`` when the session uses no worktree. */
   git_branch?: string | null;
   items?: SessionItem[];
@@ -297,6 +298,17 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     title: wire.title ?? null,
     labels: wire.labels,
     workspace: wire.workspace ?? null,
+    ...(wire.directories !== undefined || wire.workspace
+      ? {
+          directories: wire.directories ?? [
+            {
+              id: "default",
+              path: wire.workspace!,
+              name: wire.workspace!.split(/[/\\]/).pop() ?? wire.workspace!,
+            },
+          ],
+        }
+      : {}),
     gitBranch: wire.git_branch ?? null,
     items: wire.items ?? [],
     queuedItems: wire.queued_items,
@@ -440,6 +452,7 @@ export async function createSession(
     parentSessionId?: string;
     subAgentName?: string | null;
     title?: string;
+    directoryIds?: string[];
   } = {},
 ): Promise<Session> {
   const body: {
@@ -448,6 +461,7 @@ export async function createSession(
     parent_session_id?: string;
     sub_agent_name?: string | null;
     title?: string;
+    directory_ids?: string[];
   } = { agent_id: agentId, initial_items: initialItems };
   if (options.parentSessionId !== undefined) {
     body.parent_session_id = options.parentSessionId;
@@ -457,6 +471,9 @@ export async function createSession(
   }
   if (options.title !== undefined) {
     body.title = options.title;
+  }
+  if (options.directoryIds !== undefined) {
+    body.directory_ids = options.directoryIds;
   }
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
@@ -486,6 +503,7 @@ export async function createBundledSession(
     host_id?: string;
     host_type?: string;
     workspace?: string;
+    directories?: { path: string }[];
     labels?: Record<string, string>;
     terminal_launch_args?: string[];
     git?: { branch_name: string; base_branch?: string };

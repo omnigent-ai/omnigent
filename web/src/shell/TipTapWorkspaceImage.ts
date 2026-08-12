@@ -18,6 +18,7 @@ import { Image } from "@tiptap/extension-image";
 import { Link } from "@tiptap/extension-link";
 import type { AnyExtension } from "@tiptap/core";
 import { fetchFileContent, fileContentToBlob } from "@/hooks/useFileContent";
+import { DEFAULT_WORKSPACE_ENVIRONMENT_ID } from "@/lib/workspaceFiles";
 
 /**
  * Link extension that survives image-only links (GitHub badge pattern).
@@ -173,6 +174,7 @@ function formatMarkdownTitleSuffix(title: string | null | undefined): string {
 export function createWorkspaceImageExtension(
   conversationId: string,
   filePath: string,
+  environmentId = DEFAULT_WORKSPACE_ENVIRONMENT_ID,
 ): AnyExtension {
   return Image.extend({
     // ProseMirror disallows all marks on inline atoms by default, which
@@ -274,7 +276,7 @@ export function createWorkspaceImageExtension(
           const pathPart = src.split(/[?#]/)[0];
           const resolved = pathPart === "" ? "" : resolveWorkspacePath(filePath, src);
           if (resolved !== "") {
-            fetchFileContent(conversationId, resolved)
+            fetchFileContent(conversationId, resolved, environmentId)
               .then((data) => {
                 if (cancelled) return;
                 objectUrl = URL.createObjectURL(fileContentToBlob(data));

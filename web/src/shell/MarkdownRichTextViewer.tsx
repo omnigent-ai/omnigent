@@ -49,6 +49,7 @@ import {
   installMarkdownParserPatch,
   installMarkdownSerializerPatch,
 } from "./tiptapMarkdownPatches";
+import { DEFAULT_WORKSPACE_ENVIRONMENT_ID, workspaceFileKey } from "@/lib/workspaceFiles";
 
 // Minimal-escaping serialiser override (see tiptapMarkdownPatches.ts) —
 // installed once at module load, before any editor instance is created.
@@ -82,6 +83,7 @@ interface MarkdownRichTextViewerProps {
   content: string;
   conversationId: string;
   path: string;
+  environmentId?: string;
   isSettled: boolean;
   /**
    * Server returned only a prefix of a large file. Editing is disabled
@@ -107,6 +109,7 @@ export function MarkdownRichTextViewer({
   content,
   conversationId,
   path,
+  environmentId = DEFAULT_WORKSPACE_ENVIRONMENT_ID,
   isSettled,
   truncated = false,
   onDirtyChange,
@@ -138,7 +141,7 @@ export function MarkdownRichTextViewer({
     reconcileServerContent,
   } = useMarkdownEditorSync({
     content,
-    path,
+    path: workspaceFileKey(environmentId, path),
     isSettled,
     onDirtyChange,
     setContentRef,
@@ -155,10 +158,11 @@ export function MarkdownRichTextViewer({
       // at its mount sites, so a session switch with the same file open must
       // remount the editor — extensions close over conversationId/path and a
       // stale closure would fetch workspace images from the previous session.
-      key={`${conversationId}:${editorKey}`}
+      key={`${conversationId}:${environmentId}:${editorKey}`}
       content={content}
       conversationId={conversationId}
       path={path}
+      environmentId={environmentId}
       canEdit={canEdit}
       truncated={truncated}
       isDirty={isDirty}
@@ -190,6 +194,7 @@ interface InnerProps {
   content: string;
   conversationId: string;
   path: string;
+  environmentId: string;
   canEdit: boolean;
   truncated: boolean;
   isDirty: boolean;
@@ -215,6 +220,7 @@ function MarkdownRichTextViewerInner({
   content,
   conversationId,
   path,
+  environmentId,
   canEdit,
   truncated,
   isDirty,
@@ -310,6 +316,7 @@ function MarkdownRichTextViewerInner({
   const { autoSave, saveDisabled, writeFile } = useEditorAutoSave({
     conversationId,
     path,
+    environmentId,
     canEdit,
     isDirty,
     setDirty,
@@ -350,7 +357,7 @@ function MarkdownRichTextViewerInner({
       GitHubAlertBlockquote,
       HtmlPassthrough,
       Markdown,
-      createWorkspaceImageExtension(conversationId, path),
+      createWorkspaceImageExtension(conversationId, path, environmentId),
       createCommentDecorationExtension(commentStateRef),
       createSearchDecorationExtension(searchStateRef),
     ],

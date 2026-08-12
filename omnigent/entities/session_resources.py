@@ -17,6 +17,7 @@ from omnigent.entities.pagination import PagedList
 from omnigent.terminals.registry import TerminalListEntry
 
 if TYPE_CHECKING:
+    from omnigent.session_directories import SessionDirectory
     from omnigent.terminals.registry import TerminalRegistry
 
 DEFAULT_ENVIRONMENT_ID = "default"
@@ -115,7 +116,40 @@ def default_environment_resource(
         id=DEFAULT_ENVIRONMENT_ID,
         type="environment",
         session_id=session_id,
-        name="Primary environment",
+        name="Working folder",
+        metadata=metadata,
+    )
+
+
+def directory_environment_resource(
+    session_id: str,
+    directory: SessionDirectory,
+    os_env_spec: Any | None = None,
+) -> SessionResourceView:
+    """Project one attached directory as a filesystem environment.
+
+    The primary directory keeps the legacy ``default`` environment id. Extra
+    roots use their stable session-directory ids directly, so clients can use
+    the same id in resource URLs and child-session scope selection.
+
+    :param session_id: Owning session id.
+    :param directory: Stable attached directory record.
+    :param os_env_spec: Optional primary environment spec for safety metadata.
+    :returns: Environment resource rooted at ``directory.path``.
+    """
+    metadata: dict[str, object] = {
+        "environment_type": "caller_process",
+        "role": "primary" if directory.id == DEFAULT_ENVIRONMENT_ID else "project",
+        "root": directory.path,
+        "directory_id": directory.id,
+        "filesystem": True,
+    }
+    metadata.update(environment_safety_metadata(os_env_spec))
+    return SessionResourceView(
+        id=directory.id,
+        type="environment",
+        session_id=session_id,
+        name=directory.environment_name,
         metadata=metadata,
     )
 

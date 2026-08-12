@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
 import { CodeViewer } from "./CodeViewer";
@@ -85,6 +86,13 @@ function makePdfQuery(
 
 const noopRef = { current: null };
 
+function renderWithQueryClient(ui: Parameters<typeof render>[0]) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  return render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>);
+}
+
 function renderViewer(
   content: string,
   panelOpen = true,
@@ -95,7 +103,7 @@ function renderViewer(
   // select-all/copy override under test lives. Non-markdown files now render in
   // Monaco, which handles select-all + copy natively, so this suite defaults to
   // a .md path to exercise the remaining Shiki path.
-  return render(
+  return renderWithQueryClient(
     <CodeViewer
       conversationId="conv_1"
       path={path}
@@ -452,7 +460,7 @@ describe("CodeViewer image rendering", () => {
   });
 
   function renderImage(contentType: string, path = "logo.png", truncated = false) {
-    return render(
+    return renderWithQueryClient(
       <CodeViewer
         conversationId="conv_1"
         path={path}
@@ -496,7 +504,7 @@ describe("CodeViewer image rendering", () => {
   });
 
   it("opens the shared zoom lightbox when the image is clicked", async () => {
-    render(
+    renderWithQueryClient(
       <ImageLightboxProvider>
         <CodeViewer
           conversationId="conv_1"
@@ -533,7 +541,7 @@ describe("CodeViewer PDF routing", () => {
     path = "report.pdf",
     truncated = false,
   ) {
-    return render(
+    return renderWithQueryClient(
       <CodeViewer
         conversationId="conv_1"
         path={path}
@@ -586,7 +594,7 @@ describe("CodeViewer 3D model routing", () => {
   }
 
   function renderModel(path: string, encoding: "base64" | "utf-8", contentType: string | null) {
-    return render(
+    return renderWithQueryClient(
       <CodeViewer
         conversationId="conv_1"
         path={path}

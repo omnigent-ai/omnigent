@@ -13,6 +13,7 @@ import { fetchFileContent } from "@/hooks/useFileContent";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
 import { useAutoSave } from "./useAutoSave";
+import { DEFAULT_WORKSPACE_ENVIRONMENT_ID } from "@/lib/workspaceFiles";
 
 // Debounce between the last edit and an auto-save — long enough to coalesce a
 // burst of typing, short enough to keep the dirty window brief. Shared so both
@@ -22,6 +23,7 @@ const AUTOSAVE_DELAY_MS = 1000;
 interface UseEditorAutoSaveOptions {
   conversationId: string;
   path: string;
+  environmentId?: string;
   /** Editing permitted (edit permission and not truncated). Gates auto-save. */
   canEdit: boolean;
   // ── From useMarkdownEditorSync (the shared sync / dirty / conflict hook) ──
@@ -66,6 +68,7 @@ interface UseEditorAutoSaveResult {
 export function useEditorAutoSave({
   conversationId,
   path,
+  environmentId = DEFAULT_WORKSPACE_ENVIRONMENT_ID,
   canEdit,
   isDirty,
   setDirty,
@@ -77,7 +80,7 @@ export function useEditorAutoSave({
   getContent,
   isEditorDirty,
 }: UseEditorAutoSaveOptions): UseEditorAutoSaveResult {
-  const writeFile = useWriteFileContent(conversationId);
+  const writeFile = useWriteFileContent(conversationId, environmentId);
   const writeFileRef = useRef(writeFile);
   writeFileRef.current = writeFile;
   const runnerOnline = useSessionRunnerOnline(conversationId);
@@ -120,7 +123,7 @@ export function useEditorAutoSave({
         // and skip the write instead of clobbering the agent's edit.
         if (sessionActiveRef.current) {
           try {
-            const fresh = await fetchFileContent(conversationId, path);
+            const fresh = await fetchFileContent(conversationId, path, environmentId);
             // Torn down during the GET → don't touch the outer sync hook (it now
             // tracks a different file); fall through and let the write land.
             if (
@@ -157,6 +160,7 @@ export function useEditorAutoSave({
     [
       conversationId,
       path,
+      environmentId,
       setDirty,
       dismissExternalUpdate,
       markSaved,
