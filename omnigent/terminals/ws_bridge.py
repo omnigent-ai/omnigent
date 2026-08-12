@@ -41,7 +41,7 @@ import time
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 # fcntl/pty/termios are POSIX-only. This module drives tmux PTY ``attach``
 # sessions, a feature that is disabled on Windows (see the terminal
@@ -53,7 +53,11 @@ if sys.platform != "win32":
     import pty
     import termios
 
-from fastapi import WebSocket, WebSocketDisconnect
+# fastapi costs ~300ms to import and is only needed by the server side of this
+# bridge; the client CLI reaches this module for its tmux helpers. Keep the
+# import off the module path so the CLI does not pay for it.
+if TYPE_CHECKING:
+    from fastapi import WebSocket
 
 _logger = logging.getLogger(__name__)
 
@@ -435,6 +439,8 @@ async def _forward_pty_to_ws(
         interactive cap while normal output keeps the larger flood cap.
     :returns: None on EOF or websocket disconnect.
     """
+    from fastapi import WebSocketDisconnect
+
     pending = bytearray()
     eof_seen = False
     while True:
@@ -621,6 +627,8 @@ async def bridge_tmux_pty_to_websocket(
     loop.add_reader(master_fd, _on_pty_readable)
 
     async def _ws_to_pty() -> None:
+        from fastapi import WebSocketDisconnect
+
         nonlocal last_client_input_at, last_pane_check_at
         try:
             while True:
