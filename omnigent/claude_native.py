@@ -1660,6 +1660,15 @@ def _sanitize_cloned_tool_result_record(payload: _JsonObject) -> None:
     non-image JSON, assistant turns, native metadata that does not
     duplicate the payload — is left exactly as copied.
 
+    A truncated payload takes a second route. Its JSON is clipped, so it
+    cannot rehydrate into an image block at all; left alone, the clone
+    replays the partial base64 as text. Such content is collapsed to the
+    same placeholder the rebuild path uses (via
+    :func:`_strip_unparseable_image_output`, so the errored spelling is
+    covered too) and its metadata is rewritten from the collapsed form,
+    which is the only case where a record with no recoverable image
+    payload is still touched.
+
     :param payload: One decoded transcript record (mutated).
     :returns: None.
     """
@@ -1674,6 +1683,15 @@ def _sanitize_cloned_tool_result_record(payload: _JsonObject) -> None:
             continue
         inner = block.get("content")
         if isinstance(inner, str):
+            collapsed = _strip_unparseable_image_output(inner)
+            if collapsed != inner:
+                # Truncated (possibly error-prefixed) image payload: the
+                # placeholder replaces it in both content and metadata.
+                collapsed_blocks = _claude_tool_result_content_blocks(collapsed).blocks
+                if collapsed_blocks is not None:
+                    block["content"] = collapsed_blocks
+                    payload["toolUseResult"] = _json_safe_tool_use_result(collapsed)
+                    continue
             blocks = _claude_tool_result_content_blocks(inner).blocks
         elif isinstance(inner, list):
             blocks = _claude_blocks_from_parsed_list(inner).blocks
@@ -4748,6 +4766,17 @@ def _json_safe_tool_use_result(output: str) -> str:
     return output
 
 
+#: Prefix ``omnigent.tools.mcp._format_call_result`` puts on a failed MCP
+#: result (``f"Error: {joined}"``). It lands ahead of the serialized
+#: content blocks, so for a lone image it turns valid JSON into an
+#: unparseable string, and it moves the leading ``[``/``{`` that the
+#: truncated-image guard looks for — both shape checks have to know about
+#: it or the payload replays as text. Duplicated rather than imported (see
+#: ``test_mcp_error_prefix_constant_matches_the_real_formatter``, which
+#: fails if the formatter's wording drifts from this).
+_MCP_ERROR_PREFIX = "Error: "
+
+
 def _strip_unparseable_image_output(output: str) -> str:
     """Collapse a truncated/corrupt base64 image tool result to a placeholder.
 
@@ -4757,29 +4786,37 @@ def _strip_unparseable_image_output(output: str) -> str:
     the conversation store clipped it at its byte cap — is replaced with a short
     placeholder, so the corrupt ~250K-char base64 is never sent as prompt text.
 
+    A failed MCP call carries the :data:`_MCP_ERROR_PREFIX`, which moves the
+    leading ``[``/``{`` off the front of the string. Without accounting for
+    it, an errored *and* truncated image slipped past the shape guard, then
+    failed rehydration too (its JSON is clipped) and replayed the partial
+    base64 twice — as model-visible text and in metadata. One prefix is
+    therefore recognized here as well and preserved as a compact text block
+    ahead of the placeholder, so the error is not silently dropped.
+
     :param output: The persisted tool-result string.
     :returns: The original string, or a placeholder JSON array when the output
         is an unparseable image payload.
     """
-    stripped = output.lstrip()
-    if stripped[:1] not in ("[", "{") or '"image"' not in output or '"base64"' not in output:
+    body = output
+    prefix = ""
+    if output.startswith(_MCP_ERROR_PREFIX):
+        prefix = _MCP_ERROR_PREFIX
+        body = output[len(_MCP_ERROR_PREFIX) :]
+    stripped = body.lstrip()
+    if stripped[:1] not in ("[", "{") or '"image"' not in body or '"base64"' not in body:
         return output
     try:
-        json.loads(output)
+        json.loads(body)
     except (json.JSONDecodeError, ValueError):
         from omnigent.runtime.prompt import _image_omitted_placeholder
 
-        placeholder = {"type": "text", "text": _image_omitted_placeholder(None)}
-        return json.dumps([placeholder], separators=(",", ":"))
+        blocks: list[_JsonObject] = []
+        if prefix:
+            blocks.append({"type": "text", "text": prefix.strip()})
+        blocks.append({"type": "text", "text": _image_omitted_placeholder(None)})
+        return json.dumps(blocks, separators=(",", ":"))
     return output
-
-
-#: Prefix ``omnigent.tools.mcp._format_call_result`` puts on a failed MCP
-#: result (``f"Error: {joined}"``). It lands ahead of the serialized
-#: content blocks, so for a lone image it turns valid JSON into an
-#: unparseable string — the shape parser has to know about it or the
-#: payload replays as text. Mirrors that formatter; keep the two in step.
-_MCP_ERROR_PREFIX = "Error: "
 
 
 @dataclass(frozen=True)

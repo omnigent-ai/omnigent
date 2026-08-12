@@ -8614,6 +8614,145 @@ def test_claude_transcript_truncated_image_result_stripped_not_leaked() -> None:
     assert "omitted from history" in blob
 
 
+def _store_truncated(clipped_prefix: str) -> str:
+    """Append the conversation store's truncation marker to a clipped item.
+
+    Callers pass the payload already cut mid-base64, so the result is
+    unterminated JSON — the shape a real wedged session persisted.
+    """
+    return clipped_prefix + "…[truncated by conversation-store: item exceeded 245760B cap]"
+
+
+def test_errored_truncated_image_result_does_not_leak_base64() -> None:
+    """
+    An errored *and* truncated image payload leaks in neither place.
+
+    Two independent guards each assumed the payload starts the string.
+    ``_strip_unparseable_image_output`` checks for a leading ``[``/``{``,
+    and rehydration needs parseable JSON — a failed MCP call puts
+    ``"Error: "`` in front of the first, and store truncation breaks the
+    second. Together they slipped past both, so the record fell back to
+    the raw string and replayed the partial base64 twice: as
+    model-visible ``tool_result`` text and again in ``toolUseResult``.
+    The error must survive as compact text, the payload in neither place.
+    """
+    from mcp.types import ImageContent
+
+    b64 = "iVBORw0KGgo" + "A" * 100_000
+    # Real prefix from the real formatter, then the store's real clipping.
+    errored = _mcp_call_output(
+        ImageContent(type="image", data=b64, mimeType="image/png"), is_error=True
+    )
+    assert errored.startswith(claude_native._MCP_ERROR_PREFIX)
+    truncated = _store_truncated(
+        claude_native._MCP_ERROR_PREFIX
+        + '[{"type":"image","source":{"type":"base64","data":"'
+        + b64
+    )
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(truncated)
+    records = _image_output_records(truncated)
+    assert len(records) == 1
+    record = records[0]
+    blob = json.dumps(record)
+    assert b64 not in blob, "truncated base64 must not survive, prefixed or not"
+    # The error is preserved as structured compact text, not discarded.
+    content = record["message"]["content"][0]["content"]
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "Error:"}
+    assert "omitted from history" in content[1]["text"]
+    # Metadata carries the same collapsed form — no payload, still parseable.
+    tool_use_result = json.loads(record["toolUseResult"])
+    assert b64 not in json.dumps(tool_use_result)
+    assert "omitted from history" in json.dumps(tool_use_result)
+
+
+def test_errored_truncated_image_clone_record_is_collapsed_too() -> None:
+    """
+    A cloned record holding the errored+truncated shape is collapsed too.
+
+    The clone sanitizer normally only touches records whose payload it can
+    recover as an image block, and a truncated payload is exactly the one
+    it cannot — so without a second route the byte-copied record replays
+    the partial base64 on the clone's first ``--resume``.
+    """
+    b64 = "iVBORw0KGgo" + "A" * 100_000
+    truncated = _store_truncated(
+        claude_native._MCP_ERROR_PREFIX
+        + '[{"type":"image","source":{"type":"base64","data":"'
+        + b64
+    )
+    record: dict[str, Any] = {
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": truncated}],
+        },
+        "toolUseResult": json.dumps(truncated),
+    }
+    claude_native._sanitize_cloned_tool_result_record(record)
+    content = record["message"]["content"][0]["content"]
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "Error:"}
+    assert "omitted from history" in content[1]["text"]
+    assert b64 not in json.dumps(record)
+
+
+def test_strip_unparseable_image_output_negatives_are_byte_for_byte() -> None:
+    """
+    Direct negative: only a truncated *image* payload is ever collapsed.
+
+    The prefix is not a licence to restructure errored results in general.
+    Anything that is not an unparseable image payload — plain text, an
+    errored message, non-image JSON, a text block array, and an intact
+    image (which must stay rehydratable) — comes back identical.
+    """
+    strip = claude_native._strip_unparseable_image_output
+    b64 = _TINY_PNG_BASE64
+    intact_source = json.dumps(
+        [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": b64},
+            }
+        ],
+        separators=(",", ":"),
+    )
+    for output in (
+        "file written",
+        "Error: tool exploded",
+        'Error: {"foo":1}',
+        'Error: [{"type":"text","text":"nope"}]',
+        intact_source,
+        f"Error: {intact_source}",
+        json.dumps({"type": "image", "data": b64, "mimeType": "image/png"}),
+    ):
+        assert strip(output) == output, output[:60]
+    # Positive control, with and without the prefix.
+    truncated = '[{"type":"image","source":{"type":"base64","data":"' + b64
+    assert strip(truncated) != truncated
+    assert b64 not in strip(truncated)
+    assert b64 not in strip(f"Error: {truncated}")
+
+
+def test_mcp_error_prefix_constant_matches_the_real_formatter() -> None:
+    """
+    The prefix constant tracks the formatter that actually emits it.
+
+    ``claude_native`` hardcodes the prefix rather than importing it —
+    ``omnigent.tools.mcp`` builds it inline as an f-string, and importing
+    that module from the transcript builder would couple two layers for a
+    seven-character string. This asserts the duplication stays honest, so
+    changing the formatter's wording fails here instead of silently
+    reopening the base64 leak.
+    """
+    from mcp.types import TextContent
+
+    errored = _mcp_call_output(TextContent(type="text", text="boom"), is_error=True)
+    plain = _mcp_call_output(TextContent(type="text", text="boom"))
+    assert errored == f"{claude_native._MCP_ERROR_PREFIX}{plain}"
+    assert not plain.startswith(claude_native._MCP_ERROR_PREFIX)
+
+
 def test_tool_use_result_regression_old_flatten_would_crash_resume() -> None:
     """
     Pin the resume crash to the old ``toolUseResult = output`` flatten.
