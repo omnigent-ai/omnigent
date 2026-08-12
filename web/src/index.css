@@ -1129,6 +1129,19 @@ aside[aria-label="Workspace"][data-maximized] {
   overflow-wrap: break-word;
 }
 
+/* The chat prose root (MessageResponse in message.tsx) now sets `wrap-anywhere`
+ * so ordinary text/inline-code get a break opportunity instead of overflowing
+ * the fixed-width column. Inherited into a table cell, that has the exact
+ * column-collapsing effect described above for links, but for every cell:
+ * `anywhere` shrinks min-content to ~1 char, so one long-word cell can squeeze
+ * every other column down with it. Reset to `break-word` — still wraps an
+ * overlong run, but without collapsing the column below it. The table stays
+ * horizontally scrollable via its own wrapper for whatever still doesn't fit. */
+[data-streamdown="table-cell"],
+[data-streamdown="table-header-cell"] {
+  overflow-wrap: break-word;
+}
+
 /* KaTeX lays out radicals/fractions with positioned spans. Wide display math
  * gets its own horizontal scroll surface instead of relying on the surrounding
  * chat bubble to clip or wrap it. (No overflow-y override: with overflow-x

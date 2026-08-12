@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MessageAction, MessageActions, MessageContent, MessageResponse } from "./message";
+import { Message, MessageAction, MessageActions, MessageContent, MessageResponse } from "./message";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
@@ -29,6 +29,25 @@ describe("MessageContent", () => {
     expect(content).toHaveClass("text-ui", "group-[.is-user]:px-3", "group-[.is-user]:py-2");
     expect(content).not.toHaveClass("text-[0.8125rem]", "leading-[1.125rem]");
     expect(content).not.toHaveClass("group-[.is-user]:px-4", "group-[.is-user]:py-3");
+  });
+});
+
+describe("Message", () => {
+  it("stays shrinkable as a flex item of the conversation column", () => {
+    // OMNI-2900 regression: without min-w-0, a flex item in a column flex
+    // container refuses to shrink below its content's intrinsic width, so an
+    // unbroken run of text/code in the bubble forces the whole transcript
+    // column wider than the viewport instead of wrapping inside it.
+    render(<Message data-testid="message" from="assistant" />);
+
+    expect(screen.getByTestId("message")).toHaveClass("min-w-0");
+  });
+
+  it("keeps a caller's width override alongside min-w-0", () => {
+    render(<Message className="max-w-3xl" data-testid="message" from="assistant" />);
+
+    const message = screen.getByTestId("message");
+    expect(message).toHaveClass("min-w-0", "max-w-3xl");
   });
 });
 
@@ -75,6 +94,26 @@ describe("MessageResponse", () => {
     await waitFor(() => {
       expect(container.firstElementChild).toHaveClass("math-config-b");
     });
+  });
+
+  it("gives prose a break opportunity for an unbroken run (OMNI-2900)", () => {
+    // wrap-anywhere (overflow-wrap: anywhere) is inherited from this root, so
+    // a long unbroken token — a hash, an id, a long inline-code span — wraps
+    // inside the fixed-width chat column instead of overflowing it. Asserted
+    // as a class contract, not geometry: jsdom has no layout engine, so this
+    // is what actually pins the behavior (see index.css.test.ts + the live
+    // browser verification in the PR description for the geometry proof).
+    const { container } = render(<MessageResponse>same text</MessageResponse>);
+
+    expect(container.firstElementChild).toHaveClass("wrap-anywhere");
+  });
+
+  it("keeps wrap-anywhere alongside a caller-supplied className", () => {
+    const { container } = render(
+      <MessageResponse className="math-config-a">same text</MessageResponse>,
+    );
+
+    expect(container.firstElementChild).toHaveClass("wrap-anywhere", "math-config-a");
   });
 });
 

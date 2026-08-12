@@ -35,7 +35,12 @@ export type MessageProps = HTMLAttributes<HTMLDivElement> & {
 export const Message = ({ className, from, ...props }: MessageProps) => (
   <div
     className={cn(
-      "group flex w-full max-w-[95%] flex-col gap-2",
+      // min-w-0: this is a flex item of ConversationContent's column, so
+      // without it the browser refuses to shrink the bubble below its
+      // content's intrinsic width — an unbroken run of text/code then forces
+      // the whole transcript column wider than the viewport instead of
+      // wrapping inside it.
+      "group flex w-full min-w-0 max-w-[95%] flex-col gap-2",
       from === "user" ? "is-user ml-auto justify-end" : "is-assistant",
       className,
     )}
@@ -440,7 +445,20 @@ export const MessageResponse = memo(
 
     return (
       <Streamdown
-        className={cn("size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0", className)}
+        // wrap-anywhere (overflow-wrap: anywhere) is inherited, so it reaches
+        // every prose descendant — paragraphs, list items, inline code — and
+        // gives a long unbroken run (a hash, an id, a path with no slashes)
+        // a break opportunity instead of blowing out the fixed-width chat
+        // column. Fenced code blocks are unaffected: they pin `white-space:
+        // pre` (or `pre-wrap` via the .chat-code-wrap toggle, which already
+        // sets its own overflow-wrap), so this never changes their
+        // scroll-vs-wrap behavior. Table cells opt back out in index.css —
+        // `anywhere` would otherwise shrink a cell's min-content and let one
+        // long word squeeze every other column.
+        className={cn(
+          "size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+          className,
+        )}
         plugins={STREAMDOWN_PLUGINS}
         // Let links open on a plain click (and cmd/ctrl-click in a new tab)
         // instead of Streamdown's default "Open external link?" modal.
