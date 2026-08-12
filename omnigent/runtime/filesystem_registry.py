@@ -1004,9 +1004,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
         return records[:limit]
 
-    def _list_changed_files_since(
-        self, baseline_sha: str, *, limit: int
-    ) -> list[dict[str, Any]]:
+    def _list_changed_files_since(self, baseline_sha: str, *, limit: int) -> list[dict[str, Any]]:
         """Return files that differ from *baseline_sha* in the working tree.
 
         Combines committed changes (baseline..HEAD) with uncommitted changes
@@ -1029,9 +1027,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 self._git_root,
                 exc,
             )
-            raise GitStatusUnavailable(
-                f"git diff {baseline_sha} failed: {exc}"
-            ) from exc
+            raise GitStatusUnavailable(f"git diff {baseline_sha} failed: {exc}") from exc
 
         elapsed = time.monotonic() - started
         if result.returncode != 0:
@@ -1066,8 +1062,41 @@ class GitFilesystemRegistry(FilesystemRegistry):
             counts = numstat.get(rel_path, (None, None))
             records.append(self._make_record(rel_path, operation, counts))
 
+        seen_paths: set[str] = {r["path"] for r in records}
+        untracked = self._list_untracked_files()
+        for rel_path in untracked:
+            if rel_path in seen_paths:
+                continue
+            if _is_ephemeral(rel_path):
+                continue
+            first_component = Path(rel_path).parts[0] if Path(rel_path).parts else ""
+            if first_component in _SKIP_DIRS:
+                continue
+            records.append(self._make_record(rel_path, "created", (None, None)))
+
         records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
         return records[:limit]
+
+    def _list_untracked_files(self) -> list[str]:
+        """Return repo-relative paths of untracked (new) files."""
+        argv = ["git", "ls-files", "--others", "--exclude-standard"]
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return []
+        if result.returncode != 0:
+            return []
+        paths: list[str] = []
+        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+            rel = self._git_to_rel(_strip_git_quotes(line.strip()))
+            if rel is not None:
+                paths.append(rel)
+        return paths
 
     def _run_git_numstat_since(
         self, baseline_sha: str
