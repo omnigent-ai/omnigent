@@ -82,6 +82,21 @@ describe("markdown links to workspace files", () => {
     expect(link).toHaveAttribute("href", "https://example.com/page");
   });
 
+  // Overriding the `a` slot replaces Streamdown's link component, so its
+  // styling and marker attribute have to be reproduced. index.css keys the
+  // pointer cursor and the table-cell overflow-wrap rule (which stops a
+  // link-only table column collapsing to ~2ch) on the attribute.
+  it.each([
+    ["an external link", "[docs](https://example.com/page)", "docs", [] as string[]],
+    ["a workspace file link", "[notes.md](docs/notes.md)", "notes.md", ["docs/notes.md"]],
+  ])("keeps Streamdown's link styling on %s", (_label, markdown, name, changed) => {
+    renderMarkdown(markdown, changed);
+
+    const link = screen.getByText(name).closest("a");
+    expect(link).toHaveAttribute("data-streamdown", "link");
+    expect(link).toHaveClass("wrap-anywhere", "font-medium", "text-primary", "underline");
+  });
+
   it("keeps the source hast node out of the DOM", () => {
     // Streamdown passes `node` to every override; spreading it onto the element
     // renders a literal node="[object Object]" attribute.

@@ -152,12 +152,18 @@ function WorkspacePathInlineCode({
   );
 }
 
+// Streamdown's own anchor styling and marker attribute. Overriding the `a`
+// slot replaces its link component wholesale, so both must be reproduced here:
+// index.css keys the pointer cursor and the table-cell `overflow-wrap` rule
+// (which stops a link-only table column collapsing to ~2ch) on the attribute.
+const STREAMDOWN_LINK_CLASS = "wrap-anywhere font-medium text-primary underline";
+
 /**
  * Anchor renderer for markdown links. A link to a workspace file, its href
  * parked on a fragment by `markWorkspaceFileLinks` and the real path moved to
  * `WORKSPACE_FILE_LINK_ATTR`, opens the FileViewer instead of navigating,
  * matching how an inline-code path behaves. Every other link (http(s), mailto,
- * in-page anchors) still carries its own href and renders untouched.
+ * in-page anchors) still carries its own href and renders as Streamdown would.
  *
  * A marked path that names no workspace file renders as plain text: its href is
  * the parked fragment, so a live link there would go nowhere.
@@ -176,7 +182,13 @@ function WorkspaceFileLink({
 
   if (!path) {
     return (
-      <a href={href} className={className} title={title} {...props}>
+      <a
+        href={href}
+        className={cn(STREAMDOWN_LINK_CLASS, className)}
+        title={title}
+        data-streamdown="link"
+        {...props}
+      >
         {children}
       </a>
     );
@@ -200,7 +212,11 @@ function WorkspaceFileLink({
       role="button"
       tabIndex={0}
       title={title ?? path}
-      className={cn("cursor-pointer underline decoration-dotted underline-offset-2", className)}
+      data-streamdown="link"
+      // Dotted underline distinguishes "opens in the FileViewer" from a link
+      // that leaves the app; the rest matches Streamdown so a file link in a
+      // table cell wraps like any other.
+      className={cn(STREAMDOWN_LINK_CLASS, "decoration-dotted underline-offset-2", className)}
       onClick={openWorkspaceFile}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
