@@ -1,14 +1,10 @@
 """E2E: a long unbroken run of prose or inline code wraps instead of overflowing.
 
-Chat text/inline-code had no ``overflow-wrap``, and the message bubble had no
-``min-w-0`` as a flex item of the transcript column, so an unbroken run (a
-hash, an id, a long inline-code span) forced the column wider than the
-viewport instead of wrapping inside it. A deterministic assistant message
-(seeded via the ``external_assistant_message`` event — no LLM run) carries
-both a long unbroken plain-text run and a long unbroken inline-code token at
-a narrow viewport; the test asserts the observable geometry — the transcript
-column and the message bubble itself must not need to scroll horizontally to
-show the content.
+A deterministic assistant message (seeded via the ``external_assistant_message``
+event — no LLM run) carries a long unbroken plain-text run and a long unbroken
+inline-code token at a narrow viewport. Asserts observable geometry: the
+transcript column and the message bubble itself never need a horizontal
+scrollbar to show either run.
 """
 
 from __future__ import annotations
@@ -36,15 +32,12 @@ _MESSAGE_TEXT = (
 def _no_horizontal_overflow(selector: str) -> str:
     """JS predicate: does *selector*'s first match fit without horizontal scroll?
 
-    ``scrollWidth``/``clientWidth`` reflect the element's actual rendered
-    content extent even under ``overflow: visible`` (unlike a bounding-rect
-    read, which only ever reports the constrained border box), so this
-    catches an unbroken run overflowing its container regardless of whether
-    that container happens to clip, scroll, or just let it paint past its
-    edge. 1px tolerance for sub-pixel layout rounding.
+    ``scrollWidth``/``clientWidth`` catch overflow even under
+    ``overflow: visible``, unlike a bounding-rect read. 1px tolerance for
+    sub-pixel rounding.
 
     :param selector: CSS selector for the element to measure.
-    :returns: A JS arrow-function source string for ``page.wait_for_function``.
+    :returns: JS arrow-function source for ``page.wait_for_function``.
     """
     return (
         "() => { const el = document.querySelector('"
@@ -75,7 +68,12 @@ def test_chat_long_unbroken_text_and_code_wrap_without_overflow(
     bubble = page.locator(_ASSISTANT_BUBBLE).last
     expect(bubble).to_be_visible(timeout=30_000)
     expect(bubble).to_contain_text("chatColumnOverflow")
-    expect(bubble).to_contain_text("inlineCodeOverflow")
+
+    # Confirms the token actually rendered as markdown inline code, not just
+    # as text somewhere in the bubble.
+    code = bubble.locator('code[data-streamdown="inline-code"]')
+    expect(code).to_be_visible(timeout=30_000)
+    expect(code).to_contain_text("inlineCodeOverflow")
 
     # The transcript column never needs a horizontal scrollbar to show either run.
     page.wait_for_function(_no_horizontal_overflow(_TRANSCRIPT_SCROLLER), timeout=30_000)
