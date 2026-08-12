@@ -3549,7 +3549,7 @@ describe("NewChatLandingScreen smart routing", () => {
   it.each([
     ["Claude Code", "a1", true, "Smart Routing", "Opus 4.8"],
     ["Claude Code", "a1", false, null, "Default"],
-    ["Codex", "a2", true, "Smart Routing", "Default (GPT-5.5)"],
+    ["Codex", "a2", true, "Smart Routing", "Default (databricks-gpt-5.5)"],
   ] as const)(
     "%s Model dropdown with the flag %s offers %s alongside %s",
     (_label, agentId, flag, routingOption, siblingOption) => {

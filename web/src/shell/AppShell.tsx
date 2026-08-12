@@ -692,10 +692,11 @@ export function AppShell() {
     // fall back one hop until the walk resolves the true root.
     return activeSession?.parentSessionId ?? conversationId;
   }, [conversationId, activeSession, walkedRoot, queryClient]);
-  // One-shot fetch (no polling) for the Subagents tab's count badge.
-  // SubagentsPanel mounts its own polling usage of the hook against
-  // the same rootSessionId, so the cache is shared.
-  const { children: childSessions } = useChildSessions(rootSessionId);
+  // Keep the root child list fresh even when an MCP-created child does not
+  // deliver its parent-side ``session.created`` event to this browser tab.
+  // The same cache is consumed by SubagentsPanel, so the Agents tab and its
+  // badge recover automatically without requiring a page reload.
+  const { children: childSessions } = useChildSessions(rootSessionId, 3000);
   // Remember the resolved root so a later click into one of its tree
   // members can hold it steady (see ``rootSessionId`` above).
   useEffect(() => {
