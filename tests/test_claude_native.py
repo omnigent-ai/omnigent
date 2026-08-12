@@ -30,10 +30,23 @@ from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import PICKER_ACCENT, PICKER_MUTED
 from omnigent.databricks_model_discovery import DatabricksClaudeCatalog
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.runtime import tool_result_content as trc
 from omnigent.spec import load_omnigent_yaml
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
+)
+from tests._image_fixtures import (
+    _TINY_CMYK_JPEG_BASE64,
+    _TINY_GIF_BASE64,
+    _TINY_JPEG_BASE64,
+    _TINY_PNG_BASE64,
+    _TINY_PROGRESSIVE_GRAY_JPEG_BASE64,
+    _TINY_PROGRESSIVE_JPEG_BASE64,
+    _TINY_WEBP_BASE64,
+)
+from tests._image_fixtures import (
+    mcp_call_output as _mcp_call_output,
 )
 
 
@@ -7619,66 +7632,6 @@ def test_json_safe_tool_use_result_wraps_non_json() -> None:
     assert claude_native._json_safe_tool_use_result('{"a":1}') == '{"a":1}'
 
 
-# Genuinely decodable 1x1 images (generated and round-trip verified), so the
-# replay tests exercise the exact payloads real MCP screenshot tools persist.
-_TINY_PNG_BASE64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQAB"
-    "pfZFQAAAAABJRU5ErkJggg=="
-)
-_TINY_JPEG_BASE64 = (
-    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRof"
-    "Hh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwh"
-    "MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAAR"
-    "CAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAA"
-    "AgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkK"
-    "FhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWG"
-    "h4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl"
-    "5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREA"
-    "AgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYk"
-    "NOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOE"
-    "hYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk"
-    "5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDi6KKK+ZP3E//Z"
-)
-_TINY_PROGRESSIVE_JPEG_BASE64 = (
-    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a"
-    "HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIy"
-    "MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wgARCAAEAAQDASIA"
-    "AhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAVAQEBAAAAAAAAAAAAAAAAAAAEBv/aAAwD"
-    "AQACEAMQAAABjgVN/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAA"
-    "AAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QA"
-    "FBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgB"
-    "AQABPyF//9oADAMBAAIAAwAAABDz/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPxB//8QA"
-    "FBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPxB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgB"
-    "AQABPxB//9k="
-)
-_TINY_PROGRESSIVE_GRAY_JPEG_BASE64 = (
-    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a"
-    "HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wgALCAAEAAQBAREA/8QAFAABAAAAAAAA"
-    "AAAAAAAAAAAAAP/aAAgBAQAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QA"
-    "FBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgB"
-    "AQABPyF//9oACAEBAAAAEH//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EH//2Q=="
-)
-_TINY_CMYK_JPEG_BASE64 = (
-    "/9j/7gAOQWRvYmUAZAAAAAAA/9sAQwAIBgYHBgUIBwcHCQkICgwUDQwLCwwZEhMPFB0aHx4dGhwc"
-    "ICQuJyAiLCMcHCg3KSwwMTQ0NB8nOT04MjwuMzQy/8IAFAgABAAEBEMRAE0RAFkRAEsRAP/EABYA"
-    "AQEBAAAAAAAAAAAAAAAAAAYBB//aAA4EQwBNAFkASwAAAAF/M/f/AP/EABQQAQAAAAAAAAAAAAAA"
-    "AAAAAAD/2gAIAUMAAQUCf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAU0AAQUCf//EABQQAQAA"
-    "AAAAAAAAAAAAAAAAAAD/2gAIAVkAAQUCf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAUsAAQUC"
-    "f//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAUMABj8Cf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/"
-    "2gAIAU0ABj8Cf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAVkABj8Cf//EABQQAQAAAAAAAAAA"
-    "AAAAAAAAAAD/2gAIAUsABj8Cf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAUMAAT8hf//EABQQ"
-    "AQAAAAAAAAAAAAAAAAAAAAD/2gAIAU0AAT8hf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAVkA"
-    "AT8hf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAUsAAT8hf//aAA4EQwBNAFkASwAAABDf/8QA"
-    "FBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBQwABPxB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgB"
-    "TQABPxB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBWQABPxB//8QAFBABAAAAAAAAAAAAAAAA"
-    "AAAAAP/aAAgBSwABPxB//9k="
-)
-_TINY_GIF_BASE64 = "R0lGODdhAQABAIAAAAAAAAAAACwAAAAAAQABAAAIBAABBAQAOw=="
-_TINY_WEBP_BASE64 = (
-    "UklGRj4AAABXRUJQVlA4IDIAAADQAQCdASoBAAEAAUAmJaACdLoB+AADsAD+6SIf+8+fufP3"
-    "Pn/Rn/+U/fI4/kcf/KBAAA=="
-)
-
 # Header + zero-padding: signature-matching but structurally invalid per format.
 # A structurally valid minimal SOF0 + SOS pair for building marker-only fakes.
 _FAKE_SOF0 = b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00"
@@ -7842,18 +7795,6 @@ def test_tool_use_result_redacts_inline_data_uris() -> None:
     assert json.dumps(record).count(b64) == 1
 
 
-def _mcp_call_output(*content_blocks: Any, is_error: bool = False) -> str:
-    """Format a real ``CallToolResult`` through the real ``_format_call_result``.
-
-    ``is_error=True`` gives the failed spelling, which that formatter prefixes.
-    """
-    from mcp.types import CallToolResult
-
-    from omnigent.tools.mcp import _format_call_result
-
-    return _format_call_result(CallToolResult(content=list(content_blocks), isError=is_error))
-
-
 @pytest.mark.parametrize("is_error", [False, True], ids=["ok", "error"])
 def test_mcp_single_image_result_replays_as_one_structured_image(is_error: bool) -> None:
     """
@@ -7950,7 +7891,7 @@ def test_mcp_errored_non_image_result_representation_is_unchanged() -> None:
         _mcp_call_output(TextContent(type="text", text='{"foo":1}'), is_error=True),
     ):
         assert output.startswith("Error: ")
-        rehydrated = claude_native._claude_tool_result_content_blocks(output)
+        rehydrated = trc.tool_result_content_blocks(output)
         assert rehydrated.blocks is None
         records = _image_output_records(output)
         assert records[0]["message"]["content"][0]["content"] == output
@@ -8265,7 +8206,7 @@ def test_under_floor_image_payloads_stay_raw(case: str, form: str) -> None:
     also stays raw rather than collapsing to the oversized placeholder.
     """
     payload = _UNDER_FLOOR_JPEGS[case]
-    assert len(base64.b64decode(payload)) < claude_native._MIN_IMAGE_BYTES
+    assert len(base64.b64decode(payload)) < trc._MIN_IMAGE_BYTES
     image_object = json.dumps(
         {"type": "image", "data": payload, "mimeType": "image/jpeg"},
         separators=(",", ":"),
@@ -8298,7 +8239,7 @@ def test_signature_valid_but_undecodable_payloads_convert_by_design(case: str) -
     already pass with no validation at all.
     """
     payload = _HEADER_VALID_CORRUPT_JPEGS[case]
-    assert claude_native._is_supported_image_payload(payload, "image/jpeg")
+    assert trc._is_supported_image_payload(payload, "image/jpeg")
     output = json.dumps(
         {"type": "image", "data": payload, "mimeType": "image/jpeg"},
         separators=(",", ":"),
@@ -8326,8 +8267,8 @@ def test_oversized_invalid_image_collapses_instead_of_replaying_base64() -> None
     still replay verbatim so their text survives.
     """
     oversized = base64.b64encode(b"not an image payload " * 2_000).decode()
-    assert len(oversized) > claude_native._MAX_INVALID_IMAGE_REPLAY_CHARS
-    assert not claude_native._is_supported_image_payload(oversized, "image/jpeg")
+    assert len(oversized) > trc._MAX_INVALID_IMAGE_REPLAY_CHARS
+    assert not trc._is_supported_image_payload(oversized, "image/jpeg")
     image_object = json.dumps(
         {"type": "image", "data": oversized, "mimeType": "image/jpeg"},
         separators=(",", ":"),
@@ -8358,59 +8299,14 @@ def test_oversized_invalid_image_collapses_instead_of_replaying_base64() -> None
     assert "omitted from history" in content[1]["text"]
     # Below the threshold nothing changes: the raw string still replays.
     small = base64.b64encode(b"not an image").decode()
-    assert len(small) <= claude_native._MAX_INVALID_IMAGE_REPLAY_CHARS
-    assert not claude_native._is_supported_image_payload(small, "image/jpeg")
+    assert len(small) <= trc._MAX_INVALID_IMAGE_REPLAY_CHARS
+    assert not trc._is_supported_image_payload(small, "image/jpeg")
     small_output = json.dumps(
         [{"type": "image", "data": small, "mimeType": "image/jpeg"}],
         separators=(",", ":"),
     )
     small_records = _image_output_records(small_output)
     assert small_records[0]["message"]["content"][0]["content"] == small_output
-
-
-def test_collapsed_oversized_image_logs_shape_without_the_payload(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Collapsing a payload leaves a breadcrumb, but never the payload.
-
-    Dropping content silently would make a shrunken transcript
-    unexplainable after the fact, so the collapse logs at debug level
-    with the object's shape, declared media type, and size. The payload
-    itself must never reach the logs.
-
-    Patches ``_logger.debug`` directly rather than using caplog, matching
-    the other log assertions in this module: caplog depends on handler /
-    propagation state that other tests' logging setup can disturb.
-    """
-    oversized = base64.b64encode(b"not an image payload " * 2_000).decode()
-    captured: list[str] = []
-    monkeypatch.setattr(
-        claude_native._logger,
-        "debug",
-        lambda msg, *args: captured.append(msg % args),
-    )
-    block = claude_native._oversized_invalid_image_placeholder(
-        {"type": "image", "data": oversized, "mimeType": "image/jpeg"}
-    )
-    assert block is not None
-    assert len(captured) == 1
-    message = captured[0]
-    assert "collapsed oversized invalid image" in message
-    assert "'image/jpeg'" in message
-    assert str(len(oversized)) in message
-    assert "'data'" in message and "'mimeType'" in message
-    assert oversized[:64] not in message
-    # A sub-threshold payload is not collapsed, so it logs nothing.
-    captured.clear()
-    small = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 64).decode()
-    assert (
-        claude_native._oversized_invalid_image_placeholder(
-            {"type": "image", "data": small, "mimeType": "image/jpeg"}
-        )
-        is None
-    )
-    assert captured == []
 
 
 def test_large_text_block_array_keeps_byte_for_byte_tool_use_result() -> None:
@@ -8426,8 +8322,8 @@ def test_large_text_block_array_keeps_byte_for_byte_tool_use_result() -> None:
     """
     long_text = "log line that goes on and on. " * 400
     output = json.dumps([{"type": "text", "text": long_text}], separators=(",", ":"))
-    assert len(output) > claude_native._MAX_INVALID_IMAGE_REPLAY_CHARS
-    rehydrated = claude_native._claude_tool_result_content_blocks(output)
+    assert len(output) > trc._MAX_INVALID_IMAGE_REPLAY_CHARS
+    rehydrated = trc.tool_result_content_blocks(output)
     assert rehydrated.blocks is not None
     assert rehydrated.dropped_oversized_image is False
     records = _image_output_records(output)
@@ -8437,95 +8333,10 @@ def test_large_text_block_array_keeps_byte_for_byte_tool_use_result() -> None:
     assert records[0]["message"]["content"][0]["content"] == [{"type": "text", "text": long_text}]
     # And the dropped-payload case still swaps in the block list.
     oversized = base64.b64encode(b"not an image payload " * 2_000).decode()
-    dropped = claude_native._claude_tool_result_content_blocks(
+    dropped = trc.tool_result_content_blocks(
         json.dumps({"type": "image", "data": oversized, "mimeType": "image/png"})
     )
     assert dropped.dropped_oversized_image is True
-
-
-def test_image_payload_gate_accepts_and_rejects() -> None:
-    """
-    What the payload gate does and does not check.
-
-    It enforces four things — a known declared media type, strict base64, the
-    byte floor, and the declared type's magic bytes (with WebP's ``WEBP`` at
-    offset 8) — and nothing about container internals. So a truncated or
-    CRC-corrupted payload that keeps its signature is *accepted*; the cases
-    below pin both halves of that contract.
-    """
-    gate = claude_native._is_supported_image_payload
-    for mime_type, payload in (
-        ("image/png", _TINY_PNG_BASE64),
-        ("image/jpeg", _TINY_JPEG_BASE64),
-        ("image/gif", _TINY_GIF_BASE64),
-        ("image/webp", _TINY_WEBP_BASE64),
-        ("image/jpeg", _TINY_PROGRESSIVE_JPEG_BASE64),
-        ("image/jpeg", _TINY_PROGRESSIVE_GRAY_JPEG_BASE64),
-        ("image/jpeg", _TINY_CMYK_JPEG_BASE64),
-    ):
-        assert gate(payload, mime_type), mime_type
-        # Every real fixture clears the floor — that is how it was chosen.
-        assert len(base64.b64decode(payload)) >= claude_native._MIN_IMAGE_BYTES
-    # Rejected: unknown type, bad base64, non-image bytes, MIME/signature
-    # mismatch either way round.
-    assert not gate(base64.b64encode(b"<svg/>" * 8).decode(), "image/svg+xml")
-    assert not gate("!!! not base64 !!!", "image/png")
-    assert not gate(base64.b64encode(b"plain text " * 8).decode(), "image/png")
-    assert not gate(_TINY_PNG_BASE64, "image/jpeg")
-    assert not gate(_TINY_JPEG_BASE64, "image/png")
-    # Rejected: below the byte floor, even with the right signature.
-    for magic, mime_type in (
-        (b"\x89PNG\r\n\x1a\n", "image/png"),
-        (b"\xff\xd8\xff", "image/jpeg"),
-        (b"GIF89a", "image/gif"),
-    ):
-        assert len(magic) < claude_native._MIN_IMAGE_BYTES
-        assert not gate(base64.b64encode(magic).decode(), mime_type)
-    # Rejected: a RIFF container that is not WebP, and a bare RIFF/WEBP header.
-    assert not gate(
-        base64.b64encode(b"RIFF" + b"\x00" * 4 + b"AVI " + b"\x00" * 40).decode(), "image/webp"
-    )
-    assert not gate(base64.b64encode(b"RIFF\x00\x00\x00\x00WEBP").decode(), "image/webp")
-    # Accepted by design: signature intact, container corrupt or cut short.
-    corrupted_png = bytearray(base64.b64decode(_TINY_PNG_BASE64))
-    corrupted_png[20] ^= 0xFF
-    assert gate(base64.b64encode(bytes(corrupted_png)).decode(), "image/png")
-    assert gate(base64.b64encode(base64.b64decode(_TINY_JPEG_BASE64)[:100]).decode(), "image/jpeg")
-    assert gate(
-        base64.b64encode(base64.b64decode(_TINY_JPEG_BASE64) + b"\x00\x00").decode(),
-        "image/jpeg",
-    )
-
-
-def test_claude_tool_result_content_blocks_rehydrates_only_block_arrays() -> None:
-    """Only a non-empty list of text/image block dicts rehydrates; else ``None``."""
-
-    def fn(output: str) -> list[dict[str, Any]] | None:
-        """Normalize *output*, asserting nothing was dropped."""
-        rehydrated = claude_native._claude_tool_result_content_blocks(output)
-        assert rehydrated.dropped_oversized_image is False
-        return rehydrated.blocks
-
-    # An image content-block array rehydrates to the parsed list.
-    assert fn('[{"type":"image","source":{"type":"base64","data":"AAA"}}]') == [
-        {"type": "image", "source": {"type": "base64", "data": "AAA"}}
-    ]
-    # A text block array rehydrates too.
-    assert fn('[{"type":"text","text":"hi"}]') == [{"type": "text", "text": "hi"}]
-    # Plain text is not JSON → keep the raw string.
-    assert fn("file written") is None
-    # A JSON string / number / object is not a block array → keep raw.
-    assert fn('"just a string"') is None
-    assert fn("42") is None
-    assert fn('{"type":"image"}') is None
-    # An empty array carries nothing to rehydrate.
-    assert fn("[]") is None
-    # A list whose entries are not typed block dicts is not a block array.
-    assert fn('["a","b"]') is None
-    assert fn('[{"no_type":1}]') is None
-    # A typed block the API does not accept in a tool_result stays a raw
-    # string, so resume keeps sending exactly what it sent before.
-    assert fn('[{"type":"file","path":"/x"}]') is None
 
 
 def test_claude_transcript_image_result_sent_as_blocks_not_text() -> None:
@@ -8639,11 +8450,9 @@ def test_errored_truncated_image_result_does_not_leak_base64() -> None:
     errored = _mcp_call_output(
         ImageContent(type="image", data=b64, mimeType="image/png"), is_error=True
     )
-    assert errored.startswith(claude_native._MCP_ERROR_PREFIX)
+    assert errored.startswith(trc._MCP_ERROR_PREFIX)
     truncated = _store_truncated(
-        claude_native._MCP_ERROR_PREFIX
-        + '[{"type":"image","source":{"type":"base64","data":"'
-        + b64
+        trc._MCP_ERROR_PREFIX + '[{"type":"image","source":{"type":"base64","data":"' + b64
     )
     with pytest.raises(json.JSONDecodeError):
         json.loads(truncated)
@@ -8674,9 +8483,7 @@ def test_errored_truncated_image_clone_record_is_collapsed_too() -> None:
     """
     b64 = "iVBORw0KGgo" + "A" * 100_000
     truncated = _store_truncated(
-        claude_native._MCP_ERROR_PREFIX
-        + '[{"type":"image","source":{"type":"base64","data":"'
-        + b64
+        trc._MCP_ERROR_PREFIX + '[{"type":"image","source":{"type":"base64","data":"' + b64
     )
     record: dict[str, Any] = {
         "message": {
@@ -8691,62 +8498,6 @@ def test_errored_truncated_image_clone_record_is_collapsed_too() -> None:
     assert content[0] == {"type": "text", "text": "Error:"}
     assert "omitted from history" in content[1]["text"]
     assert b64 not in json.dumps(record)
-
-
-def test_strip_unparseable_image_output_negatives_are_byte_for_byte() -> None:
-    """
-    Direct negative: only a truncated *image* payload is ever collapsed.
-
-    The prefix is not a licence to restructure errored results in general.
-    Anything that is not an unparseable image payload — plain text, an
-    errored message, non-image JSON, a text block array, and an intact
-    image (which must stay rehydratable) — comes back identical.
-    """
-    strip = claude_native._strip_unparseable_image_output
-    b64 = _TINY_PNG_BASE64
-    intact_source = json.dumps(
-        [
-            {
-                "type": "image",
-                "source": {"type": "base64", "media_type": "image/png", "data": b64},
-            }
-        ],
-        separators=(",", ":"),
-    )
-    for output in (
-        "file written",
-        "Error: tool exploded",
-        'Error: {"foo":1}',
-        'Error: [{"type":"text","text":"nope"}]',
-        intact_source,
-        f"Error: {intact_source}",
-        json.dumps({"type": "image", "data": b64, "mimeType": "image/png"}),
-    ):
-        assert strip(output) == output, output[:60]
-    # Positive control, with and without the prefix.
-    truncated = '[{"type":"image","source":{"type":"base64","data":"' + b64
-    assert strip(truncated) != truncated
-    assert b64 not in strip(truncated)
-    assert b64 not in strip(f"Error: {truncated}")
-
-
-def test_mcp_error_prefix_constant_matches_the_real_formatter() -> None:
-    """
-    The prefix constant tracks the formatter that actually emits it.
-
-    ``claude_native`` hardcodes the prefix rather than importing it —
-    ``omnigent.tools.mcp`` builds it inline as an f-string, and importing
-    that module from the transcript builder would couple two layers for a
-    seven-character string. This asserts the duplication stays honest, so
-    changing the formatter's wording fails here instead of silently
-    reopening the base64 leak.
-    """
-    from mcp.types import TextContent
-
-    errored = _mcp_call_output(TextContent(type="text", text="boom"), is_error=True)
-    plain = _mcp_call_output(TextContent(type="text", text="boom"))
-    assert errored == f"{claude_native._MCP_ERROR_PREFIX}{plain}"
-    assert not plain.startswith(claude_native._MCP_ERROR_PREFIX)
 
 
 def test_tool_use_result_regression_old_flatten_would_crash_resume() -> None:
