@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import importlib.metadata
 import io
@@ -6599,7 +6600,7 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
     source_path = source_project_dir / f"{source_uuid}.jsonl"
 
     b64_structured = "iVBORw0KGgo" + "K" * 4000
-    b64_mcp = "U05BUFNIT1Q" + "L" * 4000
+    b64_mcp = _png_base64()
     image_block = {
         "type": "image",
         "source": {"type": "base64", "media_type": "image/png", "data": b64_structured},
@@ -6694,6 +6695,58 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
     assert records[2]["toolUseResult"] == json.dumps("file written")
     # The fork must not mutate the source session's transcript.
     assert source_path.read_text(encoding="utf-8") == source_text
+
+
+def test_clone_claude_transcript_leaves_invalid_image_shaped_text_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    The fork sanitizer must not "repair" text that only looks like an image.
+
+    A cloned record whose tool_result content is image-shaped text with
+    an invalid payload passes the same validation guard as the rebuild
+    path: no block conversion, no metadata rewrite — the record arrives
+    exactly as copied (modulo the usual cwd/sessionId rewrites).
+    """
+    projects_dir = tmp_path / ".claude" / "projects"
+    source_workspace = tmp_path / "source repo"
+    source_workspace.mkdir()
+    clone_workspace = tmp_path / "clone worktree"
+    clone_workspace.mkdir()
+    source_uuid = "11111111-1111-1111-1111-111111111111"
+    target_uuid = "22222222-2222-2222-2222-222222222222"
+    source_project_dir = projects_dir / claude_native._sanitize_claude_project_name(
+        str(source_workspace.resolve())
+    )
+    source_project_dir.mkdir(parents=True)
+    source_path = source_project_dir / f"{source_uuid}.jsonl"
+    fake_text = '{"type": "image", "data": "not!valid!base64", "mimeType": "image/png"}'
+    record = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u1",
+        "parentUuid": None,
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": fake_text}],
+        },
+        "toolUseResult": json.dumps(fake_text),
+    }
+    source_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+
+    result = claude_native._clone_claude_transcript(
+        source_external_session_id=source_uuid,
+        target_external_session_id=target_uuid,
+        clone_workspace=clone_workspace.resolve(),
+    )
+
+    assert result is not None
+    cloned = [json.loads(line) for line in result.read_text(encoding="utf-8").splitlines()]
+    assert cloned[0]["message"]["content"][0]["content"] == fake_text
+    assert cloned[0]["toolUseResult"] == json.dumps(fake_text)
 
 
 # ── _record_launch_for_fresh_session ────────────────────────
@@ -7456,6 +7509,16 @@ def test_json_safe_tool_use_result_wraps_non_json() -> None:
     assert claude_native._json_safe_tool_use_result('{"a":1}') == '{"a":1}'
 
 
+def _png_base64(padding: int = 4000, fill: bytes = b"\x00") -> str:
+    """A signature-valid PNG payload: real magic bytes plus padding."""
+    return base64.b64encode(b"\x89PNG\r\n\x1a\n" + fill * padding).decode()
+
+
+def _jpeg_base64(padding: int = 4000) -> str:
+    """A signature-valid JPEG payload: real magic bytes plus padding."""
+    return base64.b64encode(b"\xff\xd8\xff" + b"\x00" * padding).decode()
+
+
 def _image_output_records(output: str) -> list[dict[str, Any]]:
     """Run one ``function_call_output`` item through the shared converter.
 
@@ -7605,7 +7668,7 @@ def test_mcp_single_image_result_replays_as_one_structured_image() -> None:
     """
     from mcp.types import ImageContent
 
-    b64 = "iVBORw0KGgo" + "F" * 5000
+    b64 = _png_base64(5000)
     output = _mcp_call_output(ImageContent(type="image", data=b64, mimeType="image/png"))
     records = _image_output_records(output)
     assert len(records) == 1
@@ -7637,7 +7700,7 @@ def test_mcp_mixed_text_and_image_result_replays_as_block_list() -> None:
     """
     from mcp.types import ImageContent, TextContent
 
-    b64 = "U05BUFNIT1Q" + "G" * 5000
+    b64 = _png_base64(5000)
     output = _mcp_call_output(
         TextContent(type="text", text="took a screenshot"),
         ImageContent(type="image", data=b64, mimeType="image/png"),
@@ -7672,7 +7735,7 @@ def test_mcp_image_replay_does_not_depend_on_tool_name() -> None:
     """
     from mcp.types import ImageContent
 
-    b64 = "R0lGODdh" + "H" * 4000
+    b64 = _jpeg_base64()
     output = _mcp_call_output(ImageContent(type="image", data=b64, mimeType="image/jpeg"))
     items: list[dict[str, Any]] = [
         {
@@ -7709,8 +7772,8 @@ def test_mcp_multiple_images_replay_as_separate_blocks() -> None:
     """Two newline-joined MCP images become two blocks, each payload once."""
     from mcp.types import ImageContent
 
-    b64_one = "iVBORw0KGgo" + "I" * 4000
-    b64_two = "iVBORw0KGgo" + "J" * 4000
+    b64_one = _png_base64(4000)
+    b64_two = _png_base64(5000, fill=b"\xff")
     output = _mcp_call_output(
         ImageContent(type="image", data=b64_one, mimeType="image/png"),
         ImageContent(type="image", data=b64_two, mimeType="image/png"),
@@ -7740,6 +7803,67 @@ def test_multiline_non_image_result_stays_raw_string() -> None:
     assert record["message"]["content"][0]["content"] == output
     # Image-free: the legacy metadata passthrough applies verbatim.
     assert record["toolUseResult"] == json.dumps(output)
+
+
+def test_invalid_base64_image_shaped_text_stays_raw() -> None:
+    """
+    Image-shaped text with undecodable data is never converted.
+
+    Documentation or logs can contain a line like
+    ``{"type":"image","data":"not!valid!base64","mimeType":"image/png"}``.
+    Converting it would emit an image block Claude rejects on every
+    resume of the session — a persistent wedge rebuilt from the same
+    stored item each launch. Both the lone-object and the newline-joined
+    form must stay raw text.
+    """
+    fake = '{"type": "image", "data": "not!valid!base64", "mimeType": "image/png"}'
+    lone_records = _image_output_records(fake)
+    assert lone_records[0]["message"]["content"][0]["content"] == fake
+    mixed_output = f"some log line\n{fake}"
+    mixed_records = _image_output_records(mixed_output)
+    assert mixed_records[0]["message"]["content"][0]["content"] == mixed_output
+
+
+def test_valid_base64_of_non_image_bytes_stays_raw() -> None:
+    """
+    Decodable but non-image bytes must not become an image block.
+
+    Uses the array-entry path: a base64 string that decodes cleanly but
+    carries no image signature fails validation, so the whole output
+    keeps its raw-string representation.
+    """
+    not_an_image = base64.b64encode(b"definitely just text bytes" * 100).decode()
+    output = json.dumps(
+        [{"type": "image", "data": not_an_image, "mimeType": "image/png"}],
+        separators=(",", ":"),
+    )
+    records = _image_output_records(output)
+    assert records[0]["message"]["content"][0]["content"] == output
+
+
+def test_image_mime_signature_mismatch_stays_raw() -> None:
+    """
+    A payload whose signature disagrees with ``mimeType`` stays raw.
+
+    Claude validates the bytes against the block's declared media type,
+    so PNG-as-JPEG would fail the resume just like invalid data. An
+    ``image/*`` type outside the supported set (SVG here) is rejected
+    too — the prefix alone proves nothing.
+    """
+    mismatched = json.dumps(
+        {"type": "image", "data": _png_base64(), "mimeType": "image/jpeg"},
+        separators=(",", ":"),
+    )
+    records = _image_output_records(mismatched)
+    assert records[0]["message"]["content"][0]["content"] == mismatched
+
+    svg = base64.b64encode(b"<svg xmlns='http://www.w3.org/2000/svg'/>").decode()
+    unsupported = json.dumps(
+        {"type": "image", "data": svg, "mimeType": "image/svg+xml"},
+        separators=(",", ":"),
+    )
+    records = _image_output_records(unsupported)
+    assert records[0]["message"]["content"][0]["content"] == unsupported
 
 
 def test_claude_tool_result_content_blocks_rehydrates_only_block_arrays() -> None:

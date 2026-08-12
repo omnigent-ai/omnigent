@@ -9,6 +9,8 @@ local TTY to the existing terminal WebSocket protocol.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import json
 import logging
@@ -4827,6 +4829,45 @@ def _claude_blocks_from_parsed_list(parsed: list[object]) -> list[_JsonObject] |
     return blocks
 
 
+# Magic-byte signatures for the image formats Claude accepts as base64
+# blocks (PNG/JPEG/GIF/WebP — the set Omnigent's attachment handling
+# also maps in ``inner.native_attachments.MIME_TO_EXT``). WebP is
+# special-cased below: its ``WEBP`` tag sits inside a RIFF header.
+_IMAGE_MAGIC_BY_MEDIA_TYPE: dict[str, tuple[bytes, ...]] = {
+    "image/png": (b"\x89PNG\r\n\x1a\n",),
+    "image/jpeg": (b"\xff\xd8\xff",),
+    "image/gif": (b"GIF87a", b"GIF89a"),
+}
+
+
+def _is_supported_image_payload(data: str, media_type: str) -> bool:
+    """
+    Prove *data* is a real *media_type* image before it becomes a block.
+
+    Flattened MCP output loses provenance, so a text line that merely
+    *looks* like a serialized image (docs, logs, placeholders) must not
+    be converted: an invalid image block makes Claude reject the resume
+    on every launch. Require strict base64 and decoded bytes whose
+    signature matches the declared MIME type; anything else stays raw
+    text. Formats outside Claude's supported set (e.g. SVG) are
+    rejected too.
+
+    :param data: Candidate base64 payload.
+    :param media_type: Declared MIME type, e.g. ``"image/png"``.
+    :returns: True only for a signature-verified supported image.
+    """
+    try:
+        decoded = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    if media_type == "image/webp":
+        return len(decoded) >= 12 and decoded[:4] == b"RIFF" and decoded[8:12] == b"WEBP"
+    signatures = _IMAGE_MAGIC_BY_MEDIA_TYPE.get(media_type)
+    if signatures is None:
+        return False
+    return any(decoded.startswith(signature) for signature in signatures)
+
+
 def _claude_image_block_from_object(value: object) -> _JsonObject | None:
     """
     Return a canonical Claude image block for one parsed image object.
@@ -4834,8 +4875,9 @@ def _claude_image_block_from_object(value: object) -> _JsonObject | None:
     Accepts the Anthropic wire shape (``source`` present, kept as-is)
     and the MCP ``ImageContent`` serialization that
     ``omnigent.tools.mcp._format_call_result`` persists (bare ``data`` +
-    ``mimeType``). Anything else yields ``None`` so callers keep the raw
-    string rather than emit an API-invalid ``source``-less image block.
+    ``mimeType``). The MCP shape is converted only after strict payload
+    validation; anything else yields ``None`` so callers keep the raw
+    string rather than emit an API-invalid image block.
 
     :param value: Decoded JSON value, e.g.
         ``{"type": "image", "data": "...", "mimeType": "image/png"}``.
@@ -4850,7 +4892,7 @@ def _claude_image_block_from_object(value: object) -> _JsonObject | None:
     mime = block.get("mimeType")
     if not isinstance(data, str) or not data:
         return None
-    if not isinstance(mime, str) or not mime.startswith("image/"):
+    if not isinstance(mime, str) or not _is_supported_image_payload(data, mime):
         return None
     return {"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}}
 
