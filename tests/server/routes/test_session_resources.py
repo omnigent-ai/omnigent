@@ -18,6 +18,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import _globals, session_stream, set_runner_client, set_runner_router
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
+from omnigent.session_directories import SessionDirectory, replace_directory_nickname
 
 
 class _ConversationStore:
@@ -39,6 +40,11 @@ class _ConversationStore:
                 updated_at=1,
                 root_conversation_id="79b22ebd2309e48fdeb450c65611d51b",
                 agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+                workspace="/repo/main",
+                directories=(
+                    SessionDirectory("default", "/repo/main"),
+                    SessionDirectory(f"dir_{1:032x}", "/repo/shared"),
+                ),
             ),
             "5d29bee4350489d66feafecfebd94a97": Conversation(
                 id="5d29bee4350489d66feafecfebd94a97",
@@ -176,6 +182,21 @@ class _ConversationStore:
         del updated_at
         conv = self._conversations[conversation_id]
         conv.labels.update(updates)
+
+    def set_directory_nickname(
+        self,
+        conversation_id: str,
+        directory_id: str,
+        nickname: str | None,
+    ) -> Conversation:
+        """Persist an attached-directory nickname in this test store."""
+        conv = self._conversations[conversation_id]
+        conv.directories = replace_directory_nickname(
+            conv.directories,
+            directory_id,
+            nickname,
+        )
+        return conv
 
     def append(
         self,
@@ -480,7 +501,7 @@ def _runner_payload() -> dict[str, object]:
                 "object": "session.resource",
                 "type": "environment",
                 "session_id": "79b22ebd2309e48fdeb450c65611d51b",
-                "name": "Primary environment",
+                "name": "Working folder",
                 "metadata": {
                     "environment_type": "caller_process",
                     "role": "primary",
@@ -604,7 +625,7 @@ async def test_list_session_resources_local_fallback_lists_default(
             "object": "session.resource",
             "type": "environment",
             "session_id": "5d29bee4350489d66feafecfebd94a97",
-            "name": "Primary environment",
+            "name": "Working folder",
             "metadata": {
                 "environment_type": "caller_process",
                 "role": "primary",
@@ -989,7 +1010,7 @@ def _single_resource_payload() -> dict[str, object]:
         "object": "session.resource",
         "type": "environment",
         "session_id": "79b22ebd2309e48fdeb450c65611d51b",
-        "name": "Primary environment",
+        "name": "Working folder",
         "metadata": {"environment_type": "caller_process", "role": "primary"},
     }
 
@@ -1006,9 +1027,67 @@ async def test_list_environments_proxies_to_runner(
 
     assert resp.status_code == 200
     assert resp.json()["object"] == "list"
+    assert resp.json()["data"][0]["name"] == "Working folder"
     assert fake_runner.calls == [
         ("GET", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_list_environments_forwards_pagination_params_to_runner(
+    client: httpx.AsyncClient,
+) -> None:
+    """Environment ordering parameters survive the server proxy."""
+    fake_runner = _FakeRunnerClient(payload=_env_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments"
+        "?order=asc&limit=1000&bogus=1"
+    )
+
+    assert resp.status_code == 200
+    assert fake_runner.get_params == [{"order": "asc", "limit": "1000"}]
+
+
+@pytest.mark.asyncio
+async def test_environment_nickname_is_persisted_and_overlays_stale_runner_name(
+    client: httpx.AsyncClient,
+) -> None:
+    """PATCH updates subsequent list/get responses without a runner restart."""
+    fake_runner = _FakeRunnerClient(payload=_env_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    base = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments"
+
+    renamed = await client.patch(f"{base}/default", json={"name": "Main checkout"})
+    listed = await client.get(base)
+
+    assert renamed.status_code == 200
+    assert renamed.json()["name"] == "Main checkout"
+    assert listed.status_code == 200
+    assert listed.json()["data"][0]["name"] == "Main checkout"
+
+    cleared = await client.patch(f"{base}/default", json={"name": None})
+    assert cleared.status_code == 200
+    assert cleared.json()["name"] == "Working folder"
+
+
+@pytest.mark.asyncio
+async def test_environment_nickname_rejects_blank_or_non_json_input(
+    client: httpx.AsyncClient,
+) -> None:
+    """Nickname edits enforce validation and JSON CSRF protection."""
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+
+    blank = await client.patch(path, json={"name": "   "})
+    non_json = await client.patch(
+        path,
+        content='{"name":"Main"}',
+        headers={"content-type": "text/plain"},
+    )
+
+    assert blank.status_code == 400
+    assert non_json.status_code == 415
 
 
 @pytest.mark.asyncio
@@ -1070,6 +1149,7 @@ async def test_get_resource_by_id_proxies_to_runner(
 
     assert resp.status_code == 200
     assert resp.json()["id"] == DEFAULT_ENVIRONMENT_ID
+    assert resp.json()["name"] == "Working folder"
     assert fake_runner.calls == [
         (
             "GET",
@@ -5392,7 +5472,11 @@ async def test_file_diff_is_gzipped(client: httpx.AsyncClient) -> None:
 
     assert resp.status_code == 200
     assert resp.headers["content-encoding"] == "gzip"
-    assert resp.json() == payload
+    assert resp.json() == {
+        **payload,
+        "environment_id": "default",
+        "directory_id": "default",
+    }
 
 
 @pytest.mark.asyncio

@@ -153,6 +153,11 @@ from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
+from omnigent.session_directories import (
+    SessionDirectory,
+    build_session_directories,
+    validate_session_directories,
+)
 from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
@@ -611,10 +616,35 @@ class _SessionSnapshot:
     status_code: int | None
     created_at: float
     workspace: str | None
+    directories: tuple[SessionDirectory, ...]
     agent_id: str | None
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     agent_name: str | None = None
+
+
+def _session_directories_from_wire(
+    raw: object,
+    workspace: str | None,
+) -> tuple[SessionDirectory, ...]:
+    """Parse a session snapshot's stable roots with legacy fallback."""
+    if raw is None:
+        return build_session_directories(workspace)
+    if not isinstance(raw, list):
+        raise ValueError("session directories must be a list")
+    directories: list[SessionDirectory] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("session directory entries must be objects")
+        directory_id = item.get("id")
+        path = item.get("path")
+        nickname = item.get("nickname")
+        if not isinstance(directory_id, str) or not isinstance(path, str):
+            raise ValueError("session directory entries require string id and path")
+        if nickname is not None and not isinstance(nickname, str):
+            raise ValueError("session directory nickname must be a string or null")
+        directories.append(SessionDirectory(directory_id, path, nickname))
+    return validate_session_directories(directories)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1921,6 +1951,7 @@ def create_runner_app(
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
+    _session_directories_cache: dict[str, tuple[SessionDirectory, ...]] = {}
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
     _session_claude_launch_config_tasks: dict[
         str, asyncio.Task[ClaudeNativeUcodeConfig | None]
@@ -2338,6 +2369,7 @@ def create_runner_app(
 
     from omnigent.runtime.filesystem_registry import (
         FilesystemRegistry,
+        MultiRootFilesystemRegistry,
         create_filesystem_registry,
     )
 
@@ -2348,7 +2380,8 @@ def create_runner_app(
         filesystem_registry = None
     app.state.filesystem_registry = filesystem_registry
 
-    _session_fs_registries: dict[str, FilesystemRegistry] = {}
+    _session_fs_registries: dict[tuple[str, str], FilesystemRegistry] = {}
+    app.state.session_filesystem_registries = _session_fs_registries
 
     async def _session_snapshot(session_id: str) -> _SessionSnapshot:
         cached = _session_snapshot_cache.get(session_id)
@@ -2362,6 +2395,7 @@ def create_runner_app(
             status_code: int | None = None
             created_at: float | None = None
             workspace: str | None = None
+            directories: tuple[SessionDirectory, ...] = ()
             agent_id: str | None = None
             sub_agent_name: str | None = None
             parent_session_id: str | None = None
@@ -2375,6 +2409,9 @@ def create_runner_app(
                     if raw_created is not None:
                         created_at = float(raw_created)
                     workspace = body.get("workspace")
+                    directories = _session_directories_from_wire(
+                        body.get("directories"), workspace
+                    )
                     raw_agent_id = body.get("agent_id")
                     if isinstance(raw_agent_id, str) and raw_agent_id:
                         agent_id = raw_agent_id
@@ -2394,6 +2431,7 @@ def create_runner_app(
                 status_code=status_code,
                 created_at=created_at if created_at is not None else time.time(),
                 workspace=workspace,
+                directories=directories,
                 agent_id=agent_id,
                 sub_agent_name=sub_agent_name,
                 parent_session_id=parent_session_id,
@@ -2411,12 +2449,34 @@ def create_runner_app(
             if not snapshot.ok:
                 return None
             _session_workspace_cache[session_id] = snapshot.workspace
+            _session_directories_cache[session_id] = snapshot.directories
+            if snapshot.directories or snapshot.parent_session_id is not None:
+                resource_registry.configure_session_directories(session_id, snapshot.directories)
         return _session_workspace_cache.get(session_id)
+
+    async def _session_directory_values(
+        session_id: str,
+    ) -> tuple[SessionDirectory, ...]:
+        """Return and configure immutable roots for one session."""
+        if session_id not in _session_directories_cache:
+            snapshot = await _session_snapshot(session_id)
+            if not snapshot.ok:
+                return ()
+            _session_workspace_cache[session_id] = snapshot.workspace
+            _session_directories_cache[session_id] = snapshot.directories
+            if snapshot.directories or snapshot.parent_session_id is not None:
+                resource_registry.configure_session_directories(session_id, snapshot.directories)
+        return _session_directories_cache[session_id]
 
     async def _session_runtime_cwd(session_id: str) -> Path | None:
         workspace = await _session_workspace_value(session_id)
         if workspace and workspace.strip():
             return Path(workspace.strip()).expanduser().resolve()
+        directories = await _session_directory_values(session_id)
+        snapshot = await _session_snapshot(session_id)
+        if directories or snapshot.parent_session_id is not None:
+            root = resource_registry.compute_default_env_root(session_id, None)
+            return Path(root).resolve() if root is not None else None
         return runner_workspace.resolve() if runner_workspace is not None else None
 
     async def _load_legacy_session_init_context() -> _SessionInitContext:
@@ -2440,12 +2500,24 @@ def create_runner_app(
             status_code=200,
             created_at=float(snapshot.created_at),
             workspace=snapshot.workspace,
+            directories=tuple(
+                SessionDirectory(directory.id, directory.path, directory.nickname)
+                for directory in snapshot.directories
+            ),
             agent_id=agent_id,
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
+        _session_directories_cache[session_id] = tuple(
+            SessionDirectory(directory.id, directory.path, directory.nickname)
+            for directory in snapshot.directories
+        )
+        if _session_directories_cache[session_id] or snapshot.parent_session_id is not None:
+            resource_registry.configure_session_directories(
+                session_id, _session_directories_cache[session_id]
+            )
         if envelope.sub_agent_name:
             _session_sub_agent_names[session_id] = envelope.sub_agent_name
         _session_init_envelopes[session_id] = (time.monotonic(), envelope)
@@ -2483,23 +2555,51 @@ def create_runner_app(
 
     async def _resolve_session_fs_registry(
         session_id: str,
+        environment_id: str = DEFAULT_ENVIRONMENT_ID,
     ) -> FilesystemRegistry | None:
-        if session_id in _session_fs_registries:
-            return _session_fs_registries[session_id]
+        key = (session_id, environment_id)
+        if key in _session_fs_registries:
+            return _session_fs_registries[key]
 
+        directories = await _session_directory_values(session_id)
         session_workspace = await _session_workspace_value(session_id)
-        if session_workspace is None:
+        if (
+            environment_id == DEFAULT_ENVIRONMENT_ID
+            and not directories
+            and session_workspace is None
+        ):
+            return filesystem_registry
+        root = resource_registry.compute_environment_root(session_id, environment_id, None)
+        if root is None:
+            return None
+        root_path = Path(root).resolve()
+        if filesystem_registry is not None and root_path == filesystem_registry.cwd:
             return filesystem_registry
 
-        session_ws_path = Path(session_workspace).resolve()
-        runner_ws_resolved = runner_workspace.resolve() if runner_workspace is not None else None
-        if runner_ws_resolved is not None and session_ws_path == runner_ws_resolved:
-            return filesystem_registry
-
-        registry = create_filesystem_registry(watch_path=session_ws_path)
+        registry = create_filesystem_registry(watch_path=root_path)
         registry.start()
-        _session_fs_registries[session_id] = registry
+        _session_fs_registries[key] = registry
         return registry
+
+    async def _resolve_session_tool_fs_registry(
+        session_id: str,
+    ) -> FilesystemRegistry | None:
+        """Build a path-routing registry for runner-local agent tools."""
+        directories = await _session_directory_values(session_id)
+        environment_ids = [DEFAULT_ENVIRONMENT_ID]
+        environment_ids.extend(
+            directory.id for directory in directories if directory.id != DEFAULT_ENVIRONMENT_ID
+        )
+        registries: dict[str, FilesystemRegistry] = {}
+        for environment_id in environment_ids:
+            registry = await _resolve_session_fs_registry(session_id, environment_id)
+            if registry is not None:
+                registries[environment_id] = registry
+        if DEFAULT_ENVIRONMENT_ID not in registries:
+            return None
+        if len(registries) == 1:
+            return registries[DEFAULT_ENVIRONMENT_ID]
+        return MultiRootFilesystemRegistry(registries)
 
     from omnigent.entities.environment_filesystem import (
         FilesystemEntry,
@@ -3357,11 +3457,16 @@ def create_runner_app(
         _drop_session_claude_launch_config(session_id)
         _session_start_cache.pop(session_id, None)
         _session_workspace_cache.pop(session_id, None)
+        _session_directories_cache.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
         _session_snapshot_locks.pop(session_id, None)
         _session_init_envelopes.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
-        _session_fs_registries.pop(session_id, None)
+        stale_fs_registries = [key for key in _session_fs_registries if key[0] == session_id]
+        for key in stale_fs_registries:
+            registry = _session_fs_registries.pop(key)
+            registry.unregister_conversation(session_id)
+            registry.stop()
         _session_agent_ids.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
         if _binding := _session_comment_relays.pop(session_id, None):
@@ -6077,7 +6182,11 @@ def create_runner_app(
                                                         conv_id
                                                     ),
                                                     publish_event=_publish_event,
-                                                    filesystem_registry=filesystem_registry,
+                                                    filesystem_registry=(
+                                                        await _resolve_session_tool_fs_registry(
+                                                            conv_id
+                                                        )
+                                                    ),
                                                 )
                                             )
                                         )
@@ -6633,6 +6742,7 @@ def create_runner_app(
         from omnigent.entities.pagination import paginate_in_memory
 
         spec = await _resolve_session_agent_spec(session_id)
+        await _ensure_session_registered(session_id)
         full = resource_registry.list_resources(
             session_id,
             resource_type=cast(_ResourceType | None, type),
@@ -6701,6 +6811,7 @@ def create_runner_app(
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
     ) -> JSONResponse:
+        await _ensure_session_registered(session_id)
         return _build_typed_list_response(
             session_id,
             "environment",
@@ -6749,6 +6860,7 @@ def create_runner_app(
         environment_id: str,
     ) -> JSONResponse:
         agent_spec = await _resolve_session_agent_spec(session_id)
+        await _ensure_session_registered(session_id)
         resource = resource_registry.get_resource(
             session_id,
             environment_id,
@@ -6764,21 +6876,21 @@ def create_runner_app(
                 },
             )
         content = session_resource_view_to_dict(resource)
-        if environment_id == DEFAULT_ENVIRONMENT_ID:
-            root = resource_registry.compute_default_env_root(session_id, agent_spec)
-            if root is not None:
-                raw_metadata = content.get("metadata")
-                metadata: dict[str, object] = (
-                    dict(cast(Mapping[str, object], raw_metadata))
-                    if isinstance(raw_metadata, Mapping)
-                    else {}
-                )
-                metadata["root"] = root
+        root = resource_registry.compute_environment_root(session_id, environment_id, agent_spec)
+        if root is not None:
+            raw_metadata = content.get("metadata")
+            metadata: dict[str, object] = (
+                dict(cast(Mapping[str, object], raw_metadata))
+                if isinstance(raw_metadata, Mapping)
+                else {}
+            )
+            metadata["root"] = root
+            if environment_id == DEFAULT_ENVIRONMENT_ID:
                 home = os.path.expanduser("~")
                 if os.path.isabs(home):
                     metadata["home"] = home
-                metadata["reachable"] = _environment_reach(root, agent_spec)
-                content = {**content, "metadata": metadata}
+            metadata["reachable"] = _environment_reach(root, agent_spec)
+            content = {**content, "metadata": metadata}
         return JSONResponse(
             status_code=200,
             content=content,
@@ -7493,7 +7605,7 @@ def create_runner_app(
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/changes")
     async def list_filesystem_changes(
         session_id: str,
-        environment_id: str,  # noqa: ARG001
+        environment_id: str,
     ) -> JSONResponse:
         import asyncio as _asyncio
 
@@ -7501,7 +7613,7 @@ def create_runner_app(
 
         await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
-        session_registry = await _resolve_session_fs_registry(session_id)
+        session_registry = await _resolve_session_fs_registry(session_id, environment_id)
         try:
             # ``list_changed_files`` shells out to ``git status`` synchronously,
             # which on a large repo (cold untracked cache) can take seconds.
@@ -7532,6 +7644,8 @@ def create_runner_app(
                 "modified_at": rec.get("modified_at"),
                 "lines_added": rec.get("lines_added"),
                 "lines_removed": rec.get("lines_removed"),
+                "environment_id": environment_id,
+                "directory_id": environment_id,
             }
             for rec in raw_changes
         ]
@@ -7551,7 +7665,7 @@ def create_runner_app(
     ) -> JSONResponse:
         agent_spec = await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
-        session_registry = await _resolve_session_fs_registry(session_id)
+        session_registry = await _resolve_session_fs_registry(session_id, environment_id)
 
         from omnigent.entities.environment_filesystem import InvalidPath
         from omnigent.runner.environment_filesystem import _validate_path
@@ -7635,6 +7749,8 @@ def create_runner_app(
                 "path": relative_path,
                 "before": before,
                 "after": after,
+                "environment_id": environment_id,
+                "directory_id": environment_id,
             },
         )
 
@@ -7677,6 +7793,8 @@ def create_runner_app(
         )
 
         agent_spec = await _require_os_env(session_id)
+        await _ensure_session_registered(session_id)
+        session_registry = await _resolve_session_fs_registry(session_id, environment_id)
         env = resource_registry.resolve_environment(
             session_id,
             environment_id,
@@ -7690,8 +7808,8 @@ def create_runner_app(
         content_bytes = content_str.encode(encoding)
         try:
             existing = await fs.read(relative_path, limit=None)
-            if existing.encoding and filesystem_registry is not None:
-                filesystem_registry.seed_snapshot(
+            if existing.encoding and session_registry is not None:
+                session_registry.seed_snapshot(
                     relative_path,
                     existing.data.decode(existing.encoding, errors="replace"),
                     session_id=session_id,
@@ -7703,8 +7821,8 @@ def create_runner_app(
             content_bytes,
             create_parents=create_parents,
         )
-        if filesystem_registry is not None:
-            filesystem_registry.record_change(relative_path, result.operation, session_id)
+        if session_registry is not None:
+            session_registry.record_change(relative_path, result.operation, session_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -7735,6 +7853,8 @@ def create_runner_app(
         )
 
         agent_spec = await _require_os_env(session_id)
+        await _ensure_session_registered(session_id)
+        session_registry = await _resolve_session_fs_registry(session_id, environment_id)
         env = resource_registry.resolve_environment(
             session_id,
             environment_id,
@@ -7743,8 +7863,8 @@ def create_runner_app(
         fs = CallerProcessFilesystem(env)
         try:
             existing = await fs.read(relative_path, limit=None)
-            if existing.encoding and filesystem_registry is not None:
-                filesystem_registry.seed_snapshot(
+            if existing.encoding and session_registry is not None:
+                session_registry.seed_snapshot(
                     relative_path,
                     existing.data.decode(existing.encoding, errors="replace"),
                     session_id=session_id,
@@ -7758,8 +7878,8 @@ def create_runner_app(
             replace_all=body.get("replace_all", False),
         )
         result = await fs.edit_text(relative_path, edit_req)
-        if filesystem_registry is not None:
-            filesystem_registry.record_change(relative_path, result.operation, session_id)
+        if session_registry is not None:
+            session_registry.record_change(relative_path, result.operation, session_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -7788,6 +7908,8 @@ def create_runner_app(
         )
 
         agent_spec = await _require_os_env(session_id)
+        await _ensure_session_registered(session_id)
+        session_registry = await _resolve_session_fs_registry(session_id, environment_id)
         env = resource_registry.resolve_environment(
             session_id,
             environment_id,
@@ -7795,8 +7917,8 @@ def create_runner_app(
         )
         fs = CallerProcessFilesystem(env)
         result = await fs.delete(relative_path, recursive=recursive)
-        if filesystem_registry is not None and result.type == "file":
-            filesystem_registry.record_change(relative_path, "deleted", session_id)
+        if session_registry is not None and result.type == "file":
+            session_registry.record_change(relative_path, "deleted", session_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -7819,6 +7941,9 @@ def create_runner_app(
         # fetch is re-resolved lazily by _session_workspace_value.
         if snapshot.ok:
             _session_workspace_cache[session_id] = snapshot.workspace
+            _session_directories_cache[session_id] = snapshot.directories
+            if snapshot.directories or snapshot.parent_session_id is not None:
+                resource_registry.configure_session_directories(session_id, snapshot.directories)
 
     async def _resolve_session_spec_entry(session_id: str) -> _SpecEntry | None:
         if session_id in _session_spec_cache:
@@ -8247,6 +8372,7 @@ def create_runner_app(
         )
 
         agent_spec = await _require_os_env(session_id)
+        await _ensure_session_registered(session_id)
         env = resource_registry.resolve_environment(
             session_id,
             environment_id,
@@ -8297,6 +8423,7 @@ def create_runner_app(
         session_id: str,
         resource_id: str,
     ) -> JSONResponse:
+        await _ensure_session_registered(session_id)
         resource = resource_registry.get_resource(
             session_id,
             resource_id,
@@ -8609,7 +8736,7 @@ def create_runner_app(
                         session_async_tasks=_session_async_tasks.get(session_id),
                         harness_client=None,
                         publish_event=_publish_event,
-                        filesystem_registry=filesystem_registry,
+                        filesystem_registry=(await _resolve_session_tool_fs_registry(session_id)),
                     )
                 except Exception as exc:  # noqa: BLE001
                     return JSONResponse(

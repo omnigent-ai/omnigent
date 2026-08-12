@@ -2098,7 +2098,7 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
         "agent_id": agent_id,
         "sub_agent_name": None,
         "session_init": {
-            "protocol_version": 2,
+            "protocol_version": 3,
             "server_version": "0.6.0.dev0",
             "session_id": session_id,
             "agent_id": agent_id,
@@ -2122,7 +2122,7 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
 
     assert first_response.status_code == second_response.status_code == 201
     assert first_response.json()["created_at"] == 1234
-    assert first_response.json()["session_init_protocol_version"] == 2
+    assert first_response.json()["session_init_protocol_version"] == 3
     assert resolver_calls == 1
     assert len(pm.get_client_calls) == 1
     assert server_client.get_paths == [f"/v1/sessions/{session_id}/items"]
