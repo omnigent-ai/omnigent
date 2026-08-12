@@ -3335,24 +3335,19 @@ export function NewChatLandingScreen() {
   });
 
   const canSubmit =
-    message.trim().length > 0 &&
     selectedAgent != null &&
     (sandboxSelected ? sandboxRepoValid : !!selectedHostId && workspaceValid) &&
     !creating;
 
-  // Why submit is disabled, surfaced as the button's tooltip. Checked in the
-  // order a user fills the form — location first, then message — so the
-  // tooltip always names the next missing input. Null when nothing is
-  // actionable (submitting, or mid-create).
+  // The tooltip follows configuration order and names the next missing input.
+  // An empty prompt is valid once the required launch configuration is ready.
   const submitDisabledReason = canSubmit
     ? null
     : sandboxSelected && !sandboxRepoValid
       ? "Please enter a valid repository URL"
       : !sandboxSelected && (!selectedHostId || !workspaceValid)
         ? "Please choose a host and working directory"
-        : message.trim().length === 0
-          ? "Enter a message to get started"
-          : null;
+        : null;
 
   // Chip display labels.
   const workspaceLabel = workspaceTrimmed
@@ -3515,9 +3510,8 @@ export function NewChatLandingScreen() {
   }
 
   async function handleCreate() {
-    // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
-    // and form-submit paths that call this directly can't create a session with
-    // a blank message, host, agent, or workspace.
+    // Mirror the button gate so Enter and form submit require launch config.
+    // An empty prompt intentionally opens a session ready for its first message.
     if (!canSubmit) return;
     setCreating(true);
     setCreateError(null);
@@ -3814,16 +3808,21 @@ export function NewChatLandingScreen() {
       // as a `slash_command` event (server resolves the skill) instead
       // of plain text the agent would see as a literal "/name". Native
       // terminal agents keep plain text — their CLI owns slash commands.
-      setPendingInitialPrompt(data.id, {
-        text: initialPrompt,
-        skill: isNativeTerminalAgent
-          ? null
-          : matchSkillInvocation(initialPrompt, agent?.skills ?? []),
-        files,
-      });
+      // Skip when the landing composer produced no prompt text so ChatPage
+      // does not auto-send a blank/placeholder turn.
+      if (initialPrompt) {
+        setPendingInitialPrompt(data.id, {
+          text: initialPrompt,
+          skill: isNativeTerminalAgent
+            ? null
+            : matchSkillInvocation(initialPrompt, agent?.skills ?? []),
+          files,
+        });
+      }
       // Scope the recall entry to the new session id so ArrowUp surfaces it in
       // the freshly-opened chat (whose composer reads the same per-conversation
       // key). Sanitized text so recall reproduces exactly what was sent.
+      // Empty prompts are a no-op inside appendPromptHistoryEntry.
       appendPromptHistoryEntry(initialPrompt, data.id);
       // The session was created — drop any draft a detour back to this
       // screen stashed, so the next visit starts clean.
