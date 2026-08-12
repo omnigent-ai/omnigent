@@ -82,12 +82,13 @@ def test_copy_message_link_opens_and_highlights_target(
     fresh = browser.new_context()
     try:
         page = fresh.new_page()
+        # Wait for the flash class as soon as the page loads — it only lasts
+        # ~800ms after the scroll settles, so racing it after other expects
+        # can miss the highlight.
         page.goto(clipboard)
-
         target = page.locator(f'[data-message-id="{message_id}"]')
-        expect(target).to_be_visible(timeout=20_000)
-        expect(target).to_be_in_viewport(timeout=10_000)
-        # Flash fires after the smooth-scroll settle (~120ms); allow load + settle.
-        expect(target.locator(".animate-user-msg-flash")).to_be_attached(timeout=10_000)
+        expect(target.locator(".animate-user-msg-flash")).to_be_attached(timeout=20_000)
+        expect(target).to_be_visible()
+        expect(target).to_be_in_viewport(timeout=5_000)
     finally:
         fresh.close()
