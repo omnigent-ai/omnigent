@@ -1,7 +1,7 @@
 """Add a visibility/use purpose to stored files.
 
 Revision ID: a8c4e1f6b2d9
-Revises: f7a8b9c0d1e2
+Revises: d5e9f1a2b3c4
 Create Date: 2026-08-07
 
 Existing files become normal ``user_upload`` records. Generated Computer Use
@@ -17,7 +17,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "a8c4e1f6b2d9"
-down_revision: str | None = "f7a8b9c0d1e2"
+down_revision: str | None = "d5e9f1a2b3c4"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -11,7 +11,7 @@ fixture-only `dataEncodedLength` field. A long TextEdit accessibility tree is
 replaced with a marker and its original character count.
 
 The subscribed client observed no `item/mcpToolCall/progress` notifications in
-the successful image, failed, or interrupted calls. The interrupted call emitted
+the successful image or interrupted calls. The interrupted call emitted
 `item/started` and a terminal `turn/completed` with `status: "interrupted"`, but
 no `item/completed`; `thread/read` continued to expose the item as
 `status: "inProgress"`.

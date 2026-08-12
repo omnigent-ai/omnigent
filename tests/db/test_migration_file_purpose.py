@@ -9,7 +9,7 @@ from alembic import command
 
 from omnigent.db.utils import _build_alembic_config
 
-_PRIOR_REVISION = "f7a8b9c0d1e2"
+_PRIOR_REVISION = "d5e9f1a2b3c4"
 _THIS_REVISION = "a8c4e1f6b2d9"
 _INDEX = "ix_files_session_id_created_at"
 
