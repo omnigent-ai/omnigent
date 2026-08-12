@@ -7694,6 +7694,15 @@ _MARKER_ONLY_JPEGS: dict[str, str] = {
         "rst0-only": b"\xff\xd8\xff\xd0",
         "empty-sos": b"\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS + b"\xff\xd9",
         "repeated-soi": b"\xff\xd8\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS + b"\x01\x02\xff\xd9",
+        # A scan whose "entropy data" is only a restart marker (or a run
+        # of them, or fill bytes) carries no compressed data at all. The
+        # cursor still advances past those bytes, so tracking progress
+        # instead of content accepted these.
+        "restart-only-entropy": (b"\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS + b"\xff\xd0" + b"\xff\xd9"),
+        "restart-run-only-entropy": (
+            b"\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS + b"\xff\xd0\xff\xd1\xff\xd2" + b"\xff\xd9"
+        ),
+        "fill-only-entropy": b"\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS + b"\xff\xff" + b"\xff\xd9",
     }.items()
 }
 
@@ -8160,9 +8169,11 @@ def test_marker_only_pseudo_jpegs_stay_raw(case: str, form: str) -> None:
     """
     Marker-only pseudo-JPEGs stay raw text in every persisted form.
 
-    SOI+EOI, APP0-only, DHT-only, RST-only, empty-SOS, and repeated-SOI
-    byte strings carry no frame or scan; converting them would emit
-    image blocks Claude rejects on every resume.
+    SOI+EOI, APP0-only, DHT-only, RST-only, empty-SOS, repeated-SOI, and
+    restart/fill-only-entropy byte strings carry no frame or no real
+    scan; converting them would emit image blocks Claude rejects on
+    every resume. Each stays small, so it also stays raw rather than
+    collapsing to the oversized-payload placeholder.
     """
     payload = _MARKER_ONLY_JPEGS[case]
     image_object = json.dumps(
@@ -8181,6 +8192,107 @@ def test_marker_only_pseudo_jpegs_stay_raw(case: str, form: str) -> None:
     records = _image_output_records(output)
     assert len(records) == 1
     assert records[0]["message"]["content"][0]["content"] == output
+
+
+def test_jpeg_scan_needs_entropy_content_not_just_framing_bytes() -> None:
+    """
+    Only real entropy content makes a scan; restart/fill bytes do not.
+
+    Inside a scan, ordinary bytes and stuffed ``FF00`` literals are
+    compressed data, while restart markers (``FFD0``-``FFD7``) and runs
+    of fill ``FF`` bytes are framing. Both kinds advance the cursor, so
+    an emptiness check based on "did we move?" accepted a scan built
+    purely from framing — e.g. ``SOI + SOF + SOS + FFD0 + EOI`` walked
+    to a terminal EOI and validated. Content has to be tracked
+    separately from progress.
+    """
+    prefix = b"\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS
+    framing_only = {
+        "one restart marker": b"\xff\xd0",
+        "run of restart markers": b"\xff\xd0\xff\xd1\xff\xd2",
+        "fill bytes": b"\xff\xff",
+        "fill then restart": b"\xff\xff\xff\xd0",
+    }
+    for label, entropy in framing_only.items():
+        assert not claude_native._is_structurally_valid_jpeg(prefix + entropy + b"\xff\xd9"), label
+    real_content = {
+        "ordinary bytes": b"\x01\x02",
+        "stuffed FF00 literal": b"\xff\x00",
+        "restart marker then content": b"\xff\xd0\x01\x02",
+        "content then restart marker": b"\x01\x02\xff\xd0",
+        # Fill bytes are only legal immediately before a marker, so
+        # "fill then content" is not a shape a JPEG can hold: the fill
+        # run's last 0xFF pairs with the following byte as a marker.
+        "content then fill before EOI": b"\x01\x02\xff\xff",
+    }
+    for label, entropy in real_content.items():
+        assert claude_native._is_structurally_valid_jpeg(prefix + entropy + b"\xff\xd9"), label
+    # The helper reports the resume offset only when content was seen.
+    payload = prefix + b"\x01\x02\xff\xd9"
+    assert claude_native._jpeg_skip_entropy_data(payload, len(prefix)) == len(payload) - 2
+    assert claude_native._jpeg_skip_entropy_data(prefix + b"\xff\xd0\xff\xd9", len(prefix)) is None
+    # Genuine multi-scan and baseline fixtures are unaffected.
+    for mime_type, fixture in (
+        ("image/jpeg", _TINY_JPEG_BASE64),
+        ("image/jpeg", _TINY_PROGRESSIVE_JPEG_BASE64),
+        ("image/jpeg", _TINY_PROGRESSIVE_GRAY_JPEG_BASE64),
+        ("image/jpeg", _TINY_CMYK_JPEG_BASE64),
+    ):
+        assert claude_native._is_supported_image_payload(fixture, mime_type)
+
+
+def test_oversized_invalid_image_collapses_instead_of_replaying_base64() -> None:
+    """
+    Rejecting a big invalid image must not cost more than accepting it.
+
+    An image-shaped payload that fails structural validation cannot
+    become an image block, and the fallback keeps the raw string as
+    ``tool_result`` content — which for a large payload replays the whole
+    base64 as prompt text, exactly the shape that overflowed the context
+    window. Past ``_MAX_INVALID_IMAGE_REPLAY_CHARS`` the payload is
+    dropped for the short omitted-image placeholder instead; small
+    invalid snippets still replay verbatim so their text survives.
+    """
+    oversized = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 40_000).decode()
+    assert len(oversized) > claude_native._MAX_INVALID_IMAGE_REPLAY_CHARS
+    assert not claude_native._is_supported_image_payload(oversized, "image/jpeg")
+    image_object = json.dumps(
+        {"type": "image", "data": oversized, "mimeType": "image/jpeg"},
+        separators=(",", ":"),
+    )
+    forms = {
+        "lone": image_object,
+        "mixed": f"screenshot follows\n{image_object}",
+        "array": json.dumps(
+            [{"type": "image", "data": oversized, "mimeType": "image/jpeg"}],
+            separators=(",", ":"),
+        ),
+    }
+    for form, output in forms.items():
+        records = _image_output_records(output)
+        assert len(records) == 1, form
+        rendered = json.dumps(records[0])
+        # The payload is gone from the whole record — content and metadata.
+        assert oversized[:64] not in rendered, form
+        assert "omitted from history" in rendered, form
+        # And the record cannot recreate the overflow: it is a tiny
+        # fraction of the payload it replaced.
+        assert len(rendered) < len(oversized) // 10, form
+    # The mixed form keeps its text alongside the placeholder.
+    mixed_records = _image_output_records(forms["mixed"])
+    content = mixed_records[0]["message"]["content"][0]["content"]
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "screenshot follows"}
+    assert "omitted from history" in content[1]["text"]
+    # Below the threshold nothing changes: the raw string still replays.
+    small = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 64).decode()
+    assert len(small) <= claude_native._MAX_INVALID_IMAGE_REPLAY_CHARS
+    small_output = json.dumps(
+        [{"type": "image", "data": small, "mimeType": "image/jpeg"}],
+        separators=(",", ":"),
+    )
+    small_records = _image_output_records(small_output)
+    assert small_records[0]["message"]["content"][0]["content"] == small_output
 
 
 def test_image_payload_validator_rejects_corrupt_structure() -> None:
@@ -8216,7 +8328,7 @@ def test_image_payload_validator_rejects_corrupt_structure() -> None:
     # Marker-only pseudo-JPEGs and invalid scan state reject.
     for payload in _MARKER_ONLY_JPEGS.values():
         assert not claude_native._is_supported_image_payload(payload, "image/jpeg")
-    sos_before_sof = base64.b64encode(b"\xff\xd8" + _FAKE_SOS + b"\x01\x02\xff\d9").decode()
+    sos_before_sof = base64.b64encode(b"\xff\xd8" + _FAKE_SOS + b"\x01\x02\xff\xd9").decode()
     assert not claude_native._is_supported_image_payload(sos_before_sof, "image/jpeg")
     ns_zero_sos = base64.b64encode(
         b"\xff\xd8" + _FAKE_SOF0 + b"\xff\xda\x00\x06\x00\x00\x3f\x00\x01\x02\xff\xd9"

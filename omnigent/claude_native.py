@@ -4659,6 +4659,14 @@ def _tool_use_result_for_content(
     ``tool_result`` content the model re-sees. Image-free results keep
     the legacy passthrough so their representation is unchanged.
 
+    A payload the blocks *dropped* needs the same treatment. When an
+    oversized invalid image is collapsed to a placeholder, the content no
+    longer carries its base64 — but the legacy passthrough would, and for
+    the newline-joined shape it is not JSON, so shape-keyed redaction
+    never sees it. Mirroring the raw output there would put the payload
+    straight back into the transcript, so a large passthrough is replaced
+    by the block list whenever blocks were rehydrated at all.
+
     :param output: The persisted tool-result string.
     :param content_blocks: Rehydrated blocks, or ``None`` when the
         output is not a recognized block shape.
@@ -4667,7 +4675,10 @@ def _tool_use_result_for_content(
     """
     if content_blocks is not None and _image_payloads_in_blocks(content_blocks):
         return json.dumps(_redact_binary_blocks(content_blocks), separators=(",", ":"))
-    return _json_safe_tool_use_result(output)
+    legacy = _json_safe_tool_use_result(output)
+    if content_blocks is not None and len(legacy) > _MAX_INVALID_IMAGE_REPLAY_CHARS:
+        return json.dumps(_redact_binary_blocks(content_blocks), separators=(",", ":"))
+    return legacy
 
 
 def _tool_use_result_payload_omitted(media_type: str, _payload_length: int) -> str:
@@ -4794,6 +4805,11 @@ def _claude_tool_result_content_blocks(output: str) -> list[_JsonObject] | None:
         return _claude_blocks_from_parsed_list(parsed)
     if isinstance(parsed, dict):
         block = _claude_image_block_from_object(parsed)
+        if block is None:
+            # A lone MCP image object is how a single screenshot
+            # persists, so an oversized unconvertible one is exactly the
+            # payload that must not replay as text.
+            block = _oversized_invalid_image_placeholder(parsed)
         return [block] if block is not None else None
     if parsed is not None:
         # A JSON scalar (number, string, bool) — not block content.
@@ -4824,7 +4840,14 @@ def _claude_blocks_from_parsed_list(parsed: list[object]) -> list[_JsonObject] |
         if block_type == "image":
             image_block = _claude_image_block_from_object(block)
             if image_block is None:
-                return None
+                # Unconvertible: keep the raw string (caller's fallback)
+                # unless the payload is big enough that replaying it as
+                # text is itself the overflow risk.
+                placeholder = _oversized_invalid_image_placeholder(block)
+                if placeholder is None:
+                    return None
+                blocks.append(placeholder)
+                continue
             blocks.append(image_block)
             continue
         return None
@@ -4871,6 +4894,89 @@ _JPEG_SOF_MARKERS = frozenset(
 )
 
 
+def _jpeg_frame_header_valid(segment: bytes) -> bool:
+    """
+    Check one Start-of-Frame header for self-consistency.
+
+    Layout after the marker: length (2) + sample precision (1) + height
+    (2) + width (2) + component count (1) + 3 bytes per component, so a
+    legal header is exactly ``8 + 3 * Nf`` bytes and the smallest one
+    (a single component) is 11.
+
+    :param segment: The SOF segment, starting at its length field.
+    :returns: True when both dimensions are non-zero and the declared
+        length matches the component count.
+    """
+    if len(segment) < 11:
+        return False
+    (height, width) = struct.unpack(">HH", segment[3:7])
+    components = segment[7]
+    if height == 0 or width == 0 or components == 0:
+        return False
+    return len(segment) == 8 + 3 * components
+
+
+def _jpeg_scan_header_valid(segment: bytes) -> bool:
+    """
+    Check one Start-of-Scan header for self-consistency.
+
+    Layout after the marker: length (2) + scan-component count (1) +
+    2 bytes per scan component + Ss/Se/AhAl (3), so a legal header is
+    exactly ``6 + 2 * Ns`` bytes and the smallest one (a single
+    component) is 8.
+
+    :param segment: The SOS segment, starting at its length field.
+    :returns: True when at least one component participates and the
+        declared length matches the scan-component count.
+    """
+    if len(segment) < 8:
+        return False
+    scan_components = segment[2]
+    if scan_components == 0:
+        return False
+    return len(segment) == 6 + 2 * scan_components
+
+
+def _jpeg_skip_entropy_data(data: bytes, offset: int) -> int | None:
+    """
+    Skip a scan's entropy-coded data, stopping at the next real marker.
+
+    Inside a scan, ``FF00`` is a stuffed literal ``0xFF`` byte,
+    ``FFD0``-``FFD7`` are restart markers, and a run of ``FF`` bytes is
+    fill. Only ordinary bytes and stuffed literals are entropy
+    *content*: restart markers and fill bytes are framing, so a "scan"
+    built solely from them carries no compressed data and is not a legal
+    scan. Tracking content separately from mere progress is what rejects
+    ``SOI + SOF + SOS + FFD0 + EOI``, which otherwise walks cleanly to a
+    terminal EOI because the restart marker advances the cursor.
+
+    :param data: The whole JPEG payload.
+    :param offset: Index of the first byte after the SOS header.
+    :returns: The offset of the next real marker's ``0xFF`` byte, or
+        ``None`` when the payload ends inside the scan or the scan
+        carries no entropy content at all.
+    """
+    has_content = False
+    while offset + 1 < len(data):
+        if data[offset] != 0xFF:
+            has_content = True
+            offset += 1
+            continue
+        following = data[offset + 1]
+        if following == 0x00:  # stuffed literal 0xFF — real entropy content
+            has_content = True
+            offset += 2
+            continue
+        if 0xD0 <= following <= 0xD7:  # restart marker — framing, not content
+            offset += 2
+            continue
+        if following == 0xFF:  # fill byte — framing, not content
+            offset += 1
+            continue
+        return offset if has_content else None  # real marker ends the scan
+    return None  # payload ended inside entropy data
+
+
 def _is_structurally_valid_jpeg(data: bytes) -> bool:
     """
     Walk the JPEG marker stream, across every scan, to a terminal EOI.
@@ -4880,14 +4986,15 @@ def _is_structurally_valid_jpeg(data: bytes) -> bool:
     a syntactically valid Start of Frame (non-zero dimensions, component
     count consistent with its length) must precede any scan; every Start
     of Scan header must be length/component-consistent and followed by
-    at least one byte of entropy data; repeated SOI and restart markers
-    outside entropy data are corrupt. After a scan, entropy-coded data
-    is skipped until a real (non-stuffed, non-fill, non-restart) marker
-    and marker parsing resumes, so progressive/multi-scan files with
-    interleaved table/metadata segments (DHT/DQT/DNL/DRI/APPn/...) and
-    further SOS scans validate. The payload is accepted only when an
-    EOI marker is the final two bytes after at least one scan — strict
-    EOF, no trailing-byte tolerance.
+    real entropy *content* (ordinary bytes or stuffed ``FF00`` literals —
+    restart markers and fill bytes alone do not make a scan); repeated
+    SOI and restart markers outside entropy data are corrupt. After a
+    scan, entropy-coded data is skipped until a real (non-stuffed,
+    non-fill, non-restart) marker and marker parsing resumes, so
+    progressive/multi-scan files with interleaved table/metadata segments
+    (DHT/DQT/DNL/DRI/APPn/...) and further SOS scans validate. The
+    payload is accepted only when an EOI marker is the final two bytes
+    after at least one scan — strict EOF, no trailing-byte tolerance.
     """
     if not data.startswith(b"\xff\xd8"):
         return False
@@ -4919,49 +5026,23 @@ def _is_structurally_valid_jpeg(data: bytes) -> bool:
             return False
         segment = data[offset : offset + segment_length]
         if marker in _JPEG_SOF_MARKERS:
-            # length = 2 + 1 (precision) + 2 + 2 (dimensions) + 1 + 3*Nf
-            if segment_length < 11 or len(segment) < 8:
-                return False
-            (height, width) = struct.unpack(">HH", segment[3:7])
-            components = segment[7]
-            if height == 0 or width == 0 or components == 0:
-                return False
-            if segment_length != 8 + 3 * components:
+            if not _jpeg_frame_header_valid(segment):
                 return False
             seen_frame = True
         elif marker == 0xDA:
-            # SOS header: length = 2 + 1 (Ns) + 2*Ns + 3 (Ss/Se/AhAl),
-            # so the minimum legal header is 8 for a one-component scan.
-            if not seen_frame or segment_length < 8:
-                return False
-            scans = segment[2]
-            if scans == 0 or segment_length != 6 + 2 * scans:
+            if not seen_frame or not _jpeg_scan_header_valid(segment):
                 return False
             seen_scan = True
         offset += segment_length
         if marker != 0xDA:
             continue
         # Start of Scan: skip entropy-coded data up to the next real
-        # marker (stuffed FF00, fill FFs, and restart markers skipped).
-        # An empty scan (a real marker immediately after the header) is
-        # not a legal scan.
-        entropy_start = offset
-        while offset + 1 < len(data):
-            if data[offset] != 0xFF:
-                offset += 1
-                continue
-            following = data[offset + 1]
-            if following == 0x00 or 0xD0 <= following <= 0xD7:
-                offset += 2
-                continue
-            if following == 0xFF:
-                offset += 1
-                continue
-            break  # real marker: resume segment parsing at its 0xFF
-        else:
-            return False  # payload ends inside entropy data
-        if offset == entropy_start:
-            return False  # empty scan: no entropy data at all
+        # marker. A scan carrying only restart markers and/or fill bytes
+        # holds no compressed data and is rejected there.
+        resumed = _jpeg_skip_entropy_data(data, offset)
+        if resumed is None:
+            return False
+        offset = resumed
 
 
 def _is_structurally_valid_gif(data: bytes) -> bool:
@@ -5054,6 +5135,19 @@ _IMAGE_STRUCTURE_CHECK_BY_MEDIA_TYPE: dict[str, Callable[[bytes], bool]] = {
     "image/webp": _is_structurally_valid_webp,
 }
 
+#: Base64 length (in characters) above which an image-shaped tool result
+#: that fails structural validation is collapsed to a placeholder instead
+#: of replaying verbatim as prompt text. Rejecting a payload must not
+#: cost more than accepting it: an unconverted block keeps the raw string
+#: as ``tool_result`` content, so a large corrupt screenshot would replay
+#: as ~1 text token per 1.4 base64 chars — the very shape that overflowed
+#: the context window in the first place. 8 KiB (~6 KB of image data)
+#: sits far below any real screenshot (the smallest in the reported
+#: incident was 32,432 chars) and far above the short invalid snippets
+#: that docs, logs, and tests embed, which must keep replaying verbatim
+#: so their text survives for the model to read.
+_MAX_INVALID_IMAGE_REPLAY_CHARS = 8 * 1024
+
 
 def _is_supported_image_payload(data: str, media_type: str) -> bool:
     """
@@ -5110,6 +5204,39 @@ def _claude_image_block_from_object(value: object) -> _JsonObject | None:
     return {"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}}
 
 
+def _oversized_invalid_image_placeholder(value: object) -> _JsonObject | None:
+    """
+    Return a placeholder text block for a large unconvertible image object.
+
+    Applies only where :func:`_claude_image_block_from_object` has already
+    declined: the object is image-shaped but its payload failed structural
+    validation, so it cannot become an image block. Keeping such a payload
+    as raw text is safe for a short snippet but not for a big one, which
+    would replay its whole base64 into the prompt — so past
+    :data:`_MAX_INVALID_IMAGE_REPLAY_CHARS` the payload is dropped in
+    favor of the same short placeholder the history-stripping path uses,
+    naming the declared type so the agent knows what it lost and how to
+    recover it.
+
+    :param value: Decoded JSON value the image conversion rejected, e.g.
+        ``{"type": "image", "data": "<corrupt>", "mimeType": "image/png"}``.
+    :returns: ``{"type": "text", "text": "[... omitted ...]"}`` for an
+        oversized image-shaped object; ``None`` otherwise, so small
+        payloads and non-image values keep their existing behavior.
+    """
+    block = _json_object(value)
+    if block is None or block.get("type") != "image":
+        return None
+    data = block.get("data")
+    if not isinstance(data, str) or len(data) <= _MAX_INVALID_IMAGE_REPLAY_CHARS:
+        return None
+    from omnigent.runtime.prompt import _image_omitted_placeholder
+
+    mime = block.get("mimeType")
+    placeholder = _image_omitted_placeholder(mime if isinstance(mime, str) else None)
+    return {"type": "text", "text": placeholder}
+
+
 def _claude_blocks_from_newline_joined(output: str) -> list[_JsonObject] | None:
     """
     Recover blocks from newline-joined mixed text + image JSON.
@@ -5124,7 +5251,9 @@ def _claude_blocks_from_newline_joined(output: str) -> list[_JsonObject] | None:
 
     :param output: The persisted tool-result string.
     :returns: Content blocks when at least one line holds an image
-        object; ``None`` otherwise (caller keeps the raw string).
+        object — converted when its payload validates, else collapsed to
+        a placeholder when the payload is too large to replay as text;
+        ``None`` otherwise (caller keeps the raw string).
     """
     if "\n" not in output:
         return None
@@ -5135,9 +5264,15 @@ def _claude_blocks_from_newline_joined(output: str) -> list[_JsonObject] | None:
         image_block: _JsonObject | None = None
         if line.lstrip()[:1] == "{":
             try:
-                image_block = _claude_image_block_from_object(json.loads(line))
+                parsed_line: object | None = json.loads(line)
             except (json.JSONDecodeError, ValueError):
-                image_block = None
+                parsed_line = None
+            if parsed_line is not None:
+                image_block = _claude_image_block_from_object(parsed_line)
+                if image_block is None:
+                    # An oversized unconvertible image line becomes a
+                    # placeholder rather than replaying its base64 as text.
+                    image_block = _oversized_invalid_image_placeholder(parsed_line)
         if image_block is None:
             text_lines.append(line)
             continue
