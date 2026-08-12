@@ -337,7 +337,10 @@ describe("SettingsPage", () => {
     renderPage("/settings/appearance");
     expect(screen.getByRole("radiogroup", { name: "Default Agents view" })).toBeInTheDocument();
     expect(screen.getByTestId("agents-view-default-list")).toHaveAttribute("aria-checked", "true");
-    expect(screen.getByTestId("agents-view-default-graph")).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByTestId("agents-view-default-graph")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
     expect(localStorage.getItem("omnigent:default-agents-view")).toBeNull();
   });
 
