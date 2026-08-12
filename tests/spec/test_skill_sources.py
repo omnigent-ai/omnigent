@@ -293,6 +293,16 @@ def test_codex_provider_surfaces_home_codex_skills(tmp_path: Path) -> None:
     assert "using-superpowers" in [s.name for s in out]
 
 
+def test_codex_provider_surfaces_shared_agent_skills(tmp_path: Path) -> None:
+    """Codex slash menu includes skills from its shared Agent Skills root."""
+    home = tmp_path / "home"
+    _write_skill(home / ".agents" / "skills", "ask-matt")
+
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "codex-native")
+
+    assert "ask-matt" in [s.name for s in out]
+
+
 def test_codex_provider_respects_none_filter(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _write_skill(home / ".codex" / "skills", "using-superpowers")
