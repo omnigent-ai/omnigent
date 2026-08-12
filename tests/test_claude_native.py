@@ -4848,6 +4848,81 @@ async def test_resolve_cold_resume_args_replaces_existing_local_claude_transcrip
 
 
 @pytest.mark.asyncio
+async def test_ensure_local_claude_resume_transcript_repairs_stale_duplicated_image(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    An already-generated transcript with the old duplicate self-heals.
+
+    Pre-fix rebuilds wrote an intact image's base64 twice — once in the
+    rehydrated ``tool_result`` content block and again verbatim in
+    ``toolUseResult``. The resume helper always rewrites the transcript
+    from Omnigent items before launch (no cache, no migration), so a
+    stale affected file is repaired on the next resume: after the
+    rebuild the payload must appear exactly once.
+    """
+    b64 = "iVBORw0KGgo" + "D" * 5000
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    projects = tmp_path / "claude-projects"
+    transcript_path = (
+        projects
+        / claude_native._sanitize_claude_project_name(str(workspace.resolve()))
+        / "claude-uuid-img.jsonl"
+    )
+    transcript_path.parent.mkdir(mode=0o700, parents=True)
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": b64},
+    }
+    stale_record = {
+        "type": "user",
+        "sessionId": "claude-uuid-img",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": [image_block]}
+            ],
+        },
+        "toolUseResult": json.dumps([image_block], separators=(",", ":")),
+    }
+    transcript_path.write_text(json.dumps(stale_record) + "\n", encoding="utf-8")
+    assert transcript_path.read_text(encoding="utf-8").count(b64) == 2, "pre-fix wedged state"
+
+    image_item = {
+        "id": "fco_1",
+        "response_id": "resp_1",
+        "type": "function_call_output",
+        "call_id": "toolu_1",
+        "output": json.dumps([image_block], separators=(",", ":")),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the AP-authoritative item page carrying the image output."""
+        del request
+        return httpx.Response(200, json=_items_response_body([image_item]))
+
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        written = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_abc",
+            external_session_id="claude-uuid-img",
+            workspace=workspace.resolve(),
+        )
+
+    assert written == transcript_path
+    text = written.read_text(encoding="utf-8")
+    assert text.count(b64) == 1, "rebuild must drop the duplicated toolUseResult base64"
+    record = json.loads(text.splitlines()[0])
+    content = record["message"]["content"][0]["content"]
+    assert content[0]["source"]["data"] == b64, "the model-visible image must survive"
+    assert b64 not in record["toolUseResult"]
+
+
+@pytest.mark.asyncio
 async def test_resolve_cold_resume_args_warns_when_external_session_id_missing(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -7190,12 +7265,11 @@ def test_websocket_connect_no_ssl_context_for_ws(
         ),
         # Ordinary plain text must also round-trip to a string.
         ("plain text output", "plain text output"),
-        # Already-JSON output (e.g. an image content-block array) must pass
-        # through verbatim, not get double-encoded into a string literal.
-        (
-            '[{"type":"image","source":{"type":"base64","data":"AAA"}}]',
-            [{"type": "image", "source": {"type": "base64", "data": "AAA"}}],
-        ),
+        # Already-JSON output must pass through verbatim, not get
+        # double-encoded into a string literal. (An *image* block array is
+        # JSON too, but its inline base64 is redacted from toolUseResult —
+        # covered by the dedicated redaction tests below.)
+        ('{"a":1}', {"a": 1}),
     ],
 )
 def test_claude_transcript_tool_use_result_is_json_parseable(
@@ -7252,6 +7326,129 @@ def test_json_safe_tool_use_result_wraps_non_json() -> None:
     assert claude_native._json_safe_tool_use_result("42") == "42"
     # A JSON object string passes through unchanged.
     assert claude_native._json_safe_tool_use_result('{"a":1}') == '{"a":1}'
+
+
+def _image_output_records(output: str) -> list[dict[str, Any]]:
+    """Run one ``function_call_output`` item through the shared converter.
+
+    Both fork carry-history rebuilds and cold resumes funnel through
+    ``_claude_transcript_records_from_session_items``, so record-level
+    coverage here protects both launch paths at once.
+    """
+    items: list[dict[str, Any]] = [
+        {
+            "id": "fco_1",
+            "response_id": "resp_1",
+            "type": "function_call_output",
+            "call_id": "toolu_1",
+            "output": output,
+        }
+    ]
+    return claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+
+
+def test_tool_use_result_redacts_inline_image_base64() -> None:
+    """
+    An intact replayed image exists exactly once in the rebuilt record.
+
+    The structured ``tool_result`` content block keeps the real base64 —
+    that is the image the model re-sees on ``--resume``. The
+    ``toolUseResult`` metadata copy is replaced with a short marker, so a
+    single screenshot no longer doubles its ~250K-token payload in the
+    resumed transcript. Non-binary fields (media type, sibling text,
+    renderer metadata) survive the redaction.
+    """
+    b64 = "iVBORw0KGgo" + "A" * 5000
+    output = json.dumps(
+        [
+            {"type": "text", "text": "screenshot taken"},
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": b64},
+                "width": 1280,
+            },
+        ],
+        separators=(",", ":"),
+    )
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    # The model-visible image survives intact in the content block.
+    content = record["message"]["content"][0]["content"]
+    assert content[0] == {"type": "text", "text": "screenshot taken"}
+    assert content[1]["source"]["data"] == b64
+    # The metadata copy is redacted but keeps its shape and non-binary fields.
+    tool_use_result = json.loads(record["toolUseResult"])
+    assert tool_use_result[0] == {"type": "text", "text": "screenshot taken"}
+    redacted_source = tool_use_result[1]["source"]
+    assert b64 not in redacted_source["data"]
+    assert "image/png" in redacted_source["data"]
+    assert redacted_source["media_type"] == "image/png"
+    assert tool_use_result[1]["width"] == 1280
+    # Whole-record invariant: the payload exists exactly once.
+    assert json.dumps(record).count(b64) == 1
+
+
+def test_tool_use_result_redaction_is_tool_name_independent() -> None:
+    """
+    Redaction keys on the payload shape, not the tool that produced it.
+
+    Any tool or MCP server returning inline image data (e.g. a browser
+    screenshot tool returning an object with a nested image block) gets
+    the same treatment as a built-in image result: the payload leaves
+    ``toolUseResult`` and is carried once by the ``tool_result`` content.
+    Object-shaped output is not a text/image block array, so the content
+    stays the raw string — the one surviving copy of the payload.
+    """
+    b64 = "U05BUFNIT1Q" + "B" * 4000
+    output = json.dumps(
+        {
+            "tool": "mcp__browser__screenshot",
+            "status": "ok",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+                }
+            ],
+        },
+        separators=(",", ":"),
+    )
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    assert record["message"]["content"][0]["content"] == output
+    tool_use_result = json.loads(record["toolUseResult"])
+    assert tool_use_result["tool"] == "mcp__browser__screenshot"
+    assert tool_use_result["status"] == "ok"
+    redacted_block = tool_use_result["content"][0]
+    assert b64 not in json.dumps(redacted_block)
+    assert "image/jpeg" in redacted_block["source"]["data"]
+    assert json.dumps(record).count(b64) == 1
+
+
+def test_tool_use_result_redacts_inline_data_uris() -> None:
+    """A ``data:`` URI is an inline base64 copy too; it is redacted as well."""
+    b64 = "R0lGODdh" + "C" * 3000
+    output = json.dumps(
+        {"preview": f"data:image/gif;base64,{b64}", "ok": True},
+        separators=(",", ":"),
+    )
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    assert record["message"]["content"][0]["content"] == output
+    tool_use_result = json.loads(record["toolUseResult"])
+    assert b64 not in tool_use_result["preview"]
+    assert "image/gif" in tool_use_result["preview"]
+    assert tool_use_result["ok"] is True
+    assert json.dumps(record).count(b64) == 1
 
 
 def test_claude_tool_result_content_blocks_rehydrates_only_block_arrays() -> None:

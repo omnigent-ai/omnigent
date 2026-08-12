@@ -4539,6 +4539,22 @@ def _json_object_from_string(value: object) -> _JsonObject:
     return _json_object(parsed) or {}
 
 
+def _tool_use_result_payload_omitted(media_type: str, _payload_length: int) -> str:
+    """
+    Build the marker written over a redacted ``toolUseResult`` payload.
+
+    The payload length is deliberately unused: the marker is synthesized
+    fresh on every transcript rebuild, so it only needs to point at the
+    surviving copy, not describe the dropped one.
+
+    :param media_type: The block's declared media type, if any.
+    :param _payload_length: Unused.
+    :returns: The replacement text.
+    """
+    label = media_type or "binary"
+    return f"[{label} payload omitted from toolUseResult; kept in the tool_result content]"
+
+
 def _json_safe_tool_use_result(output: str) -> str:
     """
     Return a ``toolUseResult`` value Claude Code can ``JSON.parse``.
@@ -4550,11 +4566,21 @@ def _json_safe_tool_use_result(output: str) -> str:
     before the input prompt renders — so the whole resume fails and the
     first web-UI message is never delivered.
 
-    Outputs that are already JSON (e.g. an image content-block array)
-    pass through verbatim; anything else is wrapped as a JSON string
-    literal so the parse always succeeds. The plain-text output still
-    lives verbatim in the ``tool_result`` content block, so this does
-    not change what the model or the web UI sees.
+    Outputs that are already JSON pass through verbatim; anything else
+    is wrapped as a JSON string literal so the parse always succeeds.
+    The plain-text output still lives verbatim in the ``tool_result``
+    content block, so this does not change what the model or the web UI
+    sees.
+
+    One exception to the verbatim passthrough: inline binary payloads
+    (base64 ``image``/``document``/``file`` blocks and ``data:`` URIs)
+    are replaced with a short marker. The ``tool_result`` content block
+    already carries that payload once — the image the model re-sees — so
+    the metadata copy is pure duplication: a single intact screenshot
+    would otherwise double its ~250K-token base64 in the resumed
+    transcript. Redaction keys on the payload *shape*, so any tool or
+    MCP server returning inline image data is covered; non-binary JSON
+    structure, text, and renderer metadata are preserved.
 
     :param output: The tool result string synthesized for the
         transcript, e.g. ``"<retrieval_status>timeout</...>"`` or
@@ -4563,9 +4589,14 @@ def _json_safe_tool_use_result(output: str) -> str:
         ``toolUseResult`` field.
     """
     try:
-        json.loads(output)
+        parsed = json.loads(output)
     except (json.JSONDecodeError, ValueError):
         return json.dumps(output)
+    from omnigent.llms.adapters._content import redact_binary_payloads
+
+    redacted = redact_binary_payloads(parsed, _tool_use_result_payload_omitted)
+    if redacted != parsed:
+        return json.dumps(redacted, separators=(",", ":"))
     return output
 
 
