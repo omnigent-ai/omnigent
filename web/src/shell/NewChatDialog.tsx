@@ -128,6 +128,7 @@ import {
   smartRoutingUnavailableReason,
   type SmartRoutingUnavailableCause,
 } from "@/lib/smartRoutingAvailability";
+import { normalizeProjectDirectories } from "@/lib/projectsApi";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { partitionAgentsByKind, sortAgentsForDisplay } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
@@ -1867,6 +1868,7 @@ interface LandingDraft {
   sandboxRepoUrl: string;
   sandboxRepoBranch: string;
   workspace: string;
+  additionalDirectories: string[];
   branchName: string;
   prefilledBranch: string;
   permissionMode: string;
@@ -2100,6 +2102,9 @@ export function NewChatLandingScreen() {
     () => landingDraft?.sandboxRepoBranch ?? "",
   );
   const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
+  const [additionalDirectories, setAdditionalDirectories] = useState<string[]>(
+    () => landingDraft?.additionalDirectories ?? [],
+  );
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
   // The base branch auto-fills from the configured default (Settings › Git)
   // when the user names a worktree branch, and is left alone once the user
@@ -2230,6 +2235,7 @@ export function NewChatLandingScreen() {
     sandboxRepoUrl,
     sandboxRepoBranch,
     workspace,
+    additionalDirectories,
     branchName,
     prefilledBranch,
     permissionMode,
@@ -2322,6 +2328,7 @@ export function NewChatLandingScreen() {
     return {
       hostId: c.host_id,
       workspace: c.workspace,
+      directories: normalizeProjectDirectories(c.directories, c.workspace).map((d) => d.path),
       agentId: c.agent_id,
       useWorktree: c.use_worktree,
     };
@@ -2378,6 +2385,7 @@ export function NewChatLandingScreen() {
     setSelectedHostId(null);
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
     setWorkspace("");
+    setAdditionalDirectories([]);
     setBranchName("");
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
@@ -3141,6 +3149,9 @@ export function NewChatLandingScreen() {
     if (writes.workspace !== undefined) {
       setWorkspace((cur) => (cur === "" ? writes.workspace! : cur));
     }
+    if (writes.directories !== undefined) {
+      setAdditionalDirectories((cur) => (cur.length === 0 ? writes.directories! : cur));
+    }
     setPrefill(step.state);
   }, [
     prefill,
@@ -3470,6 +3481,7 @@ export function NewChatLandingScreen() {
     // Workspace is host-specific — clear it and let the seeding effect run for
     // the new host.
     setWorkspace("");
+    setAdditionalDirectories([]);
     seededHostRef.current = null;
   }
 
@@ -3484,6 +3496,7 @@ export function NewChatLandingScreen() {
     setSandboxSelected(true);
     setSelectedHostId(null);
     setWorkspace("");
+    setAdditionalDirectories([]);
     seededHostRef.current = null;
   }
 
@@ -3529,6 +3542,10 @@ export function NewChatLandingScreen() {
     submittedRef.current = true;
     try {
       const trimmedBranch = branchName.trim();
+      const primaryDirectory = normalizeWorkspacePath(workspaceTrimmed);
+      const attachedDirectories = additionalDirectories.filter(
+        (path) => normalizeWorkspacePath(path) !== primaryDirectory,
+      );
       // `shouldCreateWorktree` (component scope): true only when a branch is
       // named and the workspace isn't already an existing worktree. Starting
       // in an existing worktree sends no git opts — the workspace is bound
@@ -3615,6 +3632,9 @@ export function NewChatLandingScreen() {
         // session groups under its project from its first sidebar appearance,
         // same as the JSON path (see `createLabels`).
         if (selectedProject) metadata.labels = { [PROJECT_LABEL_KEY]: selectedProject };
+        if (attachedDirectories.length > 0) {
+          metadata.directories = attachedDirectories.map((path) => ({ path }));
+        }
         data = await createBundledSession(
           bundle,
           metadata as Parameters<typeof createBundledSession>[1],
@@ -3675,6 +3695,10 @@ export function NewChatLandingScreen() {
               : {
                   host_id: selectedHostId,
                   workspace: workspaceTrimmed,
+                  directories:
+                    attachedDirectories.length > 0
+                      ? attachedDirectories.map((path) => ({ path }))
+                      : undefined,
                   // Create a new worktree, or bind an existing one
                   // (`existing_worktree` records the branch for the sidebar +
                   // delete flow without creating anything), or neither.

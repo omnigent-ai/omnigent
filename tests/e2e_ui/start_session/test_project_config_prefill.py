@@ -35,6 +35,7 @@ _HOST_ID = "host_e2e_cfg"
 _PROJECT_ID = "proj_e2e_cfg"
 _PROJECT_NAME = "ConfiguredProject"
 _CONFIG_WORKSPACE = "/work/configured-repo"
+_CONFIG_DIRECTORIES = ("/work/shared", "/work/docs")
 # Bare create endpoint (POST captured); NOT the /{id}/... sub-routes.
 _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
 # One project config endpoint: /v1/projects/<id> (not the bare list).
@@ -115,6 +116,7 @@ def _project_config_body() -> str:
             "config": {
                 "host_id": _HOST_ID,
                 "workspace": _CONFIG_WORKSPACE,
+                "directories": [{"path": path} for path in _CONFIG_DIRECTORIES],
                 "agent_id": "ag_pinned_e2e",
             },
         }
@@ -211,6 +213,7 @@ async def _drive_prefill(base_url: str, session_id: str) -> None:
             assert body["agent_id"] == "ag_pinned_e2e", body
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == _CONFIG_WORKSPACE, body
+            assert body["directories"] == [{"path": path} for path in _CONFIG_DIRECTORIES], body
         finally:
             await browser.close()
 

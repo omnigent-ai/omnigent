@@ -18,6 +18,8 @@ type ProjectPrefillPhase = "location" | "settled";
 export interface ProjectPrefillConfig {
   hostId?: string;
   workspace?: string;
+  /** Additional directory roots to attach after the working directory. */
+  directories?: string[];
   agentId?: string;
   /** Opt-in worktree default; only `true` is meaningful (absent = no worktree). */
   useWorktree?: boolean;
@@ -70,6 +72,7 @@ interface ProjectPrefillWrites {
   hostId?: string;
   agentId?: string;
   workspace?: string;
+  directories?: string[];
   /** Select the managed sandbox as the target (config.hostId was the sandbox
    *  sentinel). Distinct from `hostId` — the sandbox is not a real host id. */
   selectSandbox?: boolean;
@@ -160,6 +163,7 @@ function locationStep(
     // handled by a dedicated post-settle effect once the workspace is in place
     // (see NewChatDialog's worktree effect).
     if (config!.workspace != null) writes.workspace = config!.workspace;
+    if (config!.directories != null) writes.directories = config!.directories;
   }
   return settled(state);
 }

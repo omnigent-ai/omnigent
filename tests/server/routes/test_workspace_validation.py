@@ -24,6 +24,7 @@ from omnigent.host.frames import (
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._workspace_validation import (
     WorkspaceValidationError,
+    validate_directory,
     validate_workspace,
 )
 
@@ -194,6 +195,26 @@ async def test_offline_host_rejected() -> None:
             spec_cwd=".",
         )
     assert "is offline" in exc_info.value.message
+
+
+async def test_additional_directory_is_canonicalized_without_primary_boundary(
+    host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
+) -> None:
+    """An independent project root only needs to exist on the same host."""
+    registry, _, _ = host_setup
+    _set_stat(
+        registry,
+        "/Users/corey/other-repo-link",
+        canonical="/Volumes/projects/other-repo",
+    )
+
+    canonical = await validate_directory(
+        host_registry=registry,
+        host_id=_HOST_ID,
+        directory="/Users/corey/other-repo-link",
+    )
+
+    assert canonical == "/Volumes/projects/other-repo"
 
 
 # ── Step 4: workspace stat ──────────────────────────────

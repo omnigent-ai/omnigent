@@ -8,9 +8,17 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from omnigent.entities import Conversation
 
-SessionInitProtocolVersion: TypeAlias = Literal[2]
-SESSION_INIT_PROTOCOL_VERSION: SessionInitProtocolVersion = 2
+SessionInitProtocolVersion: TypeAlias = Literal[3]
+SESSION_INIT_PROTOCOL_VERSION: SessionInitProtocolVersion = 3
 SESSION_INIT_PAYLOAD_KEY = "session_init"
+
+
+class RunnerSessionDirectory(BaseModel):
+    """One stable project directory in a runner initialization snapshot."""
+
+    id: str
+    path: str
+    nickname: str | None = None
 
 
 class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
@@ -21,6 +29,7 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     created_at: int
     updated_at: int
     workspace: str | None = None
+    directories: list[RunnerSessionDirectory] = Field(default_factory=list)
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
     model_override: str | None = None
@@ -71,6 +80,14 @@ def build_runner_session_init_payload(
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,
             workspace=conversation.workspace,
+            directories=[
+                RunnerSessionDirectory(
+                    id=directory.id,
+                    path=directory.path,
+                    nickname=directory.nickname,
+                )
+                for directory in conversation.directories
+            ],
             labels=conversation.labels,
             reasoning_effort=conversation.reasoning_effort,
             model_override=conversation.model_override,
