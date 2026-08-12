@@ -5624,3 +5624,152 @@ def test_pi_turn_without_usage_leaves_usage_none() -> None:
         assert turn_complete[0].response == "Hi there"
 
     _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# Cancellation and handover liveness
+# ---------------------------------------------------------------------------
+
+
+def _handover_lines() -> list[str]:
+    """Events that drive a turn into an in-progress structured handover."""
+    return [
+        json.dumps({"type": "response", "success": True}),
+        json.dumps(
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "usage": {"totalTokens": 60_000},
+                    "stopReason": "end_turn",
+                },
+            }
+        ),
+        json.dumps({"type": "turn_end", "toolResults": [{"name": "sys_os_read"}]}),
+    ]
+
+
+def test_waiting_for_a_handover_reports_progress() -> None:
+    """A handover that outlives the poll interval says so, once per poll.
+
+    The scaffold fails a turn that goes quiet for 240 seconds. A handover is
+    one uninterrupted model call with a 300-second budget of its own, so
+    without a progress event on every poll the outer watchdog always wins and
+    the larger budget never applies.
+    """
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc(_handover_lines())
+        executor._smart_compaction = SmartCompactionConfig(
+            enabled=True,
+            trigger_tokens=1_000,
+            timeout_seconds=0.3,
+            poll_interval_seconds=0.05,
+        )
+        scripted = list(rpc._line_queue._queue)
+        rpc._line_queue = asyncio.Queue()
+
+        async def read_line(timeout=120.0):
+            if scripted:
+                rpc._last_read_timed_out = False
+                return scripted.pop(0)
+            # Every later read is the handover poll timing out. Capped so a
+            # regression that never starts the handover fails fast instead of
+            # sitting on the 120-second default.
+            await asyncio.sleep(min(timeout, 0.05))
+            rpc._last_read_timed_out = True
+            return None
+
+        rpc.read_line = read_line
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "keep going"}], [], "system"
+            )
+        ]
+
+        progress = [event for event in events if isinstance(event, ExecutorProgress)]
+        assert progress, "a silent poll loop is what the idle watchdog kills"
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert errors and "handover did not complete" in errors[-1].message
+
+    _run(_test())
+
+
+def test_cancelling_a_turn_interrupts_the_pi_session() -> None:
+    """Cancellation stops Pi instead of leaving it generating.
+
+    ``CancelledError`` is a ``BaseException``, so it bypasses every
+    ``except Exception`` boundary in the turn body. Without an explicit
+    interrupt the subprocess keeps running the abandoned request, and the
+    model call behind it keeps holding the accelerator.
+    """
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc(
+            [json.dumps({"type": "response", "success": True})]
+        )
+        interrupted: list[str] = []
+
+        async def fake_interrupt(session_key: str) -> bool:
+            interrupted.append(session_key)
+            return True
+
+        executor.interrupt_session = fake_interrupt
+
+        async def read_line(timeout=120.0):
+            del timeout
+            raise asyncio.CancelledError
+
+        rpc.read_line = read_line
+
+        with pytest.raises(asyncio.CancelledError):
+            async for _ in executor.run_turn(
+                [{"role": "user", "content": "review the PR"}], [], "system"
+            ):
+                pass
+
+        assert interrupted, "the Pi session must be interrupted before unwinding"
+
+    _run(_test())
+
+
+def test_a_completed_turn_does_not_interrupt_the_session() -> None:
+    """The interrupt is cancellation-only; a normal turn leaves the session up."""
+
+    async def _test() -> None:
+        executor = _executor_with_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "Done.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+        interrupted: list[str] = []
+
+        async def fake_interrupt(session_key: str) -> bool:
+            interrupted.append(session_key)
+            return True
+
+        executor.interrupt_session = fake_interrupt
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "hi"}], [], "system"
+            )
+        ]
+
+        assert any(isinstance(event, TurnComplete) for event in events)
+        assert not interrupted
+
+    _run(_test())

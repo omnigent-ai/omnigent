@@ -2807,6 +2807,33 @@ class PiExecutor(Executor):
         system_prompt: str,
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
+        """Run one turn, stopping Pi if the turn is cancelled.
+
+        ``CancelledError`` is a ``BaseException``, so a watchdog-cancelled turn
+        skips every ``except Exception`` boundary in the body below and unwinds
+        without telling Pi anything. The subprocess then keeps running the
+        request the scaffold has already given up on, and the model call behind
+        it keeps holding the accelerator — once observed as two generations
+        running at the same time, the abandoned one for another 516 seconds.
+        Interrupting here aborts the in-flight turn and drops the session, the
+        same cleanup :meth:`interrupt_session` does for an explicit stop.
+        """
+        session_key = self._session_key(messages)
+        try:
+            async for event in self._run_turn(messages, tools, system_prompt, config):
+                yield event
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await self.interrupt_session(session_key)
+            raise
+
+    async def _run_turn(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        system_prompt: str,
+        config: ExecutorConfig | None = None,
+    ) -> AsyncIterator[ExecutorEvent]:
         if self._gateway:
             if self._gateway_host_override is None:
                 creds = _read_databrickscfg(self._databricks_profile)
@@ -2983,6 +3010,13 @@ class PiExecutor(Executor):
             line = await rpc.read_line(timeout=read_timeout)
             if line is None:
                 if handover_in_progress:
+                    # Say so, the way a long-running tool call does above.
+                    # A handover is one uninterrupted model call and routinely
+                    # outlasts the scaffold's 240-second idle watchdog, so a
+                    # silent poll loop lets that watchdog fail the turn before
+                    # this timeout — the larger budget above never gets to
+                    # apply, and the abandoned call keeps generating.
+                    yield ExecutorProgress()
                     continue
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
