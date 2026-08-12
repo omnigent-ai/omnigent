@@ -1296,7 +1296,7 @@ def _patch_daemon_launch(monkeypatch: pytest.MonkeyPatch, captured: dict[str, ob
         return None
 
     async def _fake_launch(
-        client: object, *, host_id: str, session_id: str, workspace: str
+        client: object, *, host_id: str, session_id: str, workspace: str, fresh: bool = False
     ) -> str:
         captured["launch"] = {"host_id": host_id, "session_id": session_id, "workspace": workspace}
         return "runner_daemon"

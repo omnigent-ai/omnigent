@@ -5245,10 +5245,11 @@ async def _forward_session_change_to_runner(
 
 
 #: Forward budget for a control event the runner answers by driving the TUI.
-#: The claude-native ``/model`` and ``/effort`` injectors wait up to 1s for the
-#: tmux advertisement and then up to 4s for the confirmation dialog, so the
-#: default 5s budget could time out on a legitimately-still-working injection
-#: and report a failure that did not happen.
+#: The claude-native slash-command injector's worst case is ~16s (1s tmux
+#: advertisement + 5s commit-poll + 10s submit-verify; the 4s dialog watch
+#: only runs after a fast verify), so the default 5s budget could time out on
+#: a legitimately-still-working injection and report a failure that did not
+#: happen.
 _TUI_INJECT_FORWARD_TIMEOUT_S = 20.0
 
 

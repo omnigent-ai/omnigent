@@ -461,16 +461,59 @@ def test_native_messages_replay_in_order_not_blobbed() -> None:
     ]
 
 
-def test_native_done_drops_equal_aggregate_by_content() -> None:
-    """A done item removes the equal aggregate rather than guessing by position."""
+def test_native_done_drops_matched_aggregate_and_supersedes_older() -> None:
+    """A commit drops its own aggregate by content and evicts older ones.
+
+    Committing the MIDDLE message proves the match is by content, not
+    position (a position drop would take the oldest ``m1``), while ``m1``
+    is evicted as superseded and the still-streamable tail ``m3`` survives.
+    """
     cid = "conv_native_content_match"
-    inflight_text.record_publish(cid, _native_delta("m1", 0, "first answer", final=True))
-    inflight_text.record_publish(cid, _native_delta("m2", 0, "second answer", final=True))
-    done = _message_done("ci_2", text="second answer")
+    inflight_text.record_publish(cid, _native_delta("m1", 0, "alpha", final=True))
+    inflight_text.record_publish(cid, _native_delta("m2", 0, "beta", final=True))
+    inflight_text.record_publish(cid, _native_delta("m3", 0, "gamma"))
+    done = _message_done("ci_2", text="beta")
 
     assert inflight_text.record_publish(cid, done) is done
     snap = inflight_text.snapshot_for(cid)
-    assert [(event["message_id"], event["delta"]) for event in snap] == [("m1", "first answer")]
+    assert [(event["message_id"], event["delta"]) for event in snap] == [("m3", "gamma")]
+
+
+def test_native_done_supersedes_stranded_older_message() -> None:
+    """A later commit evicts an earlier aggregate that never reconciled.
+
+    Reproduces the reconnect double-message bug: ``m1`` streamed but its
+    own commit never reconciled (a lost/mismatched delta), so it lingered
+    in the map and replayed on every reconnect. ``m2`` committing
+    supersedes it, so neither replays.
+    """
+    cid = "conv_native_stranded"
+    inflight_text.record_publish(cid, _native_delta("m1", 0, "I'll do the rebase.", final=True))
+    inflight_text.record_publish(cid, _native_delta("m2", 0, "Back to a clean state.", final=True))
+
+    done = _message_done("ci_2", text="Back to a clean state.")
+    assert inflight_text.record_publish(cid, done) is done
+
+    assert inflight_text.snapshot_for(cid) == []
+
+
+def test_stranded_commit_supersedes_older_but_keeps_tail() -> None:
+    """A commit matching no aggregate evicts older ones, sparing the tail.
+
+    When the committed text matches no tracked aggregate (its own deltas
+    were lost/mismatched), earlier messages are still superseded, but the
+    most-recent entry is spared in case it is still streaming.
+    """
+    cid = "conv_native_stranded_commit"
+    inflight_text.record_publish(cid, _native_delta("m1", 0, "alpha", final=True))
+    inflight_text.record_publish(cid, _native_delta("m2", 0, "beta"))
+
+    done = _message_done("ci_x", text="mismatched bytes")
+    assert inflight_text.record_publish(cid, done) is done
+
+    assert [(e["message_id"], e["delta"]) for e in inflight_text.snapshot_for(cid)] == [
+        ("m2", "beta")
+    ]
 
 
 def test_pi_empty_final_marker_is_inert() -> None:

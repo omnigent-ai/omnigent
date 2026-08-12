@@ -94,6 +94,7 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     assert spec["env"] == {
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
+        "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     }
     assert spec["os_env_type"] == "caller_process"
     # Claude Code emits long interactive transcripts; this value is
@@ -219,6 +220,7 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
+        "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     }
     args = spec["args"]
     assert args[:9] == [
@@ -1680,6 +1682,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         host_id: str,
         session_id: str,
         workspace: str,
+        fresh: bool = False,
     ) -> str:
         """
         Return the runner id that production should wait on.
@@ -1782,7 +1785,6 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
     assert updates == [
         "Creating Claude session...",
         "Starting runner...",
-        "Waiting for runner...",
         "Starting Claude terminal...",
         "Claude terminal ready.",
     ]

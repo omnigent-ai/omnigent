@@ -3199,10 +3199,24 @@ def _ensure_backend(server: str | None) -> str:
         # otherwise the session-create call deep in the REPL bring-up
         # surfaces the edge redirect as an opaque non-JSON-response
         # traceback.
+        #
+        # The auth probe (GET /v1/me, ~0.65s) and the daemon tunnel start
+        # (~2s) are independent — run them concurrently so the auth check
+        # is hidden under the longer daemon wait.
+        import concurrent.futures
+
         server = _resolve_server_url(server)
-        _ensure_databricks_server_auth(server)
-        with runner_startup_progress(initial_message=STARTUP_PHASE_CONNECTING_REMOTE):
-            _ensure_host_daemon(server)
+        with (
+            runner_startup_progress(initial_message=STARTUP_PHASE_CONNECTING_REMOTE),
+            concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            auth_future = pool.submit(_ensure_databricks_server_auth, server)
+            daemon_future = pool.submit(_ensure_host_daemon, server)
+            # Raise auth errors before daemon errors: a login failure is
+            # more actionable than a daemon-connect failure that would
+            # have been caused by the same missing credentials.
+            auth_future.result()
+            daemon_future.result()
         return server
     # Local mode: the daemon spawns (or reuses) a persistent local Omnigent server.
     # On a cold start this is the longest silent gap between the user pressing

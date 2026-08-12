@@ -115,6 +115,7 @@ from omnigent.server.routes._sessions.common import (
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import (
+    _TUI_INJECT_FORWARD_TIMEOUT_S,
     SessionLiveness,
     _apply_pending_policy_ask_writes,
     _await_settled_managed_launch,
@@ -751,10 +752,15 @@ def register_events_routes(
             # attached) is surfaced as an error rather than silently
             # falling through to AP-side compaction, which would be
             # wrong for a terminal-owned session.
+            # TUI budget, not the 5s default: the claude-native handler
+            # drives a delivery-verified slash-command inject, and a timeout
+            # here falls through to AP-side compaction on top of the
+            # terminal's own still-running /compact.
             runner_result = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
                 {"type": _COMPACT_TYPE},
+                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
             if runner_result is not None and runner_result.status_code == 200:
                 return {"queued": False}

@@ -45,8 +45,10 @@ sections.
 
 When you finish a task, print instructions to the user on how to test it: the
 commands to run, the inputs to provide, or the steps to reproduce so they can
-verify the result themselves. Don't leave the user guessing how to confirm the
-work — tell them exactly what to do.
+verify the result themselves. Prefer verification that is best performed by a
+human, such as concrete manual behavior checks, rather than only listing unit
+test commands. Don't leave the user guessing how to confirm the work — tell
+them exactly what to do.
 
 ## Deprecating features
 

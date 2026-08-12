@@ -5336,7 +5336,10 @@ def create_runner_app(
                     if cached_spec_workdir is not None
                     else cached_spec
                 )
-            else:
+            elif cached_spec.name != _sa_name:
+                # A miss on a spec already named for the sub-agent means the
+                # cache holds the CHILD (POST /v1/sessions and earlier turns
+                # store the swapped sub-spec), not a parent fallback.
                 _warn_unresolved_sub_agent(conv, _sa_name)
 
         cached_spec = _spec_with_workdir_paths(cached_spec, cached_spec_workdir)

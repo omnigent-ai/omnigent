@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.utils import get_or_create_engine
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
 
 
 def test_create_and_get(agent_store: SqlAlchemyAgentStore) -> None:
@@ -317,3 +322,184 @@ def test_delete_nonexistent_returns_false(agent_store: SqlAlchemyAgentStore) -> 
     """delete returns False for an ID that was never created."""
     result = agent_store.delete("5996d55aa263c10a717e2ee631f46409")
     assert result is False
+
+
+# ── Session-scoped agent → spawn-tree root resolution ──────────────
+#
+# Regression for OMNI-1611. Named ``sys_session_send`` children are created
+# bound to the *same* agent_id as their mint, so several conversation rows share
+# it. ``get()`` resolves ``agent.session_id`` to the agent's spawn-tree ROOT,
+# which backs the owning-session auth check in ``validate_session_agent``
+# (``check_session_access`` grants on the root's ACL). Every row sharing the
+# agent_id carries the same ``root_conversation_id``, so the lookup is a single
+# bounded query and returns the same root regardless of which row it reads — no
+# "wrong row" to return, and never ``None`` for a session-scoped agent.
+
+
+def _add_named_child(
+    conversation_store: SqlAlchemyConversationStore,
+    *,
+    agent_id: str,
+    parent_conversation_id: str,
+    sub_agent_name: str,
+) -> str:
+    """Create a named sub-agent child bound to the parent's agent_id.
+
+    Mirrors the production named-``sys_session_send`` create, which passes
+    ``agent_id=<parent agent>`` and a non-null ``sub_agent_name``.
+
+    :returns: The new child conversation id.
+    """
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        title=f"{sub_agent_name}:child",
+        parent_conversation_id=parent_conversation_id,
+        agent_id=agent_id,
+        sub_agent_name=sub_agent_name,
+    )
+    return child.id
+
+
+def test_session_scoped_agent_resolves_to_root_top_level(
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A top-level-minted agent resolves to its own conversation, not a child.
+
+    Guards the original unordered ``LIMIT 1`` bug: after named children share
+    the agent_id, the reverse lookup must still return the owning session. For a
+    top-level mint the spawn-tree root IS the mint conversation.
+    """
+    created = conversation_store.create_session_with_agent(
+        agent_id="a0000000000000000000000000000001",
+        agent_name="orchestrator-top",
+        agent_bundle_location="ag_orchestrator_top/bundle",
+        agent_description=None,
+        title="orchestrator",
+    )
+    mint_id = created.conversation.id
+    _add_named_child(
+        conversation_store,
+        agent_id=created.agent.id,
+        parent_conversation_id=mint_id,
+        sub_agent_name="worker_a",
+    )
+    _add_named_child(
+        conversation_store,
+        agent_id=created.agent.id,
+        parent_conversation_id=mint_id,
+        sub_agent_name="worker_b",
+    )
+
+    fetched = agent_store.get(created.agent.id)
+    assert fetched is not None
+    assert fetched.session_id == mint_id  # top-level mint == its own root
+    # update() shares the same reverse lookup; it must resolve identically.
+    updated = agent_store.update(created.agent.id, "ag_orchestrator_top/bundle2")
+    assert updated is not None
+    assert updated.session_id == mint_id
+
+
+def test_session_scoped_agent_resolves_to_root_child_minted(
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A child-minted agent resolves to its spawn-tree root, never ``None``.
+
+    This is the case the reverted ``parent_conversation_id IS NULL`` filter got
+    wrong: a bundle uploaded as a child has a mint whose own
+    ``parent_conversation_id`` is non-null, so that filter matched nothing and
+    returned ``None`` — which would skip the owning-session auth check. Resolving
+    the shared spawn-tree root returns a real, always-visible ancestor instead.
+    """
+    parent = conversation_store.create_conversation(
+        kind="default",
+        title="uploader-parent",
+    )
+    created = conversation_store.create_session_with_agent(
+        agent_id="a0000000000000000000000000000002",
+        agent_name="orchestrator-child",
+        agent_bundle_location="ag_orchestrator_child/bundle",
+        agent_description=None,
+        title="child-minted orchestrator",
+        parent_conversation_id=parent.id,
+    )
+    mint_id = created.conversation.id
+    # The mint itself is a child (non-null parent), so parent-nullness could not
+    # find it; its spawn-tree root is the uploader parent (top-level == own root).
+    mint_conv = conversation_store.get_conversation(mint_id)
+    assert mint_conv is not None
+    assert mint_conv.parent_conversation_id == parent.id
+    assert mint_conv.root_conversation_id == parent.id
+
+    _add_named_child(
+        conversation_store,
+        agent_id=created.agent.id,
+        parent_conversation_id=mint_id,
+        sub_agent_name="worker_a",
+    )
+    _add_named_child(
+        conversation_store,
+        agent_id=created.agent.id,
+        parent_conversation_id=mint_id,
+        sub_agent_name="worker_b",
+    )
+
+    fetched = agent_store.get(created.agent.id)
+    assert fetched is not None
+    assert fetched.session_id is not None  # the #4501 regression: must not be None
+    assert fetched.session_id == parent.id  # the shared spawn-tree root
+
+
+def test_session_scoped_agent_without_children_resolves_to_root(
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The common case — no named children — resolves to the mint (its own root)."""
+    created = conversation_store.create_session_with_agent(
+        agent_id="a0000000000000000000000000000003",
+        agent_name="solo-agent",
+        agent_bundle_location="ag_solo/bundle",
+        agent_description=None,
+        title="solo",
+    )
+    fetched = agent_store.get(created.agent.id)
+    assert fetched is not None
+    assert fetched.session_id == created.conversation.id
+
+
+def test_session_scoped_agent_resolves_to_root_split_db(tmp_path: Path) -> None:
+    """Split-DB: the lookup resolves the root when conversations live in the AP DB.
+
+    ``conversations`` (agent_id + root_conversation_id) is on the AP DB while the
+    agent row is on the Omnigent DB; the reverse lookup must target the AP engine.
+    """
+    omnigent_uri = f"sqlite:///{tmp_path}/omnigent.db"
+    conv_uri = f"sqlite:///{tmp_path}/conversations.db"
+    conversation_store = SqlAlchemyConversationStore(omnigent_uri, conv_uri)
+
+    created = conversation_store.create_session_with_agent(
+        agent_id="a0000000000000000000000000000004",
+        agent_name="orchestrator-split",
+        agent_bundle_location="ag_orchestrator_split/bundle",
+        agent_description=None,
+        title="split orchestrator",
+    )
+    mint_id = created.conversation.id
+    _add_named_child(
+        conversation_store,
+        agent_id=created.agent.id,
+        parent_conversation_id=mint_id,
+        sub_agent_name="worker_a",
+    )
+    _add_named_child(
+        conversation_store,
+        agent_id=created.agent.id,
+        parent_conversation_id=mint_id,
+        sub_agent_name="worker_b",
+    )
+
+    agent_store = SqlAlchemyAgentStore(omnigent_uri, conv_uri)
+    fetched = agent_store.get(created.agent.id)
+    assert fetched is not None
+    assert fetched.session_id == mint_id

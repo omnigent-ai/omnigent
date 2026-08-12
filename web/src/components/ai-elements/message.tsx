@@ -35,7 +35,8 @@ export type MessageProps = HTMLAttributes<HTMLDivElement> & {
 export const Message = ({ className, from, ...props }: MessageProps) => (
   <div
     className={cn(
-      "group flex w-full max-w-[95%] flex-col gap-2",
+      // min-w-0 lets this flex item shrink below its content's intrinsic width instead of widening the column.
+      "group flex w-full min-w-0 max-w-[95%] flex-col gap-2",
       from === "user" ? "is-user ml-auto justify-end" : "is-assistant",
       className,
     )}
@@ -440,7 +441,11 @@ export const MessageResponse = memo(
 
     return (
       <Streamdown
-        className={cn("size-full [&>*:first-child]:mt-0 [&>*:last-child]:mb-0", className)}
+        // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+        className={cn(
+          "size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+          className,
+        )}
         plugins={STREAMDOWN_PLUGINS}
         // Let links open on a plain click (and cmd/ctrl-click in a new tab)
         // instead of Streamdown's default "Open external link?" modal.

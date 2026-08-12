@@ -850,6 +850,7 @@ async def _prepare_codex_terminal_via_daemon(
         trust_env=not is_loopback_url(base_url),
     ) as client:
         reattached = session_id is not None
+        fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Codex session requires a session bundle.")
@@ -918,6 +919,7 @@ async def _prepare_codex_terminal_via_daemon(
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _update_startup_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)

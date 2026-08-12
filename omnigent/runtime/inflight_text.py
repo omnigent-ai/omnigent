@@ -237,6 +237,39 @@ def _consume_recent_native_text(conversation_id: str, text: str) -> None:
         _native_recent_committed.pop(conversation_id, None)
 
 
+def _supersede_older_native(conversation_id: str, committed_id: str | None) -> None:
+    """
+    Evict native aggregates superseded by a just-committed message.
+
+    Native providers stream and commit assistant text one message at a
+    time, in order, so once a message commits every earlier un-``claimed``
+    aggregate is stale: its own commit either already dropped it, or failed
+    to reconcile (a lost/reordered/mismatched delta left ``text`` neither
+    equal to nor a prefix of the committed item) and it would otherwise
+    linger in :data:`_native_inflight` and replay on every reconnect via
+    :func:`snapshot_for`. Only ``_native_inflight`` is pruned; the committed
+    transcript is unaffected, so over-eviction can at worst drop a live
+    preview the committed item then supplies. Caller holds :data:`_lock`.
+
+    Only entries BEFORE the committed one are evicted, so the entry that
+    may still be streaming (always the most recent) is never touched.
+
+    :param conversation_id: Conversation whose native buffer to prune.
+    :param committed_id: The ``message_id`` the commit reconciled against,
+        or ``None`` when it matched none. With ``None`` the commit's own
+        aggregate is untracked, so every entry except the tail (which may
+        still be streaming) is treated as superseded.
+    """
+    messages = _native_inflight.get(conversation_id)
+    if not messages:
+        return
+    ids = list(messages)
+    cut = ids.index(committed_id) if committed_id in messages else len(ids) - 1
+    for message_id in ids[:cut]:
+        if not messages[message_id].claimed:
+            _drop_native_message(conversation_id, message_id)
+
+
 def record_publish(conversation_id: str, event: dict[str, Any]) -> dict[str, Any] | None:
     """
     Update the index from an SSE event on the publish path.
@@ -401,19 +434,32 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> dict[str, Any
                         None,
                     )
                     if exact_id is not None:
+                        # Native text commits in stream order, so every
+                        # earlier un-committed aggregate is superseded by
+                        # this one — evict them before dropping the match so
+                        # a mis-reconciled entry can't linger and replay.
+                        _supersede_older_native(conversation_id, exact_id)
                         _drop_native_message(conversation_id, exact_id)
                     else:
-                        claimed = next(
+                        claimed_id = next(
                             (
-                                message
-                                for message in messages.values()
+                                message_id
+                                for message_id, message in messages.items()
                                 if message.text and text.startswith(message.text)
                             ),
                             None,
                         )
-                        if claimed is not None:
+                        if claimed_id is not None:
+                            _supersede_older_native(conversation_id, claimed_id)
+                            claimed = messages[claimed_id]
                             claimed.claimed = True
                             claimed.forwarded = False
+                        else:
+                            # The commit matched no tracked aggregate (its
+                            # own deltas were lost or mismatched). Everything
+                            # but the tail — which may still be streaming —
+                            # is superseded and safe to evict.
+                            _supersede_older_native(conversation_id, None)
                     recent = _native_recent_committed.setdefault(
                         conversation_id, deque(maxlen=_RECENT_NATIVE_MESSAGES)
                     )

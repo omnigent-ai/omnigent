@@ -197,6 +197,11 @@ _DATABRICKS_CODING_AGENT_HEADER = "x-databricks-use-coding-agent-mode: true"
 # UI, so a wrapped terminal must stay pinned to the one session the UI thinks
 # it is showing.
 _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV = "CLAUDE_CODE_DISABLE_AGENT_VIEW"
+# Claude Code's in-TUI feedback surveys ("How is Claude doing this session?",
+# the memory-recollection rating, the transcript-sharing follow-up) render
+# only in the pane, so a web-driven session shows an unanswerable prompt —
+# often with nobody attached to the terminal at all.
+_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -710,8 +715,11 @@ def build_native_claude_terminal_env(
     Build env overrides for a native Claude Code terminal process.
 
     Forces MCP Tool Search on so Claude defers MCP tool schemas and
-    loads them on demand, and disables Claude Code's agent view so the
-    terminal stays pinned to the session the Omnigent UI is showing.
+    loads them on demand, disables Claude Code's agent view so the
+    terminal stays pinned to the session the Omnigent UI is showing, and
+    disables the in-TUI feedback surveys, which a web-driven session
+    cannot see or answer (see
+    :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`).
 
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
@@ -722,11 +730,13 @@ def build_native_claude_terminal_env(
     terminal_env = {
         _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV: "true",
         _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV: "1",
+        _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV: "1",
     }
     if claude_config is not None:
         terminal_env.update(claude_config.env)
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
+        terminal_env[_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV] = "1"
     # On the apiKeyHelper path the credential reaches Claude Code via the
     # helper; a raw ANTHROPIC_API_KEY here re-triggers Claude Code's "Detected a
     # custom API key" menu, which hangs tmux delivery. Fail loud if one leaks.
@@ -3280,24 +3290,32 @@ async def _prepare_claude_terminal_via_daemon(
         # Resuming an existing session must not re-close its terminal on
         # exit; a fresh launch owns teardown.
         reattached = session_id is not None
+        fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Claude session requires a session bundle.")
+            # Session creation (POST /v1/sessions, ~2s), daemon tunnel
+            # start (~2s), and host-online polling (~0.2s) are mutually
+            # independent — run all three concurrently so they collapse to
+            # max(session_create, daemon_start) instead of their sum.
             _mark_startup_step(
                 startup_profiler,
-                "creating daemon claude session",
+                "creating daemon claude session and waiting for host online",
                 startup_progress=startup_progress,
                 progress_message="Creating Claude session...",
             )
-            session_id = await _create_claude_session(
-                client,
-                session_bundle,
-                bridge_id=None,
-                terminal_launch_args=persist_args or None,
+            session_id, _ = await asyncio.gather(
+                _create_claude_session(
+                    client,
+                    session_bundle,
+                    bridge_id=None,
+                    terminal_launch_args=persist_args or None,
+                ),
+                wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
             _mark_startup_step(
                 startup_profiler,
-                "daemon claude session created",
+                "daemon claude session created and host online",
                 startup_progress=startup_progress,
             )
         elif persist_args:
@@ -3319,17 +3337,30 @@ async def _prepare_claude_terminal_via_daemon(
                 "resume launch args persisted",
                 startup_progress=startup_progress,
             )
-        _mark_startup_step(
-            startup_profiler,
-            "waiting for host online",
-            startup_progress=startup_progress,
-        )
-        await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
-        _mark_startup_step(
-            startup_profiler,
-            "host online",
-            startup_progress=startup_progress,
-        )
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for host online",
+                startup_progress=startup_progress,
+            )
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+            _mark_startup_step(
+                startup_profiler,
+                "host online",
+                startup_progress=startup_progress,
+            )
+        else:
+            # Resume with no new flags: just wait for the host.
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for host online",
+                startup_progress=startup_progress,
+            )
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+            _mark_startup_step(
+                startup_profiler,
+                "host online",
+                startup_progress=startup_progress,
+            )
         _mark_startup_step(
             startup_profiler,
             "launching or reusing daemon runner",
@@ -3341,6 +3372,7 @@ async def _prepare_claude_terminal_via_daemon(
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _mark_startup_step(
             startup_profiler,
@@ -3348,27 +3380,30 @@ async def _prepare_claude_terminal_via_daemon(
             startup_progress=startup_progress,
             detail=f"runner={runner_id}",
         )
-        _mark_startup_step(
-            startup_profiler,
-            "waiting for runner online",
-            startup_progress=startup_progress,
-            progress_message="Waiting for runner...",
-        )
-        await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
-        _mark_startup_step(
-            startup_profiler,
-            "daemon runner online",
-            startup_progress=startup_progress,
-        )
         if reattached:
+            # Resume: runner must be online before we ask it to ensure the
+            # terminal (the POST goes to the runner via the server relay).
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for runner online",
+                startup_progress=startup_progress,
+                progress_message="Waiting for runner...",
+            )
+            await wait_for_runner_online(
+                client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S
+            )
+            _mark_startup_step(
+                startup_profiler,
+                "daemon runner online",
+                startup_progress=startup_progress,
+            )
             # Resume onto an already-online daemon runner reuses it without
             # re-running the session-start auto-create, so a runner whose
             # terminal was torn down (e.g. after a ``-p`` one-shot) comes
             # back terminal-less and the wait below would time out. Ask the
             # runner to ensure the claude terminal: idempotent (returns the
             # live one if present) and otherwise auto-creates it with cold
-            # resume so history is restored. A fresh launch already creates
-            # it on session-start, so this is only needed when reattaching.
+            # resume so history is restored.
             _mark_startup_step(
                 startup_profiler,
                 "ensuring resumed terminal on runner",
@@ -3381,15 +3416,37 @@ async def _prepare_claude_terminal_via_daemon(
                 "resumed terminal ensure requested",
                 startup_progress=startup_progress,
             )
-        _mark_startup_step(
-            startup_profiler,
-            "waiting for claude terminal ready",
-            startup_progress=startup_progress,
-            progress_message="Starting Claude terminal...",
-        )
-        terminal_id = await _wait_for_claude_terminal_ready(
-            client, session_id, timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S
-        )
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for claude terminal ready",
+                startup_progress=startup_progress,
+                progress_message="Starting Claude terminal...",
+            )
+            terminal_id = await _wait_for_claude_terminal_ready(
+                client, session_id, timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S
+            )
+        else:
+            # Fresh launch: the runner auto-creates the terminal on session-start,
+            # so runner-online and terminal-ready are sequential from the runner's
+            # side but independent from the CLI's perspective — the terminal poll
+            # returns None (404) until the runner creates it. Run both concurrently:
+            # wait_for_runner_online provides the fail-fast dead-runner signal;
+            # _wait_for_claude_terminal_ready drives to completion. The gather
+            # propagates any runner failure immediately, cancelling the terminal wait.
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for runner online and claude terminal ready",
+                startup_progress=startup_progress,
+                progress_message="Starting Claude terminal...",
+            )
+            _, terminal_id = await asyncio.gather(
+                wait_for_runner_online(
+                    client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S
+                ),
+                _wait_for_claude_terminal_ready(
+                    client, session_id, timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S
+                ),
+            )
         _mark_startup_step(
             startup_profiler,
             "claude terminal ready",
@@ -3452,7 +3509,6 @@ def _run_with_remote_server(
     :returns: None.
     """
     from omnigent.chat import _bundle_agent, _remote_headers, _server_auth
-    from omnigent.cli import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
@@ -3504,22 +3560,6 @@ def _run_with_remote_server(
                     startup_progress=progress,
                 )
 
-            # Ensure the connect daemon is up for this server, then route the
-            # runner launch through it. The runner the daemon spawns brings
-            # up the Claude terminal itself, so the CLI just waits and
-            # attaches.
-            _mark_startup_step(
-                startup_profiler,
-                "ensuring host daemon",
-                startup_progress=progress,
-                progress_message="Connecting to local daemon...",
-            )
-            _ensure_host_daemon(base_url)
-            _mark_startup_step(
-                startup_profiler,
-                "host daemon ready",
-                startup_progress=progress,
-            )
             host_id = load_or_create_host_identity().host_id
             _mark_startup_step(
                 startup_profiler,

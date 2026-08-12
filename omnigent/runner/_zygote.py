@@ -90,14 +90,18 @@ def _disk_build_stamp(package_dir: Path | None = None) -> tuple[float, str] | No
     what this process imported at boot.
 
     :param package_dir: Directory holding ``_build_info.py``; defaults to the
-        installed ``omnigent`` package directory.
+        ``omnigent`` package directory this module was loaded from.
     :returns: The stamp, or ``None`` when the file is missing or unreadable
         (e.g. an unbuilt source checkout, or a package mid-rewrite).
     """
     if package_dir is None:
-        import omnigent
-
-        package_dir = Path(omnigent.__file__).resolve().parent
+        # Derived from this module's own location rather than the top-level
+        # ``omnigent.__file__``: the zygote runs as ``python -m``, which puts
+        # its cwd on sys.path, so a daemon started from a directory that holds
+        # an ``omnigent`` checkout binds the top-level name to a namespace
+        # package (``__file__`` is None) while this module still loads from the
+        # real package.
+        package_dir = Path(__file__).resolve().parents[1]
     spec = importlib.util.spec_from_file_location(
         "_omnigent_zygote_build_probe", package_dir / "_build_info.py"
     )

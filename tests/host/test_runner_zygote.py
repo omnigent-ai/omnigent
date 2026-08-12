@@ -9,15 +9,18 @@ daemon's Popen fallback are all covered.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
+import omnigent
 from omnigent.host.runner_zygote import (
     _ZYGOTE_LOST_EXIT_CODE,
     ZygoteManager,
@@ -463,6 +466,28 @@ def test_disk_build_stamp_reads_the_on_disk_file(tmp_path, content, expected) ->
     if content is not None:
         (tmp_path / "_build_info.py").write_text(content)
     assert _disk_build_stamp(package_dir=tmp_path) == expected
+
+
+def test_disk_build_stamp_resolves_package_dir_without_top_level_file(monkeypatch) -> None:
+    """The probe finds ``_build_info.py`` even when ``omnigent.__file__`` is None.
+
+    The zygote is spawned as ``python -m``, which puts the daemon's cwd on
+    sys.path, so a daemon started from a directory that holds an ``omnigent``
+    checkout binds the top-level name to a namespace package with no
+    ``__file__``. Reading it raised ``TypeError`` and killed the zygote at boot
+    before it served a single fork, so the probe keys off its own module path.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    probed: list[Path] = []
+    monkeypatch.setattr(omnigent, "__file__", None)
+    monkeypatch.setattr(
+        importlib.util,
+        "spec_from_file_location",
+        lambda name, location: probed.append(Path(location)),
+    )
+    assert _disk_build_stamp() is None
+    assert probed == [Path(_zygote.__file__).resolve().parents[1] / "_build_info.py"]
 
 
 def _dispatch_fork(

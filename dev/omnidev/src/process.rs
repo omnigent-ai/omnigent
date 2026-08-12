@@ -15,6 +15,23 @@ pub struct ProcSpec {
 }
 
 impl ProcSpec {
+    fn from_profile(pod: &Pod, profile: &crate::profile::ProcessProfile) -> ProcSpec {
+        let expand = |value: &str| {
+            value
+                .replace("{server_port}", &pod.ports.server.to_string())
+                .replace("{vite_port}", &pod.ports.vite.to_string())
+                .replace("{vite_host}", &pod.vite_host)
+                .replace("{pod_dir}", &pod.dir.display().to_string())
+                .replace("{repo_root}", &pod.repo_root.display().to_string())
+        };
+        ProcSpec {
+            program: expand(&profile.command[0]),
+            args: profile.command[1..].iter().map(|arg| expand(arg)).collect(),
+            cwd: pod.repo_root.join(&profile.cwd),
+            extra_env: Vec::new(),
+        }
+    }
+
     fn omnigent_log_env() -> Vec<(String, String)> {
         // Child stderr is a pipe that omnidev reads into its process panes.
         // Let Omnigent's process logger mirror to that pipe despite it not
@@ -28,6 +45,9 @@ impl ProcSpec {
     /// `uv run --python <pinned> omnigent --log-to-stderr server --host 127.0.0.1 --port <p>
     /// --database-uri <db> --artifact-location <dir>`, from the repo root.
     pub fn server(pod: &Pod) -> ProcSpec {
+        if let Some(profile) = &pod.profile {
+            return Self::from_profile(pod, &profile.server);
+        }
         ProcSpec {
             program: "uv".into(),
             args: vec![
@@ -54,6 +74,15 @@ impl ProcSpec {
     /// `uv run --python <pinned> omnigent --log-to-stderr host --server http://127.0.0.1:<p>`,
     /// from the repo root.
     pub fn host(pod: &Pod) -> ProcSpec {
+        if let Some(profile) = &pod.profile {
+            return Self::from_profile(
+                pod,
+                profile
+                    .host
+                    .as_ref()
+                    .expect("host is disabled for this profile"),
+            );
+        }
         ProcSpec {
             program: "uv".into(),
             args: vec![
@@ -73,7 +102,16 @@ impl ProcSpec {
 
     /// `pnpm install`, from `web/`. Run before Vite when deps are missing or
     /// stale so Vite's dependency scan doesn't fail on an unresolved import.
-    pub fn pnpm_install(pod: &Pod) -> ProcSpec {
+    pub fn web_prepare(pod: &Pod) -> ProcSpec {
+        if let Some(profile) = &pod.profile {
+            return Self::from_profile(
+                pod,
+                profile
+                    .prepare
+                    .as_ref()
+                    .expect("web prepare is disabled for this profile"),
+            );
+        }
         ProcSpec {
             program: "pnpm".into(),
             args: vec!["install".into()],
@@ -85,6 +123,9 @@ impl ProcSpec {
     /// `pnpm run dev -- --host <host> --port <p> --strictPort`, from `web/`.
     /// `OMNIGENT_URL` (in the pod env) points Vite's proxy at this pod's backend.
     pub fn vite(pod: &Pod) -> ProcSpec {
+        if let Some(profile) = &pod.profile {
+            return Self::from_profile(pod, &profile.vite);
+        }
         ProcSpec {
             program: "pnpm".into(),
             args: vec![
@@ -107,6 +148,7 @@ impl ProcSpec {
 mod tests {
     use super::*;
     use crate::ports::Ports;
+    use crate::profile::{ProcessProfile, Profile};
 
     #[test]
     fn vite_uses_configured_bind_host_but_backend_url_stays_loopback() {
@@ -175,6 +217,57 @@ mod tests {
                 Some("1")
             );
         }
+    }
+
+    #[test]
+    fn external_profile_expands_runtime_values() {
+        let repo = tempdir();
+        let pod_dir = tempdir();
+        let mut pod = Pod::create(
+            repo.clone(),
+            pod_dir.clone(),
+            Ports {
+                server: 19191,
+                vite: 19292,
+            },
+            "0.0.0.0".into(),
+            Vec::new(),
+        )
+        .unwrap();
+        let process = ProcessProfile {
+            command: vec![
+                "server".into(),
+                "--port={server_port}".into(),
+                "--ui={vite_port}".into(),
+                "--host={vite_host}".into(),
+                "--state={pod_dir}".into(),
+            ],
+            cwd: "service".into(),
+        };
+        pod.profile = Some(Profile {
+            server: process.clone(),
+            vite: process,
+            prepare: None,
+            host: None,
+            backend_dir: "service".into(),
+            web_dir: "ui".into(),
+            dependency_manifests: vec!["package.json".into()],
+        });
+
+        let spec = ProcSpec::server(&pod);
+
+        assert_eq!(spec.program, "server");
+        assert_eq!(
+            spec.args,
+            [
+                "--port=19191",
+                "--ui=19292",
+                "--host=0.0.0.0",
+                &format!("--state={}", pod_dir.display()),
+            ]
+        );
+        assert_eq!(spec.cwd, repo.join("service"));
+        assert!(!pod.host_enabled());
     }
 
     fn tempdir() -> std::path::PathBuf {
