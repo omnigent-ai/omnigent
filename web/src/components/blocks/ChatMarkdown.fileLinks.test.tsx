@@ -109,3 +109,45 @@ describe("markdown links to workspace files", () => {
     expect(openFile).toHaveBeenCalledWith("docs/notes.md");
   });
 });
+
+// `path:line` is how agents habitually cite a file. The position is not part of
+// the filename, so resolving the span verbatim matched nothing on disk and the
+// citation rendered as inert inline code.
+describe("cited positions", () => {
+  it("opens an inline-code path that carries a line number", () => {
+    renderMarkdown("`docs/notes.md:12` has the detail", ["docs/notes.md"]);
+
+    // The span still shows what the agent wrote; only the target drops :12.
+    fireEvent.click(screen.getByRole("button", { name: "docs/notes.md:12" }));
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md");
+  });
+
+  it("opens an absolute inline-code path with a line number", () => {
+    // The shape from the report: an absolute path under the workspace root.
+    renderMarkdown(`\`${WORKSPACE}/docs/notes.md:1\` contains hi`, ["docs/notes.md"]);
+
+    fireEvent.click(screen.getByRole("button", { name: `${WORKSPACE}/docs/notes.md:1` }));
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md");
+  });
+
+  it("opens a path citing both line and column", () => {
+    renderMarkdown("`docs/notes.md:12:7` is the spot", ["docs/notes.md"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "docs/notes.md:12:7" }));
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md");
+  });
+
+  it("opens a markdown link whose href carries a line number", () => {
+    renderMarkdown("[notes.md](docs/notes.md:12)", ["docs/notes.md"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "notes.md" }));
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md");
+  });
+
+  it("leaves a trailing-colon span that is not a position alone", () => {
+    // "Note:" style prose must not be mistaken for a path with a position.
+    renderMarkdown("`docs/notes.md:abc` is not a position", ["docs/notes.md"]);
+
+    expect(screen.queryByRole("button", { name: "docs/notes.md:abc" })).toBeNull();
+  });
+});

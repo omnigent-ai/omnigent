@@ -31,8 +31,10 @@ export const FILE_LINK_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins
 export const WORKSPACE_FILE_LINK_ATTR = "data-omnigent-file";
 
 // An href that can only be a protocol URL, a protocol-relative URL, or an
-// in-page anchor, never a path to a file in the session workspace.
-const NON_FILE_HREF = /^(?:[a-zA-Z][a-zA-Z0-9+.-]*:|\/\/|#)/;
+// in-page anchor, never a path to a file in the session workspace. The
+// lookahead keeps a cited position off the scheme branch: `notes.md:12` is a
+// filename plus a line number, but is otherwise shaped exactly like a scheme.
+const NON_FILE_HREF = /^(?:[a-zA-Z][a-zA-Z0-9+.-]*:(?!\d+(?::\d+)?$)|\/\/|#)/;
 
 // Where a file link's href is parked once the path moves to the data
 // attribute. Must be a *named* fragment: harden passes a fragment-only href

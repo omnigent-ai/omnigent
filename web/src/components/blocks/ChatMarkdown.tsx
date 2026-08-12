@@ -34,6 +34,9 @@ import { toWorkspaceRelativePath, useWorkspaceFileExists } from "@/hooks/useWork
 // node="[object Object]" attribute.
 type WithHastNode<T> = T & { node?: unknown };
 
+// Trailing `:line` / `:line:col` on a cited path, e.g. `src/app.ts:42:7`.
+const POSITION_SUFFIX = /:\d+(?::\d+)?$/;
+
 /**
  * Resolves `text` to an openable workspace file, returning the click handler
  * that opens it in the FileViewer, or null when it isn't one (no FileViewer,
@@ -46,14 +49,19 @@ function useWorkspaceFileOpener(text: string): (() => void) | null {
   const conversationId = useFileViewerConversationId();
   const { root, home } = useWorkspacePaths();
 
+  // Agents cite a file with the position they mean, `docs/notes.md:12` or
+  // `:12:7`. The position is not part of the filename, so no such path is ever
+  // in the changed-files list or on disk; drop it before resolving. The span
+  // still displays the citation the agent wrote.
+  const cited = text.replace(POSITION_SUFFIX, "");
   // Collapse absolute / "~"-relative forms onto a workspace-relative path so
   // they match the changed-files list and the filesystem API. null = absolute
   // or "~" path outside the workspace (or the root itself) → never a link.
-  const linkPath = text ? toWorkspaceRelativePath(text, root, home) : null;
+  const linkPath = cited ? toWorkspaceRelativePath(cited, root, home) : null;
   // "Trusted" means we resolved an absolute/"~" form against the root, so the
   // result is known workspace-relative even if it's a bare basename (no
   // interior slash) that the existence check's path-shape heuristic rejects.
-  const trusted = linkPath !== null && linkPath !== text;
+  const trusted = linkPath !== null && linkPath !== cited;
 
   const isChanged = !!linkPath && isChangedPath(linkPath);
   // Only hit the filesystem for path-shaped spans that aren't already known

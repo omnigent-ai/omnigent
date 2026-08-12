@@ -60,6 +60,12 @@ describe("markWorkspaceFileLinks", () => {
     expectHandedOver(markHref("./docs/design.md"), "./docs/design.md");
   });
 
+  it("hands over a path citing a line number, which is shaped like a scheme", () => {
+    // `notes.md:12` parses as scheme "notes.md:" if you only look for a colon.
+    expectHandedOver(markHref("docs/notes.md:12"), "docs/notes.md:12");
+    expectHandedOver(markHref("notes.md:12:7"), "notes.md:12:7");
+  });
+
   it.each([
     ["https://example.com/docs.md", "external URL"],
     ["http://localhost:3000/x.md", "plain http URL"],
