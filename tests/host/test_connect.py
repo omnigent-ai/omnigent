@@ -4156,7 +4156,7 @@ def test_direct_spawn_keeps_the_workspace_off_sys_path(
     """The runner is spawned with ``-P`` so its workspace cannot shadow omnigent.
 
     The runner's cwd is the session workspace, and ``python -m`` would otherwise
-    prepend it to ``sys.path`` — so a session opened *in an omnigent checkout*
+    prepend it to ``sys.path``, so a session opened *in an omnigent checkout*
     imports that checkout instead of the installed package, and a long-lived
     daemon plus a mid-flight ``git pull`` then skews the two.
     """

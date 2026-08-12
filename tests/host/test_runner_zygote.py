@@ -345,7 +345,7 @@ def test_zygote_boots_from_inside_an_omnigent_checkout(monkeypatch, tmp_path) ->
     """A daemon whose cwd holds an ``omnigent/`` package still starts a zygote.
 
     The zygote inherits the daemon's cwd, which ``python -m`` would prepend to
-    ``sys.path`` — so a daemon started inside an omnigent checkout would import
+    ``sys.path``, so a daemon started inside an omnigent checkout would import
     that checkout instead of the installed package. Booting against a poisoned
     package proves the spawn keeps cwd off ``sys.path``.
 
