@@ -205,3 +205,36 @@ def test_mcp_error_prefix_constant_matches_the_real_formatter() -> None:
     plain = mcp_call_output(TextContent(type="text", text="boom"))
     assert errored == f"{trc._MCP_ERROR_PREFIX}{plain}"
     assert not plain.startswith(trc._MCP_ERROR_PREFIX)
+
+
+def test_truncated_image_detection_keys_on_shape_not_tokens() -> None:
+    """The collapse guard matches an image block's shape, not loose tokens.
+
+    Both persisted spellings must collapse when clipped — Anthropic
+    ``source.data`` and the bare MCP ``data``/``mimeType`` — while malformed
+    JSON that merely mentions the words is left alone.
+    """
+    strip = trc.strip_unparseable_image_output
+    payload = "iVBORw0KGgo" + "A" * 4_000
+    clipped = {
+        "anthropic source": '[{"type":"image","source":{"type":"base64","data":"' + payload,
+        "mcp bare data": '{"type":"image","data":"' + payload,
+        "mcp with mimeType first": '{"mimeType":"image/png","type":"image","data":"' + payload,
+        "errored mcp": 'Error: {"type":"image","data":"' + payload,
+        "spaced keys": '{"type" : "image", "data" : "' + payload,
+    }
+    for label, output in clipped.items():
+        collapsed = strip(output)
+        assert collapsed != output, label
+        assert payload[:64] not in collapsed, label
+        assert "omitted from history" in collapsed, label
+    untouched = {
+        # Mentions both words but is not an image block.
+        "kind/encoding decoy": '{"kind":"image","encoding":"base64","data":"' + payload,
+        "truncated text block": '{"type":"text","text":"hello wor',
+        # Clipped before the payload key: nothing to stand down.
+        "no data key yet": '{"type":"image","mimeType":"image/pn',
+        "plain prose": "file written",
+    }
+    for label, output in untouched.items():
+        assert strip(output) == output, label

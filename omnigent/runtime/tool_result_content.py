@@ -16,6 +16,7 @@ import base64
 import binascii
 import json
 import logging
+import re
 from dataclasses import dataclass
 
 from omnigent.json_types import JsonObject
@@ -59,6 +60,24 @@ def image_omitted_placeholder(media_type: str | None) -> str:
 _MCP_ERROR_PREFIX = "Error: "
 
 
+#: An image block's own type discriminator, and the key its payload hangs off.
+#: Matching this shape rather than loose ``"image"``/``"base64"`` tokens is what
+#: keeps unrelated malformed JSON such as ``{"kind":"image","encoding":"base64"}``
+#: from being collapsed, while catching both the Anthropic ``source.data`` form
+#: and the bare ``data``/``mimeType`` form MCP persists.
+_IMAGE_TYPE_KEY_RE = re.compile(r'"type"\s*:\s*"image"')
+_IMAGE_DATA_KEY_RE = re.compile(r'"data"\s*:')
+
+
+def _holds_clipped_image_payload(body: str) -> bool:
+    """Whether *body* looks like an image block carrying a payload.
+
+    :param body: Candidate tool-result text, error prefix already removed.
+    :returns: True when an image block's ``data`` key is present.
+    """
+    return bool(_IMAGE_TYPE_KEY_RE.search(body) and _IMAGE_DATA_KEY_RE.search(body))
+
+
 def strip_unparseable_image_output(output: str) -> str:
     """Collapse a truncated/corrupt base64 image tool result to a placeholder.
 
@@ -80,7 +99,12 @@ def strip_unparseable_image_output(output: str) -> str:
         prefix = _MCP_ERROR_PREFIX
         body = output[len(_MCP_ERROR_PREFIX) :]
     stripped = body.lstrip()
-    if stripped[:1] not in ("[", "{") or '"image"' not in body or '"base64"' not in body:
+    if stripped[:1] not in ("[", "{") or not _holds_clipped_image_payload(body):
+        return output
+    if "\n" in body:
+        # The newline-joined multi-block form is several documents, so failing
+        # ``json.loads`` here means nothing; :func:`_blocks_from_newline_joined`
+        # collapses just the clipped line and keeps the intact ones.
         return output
     try:
         json.loads(body)
@@ -376,6 +400,11 @@ def _blocks_from_newline_joined(output: str) -> RehydratedContent:
                     image_block = _oversized_invalid_image_placeholder(parsed_line)
                     if image_block is not None:
                         dropped = True
+            elif _holds_clipped_image_payload(line):
+                # A store-clipped image line no longer parses; keep the
+                # surrounding text and stand the payload down to a placeholder.
+                image_block = {"type": "text", "text": image_omitted_placeholder(None)}
+                dropped = True
         if image_block is None:
             text_lines.append(line)
             continue

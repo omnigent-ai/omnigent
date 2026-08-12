@@ -6805,6 +6805,109 @@ def _stale_duplicated_jpeg_record(b64: str) -> dict[str, Any]:
     }
 
 
+def _oversized_invalid_image_object(marker: str) -> tuple[str, str]:
+    """Return a valid-JSON MCP image object whose payload fails the gate.
+
+    Large enough to cross the collapse threshold, so normalization drops it for
+    a placeholder and reports ``dropped_oversized_image``.
+    """
+    payload = base64.b64encode(marker.encode() + b"not an image " * 4_000).decode()
+    return payload, json.dumps(
+        {"type": "image", "data": payload, "mimeType": "image/png"}, separators=(",", ":")
+    )
+
+
+@pytest.mark.parametrize("spelling", ["string", "errored-string", "list"])
+def test_clone_repair_collapses_a_dropped_oversized_payload(spelling: str) -> None:
+    """A payload normalization *dropped* must not survive clone repair.
+
+    The sanitizer used to project straight to ``.blocks``; a placeholder carries
+    no image payload, so the repair skipped the record and left the original
+    base64 in both ``tool_result`` content and ``toolUseResult``.
+    """
+    payload, image_object = _oversized_invalid_image_object("clone")
+    errored = spelling == "errored-string"
+    content: Any = {
+        "string": image_object,
+        "errored-string": f"Error: {image_object}",
+        "list": [{"type": "image", "data": payload, "mimeType": "image/png"}],
+    }[spelling]
+    record: dict[str, Any] = {
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": content}],
+        },
+        "toolUseResult": json.dumps(content if isinstance(content, str) else json.dumps(content)),
+    }
+    assert json.dumps(record).count(payload) == 2, "pre-repair wedged state"
+
+    claude_native._sanitize_cloned_tool_result_record(record)
+
+    blob = json.dumps(record)
+    assert blob.count(payload) == 0
+    assert len(blob) < len(payload) // 10
+    repaired = record["message"]["content"][0]["content"]
+    assert isinstance(repaired, list)
+    assert "omitted from history" in json.dumps(repaired)
+    assert payload not in json.dumps(record["toolUseResult"])
+    if errored:
+        assert repaired[0] == {"type": "text", "text": "Error:"}
+
+
+def test_clone_and_cwd_copy_paths_both_collapse_a_dropped_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Both transcript-copy entry points repair a dropped-payload record."""
+    projects_dir = tmp_path / ".claude" / "projects"
+    source_workspace = tmp_path / "source repo"
+    source_workspace.mkdir()
+    clone_workspace = tmp_path / "clone worktree"
+    clone_workspace.mkdir()
+    source_uuid = "11111111-1111-1111-1111-111111111111"
+    target_uuid = "22222222-2222-2222-2222-222222222222"
+    source_project_dir = projects_dir / claude_native._sanitize_claude_project_name(
+        str(source_workspace.resolve())
+    )
+    source_project_dir.mkdir(parents=True)
+    source_path = source_project_dir / f"{source_uuid}.jsonl"
+    payload, image_object = _oversized_invalid_image_object("paths")
+    record = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u1",
+        "parentUuid": None,
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": image_object}
+            ],
+        },
+        "toolUseResult": json.dumps(image_object),
+    }
+    source_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    source_text = source_path.read_text(encoding="utf-8")
+    assert source_text.count(payload) == 2, "pre-repair wedged state"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+
+    cloned = claude_native._clone_claude_transcript(
+        source_external_session_id=source_uuid,
+        target_external_session_id=target_uuid,
+        clone_workspace=clone_workspace.resolve(),
+    )
+    assert cloned is not None
+    assert cloned.read_text(encoding="utf-8").count(payload) == 0
+
+    redirected = tmp_path / "redirected.jsonl"
+    claude_native._copy_transcript_with_cwd(
+        source=source_path, target=redirected, current=clone_workspace.resolve()
+    )
+    assert redirected.read_text(encoding="utf-8").count(payload) == 0
+    # Neither copy path mutates the source transcript.
+    assert source_path.read_text(encoding="utf-8") == source_text
+
+
 def test_clone_claude_transcript_repairs_progressive_jpeg_duplication(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -8428,6 +8531,95 @@ def test_claude_transcript_truncated_image_result_stripped_not_leaked() -> None:
 def _store_truncated(clipped_prefix: str) -> str:
     """Append the store's truncation marker, leaving unterminated JSON."""
     return clipped_prefix + "…[truncated by conversation-store: item exceeded 245760B cap]"
+
+
+def _capped_mcp_image_output(
+    *, is_error: bool = False, text: str | None = None
+) -> tuple[str, str]:
+    """Build a real MCP image result clipped by the real store cap.
+
+    Goes through ``_format_call_result(ImageContent(...))`` and
+    ``cap_tool_output`` so the fixture is the exact persisted shape, which
+    carries no ``"base64"`` literal.
+    """
+    from mcp.types import CallToolResult, ImageContent, TextContent
+
+    from omnigent.runtime.tool_output import cap_tool_output
+    from omnigent.tools.mcp import _format_call_result
+
+    payload = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\xa5" * 900_000).decode()
+    blocks: list[Any] = [ImageContent(type="image", data=payload, mimeType="image/png")]
+    if text is not None:
+        blocks.insert(0, TextContent(type="text", text=text))
+    raw = _format_call_result(CallToolResult(content=blocks, isError=is_error))
+    return payload, cap_tool_output(raw)
+
+
+@pytest.mark.parametrize("is_error", [False, True], ids=["ok", "error"])
+@pytest.mark.parametrize("text", [None, "took a screenshot"], ids=["lone", "mixed"])
+def test_store_capped_mcp_image_result_does_not_leak_base64(
+    is_error: bool, text: str | None
+) -> None:
+    """A store-capped MCP ``ImageContent`` result collapses instead of replaying.
+
+    The persisted MCP shape is ``{"type":"image","data":...,"mimeType":...}`` —
+    no ``"base64"`` literal — so the old token-based guard never fired on it and
+    the clipped payload replayed as ``tool_result`` text and again in metadata.
+    """
+    payload, capped = _capped_mcp_image_output(is_error=is_error, text=text)
+    assert '"base64"' not in capped
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(capped.removeprefix("Error: "))
+
+    records = _image_output_records(capped)
+    assert len(records) == 1
+    blob = json.dumps(records[0])
+    assert blob.count(payload[:64]) == 0, "clipped payload must not survive"
+    # The record is bounded: a placeholder, not a copy of the capped output.
+    assert len(blob) < len(capped) // 100
+    content = records[0]["message"]["content"][0]["content"]
+    assert isinstance(content, list)
+    rendered = json.dumps(content)
+    assert "omitted from history" in rendered
+    if is_error:
+        assert "Error:" in rendered
+    if text is not None:
+        assert text in rendered
+
+
+def test_store_capped_multi_image_result_keeps_the_intact_image() -> None:
+    """A clipped trailing image is collapsed without discarding earlier ones.
+
+    The newline-joined form is several JSON documents, so a whole-body parse
+    failure says nothing about the intact lines; only the clipped line is stood
+    down to a placeholder.
+    """
+    from mcp.types import CallToolResult, ImageContent
+
+    from omnigent.runtime.tool_output import cap_tool_output
+    from omnigent.tools.mcp import _format_call_result
+
+    clipped = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\xa5" * 900_000).decode()
+    capped = cap_tool_output(
+        _format_call_result(
+            CallToolResult(
+                content=[
+                    ImageContent(type="image", data=_TINY_PNG_BASE64, mimeType="image/png"),
+                    ImageContent(type="image", data=clipped, mimeType="image/png"),
+                ],
+                isError=False,
+            )
+        )
+    )
+
+    records = _image_output_records(capped)
+    blob = json.dumps(records[0])
+    assert blob.count(_TINY_PNG_BASE64) == 1, "the intact image must survive"
+    assert blob.count(clipped[:64]) == 0, "the clipped payload must not"
+    assert len(blob) < len(capped) // 100
+    content = records[0]["message"]["content"][0]["content"]
+    assert content[0]["source"]["data"] == _TINY_PNG_BASE64
+    assert "omitted from history" in json.dumps(content[1:])
 
 
 def test_errored_truncated_image_result_does_not_leak_base64() -> None:

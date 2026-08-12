@@ -23,6 +23,7 @@ import sys
 import uuid
 
 from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.llms.adapters._content import redact_binary_payloads
 from omnigent.runtime.tool_result_content import (
     blocks_from_parsed_list,
     image_payloads_in_blocks,
@@ -1682,14 +1683,23 @@ def _sanitize_cloned_tool_result_record(payload: _JsonObject) -> None:
                     block["content"] = collapsed_blocks
                     payload["toolUseResult"] = _json_safe_tool_use_result(collapsed)
                     continue
-            blocks = tool_result_content_blocks(inner).blocks
+            rehydrated = tool_result_content_blocks(inner)
         elif isinstance(inner, list):
-            blocks = blocks_from_parsed_list(inner).blocks
+            rehydrated = blocks_from_parsed_list(inner)
         else:
             continue
+        blocks = rehydrated.blocks
         if blocks is None:
             continue
         payloads = image_payloads_in_blocks(blocks)
+        if rehydrated.dropped_oversized_image and not payloads:
+            # Normalization dropped the payload for a placeholder, so there is
+            # nothing left to search the metadata for — rewrite both from it.
+            block["content"] = blocks
+            payload["toolUseResult"] = json.dumps(
+                _redact_binary_blocks(blocks), separators=(",", ":")
+            )
+            continue
         if not payloads:
             continue
         block["content"] = blocks
@@ -4643,8 +4653,6 @@ def _redact_binary_blocks(value: object) -> object:
 
     :returns: A copy with base64 payloads redacted.
     """
-    from omnigent.llms.adapters._content import redact_binary_payloads
-
     return redact_binary_payloads(value, _tool_use_result_payload_omitted)
 
 
