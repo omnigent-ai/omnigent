@@ -33,11 +33,7 @@ describe("MessageContent", () => {
 });
 
 describe("Message", () => {
-  it("stays shrinkable as a flex item of the conversation column", () => {
-    // OMNI-2900 regression: without min-w-0, a flex item in a column flex
-    // container refuses to shrink below its content's intrinsic width, so an
-    // unbroken run of text/code in the bubble forces the whole transcript
-    // column wider than the viewport instead of wrapping inside it.
+  it("keeps the message shrinkable", () => {
     render(<Message data-testid="message" from="assistant" />);
 
     expect(screen.getByTestId("message")).toHaveClass("min-w-0");
