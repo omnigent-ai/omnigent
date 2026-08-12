@@ -20,9 +20,11 @@ import secrets
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import uuid
+import zlib
 
 from omnigent.json_types import JsonObject as _JsonObject
 
@@ -4829,14 +4831,172 @@ def _claude_blocks_from_parsed_list(parsed: list[object]) -> list[_JsonObject] |
     return blocks
 
 
-# Magic-byte signatures for the image formats Claude accepts as base64
-# blocks (PNG/JPEG/GIF/WebP — the set Omnigent's attachment handling
-# also maps in ``inner.native_attachments.MIME_TO_EXT``). WebP is
-# special-cased below: its ``WEBP`` tag sits inside a RIFF header.
-_IMAGE_MAGIC_BY_MEDIA_TYPE: dict[str, tuple[bytes, ...]] = {
-    "image/png": (b"\x89PNG\r\n\x1a\n",),
-    "image/jpeg": (b"\xff\xd8\xff",),
-    "image/gif": (b"GIF87a", b"GIF89a"),
+def _is_structurally_valid_png(data: bytes) -> bool:
+    """
+    Walk the PNG chunk stream, verifying structure and CRCs.
+
+    Requires the 8-byte signature, an IHDR first chunk, a final IEND
+    with nothing after it, and a valid length + CRC32 for every chunk —
+    the checks a decoder performs before touching pixel data, so
+    header-only, truncated, or corrupt payloads are rejected.
+    """
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return False
+    offset = 8
+    seen_ihdr = False
+    while True:
+        if offset + 12 > len(data):
+            return False
+        (length,) = struct.unpack(">I", data[offset : offset + 4])
+        chunk_type = data[offset + 4 : offset + 8]
+        end = offset + 12 + length
+        if end > len(data):
+            return False
+        (crc_expected,) = struct.unpack(">I", data[end - 4 : end])
+        if zlib.crc32(data[offset + 4 : end - 4]) & 0xFFFFFFFF != crc_expected:
+            return False
+        if not seen_ihdr:
+            if chunk_type != b"IHDR" or length != 13:
+                return False
+            seen_ihdr = True
+        offset = end
+        if chunk_type == b"IEND":
+            return offset == len(data)
+
+
+def _is_structurally_valid_jpeg(data: bytes) -> bool:
+    """
+    Walk JPEG marker segments to SOS, then entropy data to a final EOI.
+
+    Every marker segment's declared length must fit inside the payload;
+    after the Start of Scan the entropy-coded data must end at exactly
+    one EOI marker (stuffed ``FF00`` bytes, fill bytes, and restart
+    markers are skipped), so header-only or truncated data is rejected.
+    """
+    if not data.startswith(b"\xff\xd8"):
+        return False
+    offset = 2
+    while True:
+        if offset >= len(data) or data[offset] != 0xFF:
+            return False
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            return False
+        marker = data[offset]
+        offset += 1
+        if marker in (0x01, 0xD8) or 0xD0 <= marker <= 0xD7:
+            continue  # standalone markers carry no length field
+        if marker in (0x00, 0xD9) or marker == 0xFF:
+            return False  # stuffed byte, EOI before any scan, or fill overflow
+        if offset + 2 > len(data):
+            return False
+        (segment_length,) = struct.unpack(">H", data[offset : offset + 2])
+        if segment_length < 2 or offset + segment_length > len(data):
+            return False
+        offset += segment_length
+        if marker == 0xDA:  # Start of Scan: entropy-coded data follows
+            break
+    while offset + 1 < len(data):
+        if data[offset] != 0xFF:
+            offset += 1
+            continue
+        following = data[offset + 1]
+        if following == 0x00 or following == 0xFF or 0xD0 <= following <= 0xD7:
+            offset += 1 if following == 0xFF else 2
+            continue
+        return following == 0xD9 and offset + 2 == len(data)
+    return False
+
+
+def _is_structurally_valid_gif(data: bytes) -> bool:
+    """
+    Walk the GIF block stream to the trailer byte.
+
+    Requires a sane logical screen descriptor, consistent global/local
+    color-table sizes, well-formed extension and image blocks with
+    properly delimited data sub-blocks, at least one image, and the
+    ``0x3B`` trailer as the final byte.
+    """
+    if not data.startswith((b"GIF87a", b"GIF89a")) or len(data) < 14:
+        return False
+    (width, height) = struct.unpack("<HH", data[6:10])
+    if width == 0 or height == 0:
+        return False
+    offset = 13
+    if data[10] & 0x80:  # global color table flag
+        offset += 3 * (2 ** ((data[10] & 0x07) + 1))
+    saw_image = False
+    while True:
+        if offset >= len(data):
+            return False
+        block_type = data[offset]
+        offset += 1
+        if block_type == 0x3B:  # trailer
+            return saw_image and offset == len(data)
+        if block_type == 0x21:  # extension: label, then data sub-blocks
+            if offset >= len(data):
+                return False
+            offset += 1
+        elif block_type == 0x2C:  # image descriptor
+            if offset + 9 > len(data):
+                return False
+            packed = data[offset + 8]
+            offset += 9
+            if packed & 0x80:  # local color table flag
+                offset += 3 * (2 ** ((packed & 0x07) + 1))
+            if offset >= len(data):
+                return False
+            offset += 1  # LZW minimum code size
+            saw_image = True
+        else:
+            return False
+        while True:  # data sub-blocks: length-prefixed, zero-terminated
+            if offset >= len(data):
+                return False
+            sub_block_size = data[offset]
+            offset += 1
+            if sub_block_size == 0:
+                break
+            offset += sub_block_size
+            if offset > len(data):
+                return False
+
+
+def _is_structurally_valid_webp(data: bytes) -> bool:
+    """
+    Walk the WebP RIFF chunk stream.
+
+    Requires the RIFF/WEBP header, a RIFF size field that exactly
+    matches the payload length, well-formed chunks (2-byte-aligned
+    sizes, all inside the payload), and at least one frame chunk
+    (``VP8 ``/``VP8L``/``VP8X``).
+    """
+    if len(data) < 20 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return False
+    (riff_size,) = struct.unpack("<I", data[4:8])
+    if riff_size != len(data) - 8:
+        return False
+    offset = 12
+    saw_frame_chunk = False
+    while offset < len(data):
+        if offset + 8 > len(data):
+            return False
+        chunk_tag = data[offset : offset + 4]
+        (chunk_size,) = struct.unpack("<I", data[offset + 4 : offset + 8])
+        offset += 8 + chunk_size + (chunk_size & 1)
+        if offset > len(data):
+            return False
+        if chunk_tag in (b"VP8 ", b"VP8L", b"VP8X"):
+            saw_frame_chunk = True
+    return saw_frame_chunk and offset == len(data)
+
+
+_IMAGE_STRUCTURE_CHECK_BY_MEDIA_TYPE: dict[str, Callable[[bytes], bool]] = {
+    "image/png": _is_structurally_valid_png,
+    "image/jpeg": _is_structurally_valid_jpeg,
+    "image/gif": _is_structurally_valid_gif,
+    "image/webp": _is_structurally_valid_webp,
 }
 
 
@@ -4847,25 +5007,23 @@ def _is_supported_image_payload(data: str, media_type: str) -> bool:
     Flattened MCP output loses provenance, so a text line that merely
     *looks* like a serialized image (docs, logs, placeholders) must not
     be converted: an invalid image block makes Claude reject the resume
-    on every launch. Require strict base64 and decoded bytes whose
-    signature matches the declared MIME type; anything else stays raw
-    text. Formats outside Claude's supported set (e.g. SVG) are
-    rejected too.
+    on every launch. Require strict base64 and decoded bytes whose full
+    structure validates against the declared MIME type — magic bytes
+    alone accept header-only or corrupt data. Formats outside Claude's
+    supported set (e.g. SVG) are rejected too.
 
     :param data: Candidate base64 payload.
     :param media_type: Declared MIME type, e.g. ``"image/png"``.
-    :returns: True only for a signature-verified supported image.
+    :returns: True only for a structure-verified supported image.
     """
+    check = _IMAGE_STRUCTURE_CHECK_BY_MEDIA_TYPE.get(media_type)
+    if check is None:
+        return False
     try:
         decoded = base64.b64decode(data, validate=True)
     except (binascii.Error, ValueError):
         return False
-    if media_type == "image/webp":
-        return len(decoded) >= 12 and decoded[:4] == b"RIFF" and decoded[8:12] == b"WEBP"
-    signatures = _IMAGE_MAGIC_BY_MEDIA_TYPE.get(media_type)
-    if signatures is None:
-        return False
-    return any(decoded.startswith(signature) for signature in signatures)
+    return check(decoded)
 
 
 def _claude_image_block_from_object(value: object) -> _JsonObject | None:

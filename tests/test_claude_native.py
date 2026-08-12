@@ -6600,7 +6600,7 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
     source_path = source_project_dir / f"{source_uuid}.jsonl"
 
     b64_structured = "iVBORw0KGgo" + "K" * 4000
-    b64_mcp = _png_base64()
+    b64_mcp = _TINY_PNG_BASE64
     image_block = {
         "type": "image",
         "source": {"type": "base64", "media_type": "image/png", "data": b64_structured},
@@ -6697,7 +6697,12 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
     assert source_path.read_text(encoding="utf-8") == source_text
 
 
+@pytest.mark.parametrize(
+    "mime_type",
+    ["image/png", "image/jpeg", "image/gif", "image/webp", "invalid-base64"],
+)
 def test_clone_claude_transcript_leaves_invalid_image_shaped_text_unchanged(
+    mime_type: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -6721,7 +6726,11 @@ def test_clone_claude_transcript_leaves_invalid_image_shaped_text_unchanged(
     )
     source_project_dir.mkdir(parents=True)
     source_path = source_project_dir / f"{source_uuid}.jsonl"
-    fake_text = '{"type": "image", "data": "not!valid!base64", "mimeType": "image/png"}'
+    if mime_type == "invalid-base64":
+        fake_data, fake_mime = "not!valid!base64", "image/png"
+    else:
+        fake_data, fake_mime = _FAKE_IMAGE_PAYLOADS[mime_type], mime_type
+    fake_text = json.dumps({"type": "image", "data": fake_data, "mimeType": fake_mime})
     record = {
         "type": "user",
         "cwd": str(source_workspace.resolve()),
@@ -7509,14 +7518,39 @@ def test_json_safe_tool_use_result_wraps_non_json() -> None:
     assert claude_native._json_safe_tool_use_result('{"a":1}') == '{"a":1}'
 
 
-def _png_base64(padding: int = 4000, fill: bytes = b"\x00") -> str:
-    """A signature-valid PNG payload: real magic bytes plus padding."""
-    return base64.b64encode(b"\x89PNG\r\n\x1a\n" + fill * padding).decode()
+# Genuinely decodable 1x1 images (generated and round-trip verified), so the
+# replay tests exercise the exact payloads real MCP screenshot tools persist.
+_TINY_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQAB"
+    "pfZFQAAAAABJRU5ErkJggg=="
+)
+_TINY_JPEG_BASE64 = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRof"
+    "Hh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwh"
+    "MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAAR"
+    "CAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAA"
+    "AgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkK"
+    "FhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWG"
+    "h4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl"
+    "5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREA"
+    "AgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYk"
+    "NOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOE"
+    "hYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk"
+    "5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDi6KKK+ZP3E//Z"
+)
+_TINY_GIF_BASE64 = "R0lGODdhAQABAIAAAAAAAAAAACwAAAAAAQABAAAIBAABBAQAOw=="
+_TINY_WEBP_BASE64 = (
+    "UklGRj4AAABXRUJQVlA4IDIAAADQAQCdASoBAAEAAUAmJaACdLoB+AADsAD+6SIf+8+fufP3"
+    "Pn/Rn/+U/fI4/kcf/KBAAA=="
+)
 
-
-def _jpeg_base64(padding: int = 4000) -> str:
-    """A signature-valid JPEG payload: real magic bytes plus padding."""
-    return base64.b64encode(b"\xff\xd8\xff" + b"\x00" * padding).decode()
+# Header + zero-padding: signature-matching but structurally invalid per format.
+_FAKE_IMAGE_PAYLOADS: dict[str, str] = {
+    "image/png": base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 512).decode(),
+    "image/jpeg": base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 512).decode(),
+    "image/gif": base64.b64encode(b"GIF89a" + b"\x00" * 512).decode(),
+    "image/webp": base64.b64encode(b"RIFF" + b"\x00" * 4 + b"WEBP" + b"\x00" * 512).decode(),
+}
 
 
 def _image_output_records(output: str) -> list[dict[str, Any]]:
@@ -7668,7 +7702,7 @@ def test_mcp_single_image_result_replays_as_one_structured_image() -> None:
     """
     from mcp.types import ImageContent
 
-    b64 = _png_base64(5000)
+    b64 = _TINY_PNG_BASE64
     output = _mcp_call_output(ImageContent(type="image", data=b64, mimeType="image/png"))
     records = _image_output_records(output)
     assert len(records) == 1
@@ -7700,7 +7734,7 @@ def test_mcp_mixed_text_and_image_result_replays_as_block_list() -> None:
     """
     from mcp.types import ImageContent, TextContent
 
-    b64 = _png_base64(5000)
+    b64 = _TINY_PNG_BASE64
     output = _mcp_call_output(
         TextContent(type="text", text="took a screenshot"),
         ImageContent(type="image", data=b64, mimeType="image/png"),
@@ -7735,7 +7769,7 @@ def test_mcp_image_replay_does_not_depend_on_tool_name() -> None:
     """
     from mcp.types import ImageContent
 
-    b64 = _jpeg_base64()
+    b64 = _TINY_JPEG_BASE64
     output = _mcp_call_output(ImageContent(type="image", data=b64, mimeType="image/jpeg"))
     items: list[dict[str, Any]] = [
         {
@@ -7772,11 +7806,11 @@ def test_mcp_multiple_images_replay_as_separate_blocks() -> None:
     """Two newline-joined MCP images become two blocks, each payload once."""
     from mcp.types import ImageContent
 
-    b64_one = _png_base64(4000)
-    b64_two = _png_base64(5000, fill=b"\xff")
+    b64_one = _TINY_PNG_BASE64
+    b64_two = _TINY_GIF_BASE64
     output = _mcp_call_output(
         ImageContent(type="image", data=b64_one, mimeType="image/png"),
-        ImageContent(type="image", data=b64_two, mimeType="image/png"),
+        ImageContent(type="image", data=b64_two, mimeType="image/gif"),
     )
     records = _image_output_records(output)
     assert len(records) == 1
@@ -7851,7 +7885,7 @@ def test_image_mime_signature_mismatch_stays_raw() -> None:
     too — the prefix alone proves nothing.
     """
     mismatched = json.dumps(
-        {"type": "image", "data": _png_base64(), "mimeType": "image/jpeg"},
+        {"type": "image", "data": _TINY_PNG_BASE64, "mimeType": "image/jpeg"},
         separators=(",", ":"),
     )
     records = _image_output_records(mismatched)
@@ -7864,6 +7898,97 @@ def test_image_mime_signature_mismatch_stays_raw() -> None:
     )
     records = _image_output_records(unsupported)
     assert records[0]["message"]["content"][0]["content"] == unsupported
+
+
+@pytest.mark.parametrize(
+    ("mime_type", "payload"),
+    [
+        ("image/png", _TINY_PNG_BASE64),
+        ("image/jpeg", _TINY_JPEG_BASE64),
+        ("image/gif", _TINY_GIF_BASE64),
+        ("image/webp", _TINY_WEBP_BASE64),
+    ],
+)
+def test_mcp_image_result_replays_as_one_structured_image_all_formats(
+    mime_type: str,
+    payload: str,
+) -> None:
+    """
+    Every supported format normalizes through the real MCP path.
+
+    A genuine 1x1 image of each format Claude accepts is serialized by
+    the real ``_format_call_result`` and must replay as exactly one
+    structured image block with redacted metadata.
+    """
+    from mcp.types import ImageContent
+
+    output = _mcp_call_output(ImageContent(type="image", data=payload, mimeType=mime_type))
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    content = record["message"]["content"][0]["content"]
+    assert content == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": mime_type, "data": payload},
+        }
+    ]
+    assert payload not in json.dumps(json.loads(record["toolUseResult"]))
+    assert json.dumps(record).count(payload) == 1
+
+
+@pytest.mark.parametrize("mime_type", ["image/png", "image/jpeg", "image/gif", "image/webp"])
+@pytest.mark.parametrize("form", ["lone", "mixed", "array"])
+def test_structurally_invalid_image_payloads_stay_raw(mime_type: str, form: str) -> None:
+    """
+    Signature-matching but structurally invalid payloads stay raw text.
+
+    Magic bytes followed by zero padding pass a signature check but are
+    not decodable images; emitting them as image blocks would make
+    Claude reject every resume. All three persisted forms — lone object,
+    newline-joined, and array entry — must keep their exact raw text.
+    """
+    payload = _FAKE_IMAGE_PAYLOADS[mime_type]
+    image_object = json.dumps(
+        {"type": "image", "data": payload, "mimeType": mime_type},
+        separators=(",", ":"),
+    )
+    if form == "lone":
+        output = image_object
+    elif form == "mixed":
+        output = f"log line\n{image_object}"
+    else:
+        output = json.dumps(
+            [{"type": "image", "data": payload, "mimeType": mime_type}],
+            separators=(",", ":"),
+        )
+    records = _image_output_records(output)
+    assert len(records) == 1
+    assert records[0]["message"]["content"][0]["content"] == output
+
+
+def test_image_payload_validator_rejects_corrupt_structure() -> None:
+    """
+    The structural validator catches corruption past the magic bytes.
+
+    A CRC-corrupted PNG chunk and a truncated JPEG must be rejected even
+    though both start with the right signature; the genuine fixtures
+    must pass for all four supported formats.
+    """
+    corrupted_png = bytearray(base64.b64decode(_TINY_PNG_BASE64))
+    corrupted_png[20] ^= 0xFF
+    assert not claude_native._is_supported_image_payload(
+        base64.b64encode(bytes(corrupted_png)).decode(), "image/png"
+    )
+    truncated_jpeg = base64.b64encode(base64.b64decode(_TINY_JPEG_BASE64)[:100]).decode()
+    assert not claude_native._is_supported_image_payload(truncated_jpeg, "image/jpeg")
+    for mime_type, payload in (
+        ("image/png", _TINY_PNG_BASE64),
+        ("image/jpeg", _TINY_JPEG_BASE64),
+        ("image/gif", _TINY_GIF_BASE64),
+        ("image/webp", _TINY_WEBP_BASE64),
+    ):
+        assert claude_native._is_supported_image_payload(payload, mime_type)
 
 
 def test_claude_tool_result_content_blocks_rehydrates_only_block_arrays() -> None:
