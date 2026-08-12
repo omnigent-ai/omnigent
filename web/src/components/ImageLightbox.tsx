@@ -248,7 +248,11 @@ export function ImageLightboxProvider({ children }: { children: React.ReactNode 
               <Button
                 variant="ghost"
                 size="icon-sm"
-                className="absolute top-3 right-3 bg-background/70 hover:bg-background/90"
+                className="absolute bg-background/70 hover:bg-background/90"
+                style={{
+                  top: "calc(var(--omnigent-safe-top, 0px) + 0.75rem)",
+                  right: "calc(env(safe-area-inset-right, 0px) + 0.75rem)",
+                }}
               >
                 <XIcon />
                 <span className="sr-only">Close</span>

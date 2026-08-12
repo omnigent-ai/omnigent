@@ -62,6 +62,22 @@ describe("ZoomableImage + ImageLightboxProvider", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
+  it("offsets the close button by the iOS safe-area inset", () => {
+    renderWithProvider();
+    fireEvent.click(screen.getByRole("button", { name: "Zoom image: diagram" }));
+    // The close button adds the safe-area inset on top of the base 0.75rem
+    // offset so it clears the status bar / Dynamic Island under viewport-fit=cover,
+    // rather than the static top-3/right-3 that lands it under the notch.
+    const closeButton = screen.getByRole("button", { name: "Close" });
+    const style = closeButton.getAttribute("style") ?? "";
+    // top uses the shared safe-area var; right uses env() directly. (jsdom's CSS
+    // parser reorders the env() fallback, so match the surviving identifier.)
+    expect(style).toContain("var(--omnigent-safe-top, 0px)");
+    expect(style).toContain("safe-area-inset-right");
+    // Guard against regressing to the hardcoded corner offset.
+    expect(closeButton.className).not.toMatch(/\b(top|right)-3\b/);
+  });
+
   it("zooms in and out via the toolbar, updating the scale and label", () => {
     renderWithProvider();
     fireEvent.click(screen.getByRole("button", { name: "Zoom image: diagram" }));
