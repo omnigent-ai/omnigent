@@ -1,7 +1,7 @@
 """Add git_head_sha to conversation metadata.
 
 Revision ID: 813ae9e6c6d4
-Revises: f7a8b9c0d1e2
+Revises: d5e9f1a2b3c4
 Create Date: 2026-08-12 00:00:00.000000
 
 Records the git HEAD commit SHA at session creation time so the runner can
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "813ae9e6c6d4"
-down_revision: str | None = "f7a8b9c0d1e2"
+down_revision: str | None = "d5e9f1a2b3c4"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
