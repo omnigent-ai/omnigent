@@ -3262,7 +3262,10 @@ function ConversationRow({
       {
         // Point the user at where the session went — it's no longer in
         // the sidebar list, so surface its new home in Settings.
-        onSuccess: showArchivedToast,
+        onSuccess: () => {
+          if (isActive) navigate("/", { replace: true });
+          showArchivedToast();
+        },
         onError: () => setIsArchiving(false),
       },
     );
@@ -4242,6 +4245,8 @@ function BulkActionBar({
       { ids: nonArchivedSelected.map((c) => c.id), archived: true },
       {
         onSuccess: () => {
+          if (activeId && nonArchivedSelected.some((c) => c.id === activeId))
+            navigate("/", { replace: true });
           onDeselectAll();
         },
       },
