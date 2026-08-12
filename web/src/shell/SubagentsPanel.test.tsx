@@ -1329,7 +1329,9 @@ describe("SubagentsPanel", () => {
       // previous session — the bug condition the fix targets. All four
       // are listed so any regression that drops a key from
       // SESSION_SCOPED_PARAMS surfaces here.
-      initialEntries: ["/c/conv_root?file=existing.txt&diff=1&comment=c1&view=changed"],
+      initialEntries: [
+        "/c/conv_root?file=existing.txt&diff=1&comment=c1&view=changed&message=msg_1",
+      ],
     });
 
     const main = screen.getByTestId("subagent-main-row");

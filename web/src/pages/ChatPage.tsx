@@ -24,6 +24,7 @@ import {
   GitBranchIcon,
   GitForkIcon,
   ImageIcon,
+  Link2Icon,
   Loader2Icon,
   PaperclipIcon,
   SettingsIcon,
@@ -152,6 +153,8 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
+import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
+import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { UserMessageNav } from "@/components/UserMessageNav";
 import { HostBadge } from "@/components/HostBadge";
@@ -1773,6 +1776,7 @@ function MainAgentSurface({
     [bubbles],
   );
   const nav = useUserMessageNav(userMessageIds);
+  useMessageDeepLink(conversationId);
 
   // One rail tick per real user turn, paired with a preview of the reply that
   // followed. Walk bubbles in order: each non-system user bubble opens a turn,
@@ -3612,6 +3616,42 @@ function useCopyMessage(getText: () => string): {
   return { isCopied, handleCopy };
 }
 
+/**
+ * Copy a deep link to this message (``?message=<id>`` on the session URL).
+ * Same confirmation UX as {@link useCopyMessage}.
+ *
+ * @param messageId - Stable id stamped on the bubble (user itemId / assistant responseId).
+ */
+function useCopyMessageLink(messageId: string): {
+  isLinkCopied: boolean;
+  handleCopyLink: () => void;
+} {
+  const [isLinkCopied, setIsLinkCopied] = useState(false);
+  const timeoutRef = useRef<number>(0);
+  const isMobile = useIsMobileViewport();
+
+  useEffect(() => () => window.clearTimeout(timeoutRef.current), []);
+
+  const handleCopyLink = useCallback(() => {
+    if (isLinkCopied) return;
+    copyText(buildMessageDeepLink(messageId)).then(
+      () => {
+        setIsLinkCopied(true);
+        window.clearTimeout(timeoutRef.current);
+        timeoutRef.current = window.setTimeout(() => setIsLinkCopied(false), 2000);
+        if (isMobile) {
+          showToast(<span className="text-ui">Link copied</span>, { duration: 1500 });
+        }
+      },
+      (error) => {
+        console.warn("Failed to copy message link", error);
+      },
+    );
+  }, [messageId, isLinkCopied, isMobile]);
+
+  return { isLinkCopied, handleCopyLink };
+}
+
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useChatStore((s) => s.conversationId);
   // Author labels only matter once the session is shared with someone else.
@@ -3637,6 +3677,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
   const ts = formatBubbleTimestamp(bubble.createdAtS);
+  const { isLinkCopied, handleCopyLink } = useCopyMessageLink(bubble.itemId);
   // Runtime-injected `[System: ...]` notifications (task completion,
   // timer firings, terminal idle) ride in on role=user. When the content
   // is a pure system marker — no attached images or files — swap the
@@ -3656,6 +3697,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-testid="message-bubble"
       data-role="user"
       data-user-message-id={bubble.itemId}
+      data-message-id={bubble.itemId}
       className="max-w-[640px]"
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
@@ -3777,12 +3819,10 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
           </MessageContent>
         </div>
-        {/* Skip an empty row when there is neither a timestamp nor a copy
-            action. 40%-visible on touch (no hover), hover/focus-reveal on
-            desktop. py-1 matches the design prototype's 24px action row;
-            the timestamp rides inside it instead of adding a new row. */}
-        {(ts || text) && (
-          <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+        {/* Timestamp + copy/copy-link actions. 40%-visible on touch (no hover),
+            hover/focus-reveal on desktop. py-1 matches the design prototype's
+            24px action row; the timestamp rides inside it. */}
+        <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
             {ts && (
               <span
                 className="select-none text-[11px] leading-4 text-foreground/56"
@@ -3791,15 +3831,22 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 {ts}
               </span>
             )}
-            {text && (
-              <MessageActions>
+            <MessageActions>
+              {text && (
                 <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
                   {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
                 </MessageAction>
-              </MessageActions>
-            )}
-          </div>
-        )}
+              )}
+              <MessageAction
+                tooltip={isLinkCopied ? "Copied!" : "Copy link"}
+                size="icon-xxs"
+                data-testid="copy-message-link"
+                onClick={handleCopyLink}
+              >
+                {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
+              </MessageAction>
+            </MessageActions>
+        </div>
       </div>
     </Message>
   );
@@ -3830,6 +3877,8 @@ function AssistantBubble({
   // before the early return below (rules of hooks), but `markdownText` is
   // derived after it.
   const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
+  const { isLinkCopied, handleCopyLink } = useCopyMessageLink(bubble.responseId);
+  const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
   const handleRetryError = useCallback(async () => {
@@ -3869,6 +3918,7 @@ function AssistantBubble({
         from="assistant"
         data-testid="message-bubble"
         data-role="assistant"
+        data-message-id={bubble.responseId}
         className={isWide ? "max-w-full" : "max-w-3xl"}
       >
         {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap
@@ -3876,7 +3926,12 @@ function AssistantBubble({
             collapsed the row's trailing hairline (a flex-1 span) to zero
             and stopped its click target short of the column. Keeping the
             cap lands the hairline where an answered turn's does. */}
-        <MessageContent className={isWide || foldOnly ? "w-full" : undefined}>
+        <MessageContent
+          className={cn(
+            isWide || foldOnly ? "w-full" : undefined,
+            flashing && "animate-user-msg-flash",
+          )}
+        >
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}
@@ -3901,33 +3956,40 @@ function AssistantBubble({
         )}
         {/* Skipped on a fold-only bubble: the actions belong to content
             the user can see, and hanging them off a collapsed row spaced
-            consecutive rows unevenly depending on hidden narration. Also
-            skipped when there is neither a timestamp nor actions to show.
+            consecutive rows unevenly depending on hidden narration.
             40%-visible on touch (no hover), hover/focus-reveal on desktop.
             Order matches the design target: actions, then timestamp. */}
-        {!foldOnly && (ts || markdownText) && (
+        {!foldOnly && (
           <div className="flex items-center gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-            {markdownText && (
-              <MessageActions>
+            <MessageActions>
+              {markdownText && (
                 <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
                   {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
                 </MessageAction>
-                {/* Fork from this response: clone the session with history
-                    truncated after this turn. Hidden while the response is
-                    still streaming (its items aren't committed yet) and when
-                    the session can't be forked (sub-agent / isolated mount). */}
-                {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
-                  <MessageAction
-                    tooltip="Fork from here"
-                    size="icon-xxs"
-                    data-testid="fork-from-response"
-                    onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
-                  >
-                    <GitForkIcon size={14} />
-                  </MessageAction>
-                )}
-              </MessageActions>
-            )}
+              )}
+              <MessageAction
+                tooltip={isLinkCopied ? "Copied!" : "Copy link"}
+                size="icon-xxs"
+                data-testid="copy-message-link"
+                onClick={handleCopyLink}
+              >
+                {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
+              </MessageAction>
+              {/* Fork from this response: clone the session with history
+                  truncated after this turn. Hidden while the response is
+                  still streaming (its items aren't committed yet) and when
+                  the session can't be forked (sub-agent / isolated mount). */}
+              {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
+                <MessageAction
+                  tooltip="Fork from here"
+                  size="icon-xxs"
+                  data-testid="fork-from-response"
+                  onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
+                >
+                  <GitForkIcon size={14} />
+                </MessageAction>
+              )}
+            </MessageActions>
             {ts && (
               <span
                 className="select-none text-[11px] leading-4 text-foreground/56"
