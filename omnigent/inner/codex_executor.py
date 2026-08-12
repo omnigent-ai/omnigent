@@ -826,7 +826,7 @@ def _populate_codex_home_config(
             # The title worker needs custom-provider routing, but copying the
             # full user config also starts unrelated MCPs/plugins and can exceed
             # its timeout. auth.json alone cannot supply these provider tables.
-            source_config = tomlkit.parse(source_file.read_text())
+            source_config = tomlkit.parse(source_file.read_text(encoding="utf-8"))
             minimal_document = tomlkit.document()
             for key in ("model_provider", "model_providers", "profiles"):
                 if key in source_config:

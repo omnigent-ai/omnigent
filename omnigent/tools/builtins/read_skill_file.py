@@ -155,4 +155,4 @@ def _read_file_safely(
     if not resolved.is_file():
         return f"Error: file not found: {rel_path}"
 
-    return resolved.read_text()
+    return resolved.read_text(encoding="utf-8")

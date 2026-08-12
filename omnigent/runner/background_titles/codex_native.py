@@ -123,4 +123,4 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             return None
         if not output_path.is_file():
             return None
-        return output_path.read_text(errors="replace").strip()
+        return output_path.read_text(encoding="utf-8", errors="replace").strip()

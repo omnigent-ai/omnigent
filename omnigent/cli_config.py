@@ -1941,7 +1941,7 @@ def _qwen_auth_configured() -> bool:
     settings = Path.home() / ".qwen" / "settings.json"
     if settings.is_file():
         try:
-            data = json.loads(settings.read_text())
+            data = json.loads(settings.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return False
         if isinstance(data, dict):

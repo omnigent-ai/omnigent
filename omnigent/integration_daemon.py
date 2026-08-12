@@ -138,7 +138,9 @@ class IntegrationDaemon:
         if record is None:
             return ""
         try:
-            lines = Path(record.log_path).read_text(errors="replace").splitlines()
+            lines = (
+                Path(record.log_path).read_text(encoding="utf-8", errors="replace").splitlines()
+            )
         except OSError:
             return ""
         return "\n".join(lines[-max_lines:])

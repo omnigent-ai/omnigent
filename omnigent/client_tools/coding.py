@@ -78,7 +78,7 @@ def Read(
             for large files.
     """
     try:
-        text = Path(file_path).read_text()
+        text = Path(file_path).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return _truncate(f"Error reading {file_path}: {exc}")
     lines = text.splitlines()
@@ -132,7 +132,7 @@ def Edit(
     """
     target = Path(file_path)
     try:
-        text = target.read_text()
+        text = target.read_text(encoding="utf-8")
     except OSError as exc:
         return _truncate(f"Error reading {target}: {exc}")
     count = text.count(old_string)

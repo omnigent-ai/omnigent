@@ -432,7 +432,7 @@ def _index_from_uv_config() -> str:
 
     for path in (_user_config_base() / "uv" / "uv.toml", Path("/etc/uv/uv.toml")):
         try:
-            data = tomllib.loads(path.read_text())
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
         legacy = data.get("index-url")
