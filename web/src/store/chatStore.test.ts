@@ -3932,6 +3932,72 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("refreshSessionState", () => {
+    it("keeps the existing skills when the refreshed snapshot reports none", async () => {
+      // A refresh invalidates the server's runner-skill cache, and skills
+      // resolve OFF the snapshot hot path — so that response can answer
+      // `skills: []` for a session that has them. Applying it blanks the
+      // slash-command menu mid-session (skills showed during terminal
+      // spin-up, then vanished once the runner came online). An empty list
+      // from a refresh means "not yet known", not "none".
+      useChatStore.setState({
+        conversationId: "conv_agy",
+        skills: [{ name: "superpowers:brainstorming", description: "d" }],
+      });
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.split("?")[0] === "/v1/sessions/conv_agy" && (init?.method ?? "GET") === "GET") {
+          return mockResponse({
+            id: "conv_agy",
+            agent_id: "agent_agy",
+            agent_name: "Antigravity",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            labels: { "omnigent.wrapper": "antigravity-native-ui" },
+            skills: [],
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      await useChatStore.getState().refreshSessionState("conv_agy");
+
+      expect(useChatStore.getState().skills).toEqual([
+        { name: "superpowers:brainstorming", description: "d" },
+      ]);
+      // The rest of the binding patch still applies.
+      expect(useChatStore.getState().boundAgentName).toBe("Antigravity");
+    });
+
+    it("still applies a non-empty skills list from a refreshed snapshot", async () => {
+      // The guard must not freeze the menu: a refresh that DOES resolve
+      // skills replaces whatever was there.
+      useChatStore.setState({
+        conversationId: "conv_agy2",
+        skills: [{ name: "stale-skill", description: "old" }],
+      });
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.split("?")[0] === "/v1/sessions/conv_agy2" && (init?.method ?? "GET") === "GET") {
+          return mockResponse({
+            id: "conv_agy2",
+            agent_id: "agent_agy",
+            agent_name: "Antigravity",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            labels: { "omnigent.wrapper": "antigravity-native-ui" },
+            skills: [{ name: "fresh-skill", description: "new" }],
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      await useChatStore.getState().refreshSessionState("conv_agy2");
+
+      expect(useChatStore.getState().skills).toEqual([{ name: "fresh-skill", description: "new" }]);
+    });
+
     it("forces a fresh snapshot and applies runner-backed Codex model options", async () => {
       useChatStore.setState({
         conversationId: "conv_codex",
