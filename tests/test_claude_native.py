@@ -7837,21 +7837,23 @@ def test_tool_use_result_redacts_inline_data_uris() -> None:
     assert json.dumps(record).count(b64) == 1
 
 
-def _mcp_call_output(*content_blocks: Any) -> str:
+def _mcp_call_output(*content_blocks: Any, is_error: bool = False) -> str:
     """Format a real MCP ``CallToolResult`` the way persistence stores it.
 
     Goes through ``omnigent.tools.mcp._format_call_result`` so the test
     exercises the exact serialization a screenshot MCP tool produces,
-    not a hand-authored approximation.
+    not a hand-authored approximation. ``is_error=True`` reproduces the
+    failed-call spelling, which that formatter prefixes with ``"Error: "``.
     """
     from mcp.types import CallToolResult
 
     from omnigent.tools.mcp import _format_call_result
 
-    return _format_call_result(CallToolResult(content=list(content_blocks), isError=False))
+    return _format_call_result(CallToolResult(content=list(content_blocks), isError=is_error))
 
 
-def test_mcp_single_image_result_replays_as_one_structured_image() -> None:
+@pytest.mark.parametrize("is_error", [False, True], ids=["ok", "error"])
+def test_mcp_single_image_result_replays_as_one_structured_image(is_error: bool) -> None:
     """
     A lone MCP ``ImageContent`` replays as a real image block, once.
 
@@ -7860,29 +7862,100 @@ def test_mcp_single_image_result_replays_as_one_structured_image() -> None:
     rehydrator could not recognize: the base64 stayed ~250K tokens of
     model-visible text AND sat in ``toolUseResult``. The rebuild must
     normalize it to one structured image block with redacted metadata.
+
+    The failed spelling is the same payload behind an ``"Error: "``
+    prefix, which is not valid JSON — so it regressed to the exact
+    two-copy, model-visible-text shape after the object form was fixed.
+    It must normalize identically, with the error preserved as a compact
+    text block ahead of the image rather than silently dropped.
     """
     from mcp.types import ImageContent
 
     b64 = _TINY_PNG_BASE64
-    output = _mcp_call_output(ImageContent(type="image", data=b64, mimeType="image/png"))
+    output = _mcp_call_output(
+        ImageContent(type="image", data=b64, mimeType="image/png"), is_error=is_error
+    )
+    assert output.startswith("Error: ") is is_error
     records = _image_output_records(output)
     assert len(records) == 1
     record = records[0]
     content = record["message"]["content"][0]["content"]
     assert isinstance(content, list), "MCP image must not stay string-valued model content"
-    assert content == [
-        {
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/png", "data": b64},
-        }
-    ]
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": b64},
+    }
+    if is_error:
+        assert content == [{"type": "text", "text": "Error:"}, image_block]
+    else:
+        assert content == [image_block]
     tool_use_result = json.loads(record["toolUseResult"])
     assert b64 not in json.dumps(tool_use_result)
-    assert tool_use_result[0]["source"]["media_type"] == "image/png"
+    assert tool_use_result[-1]["source"]["media_type"] == "image/png"
     assert json.dumps(record).count(b64) == 1
 
 
-def test_mcp_mixed_text_and_image_result_replays_as_block_list() -> None:
+def test_mcp_errored_image_clone_record_is_repaired_like_the_ok_form() -> None:
+    """
+    A legacy cloned record holding the errored spelling is repaired too.
+
+    A fork clone byte-copies the source transcript, so a record written
+    before this fix carries the ``"Error: "``-prefixed string as
+    model-visible content with the payload mirrored in metadata. The clone
+    sanitizer runs through the same normalization seam, so it must
+    recover the structured image and drop the duplicate — otherwise the
+    stale record replays the overflow on the clone's first ``--resume``.
+    """
+    from mcp.types import ImageContent
+
+    b64 = _TINY_PNG_BASE64
+    output = _mcp_call_output(
+        ImageContent(type="image", data=b64, mimeType="image/png"), is_error=True
+    )
+    record: dict[str, Any] = {
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": output}],
+        },
+        "toolUseResult": json.dumps(output),
+    }
+    claude_native._sanitize_cloned_tool_result_record(record)
+    content = record["message"]["content"][0]["content"]
+    assert content == [
+        {"type": "text", "text": "Error:"},
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": b64},
+        },
+    ]
+    assert b64 not in json.dumps(record["toolUseResult"])
+    assert json.dumps(record).count(b64) == 1
+
+
+def test_mcp_errored_non_image_result_representation_is_unchanged() -> None:
+    """
+    The prefix is only unwrapped when an image payload is at stake.
+
+    Stripping it wherever it appears would silently restructure every
+    errored tool result. With no payload to protect there is nothing to
+    gain, so an errored text or non-image JSON result keeps replaying the
+    raw string exactly as it did before.
+    """
+    from mcp.types import TextContent
+
+    for output in (
+        _mcp_call_output(TextContent(type="text", text="tool exploded"), is_error=True),
+        _mcp_call_output(TextContent(type="text", text='{"foo":1}'), is_error=True),
+    ):
+        assert output.startswith("Error: ")
+        rehydrated = claude_native._claude_tool_result_content_blocks(output)
+        assert rehydrated.blocks is None
+        records = _image_output_records(output)
+        assert records[0]["message"]["content"][0]["content"] == output
+
+
+@pytest.mark.parametrize("is_error", [False, True], ids=["ok", "error"])
+def test_mcp_mixed_text_and_image_result_replays_as_block_list(is_error: bool) -> None:
     """
     Text-plus-screenshot MCP output replays as a structured block list.
 
@@ -7892,6 +7965,10 @@ def test_mcp_mixed_text_and_image_result_replays_as_block_list() -> None:
     and the base64 survived in both places. The rebuild must recover the
     original block stream, keep the text verbatim, and hold the payload
     exactly once.
+
+    The errored spelling only prefixes the first line, which is text
+    either way, so this shape never regressed — pinned here so the lone
+    image's prefix handling cannot change it.
     """
     from mcp.types import ImageContent, TextContent
 
@@ -7899,23 +7976,25 @@ def test_mcp_mixed_text_and_image_result_replays_as_block_list() -> None:
     output = _mcp_call_output(
         TextContent(type="text", text="took a screenshot"),
         ImageContent(type="image", data=b64, mimeType="image/png"),
+        is_error=is_error,
     )
     # The persisted form is genuinely not one JSON document.
     with pytest.raises(json.JSONDecodeError):
         json.loads(output)
+    expected_text = "Error: took a screenshot" if is_error else "took a screenshot"
     records = _image_output_records(output)
     assert len(records) == 1
     record = records[0]
     content = record["message"]["content"][0]["content"]
     assert content == [
-        {"type": "text", "text": "took a screenshot"},
+        {"type": "text", "text": expected_text},
         {
             "type": "image",
             "source": {"type": "base64", "media_type": "image/png", "data": b64},
         },
     ]
     tool_use_result = json.loads(record["toolUseResult"])
-    assert tool_use_result[0] == {"type": "text", "text": "took a screenshot"}
+    assert tool_use_result[0] == {"type": "text", "text": expected_text}
     assert b64 not in json.dumps(tool_use_result)
     assert json.dumps(record).count(b64) == 1
 

@@ -4774,6 +4774,14 @@ def _strip_unparseable_image_output(output: str) -> str:
     return output
 
 
+#: Prefix ``omnigent.tools.mcp._format_call_result`` puts on a failed MCP
+#: result (``f"Error: {joined}"``). It lands ahead of the serialized
+#: content blocks, so for a lone image it turns valid JSON into an
+#: unparseable string — the shape parser has to know about it or the
+#: payload replays as text. Mirrors that formatter; keep the two in step.
+_MCP_ERROR_PREFIX = "Error: "
+
+
 @dataclass(frozen=True)
 class _RehydratedContent:
     """
@@ -4821,6 +4829,17 @@ def _claude_tool_result_content_blocks(output: str) -> _RehydratedContent:
     same formatter writes for multi-block MCP results). MCP image
     entries are converted to canonical ``source``-shaped blocks.
 
+    Each of those shapes also has an *errored* spelling: the same
+    formatter prefixes a failed result with ``"Error: "``, which makes an
+    otherwise-parseable lone image object unparseable JSON. Left
+    unhandled, such a record replays its base64 twice — once as
+    model-visible ``tool_result`` text and once in metadata. One leading
+    prefix is therefore stripped for shape parsing and re-attached as a
+    compact text block ahead of the image, so the error stays visible to
+    the model without the payload going with it. The newline-joined shape
+    already survives the prefix (it only affects the first line, which is
+    text either way).
+
     :param output: The persisted tool-result string, e.g.
         ``'[{"type":"image","source":{"type":"base64","data":"..."}}]'``
         or plain text like ``"file written"``.
@@ -4828,6 +4847,37 @@ def _claude_tool_result_content_blocks(output: str) -> _RehydratedContent:
         content blocks when *output* holds a recognized block shape, and
         ``None`` otherwise so the caller keeps the raw string as the block
         content.
+    """
+    direct = _rehydrate_tool_result_shape(output)
+    if direct.blocks is not None or not output.startswith(_MCP_ERROR_PREFIX):
+        return direct
+    # Exactly one prefix is stripped — a literal "Error: Error: ..." keeps
+    # its second copy as text rather than being unwrapped twice.
+    nested = _rehydrate_tool_result_shape(output[len(_MCP_ERROR_PREFIX) :])
+    if nested.blocks is None:
+        return direct
+    if not _image_payloads_in_blocks(nested.blocks) and not nested.dropped_oversized_image:
+        # No payload at stake, so leave the representation alone: an
+        # errored non-image result keeps replaying exactly as before.
+        return direct
+    error_block: _JsonObject = {"type": "text", "text": _MCP_ERROR_PREFIX.strip()}
+    return _RehydratedContent(
+        [error_block, *nested.blocks],
+        dropped_oversized_image=nested.dropped_oversized_image,
+    )
+
+
+def _rehydrate_tool_result_shape(output: str) -> _RehydratedContent:
+    """
+    Normalize one persisted tool-result string by its literal shape.
+
+    The shape-matching core of :func:`_claude_tool_result_content_blocks`,
+    split out so the errored spelling can retry against a de-prefixed copy
+    without recursing (which would strip more than one prefix).
+
+    :param output: The persisted tool-result string.
+    :returns: A :class:`_RehydratedContent`; ``blocks`` is ``None`` when
+        *output* holds no recognized block shape.
     """
     try:
         parsed = json.loads(output)
