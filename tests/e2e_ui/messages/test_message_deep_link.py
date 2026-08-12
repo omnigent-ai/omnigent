@@ -71,17 +71,14 @@ def test_copy_message_link_opens_and_highlights_target(
         assert not message_id.startswith("pend_"), f"still pending id {message_id!r}"
 
         # test-id stays stable after click; role name "Copy link" does not
-        # (tooltip/sr-only become "Copied!"). Assert clipboard, not the
-        # brief check icon, so confirmation UX cannot flake the e2e.
+        # (tooltip/sr-only become "Copied!"). Wait for the check icon on the
+        # stable test-id locator, then read the clipboard.
         copy_link = bubble.get_by_test_id("copy-message-link")
         expect(copy_link).to_be_attached()
         bubble.hover()
         copy_link.click()
+        expect(copy_link.locator("svg.lucide-check")).to_have_count(1, timeout=5_000)
 
-        expect.poll(
-            lambda: page.evaluate("() => navigator.clipboard.readText()"),
-            timeout=5_000,
-        ).to_contain(session_id)
         clipboard = page.evaluate("() => navigator.clipboard.readText()")
         assert session_id in clipboard, f"clipboard URL {clipboard!r} missing session id"
         assert re.search(rf"[?&]message={re.escape(message_id)}", clipboard), (

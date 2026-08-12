@@ -4,6 +4,7 @@
 // - Stale anchor (id not in list) degrades to outside-end.
 // - Assertions check the target element's data attr, not just "spy called".
 
+import type * as ConversationModule from "@/components/ai-elements/conversation";
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
@@ -11,7 +12,7 @@ import { useUserMessageNav } from "./useUserMessageNav";
 
 const releaseScrollLock = vi.hoisted(() => vi.fn());
 vi.mock("@/components/ai-elements/conversation", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/components/ai-elements/conversation")>();
+  const actual = await importOriginal<typeof ConversationModule>();
   return {
     ...actual,
     releaseConversationScrollLock: releaseScrollLock,

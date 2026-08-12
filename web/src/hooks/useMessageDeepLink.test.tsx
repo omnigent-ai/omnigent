@@ -1,3 +1,4 @@
+import type * as ConversationModule from "@/components/ai-elements/conversation";
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -7,7 +8,7 @@ import { useMessageDeepLink } from "./useMessageDeepLink";
 
 const releaseScrollLock = vi.hoisted(() => vi.fn());
 vi.mock("@/components/ai-elements/conversation", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/components/ai-elements/conversation")>();
+  const actual = await importOriginal<typeof ConversationModule>();
   return {
     ...actual,
     releaseConversationScrollLock: releaseScrollLock,
