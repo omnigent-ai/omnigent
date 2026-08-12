@@ -572,6 +572,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             lambda _sid, event: published_events.append(event),
             agent_spec=agent_spec,
             server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+            runtime_cwd=tmp_path / "workspace",
+            additional_directories=("/repo/shared", "/repo/docs"),
         )
         await asyncio.sleep(0)
     finally:
@@ -591,14 +593,18 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     launched = launched_specs[0]
     assert launched.command == "/opt/codex/bin/codex"
     assert launched.args[0] == "--dangerously-bypass-hook-trust"
-    assert launched.args[1:4] == [
+    assert launched.args[1:8] == [
         "--config",
         "approval_policy=on-request",
+        "--add-dir",
+        "/repo/shared",
+        "--add-dir",
+        "/repo/docs",
         "resume",
     ]
-    assert launched.args[4] == "--remote"
-    assert launched.args[5].startswith("ws://127.0.0.1:")
-    assert launched.args[6] == thread_id
+    assert launched.args[8] == "--remote"
+    assert launched.args[9].startswith("ws://127.0.0.1:")
+    assert launched.args[10] == thread_id
     assert launched.env["OPENAI_API_KEY"] == "sk-test"
     assert "IGNORED" not in launched.env
     assert launched.env["CODEX_HOME"] == str(app_server.codex_home)

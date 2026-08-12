@@ -73,6 +73,10 @@ def test_executor_factory_reads_env_vars(
     monkeypatch.setenv("HARNESS_CODEX_GATEWAY_AUTH_COMMAND", "printf token")
     monkeypatch.setenv("HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS", "900000")
     monkeypatch.setenv("HARNESS_CODEX_CWD", "/tmp/test-cwd")
+    monkeypatch.setenv(
+        "HARNESS_CODEX_ADD_DIRS",
+        '["/tmp/shared","/tmp/docs"]',
+    )
     monkeypatch.setenv("HARNESS_CODEX_PATH", "/usr/local/bin/codex")
     monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
     monkeypatch.setenv("HARNESS_CODEX_ENABLE_WEB_SEARCH", "false")
@@ -84,6 +88,7 @@ def test_executor_factory_reads_env_vars(
         self: Any,
         *,
         cwd: str | None,
+        additional_directories: tuple[str, ...],
         os_env: Any,
         model: str | None,
         codex_path: str | None,
@@ -98,6 +103,7 @@ def test_executor_factory_reads_env_vars(
         **_kwargs: Any,
     ) -> None:
         captured["cwd"] = cwd
+        captured["additional_directories"] = additional_directories
         captured["os_env"] = os_env
         captured["model"] = model
         captured["codex_path"] = codex_path
@@ -126,6 +132,7 @@ def test_executor_factory_reads_env_vars(
     assert captured["gateway_auth_command"] == "printf token"
     assert captured["gateway_auth_refresh_interval_ms"] == "900000"
     assert captured["cwd"] == "/tmp/test-cwd"
+    assert captured["additional_directories"] == ("/tmp/shared", "/tmp/docs")
     assert captured["codex_path"] == "/usr/local/bin/codex"
     # Inverted defaults verify the truthy parser is consulted
     # for both directions: enable_web_search default is True,

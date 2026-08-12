@@ -19,7 +19,7 @@ import sys
 import time
 import urllib.parse
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, MutableMapping
+from collections.abc import Awaitable, Callable, Mapping, MutableMapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
@@ -3683,6 +3683,8 @@ async def _auto_create_codex_terminal(
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     server_client: httpx.AsyncClient | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    runtime_cwd: Path | None = None,
+    additional_directories: Sequence[str] = (),
 ) -> SessionResourceView:
     """
     Auto-create a Codex terminal for a codex-native session.
@@ -3721,6 +3723,12 @@ async def _auto_create_codex_terminal(
         default, e.g. ``"gpt-5.4-mini"``.
     :param server_client: Runner's Omnigent server HTTP client. Used to read
         persisted launch args and the native thread id.
+    :param runtime_cwd: Resolved session cwd. This may be a private scratch
+        directory for child sessions that attach roots without selecting a
+        primary directory.
+    :param additional_directories: Attached project roots beyond
+        ``runtime_cwd``. Forwarded to Codex through repeatable ``--add-dir``
+        flags.
     :returns: The created terminal resource view.
     """
     import socket as _socket
@@ -3750,7 +3758,7 @@ async def _auto_create_codex_terminal(
         server_client=server_client,
     )
     original_external_session_id = launch_config.external_session_id
-    workspace = str(launch_config.workspace)
+    workspace = str(runtime_cwd if runtime_cwd is not None else launch_config.workspace)
     bridge_dir = prepare_bridge_dir(session_id)
     socket_path = socket_path_for_bridge_dir(bridge_dir)
     codex_home = codex_home_for_bridge_dir(bridge_dir)
@@ -4119,6 +4127,7 @@ async def _auto_create_codex_terminal(
                     thread_id=launch_config.external_session_id,
                     remote_url=codex_ws_url,
                     bypass_sandbox=launch_config.bypass_sandbox,
+                    additional_directories=additional_directories,
                     # The --remote TUI loads its own config and does not
                     # inherit the app-server's -c flags; pass the same
                     # provider/model overrides so it resolves the
@@ -7107,6 +7116,8 @@ class NativeLaunchContext:
     skills_filter: str | list[str] = "all"
     agent_name: str | None = None
     session_init: RunnerSessionInitEnvelope | None = None
+    runtime_cwd: Path | None = None
+    additional_directories: Sequence[str] = ()
     auth_token_factory: Callable[[], str | None] | None = None
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None
     record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None
@@ -7175,6 +7186,8 @@ async def _launch_opencode(ctx: NativeLaunchContext) -> SessionResourceView:
         agent_spec=ctx.agent_spec,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        runtime_cwd=ctx.runtime_cwd,
+        additional_directories=ctx.additional_directories,
     )
 
 
@@ -7267,6 +7280,8 @@ async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
         agent_spec=ctx.agent_spec,
         skills_filter=ctx.skills_filter,
         session_init=ctx.session_init,
+        runtime_cwd=ctx.runtime_cwd,
+        additional_directories=ctx.additional_directories,
         auth_token_factory=ctx.auth_token_factory,
         resolve_launch_config=ctx.resolve_launch_config,
         record_launch_config=ctx.record_launch_config,

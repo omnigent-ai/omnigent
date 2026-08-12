@@ -2692,6 +2692,7 @@ def build_codex_remote_args(
     config_overrides: tuple[str, ...] = (),
     bypass_sandbox: bool = False,
     bypass_hook_trust: bool = False,
+    additional_directories: Sequence[str] = (),
 ) -> list[str]:
     """
     Build Codex CLI args for an app-server-backed TUI session.
@@ -2749,6 +2750,8 @@ def build_codex_remote_args(
         user to answer the prompt. Default ``False`` for interactive
         ``omnigent codex`` sessions where the user faces the terminal and
         can accept hooks normally.
+    :param additional_directories: Attached project roots beyond the launch
+        cwd. Each is forwarded through a repeatable ``--add-dir`` flag.
     :returns: Codex argv tail after the executable.
     """
     override_args: list[str] = []
@@ -2766,6 +2769,8 @@ def build_codex_remote_args(
         passthrough = normalize_codex_permission_launch_args(codex_args)
     if bypass_hook_trust:
         passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]
+    for directory in additional_directories:
+        passthrough.extend(("--add-dir", directory))
     if thread_id is None:
         return [*override_args, *passthrough, "--remote", remote_url]
     return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]

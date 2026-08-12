@@ -428,6 +428,37 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_executor_builds_runtime_workspace_roots_from_cwd_and_attachments(self):
+        async def _t():
+            fake_session = _FakeAppSession([[TurnComplete(response="done")]])
+            captured: dict[str, object] = {}
+
+            def _factory(**kwargs: object) -> _FakeAppSession:
+                captured.update(kwargs)
+                return fake_session
+
+            executor = CodexExecutor(
+                codex_path="/bin/echo",
+                cwd="/repo/primary",
+                additional_directories=("/repo/shared", "/repo/docs"),
+                app_session_factory=_factory,
+            )
+            _ = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+            self.assertEqual(
+                captured["runtime_workspace_roots"],
+                ("/repo/primary", "/repo/shared", "/repo/docs"),
+            )
+
+        _run(_t())
+
     def test_run_turn_databricks_uses_databricks_default_model(self):
         async def _t():
             fake_session = _FakeAppSession([[TurnComplete(response="done")]])
@@ -553,6 +584,48 @@ class TestCodexExecutor(unittest.TestCase):
             params = thread_start_call.args[1]
             self.assertNotIn("shell_tool", params["config"]["features"])
             self.assertEqual(params["dynamicTools"][0]["name"], "sys_os_shell")
+
+        _run(_t())
+
+    def test_app_server_thread_start_sets_runtime_workspace_roots(self):
+        async def _t():
+            roots = ("/repo/primary", "/repo/shared", "/repo/docs")
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd=roots[0],
+                env={},
+                tool_executor=None,
+                runtime_workspace_roots=roots,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    {"result": {"turn": {"id": "turn-1"}}},
+                ]
+            )
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            async for _event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=roots[0],
+                sandbox="workspace-write",
+            ):
+                pass
+            await inject_task
+
+            thread_start_params = session._request.await_args_list[0].args[1]
+            self.assertEqual(thread_start_params["runtimeWorkspaceRoots"], list(roots))
 
         _run(_t())
 
