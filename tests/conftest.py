@@ -294,6 +294,29 @@ def _reset_runner_catalog_cache() -> Generator[None, None, None]:
 
 
 @pytest.fixture(autouse=True)
+def _reset_session_outbox_store() -> Generator[None, None, None]:
+    """
+    Clear the session-lifecycle outbox's process-global store after every test.
+
+    ``omnigent.server.session_outbox`` is wired via module-global
+    ``configure(store)`` (mirroring ``session_live_state``), called by every
+    ``create_app(...)``. Unlike ``session_live_state``, its writes are
+    deliberately NOT best-effort — a failure propagates to the caller (see
+    the module docstring; this is the point of a durable outbox). Without
+    this reset, a test that builds an app leaves ``_store`` pointing at that
+    test's now-torn-down SQLite temp file; the next unrelated test that
+    reaches ``_publish_status`` (even one that never builds an app itself)
+    can then crash on a stale-engine write instead of running cleanly.
+
+    :returns: None.
+    """
+    yield
+    module = sys.modules.get("omnigent.server.session_outbox")
+    if module is not None:
+        module.configure(None)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_claude_native_state(
     tmp_path_factory: pytest.TempPathFactory,
     monkeypatch: pytest.MonkeyPatch,

@@ -127,6 +127,31 @@ SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
     "skipped": 5,
 }
 
+# Manager-webhook lifecycle event type (session_lifecycle_outbox.event_type).
+SESSION_LIFECYCLE_EVENT_TYPE: dict[str, int] = {
+    "session.completed": 1,
+    "session.failed": 2,
+    "session.awaiting_decision": 3,
+    "session.resumed": 4,
+}
+
+# Delivery status of a session_lifecycle_outbox row.
+SESSION_LIFECYCLE_OUTBOX_STATUS: dict[str, int] = {
+    "pending": 1,
+    "leased": 2,
+    "delivered": 3,
+    "dead_letter": 4,
+    "paused": 5,
+}
+
+# Durable status of a session_elicitations row.
+SESSION_ELICITATION_STATUS: dict[str, int] = {
+    "pending": 1,
+    "decided": 2,
+    "delivered_to_runner": 3,
+    "expired": 4,
+}
+
 
 def _assert_item_type_codes_cover_data_classes() -> None:
     """
@@ -338,3 +363,33 @@ def encode_scheduled_task_run_status(name: str) -> int:
 def decode_scheduled_task_run_status(code: int) -> str:
     """Decode a ``scheduled_task_runs.status`` int code to its name."""
     return _decode(SCHEDULED_TASK_RUN_STATUS, code, field="scheduled_task_runs.status")
+
+
+def encode_session_lifecycle_event_type(name: str) -> int:
+    """Encode a ``session_lifecycle_outbox.event_type`` name to its int code."""
+    return _encode(SESSION_LIFECYCLE_EVENT_TYPE, name, field="session_lifecycle_outbox.event_type")
+
+
+def decode_session_lifecycle_event_type(code: int) -> str:
+    """Decode a ``session_lifecycle_outbox.event_type`` int code to its name."""
+    return _decode(SESSION_LIFECYCLE_EVENT_TYPE, code, field="session_lifecycle_outbox.event_type")
+
+
+def encode_session_lifecycle_outbox_status(name: str) -> int:
+    """Encode a ``session_lifecycle_outbox.status`` name to its int code."""
+    return _encode(SESSION_LIFECYCLE_OUTBOX_STATUS, name, field="session_lifecycle_outbox.status")
+
+
+def decode_session_lifecycle_outbox_status(code: int) -> str:
+    """Decode a ``session_lifecycle_outbox.status`` int code to its name."""
+    return _decode(SESSION_LIFECYCLE_OUTBOX_STATUS, code, field="session_lifecycle_outbox.status")
+
+
+def encode_session_elicitation_status(name: str) -> int:
+    """Encode a ``session_elicitations.status`` name to its int code."""
+    return _encode(SESSION_ELICITATION_STATUS, name, field="session_elicitations.status")
+
+
+def decode_session_elicitation_status(code: int) -> str:
+    """Decode a ``session_elicitations.status`` int code to its name."""
+    return _decode(SESSION_ELICITATION_STATUS, code, field="session_elicitations.status")

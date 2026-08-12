@@ -216,12 +216,21 @@ class SessionConnectivity:
         Lets a replica that does NOT hold the tunnel derive
         ``runner_online`` from freshness (see
         :func:`runner_seen_is_fresh`) instead of its own empty registry.
+    :param runner_disconnect_grace_deadline: Epoch seconds the bound
+        runner's post-disconnect reconnect grace (OMN-104 §5.4) expires
+        at, written by the replica holding the tunnel at the same moment
+        it clears ``runner_last_seen``. ``None`` when not currently
+        grace-pending. Lets a replica that does NOT hold the tunnel
+        classify a decision arriving mid-grace as "pending redelivery"
+        rather than "runner dead", without needing the tunnel-holding
+        replica's own in-memory registry.
     """
 
     runner_id: str | None
     host_id: str | None
     needs_workspace: bool
     runner_last_seen: int | None = None
+    runner_disconnect_grace_deadline: int | None = None
 
 
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
@@ -1200,6 +1209,66 @@ class ConversationStore(ABC):
         :data:`RUNNER_LIVENESS_TTL_S`. Must NOT bump ``updated_at``.
 
         :param runner_id: The disconnected runner's id.
+        """
+        ...
+
+    @abstractmethod
+    def mark_runner_disconnected(self, runner_id: str, grace_deadline: int) -> None:
+        """
+        Atomically clear liveness and set the reconnect-grace deadline for
+        every session bound to a runner, in ONE transaction/commit.
+
+        Cross-vendor review: :meth:`clear_runner_liveness` and
+        :meth:`set_runner_disconnect_grace` used to be called as two
+        SEPARATE store writes on disconnect. Because each is its own
+        transaction, there was a real (if narrow) window between the two
+        commits where another replica's read observed BOTH
+        ``runner_last_seen`` cleared AND ``runner_disconnect_grace_deadline``
+        still absent (or a stale, already-expired value) simultaneously —
+        the runner would look neither live nor grace-pending, and a manager
+        decision landing in that exact window would be falsely 410'd even
+        though the runner is genuinely still within its reconnect grace.
+        A single ``UPDATE`` setting both columns is atomic per row under any
+        transactional isolation level a reader could observe — there is no
+        third, in-between state to read. Must NOT bump ``updated_at``.
+
+        :param runner_id: The disconnecting runner's id.
+        :param grace_deadline: Epoch seconds the reconnect grace expires at.
+        """
+        ...
+
+    @abstractmethod
+    def set_runner_disconnect_grace(self, runner_id: str, grace_deadline: int) -> None:
+        """
+        Stamp the post-disconnect reconnect-grace deadline (OMN-104 §5.4)
+        for every session bound to a runner.
+
+        Called by the replica holding the tunnel at the same moment it
+        calls :meth:`clear_runner_liveness`, so any OTHER replica handling
+        a manager decision request can see "this runner disconnected and
+        is still within its reconnect grace" instead of falling through to
+        the now-cleared ``runner_last_seen`` freshness check and
+        misclassifying a runner that is about to reconnect as dead. One
+        bulk ``UPDATE``; must NOT bump ``updated_at``.
+
+        :param runner_id: The disconnected runner's id.
+        :param grace_deadline: Epoch seconds the grace expires at.
+        """
+        ...
+
+    @abstractmethod
+    def clear_runner_disconnect_grace(self, runner_id: str) -> None:
+        """
+        Clear the reconnect-grace deadline for every session bound to a runner.
+
+        Called on reconnect (the grace is no longer pending) and once the
+        grace genuinely expires with no reconnect (the runner is now
+        confirmed dead, not merely presumed — see
+        ``_mark_disconnected_runner_failed`` in ``app.py``). Must NOT bump
+        ``updated_at``.
+
+        :param runner_id: The runner whose grace-pending marker should be
+            cleared.
         """
         ...
 

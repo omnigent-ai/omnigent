@@ -325,6 +325,31 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
     return f"Request failed on the runner; see the runner log for details: {log_reference}"
 
 
+# OMN-104 §5.4: header the server's decision-endpoint forward and
+# reconnect-redelivery hook read to distinguish "this endpoint 2xx'd" from
+# "a tracked pending_approvals Future was actually resolved" — the former is
+# NOT proof of truthful consumption (a 2xx also happens for an unknown, stale,
+# or already-resolved elicitation_id).
+_PENDING_APPROVAL_RESOLVED_HEADER = "X-Omnigent-Pending-Approval-Resolved"
+
+
+def _attach_pending_approval_header(response: Response, resolved: bool | None) -> None:
+    """
+    Stamp *response* with whether ``pending_approvals.resolve()`` found and
+    resolved a tracked Future for this request's ``approval`` event.
+
+    A no-op when *resolved* is ``None`` (the request wasn't an ``approval``
+    event at all, so the header is meaningless here).
+
+    :param response: The response about to be returned from
+        ``POST /v1/sessions/{id}/events``.
+    :param resolved: The boolean ``pending_approvals.resolve()`` returned, or
+        ``None`` for a non-approval event.
+    """
+    if resolved is not None:
+        response.headers[_PENDING_APPROVAL_RESOLVED_HEADER] = "true" if resolved else "false"
+
+
 _SpecEntry: TypeAlias = AgentSpec | ResolvedSpec
 SpecResolver: TypeAlias = Callable[[str, str | None], Awaitable[_SpecEntry | None]]
 _ResourceType: TypeAlias = Literal["environment", "terminal", "file"]
@@ -6565,10 +6590,21 @@ def create_runner_app(
                 )
             return Response(status_code=204)
 
+        _pending_approval_resolved: bool | None = None
         if body_type == "approval":
             _data = body.get("data") or body
             _elicit_action = _data.get("action", "")
-            pending_approvals.resolve(_data.get("elicitation_id", ""), _elicit_action == "accept")
+            # OMN-104 §5.4: the caller (server-side decision-endpoint forward,
+            # or the reconnect-redelivery hook) needs to know whether this
+            # specific approval was TRUTHFULLY consumed by a tracked
+            # pending_approvals Future — not just that this endpoint 2xx'd,
+            # which also fires for an unknown/stale/already-resolved id.
+            # Carried back via a response header (below) rather than the JSON
+            # body, since the body below is a passthrough of the harness
+            # subprocess's own response to a *different* forward, not ours.
+            _pending_approval_resolved = pending_approvals.resolve(
+                _data.get("elicitation_id", ""), _elicit_action == "accept"
+            )
             if _session_harness_name(conversation_id) == "claude-native":
                 await _apply_claude_native_plan_verdict(conversation_id, _data)
             if _elicit_action == "decline":
@@ -6586,21 +6622,25 @@ def create_runner_app(
         try:
             harness_client = await process_manager.get_client(conversation_id, "any")
         except NoLiveHarnessError:
-            return JSONResponse(
+            _events_response = JSONResponse(
                 status_code=409,
                 content={
                     "error": "no_live_harness",
                     "detail": "no harness subprocess is running for this conversation",
                 },
             )
+            _attach_pending_approval_header(_events_response, _pending_approval_resolved)
+            return _events_response
         except RuntimeError as exc:
-            return JSONResponse(
+            _events_response = JSONResponse(
                 status_code=503,
                 content={
                     "error": "no_harness",
                     "detail": _client_safe_error_detail(exc, context="harness lookup"),
                 },
             )
+            _attach_pending_approval_header(_events_response, _pending_approval_resolved)
+            return _events_response
         try:
             resp = await harness_client.post(
                 f"/v1/sessions/{conversation_id}/events",
@@ -6608,7 +6648,7 @@ def create_runner_app(
                 timeout=30.0,
             )
         except Exception as exc:  # noqa: BLE001
-            return JSONResponse(
+            _events_response = JSONResponse(
                 status_code=502,
                 content={
                     "error": "harness_forward_failed",
@@ -6616,7 +6656,11 @@ def create_runner_app(
                     "event_type": body_type,
                 },
             )
-        return _forward_harness_response(resp)
+            _attach_pending_approval_header(_events_response, _pending_approval_resolved)
+            return _events_response
+        _events_response = _forward_harness_response(resp)
+        _attach_pending_approval_header(_events_response, _pending_approval_resolved)
+        return _events_response
 
     async def _resolve_conversation_id(response_id: str) -> str | None:
         return _resp_to_conv.get(response_id)

@@ -1929,6 +1929,13 @@ class SessionResponse(BaseModel):
     # ``labels``); set/cleared via ``PATCH /v1/sessions/{id}`` and filtered on
     # ``GET /v1/sessions?project=``.
     project_id: str | None = None
+    # Summary (status + last attempt) of this session's most recent
+    # manager-webhook outbox row (OMN-104) — status/event_type/attempt_count/
+    # last_attempt_at/last_http_status/last_error_code, same shape as one row
+    # from ``GET .../manager-webhook-deliveries``. ``None`` when the feature
+    # isn't wired or nothing has been recorded yet. Lets the sidebar/detail
+    # view show delivery health without a second round-trip.
+    latest_manager_delivery: dict[str, Any] | None = None
 
 
 class UpdateSessionRequest(BaseModel):

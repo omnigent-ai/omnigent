@@ -13,6 +13,7 @@ import json
 import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 import httpx
@@ -23,6 +24,7 @@ from fastapi import (
 from fastapi.responses import Response
 from pydantic import ValidationError
 
+from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id, generate_task_id
 from omnigent.entities import (
     Agent,
@@ -33,6 +35,7 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
     ResourceEventData,
+    SessionElicitation,
 )
 from omnigent.entities.conversation import (
     FunctionCallData,
@@ -90,7 +93,7 @@ from omnigent.runtime.policies.builder import (
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
-from omnigent.server import session_live_state
+from omnigent.server import session_live_state, session_outbox
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -340,6 +343,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.session_lifecycle_store import SessionLifecycleStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
@@ -420,6 +424,18 @@ async def _publish_and_wait_for_harness_elicitation(
     _harness_elicitation_registry[elicitation_id] = future
     _harness_elicitation_owners[elicitation_id] = session_id
     _harness_parked_elicitations[elicitation_id] = parked
+    # Durable elicitation ledger + session.awaiting_decision outbox row
+    # (OMN-104), written transactionally before the request is published.
+    # Idempotent by elicitation_id: a re-park retry (caller-supplied id
+    # reusing the same registration) resolves to the existing row rather
+    # than a duplicate — see
+    # docs/architecture/2026-08-10-durable-session-lifecycle-push.md §5.4.
+    session_outbox.record_elicitation_raised(
+        workspace_id=current_workspace_id(),
+        session_id=session_id,
+        elicitation_id=elicitation_id,
+        request={**params.model_dump(exclude_none=True), "tool_name": tool_name},
+    )
     # settled = verdict / terminal-resolved (clear the card now); a
     # severed wait instead defers the clear so a hook retry can re-park.
     published_request = False
@@ -956,6 +972,7 @@ def _build_session_response(
     viewer_id: str | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    latest_manager_delivery: dict[str, Any] | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -1024,6 +1041,11 @@ def _build_session_response(
         ``None`` is treated as ``[]``.
     :param agent_store: Optional store used to resolve the session harness.
     :param agent_cache: Optional cache used to load the session harness spec.
+    :param latest_manager_delivery: Summary (status + last attempt) of the
+        session's most recent manager-webhook outbox row (OMN-104), or
+        ``None`` when the feature isn't wired or nothing has been recorded
+        yet. Lets the sidebar/detail view avoid a second round-trip to
+        ``GET .../manager-webhook-deliveries`` for the common case.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
     """
@@ -1142,6 +1164,7 @@ def _build_session_response(
         # sessions whose forwarder stamps a turn id; ``None`` otherwise.
         active_response_id=_session_active_response_cache.get(conv.id),
         project_id=conv.project_id,
+        latest_manager_delivery=latest_manager_delivery,
     )
 
 
@@ -1630,12 +1653,30 @@ async def _persist_model_change_note(
     _publish_external_conversation_item(session_id, persisted_items[0])
 
 
+@dataclass(frozen=True)
+class ElicitationResolutionOutcome:
+    """
+    Result of one :func:`_resolve_elicitation` call, for OMN-104's
+    harness-classified decision-endpoint resolution.
+
+    :param harness_future_resolved: ``True`` if a parked server-side
+        ``_harness_elicitation_registry`` Future was found (owned by this
+        session, not already done) and resolved by this call — a complete,
+        synchronous, in-process truthful acknowledgement on its own.
+    :param forward_outcome: The outcome of forwarding the verdict to the
+        session's bound runner (see :func:`_forward_approval_to_runner`).
+    """
+
+    harness_future_resolved: bool
+    forward_outcome: Literal["no_runner", "delivered", "not_consumed", "unreachable"]
+
+
 async def _resolve_elicitation(
     session_id: str,
     data: dict[str, Any],
     runner_router: RunnerRouter | None,
     conversation_store: ConversationStore | None = None,
-) -> None:
+) -> ElicitationResolutionOutcome:
     """
     Resolve one outstanding elicitation from an approval payload.
 
@@ -1687,6 +1728,7 @@ async def _resolve_elicitation(
     # matches, no resolved event published) rather than 500-ing the
     # client — the runner forward still fires so the runner can reject.
     elicitation_id = data.get("elicitation_id", "")
+    harness_future_resolved = False
     harness_future = _harness_elicitation_registry.get(elicitation_id)
     if harness_future is not None and not harness_future.done():
         # Only the session that owns this elicitation
@@ -1698,6 +1740,7 @@ async def _resolve_elicitation(
                 harness_future.set_result(
                     ElicitationResult.model_validate(result_payload),
                 )
+                harness_future_resolved = True
             except ValidationError:
                 _logger.warning(
                     "Invalid approval payload for %r",
@@ -1744,7 +1787,142 @@ async def _resolve_elicitation(
             )
     # Runner-side elicitations (policy approvals, scaffold dispatch)
     # resolve when the canonical approval event reaches the runner.
-    await _forward_approval_to_runner(session_id, data, runner_router)
+    forward_outcome = await _forward_approval_to_runner(session_id, data, runner_router)
+    return ElicitationResolutionOutcome(
+        harness_future_resolved=harness_future_resolved,
+        forward_outcome=forward_outcome,
+    )
+
+
+@dataclass(frozen=True)
+class DurableElicitationResolution:
+    """
+    Result of :func:`_resolve_elicitation_durably` — the shared OMN-104
+    durable-write sequence layered on top of :func:`_resolve_elicitation`.
+
+    :param outcome: The underlying :func:`_resolve_elicitation` result.
+    :param decision_record: The durable ledger row after the write, or
+        ``None`` when this id has no durable OMN-104 row at all (the
+        pre-OMN-104 no-op contract — an untracked/legacy/cross-session id).
+    :param resolved: ``True`` if this call durably recorded (or found
+        already recorded) a truthful ``session.resumed``.
+    """
+
+    outcome: ElicitationResolutionOutcome
+    decision_record: SessionElicitation | None
+    resolved: bool
+
+
+async def _resolve_elicitation_durably(
+    session_id: str,
+    data: dict[str, Any],
+    runner_router: RunnerRouter | None,
+    conversation_store: ConversationStore | None,
+    *,
+    decided_by: str | None,
+) -> DurableElicitationResolution:
+    """
+    Durably persist a verdict, then resolve it (OMN-104).
+
+    The single sequence — ownership check, durable ``record_decision``
+    BEFORE any attempt to resolve an in-memory Future or reach the
+    runner, then classify and ``record_elicitation_resumed`` on a
+    truthful ack — shared by EVERY entry point that can consume/resolve
+    an elicitation: the dedicated ``.../resolve`` URL endpoint and the
+    generic ``type == "approval"`` branch of ``POST /v1/sessions/{id}
+    /events``. A second entry point bypassing this sequence was exactly
+    the cross-vendor review finding this function exists to close —
+    both must go through here so neither can durably decide (or resume)
+    an elicitation the other doesn't durably record.
+
+    :param session_id: Session/conversation identifier that owns the
+        elicitation, e.g. ``"conv_abc123"``.
+    :param data: Approval payload carrying ``elicitation_id`` plus the
+        MCP ``ElicitationResult`` fields (``action``, optional
+        ``content``).
+    :param runner_router: Router used to resolve the session's bound
+        runner for the forward, or ``None`` in in-process setups.
+    :param conversation_store: Optional store used to mirror the
+        resolved signal into ancestor streams.
+    :param decided_by: Manager identity from a signed callback, or
+        ``None`` for a web-UI/generic-event verdict.
+    :returns: The durable resolution result — see
+        :class:`DurableElicitationResolution`.
+    """
+    elicitation_id = data.get("elicitation_id", "")
+    existing_elicitation = (
+        session_outbox.get_elicitation(elicitation_id)
+        if isinstance(elicitation_id, str) and elicitation_id
+        else None
+    )
+    owned_by_this_session = (
+        existing_elicitation is not None and existing_elicitation.session_id == session_id
+    )
+    # Durably persist the verdict FIRST, unconditionally (once ownership is
+    # established) — before any attempt to resolve an in-memory Future or
+    # reach the runner. This is what lets the classification below
+    # distinguish "durably recorded but not yet consumed" from "silently
+    # dropped" after a restart (OMN-104 §5.4).
+    decision_record = (
+        session_outbox.record_decision(
+            elicitation_id=elicitation_id,
+            decision={k: v for k, v in data.items() if k != "elicitation_id"},
+            decided_by=decided_by,
+        )
+        if owned_by_this_session
+        else None
+    )
+    # Forward the PERSISTED WINNING verdict, not this call's own `data`.
+    # record_decision is idempotent per elicitation_id (see the store's
+    # row-locked read-then-write): whichever call actually wrote first
+    # "wins", and every later call for the same id — including THIS one,
+    # if it lost a race against a conflicting concurrent verdict — gets
+    # back a row already carrying the winner's decision_payload, not its
+    # own. Forwarding the raw request `data` here instead would let a
+    # losing racing callback make the live runner/harness consume ITS
+    # verdict while the durable ledger correctly kept the actual winner's
+    # — a truthfulness split between the live action and the source of
+    # record. Only forward raw `data` when there's no durable row to defer
+    # to at all (decision_record is None: untracked/cross-session id),
+    # preserving the exact pre-OMN-104 no-op contract for that case.
+    if decision_record is not None:
+        winning_decision = (
+            json.loads(decision_record.decision_payload)
+            if decision_record.decision_payload
+            else {}
+        )
+        forward_data = {"elicitation_id": elicitation_id, **winning_decision}
+    else:
+        forward_data = data
+    outcome = await _resolve_elicitation(
+        session_id, forward_data, runner_router, conversation_store
+    )
+    if decision_record is None:
+        # No durable OMN-104 ledger row for this id — either the feature
+        # isn't wired, or (the common case for these shared entry points)
+        # the id was never registered via record_elicitation_raised / is
+        # already resolved / is unknown. Preserve the pre-OMN-104 no-op
+        # contract exactly rather than treating an always-harmless call
+        # as a fresh classification.
+        return DurableElicitationResolution(outcome=outcome, decision_record=None, resolved=False)
+    if decision_record.status in ("delivered_to_runner", "expired"):
+        # Already truthfully resumed (by an earlier call, or by reconnect
+        # redelivery) — idempotent no-op, not a fresh classification.
+        return DurableElicitationResolution(
+            outcome=outcome, decision_record=decision_record, resolved=True
+        )
+    resolved = outcome.harness_future_resolved or outcome.forward_outcome == "delivered"
+    if resolved:
+        # Truthful acknowledgement achieved synchronously (either an
+        # in-process Future was set, or the runner's own handler ran
+        # pending_approvals.resolve(...) and returned 2xx) — emit
+        # session.resumed now.
+        session_outbox.record_elicitation_resumed(
+            workspace_id=current_workspace_id(), elicitation_id=elicitation_id
+        )
+    return DurableElicitationResolution(
+        outcome=outcome, decision_record=decision_record, resolved=resolved
+    )
 
 
 def _spawn_native_approval_popup_forward(
@@ -6040,6 +6218,26 @@ async def _relay_runner_stream_once(
                                 },
                             }
                     if evt_type == "response.elicitation_request":
+                        # Durable elicitation ledger + session.awaiting_decision
+                        # outbox row (OMN-104), written before publish. This is
+                        # the harness-subprocess ctx.elicit() path (generic
+                        # scaffold-backed harnesses) relayed here from the
+                        # runner — distinct from _publish_and_wait_for_
+                        # harness_elicitation's claude-native/codex-native
+                        # hook contract, which never reaches this relay loop.
+                        _relay_elicitation_id = event.get("elicitation_id")
+                        _relay_params = event.get("params")
+                        if (
+                            isinstance(_relay_elicitation_id, str)
+                            and _relay_elicitation_id
+                            and isinstance(_relay_params, dict)
+                        ):
+                            session_outbox.record_elicitation_raised(
+                                workspace_id=current_workspace_id(),
+                                session_id=session_id,
+                                elicitation_id=_relay_elicitation_id,
+                                request=_relay_params,
+                            )
                         session_stream.publish(session_id, event)
                         await asyncio.to_thread(
                             _publish_elicitation_request_to_ancestors,
@@ -6268,6 +6466,17 @@ async def _register_policy_elicitation(
     # runner which resolves it. No server-side state needed.
     _elicit_event = build_elicitation_request_event(
         elicitation_id, elicitation, session_id=session_id
+    )
+    # Durable elicitation ledger + session.awaiting_decision outbox row
+    # (OMN-104), written before publish — this is the policy/cost-ASK
+    # path (relay tool-call gate and MCP tools/call gate both funnel
+    # through here), the primary real-world elicitation type for the
+    # runner's pending_approvals registry.
+    session_outbox.record_elicitation_raised(
+        workspace_id=current_workspace_id(),
+        session_id=session_id,
+        elicitation_id=elicitation_id,
+        request=_elicit_event["params"],
     )
     session_stream.publish(session_id, _elicit_event)
     await asyncio.to_thread(
@@ -8855,6 +9064,7 @@ async def _get_session_snapshot(
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxConfig | None = None,
     viewer_id: str | None = None,
+    session_lifecycle_store: SessionLifecycleStore | None = None,
 ) -> SessionResponse:
     """
     Read a full session snapshot from the store.
@@ -9109,6 +9319,20 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+    latest_manager_delivery: dict[str, Any] | None = None
+    if session_lifecycle_store is not None:
+        latest = await asyncio.to_thread(session_lifecycle_store.latest_delivery, conv.id)
+        if latest is not None:
+            latest_manager_delivery = {
+                "event_id": latest.id,
+                "event_type": latest.event_type,
+                "sequence": latest.sequence,
+                "status": latest.status,
+                "attempt_count": latest.attempt_count,
+                "last_attempt_at": latest.last_attempt_at,
+                "last_http_status": latest.last_http_status,
+                "last_error_code": latest.last_error_code,
+            }
     return _build_session_response(
         conv,
         items,
@@ -9134,6 +9358,7 @@ async def _get_session_snapshot(
         viewer_id=viewer_id,
         agent_store=agent_store,
         agent_cache=agent_cache,
+        latest_manager_delivery=latest_manager_delivery,
     )
 
 
@@ -9193,6 +9418,7 @@ __all__ = [
     "_register_policy_elicitation",
     "_relay_runner_stream",
     "_resolve_elicitation",
+    "_resolve_elicitation_durably",
     "_run_managed_launch",
     "_run_managed_wake",
     "_runner_reject_detail",

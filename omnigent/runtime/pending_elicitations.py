@@ -42,7 +42,7 @@ from __future__ import annotations
 import copy
 import threading
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 # Per-conversation mapping of outstanding elicitation_id → original
 # event payload. Storing the full event (not just the id) lets
@@ -104,7 +104,10 @@ def _notify_count_hook(conversation_id: str, count: int) -> None:
         hook(conversation_id, count)
 
 
-def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
+RecordPublishEdge = Literal["added", "replaced_same_id", "removed", "not_found"]
+
+
+def record_publish(conversation_id: str, event: dict[str, Any]) -> RecordPublishEdge | None:
     """
     Update the index when an SSE event is published.
 
@@ -139,25 +142,37 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
         :func:`omnigent.runtime.session_stream.publish`. Reads
         ``event["type"]`` to dispatch and ``event["elicitation_id"]``
         for both event types.
+    :returns: ``"added"`` on a fresh ``elicitation_id`` insert,
+        ``"replaced_same_id"`` when the id was already tracked (a re-park
+        retry reusing the same id),
+        ``"removed"``/``"not_found"`` for the resolved-event branch, or
+        ``None`` for an event type/shape this function ignores. Exposed so a
+        caller can gate a first-insert-only (or resolve-only) side effect —
+        e.g. the durable manager-webhook outbox hook — without re-deriving
+        idempotency itself; the index write above always happens regardless
+        of the returned edge.
     """
     event_type = event.get("type")
     if event_type == "response.elicitation_request":
         elicitation_id = event.get("elicitation_id")
         if not isinstance(elicitation_id, str) or not elicitation_id:
-            return
+            return None
         with _lock:
             ids = _pending.setdefault(conversation_id, {})
+            edge: RecordPublishEdge = "replaced_same_id" if elicitation_id in ids else "added"
             ids[elicitation_id] = event
             count = len(ids)
         _notify_count_hook(conversation_id, count)
         _notify_observer(conversation_id, event)
-        return
+        return edge
     if event_type == "response.elicitation_resolved":
         elicitation_id = event.get("elicitation_id")
         if not isinstance(elicitation_id, str) or not elicitation_id:
-            return
-        resolve(conversation_id, elicitation_id)
+            return None
+        removed = resolve(conversation_id, elicitation_id)
         _notify_observer(conversation_id, event)
+        return "removed" if removed else "not_found"
+    return None
 
 
 def _notify_observer(conversation_id: str, event: dict[str, Any]) -> None:
@@ -178,7 +193,7 @@ def _notify_observer(conversation_id: str, event: dict[str, Any]) -> None:
         observer(conversation_id, event)
 
 
-def resolve(conversation_id: str, elicitation_id: str) -> None:
+def resolve(conversation_id: str, elicitation_id: str) -> bool:
     """
     Drop an outstanding elicitation from the index.
 
@@ -201,17 +216,20 @@ def resolve(conversation_id: str, elicitation_id: str) -> None:
         was dispatched against, e.g. ``"conv_abc123"``.
     :param elicitation_id: The elicitation correlation id from the
         approval payload, e.g. ``"elicit_abc123"``.
+    :returns: ``True`` if a tracked id was removed, ``False`` if it wasn't
+        tracked (no-op).
     """
     with _lock:
         ids = _pending.get(conversation_id)
         if ids is None:
-            return
+            return False
         removed = ids.pop(elicitation_id, None) is not None
         count = len(ids)
         if not ids:
             _pending.pop(conversation_id, None)
     if removed:
         _notify_count_hook(conversation_id, count)
+    return removed
 
 
 def count_for(conversation_id: str) -> int:

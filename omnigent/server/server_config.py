@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -142,3 +143,78 @@ def copy_total_bytes_limit() -> int:
     from omnigent.runtime.content_resolver import MAX_COPY_TOTAL_BYTES
 
     return _config_positive_int("copy_max_total_bytes", MAX_COPY_TOTAL_BYTES)
+
+
+# ── Manager webhook (OMN-104) ──────────────────────────
+
+
+class ManagerWebhookConfigError(RuntimeError):
+    """Raised when ``manager_webhook`` config is invalid — fails server startup closed."""
+
+
+@dataclass(frozen=True)
+class ManagerWebhookConfig:
+    """
+    Resolved ``manager_webhook`` config block.
+
+    :param enabled: Whether the dispatcher should attempt delivery. The
+        dispatcher task itself always starts (see
+        ``omnigent/server/manager_webhook_dispatcher.py``); this only gates
+        whether it claims rows, so flipping it via config reload needs no
+        server restart.
+    :param endpoint: HTTPS URL to POST lifecycle events to. Required (and
+        HTTPS-enforced, see :func:`manager_webhook_config`) when *enabled*.
+    :param key_id: Opaque key identifier sent as ``X-Omnigent-Key-Id`` so the
+        receiver can select the right verification secret during rotation.
+    """
+
+    enabled: bool
+    endpoint: str | None
+    key_id: str | None
+
+
+def manager_webhook_config() -> ManagerWebhookConfig:
+    """
+    Resolve the ``manager_webhook`` config block.
+
+    Non-secret settings only — the signing secret is env-var only (see
+    ``omnigent/server/manager_webhook_signing.py``), never this file, per
+    this module's own secrets-stay-in-the-environment convention.
+
+    Fails closed at config-load time (raises rather than warns) when
+    *enabled* but the endpoint is missing or not HTTPS, mirroring how other
+    security-relevant settings in this codebase refuse to boot on
+    misconfiguration rather than silently running insecurely. The
+    ``allow_insecure_dev_endpoint: true`` escape hatch is an explicit,
+    local-dev-only override (e.g. ``http://localhost:...`` against a fake
+    receiver in a dev loop).
+
+    :returns: The resolved config. ``enabled=False`` (the default) when the
+        block is absent — existing session-state correctness is unaffected
+        either way; this only controls whether the dispatcher delivers.
+    :raises ManagerWebhookConfigError: If *enabled* but misconfigured
+        (missing endpoint, or a non-HTTPS endpoint without the explicit
+        dev override).
+    """
+    raw = load_server_config().get("manager_webhook") or {}
+    if not isinstance(raw, dict):
+        raise ManagerWebhookConfigError("server config manager_webhook must be a mapping")
+    enabled = bool(raw.get("enabled", False))
+    endpoint_raw = raw.get("endpoint")
+    endpoint = str(endpoint_raw).strip() if endpoint_raw else None
+    key_id_raw = raw.get("key_id")
+    key_id = str(key_id_raw).strip() if key_id_raw else None
+    allow_insecure = bool(raw.get("allow_insecure_dev_endpoint", False))
+    if enabled:
+        if not endpoint:
+            raise ManagerWebhookConfigError(
+                "manager_webhook.enabled is true but manager_webhook.endpoint is not set"
+            )
+        if not endpoint.startswith("https://") and not (
+            allow_insecure and endpoint.startswith("http://")
+        ):
+            raise ManagerWebhookConfigError(
+                f"manager_webhook.endpoint {endpoint!r} must be HTTPS "
+                "(set allow_insecure_dev_endpoint: true to override for local dev only)"
+            )
+    return ManagerWebhookConfig(enabled=enabled, endpoint=endpoint, key_id=key_id)
