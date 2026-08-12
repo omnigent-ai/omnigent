@@ -909,6 +909,10 @@ def create_app(
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
 
+    from omnigent.server.server_config import load_branding_snapshot
+
+    branding_snapshot = load_branding_snapshot(server_config)
+
     # First-boot admin bootstrap for the accounts auth provider.
     # Runs before any route is mounted so the login page is never
     # served against an empty user table (avoids the Immich-style
@@ -1205,6 +1209,7 @@ def create_app(
     app.state.host_store = host_store
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
+    app.state.branding_snapshot = branding_snapshot
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -1823,7 +1828,6 @@ def create_app(
         ``server_version`` (already public via ``/api/version``).
         """
         from omnigent.server.auth import UnifiedAuthProvider, local_single_user_enabled
-        from omnigent.server.server_config import branding_config
 
         accounts_enabled = (
             isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
@@ -1949,7 +1953,7 @@ def create_app(
                 "harness_install_enabled": harness_install_enabled,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
-                "branding": branding_config(),
+                "branding": branding_snapshot.config(),
             }
         )
 
@@ -1975,9 +1979,7 @@ def create_app(
     )
     async def branding_logo(variant: str) -> Response:
         """Serve a validated public branding asset, or 404 when unset."""
-        from omnigent.server.server_config import branding_logo_asset
-
-        asset = branding_logo_asset(variant)
+        asset = branding_snapshot.logo_asset(variant)
         if asset is None:
             raise StarletteHTTPException(status_code=404, detail="Branding logo not found")
         return Response(

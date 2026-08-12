@@ -25,6 +25,7 @@ from omnigent.server.server_config import (
     branding_config,
     branding_logo_asset,
     config_str_list,
+    load_branding_snapshot,
     load_server_config,
     resolve_config_path,
 )
@@ -240,6 +241,40 @@ def test_branding_logo_accepts_fully_decoded_rasters_in_assets_dir(
     assert asset.media_type == media_type
     assert asset.content == content
     assert branding_config()["logos"]["main"] == "/v1/branding/logo/main"
+
+
+def test_branding_snapshot_validates_shared_logo_file_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "branding:\n  logo:\n    main: logo.png\n    loading: ./logo.png\n    favicon: logo.png\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    assets = tmp_path / BRANDING_ASSETS_DIRNAME
+    assets.mkdir()
+    logo = assets / "logo.png"
+    logo.write_bytes(_PNG)
+
+    validated_paths: list[Path] = []
+    original = server_config_module._validated_image
+
+    def _counted_validation(path: Path) -> server_config_module.BrandingAsset | None:
+        validated_paths.append(path)
+        return original(path)
+
+    monkeypatch.setattr(server_config_module, "_validated_image", _counted_validation)
+
+    snapshot = load_branding_snapshot()
+
+    assert validated_paths == [logo.resolve()]
+    assert snapshot.logo_asset("main") is snapshot.logo_asset("loading")
+    assert snapshot.logo_asset("main") is snapshot.logo_asset("favicon")
+    assert snapshot.config()["logos"] == {
+        "main": "/v1/branding/logo/main",
+        "loading": "/v1/branding/logo/loading",
+        "favicon": "/v1/branding/logo/favicon",
+    }
 
 
 def test_branding_logo_accepts_every_ico_directory_entry(
