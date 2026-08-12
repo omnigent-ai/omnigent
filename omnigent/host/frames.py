@@ -73,6 +73,10 @@ class HostFrameKind(str, Enum):
     FS_RESULT = "host.fs_result"
     MODEL_OPTIONS = "host.model_options"
     MODEL_OPTIONS_RESULT = "host.model_options_result"
+    WORKSPACE_HARNESSES = "host.workspace_harnesses"
+    WORKSPACE_HARNESSES_RESULT = "host.workspace_harnesses_result"
+    PACKAGE_WORKSPACE_AGENT = "host.package_workspace_agent"
+    PACKAGE_WORKSPACE_AGENT_RESULT = "host.package_workspace_agent_result"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -849,6 +853,59 @@ class HostModelOptionsResultFrame:
     routable_models: list[str] = field(default_factory=list)
 
 
+@dataclass
+class HostWorkspaceHarnessesFrame:
+    """Server → host: discover repo-declared harnesses in a workspace.
+
+    :param path: Absolute workspace path whose ``.omnigent/config.yaml``
+        should be read.
+    """
+
+    request_id: str
+    path: str
+
+
+@dataclass
+class HostWorkspaceHarnessesResultFrame:
+    """Host → server: repo-declared agents found in the workspace.
+
+    :param agents: One row per declared ACP agent: ``{slug, name,
+        command, model, session_id_mode, send_model, command_found}``.
+    :param agent_configs: One row per agent config under
+        ``.omnigent/agent-configs/`` (see
+        ``omnigent.spec.workspace_agents.WorkspaceAgentConfig.as_dict``).
+    """
+
+    request_id: str
+    status: str
+    agents: list[_JsonObject] = field(default_factory=list)
+    agent_configs: list[_JsonObject] = field(default_factory=list)
+    error: str | None = None
+
+
+@dataclass
+class HostPackageWorkspaceAgentFrame:
+    """Server → host: package a repo-declared agent config for upload.
+
+    :param path: Absolute workspace path (containment root).
+    :param config_path: Workspace-relative path of a discovered config.
+    """
+
+    request_id: str
+    path: str
+    config_path: str
+
+
+@dataclass
+class HostPackageWorkspaceAgentResultFrame:
+    """Host → server: deterministic ``.tar.gz`` bundle bytes, base64d."""
+
+    request_id: str
+    status: str
+    bundle_b64: str | None = None
+    error: str | None = None
+
+
 HostFrame = (
     HostHelloFrame
     | HostHarnessReadinessFrame
@@ -881,6 +938,10 @@ HostFrame = (
     | HostFsResultFrame
     | HostModelOptionsFrame
     | HostModelOptionsResultFrame
+    | HostWorkspaceHarnessesFrame
+    | HostWorkspaceHarnessesResultFrame
+    | HostPackageWorkspaceAgentFrame
+    | HostPackageWorkspaceAgentResultFrame
 )
 
 
@@ -1233,6 +1294,44 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "routable_models": frame.routable_models,
             }
         )
+    if isinstance(frame, HostWorkspaceHarnessesFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.WORKSPACE_HARNESSES.value,
+                "request_id": frame.request_id,
+                "path": frame.path,
+            }
+        )
+    if isinstance(frame, HostWorkspaceHarnessesResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.WORKSPACE_HARNESSES_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "agents": frame.agents,
+                "agent_configs": frame.agent_configs,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostPackageWorkspaceAgentFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.PACKAGE_WORKSPACE_AGENT.value,
+                "request_id": frame.request_id,
+                "path": frame.path,
+                "config_path": frame.config_path,
+            }
+        )
+    if isinstance(frame, HostPackageWorkspaceAgentResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.PACKAGE_WORKSPACE_AGENT_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "bundle_b64": frame.bundle_b64,
+                "error": frame.error,
+            }
+        )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
 
 
@@ -1355,6 +1454,14 @@ def _decode_known_host_frame(
             return _decode_model_options(msg)
         case HostFrameKind.MODEL_OPTIONS_RESULT:
             return _decode_model_options_result(msg)
+        case HostFrameKind.WORKSPACE_HARNESSES:
+            return _decode_workspace_harnesses(msg)
+        case HostFrameKind.WORKSPACE_HARNESSES_RESULT:
+            return _decode_workspace_harnesses_result(msg)
+        case HostFrameKind.PACKAGE_WORKSPACE_AGENT:
+            return _decode_package_workspace_agent(msg)
+        case HostFrameKind.PACKAGE_WORKSPACE_AGENT_RESULT:
+            return _decode_package_workspace_agent_result(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -1870,6 +1977,54 @@ def _decode_model_options_result(msg: _JsonObject) -> HostModelOptionsResultFram
         models=models,
         error=_optional_nullable_str(msg, "error"),
         routable_models=routable,
+    )
+
+
+def _decode_workspace_harnesses(msg: _JsonObject) -> HostWorkspaceHarnessesFrame:
+    """Decode a host.workspace_harnesses request frame."""
+    return HostWorkspaceHarnessesFrame(
+        request_id=_required_str(msg, "request_id"),
+        path=_required_str(msg, "path"),
+    )
+
+
+def _decode_workspace_harnesses_result(msg: _JsonObject) -> HostWorkspaceHarnessesResultFrame:
+    """Decode a host.workspace_harnesses_result frame."""
+    agents = msg.get("agents", [])
+    if not isinstance(agents, list) or not all(isinstance(agent, dict) for agent in agents):
+        raise ValueError("frame field must be a list of JSON objects: 'agents'")
+    agent_configs = msg.get("agent_configs", [])
+    if not isinstance(agent_configs, list) or not all(
+        isinstance(entry, dict) for entry in agent_configs
+    ):
+        raise ValueError("frame field must be a list of JSON objects: 'agent_configs'")
+    return HostWorkspaceHarnessesResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        agents=agents,
+        agent_configs=agent_configs,
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_package_workspace_agent(msg: _JsonObject) -> HostPackageWorkspaceAgentFrame:
+    """Decode a host.package_workspace_agent request frame."""
+    return HostPackageWorkspaceAgentFrame(
+        request_id=_required_str(msg, "request_id"),
+        path=_required_str(msg, "path"),
+        config_path=_required_str(msg, "config_path"),
+    )
+
+
+def _decode_package_workspace_agent_result(
+    msg: _JsonObject,
+) -> HostPackageWorkspaceAgentResultFrame:
+    """Decode a host.package_workspace_agent_result frame."""
+    return HostPackageWorkspaceAgentResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        bundle_b64=_optional_nullable_str(msg, "bundle_b64"),
+        error=_optional_nullable_str(msg, "error"),
     )
 
 

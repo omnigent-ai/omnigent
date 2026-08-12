@@ -1614,10 +1614,15 @@ def _build_acp_spawn_env(
         omnigent_mcp = embedded.get("omnigent_mcp", True)
         if not isinstance(omnigent_mcp, bool):
             raise ValueError("executor acp_agent omnigent_mcp must be a boolean")
+        model = embedded.get("model")
+        mode = embedded.get("session_id_mode")
         agent = AcpAgentEntry(
             slug=slug or "agent",
             name=name.strip(),
             command=command.strip(),
+            model=model.strip() if isinstance(model, str) and model.strip() else None,
+            session_id_mode=mode if mode in ("server", "client") else "server",
+            send_model=bool(embedded.get("send_model", False)),
             omnigent_mcp=omnigent_mcp,
             env_passthrough=parse_env_passthrough(embedded.get("env_passthrough")),
         )

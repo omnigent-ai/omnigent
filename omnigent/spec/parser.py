@@ -91,7 +91,7 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 
 # ``executor.config`` keys kept as their nested YAML structure instead of
 # string-coerced — their consumers read the nested mapping/list shape.
-_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
+_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset({"acp_agent"})
 
 # Copy the resolver dict onto the subclass before mutating — it's inherited
 # from SafeLoader by reference, so in-place edits below would strip
@@ -656,6 +656,13 @@ def _parse_executor(
         profile = str(profile_raw)
     if etype == "omnigent" and profile is not None and "profile" not in config:
         config["profile"] = profile
+    # Mirror a top-level ``executor.acp_agent`` (one-shot embedded ACP
+    # agent) into config, like ``profile`` above — the runtime adapter
+    # reads it from the raw executor mapping, but server-side consumers
+    # (e.g. the launch gate) only see the parsed spec.
+    acp_agent_raw = raw.get("acp_agent")
+    if etype == "omnigent" and isinstance(acp_agent_raw, dict) and "acp_agent" not in config:
+        config["acp_agent"] = acp_agent_raw
     raw_cw = raw.get("context_window")
     context_window: int | None = (
         _parse_int_field(raw_cw, "executor.context_window") if raw_cw is not None else None

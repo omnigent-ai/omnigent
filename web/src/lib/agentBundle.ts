@@ -29,8 +29,22 @@ export interface AgentBundleInput {
   instructions?: string;
   /** Harness kind, e.g. "claude-sdk", "openai-agents". */
   harness: string;
-  /** Model identifier, e.g. "claude-sonnet-4-20250514". Required by the omnigent executor. */
-  model: string;
+  /** Model identifier, e.g. "claude-sonnet-4-20250514". Omitted for harnesses that own their model (e.g. ACP agents). */
+  model?: string;
+  /**
+   * One-shot ACP agent embedded as `executor.acp_agent` (takes precedence
+   * over the host's global `acp:` config at spawn). Used to launch
+   * repo-declared agents with the exact command the user consented to.
+   */
+  acpAgent?: {
+    name: string;
+    command: string;
+    model?: string;
+    sessionIdMode?: "server" | "client";
+    sendModel?: boolean;
+    /** Lend Omnigent's builtin MCP relay (default true; emitted only when false). */
+    omnigentMcp?: boolean;
+  };
   /** MCP server declarations to include as inline tools entries. */
   mcpServers?: MCPServerInput[];
 }
@@ -53,7 +67,28 @@ export async function buildAgentBundle(input: AgentBundleInput): Promise<File> {
 
   lines.push("executor:");
   lines.push("  type: omnigent");
-  lines.push(`  model: ${input.model}`);
+  if (input.model) {
+    lines.push(`  model: ${input.model}`);
+  }
+  // The spec adapter reads `acp_agent` from the raw executor mapping and
+  // carries it into executor.config, so it sits under executor:, not config:.
+  if (input.acpAgent) {
+    lines.push("  acp_agent:");
+    lines.push(`    name: ${yamlQuote(input.acpAgent.name)}`);
+    lines.push(`    command: ${yamlQuote(input.acpAgent.command)}`);
+    if (input.acpAgent.model) {
+      lines.push(`    model: ${yamlQuote(input.acpAgent.model)}`);
+    }
+    if (input.acpAgent.sessionIdMode && input.acpAgent.sessionIdMode !== "server") {
+      lines.push(`    session_id_mode: ${input.acpAgent.sessionIdMode}`);
+    }
+    if (input.acpAgent.sendModel) {
+      lines.push("    send_model: true");
+    }
+    if (input.acpAgent.omnigentMcp === false) {
+      lines.push("    omnigent_mcp: false");
+    }
+  }
   lines.push("  config:");
   lines.push(`    harness: ${input.harness}`);
   lines.push("");

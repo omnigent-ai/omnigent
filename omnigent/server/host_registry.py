@@ -259,6 +259,10 @@ class HostConnection:
         ``error_code``, and ``error``.
     :param pending_model_options: Per-``request_id`` futures for pre-launch
         model catalogs resolved by the selected host.
+    :param pending_workspace_harnesses: Per-``request_id`` futures for
+        repo-declared harness discovery in a workspace's ``.omnigent/``.
+    :param pending_package_workspace_agents: Per-``request_id`` futures
+        for packaging a repo-declared agent config into bundle bytes.
     """
 
     workspace_id: int
@@ -313,6 +317,12 @@ class HostConnection:
         default_factory=dict,
     )
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_workspace_harnesses: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_package_workspace_agents: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
 

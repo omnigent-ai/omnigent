@@ -38,12 +38,14 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
     HostModelOptionsResultFrame,
+    HostPackageWorkspaceAgentResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
+    HostWorkspaceHarnessesResultFrame,
     decode_host_frame,
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
@@ -685,6 +687,31 @@ async def _receive_loop(
                         "status": frame.status,
                         "models": frame.models,
                         "routable_models": frame.routable_models,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostWorkspaceHarnessesResultFrame):
+            harnesses_future = conn.pending_workspace_harnesses.pop(frame.request_id, None)
+            if harnesses_future is not None and not harnesses_future.done():
+                harnesses_future.set_result(
+                    {
+                        "status": frame.status,
+                        "agents": frame.agents,
+                        "agent_configs": frame.agent_configs,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostPackageWorkspaceAgentResultFrame):
+            package_future = conn.pending_package_workspace_agents.pop(frame.request_id, None)
+            if package_future is not None and not package_future.done():
+                package_future.set_result(
+                    {
+                        "status": frame.status,
+                        "bundle_b64": frame.bundle_b64,
                         "error": frame.error,
                     }
                 )
