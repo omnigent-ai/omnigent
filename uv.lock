@@ -3217,7 +3217,7 @@ wheels = [
 
 [[package]]
 name = "omnigent"
-version = "0.9.0.dev0"
+version = "0.10.0.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
@@ -3238,11 +3238,7 @@ dependencies = [
     { name = "omnigent-ui-sdk" },
     { name = "openai" },
     { name = "openai-agents" },
-    { name = "opentelemetry-exporter-otlp-proto-grpc" },
-    { name = "opentelemetry-exporter-otlp-proto-http" },
-    { name = "opentelemetry-instrumentation-fastapi" },
-    { name = "opentelemetry-instrumentation-httpx" },
-    { name = "opentelemetry-instrumentation-sqlalchemy" },
+    { name = "opentelemetry-api" },
     { name = "packaging" },
     { name = "pexpect", marker = "sys_platform != 'win32'" },
     { name = "pillow" },
@@ -3271,6 +3267,12 @@ agents-sdk = [
 ]
 all = [
     { name = "databricks-sdk" },
+    { name = "opentelemetry-exporter-otlp-proto-grpc" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-instrumentation-fastapi" },
+    { name = "opentelemetry-instrumentation-httpx" },
+    { name = "opentelemetry-instrumentation-sqlalchemy" },
+    { name = "opentelemetry-sdk" },
 ]
 antigravity = [
     { name = "google-antigravity" },
@@ -3369,6 +3371,14 @@ s3 = [
 slack = [
     { name = "omnigent-slack" },
 ]
+tracing = [
+    { name = "opentelemetry-exporter-otlp-proto-grpc" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-instrumentation-fastapi" },
+    { name = "opentelemetry-instrumentation-httpx" },
+    { name = "opentelemetry-instrumentation-sqlalchemy" },
+    { name = "opentelemetry-sdk" },
+]
 vertex = [
     { name = "google-auth" },
 ]
@@ -3428,13 +3438,21 @@ requires-dist = [
     { name = "openai-agents", specifier = ">=0.0.17" },
     { name = "openai-agents", marker = "extra == 'agents-sdk'", specifier = ">=0.1,<1" },
     { name = "openshell", marker = "extra == 'openshell'", specifier = ">=0.0.88,<1" },
+    { name = "opentelemetry-api", specifier = ">=1.20,<2" },
     { name = "opentelemetry-distro", marker = "extra == 'databricks'", specifier = ">=0,<1" },
-    { name = "opentelemetry-exporter-otlp-proto-grpc", specifier = ">=1.20,<2" },
-    { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.20,<2" },
-    { name = "opentelemetry-instrumentation-fastapi", specifier = ">=0,<1" },
-    { name = "opentelemetry-instrumentation-httpx", specifier = ">=0,<1" },
+    { name = "opentelemetry-exporter-otlp-proto-grpc", marker = "extra == 'all'", specifier = ">=1.20,<2" },
+    { name = "opentelemetry-exporter-otlp-proto-grpc", marker = "extra == 'tracing'", specifier = ">=1.20,<2" },
+    { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'all'", specifier = ">=1.20,<2" },
+    { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'tracing'", specifier = ">=1.20,<2" },
+    { name = "opentelemetry-instrumentation-fastapi", marker = "extra == 'all'", specifier = ">=0,<1" },
+    { name = "opentelemetry-instrumentation-fastapi", marker = "extra == 'tracing'", specifier = ">=0,<1" },
+    { name = "opentelemetry-instrumentation-httpx", marker = "extra == 'all'", specifier = ">=0,<1" },
+    { name = "opentelemetry-instrumentation-httpx", marker = "extra == 'tracing'", specifier = ">=0,<1" },
     { name = "opentelemetry-instrumentation-openai-agents-v2", marker = "extra == 'agents-sdk'", specifier = ">=0.1" },
-    { name = "opentelemetry-instrumentation-sqlalchemy", specifier = ">=0,<1" },
+    { name = "opentelemetry-instrumentation-sqlalchemy", marker = "extra == 'all'", specifier = ">=0,<1" },
+    { name = "opentelemetry-instrumentation-sqlalchemy", marker = "extra == 'tracing'", specifier = ">=0,<1" },
+    { name = "opentelemetry-sdk", marker = "extra == 'all'", specifier = ">=1.20,<2" },
+    { name = "opentelemetry-sdk", marker = "extra == 'tracing'", specifier = ">=1.20,<2" },
     { name = "packaging", specifier = ">=23,<26" },
     { name = "pathspec", marker = "extra == 'dev'", specifier = ">=0.12" },
     { name = "pexpect", marker = "sys_platform != 'win32'", specifier = ">=4.9,<5" },
@@ -3479,7 +3497,7 @@ provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "verte
 
 [[package]]
 name = "omnigent-client"
-version = "0.9.0.dev0"
+version = "0.10.0.dev0"
 source = { editable = "sdks/python-client" }
 dependencies = [
     { name = "httpx" },
@@ -3523,7 +3541,7 @@ dev = [
 
 [[package]]
 name = "omnigent-slack"
-version = "0.9.0.dev0"
+version = "0.10.0.dev0"
 source = { editable = "integrations/slack" }
 dependencies = [
     { name = "aiohttp" },
@@ -3548,7 +3566,7 @@ requires-dist = [
 
 [[package]]
 name = "omnigent-ui-sdk"
-version = "0.9.0.dev0"
+version = "0.10.0.dev0"
 source = { editable = "sdks/ui" }
 dependencies = [
     { name = "omnigent-client" },
@@ -3559,7 +3577,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "omnigent-client", specifier = "==0.9.0.dev0" },
+    { name = "omnigent-client", specifier = "==0.10.0.dev0" },
     { name = "prompt-toolkit", specifier = ">=3" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "rich", specifier = ">=13" },

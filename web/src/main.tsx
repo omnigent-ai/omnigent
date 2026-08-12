@@ -3,7 +3,6 @@ import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import App from "./App.tsx";
-import { PWAUpdateBanner } from "./components/pwa/PWAUpdateBanner";
 import { ThemeProvider } from "./components/theme/ThemeProvider";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { ImageLightboxProvider } from "./components/ImageLightbox";
@@ -115,7 +114,6 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo }) {
     <CapabilitiesProvider info={info}>
       <QueryClientProvider client={queryClient}>
         <ThemeProvider>
-          <PWAUpdateBanner />
           <TooltipProvider>
             <ImageLightboxProvider>
               <BrowserRouter>
