@@ -11,7 +11,8 @@ Covers the shareable message URL flow from issue #4646:
 Selectors:
   - user bubble: ``data-testid="message-bubble"`` + ``data-role="user"``
   - stable id: ``data-message-id``
-  - copy-link button: accessible name "Copy link"
+  - copy-link button: ``data-testid="copy-message-link"`` (not role
+    name "Copy link" - success flips the sr-only label to "Copied!")
   - flash: ``.animate-user-msg-flash`` on the bubble content
 """
 
@@ -58,17 +59,29 @@ def test_copy_message_link_opens_and_highlights_target(
             )
 
         _send(page, marker)
-        bubble = page.locator(_USER_BUBBLE).filter(has_text=marker)
+        # Wait until the optimistic ``pend_*`` id is promoted to the server
+        # itemId — a fresh tab cannot resolve ``?message=pend_N``.
+        bubble = page.locator(f'{_USER_BUBBLE}:not([data-message-id^="pend_"])').filter(
+            has_text=marker
+        )
         expect(bubble).to_be_visible(timeout=15_000)
 
         message_id = bubble.get_attribute("data-message-id")
         assert message_id, "user bubble missing data-message-id"
+        assert not message_id.startswith("pend_"), f"still pending id {message_id!r}"
 
-        copy_link = bubble.get_by_role("button", name="Copy link")
-        expect(copy_link).to_be_visible()
+        # test-id stays stable after click; role name "Copy link" does not
+        # (tooltip/sr-only become "Copied!"). Assert clipboard, not the
+        # brief check icon, so confirmation UX cannot flake the e2e.
+        copy_link = bubble.get_by_test_id("copy-message-link")
+        expect(copy_link).to_be_attached()
+        bubble.hover()
         copy_link.click()
-        expect(copy_link.locator("svg.lucide-check")).to_have_count(1, timeout=5_000)
 
+        expect.poll(
+            lambda: page.evaluate("() => navigator.clipboard.readText()"),
+            timeout=5_000,
+        ).to_contain(session_id)
         clipboard = page.evaluate("() => navigator.clipboard.readText()")
         assert session_id in clipboard, f"clipboard URL {clipboard!r} missing session id"
         assert re.search(rf"[?&]message={re.escape(message_id)}", clipboard), (
