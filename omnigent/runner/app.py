@@ -18,6 +18,7 @@ import logging
 import mimetypes
 import os
 import re
+import subprocess
 import tempfile
 import time
 import urllib.parse
@@ -645,6 +646,23 @@ def _response_body_preview(resp: object, *, limit: int = 500) -> str:
     return ""
 
 
+def _resolve_git_head_from_workspace(workspace: str | None) -> str | None:
+    if not workspace:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=workspace,
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.decode("utf-8", errors="replace").strip()
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
 @dataclasses.dataclass
 @dataclasses.dataclass(frozen=True)
 class _SessionSnapshot:
@@ -688,6 +706,7 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     agent_name: str | None = None
+    git_head_sha: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2028,6 +2047,7 @@ def create_runner_app(
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
+    _session_git_head_sha: dict[str, str | None] = {}  # session_id → HEAD SHA at session start
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
     _session_claude_launch_config_tasks: dict[
@@ -2494,6 +2514,7 @@ def create_runner_app(
             sub_agent_name: str | None = None
             parent_session_id: str | None = None
             agent_name: str | None = None
+            git_head_sha: str | None = None
             try:
                 resp = await server_client.get(f"/v1/sessions/{session_id}")
                 status_code = resp.status_code
@@ -2515,6 +2536,9 @@ def create_runner_app(
                     raw_agent_name = body.get("agent_name")
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
+                    raw_git_head_sha = body.get("git_head_sha")
+                    if isinstance(raw_git_head_sha, str) and raw_git_head_sha:
+                        git_head_sha = raw_git_head_sha
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -2526,6 +2550,7 @@ def create_runner_app(
                 sub_agent_name=sub_agent_name,
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
+                git_head_sha=git_head_sha,
             )
             if snapshot.ok and snapshot.agent_id is not None:
                 _session_snapshot_cache[session_id] = snapshot
@@ -2571,6 +2596,7 @@ def create_runner_app(
             agent_id=agent_id,
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
+            git_head_sha=snapshot.git_head_sha,
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
@@ -3510,6 +3536,7 @@ def create_runner_app(
         _drop_session_claude_launch_config(session_id)
         _session_start_cache.pop(session_id, None)
         _session_workspace_cache.pop(session_id, None)
+        _session_git_head_sha.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
         _session_snapshot_locks.pop(session_id, None)
         _session_init_envelopes.pop(session_id, None)
@@ -5989,7 +6016,18 @@ def create_runner_app(
             )
             from omnigent.runtime.prompt import build_instructions
 
-            instructions = build_instructions(cached_spec, None, [])
+            framework_instructions: list[str] = []
+            baseline = _session_git_head_sha.get(conv)
+            if baseline:
+                framework_instructions.append(
+                    f"gitBaseline: This session started at commit {baseline[:12]}. "
+                    f"Only reference commits after this point as your own work. "
+                    f"Commits before {baseline[:12]} belong to other sessions or "
+                    f"were made outside this session."
+                )
+            instructions = build_instructions(
+                cached_spec, None, [], framework_instructions=framework_instructions
+            )
 
         ctx = TurnDispatch(
             agent_id=_dispatched_agent_id,
@@ -8176,11 +8214,13 @@ def create_runner_app(
             # Offload to a thread so it never blocks the event loop — a blocked
             # loop can't answer the server's runner-stream relay probe and the
             # session's first turn 503s with runner_unavailable.
+            baseline = _session_git_head_sha.get(session_id)
             raw_changes = (
                 await _asyncio.to_thread(
                     session_registry.list_changed_files,
                     session_id,
                     limit=10_000,
+                    baseline_sha=baseline,
                 )
                 if session_registry is not None
                 else []
@@ -8487,6 +8527,21 @@ def create_runner_app(
         # fetch is re-resolved lazily by _session_workspace_value.
         if snapshot.ok:
             _session_workspace_cache[session_id] = snapshot.workspace
+        if session_id not in _session_git_head_sha:
+            if snapshot.git_head_sha:
+                _session_git_head_sha[session_id] = snapshot.git_head_sha
+            else:
+                resolved = await asyncio.to_thread(
+                    _resolve_git_head_from_workspace, snapshot.workspace
+                )
+                _session_git_head_sha[session_id] = resolved
+                if resolved and server_client is not None:
+                    with contextlib.suppress(Exception):
+                        await server_client.patch(
+                            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                            json={"git_head_sha": resolved},
+                            timeout=10.0,
+                        )
 
     async def _resolve_session_spec_entry(session_id: str) -> _SpecEntry | None:
         if session_id in _session_spec_cache:

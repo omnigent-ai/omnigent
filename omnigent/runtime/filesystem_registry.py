@@ -496,11 +496,20 @@ class FilesystemRegistry(ABC):
     # ── Abstract: must be implemented by subclasses ───────────────
 
     @abstractmethod
-    def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
+    def list_changed_files(
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+        baseline_sha: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Return changed files visible to *conversation_id*, newest first.
 
         :param conversation_id: The session to query, e.g. ``"conv_abc123"``.
         :param limit: Maximum number of records to return.
+        :param baseline_sha: When set, only include files changed after this
+            commit. Used to scope the files panel to a single session's
+            lifetime.
         :returns: List of file-record dicts with ``path``, ``status``,
             ``bytes``, and ``modified_at`` fields, newest first.
         """
@@ -624,12 +633,19 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             for p in paths:
                 self._snapshots.pop(p, None)
 
-    def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
+    def list_changed_files(
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+        baseline_sha: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Return files changed by the agent in *conversation_id*'s session.
 
         :param conversation_id: The session to query, e.g.
             ``"conv_abc123"``.
         :param limit: Maximum number of records to return.
+        :param baseline_sha: Ignored for non-git registries.
         :returns: List of file-record dicts suitable for the
             ``workspace.changed_files`` API response, newest first.
         """
@@ -895,28 +911,29 @@ class GitFilesystemRegistry(FilesystemRegistry):
             config.returncode,
         )
 
-    def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
-        """Return all uncommitted changes in the working tree, newest first.
+    def list_changed_files(
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+        baseline_sha: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return changed files in the working tree, newest first.
 
-        *conversation_id* is accepted for API compatibility but is not used
-        to filter results — git status always reflects the current state
-        relative to HEAD.
+        When *baseline_sha* is set, results are scoped to changes made after
+        that commit — both committed and uncommitted — so the files panel
+        reflects only this session's lifetime rather than global workspace
+        state.
 
         :param conversation_id: Ignored for git-backed registries.
         :param limit: Maximum number of records to return.
+        :param baseline_sha: When set, only include files that differ from
+            this commit (committed + uncommitted changes since session start).
         :returns: List of file-record dicts, newest first.
         """
-        # ``--untracked-files=all`` forces git to expand entirely-untracked
-        # directories into their individual files.  Without it, a new file
-        # inside a brand-new directory tree collapses to a single ``?? dir/``
-        # line, so the UI would show the directory (stat'd as ~96 B) instead
-        # of the added file.
-        #
-        # The ``:(exclude)`` pathspecs stop git from walking large untracked
-        # build/cache trees (node_modules/, .venv/ …) that we would discard
-        # below anyway.  With ``-uall`` git otherwise stat's every file in them,
-        # which dominates the runtime on big repos.  These mirror the
-        # ``_SKIP_DIRS`` root-level prune (kept below as a safety net).
+        if baseline_sha:
+            return self._list_changed_files_since(baseline_sha, limit=limit)
+
         argv = ["git", "status", "--porcelain", "--untracked-files=all"]
         argv.extend(self._skip_dir_pathspecs())
         started = time.monotonic()
@@ -986,6 +1003,104 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
         records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
         return records[:limit]
+
+    def _list_changed_files_since(
+        self, baseline_sha: str, *, limit: int
+    ) -> list[dict[str, Any]]:
+        """Return files that differ from *baseline_sha* in the working tree.
+
+        Combines committed changes (baseline..HEAD) with uncommitted changes
+        (HEAD vs working tree) to produce the full delta since the baseline.
+        """
+        _GIT_STATUS_TO_OP = {"A": "created", "M": "modified", "D": "deleted"}
+        argv = ["git", "diff", "--name-status", "--no-renames", baseline_sha]
+        started = time.monotonic()
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            _logger.warning(
+                "GitFilesystemRegistry._list_changed_files_since: %r in %s failed: %s",
+                argv,
+                self._git_root,
+                exc,
+            )
+            raise GitStatusUnavailable(
+                f"git diff {baseline_sha} failed: {exc}"
+            ) from exc
+
+        elapsed = time.monotonic() - started
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            _logger.warning(
+                "GitFilesystemRegistry._list_changed_files_since: %r exited %d after %.2fs: %s",
+                argv,
+                result.returncode,
+                elapsed,
+                stderr,
+            )
+            raise GitStatusUnavailable(
+                f"git diff exited {result.returncode}" + (f": {stderr}" if stderr else "")
+            )
+
+        numstat = self._run_git_numstat_since(baseline_sha)
+        records: list[dict[str, Any]] = []
+        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) != 2:
+                continue
+            status_code, git_path = parts
+            operation = _GIT_STATUS_TO_OP.get(status_code[0], "modified")
+            rel_path = self._git_to_rel(_strip_git_quotes(git_path))
+            if rel_path is None:
+                continue
+            if _is_ephemeral(rel_path):
+                continue
+            first_component = Path(rel_path).parts[0] if Path(rel_path).parts else ""
+            if first_component in _SKIP_DIRS:
+                continue
+            counts = numstat.get(rel_path, (None, None))
+            records.append(self._make_record(rel_path, operation, counts))
+
+        records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
+        return records[:limit]
+
+    def _run_git_numstat_since(
+        self, baseline_sha: str
+    ) -> dict[str, tuple[int | None, int | None]]:
+        """Like _run_git_numstat but diffs against *baseline_sha*."""
+        argv = ["git", "diff", "--numstat", "--no-renames", baseline_sha]
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return {}
+        if result.returncode != 0:
+            return {}
+        counts: dict[str, tuple[int | None, int | None]] = {}
+        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+            fields = line.split("\t")
+            if len(fields) != 3:
+                continue
+            added_s, removed_s, git_path = fields
+            rel_path = self._git_to_rel(_strip_git_quotes(git_path))
+            if rel_path is None:
+                continue
+            try:
+                added = int(added_s) if added_s != "-" else None
+                removed = int(removed_s) if removed_s != "-" else None
+            except ValueError:
+                added, removed = None, None
+            counts[rel_path] = (added, removed)
+        return counts
 
     def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
         """Return the change record for a single *path*, or ``None``.

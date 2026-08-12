@@ -30,6 +30,7 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     external_session_id: str | None = None
     parent_session_id: str | None = None
     root_session_id: str | None = None
+    git_head_sha: str | None = None
 
 
 class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
@@ -80,6 +81,7 @@ def build_runner_session_init_payload(
             external_session_id=conversation.external_session_id,
             parent_session_id=conversation.parent_conversation_id,
             root_session_id=conversation.root_conversation_id,
+            git_head_sha=conversation.git_head_sha,
         ),
     )
     return {

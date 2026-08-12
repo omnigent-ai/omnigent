@@ -1926,6 +1926,7 @@ class SessionResponse(BaseModel):
     pending_inputs: list[dict[str, Any]] = Field(default_factory=list)
     workspace: str | None = None
     git_branch: str | None = None
+    git_head_sha: str | None = None
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
@@ -2041,6 +2042,7 @@ class UpdateSessionRequest(BaseModel):
     subagent_routing_override: str | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
+    git_head_sha: str | None = None
     archived: bool | None = None
     project_id: str | None = None
     silent: bool = False

@@ -237,6 +237,7 @@ class Conversation:
     terminal_launch_args: list[str] | None = None
     workspace: str | None = None
     git_branch: str | None = None
+    git_head_sha: str | None = None
     archived: bool = False
     # Live-state fields written by the replica holding the runner tunnel
     # so any replica's session list can serve them. ``live_status`` is the
