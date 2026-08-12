@@ -91,6 +91,10 @@ _DEFAULT_POLL_INTERVAL_S = 0.25
 _FORWARD_LOOP_STALL_DEADLINE_S = 300.0
 _POST_TIMEOUT_S = 10.0
 _MAX_SEEN_SOURCE_IDS = 2000
+# Outstanding Computer Use calls are durable so a forwarder restart between
+# call and result can still classify the result image. Bound the set to avoid a
+# malformed transcript growing the cursor file for the life of the session.
+_MAX_COMPUTER_USE_CALL_IDS = 256
 _CURSOR_FINGERPRINT_BYTES = 256
 _FORK_COMMAND_NAMES = frozenset({"/branch", "/fork"})
 _HTTP_POST_MAX_PERMANENT_FAILURES = 3
@@ -432,6 +436,9 @@ class TranscriptForwardState:
     :param seen_source_ids: Recently-posted transcript item source
         ids. This makes retries and restarts idempotent even if the
         line cursor was not advanced before a cancellation.
+    :param computer_use_call_ids: Outstanding Computer Use calls whose
+        results may contain preview frames. Persisted across restarts and
+        removed after the corresponding output is handled.
     :param cursor_fingerprint: Hash of bytes immediately before
         ``byte_offset``. Used to detect truncation/replacement before
         seeking into a stale offset.
@@ -452,6 +459,7 @@ class TranscriptForwardState:
     byte_offset: int | None = None
     current_response_id: str | None = None
     seen_source_ids: tuple[str, ...] = ()
+    computer_use_call_ids: tuple[str, ...] = ()
     cursor_fingerprint: str | None = None
     settled_response_id: str | None = None
     pending_settled_response_id: str | None = None
@@ -524,10 +532,11 @@ class _ForwardDedupeState:
     recorded_token_usage: dict[str, int] | None = None
     observed_model: str | None = None
     posted_model: str | None = None
-    # Call ids already forwarded as Computer Use. Only these results have their
-    # images stored as preview frames, so an ordinary image tool result (e.g.
-    # reading a PNG) keeps its existing placeholder-only behavior.
-    computer_use_call_ids: set[str] = field(default_factory=set)
+    # Insertion-ordered map of outstanding Computer Use call ids. Only these
+    # results have their images stored as preview frames, so an ordinary image
+    # tool result (e.g. reading a PNG) keeps its placeholder-only behavior.
+    # ``None`` values make this an ordered set that can evict its oldest key.
+    computer_use_call_ids: dict[str, None] = field(default_factory=dict)
     # Last app Claude was granted or opened. Only open_application and
     # request_access name an app, so every later screenshot/click would
     # otherwise render as "Unknown app" for the app already being driven.
@@ -3091,6 +3100,7 @@ def _with_settle_latch(
         byte_offset=state.byte_offset,
         current_response_id=state.current_response_id,
         seen_source_ids=state.seen_source_ids,
+        computer_use_call_ids=state.computer_use_call_ids,
         cursor_fingerprint=state.cursor_fingerprint,
         settled_response_id=dedupe.settled_response_id,
         pending_settled_response_id=dedupe.pending_settled_response_id,
@@ -3282,6 +3292,7 @@ async def _forward_available_items(
         and state.pending_settled_response_id is not None
     ):
         dedupe.pending_settled_response_id = state.pending_settled_response_id
+    _restore_computer_use_calls(dedupe, state.computer_use_call_ids)
     result = await asyncio.to_thread(
         _read_transcript_items_for_state, state, agent_name, dedupe.settled_response_id
     )
@@ -3349,6 +3360,7 @@ async def _forward_available_items(
                 byte_offset=state.byte_offset,
                 current_response_id=current_response_id,
                 seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
+                computer_use_call_ids=_computer_use_call_ids(dedupe),
                 cursor_fingerprint=state.cursor_fingerprint,
                 settled_response_id=dedupe.settled_response_id,
                 pending_settled_response_id=dedupe.pending_settled_response_id,
@@ -3374,6 +3386,7 @@ async def _forward_available_items(
                 session_id=session_id,
                 item=item,
             )
+            _retire_computer_use_result(dedupe, item)
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc)
             if decision.exhausted:
@@ -3412,6 +3425,7 @@ async def _forward_available_items(
                     reason=f"transcript item {item.source_id} rejected",
                     response_id=current_response_id,
                 )
+                _retire_computer_use_result(dedupe, item)
                 seen.add(item.source_id)
                 seen_source_ids.append(item.source_id)
                 updated = TranscriptForwardState(
@@ -3420,6 +3434,7 @@ async def _forward_available_items(
                     byte_offset=state.byte_offset,
                     current_response_id=current_response_id,
                     seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
+                    computer_use_call_ids=_computer_use_call_ids(dedupe),
                     cursor_fingerprint=state.cursor_fingerprint,
                     settled_response_id=dedupe.settled_response_id,
                     pending_settled_response_id=dedupe.pending_settled_response_id,
@@ -3443,6 +3458,7 @@ async def _forward_available_items(
                     exc_info=True,
                 )
                 retry_tracker.clear(retry_key)
+                _retire_computer_use_result(dedupe, item)
                 seen.add(item.source_id)
                 seen_source_ids.append(item.source_id)
                 updated = TranscriptForwardState(
@@ -3451,6 +3467,7 @@ async def _forward_available_items(
                     byte_offset=state.byte_offset,
                     current_response_id=current_response_id,
                     seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
+                    computer_use_call_ids=_computer_use_call_ids(dedupe),
                     cursor_fingerprint=state.cursor_fingerprint,
                     settled_response_id=dedupe.settled_response_id,
                     pending_settled_response_id=dedupe.pending_settled_response_id,
@@ -3482,6 +3499,7 @@ async def _forward_available_items(
             byte_offset=state.byte_offset,
             current_response_id=current_response_id,
             seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
+            computer_use_call_ids=_computer_use_call_ids(dedupe),
             cursor_fingerprint=state.cursor_fingerprint,
             settled_response_id=dedupe.settled_response_id,
             pending_settled_response_id=dedupe.pending_settled_response_id,
@@ -3496,6 +3514,7 @@ async def _forward_available_items(
         byte_offset=result.byte_offset,
         current_response_id=current_response_id,
         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
+        computer_use_call_ids=_computer_use_call_ids(dedupe),
         cursor_fingerprint=_jsonl_cursor_fingerprint(state.transcript_path, result.byte_offset),
         settled_response_id=dedupe.settled_response_id,
         pending_settled_response_id=dedupe.pending_settled_response_id,
@@ -3789,6 +3808,7 @@ def _validated_transcript_state(
                 byte_offset=state.byte_offset,
                 current_response_id=state.current_response_id,
                 seen_source_ids=state.seen_source_ids,
+                computer_use_call_ids=state.computer_use_call_ids,
                 cursor_fingerprint=current_fingerprint,
                 settled_response_id=state.settled_response_id,
                 pending_settled_response_id=state.pending_settled_response_id,
@@ -3819,6 +3839,7 @@ def _validated_transcript_state(
         byte_offset=end_offset,
         cursor_fingerprint=_jsonl_cursor_fingerprint(state.transcript_path, end_offset),
         seen_source_ids=state.seen_source_ids,
+        computer_use_call_ids=state.computer_use_call_ids,
     )
 
 
@@ -3961,7 +3982,7 @@ async def _attach_computer_use_frames(
             and isinstance(call_id, str)
         ):
             return item
-        dedupe.computer_use_call_ids.add(call_id)
+        _remember_computer_use_call(dedupe, call_id)
         app_name = presentation.get("app_name")
         if isinstance(app_name, str) and app_name:
             dedupe.computer_use_app = app_name
@@ -5278,6 +5299,41 @@ def _bounded_seen_source_ids(seen_source_ids: list[str]) -> tuple[str, ...]:
     return tuple(seen_source_ids[-_MAX_SEEN_SOURCE_IDS:])
 
 
+def _remember_computer_use_call(dedupe: _ForwardDedupeState, call_id: str) -> None:
+    """Remember one outstanding Computer Use call within a fixed bound."""
+    dedupe.computer_use_call_ids.pop(call_id, None)
+    dedupe.computer_use_call_ids[call_id] = None
+    while len(dedupe.computer_use_call_ids) > _MAX_COMPUTER_USE_CALL_IDS:
+        oldest = next(iter(dedupe.computer_use_call_ids))
+        dedupe.computer_use_call_ids.pop(oldest, None)
+
+
+def _restore_computer_use_calls(
+    dedupe: _ForwardDedupeState,
+    call_ids: tuple[str, ...],
+) -> None:
+    """Merge persisted outstanding calls into the in-memory classification."""
+    for call_id in call_ids:
+        _remember_computer_use_call(dedupe, call_id)
+
+
+def _retire_computer_use_result(
+    dedupe: _ForwardDedupeState,
+    item: ClaudeTranscriptItem,
+) -> None:
+    """Forget a Computer Use call after its terminal output is handled."""
+    if item.item_type != "function_call_output":
+        return
+    call_id = item.data.get("call_id")
+    if isinstance(call_id, str):
+        dedupe.computer_use_call_ids.pop(call_id, None)
+
+
+def _computer_use_call_ids(dedupe: _ForwardDedupeState) -> tuple[str, ...]:
+    """Return outstanding calls in stable insertion order for persistence."""
+    return tuple(dedupe.computer_use_call_ids)
+
+
 def _read_forward_state(bridge_dir: Path) -> TranscriptForwardState | None:
     """
     Read the durable forwarder cursor from the bridge directory.
@@ -5299,6 +5355,7 @@ def _read_forward_state(bridge_dir: Path) -> TranscriptForwardState | None:
     pending_settled_response_id = raw.get("pending_settled_response_id")
     cursor_fingerprint = raw.get("cursor_fingerprint")
     seen_source_ids = raw.get("seen_source_ids", [])
+    computer_use_call_ids = raw.get("computer_use_call_ids", [])
     if not isinstance(transcript_path, str) or not isinstance(line_cursor, int):
         return None
     if line_cursor < 0:
@@ -5319,12 +5376,17 @@ def _read_forward_state(bridge_dir: Path) -> TranscriptForwardState | None:
         isinstance(source_id, str) for source_id in seen_source_ids
     ):
         seen_source_ids = []
+    if not isinstance(computer_use_call_ids, list) or not all(
+        isinstance(call_id, str) for call_id in computer_use_call_ids
+    ):
+        computer_use_call_ids = []
     return TranscriptForwardState(
         transcript_path=Path(transcript_path),
         line_cursor=line_cursor,
         byte_offset=byte_offset,
         current_response_id=current_response_id,
         seen_source_ids=tuple(seen_source_ids),
+        computer_use_call_ids=tuple(computer_use_call_ids[-_MAX_COMPUTER_USE_CALL_IDS:]),
         cursor_fingerprint=cursor_fingerprint,
         settled_response_id=settled_response_id,
         pending_settled_response_id=pending_settled_response_id,
@@ -5347,6 +5409,7 @@ def _write_forward_state(bridge_dir: Path, state: TranscriptForwardState) -> Non
         "settled_response_id": state.settled_response_id,
         "pending_settled_response_id": state.pending_settled_response_id,
         "seen_source_ids": list(state.seen_source_ids),
+        "computer_use_call_ids": list(state.computer_use_call_ids),
         "updated_at": time.time(),
     }
     if state.byte_offset is not None:

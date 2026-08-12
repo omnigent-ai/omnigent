@@ -220,8 +220,11 @@ def _prune_frames(
         if frame.id == keep_file_id:
             continue
         artifact_store.delete(frame.id)
-        if not file_store.delete(frame.id, session_id=session_id):
-            raise RuntimeError(f"failed to delete expired computer frame {frame.id}")
+        # A concurrent session cleanup may have removed the row after this
+        # listing. ``False`` means the row is already absent, which satisfies
+        # pruning; treating it as a storage failure would reject the new frame
+        # after its row and blob were already committed.
+        file_store.delete(frame.id, session_id=session_id)
         remaining -= 1
         total_bytes -= frame.bytes
 
@@ -264,6 +267,13 @@ def store_computer_use_frame(
                 if existing.filename != filename or existing.content_type != content_type:
                     continue
                 if artifact_store.exists(existing.id):
+                    _prune_frames(
+                        file_store=file_store,
+                        artifact_store=artifact_store,
+                        session_id=session_id,
+                        keep_file_id=existing.id,
+                        limits=effective_limits,
+                    )
                     return FunctionCallOutputAttachment(
                         kind="computer_frame",
                         file_id=existing.id,
@@ -289,13 +299,23 @@ def store_computer_use_frame(
             artifact_store.delete(stored.id)
         file_store.delete(stored.id, session_id=session_id)
         raise
-    _prune_frames(
-        file_store=file_store,
-        artifact_store=artifact_store,
-        session_id=session_id,
-        keep_file_id=stored.id,
-        limits=effective_limits,
-    )
+    try:
+        _prune_frames(
+            file_store=file_store,
+            artifact_store=artifact_store,
+            session_id=session_id,
+            keep_file_id=stored.id,
+            limits=effective_limits,
+        )
+    except Exception:
+        # The upload has not been returned to the caller yet, so undo it if
+        # retention enforcement fails. This prevents an unreferenced hidden
+        # frame from surviving a 5xx response.
+        with contextlib.suppress(Exception):
+            artifact_store.delete(stored.id)
+        with contextlib.suppress(Exception):
+            file_store.delete(stored.id, session_id=session_id)
+        raise
     return FunctionCallOutputAttachment(
         kind="computer_frame",
         file_id=stored.id,

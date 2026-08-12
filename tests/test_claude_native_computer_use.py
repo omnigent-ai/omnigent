@@ -15,6 +15,7 @@ import pytest
 from omnigent.claude_native_bridge import (
     _claude_computer_use_frames,
     _claude_computer_use_presentation,
+    _user_transcript_items_from_entry,
 )
 from omnigent.entities.conversation import ComputerUsePresentation
 
@@ -120,6 +121,40 @@ def test_frames_are_extracted_from_image_results() -> None:
 def test_results_without_inline_images_yield_no_frames(block: dict[str, object]) -> None:
     """Text-only, failed, and non-base64 results degrade to no frame."""
     assert _claude_computer_use_frames(block) == ()
+
+
+def test_failed_tool_result_preserves_terminal_status_for_panel() -> None:
+    """Claude's ``is_error`` flag must reach the Computer Use view model."""
+    entry = {
+        "uuid": "result-entry",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call-1",
+                    "content": "Access to Simulator was not granted.",
+                    "is_error": True,
+                }
+            ],
+        },
+    }
+
+    _, items = _user_transcript_items_from_entry(
+        entry,
+        line_number=1,
+        record_offset=0,
+        agent_name="claude-native-ui",
+        current_response_id="resp-1",
+    )
+
+    assert [item.data for item in items] == [
+        {
+            "call_id": "call-1",
+            "output": "Access to Simulator was not granted.",
+            "status": "failed",
+        }
+    ]
 
 
 @pytest.mark.asyncio

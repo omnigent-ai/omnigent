@@ -5592,14 +5592,17 @@ def _user_transcript_items_from_entry(
         response_id = current_response_id or _response_id_from_source(
             _parent_or_record_source_key(entry, line_number, record_offset)
         )
+        output_data: _JsonObject = {
+            "call_id": call_id,
+            "output": _tool_result_output(entry, block),
+        }
+        if block.get("is_error") is True:
+            output_data["status"] = "failed"
         items.append(
             ClaudeTranscriptItem(
                 source_id=_source_id(source_key, item_index, "function_call_output"),
                 item_type="function_call_output",
-                data={
-                    "call_id": call_id,
-                    "output": _tool_result_output(entry, block),
-                },
+                data=output_data,
                 response_id=response_id,
                 pending_frames=_claude_computer_use_frames(block),
             )

@@ -53,6 +53,7 @@ class MemoryArtifactStore(ArtifactStore):
         super().__init__("memory://computer-use-tests")
         self.blobs: dict[str, bytes] = {}
         self.fail_put = False
+        self.fail_delete_ids: set[str] = set()
 
     def put(self, key: str, data: bytes) -> None:
         self.blobs[key] = data
@@ -63,6 +64,8 @@ class MemoryArtifactStore(ArtifactStore):
         return self.blobs[key]
 
     def delete(self, key: str) -> None:
+        if key in self.fail_delete_ids:
+            raise RuntimeError("simulated delete failure")
         self.blobs.pop(key, None)
 
     def exists(self, key: str) -> bool:
@@ -264,6 +267,81 @@ def test_store_frame_prunes_to_count_and_byte_limits(
     assert sum(stored.bytes for stored in retained) <= len(frame) * 2
     assert attachments[-1].file_id in retained_ids
     assert set(artifact_store.blobs) == retained_ids
+
+
+def test_prune_tolerates_row_removed_by_concurrent_cleanup(
+    file_store: SqlAlchemyFileStore,
+    artifact_store: MemoryArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row already removed during pruning must not reject the new frame."""
+    limits = ComputerUseFrameLimits(max_frames_per_session=1)
+    first = store_computer_use_frame(
+        file_store=file_store,
+        artifact_store=artifact_store,
+        session_id=_SESSION,
+        data=_png(),
+        content_type="image/png",
+        limits=limits,
+    )
+    assert first.file_id is not None
+    original_delete = file_store.delete
+
+    def concurrent_delete(file_id: str, session_id: str | None = None) -> bool:
+        deleted = original_delete(file_id, session_id=session_id)
+        return False if file_id == first.file_id and deleted else deleted
+
+    monkeypatch.setattr(file_store, "delete", concurrent_delete)
+    second = store_computer_use_frame(
+        file_store=file_store,
+        artifact_store=artifact_store,
+        session_id=_SESSION,
+        data=_png(suffix=b"new"),
+        content_type="image/png",
+        limits=limits,
+    )
+
+    retained = file_store.list(
+        session_id=_SESSION,
+        purpose=FILE_PURPOSE_COMPUTER_USE_FRAME,
+    ).data
+    assert [frame.id for frame in retained] == [second.file_id]
+    assert set(artifact_store.blobs) == {second.file_id}
+
+
+def test_prune_failure_rolls_back_new_row_and_blob(
+    file_store: SqlAlchemyFileStore,
+    artifact_store: MemoryArtifactStore,
+) -> None:
+    """A retention failure cannot leave the rejected upload hidden in storage."""
+    limits = ComputerUseFrameLimits(max_frames_per_session=1)
+    first = store_computer_use_frame(
+        file_store=file_store,
+        artifact_store=artifact_store,
+        session_id=_SESSION,
+        data=_png(),
+        content_type="image/png",
+        limits=limits,
+    )
+    assert first.file_id is not None
+    artifact_store.fail_delete_ids.add(first.file_id)
+
+    with pytest.raises(RuntimeError, match="simulated delete failure"):
+        store_computer_use_frame(
+            file_store=file_store,
+            artifact_store=artifact_store,
+            session_id=_SESSION,
+            data=_png(suffix=b"new"),
+            content_type="image/png",
+            limits=limits,
+        )
+
+    retained = file_store.list(
+        session_id=_SESSION,
+        purpose=FILE_PURPOSE_COMPUTER_USE_FRAME,
+    ).data
+    assert [frame.id for frame in retained] == [first.file_id]
+    assert set(artifact_store.blobs) == {first.file_id}
 
 
 def test_session_cleanup_includes_hidden_frame_rows_and_blobs(
