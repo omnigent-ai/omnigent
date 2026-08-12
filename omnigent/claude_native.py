@@ -1636,7 +1636,93 @@ def _copy_transcript_with_cwd(
                     payload["cwd"] = current_text
                 if new_session_id is not None and isinstance(payload.get("sessionId"), str):
                     payload["sessionId"] = new_session_id
+                _sanitize_cloned_tool_result_record(payload)
             dst.write(json.dumps(payload, separators=(",", ":")) + "\n")
+
+
+def _sanitize_cloned_tool_result_record(payload: _JsonObject) -> None:
+    """
+    Repair image duplication in one copied transcript record, in place.
+
+    A fork clone (or cwd redirect) byte-copies the source's local JSONL,
+    so a transcript synthesized before the ``toolUseResult`` redaction
+    fix — or one holding an MCP screenshot as a raw string — would
+    otherwise replay its base64 twice (or as ~250K tokens of text) on
+    the clone's FIRST ``--resume`` launch, before any later rebuild can
+    heal it. Records are touched only when their ``tool_result``
+    content already carries the image payload: string content with a
+    recognizable image shape is normalized to structured blocks, and
+    duplicated metadata is repaired. Every other record — text results,
+    non-image JSON, assistant turns, native metadata that does not
+    duplicate the payload — is left exactly as copied.
+
+    :param payload: One decoded transcript record (mutated).
+    :returns: None.
+    """
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return
+    content = message.get("content")
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        inner = block.get("content")
+        if isinstance(inner, str):
+            blocks = _claude_tool_result_content_blocks(inner)
+        elif isinstance(inner, list):
+            blocks = _claude_blocks_from_parsed_list(inner)
+        else:
+            continue
+        if blocks is None:
+            continue
+        payloads = _image_payloads_in_blocks(blocks)
+        if not payloads:
+            continue
+        block["content"] = blocks
+        _repair_cloned_tool_use_result(payload, blocks, payloads)
+
+
+def _repair_cloned_tool_use_result(
+    payload: _JsonObject,
+    blocks: list[_JsonObject],
+    payloads: list[str],
+) -> None:
+    """
+    Remove a duplicated image payload from a cloned record's metadata.
+
+    ``toolUseResult`` is only rewritten when it literally contains one of
+    the payloads already present in the (now structured) content —
+    metadata that does not duplicate the image is preserved untouched.
+    A redacted passthrough is preferred; if the payload still survives
+    it (e.g. a pre-fix record whose metadata wrapped a mixed
+    text-plus-image string as a JSON string literal, which structured
+    redaction cannot reach), the metadata is replaced with the canonical
+    redacted block list.
+
+    :param payload: The transcript record (mutated).
+    :param blocks: The normalized image-bearing content blocks.
+    :param payloads: Base64 payloads present in *blocks*.
+    :returns: None.
+    """
+    tool_use_result = payload.get("toolUseResult")
+    if isinstance(tool_use_result, str):
+        result_text = tool_use_result
+    elif isinstance(tool_use_result, (dict, list)):
+        result_text = json.dumps(tool_use_result)
+    else:
+        return
+    if not any(item in result_text for item in payloads):
+        return
+    if isinstance(tool_use_result, str):
+        candidate: object = _json_safe_tool_use_result(tool_use_result)
+    else:
+        candidate = _redact_binary_blocks(tool_use_result)
+    candidate_text = candidate if isinstance(candidate, str) else json.dumps(candidate)
+    if any(item in candidate_text for item in payloads):
+        candidate = json.dumps(_redact_binary_blocks(blocks), separators=(",", ":"))
+    payload["toolUseResult"] = candidate
 
 
 def _clone_claude_transcript(
@@ -4360,7 +4446,7 @@ def _claude_transcript_record_from_session_item(
                 }
             ],
         }
-        extra["toolUseResult"] = _json_safe_tool_use_result(output)
+        extra["toolUseResult"] = _tool_use_result_for_content(output, content_blocks)
     else:
         return None
     return {
@@ -4539,6 +4625,47 @@ def _json_object_from_string(value: object) -> _JsonObject:
     return _json_object(parsed) or {}
 
 
+def _redact_binary_blocks(value: object) -> object:
+    """
+    Replace inline binary payloads with the ``toolUseResult`` marker.
+
+    Thin wrapper over the shared redaction helper (imported lazily, like
+    the ``omnigent.runtime.prompt`` import above, to keep CLI startup
+    import-light) bound to the transcript-metadata marker.
+
+    :param value: Arbitrarily nested dict/list/string content.
+    :returns: A copy with base64 payloads redacted.
+    """
+    from omnigent.llms.adapters._content import redact_binary_payloads
+
+    return redact_binary_payloads(value, _tool_use_result_payload_omitted)
+
+
+def _tool_use_result_for_content(
+    output: str,
+    content_blocks: list[_JsonObject] | None,
+) -> str:
+    """
+    Build the ``toolUseResult`` metadata for one rebuilt tool result.
+
+    When the result carries an image, the canonical redacted block list
+    is the metadata: it stays ``JSON.parse``-able, preserves every
+    non-binary field, and cannot reintroduce the payload — the base64
+    then exists exactly once in the record, in the structured
+    ``tool_result`` content the model re-sees. Image-free results keep
+    the legacy passthrough so their representation is unchanged.
+
+    :param output: The persisted tool-result string.
+    :param content_blocks: Rehydrated blocks, or ``None`` when the
+        output is not a recognized block shape.
+    :returns: A JSON-parseable string for the record's
+        ``toolUseResult`` field.
+    """
+    if content_blocks is not None and _image_payloads_in_blocks(content_blocks):
+        return json.dumps(_redact_binary_blocks(content_blocks), separators=(",", ":"))
+    return _json_safe_tool_use_result(output)
+
+
 def _tool_use_result_payload_omitted(media_type: str, _payload_length: int) -> str:
     """
     Build the marker written over a redacted ``toolUseResult`` payload.
@@ -4592,9 +4719,7 @@ def _json_safe_tool_use_result(output: str) -> str:
         parsed = json.loads(output)
     except (json.JSONDecodeError, ValueError):
         return json.dumps(output)
-    from omnigent.llms.adapters._content import redact_binary_payloads
-
-    redacted = redact_binary_payloads(parsed, _tool_use_result_payload_omitted)
+    redacted = _redact_binary_blocks(parsed)
     if redacted != parsed:
         return json.dumps(redacted, separators=(",", ":"))
     return output
@@ -4642,26 +4767,154 @@ def _claude_tool_result_content_blocks(output: str) -> list[_JsonObject] | None:
     text, or a JSON array of some other shape) stays a raw string so the
     resume request keeps sending exactly what it did before.
 
+    Three persisted shapes are recognized: a JSON block array (the
+    Claude-style form), a single MCP ``ImageContent`` object
+    (``{"type":"image","data":...,"mimeType":...}``, the shape
+    ``omnigent.tools.mcp._format_call_result`` writes for a lone image),
+    and newline-joined mixed text + image-object lines (the shape the
+    same formatter writes for multi-block MCP results). MCP image
+    entries are converted to canonical ``source``-shaped blocks.
+
     :param output: The persisted tool-result string, e.g.
         ``'[{"type":"image","source":{"type":"base64","data":"..."}}]'``
         or plain text like ``"file written"``.
-    :returns: A list of content blocks when *output* parses to a non-empty
-        list of ``text``/``image`` block dicts; ``None`` otherwise, so the
-        caller keeps the raw string as the block content.
+    :returns: A list of content blocks when *output* holds a recognized
+        block shape; ``None`` otherwise, so the caller keeps the raw
+        string as the block content.
     """
     try:
         parsed = json.loads(output)
     except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if isinstance(parsed, list):
+        return _claude_blocks_from_parsed_list(parsed)
+    if isinstance(parsed, dict):
+        block = _claude_image_block_from_object(parsed)
+        return [block] if block is not None else None
+    if parsed is not None:
+        # A JSON scalar (number, string, bool) — not block content.
         return None
-    if not isinstance(parsed, list) or not parsed:
+    return _claude_blocks_from_newline_joined(output)
+
+
+def _claude_blocks_from_parsed_list(parsed: list[object]) -> list[_JsonObject] | None:
+    """
+    Normalize a parsed block list, converting MCP image entries.
+
+    :param parsed: Decoded JSON list, e.g.
+        ``[{"type": "image", "data": "...", "mimeType": "image/png"}]``.
+    :returns: Canonical Claude blocks, or ``None`` when any entry is not
+        a ``text``/``image`` block dict (caller keeps the raw string).
+    """
+    if not parsed:
         return None
     blocks: list[_JsonObject] = []
     for value in parsed:
         block = _json_object(value)
-        if block is None or block.get("type") not in ("text", "image"):
+        if block is None:
             return None
-        blocks.append(block)
+        block_type = block.get("type")
+        if block_type == "text":
+            blocks.append(block)
+            continue
+        if block_type == "image":
+            image_block = _claude_image_block_from_object(block)
+            if image_block is None:
+                return None
+            blocks.append(image_block)
+            continue
+        return None
     return blocks
+
+
+def _claude_image_block_from_object(value: object) -> _JsonObject | None:
+    """
+    Return a canonical Claude image block for one parsed image object.
+
+    Accepts the Anthropic wire shape (``source`` present, kept as-is)
+    and the MCP ``ImageContent`` serialization that
+    ``omnigent.tools.mcp._format_call_result`` persists (bare ``data`` +
+    ``mimeType``). Anything else yields ``None`` so callers keep the raw
+    string rather than emit an API-invalid ``source``-less image block.
+
+    :param value: Decoded JSON value, e.g.
+        ``{"type": "image", "data": "...", "mimeType": "image/png"}``.
+    :returns: ``{"type": "image", "source": {...}}`` or ``None``.
+    """
+    block = _json_object(value)
+    if block is None or block.get("type") != "image":
+        return None
+    if isinstance(block.get("source"), dict):
+        return block
+    data = block.get("data")
+    mime = block.get("mimeType")
+    if not isinstance(data, str) or not data:
+        return None
+    if not isinstance(mime, str) or not mime.startswith("image/"):
+        return None
+    return {"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}}
+
+
+def _claude_blocks_from_newline_joined(output: str) -> list[_JsonObject] | None:
+    """
+    Recover blocks from newline-joined mixed text + image JSON.
+
+    ``omnigent.tools.mcp._format_call_result`` joins multiple MCP content
+    blocks with ``"\\n"``, so a text-plus-screenshot result persists as
+    plain text followed by a JSON object line — invalid as one JSON
+    document. Splitting per line reproduces the original block stream:
+    lines that parse as image objects become image blocks, everything
+    else stays verbatim text (``"\\n"``-joined, so the text content is
+    byte-identical to the persisted string).
+
+    :param output: The persisted tool-result string.
+    :returns: Content blocks when at least one line holds an image
+        object; ``None`` otherwise (caller keeps the raw string).
+    """
+    if "\n" not in output:
+        return None
+    blocks: list[_JsonObject] = []
+    text_lines: list[str] = []
+    found_image = False
+    for line in output.split("\n"):
+        image_block: _JsonObject | None = None
+        if line.lstrip()[:1] == "{":
+            try:
+                image_block = _claude_image_block_from_object(json.loads(line))
+            except (json.JSONDecodeError, ValueError):
+                image_block = None
+        if image_block is None:
+            text_lines.append(line)
+            continue
+        text = "\n".join(text_lines)
+        text_lines = []
+        if text:
+            blocks.append({"type": "text", "text": text})
+        blocks.append(image_block)
+        found_image = True
+    if not found_image:
+        return None
+    text = "\n".join(text_lines)
+    if text:
+        blocks.append({"type": "text", "text": text})
+    return blocks
+
+
+def _image_payloads_in_blocks(blocks: list[_JsonObject]) -> list[str]:
+    """
+    Return the base64 payloads carried by a block list's image blocks.
+
+    :param blocks: Canonical content blocks.
+    :returns: Non-empty ``source.data`` strings, e.g. ``["iVBOR..."]``.
+    """
+    payloads: list[str] = []
+    for block in blocks:
+        source = block.get("source")
+        if isinstance(source, dict):
+            data = source.get("data")
+            if isinstance(data, str) and data:
+                payloads.append(data)
+    return payloads
 
 
 def _preflight_local_tools(command: str) -> None:

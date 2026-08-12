@@ -6568,6 +6568,134 @@ def test_clone_claude_transcript_returns_none_when_source_missing(
     assert not clone_project_dir.exists() or not any(clone_project_dir.iterdir())
 
 
+def test_clone_claude_transcript_repairs_stale_image_duplication(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A fork's FIRST launch must not replay a stale duplicated transcript.
+
+    The clone path byte-copies the source's local JSONL, so a transcript
+    synthesized before the ``toolUseResult`` redaction fix (image base64
+    in both the structured content and the metadata) — or one holding an
+    MCP screenshot as a raw string — would overflow the clone's first
+    ``--resume`` before any later rebuild could heal it. The copy must
+    repair image-bearing tool-result records on the way through: exactly
+    one structured image copy per payload, redacted metadata, and no
+    string-valued content carrying base64. Records without image
+    duplication must pass through unchanged.
+    """
+    projects_dir = tmp_path / ".claude" / "projects"
+    source_workspace = tmp_path / "source repo"
+    source_workspace.mkdir()
+    clone_workspace = tmp_path / "clone worktree"
+    clone_workspace.mkdir()
+    source_uuid = "11111111-1111-1111-1111-111111111111"
+    target_uuid = "22222222-2222-2222-2222-222222222222"
+    source_project_dir = projects_dir / claude_native._sanitize_claude_project_name(
+        str(source_workspace.resolve())
+    )
+    source_project_dir.mkdir(parents=True)
+    source_path = source_project_dir / f"{source_uuid}.jsonl"
+
+    b64_structured = "iVBORw0KGgo" + "K" * 4000
+    b64_mcp = "U05BUFNIT1Q" + "L" * 4000
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": b64_structured},
+    }
+    mcp_object = {"type": "image", "data": b64_mcp, "mimeType": "image/png"}
+    mixed_string = "screenshot taken\n" + json.dumps(mcp_object, separators=(",", ":"))
+    stale_structured = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u1",
+        "parentUuid": None,
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": [image_block]}
+            ],
+        },
+        # Pre-fix metadata: the verbatim block array, base64 included.
+        "toolUseResult": json.dumps([image_block], separators=(",", ":")),
+    }
+    stale_mixed = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u2",
+        "parentUuid": "u1",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_2", "content": mixed_string}
+            ],
+        },
+        # Pre-fix metadata for the unparseable mixed string: a JSON
+        # string literal that still embeds the full payload.
+        "toolUseResult": json.dumps(mixed_string),
+    }
+    plain_result = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u3",
+        "parentUuid": "u2",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_3", "content": "file written"}
+            ],
+        },
+        "toolUseResult": json.dumps("file written"),
+    }
+    source_path.write_text(
+        "".join(
+            json.dumps(record) + "\n" for record in (stale_structured, stale_mixed, plain_result)
+        ),
+        encoding="utf-8",
+    )
+    source_text = source_path.read_text(encoding="utf-8")
+    assert source_text.count(b64_structured) == 2, "pre-fix wedged state"
+    assert source_text.count(b64_mcp) == 2, "pre-fix wedged state"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+
+    result = claude_native._clone_claude_transcript(
+        source_external_session_id=source_uuid,
+        target_external_session_id=target_uuid,
+        clone_workspace=clone_workspace.resolve(),
+    )
+
+    assert result is not None
+    text = result.read_text(encoding="utf-8")
+    assert text.count(b64_structured) == 1, "first-launch transcript must be repaired"
+    assert text.count(b64_mcp) == 1, "first-launch transcript must be repaired"
+    records = [json.loads(line) for line in text.splitlines() if line.strip()]
+    # Structured duplicate: content keeps the one image copy, metadata redacted.
+    content_one = records[0]["message"]["content"][0]["content"]
+    assert content_one == [image_block]
+    repaired_result = json.loads(records[0]["toolUseResult"])
+    assert b64_structured not in json.dumps(repaired_result)
+    assert repaired_result[0]["source"]["media_type"] == "image/png"
+    # MCP mixed string: normalized to a text+image block list, metadata repaired.
+    content_two = records[1]["message"]["content"][0]["content"]
+    assert content_two == [
+        {"type": "text", "text": "screenshot taken"},
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": b64_mcp},
+        },
+    ]
+    assert b64_mcp not in records[1]["toolUseResult"]
+    # No image duplication: the plain record is preserved untouched.
+    assert records[2]["message"]["content"][0]["content"] == "file written"
+    assert records[2]["toolUseResult"] == json.dumps("file written")
+    # The fork must not mutate the source session's transcript.
+    assert source_path.read_text(encoding="utf-8") == source_text
+
+
 # ── _record_launch_for_fresh_session ────────────────────────
 
 
@@ -7449,6 +7577,169 @@ def test_tool_use_result_redacts_inline_data_uris() -> None:
     assert "image/gif" in tool_use_result["preview"]
     assert tool_use_result["ok"] is True
     assert json.dumps(record).count(b64) == 1
+
+
+def _mcp_call_output(*content_blocks: Any) -> str:
+    """Format a real MCP ``CallToolResult`` the way persistence stores it.
+
+    Goes through ``omnigent.tools.mcp._format_call_result`` so the test
+    exercises the exact serialization a screenshot MCP tool produces,
+    not a hand-authored approximation.
+    """
+    from mcp.types import CallToolResult
+
+    from omnigent.tools.mcp import _format_call_result
+
+    return _format_call_result(CallToolResult(content=list(content_blocks), isError=False))
+
+
+def test_mcp_single_image_result_replays_as_one_structured_image() -> None:
+    """
+    A lone MCP ``ImageContent`` replays as a real image block, once.
+
+    Real MCP screenshot results persist as a JSON *object* string
+    (``{"type":"image","data":...,"mimeType":...}``), which the old
+    rehydrator could not recognize: the base64 stayed ~250K tokens of
+    model-visible text AND sat in ``toolUseResult``. The rebuild must
+    normalize it to one structured image block with redacted metadata.
+    """
+    from mcp.types import ImageContent
+
+    b64 = "iVBORw0KGgo" + "F" * 5000
+    output = _mcp_call_output(ImageContent(type="image", data=b64, mimeType="image/png"))
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    content = record["message"]["content"][0]["content"]
+    assert isinstance(content, list), "MCP image must not stay string-valued model content"
+    assert content == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": b64},
+        }
+    ]
+    tool_use_result = json.loads(record["toolUseResult"])
+    assert b64 not in json.dumps(tool_use_result)
+    assert tool_use_result[0]["source"]["media_type"] == "image/png"
+    assert json.dumps(record).count(b64) == 1
+
+
+def test_mcp_mixed_text_and_image_result_replays_as_block_list() -> None:
+    """
+    Text-plus-screenshot MCP output replays as a structured block list.
+
+    ``_format_call_result`` newline-joins multi-block results, so the
+    persisted string is NOT one JSON document — the worst pre-fix case:
+    unparseable, so neither rehydration nor metadata redaction applied
+    and the base64 survived in both places. The rebuild must recover the
+    original block stream, keep the text verbatim, and hold the payload
+    exactly once.
+    """
+    from mcp.types import ImageContent, TextContent
+
+    b64 = "U05BUFNIT1Q" + "G" * 5000
+    output = _mcp_call_output(
+        TextContent(type="text", text="took a screenshot"),
+        ImageContent(type="image", data=b64, mimeType="image/png"),
+    )
+    # The persisted form is genuinely not one JSON document.
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(output)
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    content = record["message"]["content"][0]["content"]
+    assert content == [
+        {"type": "text", "text": "took a screenshot"},
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": b64},
+        },
+    ]
+    tool_use_result = json.loads(record["toolUseResult"])
+    assert tool_use_result[0] == {"type": "text", "text": "took a screenshot"}
+    assert b64 not in json.dumps(tool_use_result)
+    assert json.dumps(record).count(b64) == 1
+
+
+def test_mcp_image_replay_does_not_depend_on_tool_name() -> None:
+    """
+    An image from an arbitrarily named MCP tool gets the same replay.
+
+    The converter only ever sees the output string — nothing keys on the
+    producing tool — so this pins the invariant end-to-end with a
+    realistic MCP-namespaced call preceding its result.
+    """
+    from mcp.types import ImageContent
+
+    b64 = "R0lGODdh" + "H" * 4000
+    output = _mcp_call_output(ImageContent(type="image", data=b64, mimeType="image/jpeg"))
+    items: list[dict[str, Any]] = [
+        {
+            "id": "fc_1",
+            "response_id": "resp_1",
+            "type": "function_call",
+            "name": "mcp__playwright__browser_take_screenshot",
+            "call_id": "toolu_1",
+            "arguments": "{}",
+        },
+        {
+            "id": "fco_1",
+            "response_id": "resp_1",
+            "type": "function_call_output",
+            "call_id": "toolu_1",
+            "output": output,
+        },
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+    assert len(records) == 2
+    content = records[1]["message"]["content"][0]["content"]
+    assert content[0]["source"]["data"] == b64
+    assert content[0]["source"]["media_type"] == "image/jpeg"
+    assert json.dumps(records[1]).count(b64) == 1
+
+
+def test_mcp_multiple_images_replay_as_separate_blocks() -> None:
+    """Two newline-joined MCP images become two blocks, each payload once."""
+    from mcp.types import ImageContent
+
+    b64_one = "iVBORw0KGgo" + "I" * 4000
+    b64_two = "iVBORw0KGgo" + "J" * 4000
+    output = _mcp_call_output(
+        ImageContent(type="image", data=b64_one, mimeType="image/png"),
+        ImageContent(type="image", data=b64_two, mimeType="image/png"),
+    )
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    content = record["message"]["content"][0]["content"]
+    assert [block["source"]["data"] for block in content] == [b64_one, b64_two]
+    blob = json.dumps(record)
+    assert blob.count(b64_one) == 1
+    assert blob.count(b64_two) == 1
+
+
+def test_multiline_non_image_result_stays_raw_string() -> None:
+    """
+    Multi-line plain-text results keep their raw-string representation.
+
+    Lines that parse as JSON but are not image blocks (and image-shaped
+    lines without an ``image/*`` MIME type) must not be "recovered" into
+    blocks — the newline-join normalization only fires on real images.
+    """
+    output = 'first line\n{"type": "image", "data": "QUJD", "mimeType": "text/plain"}\nlast line'
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    assert record["message"]["content"][0]["content"] == output
+    # Image-free: the legacy metadata passthrough applies verbatim.
+    assert record["toolUseResult"] == json.dumps(output)
 
 
 def test_claude_tool_result_content_blocks_rehydrates_only_block_arrays() -> None:
