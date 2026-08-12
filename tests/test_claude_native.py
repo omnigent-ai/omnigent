@@ -8295,6 +8295,81 @@ def test_oversized_invalid_image_collapses_instead_of_replaying_base64() -> None
     assert small_records[0]["message"]["content"][0]["content"] == small_output
 
 
+def test_collapsed_oversized_image_logs_shape_without_the_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Collapsing a payload leaves a breadcrumb, but never the payload.
+
+    Dropping content silently would make a shrunken transcript
+    unexplainable after the fact, so the collapse logs at debug level
+    with the object's shape, declared media type, and size. The payload
+    itself must never reach the logs.
+
+    Patches ``_logger.debug`` directly rather than using caplog, matching
+    the other log assertions in this module: caplog depends on handler /
+    propagation state that other tests' logging setup can disturb.
+    """
+    oversized = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 40_000).decode()
+    captured: list[str] = []
+    monkeypatch.setattr(
+        claude_native._logger,
+        "debug",
+        lambda msg, *args: captured.append(msg % args),
+    )
+    block = claude_native._oversized_invalid_image_placeholder(
+        {"type": "image", "data": oversized, "mimeType": "image/jpeg"}
+    )
+    assert block is not None
+    assert len(captured) == 1
+    message = captured[0]
+    assert "collapsed oversized invalid image" in message
+    assert "'image/jpeg'" in message
+    assert str(len(oversized)) in message
+    assert "'data'" in message and "'mimeType'" in message
+    assert oversized[:64] not in message
+    # A sub-threshold payload is not collapsed, so it logs nothing.
+    captured.clear()
+    small = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 64).decode()
+    assert (
+        claude_native._oversized_invalid_image_placeholder(
+            {"type": "image", "data": small, "mimeType": "image/jpeg"}
+        )
+        is None
+    )
+    assert captured == []
+
+
+def test_large_text_block_array_keeps_byte_for_byte_tool_use_result() -> None:
+    """
+    An image-free result keeps its passthrough however large it is.
+
+    The metadata fallback exists only to stop a *dropped* image payload
+    from sneaking back in via the raw output, so it has to key on that
+    explicit signal rather than on the passthrough's size. A big text
+    block array drops nothing: it rehydrates into real blocks, carries no
+    image payload, and must keep its documented byte-for-byte
+    ``toolUseResult``.
+    """
+    long_text = "log line that goes on and on. " * 400
+    output = json.dumps([{"type": "text", "text": long_text}], separators=(",", ":"))
+    assert len(output) > claude_native._MAX_INVALID_IMAGE_REPLAY_CHARS
+    rehydrated = claude_native._claude_tool_result_content_blocks(output)
+    assert rehydrated.blocks is not None
+    assert rehydrated.dropped_oversized_image is False
+    records = _image_output_records(output)
+    assert len(records) == 1
+    # Byte-for-byte passthrough, not the redacted block list.
+    assert records[0]["toolUseResult"] == output
+    assert records[0]["message"]["content"][0]["content"] == [{"type": "text", "text": long_text}]
+    # And the dropped-payload case still swaps in the block list.
+    oversized = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 40_000).decode()
+    dropped = claude_native._claude_tool_result_content_blocks(
+        json.dumps({"type": "image", "data": oversized, "mimeType": "image/png"})
+    )
+    assert dropped.dropped_oversized_image is True
+
+
 def test_image_payload_validator_rejects_corrupt_structure() -> None:
     """
     The structural validator catches corruption past the magic bytes.
@@ -8345,7 +8420,13 @@ def test_image_payload_validator_rejects_corrupt_structure() -> None:
 
 def test_claude_tool_result_content_blocks_rehydrates_only_block_arrays() -> None:
     """Only a non-empty list of text/image block dicts rehydrates; else ``None``."""
-    fn = claude_native._claude_tool_result_content_blocks
+
+    def fn(output: str) -> list[dict[str, Any]] | None:
+        """Normalize *output*, asserting nothing was dropped."""
+        rehydrated = claude_native._claude_tool_result_content_blocks(output)
+        assert rehydrated.dropped_oversized_image is False
+        return rehydrated.blocks
+
     # An image content-block array rehydrates to the parsed list.
     assert fn('[{"type":"image","source":{"type":"base64","data":"AAA"}}]') == [
         {"type": "image", "source": {"type": "base64", "data": "AAA"}}

@@ -1674,9 +1674,9 @@ def _sanitize_cloned_tool_result_record(payload: _JsonObject) -> None:
             continue
         inner = block.get("content")
         if isinstance(inner, str):
-            blocks = _claude_tool_result_content_blocks(inner)
+            blocks = _claude_tool_result_content_blocks(inner).blocks
         elif isinstance(inner, list):
-            blocks = _claude_blocks_from_parsed_list(inner)
+            blocks = _claude_blocks_from_parsed_list(inner).blocks
         else:
             continue
         if blocks is None:
@@ -4436,7 +4436,8 @@ def _claude_transcript_record_from_session_item(
         # stringified content-block array. Rehydrate them into real blocks
         # so ``claude --resume`` sends screenshots as images — not as ~250K
         # tokens of base64 text — and the model actually sees them again.
-        content_blocks = _claude_tool_result_content_blocks(output)
+        rehydrated = _claude_tool_result_content_blocks(output)
+        content_blocks = rehydrated.blocks
         tool_result_content: str | list[_JsonObject] = (
             content_blocks if content_blocks is not None else output
         )
@@ -4450,7 +4451,9 @@ def _claude_transcript_record_from_session_item(
                 }
             ],
         }
-        extra["toolUseResult"] = _tool_use_result_for_content(output, content_blocks)
+        extra["toolUseResult"] = _tool_use_result_for_content(
+            output, content_blocks, rehydrated.dropped_oversized_image
+        )
     else:
         return None
     return {
@@ -4648,6 +4651,7 @@ def _redact_binary_blocks(value: object) -> object:
 def _tool_use_result_for_content(
     output: str,
     content_blocks: list[_JsonObject] | None,
+    dropped_oversized_image: bool = False,
 ) -> str:
     """
     Build the ``toolUseResult`` metadata for one rebuilt tool result.
@@ -4664,21 +4668,25 @@ def _tool_use_result_for_content(
     longer carries its base64 — but the legacy passthrough would, and for
     the newline-joined shape it is not JSON, so shape-keyed redaction
     never sees it. Mirroring the raw output there would put the payload
-    straight back into the transcript, so a large passthrough is replaced
-    by the block list whenever blocks were rehydrated at all.
+    straight back into the transcript, so that one case uses the block
+    list instead. It is gated on the explicit
+    ``dropped_oversized_image`` signal from normalization, not on the
+    passthrough's size: a legitimately large text-block array drops
+    nothing and must keep its byte-for-byte passthrough.
 
     :param output: The persisted tool-result string.
     :param content_blocks: Rehydrated blocks, or ``None`` when the
         output is not a recognized block shape.
+    :param dropped_oversized_image: True when normalization replaced an
+        oversized unconvertible image payload with a placeholder.
     :returns: A JSON-parseable string for the record's
         ``toolUseResult`` field.
     """
-    if content_blocks is not None and _image_payloads_in_blocks(content_blocks):
+    if content_blocks is None:
+        return _json_safe_tool_use_result(output)
+    if _image_payloads_in_blocks(content_blocks) or dropped_oversized_image:
         return json.dumps(_redact_binary_blocks(content_blocks), separators=(",", ":"))
-    legacy = _json_safe_tool_use_result(output)
-    if content_blocks is not None and len(legacy) > _MAX_INVALID_IMAGE_REPLAY_CHARS:
-        return json.dumps(_redact_binary_blocks(content_blocks), separators=(",", ":"))
-    return legacy
+    return _json_safe_tool_use_result(output)
 
 
 def _tool_use_result_payload_omitted(media_type: str, _payload_length: int) -> str:
@@ -4766,7 +4774,30 @@ def _strip_unparseable_image_output(output: str) -> str:
     return output
 
 
-def _claude_tool_result_content_blocks(output: str) -> list[_JsonObject] | None:
+@dataclass(frozen=True)
+class _RehydratedContent:
+    """
+    The outcome of normalizing one persisted tool-result string.
+
+    ``dropped_oversized_image`` is the signal the metadata builder needs:
+    it is true only when normalization actually *replaced* an oversized
+    unconvertible image payload with the omitted-image placeholder, so
+    the payload lives in neither the content nor anywhere else the record
+    can reach. It is deliberately carried out here rather than inferred
+    later — recognizing the placeholder by its wording would couple two
+    modules through a user-facing string, and a size heuristic on the
+    metadata would also fire for a legitimately large text result.
+
+    :param blocks: Rehydrated content blocks, or ``None`` when the output
+        is not a recognized block shape (the caller keeps the raw string).
+    :param dropped_oversized_image: Whether a payload was dropped.
+    """
+
+    blocks: list[_JsonObject] | None
+    dropped_oversized_image: bool = False
+
+
+def _claude_tool_result_content_blocks(output: str) -> _RehydratedContent:
     """
     Rehydrate a stringified content-block array into real blocks.
 
@@ -4793,9 +4824,10 @@ def _claude_tool_result_content_blocks(output: str) -> list[_JsonObject] | None:
     :param output: The persisted tool-result string, e.g.
         ``'[{"type":"image","source":{"type":"base64","data":"..."}}]'``
         or plain text like ``"file written"``.
-    :returns: A list of content blocks when *output* holds a recognized
-        block shape; ``None`` otherwise, so the caller keeps the raw
-        string as the block content.
+    :returns: A :class:`_RehydratedContent` whose ``blocks`` is a list of
+        content blocks when *output* holds a recognized block shape, and
+        ``None`` otherwise so the caller keeps the raw string as the block
+        content.
     """
     try:
         parsed = json.loads(output)
@@ -4805,34 +4837,39 @@ def _claude_tool_result_content_blocks(output: str) -> list[_JsonObject] | None:
         return _claude_blocks_from_parsed_list(parsed)
     if isinstance(parsed, dict):
         block = _claude_image_block_from_object(parsed)
-        if block is None:
-            # A lone MCP image object is how a single screenshot
-            # persists, so an oversized unconvertible one is exactly the
-            # payload that must not replay as text.
-            block = _oversized_invalid_image_placeholder(parsed)
-        return [block] if block is not None else None
+        if block is not None:
+            return _RehydratedContent([block])
+        # A lone MCP image object is how a single screenshot persists, so
+        # an oversized unconvertible one is exactly the payload that must
+        # not replay as text.
+        placeholder = _oversized_invalid_image_placeholder(parsed)
+        if placeholder is None:
+            return _RehydratedContent(None)
+        return _RehydratedContent([placeholder], dropped_oversized_image=True)
     if parsed is not None:
         # A JSON scalar (number, string, bool) — not block content.
-        return None
+        return _RehydratedContent(None)
     return _claude_blocks_from_newline_joined(output)
 
 
-def _claude_blocks_from_parsed_list(parsed: list[object]) -> list[_JsonObject] | None:
+def _claude_blocks_from_parsed_list(parsed: list[object]) -> _RehydratedContent:
     """
     Normalize a parsed block list, converting MCP image entries.
 
     :param parsed: Decoded JSON list, e.g.
         ``[{"type": "image", "data": "...", "mimeType": "image/png"}]``.
-    :returns: Canonical Claude blocks, or ``None`` when any entry is not
-        a ``text``/``image`` block dict (caller keeps the raw string).
+    :returns: A :class:`_RehydratedContent` carrying canonical Claude
+        blocks, or ``blocks=None`` when any entry is not a
+        ``text``/``image`` block dict (caller keeps the raw string).
     """
     if not parsed:
-        return None
+        return _RehydratedContent(None)
     blocks: list[_JsonObject] = []
+    dropped = False
     for value in parsed:
         block = _json_object(value)
         if block is None:
-            return None
+            return _RehydratedContent(None)
         block_type = block.get("type")
         if block_type == "text":
             blocks.append(block)
@@ -4845,13 +4882,14 @@ def _claude_blocks_from_parsed_list(parsed: list[object]) -> list[_JsonObject] |
                 # text is itself the overflow risk.
                 placeholder = _oversized_invalid_image_placeholder(block)
                 if placeholder is None:
-                    return None
+                    return _RehydratedContent(None)
                 blocks.append(placeholder)
+                dropped = True
                 continue
             blocks.append(image_block)
             continue
-        return None
-    return blocks
+        return _RehydratedContent(None)
+    return _RehydratedContent(blocks, dropped_oversized_image=dropped)
 
 
 def _is_structurally_valid_png(data: bytes) -> bool:
@@ -5233,11 +5271,20 @@ def _oversized_invalid_image_placeholder(value: object) -> _JsonObject | None:
     from omnigent.runtime.prompt import _image_omitted_placeholder
 
     mime = block.get("mimeType")
+    # Diagnostic only — shape, declared type, and size, never the payload.
+    _logger.debug(
+        "native-claude: collapsed oversized invalid image to placeholder "
+        "(keys=%s, media_type=%r, base64_chars=%d, threshold=%d)",
+        sorted(block),
+        mime,
+        len(data),
+        _MAX_INVALID_IMAGE_REPLAY_CHARS,
+    )
     placeholder = _image_omitted_placeholder(mime if isinstance(mime, str) else None)
     return {"type": "text", "text": placeholder}
 
 
-def _claude_blocks_from_newline_joined(output: str) -> list[_JsonObject] | None:
+def _claude_blocks_from_newline_joined(output: str) -> _RehydratedContent:
     """
     Recover blocks from newline-joined mixed text + image JSON.
 
@@ -5250,16 +5297,18 @@ def _claude_blocks_from_newline_joined(output: str) -> list[_JsonObject] | None:
     byte-identical to the persisted string).
 
     :param output: The persisted tool-result string.
-    :returns: Content blocks when at least one line holds an image
-        object — converted when its payload validates, else collapsed to
-        a placeholder when the payload is too large to replay as text;
-        ``None`` otherwise (caller keeps the raw string).
+    :returns: A :class:`_RehydratedContent` carrying blocks when at least
+        one line holds an image object — converted when its payload
+        validates, else collapsed to a placeholder when the payload is too
+        large to replay as text; ``blocks=None`` otherwise (caller keeps
+        the raw string).
     """
     if "\n" not in output:
-        return None
+        return _RehydratedContent(None)
     blocks: list[_JsonObject] = []
     text_lines: list[str] = []
     found_image = False
+    dropped = False
     for line in output.split("\n"):
         image_block: _JsonObject | None = None
         if line.lstrip()[:1] == "{":
@@ -5273,6 +5322,8 @@ def _claude_blocks_from_newline_joined(output: str) -> list[_JsonObject] | None:
                     # An oversized unconvertible image line becomes a
                     # placeholder rather than replaying its base64 as text.
                     image_block = _oversized_invalid_image_placeholder(parsed_line)
+                    if image_block is not None:
+                        dropped = True
         if image_block is None:
             text_lines.append(line)
             continue
@@ -5283,11 +5334,11 @@ def _claude_blocks_from_newline_joined(output: str) -> list[_JsonObject] | None:
         blocks.append(image_block)
         found_image = True
     if not found_image:
-        return None
+        return _RehydratedContent(None)
     text = "\n".join(text_lines)
     if text:
         blocks.append({"type": "text", "text": text})
-    return blocks
+    return _RehydratedContent(blocks, dropped_oversized_image=dropped)
 
 
 def _image_payloads_in_blocks(blocks: list[_JsonObject]) -> list[str]:
