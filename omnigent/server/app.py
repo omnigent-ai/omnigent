@@ -758,6 +758,7 @@ def create_app(
     debug_router_modules: list[str] | None = None,
     admins: list[str] | None = None,
     allowed_domains: list[str] | None = None,
+    default_session_readers: list[str] | None = None,
     sandbox_config: ManagedSandboxConfig | None = None,
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
@@ -829,6 +830,10 @@ def create_app(
         config's ``allowed_domains:`` key (OIDC), e.g. ``["example.com"]``.
         Union'd with ``OMNIGENT_OIDC_ALLOWED_DOMAINS`` and the
         runtime-editable domains file.
+    :param default_session_readers: Identities from the server config's
+        ``default_session_readers:`` key. Each receives a read-only grant
+        when a new top-level session is created; this does not grant approval
+        or any other write capability.
     :param sandbox_config: Parsed ``sandbox:`` section of the server
         config — which provider to provision managed hosts
         (``host_type="managed"`` sessions) from and the URL they dial
@@ -1088,6 +1093,7 @@ def create_app(
                 tunnel_registry=tunnel_registry,
                 file_store=file_store,
                 artifact_store=artifact_store,
+                default_session_readers=tuple(default_session_readers or ()),
             )
             on_fire = build_on_fire(fire_deps)
             # The manual "run now" trigger reuses the same fire path (dispatch /
@@ -1988,6 +1994,7 @@ def create_app(
             # files a session into a project (owner-private membership).
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
+            default_session_readers=default_session_readers,
         ),
         prefix="/v1",
         tags=["sessions"],
@@ -1998,6 +2005,7 @@ def create_app(
             agent_store,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            default_session_readers=default_session_readers,
         ),
         prefix="/v1",
         tags=["imports"],

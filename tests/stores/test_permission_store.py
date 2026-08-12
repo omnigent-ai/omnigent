@@ -704,15 +704,10 @@ def test_list_conversations_user_with_no_grants_sees_nothing(
     )
 
 
-def test_list_conversations_public_only_grants_hidden_from_sidebar(
+def test_list_conversations_public_only_grants_visible_to_all_users(
     store: SqlAlchemyPermissionStore, db_uri: str
 ) -> None:
-    """Sessions with only a ``__public__`` grant are NOT listed for other users.
-
-    The ``accessible_by`` filter only matches direct user grants so that
-    public-only sessions don't clutter every user's sidebar.  Public
-    sessions remain accessible by direct URL — they just aren't listed.
-    """
+    """Sessions with a ``__public__`` grant appear for every authenticated user."""
     _ensure_user(store, "__public__")
     _ensure_user(store, "stranger@test.com")
     conv_store = SqlAlchemyConversationStore(db_uri)
@@ -726,9 +721,9 @@ def test_list_conversations_public_only_grants_hidden_from_sidebar(
     )
 
     conv_ids = {c.id for c in page.data}
-    assert conv.id not in conv_ids, (
-        f"Expected conv {conv.id!r} to be hidden from stranger (public-only grant), "
-        f"but list_conversations returned it."
+    assert conv.id in conv_ids, (
+        f"Expected conv {conv.id!r} to be visible to stranger via its public grant, "
+        f"but list_conversations returned {conv_ids}."
     )
 
 
@@ -775,16 +770,10 @@ def test_list_conversations_multiple_users_see_correct_sessions(
     assert conv_a.id not in bob_ids, "Bob must NOT see Alice's private session conv_a"
 
 
-def test_list_conversations_direct_grant_required_public_alone_hidden(
+def test_list_conversations_includes_direct_and_public_grants(
     store: SqlAlchemyPermissionStore, db_uri: str
 ) -> None:
-    """Only sessions with a direct user grant appear; public-only sessions are hidden.
-
-    ``conv_direct`` and ``conv_both`` have Alice-specific grants and must
-    appear. ``conv_public`` has only a ``__public__`` grant and must NOT
-    appear — the sidebar only shows sessions the user explicitly has
-    access to.
-    """
+    """The accessible-by listing is the union of direct and public grants."""
     _ensure_user(store, "alice@test.com")
     _ensure_user(store, "__public__")
     conv_store = SqlAlchemyConversationStore(db_uri)
@@ -805,9 +794,7 @@ def test_list_conversations_direct_grant_required_public_alone_hidden(
     visible_ids = {c.id for c in page.data}
 
     assert conv_direct.id in visible_ids, "Alice must see conv_direct (direct grant)"
-    assert conv_public.id not in visible_ids, (
-        "Alice must NOT see conv_public (public-only, no direct grant)"
-    )
+    assert conv_public.id in visible_ids, "Alice must see conv_public via its public grant"
     assert conv_both.id in visible_ids, (
         "Alice must see conv_both (has a direct grant alongside the public one)"
     )

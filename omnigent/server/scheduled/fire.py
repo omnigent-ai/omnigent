@@ -55,7 +55,7 @@ from typing import Any
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
@@ -125,6 +125,7 @@ class FireDeps:
     tunnel_registry: Any | None = None
     file_store: Any | None = None
     artifact_store: Any | None = None
+    default_session_readers: tuple[str, ...] = ()
 
 
 def _prompt_event(prompt: str) -> SessionEventInput:
@@ -620,6 +621,14 @@ async def _grant_owner(deps: FireDeps, task: ScheduledTask, conversation_id: str
     owner = task.user_id or RESERVED_USER_LOCAL
     await asyncio.to_thread(deps.permission_store.ensure_user, owner)
     await asyncio.to_thread(deps.permission_store.grant, owner, conversation_id, LEVEL_OWNER)
+    for reader_id in deps.default_session_readers:
+        if reader_id != owner:
+            await asyncio.to_thread(
+                deps.permission_store.grant,
+                reader_id,
+                conversation_id,
+                LEVEL_READ,
+            )
 
 
 async def _record_run(

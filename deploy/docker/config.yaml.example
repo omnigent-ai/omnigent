@@ -30,6 +30,13 @@ admins:
 allowed_domains:
   - example.com
 
+# Read-only session watchers. Each identity receives a level-1 grant when a
+# new top-level session is created, so it can list and read sessions without
+# becoming an admin or gaining approval/edit access. Child sessions inherit
+# this access from their parent. Do not use the ``__public__`` sentinel here.
+# default_session_readers:
+#   - omnigent-unblocker
+
 # Artifact store location (defaults to /data/artifacts in the Docker
 # stack). database_uri may also live here, but for Docker the compose
 # provides DATABASE_URL via env (it carries the password) — leave it

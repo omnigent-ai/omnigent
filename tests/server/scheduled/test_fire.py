@@ -26,7 +26,7 @@ import pytest
 
 from omnigent.db.db_models import current_workspace_id
 from omnigent.entities import ScheduledTask
-from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
 
@@ -196,6 +196,7 @@ def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
         tunnel_registry=overrides.get("tunnel_registry"),
         file_store=overrides.get("file_store"),
         artifact_store=overrides.get("artifact_store"),
+        default_session_readers=overrides.get("default_session_readers", ()),
     )
 
 
@@ -399,6 +400,28 @@ async def test_explicit_owner_is_granted() -> None:
     await _drain()
 
     assert perm.grants and perm.grants[0][0] == "alice@example.com"
+
+
+@pytest.mark.asyncio
+async def test_configured_reader_is_granted_read_access() -> None:
+    perm = FakePermissionStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice@example.com")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            permission_store=perm,
+            default_session_readers=("watcher",),
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert ("watcher", perm.grants[0][1], LEVEL_READ) in perm.grants
 
 
 @pytest.mark.asyncio
