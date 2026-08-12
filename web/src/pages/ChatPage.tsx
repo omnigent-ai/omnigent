@@ -6108,7 +6108,7 @@ function SessionConfigModal({
   costRoutingEligible: boolean;
   subagentRoutingEligible: boolean;
 }) {
-  const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const conversationId = useChatStore((s) => s.conversationId);
@@ -6515,7 +6515,7 @@ function useSessionConfigSummary({
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
 }): { label: string; value: string }[] {
-  const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
@@ -6535,6 +6535,21 @@ function useSessionConfigSummary({
     rows.push({ label: "Effort", value: effortValue ?? "Default" });
   }
   return rows;
+}
+
+/**
+ * The effort this conversation is actually at.
+ *
+ * `sessionReasoningEffort` is conversation-scoped, so two live conversations at
+ * different efforts each read their own; `selectedEffort` is the single
+ * app-global sticky pick, used only as the pre-hydration fallback. Reading the
+ * sticky pick alone would show a warm-switched conversation the last effort
+ * picked anywhere.
+ */
+function useSessionEffort(): string | null {
+  const sessionReasoningEffort = useChatStore((s) => s.sessionReasoningEffort);
+  const stickyEffort = useChatStore((s) => s.selectedEffort);
+  return sessionReasoningEffort ?? stickyEffort;
 }
 
 /**
@@ -6675,7 +6690,7 @@ function ComposerModelEffortLabel({
   costRoutingEligible: boolean;
   harnessLabel: string | null;
 }) {
-  const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
