@@ -4864,22 +4864,36 @@ def _is_structurally_valid_png(data: bytes) -> bool:
             return offset == len(data)
 
 
+# Start of Frame markers (0xC0-0xCF except DHT=0xC4, reserved 0xC8,
+# DAC=0xCC). A legal JPEG declares a frame before any scan.
+_JPEG_SOF_MARKERS = frozenset(
+    (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF)
+)
+
+
 def _is_structurally_valid_jpeg(data: bytes) -> bool:
     """
     Walk the JPEG marker stream, across every scan, to a terminal EOI.
 
     Every marker segment's declared length must fit inside the payload.
-    After a Start of Scan, entropy-coded data is skipped until a real
-    (non-stuffed, non-fill, non-restart) marker; marker parsing then
-    resumes, so progressive/multi-scan files with interleaved table and
-    metadata segments (DHT/DQT/DNL/DRI/APPn/...) and further SOS scans
-    validate. The payload is accepted only when an EOI marker is the
-    final two bytes — strict EOF, no trailing-byte tolerance — so
-    header-only, truncated, or corrupt data is rejected.
+    State invariants reject marker-only pseudo-JPEGs without codec work:
+    a syntactically valid Start of Frame (non-zero dimensions, component
+    count consistent with its length) must precede any scan; every Start
+    of Scan header must be length/component-consistent and followed by
+    at least one byte of entropy data; repeated SOI and restart markers
+    outside entropy data are corrupt. After a scan, entropy-coded data
+    is skipped until a real (non-stuffed, non-fill, non-restart) marker
+    and marker parsing resumes, so progressive/multi-scan files with
+    interleaved table/metadata segments (DHT/DQT/DNL/DRI/APPn/...) and
+    further SOS scans validate. The payload is accepted only when an
+    EOI marker is the final two bytes after at least one scan — strict
+    EOF, no trailing-byte tolerance.
     """
     if not data.startswith(b"\xff\xd8"):
         return False
     offset = 2
+    seen_frame = False
+    seen_scan = False
     while True:
         # Marker prefix: one or more 0xFF bytes (extra 0xFFs are fill).
         if offset >= len(data) or data[offset] != 0xFF:
@@ -4890,10 +4904,12 @@ def _is_structurally_valid_jpeg(data: bytes) -> bool:
             return False
         marker = data[offset]
         offset += 1
-        if marker in (0x01, 0xD8) or 0xD0 <= marker <= 0xD7:
-            continue  # standalone markers carry no length field
+        if marker == 0x01:
+            continue  # TEM carries no length field
+        if marker == 0xD8 or 0xD0 <= marker <= 0xD7:
+            return False  # repeated SOI / restart marker outside entropy
         if marker == 0xD9:  # EOI: valid only as the final two bytes
-            return offset == len(data)
+            return seen_frame and seen_scan and offset == len(data)
         if marker == 0x00:
             return False  # stuffed byte outside entropy data — corrupt
         if offset + 2 > len(data):
@@ -4901,11 +4917,35 @@ def _is_structurally_valid_jpeg(data: bytes) -> bool:
         (segment_length,) = struct.unpack(">H", data[offset : offset + 2])
         if segment_length < 2 or offset + segment_length > len(data):
             return False
+        segment = data[offset : offset + segment_length]
+        if marker in _JPEG_SOF_MARKERS:
+            # length = 2 + 1 (precision) + 2 + 2 (dimensions) + 1 + 3*Nf
+            if segment_length < 11 or len(segment) < 8:
+                return False
+            (height, width) = struct.unpack(">HH", segment[3:7])
+            components = segment[7]
+            if height == 0 or width == 0 or components == 0:
+                return False
+            if segment_length != 8 + 3 * components:
+                return False
+            seen_frame = True
+        elif marker == 0xDA:
+            # SOS header: length = 2 + 1 (Ns) + 2*Ns + 3 (Ss/Se/AhAl),
+            # so the minimum legal header is 8 for a one-component scan.
+            if not seen_frame or segment_length < 8:
+                return False
+            scans = segment[2]
+            if scans == 0 or segment_length != 6 + 2 * scans:
+                return False
+            seen_scan = True
         offset += segment_length
         if marker != 0xDA:
             continue
         # Start of Scan: skip entropy-coded data up to the next real
         # marker (stuffed FF00, fill FFs, and restart markers skipped).
+        # An empty scan (a real marker immediately after the header) is
+        # not a legal scan.
+        entropy_start = offset
         while offset + 1 < len(data):
             if data[offset] != 0xFF:
                 offset += 1
@@ -4920,6 +4960,8 @@ def _is_structurally_valid_jpeg(data: bytes) -> bool:
             break  # real marker: resume segment parsing at its 0xFF
         else:
             return False  # payload ends inside entropy data
+        if offset == entropy_start:
+            return False  # empty scan: no entropy data at all
 
 
 def _is_structurally_valid_gif(data: bytes) -> bool:

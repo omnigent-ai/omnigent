@@ -6699,7 +6699,14 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
 
 @pytest.mark.parametrize(
     "mime_type",
-    ["image/png", "image/jpeg", "image/gif", "image/webp", "invalid-base64"],
+    [
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "invalid-base64",
+        "marker-only-jpeg",
+    ],
 )
 def test_clone_claude_transcript_leaves_invalid_image_shaped_text_unchanged(
     mime_type: str,
@@ -6728,6 +6735,8 @@ def test_clone_claude_transcript_leaves_invalid_image_shaped_text_unchanged(
     source_path = source_project_dir / f"{source_uuid}.jsonl"
     if mime_type == "invalid-base64":
         fake_data, fake_mime = "not!valid!base64", "image/png"
+    elif mime_type == "marker-only-jpeg":
+        fake_data, fake_mime = _MARKER_ONLY_JPEGS["empty-sos"], "image/jpeg"
     else:
         fake_data, fake_mime = _FAKE_IMAGE_PAYLOADS[mime_type], mime_type
     fake_text = json.dumps({"type": "image", "data": fake_data, "mimeType": fake_mime})
@@ -7669,6 +7678,25 @@ _TINY_WEBP_BASE64 = (
 )
 
 # Header + zero-padding: signature-matching but structurally invalid per format.
+# A structurally valid minimal SOF0 + SOS pair for building marker-only fakes.
+_FAKE_SOF0 = b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00"
+_FAKE_SOS = b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00"
+
+# Marker-only pseudo-JPEGs: valid markers but no real frame/scan content.
+_MARKER_ONLY_JPEGS: dict[str, str] = {
+    name: base64.b64encode(payload).decode()
+    for name, payload in {
+        "soi-eoi": b"\xff\xd8\xff\xd9",
+        "app0-only": (
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+        ),
+        "dht-only": b"\xff\xd8\xff\xc4\x00\x08\x01\x01\x01\x01\x01\x01\xff\xd9",
+        "rst0-only": b"\xff\xd8\xff\xd0",
+        "empty-sos": b"\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS + b"\xff\xd9",
+        "repeated-soi": b"\xff\xd8\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS + b"\x01\x02\xff\xd9",
+    }.items()
+}
+
 _FAKE_IMAGE_PAYLOADS: dict[str, str] = {
     "image/png": base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 512).decode(),
     "image/jpeg": base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 512).decode(),
@@ -8126,6 +8154,35 @@ def test_structurally_invalid_image_payloads_stay_raw(mime_type: str, form: str)
     assert records[0]["message"]["content"][0]["content"] == output
 
 
+@pytest.mark.parametrize("case", sorted(_MARKER_ONLY_JPEGS))
+@pytest.mark.parametrize("form", ["lone", "mixed", "array"])
+def test_marker_only_pseudo_jpegs_stay_raw(case: str, form: str) -> None:
+    """
+    Marker-only pseudo-JPEGs stay raw text in every persisted form.
+
+    SOI+EOI, APP0-only, DHT-only, RST-only, empty-SOS, and repeated-SOI
+    byte strings carry no frame or scan; converting them would emit
+    image blocks Claude rejects on every resume.
+    """
+    payload = _MARKER_ONLY_JPEGS[case]
+    image_object = json.dumps(
+        {"type": "image", "data": payload, "mimeType": "image/jpeg"},
+        separators=(",", ":"),
+    )
+    if form == "lone":
+        output = image_object
+    elif form == "mixed":
+        output = f"log line\n{image_object}"
+    else:
+        output = json.dumps(
+            [{"type": "image", "data": payload, "mimeType": "image/jpeg"}],
+            separators=(",", ":"),
+        )
+    records = _image_output_records(output)
+    assert len(records) == 1
+    assert records[0]["message"]["content"][0]["content"] == output
+
+
 def test_image_payload_validator_rejects_corrupt_structure() -> None:
     """
     The structural validator catches corruption past the magic bytes.
@@ -8156,6 +8213,15 @@ def test_image_payload_validator_rejects_corrupt_structure() -> None:
     assert not claude_native._is_supported_image_payload(
         base64.b64encode(progressive[:-20]).decode(), "image/jpeg"
     )
+    # Marker-only pseudo-JPEGs and invalid scan state reject.
+    for payload in _MARKER_ONLY_JPEGS.values():
+        assert not claude_native._is_supported_image_payload(payload, "image/jpeg")
+    sos_before_sof = base64.b64encode(b"\xff\xd8" + _FAKE_SOS + b"\x01\x02\xff\d9").decode()
+    assert not claude_native._is_supported_image_payload(sos_before_sof, "image/jpeg")
+    ns_zero_sos = base64.b64encode(
+        b"\xff\xd8" + _FAKE_SOF0 + b"\xff\xda\x00\x06\x00\x00\x3f\x00\x01\x02\xff\xd9"
+    ).decode()
+    assert not claude_native._is_supported_image_payload(ns_zero_sos, "image/jpeg")
     for mime_type, payload in (
         ("image/png", _TINY_PNG_BASE64),
         ("image/jpeg", _TINY_JPEG_BASE64),
