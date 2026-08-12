@@ -6758,6 +6758,96 @@ def test_clone_claude_transcript_leaves_invalid_image_shaped_text_unchanged(
     assert cloned[0]["toolUseResult"] == json.dumps(fake_text)
 
 
+def _stale_duplicated_jpeg_record(b64: str) -> dict[str, Any]:
+    """A pre-fix synthesized record: image base64 in content AND metadata."""
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+    }
+    return {
+        "type": "user",
+        "sessionId": "sid",
+        "uuid": "u1",
+        "parentUuid": None,
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": [image_block]}
+            ],
+        },
+        "toolUseResult": json.dumps([image_block], separators=(",", ":")),
+    }
+
+
+def test_clone_claude_transcript_repairs_progressive_jpeg_duplication(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A stale two-copy progressive JPEG repairs to one on fork clone.
+
+    Before the multi-scan JPEG parser fix, a progressive JPEG stayed raw
+    (validator rejected it), so the clone sanitizer could not recognize
+    the record's image and left both payload copies in place. The clone
+    must now repair the first-launch transcript to exactly one copy.
+    """
+    projects_dir = tmp_path / ".claude" / "projects"
+    source_workspace = tmp_path / "source repo"
+    source_workspace.mkdir()
+    clone_workspace = tmp_path / "clone worktree"
+    clone_workspace.mkdir()
+    source_uuid = "11111111-1111-1111-1111-111111111111"
+    target_uuid = "22222222-2222-2222-2222-222222222222"
+    source_project_dir = projects_dir / claude_native._sanitize_claude_project_name(
+        str(source_workspace.resolve())
+    )
+    source_project_dir.mkdir(parents=True)
+    source_path = source_project_dir / f"{source_uuid}.jsonl"
+    b64 = _TINY_PROGRESSIVE_JPEG_BASE64
+    source_path.write_text(json.dumps(_stale_duplicated_jpeg_record(b64)) + "\n", encoding="utf-8")
+    assert source_path.read_text(encoding="utf-8").count(b64) == 2, "pre-fix wedged state"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+
+    result = claude_native._clone_claude_transcript(
+        source_external_session_id=source_uuid,
+        target_external_session_id=target_uuid,
+        clone_workspace=clone_workspace.resolve(),
+    )
+
+    assert result is not None
+    text = result.read_text(encoding="utf-8")
+    assert text.count(b64) == 1
+    record = json.loads(text.splitlines()[0])
+    content = record["message"]["content"][0]["content"]
+    assert content[0]["source"]["data"] == b64
+    assert b64 not in json.dumps(json.loads(record["toolUseResult"]))
+
+
+def test_copy_transcript_with_cwd_repairs_progressive_jpeg_duplication(
+    tmp_path: Path,
+) -> None:
+    """
+    The cwd-redirect copy path gets the same first-launch repair.
+
+    ``_copy_transcript_with_cwd`` without ``new_session_id`` is the
+    redirect/move form; a stale two-copy progressive JPEG record must be
+    repaired to exactly one structured copy there too.
+    """
+    b64 = _TINY_PROGRESSIVE_JPEG_BASE64
+    source = tmp_path / "source.jsonl"
+    source.write_text(json.dumps(_stale_duplicated_jpeg_record(b64)) + "\n", encoding="utf-8")
+    target = tmp_path / "target.jsonl"
+
+    claude_native._copy_transcript_with_cwd(source=source, target=target, current=tmp_path)
+
+    text = target.read_text(encoding="utf-8")
+    assert text.count(b64) == 1
+    record = json.loads(text.splitlines()[0])
+    content = record["message"]["content"][0]["content"]
+    assert content[0]["source"]["data"] == b64
+    assert b64 not in json.dumps(json.loads(record["toolUseResult"]))
+
+
 # ── _record_launch_for_fresh_session ────────────────────────
 
 
@@ -7538,6 +7628,40 @@ _TINY_JPEG_BASE64 = (
     "hYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk"
     "5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDi6KKK+ZP3E//Z"
 )
+_TINY_PROGRESSIVE_JPEG_BASE64 = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a"
+    "HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIy"
+    "MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wgARCAAEAAQDASIA"
+    "AhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAVAQEBAAAAAAAAAAAAAAAAAAAEBv/aAAwD"
+    "AQACEAMQAAABjgVN/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAA"
+    "AAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QA"
+    "FBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgB"
+    "AQABPyF//9oADAMBAAIAAwAAABDz/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPxB//8QA"
+    "FBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPxB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgB"
+    "AQABPxB//9k="
+)
+_TINY_PROGRESSIVE_GRAY_JPEG_BASE64 = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0a"
+    "HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wgALCAAEAAQBAREA/8QAFAABAAAAAAAA"
+    "AAAAAAAAAAAAAP/aAAgBAQAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QA"
+    "FBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgB"
+    "AQABPyF//9oACAEBAAAAEH//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EH//2Q=="
+)
+_TINY_CMYK_JPEG_BASE64 = (
+    "/9j/7gAOQWRvYmUAZAAAAAAA/9sAQwAIBgYHBgUIBwcHCQkICgwUDQwLCwwZEhMPFB0aHx4dGhwc"
+    "ICQuJyAiLCMcHCg3KSwwMTQ0NB8nOT04MjwuMzQy/8IAFAgABAAEBEMRAE0RAFkRAEsRAP/EABYA"
+    "AQEBAAAAAAAAAAAAAAAAAAYBB//aAA4EQwBNAFkASwAAAAF/M/f/AP/EABQQAQAAAAAAAAAAAAAA"
+    "AAAAAAD/2gAIAUMAAQUCf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAU0AAQUCf//EABQQAQAA"
+    "AAAAAAAAAAAAAAAAAAD/2gAIAVkAAQUCf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAUsAAQUC"
+    "f//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAUMABj8Cf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/"
+    "2gAIAU0ABj8Cf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAVkABj8Cf//EABQQAQAAAAAAAAAA"
+    "AAAAAAAAAAD/2gAIAUsABj8Cf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAUMAAT8hf//EABQQ"
+    "AQAAAAAAAAAAAAAAAAAAAAD/2gAIAU0AAT8hf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAVkA"
+    "AT8hf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAUsAAT8hf//aAA4EQwBNAFkASwAAABDf/8QA"
+    "FBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBQwABPxB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgB"
+    "TQABPxB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBWQABPxB//8QAFBABAAAAAAAAAAAAAAAA"
+    "AAAAAP/aAAgBSwABPxB//9k="
+)
 _TINY_GIF_BASE64 = "R0lGODdhAQABAIAAAAAAAAAAACwAAAAAAQABAAAIBAABBAQAOw=="
 _TINY_WEBP_BASE64 = (
     "UklGRj4AAABXRUJQVlA4IDIAAADQAQCdASoBAAEAAUAmJaACdLoB+AADsAD+6SIf+8+fufP3"
@@ -7937,6 +8061,41 @@ def test_mcp_image_result_replays_as_one_structured_image_all_formats(
     assert json.dumps(record).count(payload) == 1
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _TINY_PROGRESSIVE_JPEG_BASE64,
+        _TINY_PROGRESSIVE_GRAY_JPEG_BASE64,
+        _TINY_CMYK_JPEG_BASE64,
+    ],
+    ids=["progressive-rgb", "progressive-grayscale", "cmyk"],
+)
+def test_mcp_progressive_jpeg_result_replays_as_one_structured_image(payload: str) -> None:
+    """
+    Progressive and CMYK JPEGs normalize through the real MCP path.
+
+    Multi-scan (progressive) and CMYK JPEGs carry interleaved table
+    segments and several SOS scans after the first; the structural
+    validator must accept them (they are what real screenshot pipelines
+    emit) so replay produces exactly one structured image block.
+    """
+    from mcp.types import ImageContent
+
+    output = _mcp_call_output(ImageContent(type="image", data=payload, mimeType="image/jpeg"))
+    records = _image_output_records(output)
+    assert len(records) == 1
+    record = records[0]
+    content = record["message"]["content"][0]["content"]
+    assert content == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": payload},
+        }
+    ]
+    assert payload not in json.dumps(json.loads(record["toolUseResult"]))
+    assert json.dumps(record).count(payload) == 1
+
+
 @pytest.mark.parametrize("mime_type", ["image/png", "image/jpeg", "image/gif", "image/webp"])
 @pytest.mark.parametrize("form", ["lone", "mixed", "array"])
 def test_structurally_invalid_image_payloads_stay_raw(mime_type: str, form: str) -> None:
@@ -7982,6 +8141,21 @@ def test_image_payload_validator_rejects_corrupt_structure() -> None:
     )
     truncated_jpeg = base64.b64encode(base64.b64decode(_TINY_JPEG_BASE64)[:100]).decode()
     assert not claude_native._is_supported_image_payload(truncated_jpeg, "image/jpeg")
+    # An oversize segment length must reject even with a valid SOI/APP0 start.
+    oversize = bytearray(base64.b64decode(_TINY_JPEG_BASE64))
+    oversize[4] = 0x7F
+    oversize[5] = 0xFF
+    assert not claude_native._is_supported_image_payload(
+        base64.b64encode(bytes(oversize)).decode(), "image/jpeg"
+    )
+    # Trailing bytes after EOI are rejected: strict EOF policy.
+    with_trailer = base64.b64encode(base64.b64decode(_TINY_JPEG_BASE64) + b"\x00\x00").decode()
+    assert not claude_native._is_supported_image_payload(with_trailer, "image/jpeg")
+    # A progressive JPEG cut mid-scan rejects; intact it validates.
+    progressive = base64.b64decode(_TINY_PROGRESSIVE_JPEG_BASE64)
+    assert not claude_native._is_supported_image_payload(
+        base64.b64encode(progressive[:-20]).decode(), "image/jpeg"
+    )
     for mime_type, payload in (
         ("image/png", _TINY_PNG_BASE64),
         ("image/jpeg", _TINY_JPEG_BASE64),

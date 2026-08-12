@@ -4866,17 +4866,22 @@ def _is_structurally_valid_png(data: bytes) -> bool:
 
 def _is_structurally_valid_jpeg(data: bytes) -> bool:
     """
-    Walk JPEG marker segments to SOS, then entropy data to a final EOI.
+    Walk the JPEG marker stream, across every scan, to a terminal EOI.
 
-    Every marker segment's declared length must fit inside the payload;
-    after the Start of Scan the entropy-coded data must end at exactly
-    one EOI marker (stuffed ``FF00`` bytes, fill bytes, and restart
-    markers are skipped), so header-only or truncated data is rejected.
+    Every marker segment's declared length must fit inside the payload.
+    After a Start of Scan, entropy-coded data is skipped until a real
+    (non-stuffed, non-fill, non-restart) marker; marker parsing then
+    resumes, so progressive/multi-scan files with interleaved table and
+    metadata segments (DHT/DQT/DNL/DRI/APPn/...) and further SOS scans
+    validate. The payload is accepted only when an EOI marker is the
+    final two bytes — strict EOF, no trailing-byte tolerance — so
+    header-only, truncated, or corrupt data is rejected.
     """
     if not data.startswith(b"\xff\xd8"):
         return False
     offset = 2
     while True:
+        # Marker prefix: one or more 0xFF bytes (extra 0xFFs are fill).
         if offset >= len(data) or data[offset] != 0xFF:
             return False
         while offset < len(data) and data[offset] == 0xFF:
@@ -4887,26 +4892,34 @@ def _is_structurally_valid_jpeg(data: bytes) -> bool:
         offset += 1
         if marker in (0x01, 0xD8) or 0xD0 <= marker <= 0xD7:
             continue  # standalone markers carry no length field
-        if marker in (0x00, 0xD9) or marker == 0xFF:
-            return False  # stuffed byte, EOI before any scan, or fill overflow
+        if marker == 0xD9:  # EOI: valid only as the final two bytes
+            return offset == len(data)
+        if marker == 0x00:
+            return False  # stuffed byte outside entropy data — corrupt
         if offset + 2 > len(data):
             return False
         (segment_length,) = struct.unpack(">H", data[offset : offset + 2])
         if segment_length < 2 or offset + segment_length > len(data):
             return False
         offset += segment_length
-        if marker == 0xDA:  # Start of Scan: entropy-coded data follows
-            break
-    while offset + 1 < len(data):
-        if data[offset] != 0xFF:
-            offset += 1
+        if marker != 0xDA:
             continue
-        following = data[offset + 1]
-        if following == 0x00 or following == 0xFF or 0xD0 <= following <= 0xD7:
-            offset += 1 if following == 0xFF else 2
-            continue
-        return following == 0xD9 and offset + 2 == len(data)
-    return False
+        # Start of Scan: skip entropy-coded data up to the next real
+        # marker (stuffed FF00, fill FFs, and restart markers skipped).
+        while offset + 1 < len(data):
+            if data[offset] != 0xFF:
+                offset += 1
+                continue
+            following = data[offset + 1]
+            if following == 0x00 or 0xD0 <= following <= 0xD7:
+                offset += 2
+                continue
+            if following == 0xFF:
+                offset += 1
+                continue
+            break  # real marker: resume segment parsing at its 0xFF
+        else:
+            return False  # payload ends inside entropy data
 
 
 def _is_structurally_valid_gif(data: bytes) -> bool:
