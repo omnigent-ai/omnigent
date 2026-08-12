@@ -1,13 +1,15 @@
-"""Persisted tool-result content — normalize stored results for replay.
+"""Normalize persisted tool results for safe replay.
 
-Turns a tool-result string as the conversation store holds it into Anthropic
-content blocks that are safe to replay, and decides whether an inline image
-payload is plausible enough to hand to a model. Kept a cheap leaf: stdlib only,
-so any harness can import it.
+Claude-native forks and cold resumes rebuild stored MCP results into Anthropic
+content blocks. Image attachments must be normalized so Claude receives one
+structured image—not another base64 copy from ``toolUseResult`` metadata.
+Otherwise image-heavy histories can exceed the context limit before compaction;
+one affected session produced ~2.17M tokens against Claude's 1M-token maximum.
 
-Store shapes handled here (not provider shapes): the MCP ``ImageContent``
-serialization, the newline-joined multi-block form, and the ``"Error: "`` prefix
-a failed MCP call carries.
+Handles text, single or mixed MCP image blocks, newline-joined results, error
+prefixes, and malformed or store-truncated images. Valid images are preserved;
+unsafe partial payloads become bounded placeholders. Kept stdlib-only so replay
+and compaction paths can import it safely.
 """
 
 from __future__ import annotations
