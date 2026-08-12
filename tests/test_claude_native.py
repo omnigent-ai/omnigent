@@ -6698,18 +6698,17 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
 
 
 @pytest.mark.parametrize(
-    "mime_type",
+    "case",
     [
-        "image/png",
-        "image/jpeg",
-        "image/gif",
-        "image/webp",
         "invalid-base64",
-        "marker-only-jpeg",
+        "under-floor-jpeg",
+        "non-image-bytes",
+        "mime-mismatch",
+        "riff-not-webp",
     ],
 )
 def test_clone_claude_transcript_leaves_invalid_image_shaped_text_unchanged(
-    mime_type: str,
+    case: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -6733,12 +6732,17 @@ def test_clone_claude_transcript_leaves_invalid_image_shaped_text_unchanged(
     )
     source_project_dir.mkdir(parents=True)
     source_path = source_project_dir / f"{source_uuid}.jsonl"
-    if mime_type == "invalid-base64":
+    if case == "invalid-base64":
         fake_data, fake_mime = "not!valid!base64", "image/png"
-    elif mime_type == "marker-only-jpeg":
-        fake_data, fake_mime = _MARKER_ONLY_JPEGS["empty-sos"], "image/jpeg"
+    elif case == "under-floor-jpeg":
+        fake_data, fake_mime = _UNDER_FLOOR_JPEGS["soi-eoi"], "image/jpeg"
+    elif case == "non-image-bytes":
+        fake_data, fake_mime = base64.b64encode(b"plain text " * 8).decode(), "image/png"
+    elif case == "mime-mismatch":
+        fake_data, fake_mime = _TINY_PNG_BASE64, "image/jpeg"
     else:
-        fake_data, fake_mime = _FAKE_IMAGE_PAYLOADS[mime_type], mime_type
+        fake_data = base64.b64encode(b"RIFF" + b"\x00" * 4 + b"AVI " + b"\x00" * 40).decode()
+        fake_mime = "image/webp"
     fake_text = json.dumps({"type": "image", "data": fake_data, "mimeType": fake_mime})
     record = {
         "type": "user",
@@ -7554,10 +7558,8 @@ def test_websocket_connect_no_ssl_context_for_ws(
         ),
         # Ordinary plain text must also round-trip to a string.
         ("plain text output", "plain text output"),
-        # Already-JSON output must pass through verbatim, not get
-        # double-encoded into a string literal. (An *image* block array is
-        # JSON too, but its inline base64 is redacted from toolUseResult —
-        # covered by the dedicated redaction tests below.)
+        # Already-JSON output passes through verbatim, not double-encoded.
+        # (Image block arrays are JSON too; their redaction is covered below.)
         ('{"a":1}', {"a": 1}),
     ],
 )
@@ -7682,26 +7684,29 @@ _TINY_WEBP_BASE64 = (
 _FAKE_SOF0 = b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00"
 _FAKE_SOS = b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00"
 
-# Marker-only pseudo-JPEGs: valid markers but no real frame/scan content.
-_MARKER_ONLY_JPEGS: dict[str, str] = {
+# JPEG-signature strings too short to be any real image: below
+# ``_MIN_IMAGE_BYTES``, so the payload gate still rejects them.
+_UNDER_FLOOR_JPEGS: dict[str, str] = {
     name: base64.b64encode(payload).decode()
     for name, payload in {
         "soi-eoi": b"\xff\xd8\xff\xd9",
+        "rst0-only": b"\xff\xd8\xff\xd0",
+        "dht-only": b"\xff\xd8\xff\xc4\x00\x08\x01\x01\x01\x01\x01\x01\xff\xd9",
+    }.items()
+}
+
+# JPEG-signature strings that clear the byte floor but carry no decodable
+# frame or scan. The magic-byte gate accepts these by design; see
+# ``test_signature_valid_but_undecodable_payloads_convert_by_design``.
+_HEADER_VALID_CORRUPT_JPEGS: dict[str, str] = {
+    name: base64.b64encode(payload).decode()
+    for name, payload in {
         "app0-only": (
             b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
         ),
-        "dht-only": b"\xff\xd8\xff\xc4\x00\x08\x01\x01\x01\x01\x01\x01\xff\xd9",
-        "rst0-only": b"\xff\xd8\xff\xd0",
         "empty-sos": b"\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS + b"\xff\xd9",
         "repeated-soi": b"\xff\xd8\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS + b"\x01\x02\xff\xd9",
-        # A scan whose "entropy data" is only a restart marker (or a run
-        # of them, or fill bytes) carries no compressed data at all. The
-        # cursor still advances past those bytes, so tracking progress
-        # instead of content accepted these.
         "restart-only-entropy": (b"\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS + b"\xff\xd0" + b"\xff\xd9"),
-        "restart-run-only-entropy": (
-            b"\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS + b"\xff\xd0\xff\xd1\xff\xd2" + b"\xff\xd9"
-        ),
         "fill-only-entropy": b"\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS + b"\xff\xff" + b"\xff\xd9",
     }.items()
 }
@@ -7838,12 +7843,9 @@ def test_tool_use_result_redacts_inline_data_uris() -> None:
 
 
 def _mcp_call_output(*content_blocks: Any, is_error: bool = False) -> str:
-    """Format a real MCP ``CallToolResult`` the way persistence stores it.
+    """Format a real ``CallToolResult`` through the real ``_format_call_result``.
 
-    Goes through ``omnigent.tools.mcp._format_call_result`` so the test
-    exercises the exact serialization a screenshot MCP tool produces,
-    not a hand-authored approximation. ``is_error=True`` reproduces the
-    failed-call spelling, which that formatter prefixes with ``"Error: "``.
+    ``is_error=True`` gives the failed spelling, which that formatter prefixes.
     """
     from mcp.types import CallToolResult
 
@@ -8214,14 +8216,15 @@ def test_mcp_progressive_jpeg_result_replays_as_one_structured_image(payload: st
 
 @pytest.mark.parametrize("mime_type", ["image/png", "image/jpeg", "image/gif", "image/webp"])
 @pytest.mark.parametrize("form", ["lone", "mixed", "array"])
-def test_structurally_invalid_image_payloads_stay_raw(mime_type: str, form: str) -> None:
+def test_signature_matching_padding_converts_in_every_form(mime_type: str, form: str) -> None:
     """
-    Signature-matching but structurally invalid payloads stay raw text.
+    Magic bytes plus padding convert in every persisted form, by design.
 
-    Magic bytes followed by zero padding pass a signature check but are
-    not decodable images; emitting them as image blocks would make
-    Claude reject every resume. All three persisted forms — lone object,
-    newline-joined, and array entry — must keep their exact raw text.
+    The gate matches the declared type's signature and does not decode the
+    container, so these convert rather than staying raw. What still holds in
+    all three forms — lone object, newline-joined, array entry — is the
+    invariant this workstream exists for: the payload lands in the structured
+    block exactly once and never in the metadata.
     """
     payload = _FAKE_IMAGE_PAYLOADS[mime_type]
     image_object = json.dumps(
@@ -8239,22 +8242,30 @@ def test_structurally_invalid_image_payloads_stay_raw(mime_type: str, form: str)
         )
     records = _image_output_records(output)
     assert len(records) == 1
-    assert records[0]["message"]["content"][0]["content"] == output
+    record = records[0]
+    content = record["message"]["content"][0]["content"]
+    assert isinstance(content, list)
+    assert content[-1] == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": mime_type, "data": payload},
+    }
+    assert payload not in json.dumps(json.loads(record["toolUseResult"]))
+    assert json.dumps(record).count(payload) == 1
 
 
-@pytest.mark.parametrize("case", sorted(_MARKER_ONLY_JPEGS))
+@pytest.mark.parametrize("case", sorted(_UNDER_FLOOR_JPEGS))
 @pytest.mark.parametrize("form", ["lone", "mixed", "array"])
-def test_marker_only_pseudo_jpegs_stay_raw(case: str, form: str) -> None:
+def test_under_floor_image_payloads_stay_raw(case: str, form: str) -> None:
     """
-    Marker-only pseudo-JPEGs stay raw text in every persisted form.
+    Payloads below the byte floor stay raw text in every persisted form.
 
-    SOI+EOI, APP0-only, DHT-only, RST-only, empty-SOS, repeated-SOI, and
-    restart/fill-only-entropy byte strings carry no frame or no real
-    scan; converting them would emit image blocks Claude rejects on
-    every resume. Each stays small, so it also stays raw rather than
-    collapsing to the oversized-payload placeholder.
+    SOI+EOI, RST-only, and DHT-only are JPEG-signature strings far too short
+    to be any real image, so the floor rejects them; converting them would
+    emit image blocks Claude refuses on every resume. Each stays small, so it
+    also stays raw rather than collapsing to the oversized placeholder.
     """
-    payload = _MARKER_ONLY_JPEGS[case]
+    payload = _UNDER_FLOOR_JPEGS[case]
+    assert len(base64.b64decode(payload)) < claude_native._MIN_IMAGE_BYTES
     image_object = json.dumps(
         {"type": "image", "data": payload, "mimeType": "image/jpeg"},
         separators=(",", ":"),
@@ -8273,66 +8284,48 @@ def test_marker_only_pseudo_jpegs_stay_raw(case: str, form: str) -> None:
     assert records[0]["message"]["content"][0]["content"] == output
 
 
-def test_jpeg_scan_needs_entropy_content_not_just_framing_bytes() -> None:
+@pytest.mark.parametrize("case", sorted(_HEADER_VALID_CORRUPT_JPEGS))
+def test_signature_valid_but_undecodable_payloads_convert_by_design(case: str) -> None:
     """
-    Only real entropy content makes a scan; restart/fill bytes do not.
+    A signature-valid but undecodable payload is converted, deliberately.
 
-    Inside a scan, ordinary bytes and stuffed ``FF00`` literals are
-    compressed data, while restart markers (``FFD0``-``FFD7``) and runs
-    of fill ``FF`` bytes are framing. Both kinds advance the cursor, so
-    an emptiness check based on "did we move?" accepted a scan built
-    purely from framing — e.g. ``SOI + SOF + SOS + FFD0 + EOI`` walked
-    to a terminal EOI and validated. Content has to be tracked
-    separately from progress.
+    The gate checks strict base64, a byte floor, and the declared type's magic
+    bytes — it does not walk containers, so APP0-only, empty-SOS, repeated-SOI
+    and restart/fill-only-entropy strings all become image blocks. Consequence
+    if a producer ever emits one: Claude rejects that resume until the record
+    ages out. Accepted because a store-truncated payload never parses as JSON
+    and so never reaches here, and because source-shaped Claude image blocks
+    already pass with no validation at all.
     """
-    prefix = b"\xff\xd8" + _FAKE_SOF0 + _FAKE_SOS
-    framing_only = {
-        "one restart marker": b"\xff\xd0",
-        "run of restart markers": b"\xff\xd0\xff\xd1\xff\xd2",
-        "fill bytes": b"\xff\xff",
-        "fill then restart": b"\xff\xff\xff\xd0",
-    }
-    for label, entropy in framing_only.items():
-        assert not claude_native._is_structurally_valid_jpeg(prefix + entropy + b"\xff\xd9"), label
-    real_content = {
-        "ordinary bytes": b"\x01\x02",
-        "stuffed FF00 literal": b"\xff\x00",
-        "restart marker then content": b"\xff\xd0\x01\x02",
-        "content then restart marker": b"\x01\x02\xff\xd0",
-        # Fill bytes are only legal immediately before a marker, so
-        # "fill then content" is not a shape a JPEG can hold: the fill
-        # run's last 0xFF pairs with the following byte as a marker.
-        "content then fill before EOI": b"\x01\x02\xff\xff",
-    }
-    for label, entropy in real_content.items():
-        assert claude_native._is_structurally_valid_jpeg(prefix + entropy + b"\xff\xd9"), label
-    # The helper reports the resume offset only when content was seen.
-    payload = prefix + b"\x01\x02\xff\xd9"
-    assert claude_native._jpeg_skip_entropy_data(payload, len(prefix)) == len(payload) - 2
-    assert claude_native._jpeg_skip_entropy_data(prefix + b"\xff\xd0\xff\xd9", len(prefix)) is None
-    # Genuine multi-scan and baseline fixtures are unaffected.
-    for mime_type, fixture in (
-        ("image/jpeg", _TINY_JPEG_BASE64),
-        ("image/jpeg", _TINY_PROGRESSIVE_JPEG_BASE64),
-        ("image/jpeg", _TINY_PROGRESSIVE_GRAY_JPEG_BASE64),
-        ("image/jpeg", _TINY_CMYK_JPEG_BASE64),
-    ):
-        assert claude_native._is_supported_image_payload(fixture, mime_type)
+    payload = _HEADER_VALID_CORRUPT_JPEGS[case]
+    assert claude_native._is_supported_image_payload(payload, "image/jpeg")
+    output = json.dumps(
+        {"type": "image", "data": payload, "mimeType": "image/jpeg"},
+        separators=(",", ":"),
+    )
+    records = _image_output_records(output)
+    assert records[0]["message"]["content"][0]["content"] == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": payload},
+        }
+    ]
+    # Still exactly one copy: the metadata never gets a second one.
+    assert json.dumps(records[0]).count(payload) == 1
 
 
 def test_oversized_invalid_image_collapses_instead_of_replaying_base64() -> None:
     """
     Rejecting a big invalid image must not cost more than accepting it.
 
-    An image-shaped payload that fails structural validation cannot
-    become an image block, and the fallback keeps the raw string as
-    ``tool_result`` content — which for a large payload replays the whole
-    base64 as prompt text, exactly the shape that overflowed the context
-    window. Past ``_MAX_INVALID_IMAGE_REPLAY_CHARS`` the payload is
-    dropped for the short omitted-image placeholder instead; small
-    invalid snippets still replay verbatim so their text survives.
+    An image-shaped payload the gate rejects cannot become an image block, and
+    the fallback keeps the raw string as ``tool_result`` content — which for a
+    large payload replays the whole base64 as prompt text, the shape that
+    overflowed the context window. Past ``_MAX_INVALID_IMAGE_REPLAY_CHARS`` it
+    collapses to the omitted-image placeholder instead; small invalid snippets
+    still replay verbatim so their text survives.
     """
-    oversized = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 40_000).decode()
+    oversized = base64.b64encode(b"not an image payload " * 2_000).decode()
     assert len(oversized) > claude_native._MAX_INVALID_IMAGE_REPLAY_CHARS
     assert not claude_native._is_supported_image_payload(oversized, "image/jpeg")
     image_object = json.dumps(
@@ -8364,8 +8357,9 @@ def test_oversized_invalid_image_collapses_instead_of_replaying_base64() -> None
     assert content[0] == {"type": "text", "text": "screenshot follows"}
     assert "omitted from history" in content[1]["text"]
     # Below the threshold nothing changes: the raw string still replays.
-    small = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 64).decode()
+    small = base64.b64encode(b"not an image").decode()
     assert len(small) <= claude_native._MAX_INVALID_IMAGE_REPLAY_CHARS
+    assert not claude_native._is_supported_image_payload(small, "image/jpeg")
     small_output = json.dumps(
         [{"type": "image", "data": small, "mimeType": "image/jpeg"}],
         separators=(",", ":"),
@@ -8389,7 +8383,7 @@ def test_collapsed_oversized_image_logs_shape_without_the_payload(
     the other log assertions in this module: caplog depends on handler /
     propagation state that other tests' logging setup can disturb.
     """
-    oversized = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 40_000).decode()
+    oversized = base64.b64encode(b"not an image payload " * 2_000).decode()
     captured: list[str] = []
     monkeypatch.setattr(
         claude_native._logger,
@@ -8442,59 +8436,65 @@ def test_large_text_block_array_keeps_byte_for_byte_tool_use_result() -> None:
     assert records[0]["toolUseResult"] == output
     assert records[0]["message"]["content"][0]["content"] == [{"type": "text", "text": long_text}]
     # And the dropped-payload case still swaps in the block list.
-    oversized = base64.b64encode(b"\xff\xd8\xff" + b"\x00" * 40_000).decode()
+    oversized = base64.b64encode(b"not an image payload " * 2_000).decode()
     dropped = claude_native._claude_tool_result_content_blocks(
         json.dumps({"type": "image", "data": oversized, "mimeType": "image/png"})
     )
     assert dropped.dropped_oversized_image is True
 
 
-def test_image_payload_validator_rejects_corrupt_structure() -> None:
+def test_image_payload_gate_accepts_and_rejects() -> None:
     """
-    The structural validator catches corruption past the magic bytes.
+    What the payload gate does and does not check.
 
-    A CRC-corrupted PNG chunk and a truncated JPEG must be rejected even
-    though both start with the right signature; the genuine fixtures
-    must pass for all four supported formats.
+    It enforces four things — a known declared media type, strict base64, the
+    byte floor, and the declared type's magic bytes (with WebP's ``WEBP`` at
+    offset 8) — and nothing about container internals. So a truncated or
+    CRC-corrupted payload that keeps its signature is *accepted*; the cases
+    below pin both halves of that contract.
     """
-    corrupted_png = bytearray(base64.b64decode(_TINY_PNG_BASE64))
-    corrupted_png[20] ^= 0xFF
-    assert not claude_native._is_supported_image_payload(
-        base64.b64encode(bytes(corrupted_png)).decode(), "image/png"
-    )
-    truncated_jpeg = base64.b64encode(base64.b64decode(_TINY_JPEG_BASE64)[:100]).decode()
-    assert not claude_native._is_supported_image_payload(truncated_jpeg, "image/jpeg")
-    # An oversize segment length must reject even with a valid SOI/APP0 start.
-    oversize = bytearray(base64.b64decode(_TINY_JPEG_BASE64))
-    oversize[4] = 0x7F
-    oversize[5] = 0xFF
-    assert not claude_native._is_supported_image_payload(
-        base64.b64encode(bytes(oversize)).decode(), "image/jpeg"
-    )
-    # Trailing bytes after EOI are rejected: strict EOF policy.
-    with_trailer = base64.b64encode(base64.b64decode(_TINY_JPEG_BASE64) + b"\x00\x00").decode()
-    assert not claude_native._is_supported_image_payload(with_trailer, "image/jpeg")
-    # A progressive JPEG cut mid-scan rejects; intact it validates.
-    progressive = base64.b64decode(_TINY_PROGRESSIVE_JPEG_BASE64)
-    assert not claude_native._is_supported_image_payload(
-        base64.b64encode(progressive[:-20]).decode(), "image/jpeg"
-    )
-    # Marker-only pseudo-JPEGs and invalid scan state reject.
-    for payload in _MARKER_ONLY_JPEGS.values():
-        assert not claude_native._is_supported_image_payload(payload, "image/jpeg")
-    sos_before_sof = base64.b64encode(b"\xff\xd8" + _FAKE_SOS + b"\x01\x02\xff\xd9").decode()
-    assert not claude_native._is_supported_image_payload(sos_before_sof, "image/jpeg")
-    ns_zero_sos = base64.b64encode(
-        b"\xff\xd8" + _FAKE_SOF0 + b"\xff\xda\x00\x06\x00\x00\x3f\x00\x01\x02\xff\xd9"
-    ).decode()
-    assert not claude_native._is_supported_image_payload(ns_zero_sos, "image/jpeg")
+    gate = claude_native._is_supported_image_payload
     for mime_type, payload in (
         ("image/png", _TINY_PNG_BASE64),
         ("image/jpeg", _TINY_JPEG_BASE64),
         ("image/gif", _TINY_GIF_BASE64),
         ("image/webp", _TINY_WEBP_BASE64),
+        ("image/jpeg", _TINY_PROGRESSIVE_JPEG_BASE64),
+        ("image/jpeg", _TINY_PROGRESSIVE_GRAY_JPEG_BASE64),
+        ("image/jpeg", _TINY_CMYK_JPEG_BASE64),
     ):
-        assert claude_native._is_supported_image_payload(payload, mime_type)
+        assert gate(payload, mime_type), mime_type
+        # Every real fixture clears the floor — that is how it was chosen.
+        assert len(base64.b64decode(payload)) >= claude_native._MIN_IMAGE_BYTES
+    # Rejected: unknown type, bad base64, non-image bytes, MIME/signature
+    # mismatch either way round.
+    assert not gate(base64.b64encode(b"<svg/>" * 8).decode(), "image/svg+xml")
+    assert not gate("!!! not base64 !!!", "image/png")
+    assert not gate(base64.b64encode(b"plain text " * 8).decode(), "image/png")
+    assert not gate(_TINY_PNG_BASE64, "image/jpeg")
+    assert not gate(_TINY_JPEG_BASE64, "image/png")
+    # Rejected: below the byte floor, even with the right signature.
+    for magic, mime_type in (
+        (b"\x89PNG\r\n\x1a\n", "image/png"),
+        (b"\xff\xd8\xff", "image/jpeg"),
+        (b"GIF89a", "image/gif"),
+    ):
+        assert len(magic) < claude_native._MIN_IMAGE_BYTES
+        assert not gate(base64.b64encode(magic).decode(), mime_type)
+    # Rejected: a RIFF container that is not WebP, and a bare RIFF/WEBP header.
+    assert not gate(
+        base64.b64encode(b"RIFF" + b"\x00" * 4 + b"AVI " + b"\x00" * 40).decode(), "image/webp"
+    )
+    assert not gate(base64.b64encode(b"RIFF\x00\x00\x00\x00WEBP").decode(), "image/webp")
+    # Accepted by design: signature intact, container corrupt or cut short.
+    corrupted_png = bytearray(base64.b64decode(_TINY_PNG_BASE64))
+    corrupted_png[20] ^= 0xFF
+    assert gate(base64.b64encode(bytes(corrupted_png)).decode(), "image/png")
+    assert gate(base64.b64encode(base64.b64decode(_TINY_JPEG_BASE64)[:100]).decode(), "image/jpeg")
+    assert gate(
+        base64.b64encode(base64.b64decode(_TINY_JPEG_BASE64) + b"\x00\x00").decode(),
+        "image/jpeg",
+    )
 
 
 def test_claude_tool_result_content_blocks_rehydrates_only_block_arrays() -> None:
@@ -8615,11 +8615,7 @@ def test_claude_transcript_truncated_image_result_stripped_not_leaked() -> None:
 
 
 def _store_truncated(clipped_prefix: str) -> str:
-    """Append the conversation store's truncation marker to a clipped item.
-
-    Callers pass the payload already cut mid-base64, so the result is
-    unterminated JSON — the shape a real wedged session persisted.
-    """
+    """Append the store's truncation marker, leaving unterminated JSON."""
     return clipped_prefix + "…[truncated by conversation-store: item exceeded 245760B cap]"
 
 

@@ -20,11 +20,9 @@ import secrets
 import shlex
 import shutil
 import signal
-import struct
 import subprocess
 import sys
 import uuid
-import zlib
 
 from omnigent.json_types import JsonObject as _JsonObject
 
@@ -1648,26 +1646,14 @@ def _sanitize_cloned_tool_result_record(payload: _JsonObject) -> None:
     """
     Repair image duplication in one copied transcript record, in place.
 
-    A fork clone (or cwd redirect) byte-copies the source's local JSONL,
-    so a transcript synthesized before the ``toolUseResult`` redaction
-    fix — or one holding an MCP screenshot as a raw string — would
-    otherwise replay its base64 twice (or as ~250K tokens of text) on
-    the clone's FIRST ``--resume`` launch, before any later rebuild can
-    heal it. Records are touched only when their ``tool_result``
-    content already carries the image payload: string content with a
-    recognizable image shape is normalized to structured blocks, and
-    duplicated metadata is repaired. Every other record — text results,
-    non-image JSON, assistant turns, native metadata that does not
-    duplicate the payload — is left exactly as copied.
-
-    A truncated payload takes a second route. Its JSON is clipped, so it
-    cannot rehydrate into an image block at all; left alone, the clone
-    replays the partial base64 as text. Such content is collapsed to the
-    same placeholder the rebuild path uses (via
-    :func:`_strip_unparseable_image_output`, so the errored spelling is
-    covered too) and its metadata is rewritten from the collapsed form,
-    which is the only case where a record with no recoverable image
-    payload is still touched.
+    A fork clone byte-copies the source JSONL, so a record written before the
+    ``toolUseResult`` redaction fix would replay its base64 twice on the clone's
+    first ``--resume``. Two routes: content whose payload rehydrates into an
+    image block is normalized and its duplicated metadata repaired; a truncated
+    payload — which cannot rehydrate — is collapsed via
+    :func:`_strip_unparseable_image_output` and its metadata rewritten from the
+    collapsed form. That second route is the only case where a record carrying
+    no recoverable payload is still touched.
 
     :param payload: One decoded transcript record (mutated).
     :returns: None.
@@ -1714,14 +1700,11 @@ def _repair_cloned_tool_use_result(
     """
     Remove a duplicated image payload from a cloned record's metadata.
 
-    ``toolUseResult`` is only rewritten when it literally contains one of
-    the payloads already present in the (now structured) content —
-    metadata that does not duplicate the image is preserved untouched.
-    A redacted passthrough is preferred; if the payload still survives
-    it (e.g. a pre-fix record whose metadata wrapped a mixed
-    text-plus-image string as a JSON string literal, which structured
-    redaction cannot reach), the metadata is replaced with the canonical
-    redacted block list.
+    Rewritten only when the metadata literally contains a payload already
+    present in the structured content. A redacted passthrough is preferred; when
+    the payload survives that (a JSON string literal wrapping mixed
+    text-plus-image, which structured redaction cannot reach), the canonical
+    redacted block list replaces it.
 
     :param payload: The transcript record (mutated).
     :param blocks: The normalized image-bearing content blocks.
@@ -4654,11 +4637,6 @@ def _redact_binary_blocks(value: object) -> object:
     """
     Replace inline binary payloads with the ``toolUseResult`` marker.
 
-    Thin wrapper over the shared redaction helper (imported lazily, like
-    the ``omnigent.runtime.prompt`` import above, to keep CLI startup
-    import-light) bound to the transcript-metadata marker.
-
-    :param value: Arbitrarily nested dict/list/string content.
     :returns: A copy with base64 payloads redacted.
     """
     from omnigent.llms.adapters._content import redact_binary_payloads
@@ -4674,23 +4652,11 @@ def _tool_use_result_for_content(
     """
     Build the ``toolUseResult`` metadata for one rebuilt tool result.
 
-    When the result carries an image, the canonical redacted block list
-    is the metadata: it stays ``JSON.parse``-able, preserves every
-    non-binary field, and cannot reintroduce the payload — the base64
-    then exists exactly once in the record, in the structured
-    ``tool_result`` content the model re-sees. Image-free results keep
-    the legacy passthrough so their representation is unchanged.
-
-    A payload the blocks *dropped* needs the same treatment. When an
-    oversized invalid image is collapsed to a placeholder, the content no
-    longer carries its base64 — but the legacy passthrough would, and for
-    the newline-joined shape it is not JSON, so shape-keyed redaction
-    never sees it. Mirroring the raw output there would put the payload
-    straight back into the transcript, so that one case uses the block
-    list instead. It is gated on the explicit
-    ``dropped_oversized_image`` signal from normalization, not on the
-    passthrough's size: a legitimately large text-block array drops
-    nothing and must keep its byte-for-byte passthrough.
+    An image-bearing result uses the redacted block list, so the base64 exists
+    exactly once in the record — in the ``tool_result`` content the model
+    re-sees. A dropped oversized payload uses it too, since the raw passthrough
+    would still carry base64 that shape-keyed redaction cannot reach. Image-free
+    results keep the byte-for-byte passthrough.
 
     :param output: The persisted tool-result string.
     :param content_blocks: Rehydrated blocks, or ``None`` when the
@@ -4711,12 +4677,7 @@ def _tool_use_result_payload_omitted(media_type: str, _payload_length: int) -> s
     """
     Build the marker written over a redacted ``toolUseResult`` payload.
 
-    The payload length is deliberately unused: the marker is synthesized
-    fresh on every transcript rebuild, so it only needs to point at the
-    surviving copy, not describe the dropped one.
-
     :param media_type: The block's declared media type, if any.
-    :param _payload_length: Unused.
     :returns: The replacement text.
     """
     label = media_type or "binary"
@@ -4766,14 +4727,10 @@ def _json_safe_tool_use_result(output: str) -> str:
     return output
 
 
-#: Prefix ``omnigent.tools.mcp._format_call_result`` puts on a failed MCP
-#: result (``f"Error: {joined}"``). It lands ahead of the serialized
-#: content blocks, so for a lone image it turns valid JSON into an
-#: unparseable string, and it moves the leading ``[``/``{`` that the
-#: truncated-image guard looks for — both shape checks have to know about
-#: it or the payload replays as text. Duplicated rather than imported (see
-#: ``test_mcp_error_prefix_constant_matches_the_real_formatter``, which
-#: fails if the formatter's wording drifts from this).
+#: Prefix ``_format_call_result`` puts on a failed MCP result. It displaces the
+#: leading ``[``/``{`` both shape guards look for, so both must strip it.
+#: Duplicated, not imported — pinned by
+#: ``test_mcp_error_prefix_constant_matches_the_real_formatter``.
 _MCP_ERROR_PREFIX = "Error: "
 
 
@@ -4782,17 +4739,11 @@ def _strip_unparseable_image_output(output: str) -> str:
 
     Intact image outputs (valid JSON) are returned unchanged so the caller can
     rehydrate them into real image blocks for ``--resume``. Only a payload that
-    *looks* like an image but no longer parses as JSON — the shape produced when
-    the conversation store clipped it at its byte cap — is replaced with a short
-    placeholder, so the corrupt ~250K-char base64 is never sent as prompt text.
-
-    A failed MCP call carries the :data:`_MCP_ERROR_PREFIX`, which moves the
-    leading ``[``/``{`` off the front of the string. Without accounting for
-    it, an errored *and* truncated image slipped past the shape guard, then
-    failed rehydration too (its JSON is clipped) and replayed the partial
-    base64 twice — as model-visible text and in metadata. One prefix is
-    therefore recognized here as well and preserved as a compact text block
-    ahead of the placeholder, so the error is not silently dropped.
+    *looks* like an image but no longer parses as JSON — the shape the store
+    leaves when it clips at its byte cap — is replaced, so the corrupt base64
+    is never sent as prompt text. One :data:`_MCP_ERROR_PREFIX` is stripped
+    before that shape check and re-attached as a text block, so an errored
+    truncated image is collapsed too without losing the error.
 
     :param output: The persisted tool-result string.
     :returns: The original string, or a placeholder JSON array when the output
@@ -4824,18 +4775,11 @@ class _RehydratedContent:
     """
     The outcome of normalizing one persisted tool-result string.
 
-    ``dropped_oversized_image`` is the signal the metadata builder needs:
-    it is true only when normalization actually *replaced* an oversized
-    unconvertible image payload with the omitted-image placeholder, so
-    the payload lives in neither the content nor anywhere else the record
-    can reach. It is deliberately carried out here rather than inferred
-    later — recognizing the placeholder by its wording would couple two
-    modules through a user-facing string, and a size heuristic on the
-    metadata would also fire for a legitimately large text result.
-
-    :param blocks: Rehydrated content blocks, or ``None`` when the output
-        is not a recognized block shape (the caller keeps the raw string).
-    :param dropped_oversized_image: Whether a payload was dropped.
+    :param blocks: Content blocks, or ``None`` when the output holds no
+        recognized shape (the caller keeps the raw string).
+    :param dropped_oversized_image: True when an oversized unconvertible
+        image payload was replaced with the placeholder — the signal the
+        metadata builder needs, since the payload then survives nowhere.
     """
 
     blocks: list[_JsonObject] | None
@@ -4844,46 +4788,19 @@ class _RehydratedContent:
 
 def _claude_tool_result_content_blocks(output: str) -> _RehydratedContent:
     """
-    Rehydrate a stringified content-block array into real blocks.
+    Rehydrate a persisted tool-result string into content blocks.
 
-    Tool results that return image content are persisted as a JSON *string*
-    like ``'[{"type":"image","source":{...}}]'``. Passing that string
-    straight into a ``tool_result`` content block makes ``claude --resume``
-    send the base64 to the API as plain text — a single screenshot balloons
-    to ~250K text tokens instead of the ~1.5K an image block costs, which is
-    what pushes a resumed conversation over the context limit.
+    Delegates shape matching to :func:`_rehydrate_tool_result_shape`, then
+    retries once against a de-prefixed copy: the ``"Error: "`` a failed MCP
+    result carries makes an otherwise-parseable lone image object
+    unparseable, and the prefix is re-attached as a leading text block so the
+    error survives without the payload replaying as text. Only done when an
+    image payload is at stake, so errored non-image results keep their exact
+    representation.
 
-    Only ``text`` and ``image`` blocks are rehydrated: those are the block
-    types the API accepts inside a ``tool_result``. Anything else (plain
-    text, or a JSON array of some other shape) stays a raw string so the
-    resume request keeps sending exactly what it did before.
-
-    Three persisted shapes are recognized: a JSON block array (the
-    Claude-style form), a single MCP ``ImageContent`` object
-    (``{"type":"image","data":...,"mimeType":...}``, the shape
-    ``omnigent.tools.mcp._format_call_result`` writes for a lone image),
-    and newline-joined mixed text + image-object lines (the shape the
-    same formatter writes for multi-block MCP results). MCP image
-    entries are converted to canonical ``source``-shaped blocks.
-
-    Each of those shapes also has an *errored* spelling: the same
-    formatter prefixes a failed result with ``"Error: "``, which makes an
-    otherwise-parseable lone image object unparseable JSON. Left
-    unhandled, such a record replays its base64 twice — once as
-    model-visible ``tool_result`` text and once in metadata. One leading
-    prefix is therefore stripped for shape parsing and re-attached as a
-    compact text block ahead of the image, so the error stays visible to
-    the model without the payload going with it. The newline-joined shape
-    already survives the prefix (it only affects the first line, which is
-    text either way).
-
-    :param output: The persisted tool-result string, e.g.
-        ``'[{"type":"image","source":{"type":"base64","data":"..."}}]'``
-        or plain text like ``"file written"``.
-    :returns: A :class:`_RehydratedContent` whose ``blocks`` is a list of
-        content blocks when *output* holds a recognized block shape, and
-        ``None`` otherwise so the caller keeps the raw string as the block
-        content.
+    :param output: The persisted tool-result string.
+    :returns: A :class:`_RehydratedContent`; ``blocks`` is ``None`` when
+        *output* holds no recognized shape, so the caller keeps the raw string.
     """
     direct = _rehydrate_tool_result_shape(output)
     if direct.blocks is not None or not output.startswith(_MCP_ERROR_PREFIX):
@@ -4908,9 +4825,16 @@ def _rehydrate_tool_result_shape(output: str) -> _RehydratedContent:
     """
     Normalize one persisted tool-result string by its literal shape.
 
-    The shape-matching core of :func:`_claude_tool_result_content_blocks`,
-    split out so the errored spelling can retry against a de-prefixed copy
-    without recursing (which would strip more than one prefix).
+    Image tool results persist as a JSON *string*; passing that straight into a
+    ``tool_result`` block makes ``claude --resume`` send the base64 as plain
+    text, ~250K tokens per screenshot instead of ~1.5K. Three shapes are
+    recognized — a JSON block array, a lone MCP ``ImageContent`` object, and
+    newline-joined mixed text + image-object lines — and only ``text``/``image``
+    blocks are rehydrated, since those are what the API accepts inside a
+    ``tool_result``. Anything else stays a raw string.
+
+    Called (not recursed into) by :func:`_claude_tool_result_content_blocks`, so
+    that retry strips at most one error prefix.
 
     :param output: The persisted tool-result string.
     :returns: A :class:`_RehydratedContent`; ``blocks`` is ``None`` when
@@ -4979,337 +4903,64 @@ def _claude_blocks_from_parsed_list(parsed: list[object]) -> _RehydratedContent:
     return _RehydratedContent(blocks, dropped_oversized_image=dropped)
 
 
-def _is_structurally_valid_png(data: bytes) -> bool:
-    """
-    Walk the PNG chunk stream, verifying structure and CRCs.
-
-    Requires the 8-byte signature, an IHDR first chunk, a final IEND
-    with nothing after it, and a valid length + CRC32 for every chunk —
-    the checks a decoder performs before touching pixel data, so
-    header-only, truncated, or corrupt payloads are rejected.
-    """
-    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return False
-    offset = 8
-    seen_ihdr = False
-    while True:
-        if offset + 12 > len(data):
-            return False
-        (length,) = struct.unpack(">I", data[offset : offset + 4])
-        chunk_type = data[offset + 4 : offset + 8]
-        end = offset + 12 + length
-        if end > len(data):
-            return False
-        (crc_expected,) = struct.unpack(">I", data[end - 4 : end])
-        if zlib.crc32(data[offset + 4 : end - 4]) & 0xFFFFFFFF != crc_expected:
-            return False
-        if not seen_ihdr:
-            if chunk_type != b"IHDR" or length != 13:
-                return False
-            seen_ihdr = True
-        offset = end
-        if chunk_type == b"IEND":
-            return offset == len(data)
-
-
-# Start of Frame markers (0xC0-0xCF except DHT=0xC4, reserved 0xC8,
-# DAC=0xCC). A legal JPEG declares a frame before any scan.
-_JPEG_SOF_MARKERS = frozenset(
-    (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF)
-)
-
-
-def _jpeg_frame_header_valid(segment: bytes) -> bool:
-    """
-    Check one Start-of-Frame header for self-consistency.
-
-    Layout after the marker: length (2) + sample precision (1) + height
-    (2) + width (2) + component count (1) + 3 bytes per component, so a
-    legal header is exactly ``8 + 3 * Nf`` bytes and the smallest one
-    (a single component) is 11.
-
-    :param segment: The SOF segment, starting at its length field.
-    :returns: True when both dimensions are non-zero and the declared
-        length matches the component count.
-    """
-    if len(segment) < 11:
-        return False
-    (height, width) = struct.unpack(">HH", segment[3:7])
-    components = segment[7]
-    if height == 0 or width == 0 or components == 0:
-        return False
-    return len(segment) == 8 + 3 * components
-
-
-def _jpeg_scan_header_valid(segment: bytes) -> bool:
-    """
-    Check one Start-of-Scan header for self-consistency.
-
-    Layout after the marker: length (2) + scan-component count (1) +
-    2 bytes per scan component + Ss/Se/AhAl (3), so a legal header is
-    exactly ``6 + 2 * Ns`` bytes and the smallest one (a single
-    component) is 8.
-
-    :param segment: The SOS segment, starting at its length field.
-    :returns: True when at least one component participates and the
-        declared length matches the scan-component count.
-    """
-    if len(segment) < 8:
-        return False
-    scan_components = segment[2]
-    if scan_components == 0:
-        return False
-    return len(segment) == 6 + 2 * scan_components
-
-
-def _jpeg_skip_entropy_data(data: bytes, offset: int) -> int | None:
-    """
-    Skip a scan's entropy-coded data, stopping at the next real marker.
-
-    Inside a scan, ``FF00`` is a stuffed literal ``0xFF`` byte,
-    ``FFD0``-``FFD7`` are restart markers, and a run of ``FF`` bytes is
-    fill. Only ordinary bytes and stuffed literals are entropy
-    *content*: restart markers and fill bytes are framing, so a "scan"
-    built solely from them carries no compressed data and is not a legal
-    scan. Tracking content separately from mere progress is what rejects
-    ``SOI + SOF + SOS + FFD0 + EOI``, which otherwise walks cleanly to a
-    terminal EOI because the restart marker advances the cursor.
-
-    :param data: The whole JPEG payload.
-    :param offset: Index of the first byte after the SOS header.
-    :returns: The offset of the next real marker's ``0xFF`` byte, or
-        ``None`` when the payload ends inside the scan or the scan
-        carries no entropy content at all.
-    """
-    has_content = False
-    while offset + 1 < len(data):
-        if data[offset] != 0xFF:
-            has_content = True
-            offset += 1
-            continue
-        following = data[offset + 1]
-        if following == 0x00:  # stuffed literal 0xFF — real entropy content
-            has_content = True
-            offset += 2
-            continue
-        if 0xD0 <= following <= 0xD7:  # restart marker — framing, not content
-            offset += 2
-            continue
-        if following == 0xFF:  # fill byte — framing, not content
-            offset += 1
-            continue
-        return offset if has_content else None  # real marker ends the scan
-    return None  # payload ended inside entropy data
-
-
-def _is_structurally_valid_jpeg(data: bytes) -> bool:
-    """
-    Walk the JPEG marker stream, across every scan, to a terminal EOI.
-
-    Every marker segment's declared length must fit inside the payload.
-    State invariants reject marker-only pseudo-JPEGs without codec work:
-    a syntactically valid Start of Frame (non-zero dimensions, component
-    count consistent with its length) must precede any scan; every Start
-    of Scan header must be length/component-consistent and followed by
-    real entropy *content* (ordinary bytes or stuffed ``FF00`` literals —
-    restart markers and fill bytes alone do not make a scan); repeated
-    SOI and restart markers outside entropy data are corrupt. After a
-    scan, entropy-coded data is skipped until a real (non-stuffed,
-    non-fill, non-restart) marker and marker parsing resumes, so
-    progressive/multi-scan files with interleaved table/metadata segments
-    (DHT/DQT/DNL/DRI/APPn/...) and further SOS scans validate. The
-    payload is accepted only when an EOI marker is the final two bytes
-    after at least one scan — strict EOF, no trailing-byte tolerance.
-    """
-    if not data.startswith(b"\xff\xd8"):
-        return False
-    offset = 2
-    seen_frame = False
-    seen_scan = False
-    while True:
-        # Marker prefix: one or more 0xFF bytes (extra 0xFFs are fill).
-        if offset >= len(data) or data[offset] != 0xFF:
-            return False
-        while offset < len(data) and data[offset] == 0xFF:
-            offset += 1
-        if offset >= len(data):
-            return False
-        marker = data[offset]
-        offset += 1
-        if marker == 0x01:
-            continue  # TEM carries no length field
-        if marker == 0xD8 or 0xD0 <= marker <= 0xD7:
-            return False  # repeated SOI / restart marker outside entropy
-        if marker == 0xD9:  # EOI: valid only as the final two bytes
-            return seen_frame and seen_scan and offset == len(data)
-        if marker == 0x00:
-            return False  # stuffed byte outside entropy data — corrupt
-        if offset + 2 > len(data):
-            return False
-        (segment_length,) = struct.unpack(">H", data[offset : offset + 2])
-        if segment_length < 2 or offset + segment_length > len(data):
-            return False
-        segment = data[offset : offset + segment_length]
-        if marker in _JPEG_SOF_MARKERS:
-            if not _jpeg_frame_header_valid(segment):
-                return False
-            seen_frame = True
-        elif marker == 0xDA:
-            if not seen_frame or not _jpeg_scan_header_valid(segment):
-                return False
-            seen_scan = True
-        offset += segment_length
-        if marker != 0xDA:
-            continue
-        # Start of Scan: skip entropy-coded data up to the next real
-        # marker. A scan carrying only restart markers and/or fill bytes
-        # holds no compressed data and is rejected there.
-        resumed = _jpeg_skip_entropy_data(data, offset)
-        if resumed is None:
-            return False
-        offset = resumed
-
-
-def _is_structurally_valid_gif(data: bytes) -> bool:
-    """
-    Walk the GIF block stream to the trailer byte.
-
-    Requires a sane logical screen descriptor, consistent global/local
-    color-table sizes, well-formed extension and image blocks with
-    properly delimited data sub-blocks, at least one image, and the
-    ``0x3B`` trailer as the final byte.
-    """
-    if not data.startswith((b"GIF87a", b"GIF89a")) or len(data) < 14:
-        return False
-    (width, height) = struct.unpack("<HH", data[6:10])
-    if width == 0 or height == 0:
-        return False
-    offset = 13
-    if data[10] & 0x80:  # global color table flag
-        offset += 3 * (2 ** ((data[10] & 0x07) + 1))
-    saw_image = False
-    while True:
-        if offset >= len(data):
-            return False
-        block_type = data[offset]
-        offset += 1
-        if block_type == 0x3B:  # trailer
-            return saw_image and offset == len(data)
-        if block_type == 0x21:  # extension: label, then data sub-blocks
-            if offset >= len(data):
-                return False
-            offset += 1
-        elif block_type == 0x2C:  # image descriptor
-            if offset + 9 > len(data):
-                return False
-            packed = data[offset + 8]
-            offset += 9
-            if packed & 0x80:  # local color table flag
-                offset += 3 * (2 ** ((packed & 0x07) + 1))
-            if offset >= len(data):
-                return False
-            offset += 1  # LZW minimum code size
-            saw_image = True
-        else:
-            return False
-        while True:  # data sub-blocks: length-prefixed, zero-terminated
-            if offset >= len(data):
-                return False
-            sub_block_size = data[offset]
-            offset += 1
-            if sub_block_size == 0:
-                break
-            offset += sub_block_size
-            if offset > len(data):
-                return False
-
-
-def _is_structurally_valid_webp(data: bytes) -> bool:
-    """
-    Walk the WebP RIFF chunk stream.
-
-    Requires the RIFF/WEBP header, a RIFF size field that exactly
-    matches the payload length, well-formed chunks (2-byte-aligned
-    sizes, all inside the payload), and at least one frame chunk
-    (``VP8 ``/``VP8L``/``VP8X``).
-    """
-    if len(data) < 20 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
-        return False
-    (riff_size,) = struct.unpack("<I", data[4:8])
-    if riff_size != len(data) - 8:
-        return False
-    offset = 12
-    saw_frame_chunk = False
-    while offset < len(data):
-        if offset + 8 > len(data):
-            return False
-        chunk_tag = data[offset : offset + 4]
-        (chunk_size,) = struct.unpack("<I", data[offset + 4 : offset + 8])
-        offset += 8 + chunk_size + (chunk_size & 1)
-        if offset > len(data):
-            return False
-        if chunk_tag in (b"VP8 ", b"VP8L", b"VP8X"):
-            saw_frame_chunk = True
-    return saw_frame_chunk and offset == len(data)
-
-
-_IMAGE_STRUCTURE_CHECK_BY_MEDIA_TYPE: dict[str, Callable[[bytes], bool]] = {
-    "image/png": _is_structurally_valid_png,
-    "image/jpeg": _is_structurally_valid_jpeg,
-    "image/gif": _is_structurally_valid_gif,
-    "image/webp": _is_structurally_valid_webp,
+#: Magic-byte prefixes for the image types Claude accepts, keyed by the media
+#: type the caller declares. A payload must match its own declared type —
+#: Claude is told that type, so a mismatch fails the resume.
+_IMAGE_MAGIC_BY_MEDIA_TYPE: dict[str, tuple[bytes, ...]] = {
+    "image/png": (b"\x89PNG\r\n\x1a\n",),
+    "image/jpeg": (b"\xff\xd8\xff",),
+    "image/gif": (b"GIF87a", b"GIF89a"),
+    "image/webp": (b"RIFF",),  # plus b"WEBP" at offset 8, checked below
 }
 
-#: Base64 length (in characters) above which an image-shaped tool result
-#: that fails structural validation is collapsed to a placeholder instead
-#: of replaying verbatim as prompt text. Rejecting a payload must not
-#: cost more than accepting it: an unconverted block keeps the raw string
-#: as ``tool_result`` content, so a large corrupt screenshot would replay
-#: as ~1 text token per 1.4 base64 chars — the very shape that overflowed
-#: the context window in the first place. 8 KiB (~6 KB of image data)
-#: sits far below any real screenshot (the smallest in the reported
-#: incident was 32,432 chars) and far above the short invalid snippets
-#: that docs, logs, and tests embed, which must keep replaying verbatim
-#: so their text survives for the model to read.
+#: Floor below which a payload cannot be a real image of any accepted type.
+#: Measured from fixtures, not guessed: the smallest real image here is a
+#: 37-byte 1x1 GIF, while the largest non-image shape that still matches a
+#: magic prefix is a bare 12-byte ``RIFF``+``WEBP`` header.
+_MIN_IMAGE_BYTES = 16
+
+#: Base64 length above which an image-shaped payload that fails validation is
+#: collapsed rather than replayed as text — rejecting must not cost more than
+#: accepting. 8 KiB: under every real screenshot (the smallest in the reported
+#: incident was 32,432 chars), over the snippets docs and tests embed.
 _MAX_INVALID_IMAGE_REPLAY_CHARS = 8 * 1024
 
 
 def _is_supported_image_payload(data: str, media_type: str) -> bool:
     """
-    Prove *data* is a real *media_type* image before it becomes a block.
+    Check *data* is plausibly a *media_type* image before it becomes a block.
 
-    Flattened MCP output loses provenance, so a text line that merely
-    *looks* like a serialized image (docs, logs, placeholders) must not
-    be converted: an invalid image block makes Claude reject the resume
-    on every launch. Require strict base64 and decoded bytes whose full
-    structure validates against the declared MIME type — magic bytes
-    alone accept header-only or corrupt data. Formats outside Claude's
-    supported set (e.g. SVG) are rejected too.
+    Strict base64 plus a declared-type magic-byte match. An invalid image
+    block makes Claude reject the resume on every launch, so the bytes must
+    match the type we declare to it. Container validation is unnecessary: a
+    store-truncated payload never parses as JSON and so never reaches here,
+    which means a magic-valid but internally corrupt payload is accepted by
+    design.
 
     :param data: Candidate base64 payload.
     :param media_type: Declared MIME type, e.g. ``"image/png"``.
-    :returns: True only for a structure-verified supported image.
+    :returns: True for a payload whose bytes match its declared type.
     """
-    check = _IMAGE_STRUCTURE_CHECK_BY_MEDIA_TYPE.get(media_type)
-    if check is None:
+    magic = _IMAGE_MAGIC_BY_MEDIA_TYPE.get(media_type)
+    if magic is None:
         return False
     try:
         decoded = base64.b64decode(data, validate=True)
     except (binascii.Error, ValueError):
         return False
-    return check(decoded)
+    if len(decoded) < _MIN_IMAGE_BYTES or not decoded.startswith(magic):
+        return False
+    return media_type != "image/webp" or decoded[8:12] == b"WEBP"
 
 
 def _claude_image_block_from_object(value: object) -> _JsonObject | None:
     """
     Return a canonical Claude image block for one parsed image object.
 
-    Accepts the Anthropic wire shape (``source`` present, kept as-is)
-    and the MCP ``ImageContent`` serialization that
-    ``omnigent.tools.mcp._format_call_result`` persists (bare ``data`` +
-    ``mimeType``). The MCP shape is converted only after strict payload
-    validation; anything else yields ``None`` so callers keep the raw
-    string rather than emit an API-invalid image block.
+    Accepts the Anthropic wire shape (``source`` present, kept as-is) and the
+    MCP ``ImageContent`` serialization (bare ``data`` + ``mimeType``), the
+    latter only after payload validation. Anything else yields ``None`` so
+    callers keep the raw string rather than emit an API-invalid block.
 
     :param value: Decoded JSON value, e.g.
         ``{"type": "image", "data": "...", "mimeType": "image/png"}``.
@@ -5333,21 +4984,14 @@ def _oversized_invalid_image_placeholder(value: object) -> _JsonObject | None:
     """
     Return a placeholder text block for a large unconvertible image object.
 
-    Applies only where :func:`_claude_image_block_from_object` has already
-    declined: the object is image-shaped but its payload failed structural
-    validation, so it cannot become an image block. Keeping such a payload
-    as raw text is safe for a short snippet but not for a big one, which
-    would replay its whole base64 into the prompt — so past
-    :data:`_MAX_INVALID_IMAGE_REPLAY_CHARS` the payload is dropped in
-    favor of the same short placeholder the history-stripping path uses,
-    naming the declared type so the agent knows what it lost and how to
-    recover it.
+    Applies only where :func:`_claude_image_block_from_object` declined, so the
+    object is image-shaped but cannot become an image block. Keeping the payload
+    as raw text is fine for a short snippet, not past
+    :data:`_MAX_INVALID_IMAGE_REPLAY_CHARS`.
 
-    :param value: Decoded JSON value the image conversion rejected, e.g.
-        ``{"type": "image", "data": "<corrupt>", "mimeType": "image/png"}``.
-    :returns: ``{"type": "text", "text": "[... omitted ...]"}`` for an
-        oversized image-shaped object; ``None`` otherwise, so small
-        payloads and non-image values keep their existing behavior.
+    :param value: Decoded JSON value the image conversion rejected.
+    :returns: A text block for an oversized image-shaped object; ``None``
+        otherwise, so small payloads keep their existing behavior.
     """
     block = _json_object(value)
     if block is None or block.get("type") != "image":
