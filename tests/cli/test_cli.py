@@ -1641,6 +1641,9 @@ def test_start_cli_runner_process_uses_token_bound_runner_id(
     assert env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] == "bind-token"
     assert env[RUNNER_PARENT_PID_ENV_VAR] == str(os.getpid())
     assert env[RUNNER_WORKSPACE_ENV_VAR] == str(workspace.resolve())
+    # -P: this runner inherits the CLI's cwd, so launching from inside an
+    # omnigent checkout must not shadow the installed package.
+    assert captured["args"] == [sys.executable, "-P", "-m", "omnigent.runner._entry"]
 
 
 def test_start_cli_runner_process_binds_stable_local_runner_to_generated_token(

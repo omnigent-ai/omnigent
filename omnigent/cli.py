@@ -3441,7 +3441,11 @@ def _start_cli_runner_process(
     try:
         with child_logging_popen_kwargs(env) as logging_kwargs:
             runner_proc: subprocess.Popen[bytes] = subprocess.Popen(
-                [sys.executable, "-m", "omnigent.runner._entry"],
+                # This runner inherits the CLI's cwd, so -P is what stops a
+                # checkout you launched from shadowing the installed omnigent
+                # (the daemon and zygote spawns do the same). _entry re-adds the
+                # cwd afterwards, keeping spec-declared local tools importable.
+                [sys.executable, "-P", "-m", "omnigent.runner._entry"],
                 env=env,
                 stdout=log_fh,
                 stderr=log_fh,
