@@ -24,7 +24,7 @@ import uuid
 
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms.adapters._content import redact_binary_payloads
-from omnigent.runtime.tool_result_content import (
+from omnigent.runtime.tool_result_replay import (
     blocks_from_parsed_list,
     image_payloads_in_blocks,
     strip_unparseable_image_output,

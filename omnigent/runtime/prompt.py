@@ -14,7 +14,7 @@ from omnigent.entities import (
     MessageData,
     NativeToolData,
 )
-from omnigent.runtime.tool_result_content import image_omitted_placeholder
+from omnigent.runtime.tool_result_replay import image_omitted_placeholder
 from omnigent.spec import AgentSpec
 
 

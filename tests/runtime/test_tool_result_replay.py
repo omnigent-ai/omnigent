@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.runtime import tool_result_content as trc
+from omnigent.runtime import tool_result_replay as trc
 from tests._image_fixtures import (
     _TINY_CMYK_JPEG_BASE64,
     _TINY_GIF_BASE64,
