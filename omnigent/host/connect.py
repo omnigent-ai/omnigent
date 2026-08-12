@@ -671,6 +671,16 @@ def _build_runner_env(
         or key in forwarded
     }
     env["RUNNER_SERVER_URL"] = server_url
+    # GitHub credential broker coordinates: forward the managed host's id and
+    # launch token so the runner's GitHub MCP proxy can fetch the owner's token
+    # from the server per connection (never persisted). Absent on a plain local
+    # host, where there is no server-vended GitHub credential.
+    from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_TOKEN_ENV_VAR
+
+    for _broker_var in (HOST_ID_ENV_VAR, HOST_TOKEN_ENV_VAR):
+        _broker_val = base_env.get(_broker_var)
+        if _broker_val:
+            env[_broker_var] = _broker_val
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
     env[RUNNER_DELEGATED_AUTH_ENV_VAR] = "1"
@@ -3066,6 +3076,14 @@ def run_host_process(
     _cli_log = current_cli_log_path()
     if _cli_log is not None and _cli_log != host_log_path:
         print(f"CLI diagnostics: {display_log_path(_cli_log)}")
+
+    # Executor-agnostic GitHub setup: point git at the server's credential
+    # broker and attribute commits to the owner. Best-effort; the host runs in
+    # every executor and holds the launch token, so no launcher needs to inject
+    # anything GitHub-specific.
+    from omnigent.git_credential_github import configure_host_git
+
+    configure_host_git(server_url, identity.host_id)
 
     host = HostProcess(identity, server_url)
     try:
