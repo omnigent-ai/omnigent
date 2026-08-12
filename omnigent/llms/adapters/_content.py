@@ -23,6 +23,16 @@ _Value = TypeVar("_Value")
 #: Standard and URL-safe base64 alphabets, plus ``=`` padding.
 _BASE64_ALPHABET_ONLY = re.compile(r"[A-Za-z0-9+/=_-]+")
 
+#: Source ``type`` values that name content rather than a binary payload. A
+#: source with no ``type`` at all is treated as binary, since a real payload
+#: field is the likelier reading and leaking one is worse than over-redacting.
+_NON_BINARY_SOURCE_TYPES = frozenset({"text", "url", "content", "file"})
+
+#: Length above which an alphabet-only value is taken as binary even without
+#: base64's length or padding tells. Short punctuation-free text (``README``,
+#: ``line1\nline2``) stays below it; a clipped attachment runs into thousands.
+_MIN_UNTELLED_BLOB_CHARS = 64
+
 #: Payload length below which replacing an inline ``data:`` URI is not worth it:
 #: callers' markers run ~70-80 characters, so a shorter payload grows the text
 #: while destroying a legitimate small inline asset (an icon SVG, a 1px PNG).
@@ -114,17 +124,21 @@ _BINARY_BLOCK_TYPES = frozenset({"image", "document", "file"})
 
 
 def _is_base64_payload(value: str) -> bool:
-    """Whether *value* is a base64 blob rather than ordinary prose.
+    """Whether *value* is a base64 blob rather than ordinary text.
 
-    Deliberately a character-set test, not a decode: a payload clipped mid-blob
-    is exactly what must still be redacted, and it no longer decodes. Prose
-    fails on its spaces and punctuation.
+    Deliberately not a decode: a payload clipped mid-blob is exactly what must
+    still be redacted, and it no longer decodes. Instead the value must be
+    alphabet-only *and* show one of base64's tells — ``=`` padding, a length
+    that is a multiple of four, or sheer size. That keeps short punctuation-free
+    text such as ``README`` or ``line1\\nline2`` intact.
 
     :param value: Candidate payload, whitespace tolerated.
-    :returns: True when every character belongs to a base64 alphabet.
+    :returns: True when the value reads as base64 rather than text.
     """
     compact = "".join(value.split())
-    return bool(compact) and bool(_BASE64_ALPHABET_ONLY.fullmatch(compact))
+    if not compact or not _BASE64_ALPHABET_ONLY.fullmatch(compact):
+        return False
+    return "=" in compact or len(compact) % 4 == 0 or len(compact) >= _MIN_UNTELLED_BLOB_CHARS
 
 
 def _redact_data_field(block: dict[str, object], marker: Callable[[str, int], str]) -> None:
@@ -157,9 +171,10 @@ def redact_binary_payloads(
     under ``source.data``, which the URI regex never sees. Nothing is mutated
     in place, and every field other than the payload survives.
 
-    A ``source`` is only treated as binary when it says so with
-    ``type: "base64"`` — a ``document`` may carry its text under
-    ``source.type: "text"``, and that is content, not a payload.
+    A ``source`` is skipped only when its ``type`` explicitly names content
+    rather than a payload (``text``, ``url``, ``content``, ``file``) — a
+    ``document`` may carry its text under ``source.type: "text"``. A typeless
+    source is still treated as binary.
 
     :param value: Arbitrarily nested dict/list/string content.
     :param marker: Builds replacement text from media type and payload length.
@@ -179,7 +194,8 @@ def redact_binary_payloads(
             source = block.get("source")
             if isinstance(source, dict):
                 source = dict(source)
-                if source.get("type") == "base64":
+                source_type = source.get("type")
+                if not (isinstance(source_type, str) and source_type in _NON_BINARY_SOURCE_TYPES):
                     _redact_data_field(source, marker)
                 block["source"] = source
         return cast(

@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import contextlib
 import importlib.metadata
 import io
 import json
 import os
+import re
 import shlex
 import ssl
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -6803,6 +6806,131 @@ def _stale_duplicated_jpeg_record(b64: str) -> dict[str, Any]:
         },
         "toolUseResult": json.dumps([image_block], separators=(",", ":")),
     }
+
+
+def _decoded_payload_copies(record: object, raw: bytes) -> int:
+    """Count copies of *raw* by decoding, defeating wrapping and JSON escapes.
+
+    A canonical-substring search cannot see a duplicate stored in the producer's
+    wrapped spelling, which is exactly how one hid from an earlier fix.
+    """
+    run = re.compile(r"[A-Za-z0-9+/=\s]{64,}")
+
+    def _strings(value: object) -> Iterator[str]:
+        if isinstance(value, str):
+            yield value
+            try:
+                nested = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                return
+            if isinstance(nested, (dict, list, str)):
+                yield from _strings(nested)
+        elif isinstance(value, dict):
+            for item in value.values():
+                yield from _strings(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from _strings(item)
+
+    copies = 0
+    for text in _strings(record):
+        for candidate in run.findall(text):
+            compact = "".join(candidate.split())
+            padded = compact + "=" * (-len(compact) % 4)
+            try:
+                if raw in base64.b64decode(padded, validate=False):
+                    copies += 1
+            except (binascii.Error, ValueError):
+                continue
+    return copies
+
+
+def _wrapped_image_spellings() -> tuple[bytes, dict[str, str]]:
+    """A realistic PNG payload in every base64 spelling a producer may emit."""
+    raw = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 28
+    canonical = base64.b64encode(raw).decode()
+    return raw, {
+        "canonical": canonical,
+        "mime-wrapped": "\n".join(canonical[i : i + 76] for i in range(0, len(canonical), 76)),
+        "crlf-wrapped": "\r\n".join(canonical[i : i + 64] for i in range(0, len(canonical), 64)),
+        "unpadded": canonical.rstrip("="),
+        "space-separated": " ".join(canonical[i : i + 40] for i in range(0, len(canonical), 40)),
+    }
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["canonical", "mime-wrapped", "crlf-wrapped", "unpadded", "space-separated"],
+)
+@pytest.mark.parametrize("shape", ["string", "list"])
+def test_clone_repair_leaves_one_payload_copy_in_any_spelling(spelling: str, shape: str) -> None:
+    """Canonicalizing the content must not hide the metadata duplicate.
+
+    The rebuilt block carries canonical base64 while metadata keeps the
+    producer's original spelling, so an exact-substring guard skipped the record
+    and left two bytes-equal copies. Counting decoded bytes across the whole
+    record is what makes that visible.
+    """
+    raw, spellings = _wrapped_image_spellings()
+    payload = spellings[spelling]
+    if shape == "list":
+        inner: Any = [{"type": "image", "data": payload, "mimeType": "image/png"}]
+        metadata = json.dumps(json.dumps(inner))
+    else:
+        inner = json.dumps(
+            {"type": "image", "data": payload, "mimeType": "image/png"}, separators=(",", ":")
+        )
+        metadata = json.dumps(inner)
+    record: dict[str, Any] = {
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": inner}],
+        },
+        "toolUseResult": metadata,
+    }
+    assert _decoded_payload_copies(record, raw) >= 2, "pre-repair wedged state"
+
+    claude_native._sanitize_cloned_tool_result_record(record)
+
+    assert _decoded_payload_copies(record, raw) == 1
+    assert _decoded_payload_copies(record["toolUseResult"], raw) == 0
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["canonical", "mime-wrapped", "crlf-wrapped", "unpadded", "space-separated"],
+)
+def test_reconstruction_and_cwd_copy_keep_one_payload_copy(spelling: str, tmp_path: Path) -> None:
+    """Cold-resume synthesis and the cwd copy hold the same invariant."""
+    raw, spellings = _wrapped_image_spellings()
+    payload = spellings[spelling]
+    output = json.dumps(
+        {"type": "image", "data": payload, "mimeType": "image/png"}, separators=(",", ":")
+    )
+
+    records = _image_output_records(output)
+    assert _decoded_payload_copies(records[0], raw) == 1
+
+    source = tmp_path / "source.jsonl"
+    target = tmp_path / "target.jsonl"
+    stale = {
+        "type": "user",
+        "cwd": "/old/workspace",
+        "sessionId": "11111111-1111-1111-1111-111111111111",
+        "uuid": "u1",
+        "parentUuid": None,
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": output}],
+        },
+        "toolUseResult": json.dumps(output),
+    }
+    source.write_text(json.dumps(stale) + "\n", encoding="utf-8")
+
+    claude_native._copy_transcript_with_cwd(source=source, target=target, current=tmp_path)
+
+    copied = [json.loads(line) for line in target.read_text().splitlines() if line.strip()]
+    assert _decoded_payload_copies(copied, raw) == 1
 
 
 def _oversized_invalid_image_object(marker: str) -> tuple[str, str]:

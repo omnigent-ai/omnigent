@@ -1706,6 +1706,26 @@ def _sanitize_cloned_tool_result_record(payload: _JsonObject) -> None:
         _repair_cloned_tool_use_result(payload, blocks, payloads)
 
 
+#: A wrapped payload's line breaks, in every spelling they reach metadata as.
+#: Escape sequences must go as a unit — dropping the backslash alone would leave
+#: a literal ``n`` inside the payload — and the backslash run is variable because
+#: a string literal nested in another escapes each break twice.
+_WRAPPED_LINE_BREAK = re.compile(r"\\+[nrtf]")
+_LITERAL_NOISE = re.compile(r"[\\\s]+")
+
+
+def _carries_any_payload(text: str, payloads: list[str]) -> bool:
+    """
+    Whether *text* still holds one of *payloads*, in any base64 spelling.
+
+    :param text: Serialized metadata to search.
+    :param payloads: Canonical base64 payloads from the structured content.
+    :returns: True when a payload is present wrapped, unpadded, or verbatim.
+    """
+    compact = _LITERAL_NOISE.sub("", _WRAPPED_LINE_BREAK.sub("", text))
+    return any(item in compact or item.rstrip("=") in compact for item in payloads)
+
+
 def _repair_cloned_tool_use_result(
     payload: _JsonObject,
     blocks: list[_JsonObject],
@@ -1714,11 +1734,13 @@ def _repair_cloned_tool_use_result(
     """
     Remove a duplicated image payload from a cloned record's metadata.
 
-    Rewritten only when the metadata literally contains a payload already
-    present in the structured content. A redacted passthrough is preferred; when
-    the payload survives that (a JSON string literal wrapping mixed
-    text-plus-image, which structured redaction cannot reach), the canonical
-    redacted block list replaces it.
+    Rewritten only when the metadata still carries a payload present in the
+    structured content. Matching is spelling-insensitive: the content blocks hold
+    canonical base64 while the metadata may hold the producer's wrapped or
+    unpadded original, so an exact substring test would miss the duplicate it is
+    meant to find. A redacted passthrough is preferred; when the payload survives
+    that (a JSON string literal wrapping mixed text-plus-image, which structured
+    redaction cannot reach), the canonical redacted block list replaces it.
 
     :param payload: The transcript record (mutated).
     :param blocks: The normalized image-bearing content blocks.
@@ -1732,14 +1754,14 @@ def _repair_cloned_tool_use_result(
         result_text = json.dumps(tool_use_result)
     else:
         return
-    if not any(item in result_text for item in payloads):
+    if not _carries_any_payload(result_text, payloads):
         return
     if isinstance(tool_use_result, str):
         candidate: object = _json_safe_tool_use_result(tool_use_result)
     else:
         candidate = _redact_binary_blocks(tool_use_result)
     candidate_text = candidate if isinstance(candidate, str) else json.dumps(candidate)
-    if any(item in candidate_text for item in payloads):
+    if _carries_any_payload(candidate_text, payloads):
         candidate = json.dumps(_redact_binary_blocks(blocks), separators=(",", ":"))
     payload["toolUseResult"] = candidate
 

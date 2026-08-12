@@ -281,7 +281,8 @@ def test_redact_binary_payloads_still_clears_a_truncated_blob() -> None:
 
     The base64 discrimination is a character-set test for exactly this reason.
     """
-    block = {"type": "image", "source": {"type": "base64", "data": "iVBORw0KGgoAAAANSUhEUg"}}
+    clipped = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\xa5" * 9_000).decode()[:5_003]
+    block = {"type": "image", "source": {"type": "base64", "data": clipped}}
 
     result = redact_binary_payloads(block, lambda media_type, size: "[cleared]")
 
@@ -304,3 +305,50 @@ def test_redact_inline_data_uris_still_clears_a_realistic_payload() -> None:
 
     assert result == "shot [image/png:40000]"
     assert "A" * 128 not in result
+
+
+def test_redact_binary_payloads_preserves_short_punctuation_free_text() -> None:
+    """Text without punctuation is still text: ``README``, ``line1\nline2``.
+
+    Character-set alone cannot tell those from base64, so the value must also
+    show a base64 tell — padding, a length divisible by four, or sheer size.
+    """
+    marker = lambda media_type, size: "[cleared]"  # noqa: E731
+    for text in ("README", "line1\nline2", "hello", "CHANGELOG", "notes"):
+        block = {"type": "file", "data": text}
+        assert redact_binary_payloads(block, marker) == block, text
+
+
+def test_redact_binary_payloads_treats_a_typeless_source_as_binary() -> None:
+    """A source with no ``type`` is the likelier payload reading, so redact it.
+
+    Requiring ``type: "base64"`` created a false negative for image sources that
+    omit it; leaking a payload is worse than over-redacting one field.
+    """
+    payload = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\xa5" * 4_000).decode()
+    block = {"type": "image", "source": {"media_type": "image/png", "data": payload}}
+
+    result = redact_binary_payloads(block, lambda media_type, size: "[cleared]")
+
+    assert result["source"]["data"] == "[cleared]"
+
+
+@pytest.mark.parametrize("source_type", ["text", "url", "content", "file"])
+def test_redact_binary_payloads_skips_explicitly_non_binary_sources(source_type: str) -> None:
+    """Only an explicitly content-bearing source type is skipped."""
+    block = {
+        "type": "document",
+        "source": {"type": source_type, "data": "Chapter 1. The report begins here."},
+    }
+
+    assert redact_binary_payloads(block, lambda media_type, size: "[cleared]") == block
+
+
+def test_redact_binary_payloads_tolerates_a_non_string_source_type() -> None:
+    """An unhashable ``source.type`` must not raise out of the frozenset test."""
+    payload = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\xa5" * 4_000).decode()
+    block = {"type": "image", "source": {"type": {"weird": 1}, "data": payload}}
+
+    result = redact_binary_payloads(block, lambda media_type, size: "[cleared]")
+
+    assert result["source"]["data"] == "[cleared]"
