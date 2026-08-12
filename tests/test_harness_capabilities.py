@@ -97,6 +97,12 @@ def test_p0_bench_harnesses_declare_interrupt_and_streaming() -> None:
         assert caps[harness].streaming is True, harness
 
 
+def test_claude_harnesses_declare_additional_directory_support() -> None:
+    caps = harness_capabilities()
+    assert caps["claude-native"].additional_directories is True
+    assert caps["claude-sdk"].additional_directories is True
+
+
 def test_optional_bench_capabilities_default_to_unknown() -> None:
     capability = HarnessCapabilities(
         IntegrationMode.SDK_IN_PROCESS,
@@ -118,6 +124,7 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
     assert capability.fork_history is ForkHistory.NONE
     assert capability.shell_tool_name is None
     assert capability.shell_tool_prompt is None
+    assert capability.additional_directories is False
     assert capability.as_dict() == {
         "integration_mode": "sdk-in-process",
         "elicitation": "none",
@@ -128,6 +135,7 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
         "subagents": False,
         "interrupt": True,
         "streaming": True,
+        "additional_directories": False,
         "steering": None,
         "live_queue": None,
         "images": None,

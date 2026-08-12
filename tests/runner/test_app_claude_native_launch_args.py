@@ -154,6 +154,23 @@ def test_build_claude_native_base_args_resume_prefix(
     )
 
 
+def test_build_claude_native_base_args_additional_directories() -> None:
+    """Attached roots are forwarded through Claude Code's variadic flag."""
+    assert _build_claude_native_base_args(
+        reasoning_effort=None,
+        model_override="claude-opus-4-7",
+        terminal_launch_args=["--verbose"],
+        additional_directories=("/repo/shared", "/repo/docs"),
+    ) == (
+        "--verbose",
+        "--model",
+        "claude-opus-4-7",
+        "--add-dir",
+        "/repo/shared",
+        "/repo/docs",
+    )
+
+
 def test_claude_terminal_env_unset_masks_key_with_api_key_helper() -> None:
     """An apiKeyHelper launch strips the raw key + nested-session marker.
 

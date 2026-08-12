@@ -78,6 +78,7 @@ def test_executor_factory_reads_env_vars(
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND", "printf token")
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS", "900000")
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_CWD", "/tmp/test-cwd")
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_ADD_DIRS", '["/tmp/shared","/tmp/docs"]')
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_PERMISSION_MODE", "acceptEdits")
 
     captured: dict[str, Any] = {}
@@ -86,6 +87,7 @@ def test_executor_factory_reads_env_vars(
         self: Any,
         *,
         cwd: str | None,
+        add_dirs: list[str],
         os_env: Any,
         model: str | None,
         permission_mode: str,
@@ -98,6 +100,7 @@ def test_executor_factory_reads_env_vars(
         **_kwargs: Any,
     ) -> None:
         captured["cwd"] = cwd
+        captured["add_dirs"] = add_dirs
         captured["os_env"] = os_env
         captured["model"] = model
         captured["permission_mode"] = permission_mode
@@ -124,6 +127,7 @@ def test_executor_factory_reads_env_vars(
     assert captured["gateway_auth_command"] == "printf token"
     assert captured["gateway_auth_refresh_interval_ms"] == "900000"
     assert captured["cwd"] == "/tmp/test-cwd"
+    assert captured["add_dirs"] == ["/tmp/shared", "/tmp/docs"]
     assert captured["permission_mode"] == "acceptEdits"
     # When ``HARNESS_CLAUDE_SDK_OS_ENV`` is unset (this test
     # doesn't set it), the wrap defaults to ``caller_process +

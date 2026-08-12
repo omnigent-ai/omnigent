@@ -333,6 +333,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        additional_directories=True,
         fork_history=_FH.REBUILD,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
@@ -500,6 +501,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        additional_directories=True,
     ),
     "codex": _C(
         _IM.CLI_SUBPROCESS,

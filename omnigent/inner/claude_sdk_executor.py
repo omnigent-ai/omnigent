@@ -1366,6 +1366,7 @@ class ClaudeSDKExecutor(Executor):
         self,
         *,
         cwd: str | None = None,
+        add_dirs: list[str] | None = None,
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
         permission_mode: str = "auto",
@@ -1385,6 +1386,8 @@ class ClaudeSDKExecutor(Executor):
 
         Args:
             cwd: Working directory for Claude Code.
+            add_dirs: Additional project directories Claude Code may read and
+                edit, forwarded to ``ClaudeAgentOptions.add_dirs``.
             os_env: If set, enable built-in OS tools (Bash, Read, Edit, …)
                 and align them with the provided OS environment. When the
                 spec's sandbox is enabled, Omnigent wraps the Claude CLI
@@ -1464,6 +1467,7 @@ class ClaudeSDKExecutor(Executor):
                 "the Databricks Anthropic gateway."
             )
         self._cwd = cwd
+        self._add_dirs = list(add_dirs or [])
         self._os_env_spec = os_env
         self._os_env = os_env is not None
         self._model_override = model
@@ -2341,6 +2345,7 @@ class ClaudeSDKExecutor(Executor):
             "stderr": _on_stderr,
             "include_partial_messages": True,
             "include_hook_events": True,
+            "add_dirs": self._add_dirs,
             "skills": resolved.skills,
             "plugins": bundle_plugins,
             "extra_args": {"no-session-persistence": None},

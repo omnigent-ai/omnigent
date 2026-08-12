@@ -1151,6 +1151,7 @@ def _build_claude_sdk_spawn_env(
     *,
     cwd: Path | None = None,
     workdir: Path | None = None,
+    additional_directories: tuple[Path, ...] = (),
 ) -> dict[str, str]:
     """
     Build the env-var dict the claude-sdk harness wrap reads.
@@ -1167,6 +1168,8 @@ def _build_claude_sdk_spawn_env(
         agent cache). Threaded through as
         ``HARNESS_CLAUDE_SDK_BUNDLE_DIR`` so the harness wrap can
         wire the SDK ``--plugin-dir`` for agent-bundled skills.
+    :param additional_directories: Attached project roots beyond ``cwd``.
+        JSON-encoded for ``ClaudeAgentOptions.add_dirs`` in the subprocess.
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
@@ -1179,6 +1182,11 @@ def _build_claude_sdk_spawn_env(
     # ``HARNESS_CLAUDE_SDK_CWD`` in ``omnigent/inner/claude_sdk_harness.py``.
     if cwd is not None:
         env["HARNESS_CLAUDE_SDK_CWD"] = str(cwd)
+    if additional_directories:
+        env["HARNESS_CLAUDE_SDK_ADD_DIRS"] = json.dumps(
+            [str(path) for path in additional_directories],
+            separators=(",", ":"),
+        )
 
     # ── Auth resolution ────────────────────────────────────────────────
     # Priority (highest first):
