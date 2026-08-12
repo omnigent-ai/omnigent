@@ -4879,7 +4879,8 @@ async def test_ensure_local_claude_resume_transcript_repairs_stale_duplicated_im
     stale affected file is repaired on the next resume: after the
     rebuild the payload must appear exactly once.
     """
-    b64 = "iVBORw0KGgo" + "D" * 5000
+    # Padded so the fixture is already canonical standard base64.
+    b64 = "iVBORw0KGgo" + "D" * 5000 + "="
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     projects = tmp_path / "claude-projects"
@@ -6615,7 +6616,7 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
     source_project_dir.mkdir(parents=True)
     source_path = source_project_dir / f"{source_uuid}.jsonl"
 
-    b64_structured = "iVBORw0KGgo" + "K" * 4000
+    b64_structured = "iVBORw0KGgo" + "K" * 4000 + "="
     b64_mcp = _TINY_PNG_BASE64
     image_block = {
         "type": "image",
@@ -6856,6 +6857,123 @@ def _wrapped_image_spellings() -> tuple[bytes, dict[str, str]]:
         "unpadded": canonical.rstrip("="),
         "space-separated": " ".join(canonical[i : i + 40] for i in range(0, len(canonical), 40)),
     }
+
+
+def _assert_provider_ready_image(block: dict[str, Any], raw: bytes, canonical: str) -> None:
+    """Assert a rebuilt block is exactly what the provider accepts.
+
+    The provider validates ``source.data`` strictly and rejected a whole request
+    on a wrapped payload (``invalid base64 image data: Invalid symbol 13, offset
+    76``), so the emitted spelling — not just the bytes — is the contract.
+    """
+    data = block["source"]["data"]
+    assert data == canonical, "structured payload must be canonical standard base64"
+    assert not any(character.isspace() for character in data)
+    assert "\\" not in data
+    assert len(data) % 4 == 0
+    # Provider compatibility: strict decoding must succeed on the emitted string.
+    assert base64.b64decode(data, validate=True) == raw
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["canonical", "mime-wrapped", "crlf-wrapped", "unpadded", "space-separated"],
+)
+@pytest.mark.parametrize("stored", ["source-shaped", "mcp-shaped", "nested-escaped"])
+def test_rebuilt_image_block_is_canonical_for_the_provider(spelling: str, stored: str) -> None:
+    """Every valid payload reaches the model as canonical base64.
+
+    A real hosted smoke failed 4/4 attempts at 0 tokens because the
+    Anthropic-shaped passthrough kept the producer's CRLF wrapping — the shape
+    the affected session actually stores. Bytes were intact throughout; only the
+    spelling was fatal.
+    """
+    raw, spellings = _wrapped_image_spellings()
+    canonical = base64.b64encode(raw).decode()
+    payload = spellings[spelling]
+    if stored == "mcp-shaped":
+        output = json.dumps(
+            {"type": "image", "data": payload, "mimeType": "image/png"}, separators=(",", ":")
+        )
+    else:
+        blocks = [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": payload},
+            }
+        ]
+        output = json.dumps(blocks, separators=(",", ":"))
+        if stored == "nested-escaped":
+            # A JSON document nested inside a JSON string, as metadata stores it.
+            output = json.loads(json.dumps(output))
+
+    records = _image_output_records(output)
+    record = records[0]
+    content = record["message"]["content"][0]["content"]
+    assert isinstance(content, list)
+    _assert_provider_ready_image(content[-1], raw, canonical)
+    assert _decoded_payload_copies(record, raw) == 1
+    assert _decoded_payload_copies(record["toolUseResult"], raw) == 0
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["canonical", "mime-wrapped", "crlf-wrapped", "unpadded", "space-separated"],
+)
+@pytest.mark.parametrize("path", ["clone-string", "clone-list", "cwd-copy"])
+def test_repair_paths_emit_canonical_source_data(spelling: str, path: str, tmp_path: Path) -> None:
+    """Clone repair and the cwd copy canonicalize the same way."""
+    raw, spellings = _wrapped_image_spellings()
+    canonical = base64.b64encode(raw).decode()
+    blocks = [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": spellings[spelling]},
+        }
+    ]
+    serialized = json.dumps(blocks, separators=(",", ":"))
+
+    if path == "cwd-copy":
+        source = tmp_path / "source.jsonl"
+        target = tmp_path / "target.jsonl"
+        source.write_text(
+            json.dumps(
+                {
+                    "type": "user",
+                    "cwd": "/old/workspace",
+                    "sessionId": "11111111-1111-1111-1111-111111111111",
+                    "uuid": "u1",
+                    "parentUuid": None,
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "t", "content": serialized}
+                        ],
+                    },
+                    "toolUseResult": json.dumps(serialized),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        claude_native._copy_transcript_with_cwd(source=source, target=target, current=tmp_path)
+        record = next(json.loads(line) for line in target.read_text().splitlines() if line.strip())
+    else:
+        inner: Any = serialized if path == "clone-string" else blocks
+        record = {
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t", "content": inner}],
+            },
+            "toolUseResult": json.dumps(inner if isinstance(inner, str) else json.dumps(inner)),
+        }
+        claude_native._sanitize_cloned_tool_result_record(record)
+
+    content = record["message"]["content"][0]["content"]
+    assert isinstance(content, list)
+    _assert_provider_ready_image(content[-1], raw, canonical)
+    assert _decoded_payload_copies(record, raw) == 1
+    assert _decoded_payload_copies(record["toolUseResult"], raw) == 0
 
 
 @pytest.mark.parametrize(
@@ -7939,7 +8057,7 @@ def test_tool_use_result_redacts_inline_image_base64() -> None:
     resumed transcript. Non-binary fields (media type, sibling text,
     renderer metadata) survive the redaction.
     """
-    b64 = "iVBORw0KGgo" + "A" * 5000
+    b64 = "iVBORw0KGgo" + "A" * 5000 + "="
     output = json.dumps(
         [
             {"type": "text", "text": "screenshot taken"},

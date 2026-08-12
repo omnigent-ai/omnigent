@@ -323,14 +323,62 @@ def _is_supported_image_payload(data: str, media_type: str) -> bool:
     return canonical_image_payload(data, media_type) is not None
 
 
+def _canonicalized_source_block(block: JsonObject, source: JsonObject) -> JsonObject:
+    """
+    Rewrite an Anthropic-shaped block's payload to canonical base64.
+
+    The provider validates ``source.data`` strictly and rejects the whole request
+    on a wrapped payload (``invalid base64 image data: Invalid symbol 13``), so a
+    producer's line breaks must not survive into model input. Validation against
+    the declared media type is preferred; failing that, whitespace alone is
+    normalized when the result still decodes. A payload that cannot be
+    normalized safely is passed through untouched, as this shape always has been.
+
+    :param block: The parsed image block.
+    :param source: Its ``source`` object.
+    :returns: *block*, or a copy carrying the canonical payload.
+    """
+    data = source.get("data")
+    if not isinstance(data, str) or not data:
+        return block
+    media_type = source.get("media_type")
+    canonical = canonical_image_payload(data, media_type) if isinstance(media_type, str) else None
+    if canonical is None:
+        canonical = _whitespace_normalized_base64(data)
+    if canonical is None or canonical == data:
+        return block
+    return {**block, "source": {**source, "data": canonical}}
+
+
+def _whitespace_normalized_base64(data: str) -> str | None:
+    """
+    Strip ASCII whitespace and restore padding, keeping the bytes identical.
+
+    The fallback for a payload whose media type is missing or unsupported: the
+    spelling is still unsafe to send, but the bytes must not change.
+
+    :param data: Candidate base64 payload.
+    :returns: Canonical base64, or ``None`` when the result would not decode.
+    """
+    compact = "".join(data.split())
+    if not compact or compact == data:
+        return None
+    padded = compact + "=" * (-len(compact) % 4)
+    try:
+        base64.b64decode(padded, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    return padded
+
+
 def _image_block_from_object(value: object) -> JsonObject | None:
     """
     Return a canonical Claude image block for one parsed image object.
 
-    Accepts the Anthropic wire shape (``source`` present, kept as-is) and the
-    MCP ``ImageContent`` serialization (bare ``data`` + ``mimeType``), the
-    latter only after payload validation. The emitted block carries the
-    canonical base64 spelling, so a wrapped or unpadded original does not reach
+    Accepts the Anthropic wire shape (``source`` present) and the MCP
+    ``ImageContent`` serialization (bare ``data`` + ``mimeType``), the latter
+    only after payload validation. Either way the emitted block carries the
+    canonical base64 spelling, so a wrapped or unpadded original never reaches
     the provider. Anything else yields ``None`` so callers keep the raw string
     rather than emit an API-invalid block.
 
@@ -341,8 +389,9 @@ def _image_block_from_object(value: object) -> JsonObject | None:
     block = _json_object(value)
     if block is None or block.get("type") != "image":
         return None
-    if isinstance(block.get("source"), dict):
-        return block
+    source = block.get("source")
+    if isinstance(source, dict):
+        return _canonicalized_source_block(block, source)
     data = block.get("data")
     mime = block.get("mimeType")
     if not isinstance(data, str) or not data or not isinstance(mime, str):
