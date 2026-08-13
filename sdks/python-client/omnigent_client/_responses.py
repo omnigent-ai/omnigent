@@ -18,7 +18,13 @@ from typing import Any
 
 import httpx
 
-from ._errors import ToolCallDenied, raise_for_status, require_json_object, response_body
+from ._errors import (
+    OmnigentError,
+    ToolCallDenied,
+    raise_for_status,
+    require_json_object,
+    response_body,
+)
 from ._events import (
     ClientTaskCancel,
     CompactionCompleted,
@@ -236,6 +242,19 @@ class ResponsesNamespace:
                 if resp.status_code >= 400:
                     await resp.aread()
                     raise_for_status(resp.status_code, response_body(resp))
+                elif 300 <= resp.status_code < 400:
+                    # Redirects are disabled on this client (httpx defaults
+                    # follow_redirects=False), so a 3xx here is a proxy or
+                    # gateway hop we never followed. raise_for_status is a
+                    # no-op below 400, and parse_sse_stream over the
+                    # redirect's non-SSE body would complete with no events —
+                    # a silent, error-free, empty stream. Fail loud instead.
+                    await resp.aread()
+                    raise OmnigentError(
+                        f"stream open was redirected (status {resp.status_code}); "
+                        "this client does not follow redirects on a stream",
+                        resp.status_code,
+                    )
 
                 async for event in parse_sse_stream(resp.aiter_bytes()):
                     # ── Fire hooks and collect state ──────────
