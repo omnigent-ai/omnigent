@@ -123,7 +123,7 @@
             "type": "array"
           },
           "skills": {
-            "description": "Skills bundled in the agent spec (`skills/<name>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session (and its runner) exists. Host-discovered skills are runner-owned, so they are NOT listed here \u2014 the session snapshot's `skills` field carries the merged set once a runner is bound. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",
+            "description": "Skills bundled in the agent spec (`skills/<dir>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session (and its runner) exists. Host-discovered skills are runner-owned, so they are NOT listed here \u2014 the session snapshot's `skills` field carries the merged set once a runner is bound. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",
             "items": {
               "$ref": "#/components/schemas/SkillSummary"
             },
@@ -1284,6 +1284,25 @@
           "response"
         ],
         "title": "CreatedEvent",
+        "type": "object"
+      },
+      "DailyCost": {
+        "description": "One day's LLM spend for the daily timeline chart.",
+        "properties": {
+          "cost_usd": {
+            "default": 0.0,
+            "title": "Cost Usd",
+            "type": "number"
+          },
+          "day": {
+            "title": "Day",
+            "type": "string"
+          }
+        },
+        "required": [
+          "day"
+        ],
+        "title": "DailyCost",
         "type": "object"
       },
       "ElicitationRequestEvent": {
@@ -5797,6 +5816,17 @@
       "SessionUsage": {
         "description": "One session's rolled-up LLM spend for the `GET /v1/usage` report.\n\n`cost_usd` is the subtree total \u2014 the session plus every sub-agent it\nspawned \u2014 read from `session_usage` via\n`omnigent.runtime.policies.builder.load_session_usage`. It is the\nauthoritative session figure (the same value the web session sidebar\nshows as \"Session cost\" and the daily rollup records).\n\n`models` is the per-model cost breakdown, mirroring the web session\nsidebar's per-model list. Deliberately **not guaranteed to sum to\n`cost_usd`**: native harnesses report a single cumulative session\ntotal and the server attributes it to the currently-active model, so on\na session that switched models mid-run each model's bucket is a snapshot\nof the running total rather than that model's own spend. The header\n`cost_usd` stays authoritative; the per-model values are shown\nfaithfully as recorded (same convention as the web UI).",
         "properties": {
+          "agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Name"
+          },
           "cost_usd": {
             "default": 0.0,
             "description": "Authoritative cumulative USD spend for this session's subtree.",
@@ -5808,10 +5838,32 @@
             "title": "Created At",
             "type": "integer"
           },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harness"
+          },
           "id": {
             "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
             "title": "Id",
             "type": "string"
+          },
+          "llm_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Model"
           },
           "models": {
             "additionalProperties": {
@@ -6924,6 +6976,13 @@
             "description": "Total spend on the current UTC day.",
             "title": "Cost Today",
             "type": "number"
+          },
+          "daily_costs": {
+            "items": {
+              "$ref": "#/components/schemas/DailyCost"
+            },
+            "title": "Daily Costs",
+            "type": "array"
           },
           "object": {
             "const": "usage_report",
@@ -10373,7 +10432,7 @@
     },
     "/v1/sessions/{session_id}/permissions/{target_user_id}": {
       "delete": {
-        "description": "Revoke a user's permission on a session.\n\nRequires manage-level access. Cannot revoke your own\nmanage grant (prevents orphaned sessions). Returns 204\nwhether or not the grant existed (idempotent).\n\n**Returns:** 204 No Content.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 403 if attempting to revoke own manage grant.",
+        "description": "Revoke a permission on a session \u2014 someone else's, or your own.\n\nTwo shapes, one endpoint:\n\n* *Revoke* \u2014 removing **another** user's grant is a management\n  action and needs manage access.\n* *Leave* \u2014 removing **your own** grant (\"unshare myself\", so a\n  shared session stops cluttering your sidebar) needs only read\n  access, since giving up access requires no privilege.\n\nEither way the owner grant is protected: it is what keeps the\nsession reachable, so revoking it would orphan the session. That\nguard covers the self case too \u2014 an owner cannot leave, and\narchives or deletes instead. A manage-level *grantee* is still a\nguest and may leave. Leaving records no lasting refusal, so the\nowner re-granting brings the session back.\n\nIdempotent: 204 whether or not a grant existed.\n\n**Returns:** 204 No Content.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 403 when the target holds the owner grant, 400 when leaving a sub-agent session, 401 if unauthenticated.",
         "operationId": "revoke_permission_v1_sessions__session_id__permissions__target_user_id__delete",
         "parameters": [
           {
@@ -10387,7 +10446,7 @@
             }
           },
           {
-            "description": "User whose grant to revoke, e.g. `\"alice@example.com\"`.",
+            "description": "User whose grant to revoke, or the caller's own id to leave, e.g. `\"alice@example.com\"`.",
             "in": "path",
             "name": "target_user_id",
             "required": true,
@@ -12391,7 +12450,7 @@
     },
     "/v1/sessions/{source_id}/fork": {
       "post": {
-        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that built-in agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` is not a bindable built-in agent; 403 if the caller lacks read access; 400 if the source is a sub-agent session, has no agent binding, or `body.up_to_response_id` names no response in the source session.",
+        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that built-in agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` is not a bindable built-in agent; 403 if the caller lacks read access; 400 if the source has no agent binding, or `body.up_to_response_id` names no response in the source session.",
         "operationId": "fork_session_v1_sessions__source_id__fork_post",
         "parameters": [
           {

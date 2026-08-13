@@ -27,17 +27,23 @@ Architecture verified end-to-end:
 The OpenAI-key-gated test runs the full chain against gpt-4o-mini.
 The unkeyed test asserts on plumbing only (handler is reached,
 503 on bad harness name).
+
+Turn-context recovery tests are also included here (see the
+``# ── turn-context recovery ──`` section at the bottom of this
+file): verdict-delivery failure retry/signal, ``_resync_turn_state``
+edge cases, and the three-factor causal chain.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import tempfile
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
@@ -46,17 +52,54 @@ from typing import Any, cast
 import httpx
 import pytest
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse as _StreamingResponse
 
+import omnigent.runtime.harnesses._executor_adapter as _adapter_mod_recovery
+from omnigent.inner.executor import (
+    Executor as _RecoveryExecutor,
+)
+from omnigent.inner.executor import (
+    ExecutorConfig as _RecoveryExecutorConfig,
+)
+from omnigent.inner.executor import (
+    ExecutorEvent as _RecoveryExecutorEvent,
+)
+from omnigent.inner.executor import (
+    Message as _RecoveryMessage,
+)
+from omnigent.inner.executor import (
+    ToolSpec as _RecoveryToolSpec,
+)
+from omnigent.inner.executor import (
+    TurnComplete as _RecoveryTurnComplete,
+)
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
+    _RUNNER_TURN_CONTEXT_DESYNC_CODE,
     _build_spawn_env_from_spec,
+    _evaluate_policy_via_omnigent,
     _forward_harness_response,
     _resolve_harness_config,
 )
 from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.runtime.harnesses._executor_adapter import (
+    _ORPHAN_RESYNC_THRESHOLD,
+    ExecutorAdapter,
+)
+from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultEvent
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
 from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy
+from tests.runner.conftest import (
+    _FakeProcessManager as _RecoveryFakeProcessManager,
+)
+from tests.runner.conftest import (
+    _runner_client as _recovery_runner_client,
+)
+from tests.runner.conftest import (
+    _ScriptedHarnessClient as _RecoveryScriptedHarnessClient,
+)
 from tests.runner.helpers import NullServerClient
 
 _TEST_HARNESS_NAME = "runner-test-default"
@@ -171,6 +214,7 @@ async def _await_bg_turn_task(conv: str, *, timeout: float = 10.0) -> None:
 
 
 async def _drain_published_statuses(
+    queues: dict[str, Any],
     conv: str,
     *,
     until: str,
@@ -178,15 +222,16 @@ async def _drain_published_statuses(
 ) -> list[str]:
     """Collect ``session.status`` values a runner published for a session.
 
-    Reads the runner's module-level per-session event queue
-    (``omnigent.runner.app._session_event_queues_ref``) — the same queue
-    the SSE ``/stream`` endpoint drains — and returns the ordered list of
-    ``session.status`` values seen, stopping once *until* is published. This
-    polls the in-process queue rather than a concurrent SSE ``GET`` because
-    ``httpx.ASGITransport`` does not interleave a streaming response with a
-    concurrent ``POST`` on the same client, so a live SSE subscriber would
-    never observe the background turn's events.
+    Reads the runner's per-session event queue (``app.state.session_event_queues``)
+    — the same queue the SSE ``/stream`` endpoint drains — and returns the
+    ordered list of ``session.status`` values seen, stopping once *until* is
+    published. This polls the in-process queue rather than a concurrent SSE
+    ``GET`` because ``httpx.ASGITransport`` does not interleave a streaming
+    response with a concurrent ``POST`` on the same client, so a live SSE
+    subscriber would never observe the background turn's events.
 
+    :param queues: The app's per-session event-queue dict, i.e.
+        ``app.state.session_event_queues``.
     :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param until: Stop once this ``session.status`` value is observed,
         e.g. ``"failed"``.
@@ -195,12 +240,10 @@ async def _drain_published_statuses(
         assertion instead of spinning forever.
     :returns: Ordered ``session.status`` values published for *conv*.
     """
-    from omnigent.runner.app import _session_event_queues_ref
-
     statuses: list[str] = []
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        queue = _session_event_queues_ref.get(conv)
+        queue = queues.get(conv)
         drained = False
         while queue is not None and not queue.empty():
             event = queue.get_nowait()
@@ -218,6 +261,7 @@ async def _drain_published_statuses(
 
 
 async def _drain_failed_status_event(
+    queues: dict[str, Any],
     conv: str,
     *,
     timeout: float,
@@ -229,17 +273,17 @@ async def _drain_failed_status_event(
     ``error`` payload. Used to prove a SETUP-phase failure forwards its
     error message on the terminal ``failed`` event instead of dropping it.
 
+    :param queues: The app's per-session event-queue dict, i.e.
+        ``app.state.session_event_queues``.
     :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param timeout: Hard cap in seconds; returns ``None`` if no failed
         event arrives so a regression fails the assertion rather than
         hanging.
     :returns: The ``session.status: failed`` event dict, or ``None``.
     """
-    from omnigent.runner.app import _session_event_queues_ref
-
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        queue = _session_event_queues_ref.get(conv)
+        queue = queues.get(conv)
         drained = False
         while queue is not None and not queue.empty():
             event = queue.get_nowait()
@@ -1604,8 +1648,12 @@ async def test_runner_background_turn_emits_failed_when_spawn_env_build_raises(
             },
         )
         assert response.status_code == 202
+        # Await the background turn task (main's helper) before draining, then
+        # read the runner's per-session queue via the ``app.state`` test seam.
         await _await_bg_turn_task(conv)
-        statuses = await _drain_published_statuses(conv, until="failed", timeout=2.0)
+        statuses = await _drain_published_statuses(
+            app.state.session_event_queues, conv, until="failed", timeout=2.0
+        )
 
     # The turn published "running" then "failed" — it reached a terminal
     # state and cleared. Without the fix, the setup-phase OmnigentError is
@@ -1692,8 +1740,12 @@ async def test_runner_failed_status_carries_setup_error_message(
             },
         )
         assert response.status_code == 202
+        # Await the background turn task (main's helper) before draining, then
+        # read the runner's per-session queue via the ``app.state`` test seam.
         await _await_bg_turn_task(conv)
-        failed_event = await _drain_failed_status_event(conv, timeout=2.0)
+        failed_event = await _drain_failed_status_event(
+            app.state.session_event_queues, conv, timeout=2.0
+        )
 
     # The failed event must carry the real setup error message — not a
     # bare status. Without the fix ``error`` is absent and the REPL
@@ -1712,6 +1764,7 @@ async def test_runner_failed_status_carries_setup_error_message(
 
 
 async def _drain_status_events(
+    queues: dict[str, Any],
     conv: str,
     *,
     until: str,
@@ -1723,6 +1776,8 @@ async def _drain_status_events(
     so one drain can assert both the status order and the carried ``error``
     payload — the queue is consumed by reading, so a test cannot drain twice.
 
+    :param queues: The app's per-session event-queue dict, i.e.
+        ``app.state.session_event_queues``.
     :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param until: Stop once this ``session.status`` value is observed,
         e.g. ``"failed"``.
@@ -1731,12 +1786,10 @@ async def _drain_status_events(
         assertion instead of spinning forever.
     :returns: Ordered ``session.status`` event dicts published for *conv*.
     """
-    from omnigent.runner.app import _session_event_queues_ref
-
     events: list[dict[str, Any]] = []
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        queue = _session_event_queues_ref.get(conv)
+        queue = queues.get(conv)
         drained = False
         while queue is not None and not queue.empty():
             event = queue.get_nowait()
@@ -1873,11 +1926,13 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
             },
         )
         assert response.status_code == 202
-        # Await the background turn task directly so we know it has completed
-        # (and published its terminal status) before draining — the same race
-        # guard the sibling failed-status tests use.
+        # Await the background turn task (main's helper) before draining — the
+        # same race guard the sibling failed-status tests use — then read the
+        # runner's per-session queue via the ``app.state`` test seam.
         await _await_bg_turn_task(conv)
-        events = await _drain_status_events(conv, until=until, timeout=2.0)
+        events = await _drain_status_events(
+            app.state.session_event_queues, conv, until=until, timeout=2.0
+        )
 
     statuses = [event.get("status") for event in events]
     # The turn must reach the parametrized terminal state. Without the fix,
@@ -7639,3 +7694,1899 @@ async def test_spawn_async_tool_phase_tool_call_policy_allow(
     item = inbox.get_nowait()
     assert item["status"] == "completed"
     assert item["output"] == "ok"
+
+
+# ── cross-process lifecycle desync recovery ── ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_setup_cancel_does_not_leave_active_turn() -> None:
+    """Cancel during SETUP must not leave ``_active_turns`` stale.
+
+    A ``CancelledError`` raised before the streaming phase escapes
+    ``_run_turn_bg``'s ``except Exception``; without the dedicated
+    ``except asyncio.CancelledError`` clause nothing pops ``_active_turns``
+    and every later message buffers forever (the permanent-wedge mode).
+    """
+    conv = "conv_setup_cancel"
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        started.set()
+        # Park the turn in the SETUP phase (before the streaming phase).
+        await release.wait()
+        return AgentSpec(
+            spec_version=1,
+            name="claude-sdk-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_sdk",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 202
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+
+        active = app.state.active_turns
+        task = active.get(conv)
+        assert isinstance(task, asyncio.Task)
+
+        # Cancel during SETUP.
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+        # Slot cleared via terminal-cleanup path, not stale.
+        assert conv not in active
+
+
+@pytest.mark.asyncio
+async def test_desync_emits_user_visible_error() -> None:
+    """Recovered desync surfaces a distinct, non-retryable error code.
+
+    With no buffered continuation, ``_resync_turn_state`` publishes a
+    ``session.status: failed`` carrying ``runner_turn_context_desync`` — a
+    code intentionally absent from AP's retryable allowlist so the L2
+    classifier treats it as terminal instead of retry-looping.
+    """
+    conv = "conv_desync_visible"
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app):
+        # Drive the recovery entry directly (no live turn, no buffer).
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+        failed_event = await _drain_failed_status_event(
+            app.state.session_event_queues, conv, timeout=5.0
+        )
+
+    assert conv in app.state.desynced_sessions
+    assert failed_event is not None
+    error = failed_event.get("error")
+    assert isinstance(error, dict)
+    assert error["code"] == "runner_turn_context_desync"
+    assert error["message"]
+
+
+class _SetupBoom(BaseException):
+    """Non-Exception BaseException exercises the terminal-cleanup finally floor."""
+
+
+@pytest.mark.asyncio
+async def test_setup_base_exception_does_not_leave_active_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BaseException during SETUP must not leave ``_active_turns`` stale.
+
+    A non-``Exception`` ``BaseException`` raised in the BACKGROUND setup phase
+    (here the spawn-env build, the same background-only step the
+    spawn-env-failure test drives) escapes ``_run_turn_bg``'s
+    ``except Exception``. The real ``finally`` floor must still pop the slot —
+    otherwise every later message buffers forever (the permanent-wedge mode).
+    """
+    conv = "conv_setup_base_exc"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="claude-sdk-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    def _raising_build(
+        spec: object, *, cwd: object = None, workdir: object = None
+    ) -> dict[str, str]:
+        del spec, workdir
+        # A BaseException that is NOT an Exception subclass, raised inside the
+        # background setup phase (after the 202).
+        raise _SetupBoom("spawn-env aborted")
+
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._build_claude_sdk_spawn_env",
+        _raising_build,
+    )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_sdk",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 202
+
+        active = app.state.active_turns
+        # Wait for the background turn task to bind, then finish unwinding
+        # through the finally floor (the BaseException propagates out).
+        deadline = asyncio.get_running_loop().time() + 5.0
+        task: asyncio.Task[None] | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            candidate = active.get(conv)
+            if isinstance(candidate, asyncio.Task):
+                task = candidate
+                if task.done():
+                    break
+            elif task is not None:
+                # Slot already cleared by the finally floor.
+                break
+            await asyncio.sleep(0.02)
+
+        # The finally floor popped the slot despite the BaseException — never
+        # left stale (the permanent-wedge failure mode).
+        assert conv not in active
+        # The BaseException propagated out of the task (finally did not swallow).
+        assert task is not None
+        assert task.done() and not task.cancelled()
+        assert isinstance(task.exception(), _SetupBoom)
+
+
+# ── turn-context recovery ──────────────────────────────────────────────────
+#
+# Tests for harness↔runner turn-context recovery (``_resync_turn_state``),
+# policy-verdict delivery failures, and the three-factor causal chain.
+# Consolidated from former test_app_sessions_desync, test_evaluate_policy_desync,
+# and test_desync_live_repro modules.
+
+# ── Helpers shared across recovery tests ──────────────────────────────────
+
+
+def _recovery_request(text: str = "hi") -> _CreateResponseRequest:
+    return _CreateResponseRequest(model="agent", input=text)
+
+
+def _recovery_tool_result(call_id: str, output: str) -> _ToolResultEvent:
+    return _ToolResultEvent(type="tool_result", call_id=call_id, output=output)
+
+
+def _drain_recovery_status_events(queues: dict[str, Any], conv_id: str) -> list[dict[str, Any]]:
+    """Pop every queued ``session.status`` event for *conv_id*."""
+    queue = queues.get(conv_id)
+    out: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        event = queue.get_nowait()
+        if isinstance(event, dict) and event.get("type") == "session.status":
+            out.append(event)
+    return out
+
+
+# ── Verdict-delivery failure tests (from test_evaluate_policy_desync) ─────
+
+
+class _PolicyOkServerClient:
+    """Server client whose evaluate POST returns a real ALLOW verdict."""
+
+    async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+        del json, timeout
+        return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW", "reason": None})
+
+
+class _PolicyDeadChannelHarnessClient:
+    """Harness client whose verdict POST always raises a dead-channel error."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.attempts = 0
+        self._exc = exc
+
+    async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+        del json, timeout
+        self.attempts += 1
+        raise self._exc
+
+
+async def test_verdict_delivery_failure_retries_then_signals() -> None:
+    """A dead-channel verdict POST retries once, then fires on_delivery_failure."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _PolicyDeadChannelHarnessClient(httpx.RemoteProtocolError("peer closed connection"))
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_xyz",
+        evaluation_id="poleval_1",
+        phase="PHASE_TOOL_CALL",
+        data={"name": "mcp__github__merge_pull_request", "arguments": {}},
+        on_delivery_failure=_on_delivery_failure,
+    )
+
+    assert harness.attempts == 2
+    assert signaled == ["conv_xyz"]
+
+
+async def test_httpcore_read_error_is_treated_as_dead_channel() -> None:
+    """An httpcore-level read error also retries-then-signals."""
+    import httpcore
+
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _PolicyDeadChannelHarnessClient(httpcore.ReadError("read failed"))
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_abc",
+        evaluation_id="poleval_2",
+        phase="PHASE_LLM_REQUEST",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+    assert signaled == ["conv_abc"]
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ConnectError("connection refused"),
+        httpx.ConnectTimeout("connect timed out"),
+    ],
+)
+async def test_connect_failure_is_treated_as_dead_channel(exc: BaseException) -> None:
+    """A connect failure (subprocess already gone) retries-then-signals."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _PolicyDeadChannelHarnessClient(exc)
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_conn",
+        evaluation_id="poleval_conn",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+    assert signaled == ["conv_conn"]
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ReadTimeout("read timed out"),
+        httpx.WriteTimeout("write timed out"),
+        httpx.PoolTimeout("pool timed out"),
+    ],
+)
+async def test_delivery_timeout_is_treated_as_dead_channel(exc: BaseException) -> None:
+    """A verdict-delivery timeout retries-then-signals, not parks for 24h."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _PolicyDeadChannelHarnessClient(exc)
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_timeout",
+        evaluation_id="poleval_timeout",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+    assert signaled == ["conv_timeout"]
+
+
+async def test_non_2xx_verdict_response_retries_then_signals() -> None:
+    """A non-2xx verdict POST is an unacknowledged delivery: retry then signal."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    class _Non2xxHarness:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+            del json, timeout
+            self.attempts += 1
+            return httpx.Response(500, text="boom")
+
+    harness = _Non2xxHarness()
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_500",
+        evaluation_id="poleval_500",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+    assert signaled == ["conv_500"]
+
+
+async def test_non_transport_delivery_error_signals_without_retry() -> None:
+    """A non-transport delivery error signals without retry."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _PolicyDeadChannelHarnessClient(ValueError("malformed body"))
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_q",
+        evaluation_id="poleval_3",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 1
+    assert signaled == ["conv_q"]
+
+
+async def test_3xx_verdict_response_is_unacknowledged_and_signals() -> None:
+    """A 3xx verdict response is NOT a 2xx ack: retry then signal."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    class _RedirectHarness:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+            del json, timeout
+            self.attempts += 1
+            return httpx.Response(302, headers={"location": "/elsewhere"})
+
+    harness = _RedirectHarness()
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_3xx",
+        evaluation_id="poleval_3xx",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+    assert signaled == ["conv_3xx"]
+
+
+async def test_successful_delivery_does_not_signal() -> None:
+    """A clean delivery posts exactly once and never signals a recovery."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    class _OkHarness:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+            del json, timeout
+            self.attempts += 1
+            return httpx.Response(200, json={})
+
+    harness = _OkHarness()
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_ok",
+        evaluation_id="poleval_4",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 1
+    assert signaled == []
+
+
+# ── Turn-state recovery tests (from test_app_sessions_desync) ─────────────
+
+
+@pytest.mark.asyncio
+async def test_wedged_session_releases_and_recovers() -> None:
+    """A wedged turn with a buffered message releases promptly.
+
+    Simulates a turn parked on the 24h policy-evaluation future. ``_resync_turn_state``
+    must release it in milliseconds, flag the conversation as needing recovery, and let
+    the buffered continuation bind a fresh turn (which clears the flag).
+    """
+    conv = "conv_recovery_recover"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    forever = asyncio.Event()
+
+    async def _wedged_turn() -> None:
+        await forever.wait()
+
+    async with _recovery_runner_client(app) as http:
+        task = asyncio.create_task(_wedged_turn())
+        app.state.active_turns[conv] = task
+        try:
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "follow up"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
+            await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+            elapsed = loop.time() - t0
+
+            assert elapsed < 2.0, elapsed
+            assert task.cancelled() or task.done()
+            assert conv in app.state.desynced_sessions
+
+            deadline = loop.time() + 3.0
+            while loop.time() < deadline and conv in app.state.desynced_sessions:
+                await asyncio.sleep(0.02)
+            assert conv not in app.state.desynced_sessions
+        finally:
+            forever.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    queue = app.state.session_event_queues.get(conv)
+    recovery_failed = []
+    while queue is not None and not queue.empty():
+        event = queue.get_nowait()
+        if (
+            isinstance(event, dict)
+            and event.get("type") == "session.status"
+            and event.get("status") == "failed"
+            and isinstance(event.get("error"), dict)
+            and event["error"].get("code") == "runner_turn_context_desync"
+        ):
+            recovery_failed.append(event)
+    assert recovery_failed == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_drains_buffer_when_turn_pops_active_slot() -> None:
+    """Recovery drains the buffer even when the cancelled turn self-pops."""
+    conv = "conv_recovery_selfpop"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    forever = asyncio.Event()
+
+    async def _wedged_turn() -> None:
+        try:
+            await forever.wait()
+        except asyncio.CancelledError:
+            app.state.active_turns.pop(conv, None)
+            raise
+
+    async with _recovery_runner_client(app) as http:
+        task = asyncio.create_task(_wedged_turn())
+        app.state.active_turns[conv] = task
+        try:
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "follow up"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+
+            loop = asyncio.get_running_loop()
+            await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+            assert task.cancelled() or task.done()
+
+            deadline = loop.time() + 3.0
+            while loop.time() < deadline and conv in app.state.desynced_sessions:
+                await asyncio.sleep(0.02)
+            assert conv not in app.state.desynced_sessions
+        finally:
+            forever.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.asyncio
+async def test_recovery_stream_mode_forwards_interrupt() -> None:
+    """Stream-mode recovery clears the gate and forwards interrupt."""
+    conv = "conv_recovery_streammode"
+    harness = _RecoveryScriptedHarnessClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert conv not in app.state.active_turns
+    assert {"type": "interrupt"} in harness.patched_events
+
+
+class _DeadInterruptHarnessClient(_RecoveryScriptedHarnessClient):
+    """Scripted harness whose interrupt POST always raises (wedged/dead harness)."""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        raise httpx.ConnectError("harness gone")
+
+
+@pytest.mark.asyncio
+async def test_recovery_stream_mode_clears_gate_even_when_interrupt_fails() -> None:
+    """Stream-mode sentinel clears and buffer drains even on a dead interrupt."""
+    conv = "conv_recovery_streammode_dead"
+    harness = _DeadInterruptHarnessClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app) as http:
+        app.state.active_turns[conv] = None
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag",
+                "model": "x",
+                "content": [{"role": "user", "content": "follow up"}],
+            },
+        )
+        assert resp.status_code == 202, resp.text
+
+        loop = asyncio.get_running_loop()
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+        deadline = loop.time() + 3.0
+        while loop.time() < deadline and conv in app.state.desynced_sessions:
+            await asyncio.sleep(0.02)
+        assert conv not in app.state.desynced_sessions
+
+
+class _InterruptEndsStreamHarnessClient(_RecoveryScriptedHarnessClient):
+    """Interrupt POST succeeds AND drives proxy_stream terminal bookkeeping."""
+
+    app: Any = None
+    conv: str = ""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            self.app.state.on_proxy_stream_end(self.conv)
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_recovery_stream_mode_publishes_single_terminal_status() -> None:
+    """Stream-mode no-buffer recovery publishes exactly ONE terminal status."""
+    conv = "conv_recovery_single_terminal"
+    harness = _InterruptEndsStreamHarnessClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    queue = app.state.session_event_queues.get(conv)
+    statuses: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if isinstance(ev, dict) and ev.get("type") == "session.status":
+            statuses.append(ev)
+
+    assert len(statuses) == 1, statuses
+    assert statuses[0]["status"] == "failed"
+    assert statuses[0]["error"]["code"] == "runner_turn_context_desync"
+    assert {"type": "interrupt"} in harness.patched_events
+
+
+class _SlotSwapBaseException(BaseException):
+    """A non-Exception raised in setup to exercise the finally floor."""
+
+
+@pytest.mark.asyncio
+async def test_run_turn_bg_finalizer_identity_guard_spares_foreign_slot() -> None:
+    """F2: the ``_run_turn_bg`` finally floor must identity-compare before popping."""
+    conv = "conv_finalizer_identity"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+
+    foreign_task = asyncio.create_task(asyncio.Event().wait())
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        app.state.active_turns[conv] = foreign_task
+        raise _SlotSwapBaseException
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    try:
+        async with _recovery_runner_client(app) as http:
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "turn A"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+
+            task = app.state.active_turns.get(conv)
+            assert isinstance(task, asyncio.Task)
+
+            with contextlib.suppress(BaseException):
+                await task
+
+        assert app.state.active_turns.get(conv) is foreign_task
+    finally:
+        foreign_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await foreign_task
+        app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+async def test_on_proxy_stream_end_spares_superseded_response() -> None:
+    """BLOCKING-1: a stale stream terminal must not clobber a newer turn's state."""
+    conv = "conv_stream_supersede"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    newer = asyncio.create_task(asyncio.Event().wait())
+    try:
+        app.state.active_turns[conv] = newer
+        app.state.live_response_id[conv] = "resp_new"
+
+        app.state.on_proxy_stream_end(conv, owner_response_id="resp_old")
+
+        assert app.state.active_turns.get(conv) is newer
+        assert app.state.live_response_id.get(conv) == "resp_new"
+        assert conv not in pm.cleared_in_flight
+
+        app.state.on_proxy_stream_end(conv, owner_response_id="resp_new")
+        assert conv not in app.state.active_turns
+        assert conv not in app.state.live_response_id
+        assert conv in pm.cleared_in_flight
+    finally:
+        newer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await newer
+        app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+async def test_resync_ownership_gate_ignores_superseded_delivery_failure() -> None:
+    """BLOCKING-2: a delayed verdict-delivery failure must not cancel a newer turn."""
+    conv = "conv_delivery_supersede"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        app.state.live_response_id[conv] = "resp_new"
+
+        await app.state.resync_turn_state(
+            conv, "verdict_delivery_channel_dead", owner_response_id="resp_old"
+        )
+
+    assert conv in app.state.active_turns
+    assert app.state.live_response_id.get(conv) == "resp_new"
+    queue = app.state.session_event_queues.get(conv)
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        assert not (
+            isinstance(ev, dict)
+            and ev.get("type") == "session.status"
+            and ev.get("status") == "failed"
+            and isinstance(ev.get("error"), dict)
+            and ev["error"].get("code") == "runner_turn_context_desync"
+        ), ev
+    app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+async def test_resync_clears_in_flight_marker_no_buffer() -> None:
+    """B1: an accepted no-buffer resync clears the process-manager in-flight marker."""
+    conv = "conv_resync_inflight"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        app.state.live_response_id[conv] = "resp_live"
+        pm.mark_in_flight(conv, "resp_live")
+        assert conv not in pm.cleared_in_flight
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert conv in pm.cleared_in_flight
+    queue = app.state.session_event_queues.get(conv)
+    failed = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if (
+            isinstance(ev, dict)
+            and ev.get("type") == "session.status"
+            and ev.get("status") == "failed"
+            and isinstance(ev.get("error"), dict)
+            and ev["error"].get("code") == "runner_turn_context_desync"
+        ):
+            failed.append(ev)
+    assert len(failed) == 1, failed
+    app.state.active_turns.pop(conv, None)
+
+
+class _InterruptBindsContinuationClient(_RecoveryScriptedHarnessClient):
+    """On the recovery interrupt, bind a continuation AND drain the buffer."""
+
+    app: Any = None
+    conv: str = ""
+    continuation: asyncio.Task[None] | None = None
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            self.app.state.session_message_buffers.pop(self.conv, None)
+            self.continuation = asyncio.create_task(asyncio.Event().wait())
+            self.app.state.turn_bind_epoch[self.conv] = (
+                self.app.state.turn_bind_epoch.get(self.conv, 0) + 1
+            )
+            self.app.state.active_turns[self.conv] = self.continuation
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_resync_does_not_publish_failed_over_drained_continuation() -> None:
+    """NB3: a continuation that binds AND drains the buffer during teardown wins."""
+    conv = "conv_resync_cont_race"
+    harness = _InterruptBindsContinuationClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        app.state.session_message_buffers[conv] = [{"content": "follow up"}]
+        try:
+            await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+            assert app.state.active_turns.get(conv) is harness.continuation
+            queue = app.state.session_event_queues.get(conv)
+            while queue is not None and not queue.empty():
+                ev = queue.get_nowait()
+                assert not (
+                    isinstance(ev, dict)
+                    and ev.get("type") == "session.status"
+                    and ev.get("status") == "failed"
+                    and isinstance(ev.get("error"), dict)
+                    and ev["error"].get("code") == "runner_turn_context_desync"
+                ), ev
+        finally:
+            if harness.continuation is not None:
+                harness.continuation.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await harness.continuation
+            app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+async def test_resync_removes_completed_stale_task_and_publishes_terminal() -> None:
+    """BLOCKING (round 5): a COMPLETED task in the slot is a corpse, not a continuation."""
+    conv = "conv_resync_corpse"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    done_task = asyncio.create_task(asyncio.sleep(0))
+    await done_task
+    assert done_task.done()
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = done_task
+        app.state.live_response_id[conv] = "resp_dead"
+        pm.mark_in_flight(conv, "resp_dead")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert conv not in app.state.active_turns
+    assert conv in pm.cleared_in_flight
+    queue = app.state.session_event_queues.get(conv)
+    failed = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if (
+            isinstance(ev, dict)
+            and ev.get("type") == "session.status"
+            and ev.get("status") == "failed"
+            and isinstance(ev.get("error"), dict)
+            and ev["error"].get("code") == "runner_turn_context_desync"
+        ):
+            failed.append(ev)
+    assert len(failed) == 1, failed
+    assert conv not in app.state.active_turns
+
+
+class _CompleteTaskOnInterruptClient(_RecoveryScriptedHarnessClient):
+    """On the recovery interrupt, complete the wedged task so it arrives DONE."""
+
+    task: asyncio.Task[None] | None = None
+    release: asyncio.Event | None = None
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt":
+            if self.release is not None:
+                self.release.set()
+            if self.task is not None:
+                with contextlib.suppress(BaseException):
+                    await self.task
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_resync_clears_interrupt_token_when_task_completes_during_teardown() -> None:
+    """Round-6 pre-empt: a task that completes during teardown must not leak its token."""
+    conv = "conv_resync_token_leak"
+    harness = _CompleteTaskOnInterruptClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    release = asyncio.Event()
+
+    async def _turn() -> None:
+        await release.wait()
+
+    task = asyncio.create_task(_turn())
+    harness.task = task
+    harness.release = release
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = task
+        app.state.live_response_id[conv] = "resp_live"
+        pm.mark_in_flight(conv, "resp_live")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert task.done()
+    assert conv not in app.state.interrupted_sessions
+    assert conv not in app.state.active_turns
+    app.state.active_turns.pop(conv, None)
+
+
+class _InterruptBindsStreamContinuationClient(_RecoveryScriptedHarnessClient):
+    """On the recovery interrupt, bind a NEW stream=true turn (None sentinel)."""
+
+    app: Any = None
+    conv: str = ""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            self.app.state.turn_bind_epoch[self.conv] = (
+                self.app.state.turn_bind_epoch.get(self.conv, 0) + 1
+            )
+            self.app.state.active_turns[self.conv] = None
+            self.app.state.live_response_id[self.conv] = "resp_new"
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_resync_does_not_clobber_stream_continuation_reusing_none_sentinel() -> None:
+    """BLOCKING (round 6): a new stream=true turn (None sentinel) is not a corpse."""
+    conv = "conv_resync_stream_reuse"
+    harness = _InterruptBindsStreamContinuationClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        app.state.live_response_id[conv] = "resp_old"
+        pm.mark_in_flight(conv, "resp_old")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert conv in app.state.active_turns
+    assert app.state.live_response_id.get(conv) == "resp_new"
+    queue = app.state.session_event_queues.get(conv)
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        assert not (
+            isinstance(ev, dict)
+            and ev.get("type") == "session.status"
+            and ev.get("status") == "failed"
+            and isinstance(ev.get("error"), dict)
+            and ev["error"].get("code") == "runner_turn_context_desync"
+        ), ev
+    app.state.active_turns.pop(conv, None)
+
+
+class _ReplacementRunsToCompletionClient(_RecoveryScriptedHarnessClient):
+    """On the recovery interrupt, run a replacement turn to COMPLETION."""
+
+    app: Any = None
+    conv: str = ""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            st = self.app.state
+            st.turn_bind_epoch[self.conv] = st.turn_bind_epoch.get(self.conv, 0) + 1
+            st.active_turns[self.conv] = None
+            st.live_response_id[self.conv] = "resp_new"
+            st.on_proxy_stream_end(self.conv, owner_response_id="resp_new")
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_resync_does_not_clobber_replacement_that_finished_during_interrupt() -> None:
+    """BLOCKING (round 7): a replacement that starts AND finishes during teardown wins."""
+    conv = "conv_resync_replacement_done"
+    harness = _ReplacementRunsToCompletionClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        app.state.live_response_id[conv] = "resp_old"
+        pm.mark_in_flight(conv, "resp_old")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    queue = app.state.session_event_queues.get(conv)
+    statuses: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if isinstance(ev, dict) and ev.get("type") == "session.status":
+            statuses.append(ev)
+
+    recovery_failed = [
+        s
+        for s in statuses
+        if s.get("status") == "failed"
+        and isinstance(s.get("error"), dict)
+        and s["error"].get("code") == "runner_turn_context_desync"
+    ]
+    assert recovery_failed == [], statuses
+    assert any(s.get("status") == "idle" for s in statuses), statuses
+    app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+async def test_delete_session_clears_all_paired_recovery_state() -> None:
+    """A deleted session must not leave recovery state that a same-id recreate inherits."""
+    conv = "conv_delete_recreate"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app) as http:
+        app.state.begin_turn_slot(conv)
+        app.state.desync_terminalized[conv] = app.state.turn_bind_epoch[conv]
+        app.state.desynced_sessions.add(conv)
+
+        resp = await http.request("DELETE", f"/v1/sessions/{conv}")
+        assert resp.status_code in (200, 204), resp.text
+
+    assert conv not in app.state.turn_bind_epoch
+    assert conv not in app.state.desync_terminalized
+    assert conv not in app.state.desynced_sessions
+
+    app.state.begin_turn_slot(conv)
+    app.state.on_proxy_stream_end(conv)
+    queue = app.state.session_event_queues.get(conv)
+    statuses = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if isinstance(ev, dict) and ev.get("type") == "session.status":
+            statuses.append(ev)
+    assert any(s.get("status") == "idle" for s in statuses), statuses
+
+
+class _DeleteRecreateDuringInterruptClient(_RecoveryScriptedHarnessClient):
+    """On the recovery interrupt, simulate a same-id delete → recreate mid-await."""
+
+    app: Any = None
+    conv: str = ""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            st = self.app.state
+            st.active_turns.pop(self.conv, None)
+            st.turn_bind_epoch.pop(self.conv, None)
+            st.desync_terminalized.pop(self.conv, None)
+            st.desynced_sessions.discard(self.conv)
+            st.begin_turn_slot(self.conv)
+            st.live_response_id[self.conv] = "resp_new"
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_resync_does_not_clobber_recreated_session_after_delete_mid_interrupt() -> None:
+    """BLOCKING-class (round 8): a same-id recreate during the interrupt await is not clobbered."""
+    conv = "conv_delete_mid_interrupt"
+    harness = _DeleteRecreateDuringInterruptClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.begin_turn_slot(conv)
+        app.state.live_response_id[conv] = "resp_old"
+        pm.mark_in_flight(conv, "resp_old")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert conv in app.state.active_turns
+    assert app.state.live_response_id.get(conv) == "resp_new"
+    queue = app.state.session_event_queues.get(conv)
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        assert not (
+            isinstance(ev, dict)
+            and ev.get("type") == "session.status"
+            and ev.get("status") == "failed"
+            and isinstance(ev.get("error"), dict)
+            and ev["error"].get("code") == "runner_turn_context_desync"
+        ), ev
+    app.state.active_turns.pop(conv, None)
+
+
+class _NestedRecoveryDuringInterruptClient(_RecoveryScriptedHarnessClient):
+    """On the OLD recovery's interrupt, bind a replacement AND claim a nested token."""
+
+    app: Any = None
+    conv: str = ""
+    nested_epoch: int = 0
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            st = self.app.state
+            st.begin_turn_slot(self.conv)
+            st.live_response_id[self.conv] = "resp_new"
+            self.nested_epoch = st.turn_bind_epoch[self.conv]
+            st.desync_terminalized[self.conv] = self.nested_epoch
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_old_recovery_does_not_strip_nested_recovery_token() -> None:
+    """BLOCKING (round 9): the old recovery must not pop a nested recovery's token."""
+    conv = "conv_nested_recovery"
+    harness = _NestedRecoveryDuringInterruptClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.begin_turn_slot(conv)
+        app.state.live_response_id[conv] = "resp_old"
+        pm.mark_in_flight(conv, "resp_old")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert app.state.desync_terminalized.get(conv) == harness.nested_epoch
+
+
+# ── Three-factor causal chain tests (from test_desync_live_repro) ─────────
+
+_ADAPTER_LOGGER_RECOVERY = "omnigent.runtime.harnesses._executor_adapter"
+_APP_LOGGER_RECOVERY = "omnigent.runner.app"
+
+_ORPHAN_RESYNC_THRESHOLD_DEFAULT_RECOVERY = _ORPHAN_RESYNC_THRESHOLD
+
+
+class _DispatchParkingExecutor(_RecoveryExecutor):
+    """Inner executor that parks a REAL tool dispatch through production code."""
+
+    def __init__(self, events: list[_RecoveryExecutorEvent] | None = None) -> None:
+        self._events = events or []
+        self.interrupt_calls: list[str] = []
+        self.close_calls = 0
+        self.close_session_calls = 0
+
+    async def run_turn(
+        self,
+        messages: list[_RecoveryMessage],
+        tools: list[_RecoveryToolSpec],
+        system_prompt: str,
+        config: _RecoveryExecutorConfig | None = None,
+    ) -> Any:
+        await self._tool_executor("Bash", {"command": "ls"})  # type: ignore[attr-defined]
+        for event in self._events:
+            yield event
+
+    async def interrupt_session(self, session_key: str) -> bool:
+        self.interrupt_calls.append(session_key)
+        return True
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+    async def close_session(self, session_key: str) -> None:
+        del session_key
+        self.close_session_calls += 1
+
+    async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+        del session_key, content
+        return True
+
+
+class _ChainOkServerClient:
+    """Server client whose ``/policies/evaluate`` returns ALLOW."""
+
+    async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+        del json, timeout
+        return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW", "reason": None})
+
+
+class _ChainDeadChannelHarnessClient:
+    """Harness client whose verdict POST raises a real dead-channel error."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.attempts = 0
+        self._exc = exc
+
+    async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+        del json, timeout
+        self.attempts += 1
+        raise self._exc
+
+
+class _HarnessInterruptClient:
+    """Harness HTTP client modelling the runner→harness interrupt hop."""
+
+    def __init__(self, pm: _ChainProcessManager) -> None:
+        self._pm = pm
+
+    async def post(
+        self, _url: str, *, json: dict[str, Any], timeout: Any = None
+    ) -> httpx.Response:
+        del timeout
+        if json.get("type") == "interrupt":
+            task = self._pm.consume_task
+            if task is not None and not task.done():
+                task.cancel()
+        return httpx.Response(200, json={})
+
+    def stream(self, _method: str, _url: str, **_kwargs: Any) -> _ChainEmptyStream:
+        return _ChainEmptyStream()
+
+
+class _ChainEmptyStream:
+    """Async-context-manager stub yielding a 200 response with no SSE frames."""
+
+    status_code = 200
+    headers: dict[str, str] = {}
+
+    async def __aenter__(self) -> _ChainEmptyStream:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
+    async def aiter_text(self) -> Any:
+        return
+        yield  # pragma: no cover
+
+
+class _ChainProcessManager:
+    """Process-manager stub for the three-factor chain."""
+
+    handles_tool_dispatch = True
+
+    def __init__(self) -> None:
+        self._sessions: set[str] = set()
+        self.consume_task: asyncio.Task[None] | None = None
+        self.respawn_hook: Any = None
+        self.marked_in_flight: list[tuple[str, str]] = []
+        self.cleared_in_flight: list[str] = []
+
+    def set_respawn_hook(self, hook: Any) -> None:
+        self.respawn_hook = hook
+
+    async def get_client(self, conversation_id: str, harness: str, env: Any = None) -> Any:
+        del harness, env
+        self._sessions.add(conversation_id)
+        return _HarnessInterruptClient(self)
+
+    def has_session(self, conversation_id: str) -> bool:
+        return conversation_id in self._sessions
+
+    def has_active_turn(self, conversation_id: str) -> bool:
+        del conversation_id
+        return False
+
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        self.marked_in_flight.append((conversation_id, response_id))
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        self.cleared_in_flight.append(conversation_id)
+
+    async def forward_cancel(self, conversation_id: str) -> bool:
+        del conversation_id
+        return True
+
+    async def release(self, conversation_id: str) -> None:
+        self._sessions.discard(conversation_id)
+
+
+def _chain_request(text: str = "hi") -> _CreateResponseRequest:
+    return _CreateResponseRequest(model="agent", input=text)
+
+
+def _chain_tool_result(call_id: str, output: str) -> _ToolResultEvent:
+    return _ToolResultEvent(type="tool_result", call_id=call_id, output=output)
+
+
+def _chain_drain_status_events(queues: dict[str, Any], conv_id: str) -> list[dict[str, Any]]:
+    queue = queues.get(conv_id)
+    out: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        event = queue.get_nowait()
+        if isinstance(event, dict) and event.get("type") == "session.status":
+            out.append(event)
+    return out
+
+
+async def _chain_start_turn_stream(
+    adapter: ExecutorAdapter, request: _CreateResponseRequest
+) -> _StreamingResponse:
+    resp = await adapter._start_or_inject_turn(request)
+    assert isinstance(resp, _StreamingResponse), resp
+    return resp
+
+
+async def _chain_drain_stream(body_iterator: Any) -> None:
+    async for _chunk in body_iterator:
+        pass
+
+
+async def _chain_spin_until(predicate: Any, *, limit: int = 200) -> None:
+    for _ in range(limit):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition never became true")
+
+
+def _chain_wedged_dispatch_call_id(adapter: ExecutorAdapter) -> str | None:
+    for ctx in adapter._in_flight.values():
+        if ctx._pending_tool_calls:
+            return next(iter(ctx._pending_tool_calls))
+    return None
+
+
+async def _run_three_factor_chain(adapter: ExecutorAdapter) -> tuple[Any, str]:
+    """Wire factors 1→2→3 through real callsites and return the wedged state."""
+    conv = "conv_chain"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+
+    resp = await _chain_start_turn_stream(adapter, _chain_request("primary turn"))
+    consume_task: asyncio.Task[None] = asyncio.create_task(_chain_drain_stream(resp.body_iterator))
+    pm.consume_task = consume_task
+    await _chain_spin_until(lambda: _chain_wedged_dispatch_call_id(adapter) is not None)
+    app.state.active_turns[conv] = None
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        buffered = await client.post(
+            f"/v1/sessions/{conv}/events",
+            json={"type": "message", "role": "user", "content": "queued during the drop"},
+        )
+    assert buffered.status_code == 202
+    assert app.state.session_message_buffers.get(conv)
+
+    async def _on_delivery_failure(cid: str) -> None:
+        await app.state.resync_turn_state(cid, "verdict_delivery_channel_dead")
+
+    harness = _ChainDeadChannelHarnessClient(
+        httpx.RemoteProtocolError("Server disconnected without sending a response")
+    )
+    await _evaluate_policy_via_omnigent(
+        server_client=_ChainOkServerClient(),
+        harness_client=harness,
+        conversation_id=conv,
+        evaluation_id="poleval_chain",
+        phase="PHASE_TOOL_CALL",
+        data={"name": "mcp__github__merge_pull_request", "arguments": {}},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+
+    await asyncio.gather(consume_task, return_exceptions=True)
+    await _chain_spin_until(lambda: adapter._current_ctx is None)
+    return app, conv
+
+
+async def test_three_factor_chain_self_heals_and_recovers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Fix LIVE: the chained recovery fails CLOSED, self-heals, and recovers."""
+    executor = _DispatchParkingExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with caplog.at_level(logging.ERROR, logger=_ADAPTER_LOGGER_RECOVERY):
+        app, conv = await _run_three_factor_chain(adapter)
+
+        verdict = await adapter._stable_policy_evaluator("PHASE_TOOL_CALL", {})
+        assert verdict.action == "POLICY_ACTION_DENY"
+
+        for _ in range(_ORPHAN_RESYNC_THRESHOLD):
+            result = await adapter._stable_tool_executor("Bash", {"command": "ls"})
+            assert result["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+
+    text = caplog.text
+    assert "defaulting to POLICY_ACTION_DENY" in text
+    assert "returning ALLOW by default" not in text
+    assert "defaulting to POLICY_ACTION_ALLOW" not in text
+    assert "forcing Tier-1 SDK reset" in text
+    assert adapter._orphan_callback_count < _ORPHAN_RESYNC_THRESHOLD
+
+    statuses = _chain_drain_status_events(app.state.session_event_queues, conv)
+    assert all(
+        s.get("error", {}).get("code") != _RUNNER_TURN_CONTEXT_DESYNC_CODE for s in statuses
+    ), statuses
+    assert conv not in app.state.desync_terminalized
+
+    cont_executor = _DispatchParkingExecutor(events=[_RecoveryTurnComplete(response="ok")])
+    adapter._executor_factory = lambda: cont_executor
+    cont_resp = await _chain_start_turn_stream(adapter, _chain_request("continuation work"))
+    cont_consume: asyncio.Task[None] = asyncio.create_task(
+        _chain_drain_stream(cont_resp.body_iterator)
+    )
+
+    await _chain_spin_until(lambda: _chain_wedged_dispatch_call_id(adapter) is not None)
+    cont_call_id = _chain_wedged_dispatch_call_id(adapter)
+    assert cont_call_id is not None and cont_call_id != "call_inflight"
+
+    await adapter._handle_tool_result_event(_chain_tool_result(cont_call_id, "dispatched-live"))
+    await asyncio.gather(cont_consume, return_exceptions=True)
+    await _chain_spin_until(lambda: adapter._current_ctx is None)
+    assert adapter._orphan_callback_count == 0
+
+
+async def test_three_factor_chain_fix_disabled_reproduces_wedge(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NEGATIVE CONTROL: with the fix toggled OFF, the chain WEDGES (from real code)."""
+    monkeypatch.setattr(_adapter_mod_recovery, "FAIL_CLOSED_PHASES", ())
+    monkeypatch.setattr(_adapter_mod_recovery, "_ORPHAN_RESYNC_THRESHOLD", 10**9)
+
+    executor = _DispatchParkingExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with caplog.at_level(logging.ERROR, logger=_ADAPTER_LOGGER_RECOVERY):
+        await _run_three_factor_chain(adapter)
+
+        verdict = await adapter._stable_policy_evaluator("PHASE_TOOL_CALL", {})
+        assert verdict.action == "POLICY_ACTION_ALLOW"
+
+        n_orphans = _ORPHAN_RESYNC_THRESHOLD_DEFAULT_RECOVERY * 2
+        for _ in range(n_orphans):
+            result = await adapter._stable_tool_executor("Bash", {"command": "ls"})
+            assert result["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+
+    text = caplog.text
+    assert "policy evaluator fired with no active turn context (phase=PHASE_TOOL_CALL" in text
+    assert "defaulting to POLICY_ACTION_ALLOW" in text
+    assert "tool callback fired with no active turn context (tool=" in text
+    assert "returning error" in text
+    assert "forcing Tier-1 SDK reset" not in text
+    assert adapter._orphan_callback_count >= n_orphans
+
+
+async def test_runner_recovery_publishes_single_recovery_terminal_status() -> None:
+    """Fix LIVE (runner half): a recovery signal with NO buffer yields ONE status."""
+    conv = "conv_runner_recovery"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    app.state.active_turns[conv] = None
+
+    async def _on_delivery_failure(cid: str) -> None:
+        await app.state.resync_turn_state(cid, "verdict_delivery_channel_dead")
+
+    harness = _ChainDeadChannelHarnessClient(
+        httpx.RemoteProtocolError("Server disconnected without sending a response")
+    )
+    await _evaluate_policy_via_omnigent(
+        server_client=_ChainOkServerClient(),
+        harness_client=harness,
+        conversation_id=conv,
+        evaluation_id="poleval_runner",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+
+    assert harness.attempts == 2
+    assert conv not in app.state.active_turns
+    statuses = _chain_drain_status_events(app.state.session_event_queues, conv)
+    assert len(statuses) == 1, statuses
+    assert statuses[0]["status"] == "failed"
+    assert statuses[0]["error"]["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+    assert conv in app.state.desync_terminalized
+
+
+async def test_negative_control_runner_legacy_swallow_leaves_turn_wedged() -> None:
+    """NEGATIVE CONTROL (runner half): legacy log-and-swallow leaves the wedge."""
+    conv = "conv_legacy_wedge"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    app.state.active_turns[conv] = None
+
+    harness = _ChainDeadChannelHarnessClient(
+        httpx.RemoteProtocolError("Server disconnected without sending a response")
+    )
+    await _evaluate_policy_via_omnigent(
+        server_client=_ChainOkServerClient(),
+        harness_client=harness,
+        conversation_id=conv,
+        evaluation_id="poleval_legacy",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=None,
+    )
+
+    assert conv in app.state.active_turns
+    assert _chain_drain_status_events(app.state.session_event_queues, conv) == []
+    assert conv not in app.state.desync_terminalized
+
+
+def _fake_entry(harness: str, model: str | None, returncode: int | None = None) -> Any:
+    """Build a ``_SubprocessEntry`` with a fake process + client."""
+    from omnigent.runtime.harnesses.process_manager import _SubprocessEntry
+
+    class _FakeProc:
+        def __init__(self, rc: int | None) -> None:
+            self.returncode = rc
+
+    return _SubprocessEntry(
+        process=_FakeProc(returncode),  # type: ignore[arg-type]
+        client=object(),  # type: ignore[arg-type]
+        endpoint=None,  # type: ignore[arg-type]
+        harness=harness,
+        model=model,
+    )
+
+
+async def test_get_client_signals_resync_on_model_and_agent_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gap 1 (process-manager half): a model/agent-switch respawn fires the hook."""
+    from omnigent.runtime.harnesses.process_manager import (
+        HarnessProcessManager,
+        _model_env_key,
+    )
+
+    pm = HarnessProcessManager()
+    pm._started = True
+    signals: list[tuple[str, str, str]] = []
+
+    async def _hook(conv_id: str, reason: str, replaced_response_id: str) -> None:
+        signals.append((conv_id, reason, replaced_response_id))
+
+    pm.set_respawn_hook(_hook)
+
+    closed: list[Any] = []
+
+    async def _fake_close(entry: Any) -> None:
+        closed.append(entry)
+
+    async def _fake_spawn(conv_id: str, harness: str, env: Any) -> Any:
+        del conv_id
+        return _fake_entry(harness, (env or {}).get(_model_env_key(harness)))
+
+    monkeypatch.setattr(pm, "_close_entry", _fake_close)
+    monkeypatch.setattr(pm, "_spawn_entry", _fake_spawn)
+
+    conv = "conv_pm_switch"
+    harness = "claude-sdk"
+    model_key = _model_env_key(harness)
+
+    pm._entries[conv] = _fake_entry(harness, "model-A")
+    pm._in_flight_response_ids[conv] = "resp_live_1"
+
+    await pm.get_client(conv, harness, env={model_key: "model-B"})
+    assert signals == [(conv, "harness_respawn_model_switch", "resp_live_1")]
+    assert len(closed) == 1
+
+    signals.clear()
+    await pm.get_client(conv, harness, env={model_key: "model-B"})
+    assert signals == []
+
+    signals.clear()
+    pm._in_flight_response_ids[conv] = "resp_live_2"
+    await pm.get_client(conv, "openai-agents", env={})
+    assert signals == [(conv, "harness_respawn_agent_switch", "resp_live_2")]
+
+    signals.clear()
+    pm._entries[conv] = _fake_entry("openai-agents", "model-A")
+    pm._in_flight_response_ids.pop(conv, None)
+    await pm.get_client(conv, "openai-agents", env={model_key: "model-B"})
+    assert signals == []
+
+    signals.clear()
+    pm._entries[conv] = _fake_entry("openai-agents", None, returncode=1)
+    pm._in_flight_response_ids[conv] = "resp_dead"
+    await pm.get_client(conv, "openai-agents", env={})
+    assert signals == []
+
+
+async def test_get_client_isolates_respawn_hook_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising respawn hook must NOT break harness acquisition."""
+    from omnigent.runtime.harnesses.process_manager import (
+        HarnessProcessManager,
+        _model_env_key,
+    )
+
+    pm = HarnessProcessManager()
+    pm._started = True
+
+    async def _boom_hook(conv_id: str, reason: str, replaced_response_id: str) -> None:
+        del conv_id, reason, replaced_response_id
+        raise RuntimeError("resync adapter blew up")
+
+    pm.set_respawn_hook(_boom_hook)
+
+    async def _fake_close(entry: Any) -> None:
+        del entry
+
+    spawned: list[Any] = []
+
+    async def _fake_spawn(conv_id: str, harness: str, env: Any) -> Any:
+        del conv_id
+        entry = _fake_entry(harness, (env or {}).get(_model_env_key(harness)))
+        spawned.append(entry)
+        return entry
+
+    monkeypatch.setattr(pm, "_close_entry", _fake_close)
+    monkeypatch.setattr(pm, "_spawn_entry", _fake_spawn)
+
+    conv = "conv_pm_hook_boom"
+    harness = "claude-sdk"
+    model_key = _model_env_key(harness)
+    pm._entries[conv] = _fake_entry(harness, "model-A")
+    pm._in_flight_response_ids[conv] = "resp_live"
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.runtime.harnesses.process_manager"):
+        client = await pm.get_client(conv, harness, env={model_key: "model-B"})
+
+    assert spawned
+    assert client is spawned[-1].client
+    assert pm._entries[conv] is spawned[-1]
+    assert "respawn resync hook failed" in caplog.text
+
+
+async def test_respawn_adapter_gates_on_active_turn() -> None:
+    """Gap 1 (runner gate): the respawn adapter only resyncs the MATCHING turn."""
+    conv = "conv_respawn_gate"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    assert pm.respawn_hook is not None
+
+    await pm.respawn_hook(conv, "harness_respawn_model_switch", "resp_gone")
+    assert _chain_drain_status_events(app.state.session_event_queues, conv) == []
+    assert conv not in app.state.desync_terminalized
+
+    app.state.active_turns[conv] = None
+    app.state.live_response_id[conv] = "resp_new"
+    await pm.respawn_hook(conv, "harness_respawn_model_switch", "resp_old")
+    assert conv in app.state.active_turns
+    assert _chain_drain_status_events(app.state.session_event_queues, conv) == []
+
+    app.state.active_turns[conv] = None
+    app.state.live_response_id[conv] = "resp_wedged"
+    await pm.respawn_hook(conv, "harness_respawn_model_switch", "resp_wedged")
+    assert conv not in app.state.active_turns
+    statuses = _chain_drain_status_events(app.state.session_event_queues, conv)
+    assert len(statuses) == 1, statuses
+    assert statuses[0]["status"] == "failed"
+    assert statuses[0]["error"]["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+
+
+async def _run_respawn_chain(
+    adapter: ExecutorAdapter,
+) -> tuple[Any, str, asyncio.Task[None], _ChainProcessManager]:
+    """Wire a real in-flight turn + buffered message, then fire the respawn hook."""
+    conv = "conv_respawn_chain"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    assert pm.respawn_hook is not None
+
+    resp = await _chain_start_turn_stream(adapter, _chain_request("primary turn"))
+    consume_task: asyncio.Task[None] = asyncio.create_task(_chain_drain_stream(resp.body_iterator))
+    pm.consume_task = consume_task
+    await _chain_spin_until(lambda: _chain_wedged_dispatch_call_id(adapter) is not None)
+    app.state.active_turns[conv] = None
+    app.state.live_response_id[conv] = "resp_wedged"
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        buffered = await client.post(
+            f"/v1/sessions/{conv}/events",
+            json={"type": "message", "role": "user", "content": "after the switch"},
+        )
+    assert buffered.status_code == 202
+    assert app.state.session_message_buffers.get(conv)
+
+    assert adapter._orphan_callback_count == 0
+    await pm.respawn_hook(conv, "harness_respawn_model_switch", "resp_wedged")
+    return app, conv, consume_task, pm
+
+
+async def test_model_switch_mid_turn_orphan_burst_next_turn_recovers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Gap 1+2 headline: mid-turn model switch → resync at respawn → recovers."""
+    executor = _DispatchParkingExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with caplog.at_level(logging.ERROR, logger=_ADAPTER_LOGGER_RECOVERY):
+        app, conv, consume_task, pm = await _run_respawn_chain(adapter)
+
+        assert conv not in app.state.active_turns
+        await asyncio.gather(consume_task, return_exceptions=True)
+        await _chain_spin_until(lambda: adapter._current_ctx is None)
+        statuses = _chain_drain_status_events(app.state.session_event_queues, conv)
+        assert all(
+            s.get("error", {}).get("code") != _RUNNER_TURN_CONTEXT_DESYNC_CODE for s in statuses
+        ), statuses
+
+        await _chain_spin_until(
+            lambda: (
+                conv not in app.state.desynced_sessions
+                and not app.state.session_message_buffers.get(conv)
+                and conv in pm.cleared_in_flight
+            )
+        )
+        assert conv not in app.state.desynced_sessions
+        assert not app.state.session_message_buffers.get(conv)
+        assert conv in pm.cleared_in_flight
+
+        adapter._ensure_executor()
+        out = await adapter._stable_tool_executor("sys_os_shell", {"command": "ls"})
+        assert out["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+        assert adapter._executor is None
+
+    assert "forcing Tier-1 SDK reset" in caplog.text
+
+    cont_executor = _DispatchParkingExecutor(events=[_RecoveryTurnComplete(response="ok")])
+    adapter._executor_factory = lambda: cont_executor
+    cont_resp = await _chain_start_turn_stream(adapter, _chain_request("continuation work"))
+    cont_consume: asyncio.Task[None] = asyncio.create_task(
+        _chain_drain_stream(cont_resp.body_iterator)
+    )
+    await _chain_spin_until(lambda: _chain_wedged_dispatch_call_id(adapter) is not None)
+    cont_call_id = _chain_wedged_dispatch_call_id(adapter)
+    assert cont_call_id is not None
+    await adapter._handle_tool_result_event(_chain_tool_result(cont_call_id, "dispatched-live"))
+    await asyncio.gather(cont_consume, return_exceptions=True)
+    await _chain_spin_until(lambda: adapter._current_ctx is None)
+    assert adapter._orphan_callback_count == 0
+
+
+async def test_respawn_without_hook_leaves_turn_wedged() -> None:
+    """NEGATIVE CONTROL (gap 1): no respawn signal → the turn stays wedged."""
+    conv = "conv_respawn_nohook"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    app.state.active_turns[conv] = None
+    app.state.session_message_buffers[conv] = [
+        {"content": "after the switch", "conversation_id": conv}
+    ]
+
+    assert conv in app.state.active_turns
+    assert _chain_drain_status_events(app.state.session_event_queues, conv) == []
+    assert conv not in app.state.desync_terminalized
+    assert app.state.session_message_buffers.get(conv)
+
+
+async def test_factor2_verdict_post_remoteprotocolerror_retries_then_signals() -> None:
+    """Factor #2: the verdict POST raising ``RemoteProtocolError`` signals recovery."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _ChainDeadChannelHarnessClient(
+        httpx.RemoteProtocolError("Server disconnected without sending a response")
+    )
+    await _evaluate_policy_via_omnigent(
+        server_client=_ChainOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_factor2",
+        evaluation_id="poleval_factor2",
+        phase="PHASE_TOOL_CALL",
+        data={"name": "mcp__github__merge_pull_request", "arguments": {}},
+        on_delivery_failure=_on_delivery_failure,
+    )
+
+    assert harness.attempts == 2
+    assert signaled == ["conv_factor2"]
+
+
+async def test_factor3_new_message_lands_in_real_buffer(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Factor #3: a new message lands in the real ``buffering ...`` branch."""
+    conv = "conv_factor3"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.active_turns[conv] = None
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        with caplog.at_level(logging.INFO, logger=_APP_LOGGER_RECOVERY):
+            resp = await client.post(
+                f"/v1/sessions/{conv}/events",
+                json={"type": "message", "role": "user", "content": "second message"},
+            )
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["status"] == "buffered"
+    assert "buffering message for active turn" in caplog.text
+    buffered = app.state.session_message_buffers.get(conv)
+    assert buffered
+    assert buffered[-1]["content"] == "second message"
+    assert buffered[-1]["conversation_id"] == conv

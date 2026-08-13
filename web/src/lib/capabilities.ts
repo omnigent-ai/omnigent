@@ -92,6 +92,12 @@ export interface ServerInfo {
    */
   sandbox_provider: string | null;
   /**
+   * Every launch-capable sandbox provider, in configured order — one
+   * new-session picker row each. Empty or absent falls back to the single
+   * ``sandbox_provider`` row. Read via :func:`sandboxProviderOptions`.
+   */
+  sandbox_providers?: string[];
+  /**
    * Server session-sharing policy. Drives whether the SPA shows the
    * Share control (``"on"``), restricts it to read-only invites
    * (``"read_only"``), or hides it entirely (``"off"``), in lockstep
@@ -160,6 +166,7 @@ const FALLBACK_SERVER_INFO: ServerInfo = {
   databricks_features: false,
   managed_sandboxes_enabled: false,
   sandbox_provider: null,
+  sandbox_providers: [],
   // Sharing fails OPEN (opposite of the other caps): a failed probe must
   // not silently disable sharing, so the sentinel is the permissive "on".
   sharing_mode: "on",
@@ -219,6 +226,9 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           managed_sandboxes_enabled: data.managed_sandboxes_enabled === true,
           sandbox_provider:
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
+          sandbox_providers: Array.isArray(data.sandbox_providers)
+            ? data.sandbox_providers.filter((p): p is string => typeof p === "string")
+            : [],
           sharing_mode: SHARING_MODES.includes(data.sharing_mode as SharingMode)
             ? (data.sharing_mode as SharingMode)
             : "on",
@@ -298,4 +308,17 @@ export function sandboxOptionLabel(provider: string | null): string {
   const name =
     SANDBOX_PROVIDER_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
   return `${name} Sandbox`;
+}
+
+/**
+ * Provider ids to offer as new-session sandbox rows.
+ *
+ * Falls back to the single ``sandbox_provider`` when the server reports
+ * no list; ``[null]`` yields one row with the generic label. Tolerates a
+ * missing list (a hand-built ServerInfo) rather than throwing on render.
+ */
+export function sandboxProviderOptions(info: ServerInfo): (string | null)[] {
+  const offered = info.sandbox_providers;
+  if (Array.isArray(offered) && offered.length > 0) return offered;
+  return [info.sandbox_provider];
 }

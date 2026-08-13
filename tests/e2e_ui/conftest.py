@@ -55,6 +55,7 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
+from tests._helpers.compat import apply_server_env, compat_server_cwd, server_executable
 from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
 from tests.codex_parity.sidecar_harness import (
     CodexResponsesSidecar,
@@ -951,9 +952,8 @@ def live_server(
     # OMNIGENT_RUNNER_TUNNEL_TOKEN lets the server accept
     # exactly the sibling runner's WebSocket tunnel.
     mock_url = mock_llm_server_url
-    env = {
+    env: dict[str, str] = {
         **os.environ,
-        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
         "OMNIGENT_BUILTIN_AGENT_DIRS": os.pathsep.join(builtin_dirs),
         # Point the openai-agents harness at the mock LLM server so no
@@ -966,11 +966,21 @@ def live_server(
         # WS /v1/dictation/stream transcribes any audio into FAKE_SCRIPT,
         # so chat/test_dictation.py needs no sherpa models or real ASR.
         "OMNIGENT_DICTATION_ENGINE": os.environ.get("OMNIGENT_DICTATION_ENGINE", "fake"),
+        # In compat mode the server binary runs from the pinned old venv, but
+        # the SPA was built from HEAD into _BUILD_OUTPUT. Point the old server
+        # at that directory so it serves the HEAD bundle instead of whatever
+        # stale (or absent) bundle ships in its own site-packages.
+        "OMNIGENT_WEB_UI_DIST": str(_BUILD_OUTPUT),
     }
+    # In normal runs, prepend the worktree so the server imports from the
+    # checked-out source. In compat mode (OMNIGENT_COMPAT_SERVER_PYTHON set),
+    # drop PYTHONPATH so the pinned old build in the compat venv resolves
+    # instead of being shadowed by the worktree.
+    apply_server_env(env, _REPO_ROOT)
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime; closed in finally
     proc = subprocess.Popen(
         [
-            sys.executable,
+            server_executable(),
             # Equivalent of the unit tests' ``monkeypatch.setattr(presence,
             # "_LEAVE_GRACE_S", ...)``, but applied INSIDE this spawned
             # interpreter — a monkeypatch in the test process can't reach a
@@ -996,6 +1006,9 @@ def live_server(
             str(agent_yaml_path),
         ],
         env=env,
+        # Compat mode: neutral CWD so the worktree doesn't shadow the pinned
+        # old server install via sys.path[0]. None (inherit) in normal runs.
+        cwd=compat_server_cwd(),
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )

@@ -22,6 +22,7 @@ LLM turn whose timing would make it flaky.
 from __future__ import annotations
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 _WORKING = '[data-testid="working-indicator"]'
@@ -52,6 +53,7 @@ def _publish_status(
     resp.raise_for_status()
 
 
+@pytest.mark.compat_smoke
 def test_bare_idle_clears_working_indicator(
     page: Page,
     seeded_session: tuple[str, str],

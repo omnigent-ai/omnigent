@@ -199,3 +199,119 @@ def test_embedded_agent_forwards_env_passthrough(_isolate_config: Path) -> None:
     )
     env = _build_acp_spawn_env(spec)
     assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == "XAI_API_KEY"
+
+
+def test_embedded_agent_overrides_config_lookup(_isolate_config: Path) -> None:
+    """An embedded agent is used even when the slug is configured.
+
+    When a one-shot embedded agent is present, it takes precedence over a
+    config-based lookup so the client-side resolution can work with remote
+    servers: the local runner resolves acp:<slug> and embeds it, bypassing
+    the need for the server to have that agent configured.
+    """
+    _write_acp_config(_isolate_config)  # write config with goose and others
+    # Now pass an embedded agent with a different command
+    env = _build_acp_spawn_env(
+        _make_spec(
+            harness="acp:goose",
+            acp_agent={
+                "name": "Different Goose",
+                "command": "goose acp --custom-flag",
+            },
+        )
+    )
+    # The embedded command is used, not the one from config
+    assert env["HARNESS_ACP_COMMAND"] == "goose acp --custom-flag"
+    assert env["HARNESS_ACP_NAME"] == "Different Goose"
+
+
+@pytest.mark.parametrize(
+    "agent_fields",
+    [
+        # Qwen-shaped agent: client-side session id + send model
+        {
+            "name": "Qwen",
+            "command": "qwen --acp",
+            "session_id_mode": "client",
+            "send_model": True,
+            "model": "qwen-vl-max",
+            "expected_session_id_mode": "client",
+            "expected_send_model": True,
+            "expected_model": "qwen-vl-max",
+        },
+        # Agent with MCP disabled
+        {
+            "name": "Custom",
+            "command": "custom acp",
+            "omnigent_mcp": False,
+            "expected_omnigent_mcp": False,
+        },
+        # Agent with environment passthrough
+        {
+            "name": "GrokAgent",
+            "command": "grok agent stdio",
+            "env_passthrough": ["XAI_API_KEY"],
+            "expected_env_passthrough": "XAI_API_KEY",
+        },
+        # Agent with model only
+        {
+            "name": "TestAgent",
+            "command": "test --acp",
+            "model": "test-model-v1",
+            "expected_model": "test-model-v1",
+        },
+    ],
+)
+def test_embedded_agent_round_trip_preserves_all_fields(
+    agent_fields: dict,
+) -> None:
+    """Embedded agents preserve all fields through the round-trip.
+
+    What breaks if this fails: an agent configured with non-default values
+    (e.g. Qwen with `session_id_mode: client`, OpenClaw with
+    `omnigent_mcp: false`) silently loses these settings when launched via
+    `--harness acp:<slug>`, causing incorrect spawn behavior at runtime.
+    Example: Qwen expects the runner to generate the session id but switches
+    to server mode, fails to send the model, and breaks Qwen's response
+    generation.
+    """
+    agent_dict = {
+        "name": agent_fields["name"],
+        "command": agent_fields["command"],
+    }
+    # Add optional fields that were declared
+    for field in ("model", "session_id_mode", "send_model", "omnigent_mcp", "env_passthrough"):
+        if field in agent_fields:
+            agent_dict[field] = agent_fields[field]
+
+    env = _build_acp_spawn_env(_make_spec(harness="acp:test", acp_agent=agent_dict))
+
+    # Core fields always present
+    assert env["HARNESS_ACP_COMMAND"] == agent_fields["command"]
+    assert env["HARNESS_ACP_NAME"] == agent_fields["name"]
+
+    # session_id_mode preservation
+    if "expected_session_id_mode" in agent_fields:
+        assert env["HARNESS_ACP_SESSION_ID_MODE"] == agent_fields["expected_session_id_mode"], (
+            f"session_id_mode not preserved: got {env.get('HARNESS_ACP_SESSION_ID_MODE')}"
+        )
+
+    # send_model preservation
+    if "expected_send_model" in agent_fields:
+        if agent_fields["expected_send_model"]:
+            assert env["HARNESS_ACP_SEND_MODEL"] == "1"
+        else:
+            assert "HARNESS_ACP_SEND_MODEL" not in env
+
+    # omnigent_mcp preservation
+    if "expected_omnigent_mcp" in agent_fields:
+        expected_mcp = "1" if agent_fields["expected_omnigent_mcp"] else "0"
+        assert env["HARNESS_ACP_OMNIGENT_MCP"] == expected_mcp
+
+    # model preservation
+    if "expected_model" in agent_fields:
+        assert env["HARNESS_ACP_MODEL"] == agent_fields["expected_model"]
+
+    # env_passthrough preservation
+    if "expected_env_passthrough" in agent_fields:
+        assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == agent_fields["expected_env_passthrough"]

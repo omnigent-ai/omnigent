@@ -19,9 +19,11 @@ from typing import Any
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 
+from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
     HostHelloFrame,
     HostListDirFrame,
@@ -110,6 +112,18 @@ def fs_app(
         create_hosts_router(registry, host_store, conv_store),
         prefix="/v1",
     )
+
+    @app.exception_handler(OmnigentError)
+    async def _handle_omnigent_error(
+        request: Request,
+        exc: OmnigentError,
+    ) -> JSONResponse:
+        """Convert application errors to structured JSON responses."""
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
     return app, registry, host_store, conv_store
 
 
@@ -425,20 +439,21 @@ async def test_list_filesystem_offline_host_returns_409(
     fs_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
     """
-    Verify a request for a host whose tunnel is closed returns 409.
+    Verify a request for an offline host returns 409.
 
-    The host record exists in the DB but is not in the registry
+    The host record exists in the DB but is offline and not in the registry
     — list_dir requires a live tunnel so the only sensible
     response is "host is offline" (409 Conflict, mirroring the
     launch endpoint).
     """
     app, _reg, host_store, _cs = fs_app
-    # Persist the host record but never register a tunnel.
+    # Persist the host record as offline and never register a tunnel.
     host_store.upsert_on_connect(
         host_id="3d9665477127e41f42de3f4109418173",
         name="offline-host",
         user_id="local",
     )
+    host_store.set_offline("3d9665477127e41f42de3f4109418173")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get("/v1/hosts/3d9665477127e41f42de3f4109418173/filesystem")
     assert resp.status_code == 409

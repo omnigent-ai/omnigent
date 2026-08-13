@@ -9,11 +9,12 @@ import urllib.parse
 import webbrowser
 from collections.abc import Callable
 
-# Databricks workspace-hosted omnigent: the API proxy and the web UI are
-# mounted on different workspace paths. ``conversation_url`` maps the
-# server (API) base onto the UI mount so browser links land on the SPA
-# instead of the JSON API.
-WORKSPACE_API_PATH = "/api/2.0/omnigent"
+# The workspace-hosted API mount (routing-relevant shape) lives in cli_auth
+# next to the header builder that keys off it; the browser-link helpers below
+# only need it to map the API base onto the UI mount. The UI mount is a
+# browser-link concern, so it stays here.
+from omnigent.cli_auth import WORKSPACE_API_PATH
+
 WORKSPACE_UI_PATH = "/omnigent"
 
 # Client-side SPA route for one conversation (see web/src/App.tsx's
@@ -47,22 +48,6 @@ def strip_conversation_path(url: str) -> str:
     return urllib.parse.urlunsplit(
         (parsed.scheme, parsed.netloc, trimmed, parsed.query, parsed.fragment)
     )
-
-
-def is_workspace_hosted_url(base_url: str) -> bool:
-    """
-    Whether *base_url* is a Databricks workspace-hosted Omnigent mount.
-
-    True for the API proxy mount (``https://<ws>/api/2.0/omnigent``) the
-    CLI connects to on a workspace. Used to suppress UI a workspace
-    deployment shouldn't surface (e.g. the startup banner's server-version
-    row, since a workspace build reports no meaningful version string).
-
-    :param base_url: Omnigent server base URL, e.g.
-        ``"https://example.databricks.com/api/2.0/omnigent"``.
-    :returns: ``True`` when the URL path is the workspace API mount.
-    """
-    return urllib.parse.urlsplit(base_url.rstrip("/")).path == WORKSPACE_API_PATH
 
 
 def display_server_url(base_url: str) -> str:

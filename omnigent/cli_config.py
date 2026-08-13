@@ -2136,6 +2136,40 @@ def _launch_goose_configure() -> str | None:
     return "Provider not detected yet"
 
 
+def _show_acp_cli_harness(name: str) -> None:
+    """Show install + sign-in instructions for one builtin ACP CLI harness.
+
+    These harnesses own their credentials (``OWN_AUTH``) and install out-of-band,
+    so there is nothing for Omnigent to store or run on the user's behalf — the
+    drill-in reports what it can and names the two commands. Read-only: it
+    changes no config, which is why it's a display rather than a manage loop.
+
+    :param name: The :data:`ACP_CLI_HARNESSES` row key, e.g. ``"grok"``.
+    """
+    from omnigent._platform import resolve_cli_binary
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+    from omnigent.onboarding.interactive import console
+
+    row = ACP_CLI_HARNESSES.get(name)
+    if row is None:  # defensive: a stale key from a concurrent config change
+        return
+
+    installed = resolve_cli_binary(row.binary) is not None
+    console.print(f"\n  [bold]{row.label}[/bold] — ACP agent (owns its own auth)")
+    if installed:
+        console.print(f"    ✓ `{row.binary}` found on PATH")
+    else:
+        hint = row.install.install_hint or row.binary
+        console.print(
+            f"    ○ `{row.binary}` not found. Install with:\n        [bold]{hint}[/bold]"
+        )
+    if row.login_command:
+        console.print(f"    Sign in with:\n        [bold]{row.login_command}[/bold]")
+    if row.install.auth_hint:
+        console.print(f"    {row.install.auth_hint}")
+    console.print(f"    Launch with: [bold]omnigent run --harness {name}[/bold]\n")
+
+
 def _manage_goose_harness() -> None:
     """Run the level-2 loop for Goose: ensure the CLI, then guide ``goose configure``.
 
@@ -3475,6 +3509,7 @@ def _run_configure_harnesses_interactive() -> None:
     _ACP_IMPORT = "\x00acp-import-openclaw"
     _ACP_ADD = "\x00acp-add"
     _ACP_AGENT_PREFIX = "\x00acp-agent:"
+    _ACP_CLI_PREFIX = "\x00acp-cli:"
     families = [ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE]
 
     # Status glyph + Rich color per readiness kind: "ready" is a configured,
@@ -3752,6 +3787,39 @@ def _run_configure_harnesses_interactive() -> None:
                     (_GOOSE, "Goose", "Not configured", "warn", "Open to run `goose configure`."),
                 )
 
+        # Builtin ACP CLI harnesses (omnigent/acp_cli_harnesses.py) — vendor CLIs
+        # that speak ACP on stdio. Derived from the catalog so adding a row there
+        # surfaces it here too; without this they were addressable via
+        # `--harness <name>` but invisible in setup, making a shipped harness less
+        # discoverable than a user's own `acp:` entry.
+        from omnigent._platform import resolve_cli_binary
+        from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+        for _acp_cli_name, _acp_cli_row in sorted(ACP_CLI_HARNESSES.items()):
+            _acp_cli_key = _ACP_CLI_PREFIX + _acp_cli_name
+            if resolve_cli_binary(_acp_cli_row.binary) is None:
+                rows.append(
+                    (
+                        _acp_cli_key,
+                        _acp_cli_row.label,
+                        "Not installed",
+                        "missing",
+                        _install_hint(_acp_cli_row.install.install_hint or _acp_cli_row.binary),
+                    )
+                )
+            else:
+                # The vendor owns its auth, so we can report the binary is present
+                # but not whether it is signed in.
+                rows.append(
+                    (
+                        _acp_cli_key,
+                        _acp_cli_row.label,
+                        "ACP · own auth",
+                        "ready",
+                        "Select for install and sign-in instructions.",
+                    )
+                )
+
         # Copilot — GitHub token (github-copilot-sdk extra is soft).
         if copilot_github_token_configured(config) or any(
             os.environ.get(v) for v in COPILOT_TOKEN_ENV_VARS
@@ -3939,6 +4007,8 @@ def _run_configure_harnesses_interactive() -> None:
             _add_acp_agent()
         elif isinstance(selected_target, str) and selected_target.startswith(_ACP_AGENT_PREFIX):
             _manage_acp_agent(selected_target[len(_ACP_AGENT_PREFIX) :])
+        elif isinstance(selected_target, str) and selected_target.startswith(_ACP_CLI_PREFIX):
+            _show_acp_cli_harness(selected_target[len(_ACP_CLI_PREFIX) :])
         elif selected_target == _HERMES:
             _manage_hermes_harness()
         elif selected_target == _KIRO:

@@ -1804,8 +1804,10 @@ async def supervise_forwarder(
     if client is None:
         client = client_for_transport(app_server_url, client_name="omnigent-codex-forwarder")
         await client.connect()
-    async with httpx.AsyncClient(
-        base_url=base_url,
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(
+        base_url,
         headers=headers,
         auth=auth,
         timeout=httpx.Timeout(30.0),

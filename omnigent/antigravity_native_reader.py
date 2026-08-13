@@ -3269,8 +3269,10 @@ async def run_reader_with_bridge(
     # would keep targeting the rotated-away session).
     current = {"session_id": session_id}
 
-    async with httpx.AsyncClient(
-        base_url=base_url,
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(
+        base_url,
         headers=headers,
         auth=auth,
         timeout=httpx.Timeout(_READER_CLIENT_TIMEOUT_SECONDS),

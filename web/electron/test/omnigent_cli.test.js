@@ -20,6 +20,7 @@ const {
   parseDaemonRecord,
   daemonServerUrl,
   getHostConnectionFast,
+  localHostId,
 } = require("../src/omnigent_cli");
 
 describe("normalizeServerUrl", () => {
@@ -310,5 +311,18 @@ describe("getHostConnectionFast — probe destination & token handling (S1)", ()
 
     assert.equal(calls.length, 1);
     assert.equal(calls[0].headers.Authorization, undefined);
+  });
+});
+
+describe("localHostId", () => {
+  // The id is memoized process-wide, so this is the ONLY case that may call
+  // localHostId — a second one would read the cache, not the mocked file.
+  it("strips the legacy host_ prefix so the id matches a /v1/hosts row", () => {
+    mock.method(fs, "readFileSync", () => "host:\n  host_id: host_abc123\n  name: laptop\n");
+
+    // The renderer compares this against host_id as a plain string, so the
+    // prefixed form would make "this machine" unmatchable in the host list.
+    assert.equal(localHostId(), "abc123");
+    assert.equal(localHostId(), "abc123");
   });
 });

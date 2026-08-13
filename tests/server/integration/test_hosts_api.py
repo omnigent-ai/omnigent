@@ -9,10 +9,11 @@ from pathlib import Path
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
@@ -117,6 +118,18 @@ def _build_host_api_app(
         create_hosts_router(registry, host_store, conv_store),
         prefix="/v1",
     )
+
+    @app.exception_handler(OmnigentError)
+    async def _handle_omnigent_error(
+        request: Request,
+        exc: OmnigentError,
+    ) -> JSONResponse:
+        """Convert application errors to structured JSON responses."""
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
     return app, registry, host_store, conv_store
 
 
@@ -1194,14 +1207,15 @@ async def test_resolve_host_launch_enforces_host_and_session_ownership(
 
     # Host known but offline (in the store, no live connection) → 409.
     host_store.upsert_on_connect("3d9665477127e41f42de3f4109418173", "alice-old", "alice@test.com")
-    with pytest.raises(HTTPException) as exc:
+    host_store.set_offline("3d9665477127e41f42de3f4109418173")
+    with pytest.raises(OmnigentError) as exc:
         resolve_host_launch(
             user_id="alice@test.com",
             host_id="3d9665477127e41f42de3f4109418173",
             session_id=conv.id,
             **stores,
         )
-    assert exc.value.status_code == 409
+    assert exc.value.code == ErrorCode.CONFLICT
 
 
 async def test_launch_runner_rejects_other_users_session(

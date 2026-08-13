@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
+import pytest
 from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm
@@ -50,6 +51,7 @@ def _fail_stream_then_recover(page: Page, session_id: str) -> list[int]:
     return attempts
 
 
+@pytest.mark.compat_smoke
 def test_transient_stream_404_recovers_without_manual_reload(
     page: Page,
     seeded_session: tuple[str, str],
