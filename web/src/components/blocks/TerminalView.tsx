@@ -161,6 +161,13 @@ export function TerminalView({
   // 4400 wrong-replica close. If keyless still fails with 4400, the host is
   // genuinely unreachable — stop retrying.
   const keylessRef = useRef(false);
+  // Bumped by every attach so an in-flight attach can tell it has been
+  // superseded — a ref callback can re-run for the *same* node, which
+  // leaves no other way to retire the previous attempt's async work.
+  const attachGenerationRef = useRef(0);
+  // Abort handle for the outgoing attach's direct-upgrade probe, which
+  // otherwise holds a loopback socket open for its full timeout.
+  const upgradeCtlRef = useRef<AbortController | null>(null);
 
   // Stable dispatcher: updates local state and notifies the parent.
   const notifyState = useCallback((next: ConnectionState) => {
@@ -200,6 +207,17 @@ export function TerminalView({
   const attachSession = useCallback(
     (node: HTMLDivElement | null) => {
       if (node === null) return;
+      // React re-runs a ref callback for the *same* node whenever the
+      // callback's identity changes — here, when the runner's
+      // direct-attach advert lands after mount. Retire the previous
+      // attach before touching the node: otherwise xterm stacks a
+      // second instance inside it (two helper textareas, two
+      // renderers) and the superseded upgrade watcher later re-dials
+      // on top of the session that replaced it.
+      const generation = (attachGenerationRef.current += 1);
+      upgradeCtlRef.current?.abort();
+      disposeActiveSession();
+      node.replaceChildren();
       // Reset to ``connecting`` for every fresh attach so a stale
       // overlay from a previous mount doesn't flash during the
       // handshake. The session's WS ``open`` handler transitions us
@@ -219,13 +237,17 @@ export function TerminalView({
       let terminalSession: TerminalSession | null = null;
       let cancelled = false;
       const upgradeCtl = new AbortController();
+      upgradeCtlRef.current = upgradeCtl;
+      // Superseded by a later attach on this node? React 18 never calls
+      // the ref cleanup, so `cancelled` alone can't catch that case.
+      const superseded = () => cancelled || attachGenerationRef.current !== generation;
       void (async () => {
         // The awaited microtask preserves the StrictMode-collapse
         // behavior queueMicrotask provided; the URL resolution (when a
-        // direct URL exists) adds real async time, so re-check
-        // `cancelled` after every await.
+        // direct URL exists) adds real async time, so re-check after
+        // every await.
         await Promise.resolve();
-        if (cancelled) return;
+        if (superseded()) return;
         // Route this WS to the replica holding the session's runner tunnel
         // (key = the session's host_id). A browser WS can't set request
         // headers, so the key rides the query string. Only against a
@@ -245,7 +267,7 @@ export function TerminalView({
         // direct only when the loopback listener is already known
         // reachable; otherwise it returns the relay URL immediately.
         const url = await resolveInitialAttachUrl(directUrl, relayUrl);
-        if (cancelled) return;
+        if (superseded()) return;
         terminalSession = new TerminalSession(
           node,
           url,
@@ -264,7 +286,7 @@ export function TerminalView({
         // pick the direct URL.
         if (directUrl !== undefined && url === relayUrl) {
           const upgraded = await watchDirectUpgrade(directUrl, upgradeCtl.signal);
-          if (cancelled || !upgraded) return;
+          if (superseded() || !upgraded) return;
           disposeActiveSession();
           setConnectAttempt((attempt) => attempt + 1);
         }
