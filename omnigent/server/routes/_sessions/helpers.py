@@ -3867,6 +3867,16 @@ def _publish_runner_mcp_startup_failures(session_id: str, failures: dict[str, st
     published anything and left failures as a log line only. This
     routes that same data into the existing event/cache/UI band.
 
+    Shares ``_session_mcp_startup_cache`` with :func:`_publish_mcp_startup`.
+    That's safe only because a given session's harness routing never mixes
+    the two publishers: a native-forwarder session never also calls this
+    function, and vice versa. If that ever changed, a native ``"starting"``
+    snapshot cached for a session could be folded to ``"ready"`` by a
+    runner ``tools/list`` snapshot that simply doesn't mention that server
+    (see the fold loop below) — this function has no way to distinguish
+    "healthy and not in *failures*" from "not this publisher's server to
+    report on".
+
     Unlike the native forwarder, the runner has no explicit startup
     sequence to mirror — only a snapshot of which servers failed
     this call. Previously-failed servers absent from the new
