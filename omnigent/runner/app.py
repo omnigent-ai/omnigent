@@ -7791,6 +7791,12 @@ def create_runner_app(
             on_client_interaction=entry.instance.note_client_interaction,
         )
 
+    # Reused by the loopback direct-attach listener (see
+    # ``omnigent.runner.direct_attach``): same attach handler served on a
+    # token-gated 127.0.0.1 port so a same-machine browser can skip the
+    # server relay.
+    app.state.terminal_attach_handler = terminal_resource_attach_ws
+
     async def _require_os_env(session_id: str) -> AgentSpec | None:
         spec = await _resolve_session_agent_spec(session_id)
         if spec is not None and getattr(spec, "os_env", None) is None:

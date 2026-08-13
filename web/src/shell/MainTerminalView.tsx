@@ -197,6 +197,7 @@ export function MainTerminalView({
                     readOnly={readOnly}
                     transport={activeTerminal.transport}
                     active={visible}
+                    directAttachUrl={activeTerminal.directAttachUrl}
                     onStateChange={(state) => {
                       setTerminalConnectionState(activeTerminal.id, state);
                     }}
