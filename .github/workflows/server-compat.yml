@@ -41,9 +41,16 @@ on:
       - "omnigent/runner/app.py"
       - "omnigent/host/frames.py"
       - "omnigent/runner/transports/**"
+      - "omnigent/server/app.py"
+      - "web/src/lib/sessionsApi.ts"
+      - "web/src/lib/sse.ts"
+      - "web/src/lib/capabilities.ts"
       - "tests/e2e/test_server_runner_compat_smoke.py"
+      - "tests/e2e_ui/test_server_compat_smoke.py"
+      - "tests/e2e_ui/conftest.py"
       - "tests/_helpers/compat.py"
       - ".github/actions/compat-smoke-run/**"
+      - ".github/actions/compat-smoke-ui-run/**"
       - ".github/workflows/server-compat.yml"
 
 concurrency:
@@ -121,6 +128,23 @@ jobs:
         with:
           server_version: ${{ needs.resolve-latest.outputs.latest_tag }}
           artifact_suffix: "-config2"
+
+  compat-smoke-ui:
+    name: "Compat smoke – UI (new SPA / old server ${{ needs.resolve-latest.outputs.latest_tag }})"
+    needs: resolve-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+          fetch-depth: 0
+      - name: Run UI compat smoke
+        uses: ./.github/actions/compat-smoke-ui-run
+        with:
+          server_version: ${{ needs.resolve-latest.outputs.latest_tag }}
+          artifact_suffix: "-ui"
 
   # ── Full pairwise matrix (schedule + dispatch only) ────────────────────────
   # Compute the full pairwise (server, runner) matrices. Integration is the

@@ -55,6 +55,7 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
+from tests._helpers.compat import apply_server_env, compat_server_cwd, server_executable
 from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
 from tests.codex_parity.sidecar_harness import (
     CodexResponsesSidecar,
@@ -283,6 +284,52 @@ def pytest_configure(config: pytest.Config) -> None:
             "tests/e2e_ui must run headless in CI. Remove --headed; headed "
             "browser windows are only allowed for local debugging."
         )
+
+
+# ── Server-version skip (mirrors tests/e2e/conftest.py) ──────────────────────
+
+
+@pytest.fixture(scope="session")
+def server_version(live_server: str) -> str:
+    """Version reported by the live server (``GET /v1/info``).
+
+    In compat mode the server is a pinned older build, so this can differ
+    from the installed (test-process) version.
+
+    :param live_server: Base URL of the live server.
+    :returns: The server version string, e.g. ``"0.9.0"``.
+    """
+    from tests._helpers.compat import resolve_server_version
+
+    return resolve_server_version(live_server)
+
+
+@pytest.fixture(autouse=True)
+def _enforce_min_server_version(request: pytest.FixtureRequest) -> None:
+    """Skip tests marked ``@pytest.mark.min_server_version(X)`` on older servers.
+
+    Only resolves ``server_version`` (and starts the live server) when
+    the marker is present or a compat run is active
+    (``OMNIGENT_COMPAT_SERVER_VERSION`` set).
+
+    :param request: The pytest request.
+    """
+    import os as _os
+
+    from tests._helpers.compat import meets_min_server_version
+
+    marker = request.node.get_closest_marker("min_server_version")
+    compat_pinned = _os.environ.get("OMNIGENT_COMPAT_SERVER_VERSION")
+    if marker is None and not compat_pinned:
+        return
+    server_ver = request.getfixturevalue("server_version")
+    if marker is None:
+        return
+    if not marker.args:
+        raise pytest.UsageError("min_server_version marker requires a version argument")
+    required = marker.args[0]
+    if not meets_min_server_version(server_ver, required):
+        pytest.skip(f"requires server >= {required}; running {server_ver}")
 
 
 @pytest.fixture(scope="session")
@@ -951,9 +998,8 @@ def live_server(
     # OMNIGENT_RUNNER_TUNNEL_TOKEN lets the server accept
     # exactly the sibling runner's WebSocket tunnel.
     mock_url = mock_llm_server_url
-    env = {
+    env: dict[str, str] = {
         **os.environ,
-        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
         "OMNIGENT_BUILTIN_AGENT_DIRS": os.pathsep.join(builtin_dirs),
         # Point the openai-agents harness at the mock LLM server so no
@@ -967,10 +1013,15 @@ def live_server(
         # so chat/test_dictation.py needs no sherpa models or real ASR.
         "OMNIGENT_DICTATION_ENGINE": os.environ.get("OMNIGENT_DICTATION_ENGINE", "fake"),
     }
+    # In normal runs, prepend the worktree so the server imports from the
+    # checked-out source. In compat mode (OMNIGENT_COMPAT_SERVER_PYTHON set),
+    # drop PYTHONPATH so the pinned old build in the compat venv resolves
+    # instead of being shadowed by the worktree.
+    apply_server_env(env, _REPO_ROOT)
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime; closed in finally
     proc = subprocess.Popen(
         [
-            sys.executable,
+            server_executable(),
             # Equivalent of the unit tests' ``monkeypatch.setattr(presence,
             # "_LEAVE_GRACE_S", ...)``, but applied INSIDE this spawned
             # interpreter — a monkeypatch in the test process can't reach a
@@ -996,6 +1047,9 @@ def live_server(
             str(agent_yaml_path),
         ],
         env=env,
+        # Compat mode: neutral CWD so the worktree doesn't shadow the pinned
+        # old server install via sys.path[0]. None (inherit) in normal runs.
+        cwd=compat_server_cwd(),
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )
