@@ -599,6 +599,19 @@ function SubagentRow({
   const Icon = brandChildIcon(child) ?? iconForAgentType(child.tool);
   const primary = childPrimaryLabel(child);
   const isActive = conversationId === child.id;
+  const effectiveModel = child.model_override ?? child.routed_model;
+  const modelLabel = effectiveModel ? shortModelName(formatModelDisplayName(effectiveModel)) : null;
+  const effortLabel = child.reasoning_effort;
+  const modelEffortTitle = [
+    effectiveModel
+      ? child.model_override
+        ? `Model: ${effectiveModel}`
+        : `Smart routing picked ${effectiveModel}`
+      : null,
+    effortLabel ? `Reasoning effort: ${effortLabel}` : null,
+  ]
+    .filter((part): part is string => part !== null)
+    .join(" · ");
   // De-emphasize settled rows (done/idle) so working/failed agents dominate
   // — but never the row the user is currently viewing.
   const dim = !isActive && SETTLED_STATE[status.activity];
@@ -657,32 +670,21 @@ function SubagentRow({
             )}
             <Icon className="size-3.5 shrink-0 text-muted-foreground" />
             <span className="shrink-0 truncate text-sm font-medium">{primary}</span>
-            {(child.model_override ?? child.routed_model) ? (
-              // Keep the effective pinned model beside the effort badge. Older
-              // servers only provide routed_model, so retain that fallback.
+            {modelLabel || effortLabel ? (
+              // Keep model and effort in one cue, matching the composer's
+              // foreground model plus muted effort treatment.
               <Badge
-                data-testid="subagent-model"
-                title={
-                  child.routed_model
-                    ? `Smart routing picked ${child.routed_model}`
-                    : `Model: ${child.model_override}`
-                }
+                data-testid="subagent-model-effort"
+                title={modelEffortTitle}
                 variant="outline"
-                className="h-4 max-w-32 shrink-0 truncate px-1 font-mono text-[10px] font-normal"
+                className="h-4 max-w-44 shrink-0 truncate gap-0 px-1 text-[10px] font-normal text-muted-foreground"
               >
-                {shortModelName(
-                  formatModelDisplayName(child.model_override ?? child.routed_model ?? ""),
+                {modelLabel && <span className="font-mono text-foreground">{modelLabel}</span>}
+                {effortLabel && (
+                  <span className={cn("text-muted-foreground", modelLabel && "ml-1")}>
+                    {modelLabel ? ` | ${effortLabel}` : effortLabel}
+                  </span>
                 )}
-              </Badge>
-            ) : null}
-            {child.reasoning_effort ? (
-              <Badge
-                data-testid="subagent-reasoning-effort"
-                title={`Reasoning effort: ${child.reasoning_effort}`}
-                variant="outline"
-                className="h-4 shrink-0 px-1 text-[10px] font-normal capitalize"
-              >
-                {child.reasoning_effort}
               </Badge>
             ) : null}
             <span className="flex-1" />
