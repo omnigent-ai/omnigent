@@ -108,9 +108,11 @@ runs:
       shell: bash
       run: uv run playwright install --with-deps chromium
 
-    - name: "Build HEAD SPA (Config A: new SPA / old server)"
-      # Skipped in Config B — the old SPA is built from the release tag instead.
-      if: ${{ inputs.ui_version == '' }}
+    - name: Build HEAD SPA
+      # Always build the HEAD SPA so the built_spa fixture's tombstone assertion
+      # passes. In Config B OMNIGENT_WEB_UI_DIST is then set to the old bundle,
+      # so the server serves that instead — but the HEAD build must exist for the
+      # fixture's structural check.
       shell: bash
       env:
         NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
@@ -170,14 +172,11 @@ runs:
         else
           echo "Could not locate built SPA under $src" >&2; exit 1
         fi
-        cp -r "$built" "$dist"
-        # Also copy into the HEAD checkout's static dir so --ui-skip-build's
-        # _assert_service_worker_tombstone check (which always looks at
-        # omnigent/server/static/web-ui/) finds a populated build.
-        head_static="${GITHUB_WORKSPACE}/omnigent/server/static/web-ui"
-        rm -rf "$head_static"
-        cp -r "$built" "$head_static"
-        echo "OMNIGENT_WEB_UI_DIST=$head_static" >> "$GITHUB_ENV"
+        # Set OMNIGENT_WEB_UI_DIST so the HEAD server serves this old bundle.
+        # The HEAD SPA is still built above (built_spa fixture needs it for the
+        # tombstone assertion); the server uses OMNIGENT_WEB_UI_DIST to override
+        # which bundle it actually mounts.
+        echo "OMNIGENT_WEB_UI_DIST=$built" >> "$GITHUB_ENV"
 
     - name: Run UI compat tests
       shell: bash
