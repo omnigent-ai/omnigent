@@ -1744,7 +1744,7 @@ class PiExecutor(Executor):
             budget. ``None`` resolves to ``RetryPolicy()`` defaults.
             See Phase 1f of ``designs/RETRY_ACROSS_HARNESSES.md``.
         :param bundle_dir: The agent bundle's extracted on-disk path.
-            When set, ``<bundle_dir>/skills/<name>/SKILL.md`` files
+            When set, ``<bundle_dir>/skills/<dir>/SKILL.md`` files
             are exposed to Pi via ``--skill <path>`` based on
             *skills_filter*. ``None`` skips bundle-skill wiring.
         :param agent_name: Optional agent display name. Reserved for

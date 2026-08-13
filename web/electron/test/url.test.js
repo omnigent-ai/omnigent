@@ -12,6 +12,8 @@ const {
   isPlainHttpRemote,
   expandDatabricksWorkspaceUrl,
   WORKSPACE_UI_PATH,
+  fetchServerManifest,
+  PRE_MANIFEST_BASELINE,
 } = require("../src/url");
 
 describe("defaultSchemeFor", () => {
@@ -222,5 +224,178 @@ describe("expandDatabricksWorkspaceUrl", () => {
 
   it("returns unparseable input unchanged", async () => {
     assert.equal(await expandDatabricksWorkspaceUrl("not a url"), "not a url");
+  });
+});
+
+/** A JSON Response stand-in for the manifest fetch. */
+function fakeJsonResponse(body, { ok = true, contentType = "application/json" } = {}) {
+  return {
+    ok,
+    headers: { get: (name) => (name.toLowerCase() === "content-type" ? contentType : null) },
+    json: async () => {
+      if (typeof body === "string") throw new SyntaxError("Unexpected token");
+      return body;
+    },
+  };
+}
+
+describe("fetchServerManifest", () => {
+  it("reads a well-formed manifest", async () => {
+    await withFetch(
+      async (url) => {
+        assert.equal(url, "http://localhost:6767/.well-known/omnigent.json");
+        return fakeJsonResponse({
+          manifest_version: 1,
+          server_version: "0.6.0",
+          min_desktop_version: null,
+          ui: { server_picker: "sidebar" },
+        });
+      },
+      async () => {
+        const m = await fetchServerManifest("http://localhost:6767/");
+        assert.equal(m.manifestVersion, 1);
+        assert.equal(m.serverVersion, "0.6.0");
+        assert.equal(m.minDesktopVersion, null);
+        assert.equal(m.ui.server_picker, "sidebar");
+      },
+    );
+  });
+
+  it("treats a 404 as the pre-manifest baseline, not an error", async () => {
+    // Every server older than the manifest route 404s here. This is THE
+    // backwards-compat path: a new shell against an old server must connect
+    // normally, so the absence resolves to a usable manifest.
+    await withFetch(
+      async () => fakeJsonResponse({}, { ok: false }),
+      async () => {
+        const m = await fetchServerManifest("http://localhost:6767/");
+        assert.deepEqual(m, PRE_MANIFEST_BASELINE);
+        // Fails a `>= 1` gate without the caller testing for null.
+        assert.ok(!(m.manifestVersion >= 1));
+      },
+    );
+  });
+
+  it("ignores an HTML body from an SPA catch-all", async () => {
+    // An older server without `.well-known` on its API allowlist serves
+    // index.html with 200 for unknown paths. Parsing that as a manifest would
+    // be worse than having none, so the content type is checked.
+    await withFetch(
+      async () => fakeJsonResponse("<!doctype html>", { contentType: "text/html; charset=utf-8" }),
+      async () => {
+        assert.deepEqual(
+          await fetchServerManifest("http://localhost:6767/"),
+          PRE_MANIFEST_BASELINE,
+        );
+      },
+    );
+  });
+
+  it("falls back when the server is unreachable", async () => {
+    await withFetch(
+      async () => {
+        throw new Error("ECONNREFUSED");
+      },
+      async () => {
+        assert.deepEqual(
+          await fetchServerManifest("http://localhost:6767/"),
+          PRE_MANIFEST_BASELINE,
+        );
+      },
+    );
+  });
+
+  it("falls back on malformed JSON", async () => {
+    await withFetch(
+      async () => fakeJsonResponse("{ not json"),
+      async () => {
+        assert.deepEqual(
+          await fetchServerManifest("http://localhost:6767/"),
+          PRE_MANIFEST_BASELINE,
+        );
+      },
+    );
+  });
+
+  it("falls back when manifest_version is missing or not a number", async () => {
+    // Each body swaps the process-global fetch, so the cases must run serially.
+    /* oxlint-disable no-await-in-loop */
+    for (const body of [{}, { manifest_version: "1" }, { manifest_version: NaN }, null, 42]) {
+      await withFetch(
+        async () => fakeJsonResponse(body),
+        async () => {
+          assert.deepEqual(
+            await fetchServerManifest("http://localhost:6767/"),
+            PRE_MANIFEST_BASELINE,
+            `expected baseline for body ${JSON.stringify(body)}`,
+          );
+        },
+      );
+    }
+    /* oxlint-enable no-await-in-loop */
+  });
+
+  it("keeps a NEWER envelope usable and preserves unknown fields", async () => {
+    // The other direction: an OLD shell against a NEWER server. A bumped
+    // envelope and unfamiliar ui shapes must not be rejected — the shell reads
+    // what it knows and passes the rest through, which is what lets the server
+    // add capabilities without waiting for shells to update.
+    await withFetch(
+      async () =>
+        fakeJsonResponse({
+          manifest_version: 99,
+          server_version: "9.9.9",
+          min_desktop_version: null,
+          ui: { server_picker: "some-future-shape", future_thing: { nested: true } },
+          brand_new_top_level_key: "ignored but harmless",
+        }),
+      async () => {
+        const m = await fetchServerManifest("http://localhost:6767/");
+        assert.equal(m.manifestVersion, 99);
+        assert.ok(m.manifestVersion >= 1, "a newer envelope still passes a >=1 gate");
+        assert.equal(m.ui.server_picker, "some-future-shape");
+        assert.deepEqual(m.ui.future_thing, { nested: true });
+      },
+    );
+  });
+
+  it("coerces wrong-typed optional fields instead of failing", async () => {
+    await withFetch(
+      async () =>
+        fakeJsonResponse({
+          manifest_version: 1,
+          server_version: 42,
+          min_desktop_version: [],
+          ui: "not-an-object",
+        }),
+      async () => {
+        const m = await fetchServerManifest("http://localhost:6767/");
+        // The envelope is valid, so the manifest is used — but each unusable
+        // field degrades on its own rather than discarding the whole document.
+        assert.equal(m.manifestVersion, 1);
+        assert.equal(m.serverVersion, null);
+        assert.equal(m.minDesktopVersion, null);
+        assert.deepEqual(m.ui, {});
+      },
+    );
+  });
+
+  it("returns the baseline for an unparseable server URL", async () => {
+    assert.deepEqual(await fetchServerManifest("not a url"), PRE_MANIFEST_BASELINE);
+  });
+
+  it("requests the manifest at the origin root, ignoring any path", async () => {
+    // A workspace-mounted server (…/ml/omnigents) still serves the manifest at
+    // the ORIGIN root — well-known URIs are origin-scoped by RFC 8615.
+    await withFetch(
+      async (url) => {
+        assert.equal(url, "https://ws.example.com/.well-known/omnigent.json");
+        return fakeJsonResponse({ manifest_version: 1 });
+      },
+      async () => {
+        const m = await fetchServerManifest("https://ws.example.com/ml/omnigents");
+        assert.equal(m.manifestVersion, 1);
+      },
+    );
   });
 });

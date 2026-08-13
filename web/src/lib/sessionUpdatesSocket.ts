@@ -16,7 +16,8 @@
 // id list is NEVER trusted from the client for authorization — the server
 // access-checks every watched id against the connection's user.
 
-import { resolveWebSocketUrl } from "@/lib/host";
+import { getOmnigentHostConfig, resolveWebSocketUrl } from "@/lib/host";
+import { modalHostId } from "@/lib/sessionHost";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
 
 /** A frame pushed by the server over the updates stream. */
@@ -61,10 +62,32 @@ function nextReconnectDelay(failedAttempts: number): number {
  * (whether served by the Omnigent server directly or through the Vite dev proxy),
  * and an embedding host rebases it onto its proxied WS surface.
  *
+ * When a host fetcher is installed, append `?omnigent_slice_key=<frozen modal
+ * host>`. A browser WebSocket handshake can't set request headers, so the
+ * routing key rides the query string (the same seam the terminal-attach WS
+ * uses). This WS watches sessions across MANY hosts, so no single key is
+ * "correct" — it's a NICE-TO-HAVE load/perf lever: keying by the modal host
+ * (the one backing most of the user's sessions) lands the standing rescan on
+ * the replica most likely holding their sessions' tunnels, so the per-session
+ * status read hits that replica's warm relay cache instead of the cross-replica
+ * fallback, and spreads the standing connections finer than per-tenant.
+ * Correctness is unaffected (the rescan reads are replica-safe).
+ *
+ * The key comes from {@link modalHostId}, which is resolved once and never
+ * changes for the page — so every auto-reconnect rebuilds the identical URL and
+ * never re-keys (no connection churn). The provider only calls `start()` once
+ * the modal host is resolved (see `isModalHostResolved`), so this reads a
+ * settled value. Omitted on an unsharded server and when no host was picked.
+ *
  * @returns The fully-qualified WebSocket URL.
  */
 function buildUpdatesUrl(): string {
-  return resolveWebSocketUrl("/v1/sessions/updates");
+  const path = "/v1/sessions/updates";
+  if (!getOmnigentHostConfig().fetcher) return resolveWebSocketUrl(path);
+  const sliceKey = modalHostId();
+  return resolveWebSocketUrl(
+    sliceKey ? `${path}?omnigent_slice_key=${encodeURIComponent(sliceKey)}` : path,
+  );
 }
 
 /**

@@ -231,7 +231,7 @@ def arm_smart_routing_session(
         body["workspace"] = workspace
     try:
         with httpx.Client(
-            base_url=base_url, headers=_headers(base_url), timeout=_TIMEOUT
+            base_url=base_url, headers=_headers(base_url, host_id=host_id), timeout=_TIMEOUT
         ) as client:
             resp = client.post("/v1/sessions", json=body)
             if resp.status_code >= 400:
@@ -292,7 +292,7 @@ def known_host_id(*, base_url: str, host_id: str | None) -> str | None:
     """
     if host_id is None:
         return None
-    payload = _get_json(base_url=base_url, path="/v1/hosts")
+    payload = _get_json(base_url=base_url, path="/v1/hosts", host_id=host_id)
     hosts = payload.get("hosts") if isinstance(payload, dict) else None
     if not isinstance(hosts, list):
         return None
@@ -311,7 +311,7 @@ def _gateway_inference_for_host(*, base_url: str, host_id: str) -> dict[str, Any
     :returns: The map, or ``None`` when the host, the field, or the request is
         unavailable (all of which mean "unknown", which does not gate).
     """
-    payload = _get_json(base_url=base_url, path="/v1/hosts")
+    payload = _get_json(base_url=base_url, path="/v1/hosts", host_id=host_id)
     hosts = payload.get("hosts") if isinstance(payload, dict) else None
     if not isinstance(hosts, list):
         return None
@@ -343,19 +343,23 @@ def _gateway_state(gateway: dict[str, Any], harness: str) -> Any:
     return None
 
 
-def _headers(base_url: str) -> dict[str, str]:
+def _headers(base_url: str, *, host_id: str | None) -> dict[str, str]:
     """
     Auth headers for *base_url*, matching every other CLI server call.
 
     :param base_url: Omnigent server base URL.
+    :param host_id: This machine's host id for the slice-key header, or
+        ``None``. Required kwarg because ``_remote_headers`` makes it required
+        (host_id sharding, commit 615383a) — a preflight read that omitted it
+        used to crash before the routing decision ran.
     :returns: Header mapping, possibly empty for a local server.
     """
     from omnigent.chat import _remote_headers
 
-    return _remote_headers(server_url=base_url)
+    return _remote_headers(server_url=base_url, host_id=host_id)
 
 
-def _get_json(*, base_url: str, path: str) -> dict[str, Any]:
+def _get_json(*, base_url: str, path: str, host_id: str | None = None) -> dict[str, Any]:
     """
     GET *path* and return its JSON object, or ``{}`` on any failure.
 
@@ -366,11 +370,15 @@ def _get_json(*, base_url: str, path: str) -> dict[str, Any]:
 
     :param base_url: Omnigent server base URL.
     :param path: Request path, e.g. ``"/v1/info"``.
+    :param host_id: This machine's host id for the slice-key header, or
+        ``None`` (the ``/v1/info`` availability probe needs no host routing).
     :returns: The decoded object, or ``{}``.
     """
     try:
         with httpx.Client(
-            base_url=base_url, headers=_headers(base_url), timeout=_PREFLIGHT_TIMEOUT
+            base_url=base_url,
+            headers=_headers(base_url, host_id=host_id),
+            timeout=_PREFLIGHT_TIMEOUT,
         ) as client:
             resp = client.get(path)
             if resp.status_code >= 400:

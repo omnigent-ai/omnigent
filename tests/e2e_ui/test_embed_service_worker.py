@@ -1,17 +1,21 @@
-"""Build-output guard for the PWA embed island.
+"""Build-output guard: the embed island ships no service worker.
 
-Companion to ``conftest._assert_pwa_build`` (which guards the *standalone* SPA
-build in the ``built_spa`` fixture): this asserts the **embed island** ships no
-service worker or web manifest. The island is mounted inside a host application
-(e.g. Databricks), so it must never register a SW or precache anything — that is
-why ``vite.embed.config.ts`` omits the ``emitPwaAssets`` plugin and never mounts
-``PWAUpdateBanner``. A regression that added either would hijack the host page's
-origin with our service worker.
+Companion to ``conftest._assert_service_worker_tombstone`` (which guards the
+*standalone* SPA build in the ``built_spa`` fixture): this asserts the **embed
+island** ships no service worker or web manifest. The island is mounted inside a
+host application (e.g. Databricks), so it must never register a worker or
+precache anything — that is why ``vite.embed.config.ts`` omits the
+``emitServiceWorkerTombstone`` plugin. A regression that added one would hijack
+the host page's origin with our service worker.
 
-Note: the install icons under ``public/`` *are* copied into the embed output
-(Vite copies ``publicDir`` for every build) — but they are inert images. Only a
-service worker or web manifest could affect the host's origin, so those (plus
-the ``workbox-`` runtime) are precisely what this guard forbids.
+This outlives the retired PWA: the standalone build's ``sw.js`` is now only a
+tombstone that unregisters itself, but the embed island must ship neither that
+nor any future worker.
+
+Note: icons under ``public/`` *are* copied into the embed output (Vite copies
+``publicDir`` for every build) — but they are inert images. Only a service worker
+or web manifest could affect the host's origin, so those (plus the ``workbox-``
+runtime) are precisely what this guard forbids.
 
 Part of the gated e2e suite (needs ``npm`` + a vite build); see this package's
 ``conftest`` module docstring for how the suite is run and excluded from the
@@ -57,7 +61,7 @@ def test_embed_build_ships_no_service_worker(built_spa: None, tmp_path: Path) ->
         and (p.name == "sw.js" or p.suffix == ".webmanifest" or p.name.startswith("workbox-"))
     )
     assert not leaked, (
-        f"embed island leaked PWA/service-worker assets {leaked} — the embed "
-        "build must not emit a service worker or manifest (it loads inside a "
-        "host app's origin)"
+        f"embed island leaked service-worker assets {leaked} — the embed build "
+        "must not emit a service worker or manifest (it loads inside a host "
+        "app's origin)"
     )

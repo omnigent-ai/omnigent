@@ -12,7 +12,7 @@ import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
-import { resolveWebSocketUrl } from "@/lib/host";
+import { isDatabricksWorkspace, resolveWebSocketUrl } from "@/lib/host";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import {
   readTerminalThemeMode,
@@ -20,12 +20,14 @@ import {
   subscribeTerminalTheme,
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
+import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
 import {
   type ConnectionState,
   type TerminalActivityListener,
   type TerminalInputListener,
   isUnexpectedTerminalClose,
   TerminalSession,
+  WS_CLOSE_WRONG_REPLICA,
 } from "./TerminalSession";
 
 /**
@@ -82,6 +84,14 @@ interface TerminalViewProps {
    * behavior the UI renders for.
    */
   transport?: "control" | "pty";
+  /**
+   * False while the surface is mounted but hidden (a pre-warmed attach
+   * kept alive behind the chat view). The session stays connected either
+   * way; on the hidden→visible edge the terminal takes keyboard focus —
+   * the WS-open auto-focus is a browser no-op on a hidden element.
+   * Default true.
+   */
+  active?: boolean;
 }
 
 export function TerminalView({
@@ -94,6 +104,7 @@ export function TerminalView({
   onResume,
   resumePending = false,
   transport,
+  active = true,
 }: TerminalViewProps) {
   // Control mode: xterm owns the buffer + mouse, so plain drag selects and
   // the normal copy gesture works — no forced-selection modifier, no hint bar.
@@ -135,6 +146,10 @@ export function TerminalView({
   onActivityRef.current = onActivity;
   const onInputRef = useRef(onInput);
   onInputRef.current = onInput;
+  // Track whether this terminal has already tried a keyless re-dial after a
+  // 4400 wrong-replica close. If keyless still fails with 4400, the host is
+  // genuinely unreachable — stop retrying.
+  const keylessRef = useRef(false);
 
   // Stable dispatcher: updates local state and notifies the parent.
   const notifyState = useCallback((next: ConnectionState) => {
@@ -194,9 +209,19 @@ export function TerminalView({
       let cancelled = false;
       queueMicrotask(() => {
         if (cancelled) return;
+        // Route this WS to the replica holding the session's runner tunnel
+        // (key = the session's host_id). A browser WS can't set request
+        // headers, so the key rides the query string. Only against a
+        // Databricks workspace-hosted server — an unsharded server needs no key,
+        // and a hostless session yields none.
+        const computedHostId = (() => {
+          if (keylessRef.current || !isDatabricksWorkspace()) return undefined;
+          const h = getSessionHost(sessionId);
+          return h && !isHostKeyless(h) ? h : undefined;
+        })();
         terminalSession = new TerminalSession(
           node,
-          buildAttachUrl(sessionId, terminalId, readOnly, transport),
+          buildAttachUrl(sessionId, terminalId, readOnly, computedHostId, transport),
           notifyState,
           isDarkRef.current,
           notifyActivity,
@@ -229,6 +254,30 @@ export function TerminalView({
     sessionRef.current?.setTheme(isDark);
   }, [isDark]);
 
+  // On the hidden→visible edge of a pre-warmed surface: focus the
+  // terminal (the session's WS-open focus is a no-op while the element is
+  // hidden — visibility:hidden elements aren't focusable), and if the
+  // transport dropped while the surface sat in the background — possibly
+  // exhausting the reconnect budget with nobody watching — retry
+  // immediately with a fresh budget. Reveal is a user signal, exactly
+  // like the visibilitychange redial for frozen tabs. Deliberate closes
+  // (4xxx) keep the dead-end overlay as ever.
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const wasActiveRef = useRef(active);
+  useEffect(() => {
+    if (active && !wasActiveRef.current) {
+      sessionRef.current?.focus();
+      const current = stateRef.current;
+      if (current.kind === "closed" && isUnexpectedTerminalClose(current.code)) {
+        reconnectAttemptsRef.current = 0;
+        disposeActiveSession();
+        setConnectAttempt((attempt) => attempt + 1);
+      }
+    }
+    wasActiveRef.current = active;
+  }, [active, disposeActiveSession]);
+
   // Push code-font changes (Settings → Appearance) into the live session the
   // same way — xterm is a fixed-pixel widget, so it can't follow a CSS variable
   // like the chrome font and must be told imperatively. The subscription
@@ -257,6 +306,24 @@ export function TerminalView({
     // "connecting" (a re-dial in flight) keeps the pending flag;
     // "error" is transient and always followed by a close event.
     if (state.kind !== "closed") return;
+    // Wrong-replica close (4400): the keyed request reached the wrong replica.
+    // Mark the host keyless so the next dial skips the key, and re-dial
+    // immediately without backoff (the correct route is one handshake away).
+    // One-shot: if we're ALREADY keyless and still get 4400, the host is
+    // genuinely unreachable from here — stop, don't loop.
+    if (state.code === WS_CLOSE_WRONG_REPLICA) {
+      if (keylessRef.current) {
+        setReconnectPending(false);
+        return;
+      }
+      keylessRef.current = true;
+      const hostId = getSessionHost(sessionId);
+      if (hostId) markHostKeyless(hostId);
+      setReconnectPending(true);
+      disposeActiveSession();
+      setConnectAttempt((attempt) => attempt + 1);
+      return;
+    }
     if (!isUnexpectedTerminalClose(state.code)) {
       setReconnectPending(false);
       return;
@@ -298,7 +365,7 @@ export function TerminalView({
       window.clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [state, disposeActiveSession]);
+  }, [state, disposeActiveSession, sessionId]);
 
   return (
     <div
@@ -476,15 +543,21 @@ export function buildAttachPath(
   sessionId: string,
   terminalId: string,
   readOnly: boolean,
+  hostId?: string,
   transport?: string,
 ): string {
   const path =
     `/v1/sessions/${encodeURIComponent(sessionId)}` +
     `/resources/terminals/${encodeURIComponent(terminalId)}/attach`;
-  // Only emit query params when set — the server defaults keep the common
-  // case's URLs short and stable for anything that greps the access log.
+  // Query params are only emitted when set, so the common (unsharded) case
+  // keeps URLs short and stable for anything that greps the access log.
+  // ``omnigent_slice_key`` pins this WebSocket to the replica holding the
+  // tunnel: a browser WS handshake can't carry request headers, so the routing
+  // key rides the query string — the one part of the handshake page JS controls
+  // — and the server ignores it as an app param.
   const params = new URLSearchParams();
   if (readOnly) params.set("read_only", "true");
+  if (hostId) params.set("omnigent_slice_key", hostId);
   if (transport) params.set("transport", transport);
   const qs = params.toString();
   return qs ? `${path}?${qs}` : path;
@@ -500,6 +573,8 @@ export function buildAttachPath(
  * :param sessionId: Session/conversation identifier.
  * :param terminalId: Opaque terminal resource id.
  * :param readOnly: If true, requests a read-only attach.
+ * :param hostId: The session's host_id, forwarded as the routing key
+ *     ``?omnigent_slice_key=``.
  * :param transport: Optional per-attach transport override.
  * :returns: The fully-qualified ``ws(s)://`` URL.
  */
@@ -507,9 +582,10 @@ function buildAttachUrl(
   sessionId: string,
   terminalId: string,
   readOnly: boolean,
+  hostId?: string,
   transport?: string,
 ): string {
   // Delegates origin/prefix resolution to the embed host when present
   // (standalone falls back to the current page's origin).
-  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, transport));
+  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, hostId, transport));
 }

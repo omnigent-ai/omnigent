@@ -84,6 +84,7 @@ from omnigent.runtime import (
     get_runner_ws_factory,
     get_terminal_registry,
 )
+from omnigent.server._runner_ws_tunnel import WrongReplicaWSError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import ConversationStore
@@ -92,6 +93,7 @@ from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_NOT_FOUND,
+    WS_CLOSE_WRONG_REPLICA,
     bridge_tmux_pty_to_websocket,
 )
 
@@ -99,6 +101,7 @@ _logger = logging.getLogger(__name__)
 
 _WS_CLOSE_TERMINAL_NOT_FOUND: Final[int] = WS_CLOSE_TERMINAL_NOT_FOUND
 _WS_CLOSE_INTERNAL_ERROR: Final[int] = WS_CLOSE_INTERNAL_ERROR
+_WS_CLOSE_WRONG_REPLICA: Final[int] = WS_CLOSE_WRONG_REPLICA
 
 
 def create_terminal_attach_router(
@@ -180,6 +183,17 @@ def create_terminal_attach_router(
             )
             try:
                 runner_cm = ws_factory(runner_path)
+            except WrongReplicaWSError:
+                # Wrong-replica routing miss: the runner tunnel is bound but not
+                # on this replica (the key routed here, but the host homed its
+                # tunnel elsewhere). Signal 4400 so the client re-dials WITHOUT
+                # the key and reaches the replica that holds the tunnel — the WS
+                # analogue of the fetch path's keyless re-address on a 400.
+                await websocket.close(
+                    code=_WS_CLOSE_WRONG_REPLICA,
+                    reason="host on another replica; retry without slice key",
+                )
+                return
             except Exception:  # noqa: BLE001
                 await websocket.close(
                     code=_WS_CLOSE_INTERNAL_ERROR,

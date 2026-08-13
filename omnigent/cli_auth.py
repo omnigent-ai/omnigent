@@ -25,7 +25,12 @@ import os
 import stat
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import httpx
 
 _logger = logging.getLogger(__name__)
 _TOKEN_FILE_NAME = "auth_tokens.json"
@@ -277,6 +282,34 @@ def load_databricks_org_id(server_url: str) -> str | None:
 # workspace request by this header (equivalently to the ``?o=`` query param).
 DATABRICKS_ORG_ID_HEADER = "X-Databricks-Org-Id"
 
+# Replica-routing header for a host-sharded deployment. The sharding layer
+# routes requests by this value — else the default fallback — so a host's
+# control tunnel, its runners' tunnels, and their session traffic all land on
+# one replica when they carry the same key (the host_id). Omitted for an
+# unsharded / single-replica deployment, which needs no sticky routing.
+OMNIGENT_SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key"
+
+# A host-sharded deployment mounts the API at this path; an unsharded /
+# single-replica server mounts elsewhere (usually the root). This is the
+# routing-relevant shape of a server URL, so it lives here next to the
+# request-header builder that keys off it (rather than in the browser-link
+# helpers, which only borrow it).
+WORKSPACE_API_PATH = "/api/2.0/omnigent"
+
+
+def is_workspace_hosted_url(base_url: str) -> bool:
+    """Whether *base_url* is a host-sharded deployment mount.
+
+    True for the host-sharded mount (``https://<host>/api/2.0/omnigent``), which
+    is the only deployment fronted by the sharding layer. Used to gate behavior
+    that only applies there (see :func:`databricks_request_headers`).
+
+    :param base_url: Omnigent server base URL, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``.
+    :returns: ``True`` when the URL path is the workspace API mount.
+    """
+    return urllib.parse.urlsplit(base_url.rstrip("/")).path == WORKSPACE_API_PATH
+
 
 # Opaque extra request headers for dev/test: a JSON object of header name→value
 # in :data:`DATABRICKS_EXTRA_HEADERS_ENV_VAR`. Databricks deployments use it to
@@ -310,7 +343,10 @@ def _databricks_extra_headers() -> dict[str, str]:
 
 
 def databricks_request_headers(
-    server_url: str, *, bearer_token: str | None = None
+    server_url: str,
+    *,
+    bearer_token: str | None = None,
+    host_id: str | None = None,
 ) -> dict[str, str]:
     """Build the headers for a request to a Databricks-fronted server.
 
@@ -335,8 +371,17 @@ def databricks_request_headers(
         ``"https://example.databricks.com/api/2.0/omnigent"``.
     :param bearer_token: The workspace bearer token, or ``None`` when the
         credential is supplied by a separate mechanism (or there is none).
+    :param host_id: The host a request is scoped to (its control tunnel, its
+        runners, and their session traffic all name it so they co-locate on one
+        replica). Pass it unconditionally: it is emitted (as the
+        :data:`OMNIGENT_SLICE_KEY_HEADER` routing header) only when *server_url*
+        is a host-sharded mount, since that is the only deployment with the
+        sharding layer that reads it. ``None`` defaults to the runner's own
+        host_id inside a runner process (via ``OMNIGENT_RUNNER_SLICE_KEY``) and
+        otherwise leaves routing to the default.
     :returns: A header dict carrying ``Authorization``, ``X-Databricks-Org-Id``,
-        and/or the configured extra headers as available, possibly empty.
+        ``X-Databricks-Omnigent-Slice-Key``, and/or the configured extra headers
+        as available, possibly empty.
     """
     headers: dict[str, str] = {}
     if bearer_token:
@@ -344,10 +389,129 @@ def databricks_request_headers(
     org_id = load_databricks_org_id(server_url)
     if org_id:
         headers[DATABRICKS_ORG_ID_HEADER] = org_id
+    # Resolve the slice-key host_id when the caller names none, so every
+    # request still carries a key (routed by the sharding layer rather than
+    # depending on its default). Two ordered fallbacks, both host_ids:
+    #   1. In a runner process, the runner's own host_id (exported at launch as
+    #      OMNIGENT_RUNNER_SLICE_KEY) — keys the runner's server traffic
+    #      (transcript posts, uploads, policy checks) onto its host's replica,
+    #      co-located with its tunnel.
+    #   2. Otherwise, on the CLI, this machine's OWN host_id if it already has a
+    #      host identity — a host-less CLI request (session list, /me-adjacent
+    #      reads, export) then keys to the replica holding this CLI's own hosts'
+    #      tunnels. Read-only (never mints an identity), so a non-host machine
+    #      stays unkeyed (→ default). Gated on the host-sharded mount below so
+    #      the file read only happens for requests that could use it.
+    # Only a host-sharded deployment runs the sharding layer that reads the
+    # header; an unsharded server is single-replica and would just log a header
+    # it ignores — so gate emission (and the CLI identity lookup) on the mount.
+    # Callers never reason about the deployment; a new RPC routed through this
+    # builder is keyed automatically.
+    on_workspace_mount = is_workspace_hosted_url(server_url)
+    if host_id is None:
+        from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
+
+        host_id = os.environ.get(RUNNER_SLICE_KEY_ENV_VAR)
+    if host_id is None and on_workspace_mount:
+        from omnigent.host.identity import load_host_identity_if_present
+
+        identity = load_host_identity_if_present()
+        if identity is not None:
+            host_id = identity.host_id
+    # Kill switch: slice-key emission is ON by default; export
+    # ``OMNIGENT_HOST_SLICE_KEY_ENABLED=0`` to turn it off and fall back to the
+    # server's default (workspace-id) routing with no redeploy — a per-process
+    # escape hatch for a bad rollout, since this emits from sidecar-less
+    # processes (laptop CLI, managed sandbox host, spawned runner) that can't
+    # evaluate a server-side flag. Only the exact value "0" disables it; unset,
+    # "1", or anything else leaves emission on.
+    slice_key_enabled = os.environ.get("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1") != "0"
+    if host_id and on_workspace_mount and slice_key_enabled:
+        headers[OMNIGENT_SLICE_KEY_HEADER] = host_id
     # Opaque dev/test extra headers (request-routing selectors); no-op in prod
     # (env unset).
     headers.update(_databricks_extra_headers())
     return headers
+
+
+# Sentinel for the ``timeout`` argument of :func:`open_server_client`. ``None``
+# is a meaningful httpx value ("disable timeout"), so it can't stand in for
+# "unset". When the caller passes nothing we omit ``timeout`` entirely and let
+# httpx apply its own default, rather than silently changing it.
+_TIMEOUT_UNSET: Any = object()
+
+
+def open_server_client(
+    server_url: str,
+    *,
+    auth: httpx.Auth | None = None,
+    bearer_token: str | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: Any = _TIMEOUT_UNSET,
+    follow_redirects: bool = False,
+    transport: httpx.AsyncBaseTransport | None = None,
+    host_id: str | None = None,
+) -> httpx.AsyncClient:
+    """Open an :class:`httpx.AsyncClient` to an Omnigent server, keyed for routing.
+
+    The one way to open a client to the server. It folds
+    :func:`databricks_request_headers` in for you, so a request to a host-sharded
+    mount automatically carries the org-id and slice-key routing headers (and any
+    dev/test selectors) — and a request to an unsharded server carries none.
+    Callers never reason about the deployment; a new server RPC opened through
+    this factory is routed correctly by construction, which is why it exists
+    rather than each site building headers by hand.
+
+    :param server_url: The server base URL, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``. Both the client's
+        ``base_url`` and the input to the routing-header builder.
+    :param auth: An httpx ``Auth`` when the credential is minted per request
+        (e.g. :class:`_RunnerDatabricksAuth`, which re-injects a fresh bearer and
+        the routing headers on the OAuth-redirect retry). Mutually exclusive with
+        *bearer_token* in practice: pass one or the other, not both.
+    :param bearer_token: A static workspace bearer, folded in as
+        ``Authorization``. Leave ``None`` when *auth* supplies the credential or
+        there is none.
+    :param headers: Extra request headers (e.g. the runner ``Origin`` sentinel).
+        Merged *under* the routing headers, so routing always wins over a
+        caller-supplied collision.
+    :param timeout: An httpx timeout (``httpx.Timeout``, ``float``, or ``None``
+        to disable). Omitted by default so httpx applies its own default rather
+        than this factory silently overriding it.
+    :param follow_redirects: Passed through to httpx. Defaults to ``False``
+        (httpx's own default); callers relying on seeing a 3xx — e.g. an auth
+        flow that re-mints on the Databricks Apps OAuth login redirect — keep it
+        ``False``.
+    :param transport: An httpx ``AsyncBaseTransport`` to substitute for the
+        default network transport. Its one production-adjacent use is injecting a
+        test transport (e.g. ``httpx.MockTransport``); ``None`` uses the default.
+    :param host_id: The host a request is scoped to, forwarded to
+        :func:`databricks_request_headers` (which emits it as the slice-key only
+        on a host-sharded mount and otherwise falls back to the runner's own
+        host_id). Pass it unconditionally when known.
+    :returns: A configured :class:`httpx.AsyncClient`.
+    """
+    import httpx
+    from omnigent_client._http import is_loopback_url
+
+    pinned = {
+        **(headers or {}),
+        **databricks_request_headers(server_url, bearer_token=bearer_token, host_id=host_id),
+    }
+    kwargs: dict[str, Any] = {}
+    if timeout is not _TIMEOUT_UNSET:
+        kwargs["timeout"] = timeout
+    if transport is not None:
+        kwargs["transport"] = transport
+    return httpx.AsyncClient(
+        base_url=server_url,
+        headers=pinned,
+        auth=auth,
+        follow_redirects=follow_redirects,
+        # A proxy cannot reach a loopback server, so local targets bypass it.
+        trust_env=not is_loopback_url(server_url),
+        **kwargs,
+    )
 
 
 def clear_token(server_url: str) -> None:

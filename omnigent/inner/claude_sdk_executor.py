@@ -71,6 +71,7 @@ from .executor import (
     ToolSpec,
     TurnComplete,
     classify_tool_result,
+    describe_exception,
 )
 from .native_attachments import unresolved_attachment_marker
 from .sandbox import (
@@ -1425,7 +1426,7 @@ class ClaudeSDKExecutor(Executor):
                 ships its own ``skills/`` directory. Used to expose
                 bundled skills to Claude via ``--plugin-dir <bundle>``
                 (the SDK's plugin convention loads SKILL.md files from
-                ``<plugin>/skills/<name>/``). ``None`` for agents
+                ``<plugin>/skills/<dir>/``). ``None`` for agents
                 without a bundled-skill directory — the harness skips
                 the plugin-dir wiring.
             agent_name: Optional agent display name. When *bundle_dir*
@@ -2319,7 +2320,7 @@ class ClaudeSDKExecutor(Executor):
             skills="all", setting_sources=None
         )
         # Bundle skills are exposed via the SDK's plugin mechanism.
-        # The bundle's ``<bundle>/skills/<name>/SKILL.md`` files are
+        # The bundle's ``<bundle>/skills/<dir>/SKILL.md`` files are
         # discovered as plugin skills (no ``.claude/`` prefix needed
         # under the plugin convention — see plugin discovery test in
         # tests/inner/test_claude_sdk_executor.py). The plugin's
@@ -2361,7 +2362,7 @@ class ClaudeSDKExecutor(Executor):
                 cfg.extra.get("reasoning_effort"), "Claude Agent SDK", CLAUDE_EFFORTS
             )
         except ValueError as exc:
-            yield ExecutorError(message=str(exc), retryable=False)
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
         if reasoning_effort is not None:
             options_kwargs["effort"] = reasoning_effort
@@ -2843,6 +2844,9 @@ class ClaudeSDKExecutor(Executor):
                         elif getattr(system_msg, "hook_event_name", None) == "PreCompact":
                             compaction_occurred = True
                             logger.info("Claude SDK compaction detected (PreCompact hook)")
+                            from omnigent.inner.executor import CompactionStarted
+
+                            yield CompactionStarted()
                         else:
                             logger.info("Claude CLI system message: %s", data)
             finally:

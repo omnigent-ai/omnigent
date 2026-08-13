@@ -25,6 +25,11 @@ RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN"
 # Host-launched runners use their binding token to obtain a short-lived,
 # owner-scoped server bearer instead of resolving the host user's credentials.
 RUNNER_DELEGATED_AUTH_ENV_VAR = "OMNIGENT_RUNNER_DELEGATED_AUTH"
+# Replica-routing key the runner stamps on its tunnel handshake so it
+# co-locates with the host that launched it (value = that host's host_id). The
+# host injects it when spawning the runner; absent for CLI-local runners, which
+# then leave routing to the default.
+RUNNER_SLICE_KEY_ENV_VAR = "OMNIGENT_RUNNER_SLICE_KEY"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
 # Sentinel ``Origin`` header that the project's own non-browser WebSocket
 # clients (runner -> server tunnel, host/daemon -> server tunnel,

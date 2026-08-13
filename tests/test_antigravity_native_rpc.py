@@ -2055,8 +2055,44 @@ def test_cold_start_port_falls_back_when_agy_found_but_no_port(
         "resolve_pane_agy_rpc_port_state",
         lambda _sock, _tgt: rpc.PaneAgyResolution(agy_found=True, port=None),
     )
+    # Restricted /proc: lsof attributes NO port for ANY agy, so the missing port
+    # really is an attribution limit rather than a still-booting agy.
+    monkeypatch.setattr(rpc, "_can_attribute_any_agy_port", lambda: False)
     monkeypatch.setattr(rpc, "_candidate_agy_rpc_ports", lambda: [52548])
     assert rpc.resolve_cold_start_agy_rpc_port(Path("/tmp/agy/tmux.sock"), "main") == 52548
+
+
+def test_cold_start_port_keeps_polling_when_lsof_works_but_our_agy_has_no_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """State 2 split: lsof WORKS here, so "no port for our agy" means not-yet-bound.
+
+    The agy boot window on a normal host: tmux has already exec-ed agy (so it IS
+    in the pane subtree) but it has not bound its connect-RPC listener yet, ~250ms
+    after launch. lsof is perfectly able to attribute ports — it attributes one
+    for a DIFFERENT, older agy — so the absence of a port for ours is evidence it
+    is still starting, not evidence that attribution is impossible.
+
+    Falling back to the candidate scan here hands us a FOREIGN agy and durably
+    cross-binds the session: the new conversation is StartCascade-d inside another
+    session's agy, the reader then adopts that agy's active cascade, and the user
+    sees their existing conversation duplicated while their own agy is orphaned.
+    """
+    monkeypatch.setattr(
+        rpc,
+        "resolve_pane_agy_rpc_port_state",
+        lambda _sock, _tgt: rpc.PaneAgyResolution(agy_found=True, port=None),
+    )
+    # lsof is functional on this host: it attributes a port for the other agy.
+    monkeypatch.setattr(rpc, "_can_attribute_any_agy_port", lambda: True)
+    monkeypatch.setattr(
+        rpc,
+        "_candidate_agy_rpc_ports",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("lsof works; must keep polling rather than scan candidates")
+        ),
+    )
+    assert rpc.resolve_cold_start_agy_rpc_port(Path("/tmp/agy/tmux.sock"), "main") is None
 
 
 def test_cold_start_port_no_pane_uses_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2078,3 +2114,108 @@ def test_cold_start_port_no_pane_none_when_no_candidates(
     """No pane and no candidates yet → ``None`` (keep polling)."""
     monkeypatch.setattr(rpc, "_candidate_agy_rpc_ports", list)
     assert rpc.resolve_cold_start_agy_rpc_port(None, None) is None
+
+
+# ---------------------------------------------------------------------------
+# Port attribution without lsof (psutil primary)
+# ---------------------------------------------------------------------------
+#
+# agy binds an ephemeral connect-RPC port and advertises it nowhere, so omnigent
+# must reverse-discover it. Shelling out to ``lsof`` made that an undeclared
+# system dependency: absent it (minimal Debian, slim containers), attribution
+# silently failed and the cold-start bound a FOREIGN agy. psutil is already a
+# hard dependency and is cross-platform, so it is the primary path.
+
+
+def test_pid_listen_ports_uses_psutil_without_lsof(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Loopback LISTEN ports resolve via psutil even when lsof is missing."""
+
+    class _Addr:
+        def __init__(self, ip: str, port: int) -> None:
+            self.ip, self.port = ip, port
+
+    class _Conn:
+        def __init__(self, ip: str, port: int, status: str) -> None:
+            self.laddr, self.status = _Addr(ip, port), status
+
+    class _Proc:
+        def __init__(self, _pid: int) -> None:
+            pass
+
+        def net_connections(self, kind: str = "tcp") -> list[_Conn]:
+            import psutil
+
+            return [
+                _Conn("127.0.0.1", 44361, psutil.CONN_LISTEN),
+                _Conn("127.0.0.1", 34601, psutil.CONN_LISTEN),
+                _Conn("127.0.0.1", 51000, psutil.CONN_ESTABLISHED),  # not listening
+                _Conn("10.0.0.5", 8080, psutil.CONN_LISTEN),  # not loopback
+            ]
+
+    monkeypatch.setattr(rpc.psutil, "Process", _Proc)
+    # lsof is absent on this host.
+    monkeypatch.setattr(
+        rpc,
+        "_run_lsof_listen_ports",
+        lambda _pid: (_ for _ in ()).throw(AssertionError("no lsof")),
+    )
+    assert rpc._pid_listen_ports(72753) == [34601, 44361]
+
+
+def test_pid_listen_ports_falls_back_to_lsof_when_psutil_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A psutil failure (AccessDenied / gone) falls back to lsof, not an error."""
+    import psutil
+
+    class _Proc:
+        def __init__(self, _pid: int) -> None:
+            raise psutil.AccessDenied(72753)
+
+    monkeypatch.setattr(rpc.psutil, "Process", _Proc)
+    monkeypatch.setattr(rpc, "_run_lsof_listen_ports", lambda _pid: "TCP 127.0.0.1:52548 (LISTEN)")
+    assert rpc._pid_listen_ports(72753) == [52548]
+
+
+def test_pid_listen_ports_falls_back_to_lsof_on_psutil_without_net_connections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A psutil too old to have ``net_connections`` degrades to lsof, not an error.
+
+    ``net_connections`` is the 6.0 rename of ``connections``, and the dependency
+    floor still admits 5.9 (only reachable via ``--resolution lowest`` or a
+    downstream pin, but admitted). The missing attribute raises ``AttributeError``
+    — neither ``psutil.Error`` nor ``OSError`` — so an un-widened ``except`` lets
+    it escape and discovery fails outright on a host where lsof would have
+    answered, which is strictly worse than the pre-psutil behaviour.
+    """
+
+    class _OldProc:
+        """psutil 5.9's surface: ``connections``, no ``net_connections``."""
+
+        def __init__(self, _pid: int) -> None:
+            pass
+
+        def connections(self, kind: str = "inet") -> list[object]:
+            raise AssertionError("the deprecated 5.9 spelling must not be called")
+
+    monkeypatch.setattr(rpc.psutil, "Process", _OldProc)
+    monkeypatch.setattr(rpc, "_run_lsof_listen_ports", lambda _pid: "TCP 127.0.0.1:52548 (LISTEN)")
+    assert rpc._pid_listen_ports(72753) == [52548]
+
+
+def test_pid_listen_ports_empty_when_neither_source_attributes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both sources blind (restricted /proc) → empty, so callers keep their
+    existing 'cannot attribute' semantics rather than seeing a wrong port."""
+    import psutil
+
+    class _Proc:
+        def __init__(self, _pid: int) -> None:
+            raise psutil.AccessDenied(72753)
+
+    monkeypatch.setattr(rpc.psutil, "Process", _Proc)
+    monkeypatch.setattr(rpc, "_run_lsof_listen_ports", lambda _pid: "")
+    assert rpc._pid_listen_ports(72753) == []
