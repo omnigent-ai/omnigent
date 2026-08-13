@@ -1425,11 +1425,36 @@ describe("useBulkDeleteConversations", () => {
       .mockResolvedValueOnce(mockResponse({ deleted: true })); // delete conv_b
 
     const { queryClient, rendered } = renderBulkDeleteHook();
-    rendered.result.current.mutate(["conv_a", "conv_b"]);
+    rendered.result.current.mutate({ ids: ["conv_a", "conv_b"] });
     await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
 
     const data = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
     expect(data!.pages[0].data.map((c) => c.id)).toEqual(["conv_keep"]);
+  });
+
+  it("appends ?delete_branch=true only for ids in deleteBranchIds", async () => {
+    // conv_a opts into branch cleanup, conv_b does not.
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ queued: false })) // stop conv_a
+      .mockResolvedValueOnce(mockResponse({ deleted: true })) // delete conv_a
+      .mockResolvedValueOnce(mockResponse({ queued: false })) // stop conv_b
+      .mockResolvedValueOnce(mockResponse({ deleted: true })); // delete conv_b
+
+    const { rendered } = renderBulkDeleteHook();
+    rendered.result.current.mutate({
+      ids: ["conv_a", "conv_b"],
+      deleteBranchIds: new Set(["conv_a"]),
+    });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    // Each session deletes independently, so the per-session flag must ride
+    // only on the DELETE for the id the user ticked.
+    const deleteUrls = fetchMock.mock.calls
+      .map((call) => call[0] as string)
+      .filter((url) => url.startsWith("/v1/sessions/conv_") && !url.includes("/events"));
+    expect(deleteUrls).toContain("/v1/sessions/conv_a?delete_branch=true");
+    expect(deleteUrls).toContain("/v1/sessions/conv_b");
+    expect(deleteUrls).not.toContain("/v1/sessions/conv_b?delete_branch=true");
   });
 
   it("evicts succeeded ids from cache even when some deletes fail", async () => {
@@ -1441,7 +1466,7 @@ describe("useBulkDeleteConversations", () => {
       .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 })); // delete conv_b fails
 
     const { queryClient, rendered } = renderBulkDeleteHook();
-    rendered.result.current.mutate(["conv_a", "conv_b"]);
+    rendered.result.current.mutate({ ids: ["conv_a", "conv_b"] });
     await waitFor(() => expect(rendered.result.current.isError).toBe(true));
 
     // conv_a was successfully deleted and should be evicted; conv_b stays.
