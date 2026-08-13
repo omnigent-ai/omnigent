@@ -58,11 +58,11 @@ function installBridge(overrides: Record<string, unknown> = {}) {
  *  single claim fetch to have fired. */
 async function runAction(
   evt: BrowserActionRequestEvent,
-  opts: { expectResult?: boolean } = {},
+  opts: { expectResult?: boolean; source?: string } = {},
 ): Promise<void> {
-  const { expectResult = true } = opts;
+  const { expectResult = true, source = CONV } = opts;
   renderHook(() => useBrowserAgentRelay(CONV));
-  emitBrowserActionRequest(evt);
+  emitBrowserActionRequest(evt, source);
   if (expectResult) {
     await vi.waitFor(() => {
       expect(
@@ -155,6 +155,46 @@ describe("useBrowserAgentRelay — claim-first protocol", () => {
     const body = postedResult();
     expect(body.claim_token).toBe("tok_1");
     expect((body.result as { ok: boolean }).ok).toBe(true);
+  });
+
+  it("routes claim, dispatch, and result to the delivering conversation, not the mounted one", async () => {
+    // A background conversation (A) issues a browser action while a different
+    // conversation (B) is on screen and owns the relay. Every hop must target A:
+    // claiming at B is rejected as an owner mismatch, so nothing executes and
+    // A's browser tool times out. This is what background streams made reachable.
+    const VISIBLE = "conv_visible_B";
+    const BACKGROUND = "conv_background_A";
+    const bridge = installBridge();
+    authenticatedFetch.mockResolvedValueOnce(WON).mockResolvedValueOnce(jsonResponse({}));
+
+    renderHook(() => useBrowserAgentRelay(VISIBLE));
+    emitBrowserActionRequest(actionEvent("navigate", { url: "https://a" }), BACKGROUND);
+
+    await vi.waitFor(() => {
+      expect(
+        authenticatedFetch.mock.calls.some((c) => String(c[0]).includes("/browser/action_result/")),
+      ).toBe(true);
+    });
+
+    const claimUrl = String(
+      authenticatedFetch.mock.calls.find((c) =>
+        String(c[0]).includes("/browser/action_claim/"),
+      )![0],
+    );
+    expect(claimUrl).toContain(`/v1/sessions/${BACKGROUND}/browser/action_claim/`);
+    expect(claimUrl).not.toContain(VISIBLE);
+
+    // Dispatch targeted A's WebContentsView, and the result posted to A.
+    expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(BACKGROUND, "https://a", undefined, {
+      force: true,
+      agent: true,
+    });
+    const resultUrl = String(
+      authenticatedFetch.mock.calls.find((c) =>
+        String(c[0]).includes("/browser/action_result/"),
+      )![0],
+    );
+    expect(resultUrl).toContain(`/v1/sessions/${BACKGROUND}/browser/action_result/`);
   });
 });
 
@@ -309,7 +349,7 @@ describe("useBrowserAgentRelay — result POST resilience", () => {
       .mockRejectedValueOnce(new Error("result POST network error"));
 
     renderHook(() => useBrowserAgentRelay(CONV));
-    emitBrowserActionRequest(actionEvent("screenshot"));
+    emitBrowserActionRequest(actionEvent("screenshot"), CONV);
 
     await vi.waitFor(() => {
       // Both the claim and the (failed) result POST were attempted.
@@ -326,7 +366,7 @@ describe("useBrowserAgentRelay — result POST resilience", () => {
     (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = undefined;
 
     renderHook(() => useBrowserAgentRelay(CONV));
-    emitBrowserActionRequest(actionEvent("screenshot"));
+    emitBrowserActionRequest(actionEvent("screenshot"), CONV);
     await Promise.resolve();
     await Promise.resolve();
 

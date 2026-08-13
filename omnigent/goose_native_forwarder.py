@@ -648,9 +648,9 @@ async def forward_goose_store_to_session(
     # supervisor) if the replay's idle post hits a transient server error.
     needs_replay = goose_session_id is not None and last_id > 0
 
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
-    ) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
                 if needs_replay and goose_session_id is not None:

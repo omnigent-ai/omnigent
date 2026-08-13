@@ -1982,7 +1982,7 @@ def test_idless_tool_complete_is_suppressed() -> None:
 
 
 async def test_policy_evaluator_no_active_turn_context_is_phase_aware() -> None:
-    """With no active turn context (turn-context desync, #1026) the policy
+    """With no active turn context (turn-context desync) the policy
     evaluator must not blanket-ALLOW. PHASE_TOOL_CALL fails closed (this adapter
     is the only enforcement point, never re-checked server-side); advisory LLM
     phases and the post-execution result phase fail open so a transient desync

@@ -34,6 +34,7 @@ function ctx(opts?: {
   timestamp?: number;
   createdBy?: string;
   createdAtS?: number;
+  clientCreatedAtS?: number;
 }): BlockContext {
   return {
     agent: opts?.agent ?? "test",
@@ -44,6 +45,7 @@ function ctx(opts?: {
     itemId: opts?.itemId === undefined ? null : opts.itemId,
     ...(opts?.createdBy !== undefined ? { createdBy: opts.createdBy } : {}),
     ...(opts?.createdAtS !== undefined ? { createdAtS: opts.createdAtS } : {}),
+    ...(opts?.clientCreatedAtS !== undefined ? { clientCreatedAtS: opts.clientCreatedAtS } : {}),
   };
 }
 
@@ -2836,7 +2838,7 @@ describe("buildBubbles — workedForS turn duration", () => {
   const textDone = (
     itemId: string,
     text: string,
-    stamps?: { timestamp?: number; createdAtS?: number },
+    stamps?: { timestamp?: number; createdAtS?: number; clientCreatedAtS?: number },
   ): AnyBlock => ({
     type: "text_done",
     ctx: ctx({ itemId, ...stamps }),
@@ -2884,6 +2886,92 @@ describe("buildBubbles — workedForS turn duration", () => {
         textDone("a2", "b", { createdAtS: 1_753_900_000 }),
       ]).workedForS,
     ).toBeUndefined();
+    // Post-timestamp-feature live shape: live blocks carry BOTH the
+    // page-relative clock and a client-epoch stamp. A mid-turn reload
+    // pairs a server-stamped first block with such a live last block —
+    // the epoch branch must not reach for the client stamp (it lives in
+    // `clientCreatedAtS` precisely so these guards stay single-clock).
+    expect(
+      assistantBubble([
+        textDone("a1", "a", { createdAtS: 1_753_900_000 }),
+        textDone("a2", "b", { timestamp: 42, clientCreatedAtS: 1_753_900_045 }),
+      ]).workedForS,
+    ).toBeUndefined();
+    // …reverse direction, live first block with both stamps.
+    expect(
+      assistantBubble([
+        textDone("a1", "a", { timestamp: 42, clientCreatedAtS: 1_753_900_045 }),
+        textDone("a2", "b", { createdAtS: 1_753_900_000 }),
+      ]).workedForS,
+    ).toBeUndefined();
+  });
+
+  it("spans live blocks that also carry client-epoch stamps via the page clock", () => {
+    // Pure-live turn post-timestamp-feature: every block has a
+    // clientCreatedAtS, but the page-relative branch still decides.
+    const bubble = assistantBubble([
+      textDone("a1", "working…", { timestamp: 10.25, clientCreatedAtS: 1_753_900_000 }),
+      textDone("a2", "done", { timestamp: 116.5, clientCreatedAtS: 1_753_900_106 }),
+    ]);
+    expect(bubble.workedForS).toBeCloseTo(106.25);
+  });
+});
+
+describe("buildBubbles — bubble display timestamps", () => {
+  const userBlock = (stamps: { createdAtS?: number; clientCreatedAtS?: number }): AnyBlock => ({
+    type: "user_message",
+    ctx: ctx({ itemId: "u1", responseId: "resp_1", ...stamps }),
+    content: [{ type: "input_text", text: "hi" }],
+  });
+  const textDone = (
+    itemId: string,
+    stamps?: { timestamp?: number; createdAtS?: number; clientCreatedAtS?: number },
+  ): AnyBlock => ({
+    type: "text_done",
+    ctx: ctx({ itemId, ...stamps }),
+    fullText: "text",
+    hasCodeBlocks: false,
+  });
+
+  it("prefers the server stamp, falls back to the client stamp", () => {
+    // Cold load: the server stamp flows straight through.
+    let bubble = buildBubbles([userBlock({ createdAtS: 1_753_900_000 })], null)[0] as Extract<
+      Bubble,
+      { kind: "user" }
+    >;
+    expect(bubble.createdAtS).toBe(1_753_900_000);
+    // Live: no server stamp yet, the client send-time stamp shows.
+    bubble = buildBubbles([userBlock({ clientCreatedAtS: 1_753_900_001 })], null)[0] as Extract<
+      Bubble,
+      { kind: "user" }
+    >;
+    expect(bubble.createdAtS).toBe(1_753_900_001);
+    // Neither: no timestamp rendered.
+    bubble = buildBubbles([userBlock({})], null)[0] as Extract<Bubble, { kind: "user" }>;
+    expect(bubble.createdAtS).toBeUndefined();
+  });
+
+  it("stamps an assistant group from its first stamped block", () => {
+    const bubble = buildBubbles(
+      [
+        textDone("a1", { clientCreatedAtS: 1_753_900_010 }),
+        textDone("a2", { clientCreatedAtS: 1_753_900_020 }),
+      ],
+      null,
+    )[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(bubble.createdAtS).toBe(1_753_900_010);
+    // The FIRST stamped block wins — the stamp marks when the response
+    // started, even when a later block carries a different clock (the
+    // live-first/server-tail mix can't occur in practice, but the walk
+    // is deterministic either way).
+    const reloaded = buildBubbles(
+      [
+        textDone("a1", { clientCreatedAtS: 1_753_900_010 }),
+        textDone("a2", { createdAtS: 1_753_900_005 }),
+      ],
+      null,
+    )[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(reloaded.createdAtS).toBe(1_753_900_010);
   });
 });
 

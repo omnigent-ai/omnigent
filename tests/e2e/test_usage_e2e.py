@@ -18,6 +18,7 @@ import json
 import tarfile
 
 import httpx
+import pytest
 import yaml
 
 _OWNER_EMAIL = "usage-owner@e2e.test"
@@ -54,6 +55,7 @@ def _create_session(client: httpx.Client, *, email: str) -> str:
     return resp.json()["session_id"]
 
 
+@pytest.mark.compat_smoke
 def test_usage_report_happy_path(http_client: httpx.Client) -> None:
     """The report is well-formed, windows are monotonic, and it lists the caller's session."""
     session_id = _create_session(http_client, email=_OWNER_EMAIL)

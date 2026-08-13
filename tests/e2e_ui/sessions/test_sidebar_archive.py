@@ -132,6 +132,10 @@ def test_archive_session_removes_row_without_stop_event(
     # flight, then unmounts entirely once the list refetches without it.
     expect(page.locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
 
+    # Archiving the *active* session redirects to home so the user isn't
+    # stranded on a stale URL with no sidebar row to navigate from.
+    page.wait_for_url(f"{base_url}/", timeout=10_000)
+
     # And the archive is durable: the store row carries the flag, not
     # just the client cache. Poll — the list refetch that unmounts the
     # row can land marginally before the snapshot reflects it.

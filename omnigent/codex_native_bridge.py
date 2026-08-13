@@ -188,8 +188,11 @@ def codex_mcp_config_overrides(
         ``['mcp_servers.omnigent.command="python"', ...]``.
     """
     python = python_executable or sys.executable
+    # -I: codex launches this MCP server in the workspace, so cwd must stay off
+    # sys.path or a workspace that is an omnigent checkout shadows the installed
+    # package. Matches every other bridge's serve-mcp invocation.
     args_toml = json.dumps(
-        ["-m", "omnigent.claude_native_bridge", "serve-mcp", "--bridge-dir", str(bridge_dir)]
+        ["-I", "-m", "omnigent.claude_native_bridge", "serve-mcp", "--bridge-dir", str(bridge_dir)]
     )
     return [
         f'mcp_servers.omnigent.command="{python}"',

@@ -92,7 +92,7 @@ def _fetch_server_info(server_url: str, *, timeout: float) -> dict[str, Any] | N
         base = server_url.rstrip("/")
         resp = httpx.get(
             f"{base}/v1/info",
-            headers=_remote_headers(server_url=base),
+            headers=_remote_headers(server_url=base, host_id=None),
             timeout=timeout,
             trust_env=False,
         )

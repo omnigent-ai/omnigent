@@ -52,7 +52,9 @@ class OmnigentClient:
         authentication. When set, the auth handler runs on every
         request, allowing transparent token refresh for OAuth
         flows. ``None`` (default) relies on static ``headers``.
-    :param timeout: Default timeout for HTTP requests in seconds.
+    :param timeout: Default timeout for non-streaming HTTP requests in
+        seconds. SSE streams use a 600-second read timeout so server-side
+        tool execution can pause the stream for several minutes.
     """
 
     def __init__(
@@ -61,23 +63,9 @@ class OmnigentClient:
         *,
         headers: dict[str, str] | None = None,
         auth: httpx.Auth | None = None,
-        # Public SDK API surface. Removing would be a breaking
-        # change for downstream consumers; leaving it
-        # accepted-but-ignored preserves compatibility while the
-        # SSE client internally uses a fixed 600s read timeout
-        # (tool calls can legitimately hold the stream open for
-        # minutes).
         timeout: float = 30.0,
     ) -> None:
         self._base_url = base_url.rstrip("/")
-        # Long read timeout for SSE streams (tool execution can
-        # pause the stream for minutes).
-        sse_timeout = httpx.Timeout(
-            connect=30.0,
-            read=600.0,
-            write=30.0,
-            pool=30.0,
-        )
         # Announce this as a first-party non-browser client via the sentinel
         # Origin. The server's require_trusted_origin CSRF guard on the
         # multipart routes (POST /v1/sessions bundle create, file upload)
@@ -90,7 +78,7 @@ class OmnigentClient:
         self._http = httpx.AsyncClient(
             headers=default_headers,
             auth=auth,
-            timeout=sse_timeout,
+            timeout=httpx.Timeout(timeout),
             # A proxy cannot reach our loopback server, so bypass the
             # environment for local targets. Loopback is plain HTTP with
             # explicit headers, so losing netrc/CA env with it costs nothing.

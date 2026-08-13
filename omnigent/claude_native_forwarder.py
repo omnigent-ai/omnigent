@@ -794,9 +794,9 @@ async def forward_claude_transcript_to_session(
     task_statuses: dict[str, str] = {}
     task_order: list[str] = []
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
-    ) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
                 async with asyncio.timeout(_FORWARD_LOOP_STALL_DEADLINE_S):
