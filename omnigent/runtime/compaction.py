@@ -26,7 +26,7 @@ from omnigent.entities import (
     ConversationItem,
     MessageData,
 )
-from omnigent.llms.adapters._content import redact_inline_data_uris
+from omnigent.llms.adapters._content import redact_binary_payloads
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
@@ -227,12 +227,14 @@ def _clear_binary_content(
     protect_from: int,
 ) -> list[dict[str, Any]]:
     """
-    Replace binary payload data in image/file content blocks
-    outside the recent window with a clearing marker.
+    Replace binary payload data in image/document/file content
+    blocks outside the recent window with a clearing marker.
 
-    The ``file_id`` is preserved so the agent can re-fetch the
-    content if needed. Text content blocks within the same message
-    are untouched.
+    Delegates to the canonical :func:`redact_binary_payloads`, which
+    covers bare ``data``, Anthropic-shaped ``source.data``, and
+    ``data:`` URIs in one pass. The ``file_id`` is preserved so the
+    agent can re-fetch the content if needed. Text content blocks
+    within the same message are untouched.
 
     :param messages: The messages list to process (modified in place).
     :param protect_from: Index of the first message in the recent
@@ -245,15 +247,8 @@ def _clear_binary_content(
             break
         if "content" not in msg:
             continue
-        content = msg.get("content")
-        if isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") in ("image", "file") and "data" in block:
-                    block["data"] = _BINARY_CONTENT_CLEARED
-        msg["content"] = redact_inline_data_uris(
-            content,
+        msg["content"] = redact_binary_payloads(
+            msg.get("content"),
             lambda _media_type, _payload_length: _BINARY_CONTENT_CLEARED,
         )
     return messages

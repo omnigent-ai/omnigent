@@ -796,6 +796,7 @@ async def _prepare_antigravity_terminal_via_daemon(
         bridge_id: str
         conversation_id: str
         resume = False
+        fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException(
@@ -858,6 +859,7 @@ async def _prepare_antigravity_terminal_via_daemon(
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _update_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)

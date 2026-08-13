@@ -548,7 +548,7 @@ def test_clear_binary_content_recurses_into_nested_provider_shapes() -> None:
             "content": [
                 {
                     "type": "input_image",
-                    "image_url": {"url": "data:image/png;base64,QUJD"},
+                    "image_url": {"url": "data:image/png;base64," + "Q" * 200},
                     "filename": "chat-completions.png",
                 },
                 {
@@ -556,7 +556,7 @@ def test_clear_binary_content_recurses_into_nested_provider_shapes() -> None:
                     "source": {
                         "type": "base64",
                         "media_type": "image/png",
-                        "data": "data:image/png;base64,REVG",
+                        "data": "data:image/png;base64," + "R" * 200,
                     },
                     "filename": "anthropic.png",
                 },
@@ -571,6 +571,73 @@ def test_clear_binary_content_recurses_into_nested_provider_shapes() -> None:
     assert anthropic["source"]["data"] == _BINARY_CONTENT_CLEARED
     assert chat_completions["filename"] == "chat-completions.png"
     assert anthropic["filename"] == "anthropic.png"
+
+
+def test_clear_binary_content_redacts_bare_source_data_and_documents() -> None:
+    """Bare base64 under ``source.data``, and ``document`` blocks, are cleared.
+
+    The previous hand-rolled walk only matched ``image``/``file`` with a bare
+    top-level ``data``, so an Anthropic-shaped block — whose payload lives at
+    ``source.data`` without a ``data:`` prefix — survived compaction.
+    """
+    bare = "iVBORw0KGgoAAAANSUhEUg" * 3
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "data": bare, "file_id": "file_img"},
+                {"type": "file", "data": bare, "file_id": "file_file"},
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": bare},
+                    "filename": "anthropic.png",
+                },
+                {"type": "document", "data": bare, "file_id": "file_doc"},
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": bare,
+                    },
+                },
+                {"type": "text", "text": "keep me"},
+            ],
+        }
+    ]
+
+    _clear_binary_content(messages, protect_from=len(messages))
+
+    image, file_block, anthropic, document, pdf, text = messages[0]["content"]
+    # Shapes the old walk already handled.
+    assert image["data"] == _BINARY_CONTENT_CLEARED
+    assert file_block["data"] == _BINARY_CONTENT_CLEARED
+    # Shapes it missed.
+    assert anthropic["source"]["data"] == _BINARY_CONTENT_CLEARED
+    assert document["data"] == _BINARY_CONTENT_CLEARED
+    assert pdf["source"]["data"] == _BINARY_CONTENT_CLEARED
+    # Everything that is not a payload survives.
+    assert image["file_id"] == "file_img"
+    assert file_block["file_id"] == "file_file"
+    assert document["file_id"] == "file_doc"
+    assert anthropic["filename"] == "anthropic.png"
+    assert anthropic["source"]["media_type"] == "image/png"
+    assert text == {"type": "text", "text": "keep me"}
+
+
+@pytest.mark.parametrize("payload", ["", None, 123])
+def test_clear_binary_content_leaves_an_absent_payload_alone(payload: object) -> None:
+    """A block with no actual payload string keeps whatever it had.
+
+    The old walk overwrote any ``data`` key it found, so an empty or non-string
+    value became the clearing marker — claiming content had been removed when
+    there was none.
+    """
+    messages = [{"role": "user", "content": [{"type": "image", "data": payload}]}]
+
+    _clear_binary_content(messages, protect_from=len(messages))
+
+    assert messages[0]["content"][0]["data"] == payload
 
 
 def test_clear_binary_content_preserves_recent_nested_content_byte_identical() -> None:

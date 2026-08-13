@@ -1457,7 +1457,10 @@ class HostProcess:
 
             with child_logging_popen_kwargs(env) as logging_kwargs:
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "omnigent.runner._entry"],
+                    # -P keeps cwd off sys.path: a workspace that is itself an
+                    # omnigent checkout would otherwise shadow the installed
+                    # package. _entry re-adds it for spec-declared local tools.
+                    [sys.executable, "-P", "-m", "omnigent.runner._entry"],
                     env=env,
                     # A daemon may outlive the checkout it started from.
                     cwd=str(workspace),

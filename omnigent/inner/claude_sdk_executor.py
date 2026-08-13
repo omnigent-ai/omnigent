@@ -1426,7 +1426,7 @@ class ClaudeSDKExecutor(Executor):
                 ships its own ``skills/`` directory. Used to expose
                 bundled skills to Claude via ``--plugin-dir <bundle>``
                 (the SDK's plugin convention loads SKILL.md files from
-                ``<plugin>/skills/<name>/``). ``None`` for agents
+                ``<plugin>/skills/<dir>/``). ``None`` for agents
                 without a bundled-skill directory — the harness skips
                 the plugin-dir wiring.
             agent_name: Optional agent display name. When *bundle_dir*
@@ -2320,7 +2320,7 @@ class ClaudeSDKExecutor(Executor):
             skills="all", setting_sources=None
         )
         # Bundle skills are exposed via the SDK's plugin mechanism.
-        # The bundle's ``<bundle>/skills/<name>/SKILL.md`` files are
+        # The bundle's ``<bundle>/skills/<dir>/SKILL.md`` files are
         # discovered as plugin skills (no ``.claude/`` prefix needed
         # under the plugin convention — see plugin discovery test in
         # tests/inner/test_claude_sdk_executor.py). The plugin's

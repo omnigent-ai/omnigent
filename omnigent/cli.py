@@ -3199,10 +3199,24 @@ def _ensure_backend(server: str | None) -> str:
         # otherwise the session-create call deep in the REPL bring-up
         # surfaces the edge redirect as an opaque non-JSON-response
         # traceback.
+        #
+        # The auth probe (GET /v1/me, ~0.65s) and the daemon tunnel start
+        # (~2s) are independent — run them concurrently so the auth check
+        # is hidden under the longer daemon wait.
+        import concurrent.futures
+
         server = _resolve_server_url(server)
-        _ensure_databricks_server_auth(server)
-        with runner_startup_progress(initial_message=STARTUP_PHASE_CONNECTING_REMOTE):
-            _ensure_host_daemon(server)
+        with (
+            runner_startup_progress(initial_message=STARTUP_PHASE_CONNECTING_REMOTE),
+            concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            auth_future = pool.submit(_ensure_databricks_server_auth, server)
+            daemon_future = pool.submit(_ensure_host_daemon, server)
+            # Raise auth errors before daemon errors: a login failure is
+            # more actionable than a daemon-connect failure that would
+            # have been caused by the same missing credentials.
+            auth_future.result()
+            daemon_future.result()
         return server
     # Local mode: the daemon spawns (or reuses) a persistent local Omnigent server.
     # On a cold start this is the longest silent gap between the user pressing
@@ -3427,7 +3441,11 @@ def _start_cli_runner_process(
     try:
         with child_logging_popen_kwargs(env) as logging_kwargs:
             runner_proc: subprocess.Popen[bytes] = subprocess.Popen(
-                [sys.executable, "-m", "omnigent.runner._entry"],
+                # This runner inherits the CLI's cwd, so -P is what stops a
+                # checkout you launched from shadowing the installed omnigent
+                # (the daemon and zygote spawns do the same). _entry re-adds the
+                # cwd afterwards, keeping spec-declared local tools importable.
+                [sys.executable, "-P", "-m", "omnigent.runner._entry"],
                 env=env,
                 stdout=log_fh,
                 stderr=log_fh,
@@ -6479,10 +6497,24 @@ def _materialize_harness_launcher_file(
     if acp_agent is not None:
         if canonical != "acp":
             raise click.ClickException("An ephemeral ACP agent requires the acp harness.")
-        executor["acp_agent"] = {
+        # Embed all fields that affect spawn so the remote server sees the same
+        # agent config as the client. Preserve session_id_mode, send_model,
+        # omnigent_mcp, env_passthrough, and model.
+        agent_dict: dict[str, object] = {
             "name": acp_agent.name,
             "command": acp_agent.command,
         }
+        if acp_agent.model is not None:
+            agent_dict["model"] = acp_agent.model
+        if acp_agent.session_id_mode != "server":
+            agent_dict["session_id_mode"] = acp_agent.session_id_mode
+        if acp_agent.send_model:
+            agent_dict["send_model"] = acp_agent.send_model
+        if not acp_agent.omnigent_mcp:
+            agent_dict["omnigent_mcp"] = acp_agent.omnigent_mcp
+        if acp_agent.env_passthrough:
+            agent_dict["env_passthrough"] = list(acp_agent.env_passthrough)
+        executor["acp_agent"] = agent_dict
 
     raw = {
         "name": display_name,
@@ -7558,6 +7590,17 @@ def run(
             raise click.ClickException("--from-openclaw cannot be combined with --harness.")
         acp_agent = _resolve_openclaw_run_agent(from_openclaw)
         harness = f"acp:{acp_agent.slug}"
+    # Client-side harness resolution for acp:<slug>: resolve the slug before
+    # embedding in the spec so it works with remote servers. The server would resolve
+    # the slug from ITS config (if present), but fails when the agent is only
+    # configured locally on the client. Embedding the resolved agent avoids this gap.
+    # Preserve the existing config-lookup path as fallback; specs authored by hand
+    # still use it.
+    if acp_agent is None and harness is not None and harness.startswith("acp:"):
+        from omnigent.onboarding.acp_auth import resolve_acp_agent
+
+        slug = harness.split(":", 1)[1]
+        acp_agent = resolve_acp_agent(slug)
     direct_server_cli = (
         target is None
         and server_from_cli

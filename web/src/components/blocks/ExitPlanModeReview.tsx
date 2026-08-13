@@ -16,12 +16,13 @@
 //      revises toward it.
 //
 // The plan markdown renders through the same secure Streamdown stack
-// as assistant chat bubbles (`MessageResponse`).
+// as assistant chat bubbles, so file paths and file links a plan names
+// open in the FileViewer just as they do in a message.
 
 import { CheckIcon, XIcon, ZapIcon } from "lucide-react";
 import { useState } from "react";
-import { MessageResponse } from "@/components/ai-elements/message";
 import { Button } from "@/components/ui/button";
+import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 import { Textarea } from "@/components/ui/textarea";
 
 interface ExitPlanModeReviewProps {
@@ -52,7 +53,7 @@ export function ExitPlanModeReview({
           the whole plan out). The short lead-in caption above stays muted
           for hierarchy, matching the Codex command card. */}
       <div className="text-ui text-foreground">
-        <MessageResponse>{plan}</MessageResponse>
+        <FilePathAwareMessageResponse>{plan}</FilePathAwareMessageResponse>
       </div>
       {rejecting ? (
         <div className="flex flex-col gap-2 pt-1" data-testid="exit-plan-mode-feedback">

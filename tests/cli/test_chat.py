@@ -1296,7 +1296,7 @@ def _patch_daemon_launch(monkeypatch: pytest.MonkeyPatch, captured: dict[str, ob
         return None
 
     async def _fake_launch(
-        client: object, *, host_id: str, session_id: str, workspace: str
+        client: object, *, host_id: str, session_id: str, workspace: str, fresh: bool = False
     ) -> str:
         captured["launch"] = {"host_id": host_id, "session_id": session_id, "workspace": workspace}
         return "runner_daemon"
@@ -2213,7 +2213,7 @@ def test_materialize_bundle_overrides_brain_harness(
         assert worker_harnesses == expected_workers, (
             f"Sub-agent harnesses changed under a brain-only override: "
             f"{worker_harnesses}. The override must rewrite only the "
-            f"top-level config.yaml, never agents/<name>/config.yaml."
+            f"top-level config.yaml, never agents/<dir>/config.yaml."
         )
     finally:
         _cleanup_materialized_override_bundle(materialized)

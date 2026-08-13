@@ -662,6 +662,14 @@ def _remote_headers(
     return headers
 
 
+# Cache the resolved _DatabricksBearerAuth object per server URL so that
+# repeated calls to _remote_headers for the same URL reuse the same SDK
+# Config instance. The SDK's Config.authenticate() caches the OAuth token
+# in memory and only re-runs the CLI shell-out when it nears expiry, so
+# reusing the object is both fast and correct for long-running callers.
+_databricks_auth_cache: dict[str, object] = {}
+
+
 def _stored_databricks_record_token(server_url: str) -> str | None:
     """Mint a workspace token from a stored Databricks Apps record.
 
@@ -670,6 +678,12 @@ def _stored_databricks_record_token(server_url: str) -> str | None:
     via the Databricks CLI's host-keyed OAuth cache. One-shot — callers
     that issue many requests should use :class:`_DatabricksTokenAuth`,
     which reuses the SDK config across requests.
+
+    The resolved ``_DatabricksBearerAuth`` object is cached per
+    ``server_url`` so repeated calls reuse the same SDK ``Config``
+    instance. The SDK serves the cached OAuth token from memory and only
+    re-runs the Databricks CLI when the token nears expiry, so this is
+    both fast on repeat calls and safe for long-running callers.
 
     :param server_url: The remote server URL, e.g.
         ``"https://myapp-123.aws.databricksapps.com"``.
@@ -686,8 +700,11 @@ def _stored_databricks_record_token(server_url: str) -> str | None:
     if workspace_host is None:
         return None
     try:
-        auth, _host = _resolve_databricks_auth(host=workspace_host)
-        return auth.current_token()
+        auth = _databricks_auth_cache.get(server_url)
+        if auth is None:
+            auth, _host = _resolve_databricks_auth(host=workspace_host)
+            _databricks_auth_cache[server_url] = auth
+        return auth.current_token()  # type: ignore[union-attr]
     except (DatabricksAuthError, ImportError, ValueError):
         return None
 
@@ -1488,13 +1505,16 @@ async def _prepare_chat_session_via_daemon(
                 if fork_session_id is not None:
                     fork_result = await sdk.sessions.fork(fork_session_id)
                     session_id = fork_result["id"]
+                    fresh_session = False
                 elif resume_conversation_id is not None:
                     session_id = resume_conversation_id
+                    fresh_session = False
                 else:
                     created = await sdk.sessions.create(
                         bundle, filename="agent.tar.gz", workspace=workspace
                     )
                     session_id = created.id
+                    fresh_session = True
             except ClientOmnigentError as exc:
                 # Any create/fork/resume rejection here is a server-side answer, not
                 # a client bug worth a traceback: a wrong base URL that answers
@@ -1523,7 +1543,11 @@ async def _prepare_chat_session_via_daemon(
             if progress is not None:
                 progress.update(STARTUP_PHASE_LAUNCHING_AGENT)
             runner_id = await launch_or_reuse_daemon_runner(
-                client, host_id=host_id, session_id=session_id, workspace=workspace
+                client,
+                host_id=host_id,
+                session_id=session_id,
+                workspace=workspace,
+                fresh=fresh_session,
             )
             await wait_for_runner_online(
                 client, runner_id, timeout_s=_DAEMON_CHAT_RUNNER_ONLINE_TIMEOUT_S

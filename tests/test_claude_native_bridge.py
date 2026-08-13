@@ -2855,7 +2855,7 @@ def test_augment_claude_args_injects_plugin_dir_for_bundle_with_skills(
 
     assert "--plugin-dir" in args
     # The plugin path is the bundle root (Claude discovers
-    # <bundle>/skills/<name>/SKILL.md under the plugin convention).
+    # <bundle>/skills/<dir>/SKILL.md under the plugin convention).
     assert args[args.index("--plugin-dir") + 1] == str(bundle)
     # "all" → host skills via the CLI default; no explicit override.
     assert "--setting-sources" not in args

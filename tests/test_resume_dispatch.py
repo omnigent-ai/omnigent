@@ -690,3 +690,96 @@ def test_read_wrapper_label_remote_raises_on_404(
         )
     assert "5eca720dc2bc6cdc3a99028d7bd0f917" in excinfo.value.message
     assert "not found" in excinfo.value.message
+
+
+# ── _resolve_current_user_id ──────────────────────────────
+
+
+def test_resolve_current_user_id_returns_user_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Happy path: ``GET /v1/me`` answers 200 with a ``user_id`` → return it.
+
+    The cross-agent picker feeds this to its owner filter so ``omnigent
+    resume`` lists only the caller's own sessions.
+    """
+
+    def _fake_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
+        """Return a canned ``GET /v1/me`` identity."""
+        del headers, timeout
+        assert url.endswith("/v1/me"), url
+        return httpx.Response(200, json={"user_id": "alice@example.com", "is_admin": False})
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+
+    result = resume_dispatch._resolve_current_user_id(
+        base_url="https://example.com",
+        headers={},
+    )
+    assert result == "alice@example.com"
+
+
+def test_resolve_current_user_id_none_when_server_has_no_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A permissionless single-user server answers ``user_id: null`` → ``None``.
+
+    There is no sharing on such a server, so the picker must fall back to
+    listing everything (no owner filter) rather than hiding all rows.
+    """
+
+    def _fake_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
+        """Return the unauthenticated-identity shape."""
+        del url, headers, timeout
+        return httpx.Response(200, json={"user_id": None, "is_admin": False})
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+
+    result = resume_dispatch._resolve_current_user_id(
+        base_url="https://example.com",
+        headers={},
+    )
+    assert result is None
+
+
+def test_resolve_current_user_id_none_on_non_200(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A non-200 (e.g. OIDC 401 with a ``login_url``) yields ``None`` — the
+    picker lists everything rather than failing. Resume stays usable even
+    when identity can't be resolved.
+    """
+
+    def _fake_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
+        """Return a 401 login-required response."""
+        del url, headers, timeout
+        return httpx.Response(401, json={"user_id": None, "login_url": "/login"})
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+
+    result = resume_dispatch._resolve_current_user_id(
+        base_url="https://example.com",
+        headers={},
+    )
+    assert result is None
+
+
+def test_resolve_current_user_id_none_on_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A transport failure must NEVER break resume — it degrades to ``None``
+    (no owner filter), same as any other unresolved-identity case.
+    """
+
+    def _fake_get(url: str, *, headers: dict[str, str], timeout: float) -> httpx.Response:
+        """Raise the network error the picker must swallow."""
+        del url, headers, timeout
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+
+    result = resume_dispatch._resolve_current_user_id(
+        base_url="https://example.com",
+        headers={},
+    )
+    assert result is None

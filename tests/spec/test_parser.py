@@ -3916,3 +3916,51 @@ def test_config_loader_does_not_mutate_shared_safeloader_resolvers() -> None:
     # The subclass still narrows bools: ``on`` is a plain string, ``false`` a bool.
     assert yaml.load("on", loader) == "on"
     assert yaml.load("false", loader) is False
+
+
+# ── Sub-agent bundle provenance (``source_rel_dir``) ──────────
+
+
+def _write_agent(directory: Path, name: str) -> Path:
+    """Create a minimal agent bundle at *directory* named *name*."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "config.yaml").write_text(yaml.dump({"spec_version": 1, "name": name}))
+    return directory
+
+
+def test_sub_agent_source_rel_dir_stamped_at_each_depth(tmp_path: Path) -> None:
+    """Every parsed sub-agent records the directory it came from.
+
+    The child's skills and local tools live under
+    ``<parent bundle>/agents/<dir>``; without this stamp the runner has
+    no way to walk down to them and falls back to the parent's bundle
+    root, exposing the parent's assets to the child.
+    """
+    root = _write_agent(tmp_path / "root", "root")
+    manager = _write_agent(root / "agents" / "manager", "manager")
+    _write_agent(manager / "agents" / "researcher", "researcher")
+
+    spec = parse(root)
+
+    assert spec.source_rel_dir is None  # root has no parent bundle
+    (child,) = spec.sub_agents
+    assert child.source_rel_dir == "manager"
+    (grandchild,) = child.sub_agents
+    assert grandchild.source_rel_dir == "researcher"
+
+
+def test_sub_agent_source_rel_dir_uses_directory_not_yaml_name(tmp_path: Path) -> None:
+    """The stamp is the directory name even when the YAML name differs.
+
+    Using the YAML ``name`` would build a path that does not exist on
+    disk, so the workdir gate would reject it and the child would
+    silently inherit the parent's bundle root again.
+    """
+    root = _write_agent(tmp_path / "root", "root")
+    _write_agent(root / "agents" / "web-researcher", "Deep Researcher")
+
+    spec = parse(root)
+
+    (child,) = spec.sub_agents
+    assert child.name == "Deep Researcher"
+    assert child.source_rel_dir == "web-researcher"

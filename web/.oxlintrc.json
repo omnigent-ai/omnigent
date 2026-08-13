@@ -46,6 +46,11 @@
       {
         "paths": [
           {
+            "name": "@/lib/host",
+            "importNames": ["hostFetch"],
+            "message": "Don't call hostFetch directly — use authenticatedFetch (@/lib/identity), which stamps the auth + Dicer slice-key headers so host-scoped requests reach the replica holding the session's runner tunnel. hostFetch is the low-level transport; the only allowed direct users are the authenticatedFetch choke point and the /v1/info bootstrap in capabilities.ts."
+          },
+          {
             "name": "react-router-dom",
             "importNames": [
               "useNavigate",
@@ -84,6 +89,18 @@
       "files": ["src/lib/routing.tsx"],
       "rules": {
         "no-restricted-imports": "off"
+      }
+    },
+    {
+      "files": ["src/lib/identity.ts", "src/lib/capabilities.ts"],
+      "rules": {
+        "no-restricted-imports": "off"
+      }
+    },
+    {
+      "files": ["src/lib/identity.ts", "src/lib/sessionHost.ts"],
+      "rules": {
+        "no-underscore-dangle": "off"
       }
     },
     {

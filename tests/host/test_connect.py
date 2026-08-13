@@ -4147,3 +4147,21 @@ def test_zygote_start_failure_disables_it(
     assert host._zygote_disabled is True
     assert zygote.stop_calls == 0
     assert len(popen_argvs) == 1
+
+
+def test_direct_spawn_keeps_the_workspace_off_sys_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The runner is spawned with ``-P`` so its workspace cannot shadow omnigent.
+
+    The runner's cwd is the session workspace, and ``python -m`` would otherwise
+    prepend it to ``sys.path``, so a session opened *in an omnigent checkout*
+    imports that checkout instead of the installed package, and a long-lived
+    daemon plus a mid-flight ``git pull`` then skews the two.
+    """
+    zygote = _FakeZygote(fail_at="start", running=False)
+
+    _host, popen_argvs = _spawn_with_fake_zygote(monkeypatch, tmp_path, zygote)
+
+    assert popen_argvs[0][1:] == ["-P", "-m", "omnigent.runner._entry"]

@@ -114,6 +114,11 @@ def _pick_conversation_for_resume(
 
     base_url = server.rstrip("/")
     headers = _remote_headers(server_url=base_url)
+    # Resume is owner-only, so the picker lists only the caller's own
+    # sessions — never ones merely shared with them. Resolve who the
+    # caller is here so the picker can drop shared rows; best-effort, so
+    # an unresolved identity just leaves the list unfiltered.
+    owner_user_id = _resolve_current_user_id(base_url=base_url, headers=headers)
 
     async def _drive() -> str | None:
         """
@@ -128,7 +133,9 @@ def _pick_conversation_for_resume(
         from omnigent_client import OmnigentClient
 
         async with OmnigentClient(base_url=base_url, headers=headers) as client:
-            return await pick_conversation_cross_agent_from_sdk(client)
+            return await pick_conversation_cross_agent_from_sdk(
+                client, owner_user_id=owner_user_id
+            )
 
     try:
         return asyncio.run(_drive())
@@ -148,6 +155,44 @@ def _pick_conversation_for_resume(
         raise click.ClickException(
             f"Picker failed against {base_url!r}: {type(exc).__name__}: {exc}",
         ) from exc
+
+
+def _resolve_current_user_id(
+    *,
+    base_url: str,
+    headers: dict[str, str],
+) -> str | None:
+    """
+    Best-effort ``GET /v1/me`` to learn who the caller is.
+
+    The cross-agent resume picker uses this to drop sessions merely
+    *shared* with the caller (resume is owner-only). It is deliberately
+    best-effort: a permissionless single-user server answers
+    ``user_id: null`` (no sharing — nothing to filter), and a transient
+    lookup failure must never break resume. Both fall back to ``None``,
+    which the picker reads as "no owner filter". Reuses the same header
+    chain the picker's own requests carry, so it authenticates
+    identically.
+
+    :param base_url: Remote server URL without a trailing slash.
+    :param headers: Request headers (auth) shared with the picker.
+    :returns: The caller's ``user_id``, or ``None`` when it can't be
+        resolved (unauthenticated, non-200, non-JSON, or unreachable).
+    """
+    try:
+        resp = httpx.get(f"{base_url}/v1/me", headers=headers, timeout=10.0)
+    except httpx.HTTPError:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    user_id = body.get("user_id")
+    return user_id if isinstance(user_id, str) and user_id else None
 
 
 def _dispatch_by_runtime(

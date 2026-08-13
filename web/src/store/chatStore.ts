@@ -103,6 +103,8 @@ import { isClaudeNativeModel } from "@/lib/claudeNativeModels";
 import { isCodexNativeModel } from "@/lib/codexNativeModels";
 import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { getOmnigentHostConfig } from "@/lib/host";
+import { getSessionHost } from "@/lib/sessionHost";
 import { isSystemUserContent } from "@/lib/systemMessage";
 import { isNativeWrapper } from "@/lib/nativeCodingAgents";
 
@@ -2462,6 +2464,28 @@ async function bindStream(
   racedNativeModelOptions.delete(id);
   const controller = new AbortController();
   set({ abortController: controller });
+
+  // Opening a conversation URL with no session list loaded yet leaves the
+  // session→host map empty, so the SSE stream
+  // (and every host-scoped request) would open UNKEYED and route to the default
+  // replica — NOT the one holding this session's runner tunnel. The live tail
+  // then subscribes to the wrong replica's event bus and silently delivers
+  // nothing (the server swallows the miss; there's no 503 to trigger the keyless
+  // retry). When sharded (a host fetcher is wired), resolve the session's host_id
+  // FIRST (one fast metadata GET that populates the map via sessionFromWire) so
+  // the stream keys correctly. Best-effort: a failed resolve falls through to the
+  // unkeyed open (no worse than pre-fix); the conversationId guard bails if the
+  // user navigated away during the resolve. Re-apply after every resync, see
+  // agentbricks/mas/.claude/skills/sync-omnigents/SKILL.md.
+  if (getOmnigentHostConfig().fetcher && getSessionHost(id) === null) {
+    try {
+      await getSessionSlim(id);
+    } catch {
+      // Best-effort: a failed resolve (bad id, transient) falls through to the
+      // unkeyed open; the snapshot fetch surfaces the real error.
+    }
+    if (get().conversationId !== id) return;
+  }
 
   void startStreamPump(id, controller, set, get);
 

@@ -1240,6 +1240,9 @@ class HarnessProcessManager:
                 self._harness_zygote_disabled = True
         return await asyncio.create_subprocess_exec(
             sys.executable,
+            # -P keeps the inherited workspace cwd off sys.path so it can't
+            # shadow the installed omnigent the harness module comes from.
+            "-P",
             "-m",
             "omnigent.runtime.harnesses._runner",
             *runner_argv,

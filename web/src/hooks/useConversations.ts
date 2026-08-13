@@ -37,6 +37,7 @@ import {
 import { showToast } from "@/components/ui/toast";
 import { conversationDisplayLabel, setLegacyPinnedConversationId } from "@/shell/sidebarNav";
 import { stopSession } from "@/lib/sessionsApi";
+import { setSessionHost } from "@/lib/sessionHost";
 import {
   createProject as apiCreateProject,
   deleteProject as apiDeleteProject,
@@ -303,6 +304,12 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const wire = await res.json();
+  // Seed the session→host map on this pin-backfill path too, not just the list
+  // seed / `sessionFromWire`: a pinned session outside the paginated window can
+  // enter client state only through here, and terminal-attach / session-scoped
+  // requests key their slice off this map — so record the host before returning
+  // the row, or those requests fall back to the modal and can miss the replica.
+  setSessionHost(wire.id, wire.host_id);
   return {
     id: wire.id,
     object: "conversation",
@@ -363,7 +370,18 @@ async function fetchConversationsPage({
   const signal = searchQuery ? AbortSignal.timeout(SEARCH_FETCH_TIMEOUT_MS) : undefined;
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return withoutDeletingSessions((await res.json()) as ConversationsPage);
+  const page = (await res.json()) as ConversationsPage;
+  // Seed the session→host map from every list row, not just sessions the user
+  // has opened (which is all `sessionFromWire` covers). Two payoffs: (1) the
+  // modal-host pick (`resolveModalHost`, latched on this query's first settle)
+  // sees ALL the user's sessions, so it picks the true most-common host rather
+  // than whichever single session happened to be fetched individually first;
+  // (2) a session-scoped request (`/v1/sessions/{id}/*`) issued before that
+  // session's own snapshot loads still keys to the right replica instead of
+  // falling back to the modal. host_id is fixed for a session's life, so this
+  // can't seed a stale value; a hostless row clears any prior mapping.
+  for (const row of page.data) setSessionHost(row.id, row.host_id);
+  return withoutDeletingSessions(page);
 }
 
 /**
@@ -976,6 +994,38 @@ export function useBulkStopSessions() {
     },
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    },
+  });
+}
+
+/**
+ * Move multiple sessions to a project (or remove from all projects when
+ * `project=""`). Each session is moved independently; partial failures don't
+ * block the rest.
+ */
+export function useBulkMoveToProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ ids, project }: { ids: string[]; project: string }) => {
+      const results = await Promise.allSettled(
+        ids.map((id) => moveConversationToProject(id, project)),
+      );
+      const failed: string[] = [];
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].status === "rejected") failed.push(ids[i]);
+      }
+      if (failed.length > 0) {
+        throw new BulkConversationMutationError("move", { failed, total: ids.length });
+      }
+      return results
+        .filter((r): r is PromiseFulfilledResult<Conversation> => r.status === "fulfilled")
+        .map((r) => r.value);
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
 }

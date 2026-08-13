@@ -411,9 +411,16 @@ class _FakeRunnerRouter:
     def __init__(self, client: _FakeRunnerClient) -> None:
         self.client = client
         self.resource_calls: list[str] = []
+        self.resource_conversations: list[Conversation | None] = []
 
-    def client_for_session_resources(self, session_id: str) -> _RoutedRunner:
+    def client_for_session_resources(
+        self,
+        session_id: str,
+        *,
+        conversation: Conversation | None = None,
+    ) -> _RoutedRunner:
         self.resource_calls.append(session_id)
+        self.resource_conversations.append(conversation)
         return _RoutedRunner(self.client)
 
 
@@ -551,6 +558,9 @@ async def test_list_session_resources_proxies_to_bound_runner(
 
     assert resp.status_code == 200
     assert fake_router.resource_calls == ["79b22ebd2309e48fdeb450c65611d51b"]
+    assert [conv.id for conv in fake_router.resource_conversations if conv is not None] == [
+        "79b22ebd2309e48fdeb450c65611d51b"
+    ]
     assert fake_runner.calls == [
         ("GET", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources")
     ]
