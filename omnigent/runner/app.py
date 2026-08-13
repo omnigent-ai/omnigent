@@ -1903,6 +1903,11 @@ def create_runner_app(
 
     _version_cache: dict[str, int] = {}  # conversation_id → last seen agent_version
     _spec_cache: dict[str, _SpecEntry] = {}  # agent_id → cached AgentSpec for terminal tools
+    # Bumped whenever an agent's _spec_cache entry is invalidated. A resolution
+    # already in flight when that happens must not write its now-superseded
+    # bundle back into the cache.
+    _spec_cache_epochs: dict[str, int] = {}  # agent_id → invalidation generation
+    _session_spec_epochs: dict[str, int] = {}  # session_id → invalidation generation
     _resp_to_conv: dict[str, str] = {}  # harness response_id → conversation_id
     _live_response_id: dict[str, str] = {}
     _session_start_cache: dict[str, float] = {}  # session_id → registered start time
@@ -1986,6 +1991,9 @@ def create_runner_app(
     _ingest_cond: dict[str, asyncio.Condition] = {}
     _interrupted_sessions: set[str] = set()
     app.state.interrupted_sessions = _interrupted_sessions
+    # The spec caches are closure state, but their invalidation ordering is
+    # worth asserting directly rather than inferring from a turn's output.
+    app.state.spec_caches = {"agent": _spec_cache, "session": _session_spec_cache}
     _background_tasks: set[asyncio.Task[object]] = set()
     _subagent_wake_pending: set[str] = set()
 
@@ -5292,6 +5300,9 @@ def create_runner_app(
         if _dispatched_agent_id:
             _session_agent_ids[conv] = _dispatched_agent_id
 
+        # Captured before any resolver await below: every memoizing write in this
+        # block is fenced on it, so a reset that lands mid-resolve is not undone.
+        _turn_session_epoch = _session_spec_epochs.get(conv, 0)
         cached_spec_entry = _session_spec_cache.get(conv)
         cached_spec = _unwrap_resolved_spec(cached_spec_entry)
         cached_spec_workdir = _resolved_spec_workdir(cached_spec_entry)
@@ -5300,13 +5311,19 @@ def create_runner_app(
             if _aid:
                 try:
                     resolved = await spec_resolver(_aid, conv)
+                    # This turn keeps what it resolved; only caching is fenced.
+                    _session_epoch_current = (
+                        _session_spec_epochs.get(conv, 0) == _turn_session_epoch
+                    )
                     if isinstance(resolved, ResolvedSpec):
                         cached_spec = _unwrap_resolved_spec(resolved)
                         cached_spec_workdir = _resolved_spec_workdir(resolved)
-                        _session_spec_cache[conv] = resolved
+                        if _session_epoch_current:
+                            _session_spec_cache[conv] = resolved
                     elif resolved is not None:
                         cached_spec = resolved
-                        _session_spec_cache[conv] = resolved
+                        if _session_epoch_current:
+                            _session_spec_cache[conv] = resolved
                 except (httpx.HTTPError, RuntimeError):
                     _logger.warning(
                         "Spec resolution failed for %s",
@@ -5342,12 +5359,14 @@ def create_runner_app(
                 cached_spec_entry = sub_entry
                 cached_spec = _unwrap_resolved_spec(sub_entry)
                 cached_spec_workdir = _resolved_spec_workdir(sub_entry)
-                _session_spec_cache[conv] = sub_entry
+                if _session_spec_epochs.get(conv, 0) == _turn_session_epoch:
+                    _session_spec_cache[conv] = sub_entry
 
         cached_spec = _spec_with_workdir_paths(cached_spec, cached_spec_workdir)
         if cached_spec is not None:
             cached_spec_entry = _rewrap_like(cached_spec_entry, cached_spec, cached_spec_workdir)
-            _session_spec_cache[conv] = cached_spec_entry
+            if _session_spec_epochs.get(conv, 0) == _turn_session_epoch:
+                _session_spec_cache[conv] = cached_spec_entry
 
         harness_name: str | None = None
         spawn_env: dict[str, str] | None = None
@@ -5732,6 +5751,7 @@ def create_runner_app(
                 _turn_spec_entry = _session_entry
                 _turn_spec = _unwrap_resolved_spec(_session_entry)
             if _turn_spec is None and spec_resolver is not None:
+                _eager_epoch = _spec_cache_epochs.get(_turn_agent_id, 0)
                 try:
                     _resolved_turn_spec = await spec_resolver(_turn_agent_id, conv_id)
                     _turn_spec = _unwrap_resolved_spec(_resolved_turn_spec)
@@ -5748,8 +5768,11 @@ def create_runner_app(
                     )
                 else:
                     if _resolved_turn_spec is not None and _turn_spec is not None:
-                        _spec_cache[_turn_agent_id] = _resolved_turn_spec
                         _turn_spec_entry = _resolved_turn_spec
+                        # This turn keeps what it resolved; only the shared cache
+                        # is fenced, so an invalidation mid-resolve is not undone.
+                        if _spec_cache_epochs.get(_turn_agent_id, 0) == _eager_epoch:
+                            _spec_cache[_turn_agent_id] = _resolved_turn_spec
             _turn_spec_resolved = True
             _turn_mcp = ProxyMcpManager(conv_id, server_client)
             if _eager_spec_error is None and _turn_spec is not None:
@@ -5779,6 +5802,7 @@ def create_runner_app(
                 _turn_spec_entry = cached
                 _turn_spec = _unwrap_resolved_spec(cached)
                 return cached, None
+            lazy_epoch = _spec_cache_epochs.get(_turn_agent_id, 0)
             try:
                 resolved = await spec_resolver(_turn_agent_id, conv_id)
             except (httpx.HTTPError, RuntimeError) as exc:
@@ -5793,9 +5817,10 @@ def create_runner_app(
                     "Failed to resolve the agent spec for this turn.",
                 )
             if resolved is not None:
-                _spec_cache[_turn_agent_id] = resolved
                 _turn_spec_entry = resolved
                 _turn_spec = _unwrap_resolved_spec(resolved)
+                if _spec_cache_epochs.get(_turn_agent_id, 0) == lazy_epoch:
+                    _spec_cache[_turn_agent_id] = resolved
                 return resolved, None
             return None, None
 
@@ -7843,6 +7868,7 @@ def create_runner_app(
                     f"session spec resolver: session {session_id!r} has no agent_id",
                     code=ErrorCode.NOT_FOUND,
                 )
+            resolve_epoch = _session_spec_epochs.get(session_id, 0)
             spec_entry = await spec_resolver(agent_id, session_id)
             if spec_entry is None:
                 raise OmnigentError(
@@ -7864,7 +7890,10 @@ def create_runner_app(
                         _warn_unresolved_sub_agent(session_id, sub_agent_name)
                     else:
                         spec_entry = sub_entry
-            _session_spec_cache[session_id] = spec_entry
+            # The caller keeps what it resolved; caching is fenced so a reset
+            # that landed while the resolver was awaited is not undone.
+            if _session_spec_epochs.get(session_id, 0) == resolve_epoch:
+                _session_spec_cache[session_id] = spec_entry
             return spec_entry
 
     async def _resolve_session_agent_spec(session_id: str) -> AgentSpec | None:
@@ -8325,8 +8354,10 @@ def create_runner_app(
         _session_tool_schemas.pop(session_id, None)
         _session_mcp_spec_hash.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
+        _session_spec_epochs[session_id] = _session_spec_epochs.get(session_id, 0) + 1
         if agent_id:
             _spec_cache.pop(agent_id, None)
+            _spec_cache_epochs[agent_id] = _spec_cache_epochs.get(agent_id, 0) + 1
 
     @app.delete("/v1/sessions/{session_id}/resources")
     async def cleanup_session_resources(
