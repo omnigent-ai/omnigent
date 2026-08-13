@@ -158,6 +158,27 @@ vi.mock("./SubagentsPanel", () => ({
     <div data-testid="subagents-panel" data-conversation-id={conversationId} />
   ),
 }));
+// Stub the Ask-sub-agent dialog so the mount-gating tests can observe when it
+// is mounted, without the real dialog's agent-catalog fetch. The ask is
+// triggered through AskSubagentContext (see AskProbe below), not a popover.
+vi.mock("./AddAgentDialog", () => ({
+  AddAgentDialog: ({
+    initialContext,
+    parentSessionId,
+    open,
+  }: {
+    initialContext?: { selectedText: string };
+    parentSessionId?: string;
+    open?: boolean;
+  }) => (
+    <div
+      data-testid="stub-add-agent-dialog"
+      data-context={initialContext?.selectedText}
+      data-parent={parentSessionId}
+      data-open={String(open)}
+    />
+  ),
+}));
 // The real WorkspacePanel mounts a rail xterm for an open shell tab; stub the
 // low-level view to a marker echoing the attached terminal id.
 vi.mock("@/components/blocks/TerminalView", () => ({
@@ -215,6 +236,7 @@ import { useChildSessions } from "@/hooks/useChildSessions";
 const useChildSessionsMock = vi.mocked(useChildSessions);
 
 import { useSession } from "@/hooks/useSession";
+import { useAskSubagent } from "@/shell/AskSubagentContext";
 
 const useSessionMock = vi.mocked(useSession);
 
@@ -3534,5 +3556,125 @@ describe("Mobile header actions menu", () => {
     expect(screen.queryByRole("menuitem", { name: /^share$/i })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: /^clone$/i })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: /^resume$/i })).toBeNull();
+  });
+});
+
+describe("Ask sub-agent dialog mounting", () => {
+  function setEditAccess(
+    level: number,
+    {
+      id = "conv_ask",
+      parentSessionId = null,
+    }: { id?: string; parentSessionId?: string | null } = {},
+  ) {
+    useSessionMock.mockReturnValue({
+      session: {
+        id,
+        agentId: "ag",
+        agentName: null,
+        runnerId: null,
+        status: "idle",
+        createdAt: 0,
+        title: null,
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: level,
+        parentSessionId,
+        subAgentName: null,
+        kind: "default",
+      },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+    mockConversations([{ id, permission_level: level }]);
+  }
+
+  // Consumes the AskSubagentContext AppShell provides — the real bridge the
+  // selection toolbar uses. Exposes canAsk and a trigger for the opener.
+  function AskProbe() {
+    const ask = useAskSubagent();
+    return (
+      <button
+        type="button"
+        data-testid="probe-ask"
+        data-can-ask={String(ask?.canAsk ?? false)}
+        onClick={() =>
+          ask?.askSubagent({ selectedText: "selected snippet", surroundingExcerpt: null })
+        }
+      >
+        ask
+      </button>
+    );
+  }
+
+  function makeTree(qc: QueryClient, route = "/c/conv_ask") {
+    return (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[route]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route path="c/:conversationId" element={<AskProbe />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+  }
+
+  it("mounts AddAgentDialog only after an ask (never while closed), with the selected context", () => {
+    setEditAccess(4);
+    render(makeTree(new QueryClient({ defaultOptions: { queries: { retry: false } } })));
+
+    // Edit access → the ask affordance is available, but nothing is mounted yet
+    // (a closed dialog would otherwise fetch the agent catalog).
+    expect(screen.getByTestId("probe-ask")).toHaveAttribute("data-can-ask", "true");
+    expect(screen.queryByTestId("stub-add-agent-dialog")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("probe-ask"));
+    const dialog = screen.getByTestId("stub-add-agent-dialog");
+    expect(dialog).toHaveAttribute("data-context", "selected snippet");
+    expect(dialog).toHaveAttribute("data-open", "true");
+    // Parented at the ACTIVE conversation (the source), not a fixed root.
+    expect(dialog).toHaveAttribute("data-parent", "conv_ask");
+  });
+
+  it("parents the ask at the active (source) session, not the root — enabling nesting", () => {
+    // Viewing ask-1 (a child of main): an ask here creates a child of ask-1, so
+    // ask-2 nests under ask-1 (not under the root, main).
+    setEditAccess(4, { id: "ask-1", parentSessionId: "main" });
+    render(
+      makeTree(new QueryClient({ defaultOptions: { queries: { retry: false } } }), "/c/ask-1"),
+    );
+
+    fireEvent.click(screen.getByTestId("probe-ask"));
+    const dialog = screen.getByTestId("stub-add-agent-dialog");
+    expect(dialog).toHaveAttribute("data-parent", "ask-1");
+    expect(dialog).toHaveAttribute("data-context", "selected snippet");
+  });
+
+  it("unmounts the dialog and abandons the ask when edit access is lost", () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    setEditAccess(4);
+    const { rerender } = render(makeTree(qc));
+
+    fireEvent.click(screen.getByTestId("probe-ask"));
+    expect(screen.getByTestId("stub-add-agent-dialog")).toBeInTheDocument();
+
+    // Permission downgraded to read-only → canAsk flips false and the dialog
+    // unmounts.
+    setEditAccess(1);
+    rerender(makeTree(qc));
+    expect(screen.getByTestId("probe-ask")).toHaveAttribute("data-can-ask", "false");
+    expect(screen.queryByTestId("stub-add-agent-dialog")).toBeNull();
+
+    // Re-granting access must NOT reopen the abandoned ask (context was
+    // cleared), though the affordance is available again.
+    setEditAccess(4);
+    rerender(makeTree(qc));
+    expect(screen.getByTestId("probe-ask")).toHaveAttribute("data-can-ask", "true");
+    expect(screen.queryByTestId("stub-add-agent-dialog")).toBeNull();
   });
 });

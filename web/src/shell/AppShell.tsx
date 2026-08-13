@@ -1,4 +1,12 @@
-import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
@@ -12,7 +20,7 @@ import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
-import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { derivePermissionLevel, hasEditAccess, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   isAndroidShell,
   isIOSShell,
@@ -37,6 +45,7 @@ import {
 } from "@/components/ui/dialog";
 import {
   cachedTreeContains,
+  collectCachedSubtreeNames,
   executionLogTabKey,
   MAIN_EXECUTION_LOG_KEY,
   MAX_TREE_DEPTH,
@@ -84,6 +93,7 @@ import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
+import { AddAgentDialog } from "./AddAgentDialog";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
 import {
   TerminalFirstContextProvider,
@@ -97,10 +107,36 @@ import { CommandPalette } from "./CommandPalette";
 import { Toaster } from "@/components/ui/toast";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
+import {
+  AskSubagentContextProvider,
+  type AskSubagentContextValue,
+  type AskSubagentSelection,
+} from "./AskSubagentContext";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
 import type { RightRailTab } from "./railTabs";
+
+/**
+ * Chat-surface context providers composed into one wrapper, so adding a
+ * provider doesn't re-indent the whole app subtree. Wraps the shared surface
+ * with the fork/clone opener and the "Ask sub-agent" opener.
+ */
+function ChatSurfaceProviders({
+  fork,
+  ask,
+  children,
+}: {
+  fork: ForkDialogContextValue;
+  ask: AskSubagentContextValue;
+  children: ReactNode;
+}) {
+  return (
+    <ForkDialogContextProvider value={fork}>
+      <AskSubagentContextProvider value={ask}>{children}</AskSubagentContextProvider>
+    </ForkDialogContextProvider>
+  );
+}
 
 /**
  * Top-level layout. The sidebar and right panels are responsive:
@@ -565,6 +601,32 @@ export function AppShell() {
   useEffect(() => {
     stickyRootRef.current = rootSessionId;
   }, [rootSessionId]);
+  // "Ask sub-agent": text selected in an assistant response opens the Add Agent
+  // dialog prefilled with that selection. Local state (no global store) — the
+  // selection popover reports the text and the dialog below reads it.
+  const [askSubagentSelection, setAskSubagentSelection] = useState<AskSubagentSelection | null>(
+    null,
+  );
+  // Clear any pending selection when the viewed conversation changes so a stale
+  // selection can't open the dialog on the next session.
+  useEffect(() => {
+    setAskSubagentSelection(null);
+  }, [conversationId]);
+  // Abandon a pending ask if the viewer loses edit access (e.g. a permission
+  // downgrade) so the dialog can't stay open or reopen for a read-only viewer.
+  useEffect(() => {
+    if (!hasEditAccess(permissionLevel)) setAskSubagentSelection(null);
+  }, [permissionLevel]);
+  // Names already used across the root tree (from the rail's cached child
+  // lists) so the Ask dialog's derived name stays unique. Best-effort; the
+  // dialog also dedupes against fresh siblings (the server's real constraint).
+  const askSubagentTreeNames = useMemo(
+    () =>
+      askSubagentSelection !== null && rootSessionId
+        ? collectCachedSubtreeNames(queryClient, rootSessionId, MAX_TREE_DEPTH)
+        : [],
+    [queryClient, rootSessionId, askSubagentSelection],
+  );
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.
   const subagentsWorking = childSessions.filter((c) => c.busy).length;
@@ -1489,6 +1551,16 @@ export function AppShell() {
     }),
     [canClone],
   );
+  // Cross-surface "Ask sub-agent" opener for ChatPage's selection toolbar.
+  // ``canAsk`` mirrors the Agents-rail Add-agent gate (edit access to the root
+  // session); ``askSubagent`` stashes the selection so the dialog below opens.
+  const askSubagentContextValue = useMemo<AskSubagentContextValue>(
+    () => ({
+      canAsk: hasEditAccess(permissionLevel),
+      askSubagent: setAskSubagentSelection,
+    }),
+    [permissionLevel],
+  );
   const workspacePanelVisible = Boolean(
     conversationId &&
     hasRailContent &&
@@ -1501,7 +1573,7 @@ export function AppShell() {
   return (
     <FileViewerContext.Provider value={fileViewerContextValue}>
       <TerminalFirstContextProvider value={terminalFirstContextValue}>
-        <ForkDialogContextProvider value={forkDialogContextValue}>
+        <ChatSurfaceProviders fork={forkDialogContextValue} ask={askSubagentContextValue}>
           {/* `app-shell` paints the near-white brand gradient canvas (see
         index.css); bg-sidebar is the fallback the gradient sits over. The
         white sidebar / workspace cards float on this canvas.
@@ -1854,6 +1926,20 @@ export function AppShell() {
               }}
             />
           )}
+          {/* "Ask sub-agent" dialog: opens from ChatPage's selection toolbar and
+              parents the child under the ACTIVE conversation, so asks nest. Mounted
+              only while an ask is pending and the viewer keeps edit access. */}
+          {conversationId && askSubagentSelection !== null && hasEditAccess(permissionLevel) && (
+            <AddAgentDialog
+              parentSessionId={conversationId}
+              initialContext={askSubagentSelection}
+              existingNames={askSubagentTreeNames}
+              open
+              onOpenChange={(nextOpen) => {
+                if (!nextOpen) setAskSubagentSelection(null);
+              }}
+            />
+          )}
           {/* Agent tools & policies — the mobile counterpart of the desktop
         AgentInfoButton popover, opened from the header's three-dot menu. */}
           {hasAgentInfo && (
@@ -1885,7 +1971,7 @@ export function AppShell() {
           {/* Transient toasts (e.g. "session archived"). Mounted once here so
               any surface can fire one via showToast(). */}
           <Toaster />
-        </ForkDialogContextProvider>
+        </ChatSurfaceProviders>
       </TerminalFirstContextProvider>
     </FileViewerContext.Provider>
   );

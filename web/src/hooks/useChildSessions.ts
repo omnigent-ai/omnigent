@@ -133,6 +133,42 @@ export function cachedTreeContains(
 }
 
 /**
+ * Collect the ``session_name``s of every cached descendant under ``rootId``.
+ *
+ * Synchronous and cache-only (mirrors {@link cachedTreeContains}) — never
+ * fetches. Used by the "Ask sub-agent" flow to keep a selection-derived name
+ * unique across the root tree the rail has loaded. Best-effort by design: the
+ * server still enforces per-parent (sibling) title uniqueness, so a
+ * fresh-sibling check remains the correctness guarantee.
+ *
+ * @param queryClient - The app QueryClient holding child-session caches.
+ * @param rootId - Root session whose cached tree to walk.
+ * @param maxDepth - Levels below the root to examine, e.g. ``MAX_TREE_DEPTH``.
+ * @returns The non-empty ``session_name``s found in the cached tree.
+ */
+export function collectCachedSubtreeNames(
+  queryClient: QueryClient,
+  rootId: string,
+  maxDepth: number,
+): string[] {
+  const names: string[] = [];
+  let frontier = [rootId];
+  for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
+    const next: string[] = [];
+    for (const id of frontier) {
+      const children = queryClient.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey(id));
+      if (!children) continue;
+      for (const child of children) {
+        if (child.session_name) names.push(child.session_name);
+        next.push(child.id);
+      }
+    }
+    frontier = next;
+  }
+  return names;
+}
+
+/**
  * Sentinel value used in place of a session id for the rail/panel's
  * "main" entry. The panel resolves it to the currently-viewed parent
  * conversation id at runtime so the same code path serves both main
