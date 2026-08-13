@@ -1250,8 +1250,8 @@ async def _auto_create_opencode_terminal(
     # gateway or a pinned default) + the agent's MCP servers + force-ask.
     config: dict[str, object] = {}
     instructions = _opencode_native_instructions_from_spec(agent_spec)
+    instructions_path = bridge_dir / "agent-instructions.md"
     if instructions:
-        instructions_path = bridge_dir / "agent-instructions.md"
         instructions_path.write_text(instructions, encoding="utf-8")
     gateway = resolve_databricks_gateway(
         _opencode_native_profile_from_spec(agent_spec), model_id=model_override
