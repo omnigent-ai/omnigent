@@ -1091,7 +1091,7 @@ class AcpExecutor(Executor):
 
         return events
 
-    def _note_config_options(self, options: object) -> None:
+    def _note_config_options(self, options: object) -> str | None:
         """Record which session config options the agent exposes, and their values.
 
         ACP agents advertise settable options (``mode``, ``model``, …) via
@@ -1099,9 +1099,14 @@ class AcpExecutor(Executor):
         switch is possible at all; tracking ``model``'s ``currentValue`` is the
         only trustworthy record of which model is live — an agent's own
         self-report is unreliable.
+
+        :returns: The echoed ``model`` ``currentValue`` when the payload carried a
+            model option, else ``None`` — lets a caller distinguish "the agent
+            reported its model" from "no model option present".
         """
         if not isinstance(options, list):
-            return
+            return None
+        model_value: str | None = None
         for opt in options:
             if not isinstance(opt, dict):
                 continue
@@ -1113,6 +1118,8 @@ class AcpExecutor(Executor):
                 current = opt.get("currentValue")
                 if isinstance(current, str) and current:
                     self._active_model = current
+                    model_value = current
+        return model_value
 
     async def _apply_model_override(self, session_id: str, model: str | None) -> None:
         """Warm-switch the agent's model via ACP ``session/set_config_option``.
@@ -1157,14 +1164,23 @@ class AcpExecutor(Executor):
                 response["error"].get("message", response["error"]),
             )
             return
-        # The agent echoes its options back; trust that over our request so
-        # ``_active_model`` reflects what the agent actually holds.
+        # The agent echoes its options back; trust the echoed ``currentValue``
+        # over our request, since an agent may normalize or silently reject the
+        # id. Fall back to the requested model only when the agent echoed no model
+        # option at all (some accept the switch without echoing options) — never
+        # overwrite an echoed value with the request, or a later turn would skip a
+        # switch it should retry.
         result = response.get("result")
-        if isinstance(result, dict):
+        echoed_model = (
             self._note_config_options(result.get("configOptions"))
-        if self._active_model != model:
+            if isinstance(result, dict)
+            else None
+        )
+        if echoed_model is None:
             self._active_model = model
-        logger.info("acp[%s] model switched to %s (transcript kept)", self._config.name, model)
+        logger.info(
+            "acp[%s] model set to %s (transcript kept)", self._config.name, self._active_model
+        )
 
     async def run_turn(
         self,
@@ -1227,8 +1243,10 @@ class AcpExecutor(Executor):
                     )
                 break
 
-        # On a fresh session, replay prior conversation so a model switch (which
-        # respawns the subprocess) or a session reset doesn't drop the thread.
+        # On a fresh session, replay prior conversation so a subprocess restart
+        # (after the agent process exits) or a session reset doesn't drop the
+        # thread. A ``/model`` switch no longer respawns — it reconfigures the
+        # live session (see ``_apply_model_override``) — so it never reaches here.
         if fresh_session and latest_user_idx is not None and latest_user_idx > 0:
             history_prefix = self._history_prefix(messages[:latest_user_idx])
             user_text = f"{history_prefix}\n\nuser: {user_text}" if user_text else history_prefix

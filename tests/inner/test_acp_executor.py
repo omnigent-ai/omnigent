@@ -402,6 +402,62 @@ async def test_model_override_rejection_latches_off_and_does_not_raise() -> None
     ex._rpc.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_model_override_trusts_echoed_value_over_request() -> None:
+    """
+    When the agent echoes a ``currentValue`` that differs from the request, we
+    record the echo — not the request.
+
+    An agent may normalize the id or silently keep its current model while still
+    returning success. ``currentValue`` is the only trustworthy record, so
+    ``_active_model`` must reflect it. Because the request was not actually
+    reached, the next turn must be free to retry it.
+
+    **What breaks if this fails**: ``_active_model`` reflects a model the agent
+    never switched to, so a later ``/model`` for the requested id is wrongly
+    skipped as already-active.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(_model_option("swe-1-7-medium"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        # Agent accepts the call but reports a different (normalized) id.
+        return {"result": {"configOptions": [{"id": "model", "currentValue": "gemini-3-1-pro"}]}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "gemini-3-1-pro-low")
+
+    # Echo wins over the request.
+    assert ex._active_model == "gemini-3-1-pro"
+    # The requested id was not reached, so a later turn still attempts it.
+    calls: list[str] = []
+
+    async def tracking_rpc(method, params, timeout=30.0):
+        calls.append(params["value"])
+        return {"result": {"configOptions": [{"id": "model", "currentValue": params["value"]}]}}
+
+    ex._rpc = tracking_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "gemini-3-1-pro-low")
+    assert calls == ["gemini-3-1-pro-low"]
+
+
+@pytest.mark.asyncio
+async def test_model_override_falls_back_to_request_when_no_option_echoed() -> None:
+    """
+    When the agent accepts the switch but echoes no model option, record the
+    requested model.
+
+    **What breaks if this fails**: ``_active_model`` is left stale after a
+    successful switch, so the same switch is re-requested every turn.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(_model_option("swe-1-7-medium"))
+    ex._rpc = AsyncMock(return_value={"result": {}})  # type: ignore[assignment]
+
+    await ex._apply_model_override("s1", "gemini-3-1-pro-low")
+    assert ex._active_model == "gemini-3-1-pro-low"
+
+
 # ---------------------------------------------------------------------------
 # interrupt → session/cancel
 # ---------------------------------------------------------------------------
