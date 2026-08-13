@@ -258,7 +258,7 @@ def test_file_passes_from_parent_agent_to_subagent(
     child_session_id = _find_child_session_id(
         http_client,
         parent_session_id=parent_session_id,
-        child_title="analyst:analyst-1",
+        child_title="analyst:file-analysis",
     )
     child_file = _wait_for_child_file(
         http_client,

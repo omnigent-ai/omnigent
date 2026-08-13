@@ -1827,25 +1827,27 @@ async def _execute_subagent_tool(
                 "after completion."
             )
     else:
-        # Auto-generate a structured session name (e.g. "researcher-1").
-        # Recover ordinals from existing children on first spawn after
-        # runner restart to avoid duplicates.
-        _all_children = await _list_child_sessions(
-            server_client=server_client,
-            conversation_id=conversation_id,
-            tool=str(sub_agent_name),
-        )
-        if not isinstance(_all_children, str):
-            _runner_app.recover_subagent_ordinals(
+        if not session_name:
+            # No title hint — auto-generate a structured session name
+            # (e.g. "researcher-1"). Recover ordinals from existing
+            # children on first spawn after runner restart to avoid
+            # duplicates.
+            _all_children = await _list_child_sessions(
+                server_client=server_client,
+                conversation_id=conversation_id,
+                tool=str(sub_agent_name),
+            )
+            if not isinstance(_all_children, str):
+                _runner_app.recover_subagent_ordinals(
+                    conversation_id,
+                    str(sub_agent_name),
+                    _all_children,
+                )
+            ordinal = _runner_app.next_subagent_ordinal(
                 conversation_id,
                 str(sub_agent_name),
-                _all_children,
             )
-        ordinal = _runner_app.next_subagent_ordinal(
-            conversation_id,
-            str(sub_agent_name),
-        )
-        session_name = f"{sub_agent_name}-{ordinal}"
+            session_name = f"{sub_agent_name}-{ordinal}"
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
         # Apply an allowlisted per-dispatch harness override. The sub-agent
         # spec must explicitly opt in via executor.config.allowed_harnesses,

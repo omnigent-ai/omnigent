@@ -228,13 +228,12 @@ def _build_sys_session_send_schema(
             "title": {
                 "type": "string",
                 "description": (
-                    "Named mode: optional semantic hint for the "
+                    "Named mode: optional task-based title for the "
                     "sub-agent session (e.g. 'auth' or 'payments'). "
-                    "A structured name (e.g. 'researcher-1') is "
-                    "auto-assigned and returned in the response "
-                    "handle — use that name or 'session_id' to "
-                    "continue the same session. Pair with 'agent'; "
-                    "omit when using 'session_id'."
+                    "Reusing the same (agent, title) pair continues "
+                    "the existing session. When omitted, a structured "
+                    "name (e.g. 'researcher-1') is auto-assigned. "
+                    "Pair with 'agent'; omit when using 'session_id'."
                 ),
             },
         }
