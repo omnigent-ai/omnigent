@@ -159,9 +159,19 @@ runs:
         cd "$src"
         pnpm install --frozen-lockfile --filter web
         pnpm --filter web run build
-        # The Vite output is web/dist/; copy to a stable path and point
-        # the HEAD server at it so it serves the old bundle.
-        cp -r "$src/web/dist" "$dist"
+        # vite.config.ts writes to ../omnigent/server/static/web-ui relative
+        # to web/ — resolve to the absolute path inside the old checkout.
+        built=$(cd web && node -e "const p=require('./vite.config.ts')" 2>/dev/null \
+          || echo "$src/omnigent/server/static/web-ui")
+        # Fall back to checking both known locations.
+        if [ -d "$src/omnigent/server/static/web-ui" ]; then
+          built="$src/omnigent/server/static/web-ui"
+        elif [ -d "$src/web/dist" ]; then
+          built="$src/web/dist"
+        else
+          echo "Could not locate built SPA under $src" >&2; exit 1
+        fi
+        cp -r "$built" "$dist"
         echo "OMNIGENT_WEB_UI_DIST=$dist" >> "$GITHUB_ENV"
 
     - name: Run UI compat tests
