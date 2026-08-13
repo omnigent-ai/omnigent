@@ -405,7 +405,9 @@ export function buildPendingBubbles(
       itemId: p.tempId,
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
-      createdAtS: Math.floor(Date.now() / 1000),
+      // Stamped once at send time; absent for snapshot-replayed entries,
+      // which show no timestamp rather than a re-stamped render time.
+      ...(p.createdAtS !== undefined ? { createdAtS: p.createdAtS } : {}),
     };
   });
 }
@@ -3629,6 +3631,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
+  const ts = formatBubbleTimestamp(bubble.createdAtS);
   // Runtime-injected `[System: ...]` notifications (task completion,
   // timer firings, terminal idle) ride in on role=user. When the content
   // is a pure system marker — no attached images or files — swap the
@@ -3769,23 +3772,24 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
           </MessageContent>
         </div>
-        <div className="mt-0.5 flex items-center justify-end gap-2 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
-          {(() => {
-            const ts = formatBubbleTimestamp(bubble.createdAtS);
-            return ts ? (
-              <span className="select-none text-[10px] leading-none text-muted-foreground/60">
-                {ts}
-              </span>
-            ) : null;
-          })()}
-          {text && (
-            <MessageActions>
-              <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
-                {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-              </MessageAction>
-            </MessageActions>
-          )}
-        </div>
+        {/* Skip an empty row when there is neither a timestamp nor a copy
+            action. 40%-visible on touch (no hover), hover/focus-reveal on
+            desktop. py-1 matches the design prototype's 24px action row;
+            the timestamp rides inside it instead of adding a new row. */}
+        {(ts || text) && (
+          <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+            {ts && (
+              <span className="select-none text-[11px] leading-4 text-foreground/56">{ts}</span>
+            )}
+            {text && (
+              <MessageActions>
+                <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                  {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+                </MessageAction>
+              </MessageActions>
+            )}
+          </div>
+        )}
       </div>
     </Message>
   );
@@ -3821,6 +3825,7 @@ function AssistantBubble({
   if (bubble.items.length === 0) return null;
 
   const markdownText = collectBubbleMarkdown(bubble.items);
+  const ts = formatBubbleTimestamp(bubble.createdAtS);
 
   // The bubble collapses to nothing but the "Worked for" row — its text
   // all sits inside the fold, and its answer lands in a later bubble.
@@ -3877,17 +3882,12 @@ function AssistantBubble({
         )}
         {/* Skipped on a fold-only bubble: the actions belong to content
             the user can see, and hanging them off a collapsed row spaced
-            consecutive rows unevenly depending on hidden narration. */}
-        {!foldOnly && (
-          <div className="mt-0.5 flex items-center gap-2 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
-            {(() => {
-              const ts = formatBubbleTimestamp(bubble.createdAtS);
-              return ts ? (
-                <span className="select-none text-[10px] leading-none text-muted-foreground/60">
-                  {ts}
-                </span>
-              ) : null;
-            })()}
+            consecutive rows unevenly depending on hidden narration. Also
+            skipped when there is neither a timestamp nor actions to show.
+            40%-visible on touch (no hover), hover/focus-reveal on desktop.
+            Order matches the design target: actions, then timestamp. */}
+        {!foldOnly && (ts || markdownText) && (
+          <div className="flex items-center gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
             {markdownText && (
               <MessageActions>
                 <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
@@ -3908,6 +3908,9 @@ function AssistantBubble({
                   </MessageAction>
                 )}
               </MessageActions>
+            )}
+            {ts && (
+              <span className="select-none text-[11px] leading-4 text-foreground/56">{ts}</span>
             )}
           </div>
         )}

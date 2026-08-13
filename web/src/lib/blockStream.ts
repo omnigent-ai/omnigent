@@ -206,7 +206,9 @@ function ctx(
     // under the item's true id without moving the reducer's active id.
     responseId: responseId || state.responseId,
     itemId,
-    createdAtS: Math.floor(Date.now() / 1000),
+    // Live blocks carry no server stamp yet — record the client clock
+    // separately so same-clock duration guards never mix epochs.
+    clientCreatedAtS: Math.floor(Date.now() / 1000),
   };
 }
 

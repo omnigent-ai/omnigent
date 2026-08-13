@@ -137,6 +137,11 @@ export interface SendOptions {
 export interface PendingUserMessage {
   tempId: string;
   content: MessageContentBlock[];
+  /** Client epoch seconds stamped ONCE at send time — the optimistic
+   *  bubble's display timestamp. Stamping here (not at render or
+   *  promotion) keeps the shown time pinned to when the user hit send.
+   *  Absent on snapshot-replayed entries (server carries no stamp). */
+  createdAtS?: number;
   /** Author email for this pending message. Set at send time for fresh sends; set from the snapshot's created_by for replayed entries (which may differ from the current viewer). Used as fallback when session.input.consumed arrives without created_by (native-terminal path). */
   author?: string;
   /**
@@ -1376,7 +1381,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((s) => ({
       pendingUserMessages: [
         ...s.pendingUserMessages,
-        { tempId, content, ...(selfAuthor !== null ? { author: selfAuthor } : {}) },
+        {
+          tempId,
+          content,
+          createdAtS: Math.floor(Date.now() / 1000),
+          ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+        },
       ],
       // A new turn supersedes the prior turn's background-shell tally: the
       // "N background tasks still running" label must give way to "Working…" the
@@ -1587,6 +1597,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         {
           tempId,
           content: [{ type: "input_text" as const, text: commandText }],
+          createdAtS: Math.floor(Date.now() / 1000),
           ...(selfAuthor !== null ? { author: selfAuthor } : {}),
         },
       ],
@@ -4158,6 +4169,7 @@ function committedUserBlock(
   content: MessageContentBlock[],
   stableKey?: string,
   createdBy?: string,
+  createdAtS?: number,
 ): UserMessageBlock {
   return {
     type: "user_message",
@@ -4171,7 +4183,10 @@ function committedUserBlock(
       // Live human-author attribution (multi-user); omit when absent so
       // null carries no author. Mirrors itemsToBlocks on cold load.
       ...(createdBy !== undefined ? { createdBy } : {}),
-      createdAtS: Math.floor(Date.now() / 1000),
+      // Client clock — see blockStream.ctx; keeps server-stamped
+      // `createdAtS` comparisons single-clock. A promoted optimistic
+      // bubble keeps its send-time stamp rather than re-stamping now.
+      clientCreatedAtS: createdAtS ?? Math.floor(Date.now() / 1000),
     },
     content,
     stableKey,
@@ -4813,6 +4828,7 @@ export function handleSessionEvent(event: StreamEvent): void {
                   content,
                   matched.tempId,
                   event.createdBy ?? matched.author,
+                  matched.createdAtS,
                 ),
               ],
             };
@@ -4846,6 +4862,7 @@ export function handleSessionEvent(event: StreamEvent): void {
                 content,
                 head.tempId,
                 event.createdBy ?? head.author,
+                head.createdAtS,
               ),
             ],
           };
