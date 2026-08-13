@@ -1,10 +1,12 @@
-// Tests for the branch checkbox list in the sidebar's bulk-delete modal
-// (selection mode). Contract: worktree sessions among the selection each get
-// a checkbox listing their local git branch; ticking one opts that session
-// into `?delete_branch=true`. Checkboxes default unchecked (branch deletion is
-// irreversible), and a "Select all" toggle flips the whole list at once. The
-// per-session branch flags ride along in `bulkDelete.mutate({ ids,
-// deleteBranchIds })`. See BulkActionBar in Sidebar.tsx.
+// Tests for the branch table in the sidebar's bulk-delete modal (selection
+// mode). Contract: worktree sessions among the selection each get a table row
+// with a checkbox and their local git branch; ticking one opts that session
+// into `?delete_branch=true`. Row checkboxes default unchecked (branch deletion
+// is irreversible). The header checkbox is tri-state — unchecked when no row is
+// ticked, indeterminate ([-]) for a partial selection, checked when all rows
+// are ticked — and toggling it flips the whole table at once. The per-session
+// branch flags ride along in `bulkDelete.mutate({ ids, deleteBranchIds })`. See
+// BulkActionBar in Sidebar.tsx.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
@@ -191,7 +193,7 @@ describe("bulk-delete branch list", () => {
     });
   });
 
-  it("Select all ticks every branch; the flags reach deleteBranchIds", () => {
+  it("toggling the header checkbox ticks every branch; the flags reach deleteBranchIds", () => {
     renderSidebar();
     const dialog = selectAllAndOpenDeleteDialog();
 
@@ -206,6 +208,39 @@ describe("bulk-delete branch list", () => {
       ids: ["conv_a", "conv_b", "conv_c"],
       deleteBranchIds: new Set(["conv_a", "conv_b"]),
     });
+  });
+
+  it("re-toggling the header checkbox when all are ticked clears every branch", () => {
+    renderSidebar();
+    const dialog = selectAllAndOpenDeleteDialog();
+    const header = within(dialog).getByTestId("bulk-delete-branch-toggle-all");
+
+    fireEvent.click(header); // none → all
+    fireEvent.click(header); // all → none
+    for (const box of within(dialog).getAllByTestId("bulk-delete-branch-checkbox")) {
+      expect(box).not.toBeChecked();
+    }
+  });
+
+  it("drives the header checkbox tri-state from the row selection", () => {
+    renderSidebar();
+    const dialog = selectAllAndOpenDeleteDialog();
+    const header = within(dialog).getByTestId("bulk-delete-branch-toggle-all");
+    const rows = within(dialog).getAllByTestId("bulk-delete-branch-checkbox");
+
+    // Nothing ticked → unchecked, not indeterminate.
+    expect(header).not.toBeChecked();
+    expect(header).not.toBePartiallyChecked();
+
+    // One of two ticked → indeterminate ([-]), not checked.
+    fireEvent.click(rows[0]);
+    expect(header).toBePartiallyChecked();
+    expect(header).not.toBeChecked();
+
+    // Both ticked → checked, no longer indeterminate.
+    fireEvent.click(rows[1]);
+    expect(header).toBeChecked();
+    expect(header).not.toBePartiallyChecked();
   });
 
   it("omits the branch list entirely when no selected session has a worktree", () => {

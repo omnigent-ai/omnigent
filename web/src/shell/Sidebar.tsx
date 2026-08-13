@@ -4358,6 +4358,10 @@ function BulkActionBar({
   );
   const allBranchesSelected =
     worktreeSelected.length > 0 && worktreeSelected.every((c) => branchesToDelete.has(c.id));
+  // Drives the header checkbox's indeterminate ([-]) state: some but not all
+  // branches ticked.
+  const someBranchesSelected =
+    !allBranchesSelected && worktreeSelected.some((c) => branchesToDelete.has(c.id));
 
   function toggleBranch(id: string, checked: boolean) {
     setBranchesToDelete((prev) => {
@@ -4612,40 +4616,62 @@ function BulkActionBar({
                 Optionally delete the local git branches for these worktree sessions. These actions
                 are <span className="font-semibold text-destructive">irreversible</span>.
               </p>
-              <Button
-                type="button"
-                variant="outline"
-                size="xs"
-                className="self-start"
-                onClick={toggleAllBranches}
-                data-testid="bulk-delete-branch-toggle-all"
-              >
-                {allBranchesSelected ? "Clear all" : "Select all"}
-              </Button>
-              <ul className="flex max-h-56 flex-col gap-3 overflow-y-auto">
-                {worktreeSelected.map((c) => (
-                  <li key={c.id}>
-                    <label className="flex cursor-pointer items-start gap-2 text-ui">
-                      <input
-                        type="checkbox"
-                        data-testid="bulk-delete-branch-checkbox"
-                        checked={branchesToDelete.has(c.id)}
-                        onChange={(e) => toggleBranch(c.id, e.target.checked)}
-                        className="mt-0.5 size-4 shrink-0 accent-destructive"
-                      />
-                      <GitBranchIcon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
-                      <span className="flex min-w-0 flex-col">
-                        <code className="break-all rounded bg-muted px-1 py-0.5 text-sm">
-                          {c.git_branch}
-                        </code>
-                        <span className="truncate text-sm text-muted-foreground">
-                          {conversationDisplayLabel(c)}
-                        </span>
-                      </span>
-                    </label>
-                  </li>
-                ))}
-              </ul>
+              <div className="max-h-56 overflow-y-auto">
+                <table className="w-full border-collapse text-left text-ui">
+                  <thead>
+                    <tr className="border-b border-destructive/20 text-sm text-muted-foreground">
+                      <th scope="col" className="w-8 py-1.5 pr-2 font-medium">
+                        <input
+                          type="checkbox"
+                          ref={(el) => {
+                            if (el) el.indeterminate = someBranchesSelected;
+                          }}
+                          checked={allBranchesSelected}
+                          onChange={toggleAllBranches}
+                          aria-label="Select all branches"
+                          data-testid="bulk-delete-branch-toggle-all"
+                          className="mt-1 size-4 shrink-0 accent-destructive"
+                        />
+                      </th>
+                      <th scope="col" className="py-1.5 pr-3 font-medium">
+                        Branch
+                      </th>
+                      <th scope="col" className="py-1.5 font-medium">
+                        Session
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {worktreeSelected.map((c) => (
+                      <tr key={c.id} className="align-top">
+                        <td className="py-2 pr-2">
+                          <input
+                            type="checkbox"
+                            data-testid="bulk-delete-branch-checkbox"
+                            checked={branchesToDelete.has(c.id)}
+                            onChange={(e) => toggleBranch(c.id, e.target.checked)}
+                            aria-label={`Delete branch ${c.git_branch}`}
+                            className="mt-0.5 size-4 shrink-0 cursor-pointer accent-destructive"
+                          />
+                        </td>
+                        <td className="py-2 pr-3">
+                          <span className="flex items-start gap-1.5">
+                            <GitBranchIcon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+                            <code className="break-all rounded bg-muted px-1 py-0.5 text-sm">
+                              {c.git_branch}
+                            </code>
+                          </span>
+                        </td>
+                        <td className="py-2 text-sm text-muted-foreground">
+                          <span className="line-clamp-2 break-all">
+                            {conversationDisplayLabel(c)}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
           )}
           <DialogFooter className="border-t-0 bg-transparent">
