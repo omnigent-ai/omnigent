@@ -91,7 +91,7 @@ Gemini-native and has no OpenAI-compatible gateway / Databricks path.
 
 ```yaml
 executor:
-  harness: antigravity         # aliases: agy, google-antigravity
+  harness: antigravity         # aliases: agy, google-antigravity (native: antigravity-native, agy-native)
   model: gemini-3.5-flash
   auth:
     type: api_key

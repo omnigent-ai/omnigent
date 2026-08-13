@@ -5577,6 +5577,18 @@ def test_click_subcommands_allowlist_covers_registered_commands() -> None:
     )
 
 
+def test_agy_cli_alias_registered_and_in_subcommands() -> None:
+    """``omni agy`` alias is registered on the cli group and present in allowlists."""
+    from omnigent.cli import _ALIAS_COMMANDS, _CLICK_SUBCOMMANDS, _HARNESS_COMMANDS, cli
+
+    assert "agy" in cli.commands
+    assert "antigravity" in cli.commands
+    assert cli.commands["agy"].callback is cli.commands["antigravity"].callback
+    assert "agy" in _CLICK_SUBCOMMANDS
+    assert "agy" in _HARNESS_COMMANDS
+    assert "agy" in _ALIAS_COMMANDS
+
+
 # ── first-run smart defaults (omnigent run) ──────────
 
 

@@ -1597,6 +1597,7 @@ def _print_version_callback(ctx: click.Context, _param: click.Parameter, value: 
 # decorated below.
 _HARNESS_COMMANDS: frozenset[str] = frozenset(
     {
+        "agy",
         "antigravity",
         "claude",
         "codex",
@@ -1624,7 +1625,7 @@ _ACCENT_RGB = (244, 59, 166)
 # object registered under a second name, e.g. ``update`` -> ``upgrade``).
 # Kept runnable/registered but omitted from the ``--help`` listing so the
 # alias isn't shown as a duplicate line.
-_ALIAS_COMMANDS: frozenset[str] = frozenset({"update"})
+_ALIAS_COMMANDS: frozenset[str] = frozenset({"update", "agy"})
 
 
 def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
@@ -1642,6 +1643,7 @@ def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
     return {
         "cursor": cursor_sdk_installed,
         "antigravity": antigravity_sdk_installed,
+        "agy": antigravity_sdk_installed,
     }
 
 
@@ -1836,6 +1838,7 @@ def cli() -> None:
 # Keep in sync with ``@cli.command()`` decorations below.
 _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
     {
+        "agy",
         "antigravity",
         "attach",
         "claude",

@@ -712,10 +712,12 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
     aliases={
         **{alias: name for name, row in ACP_CLI_HARNESSES.items() for alias in row.aliases},
         "agy": "antigravity",
+        "agy-native": "antigravity-native",
         "claude": "claude-sdk",
         "github-copilot": "copilot",
         "google-antigravity": "antigravity",
         "kimi-code": "kimi",
+        "native-agy": "antigravity-native",
         "native-antigravity": "antigravity-native",
         "native-goose": "goose-native",
         "native-hermes": "hermes-native",
@@ -730,6 +732,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
     },
     native_harnesses=frozenset(
         {
+            "agy-native",
             "antigravity-native",
             "claude-native",
             "codex-native",
@@ -738,6 +741,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "hermes-native",
             "kimi-native",
             "kiro-native",
+            "native-agy",
             "native-antigravity",
             "native-claude",
             "native-codex",

@@ -1104,10 +1104,10 @@ def register_native_commands(cli: click.Group) -> None:
 
         \b
         Examples:
-          omnigent antigravity
-          omnigent antigravity --resume conv_abc123
-          omnigent antigravity --resume                  # interactive picker
-          omnigent antigravity --server https://<app>.databricksapps.com
+          omni agy
+          omni agy --resume conv_abc123
+          omni agy --resume                  # interactive picker
+          omni agy --server https://<app>.databricksapps.com
         """
         # Validate option combinations BEFORE any side effects (daemon spawn,
         # server discovery) -- see the same comment in the claude command.
@@ -1154,6 +1154,9 @@ def register_native_commands(cli: click.Group) -> None:
             auto_open_conversation=auto_open_conversation,
             command=resolved_command or None,
         )
+
+    # Register ``agy`` CLI shortcut for parity with the upstream binary name.
+    cli.add_command(antigravity, name="agy")
 
     @cli.command(
         context_settings={
