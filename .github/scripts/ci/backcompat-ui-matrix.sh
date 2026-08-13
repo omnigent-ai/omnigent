@@ -56,9 +56,10 @@ done
 
 num_shards="${NUM_SHARDS:-3}"
 
-# Cap: each cell produces num_shards jobs; GitHub limits a matrix to 256.
+# Each release tag produces 2 × num_shards jobs: one Config A cell
+# (server=tag) and one Config B cell (ui=tag). Cap at 256 total.
 max_ui=256
-while [ "${#V[@]}" -gt 0 ] && [ "$(( ${#V[@]} * num_shards ))" -gt "$max_ui" ]; do
+while [ "${#V[@]}" -gt 0 ] && [ "$(( ${#V[@]} * 2 * num_shards ))" -gt "$max_ui" ]; do
   dropped="${V[${#V[@]} - 1]}"
   unset 'V[${#V[@]}-1]'
   V=("${V[@]}")
@@ -66,12 +67,17 @@ while [ "${#V[@]}" -gt 0 ] && [ "$(( ${#V[@]} * num_shards ))" -gt "$max_ui" ]; 
 done
 
 items=()
-for s in "${V[@]}"; do
+for v in "${V[@]}"; do
+  # Config A: new SPA (HEAD), old server
   for ((i = 0; i < num_shards; i++)); do
-    items+=("{\"server\":\"$s\",\"shard_id\":$i,\"num_shards\":$num_shards}")
+    items+=("{\"server\":\"$v\",\"ui\":\"\",\"config\":\"A\",\"shard_id\":$i,\"num_shards\":$num_shards}")
+  done
+  # Config B: old SPA (tag), new server (HEAD)
+  for ((i = 0; i < num_shards; i++)); do
+    items+=("{\"server\":\"\",\"ui\":\"$v\",\"config\":\"B\",\"shard_id\":$i,\"num_shards\":$num_shards}")
   done
 done
 
 json=$(IFS=,; echo "${items[*]:-}")
 echo "ui_matrix={\"include\":[$json]}" >>"${GITHUB_OUTPUT:-/dev/stdout}"
-echo "versions: ${V[*]:-(none)}; UI jobs: ${#items[@]}" >&2
+echo "versions: ${V[*]:-(none)}; UI jobs: ${#items[@]} (${#V[@]} tags × 2 configs × $num_shards shards)" >&2

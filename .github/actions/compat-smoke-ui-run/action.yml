@@ -1,25 +1,38 @@
 name: "Run UI compat tests (smoke or full suite)"
 description: >
-  Run tests/e2e_ui/ with the server subprocess pinned to an older released
-  build (server_version) while the SPA and runner stay on the checked-out code.
+  Run tests/e2e_ui/ in one of two cross-version configurations:
 
-  Two modes:
-  - full_suite=false (default): run only @pytest.mark.compat_smoke tests — fast
-    PR gate (~10 min).
-  - full_suite=true: run the complete tests/e2e_ui/ suite, sharded — used by
-    the overnight backcompat-e2e-ui matrix.
+  Config A — new SPA + new runner, old server (server_version set):
+    The server subprocess is pinned to the released tag while the SPA is
+    built from HEAD. Tests the common deploy ordering where the server
+    lags behind the frontend.
 
-  The action mirrors the setup from e2e-ui.yml's e2e-ui job (Python, uv,
-  pnpm, Playwright, bubblewrap, tmux, SPA build) but skips the Codex
-  parity sidecar (Rust), which is not needed for the openai-agents suite.
+  Config B — old SPA, new server + new runner (ui_version set):
+    The SPA is built from the released tag's web/ source and the HEAD
+    server is pointed at it via OMNIGENT_WEB_UI_DIST. Tests cached-SPA
+    scenarios where a user's browser has an older bundle after a server
+    upgrade.
+
+  Exactly one of server_version / ui_version must be set.
+
+  Two run modes:
+  - full_suite=false (default): run only @pytest.mark.compat_smoke tests.
+  - full_suite=true: run the complete tests/e2e_ui/ suite, sharded.
 
 inputs:
   server_version:
     description: >
-      Release tag for the OLD server build (e.g. v0.9.0). The server
-      subprocess is pinned to this build via OMNIGENT_COMPAT_SERVER_PYTHON.
-      Required.
-    required: true
+      Release tag for the OLD server (e.g. v0.9.0). SPA and runner stay
+      on HEAD. Mutually exclusive with ui_version.
+    required: false
+    default: ""
+  ui_version:
+    description: >
+      Release tag whose web/ source is used to build the OLD SPA (e.g.
+      v0.9.0). Server and runner stay on HEAD; OMNIGENT_WEB_UI_DIST is
+      set to the old built bundle. Mutually exclusive with server_version.
+    required: false
+    default: ""
   full_suite:
     description: >
       "true" = run the full tests/e2e_ui/ suite with sharding (overnight matrix).
@@ -95,7 +108,9 @@ runs:
       shell: bash
       run: uv run playwright install --with-deps chromium
 
-    - name: Build web SPA
+    - name: "Build HEAD SPA (Config A: new SPA / old server)"
+      # Skipped in Config B — the old SPA is built from the release tag instead.
+      if: ${{ inputs.ui_version == '' }}
       shell: bash
       env:
         NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
@@ -103,7 +118,8 @@ runs:
         pnpm install --frozen-lockfile --filter web
         pnpm --filter web run build
 
-    - name: "Build pinned old server"
+    - name: "Build pinned old server (Config A)"
+      if: ${{ inputs.server_version != '' }}
       shell: bash
       env:
         SERVER_VERSION_INPUT: ${{ inputs.server_version }}
@@ -121,6 +137,32 @@ runs:
         "$venv/bin/omnigent" --version
         echo "OMNIGENT_COMPAT_SERVER_PYTHON=$venv/bin/python" >> "$GITHUB_ENV"
         echo "OMNIGENT_COMPAT_SERVER_VERSION=${tag#v}" >> "$GITHUB_ENV"
+
+    - name: "Build old SPA from release tag (Config B: old SPA / new server)"
+      # Check out the old tag's web/ source into a temp dir, build it there,
+      # then set OMNIGENT_WEB_UI_DIST so the HEAD server serves that bundle.
+      if: ${{ inputs.ui_version != '' }}
+      shell: bash
+      env:
+        UI_VERSION_INPUT: ${{ inputs.ui_version }}
+        NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+      run: |
+        tag="$UI_VERSION_INPUT"
+        if ! [[ "$tag" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([a-z0-9.]*)?$ ]]; then
+          echo "Invalid ui_version: '$tag'" >&2; exit 1
+        fi
+        src="$RUNNER_TEMP/ui-spa-src"
+        dist="$RUNNER_TEMP/ui-spa-dist"
+        git worktree add --detach "$src" "$tag"
+        # Build the old SPA in its own directory. pnpm install uses the
+        # old lock file; the build output lands in web/dist/ inside src.
+        cd "$src"
+        pnpm install --frozen-lockfile --filter web
+        pnpm --filter web run build
+        # The Vite output is web/dist/; copy to a stable path and point
+        # the HEAD server at it so it serves the old bundle.
+        cp -r "$src/web/dist" "$dist"
+        echo "OMNIGENT_WEB_UI_DIST=$dist" >> "$GITHUB_ENV"
 
     - name: Run UI compat tests
       shell: bash

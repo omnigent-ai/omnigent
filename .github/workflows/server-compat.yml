@@ -124,8 +124,8 @@ jobs:
           server_version: ${{ needs.resolve-latest.outputs.latest_tag }}
           artifact_suffix: "-config2"
 
-  compat-smoke-ui:
-    name: "Compat smoke – UI (new SPA / old server ${{ needs.resolve-latest.outputs.latest_tag }})"
+  compat-smoke-ui-config-a:
+    name: "Compat smoke – UI Config A (new SPA / old server ${{ needs.resolve-latest.outputs.latest_tag }})"
     needs: resolve-latest
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -135,11 +135,28 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
           fetch-depth: 0
-      - name: Run UI compat smoke
+      - name: Run UI compat smoke (Config A)
         uses: ./.github/actions/compat-smoke-ui-run
         with:
           server_version: ${{ needs.resolve-latest.outputs.latest_tag }}
-          artifact_suffix: "-ui"
+          artifact_suffix: "-ui-config-a"
+
+  compat-smoke-ui-config-b:
+    name: "Compat smoke – UI Config B (old SPA ${{ needs.resolve-latest.outputs.latest_tag }} / new server)"
+    needs: resolve-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+          fetch-depth: 0
+      - name: Run UI compat smoke (Config B)
+        uses: ./.github/actions/compat-smoke-ui-run
+        with:
+          ui_version: ${{ needs.resolve-latest.outputs.latest_tag }}
+          artifact_suffix: "-ui-config-b"
 
   # ── Full pairwise matrix (schedule + dispatch only) ────────────────────────
   # Compute the full pairwise (server, runner) and UI matrices.
@@ -263,7 +280,7 @@ jobs:
         run: bash .github/scripts/ci/backcompat-ui-matrix.sh
 
   backcompat-e2e-ui:
-    name: Backcompat e2e-ui (server ${{ matrix.server }}, shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
+    name: "Backcompat e2e-ui (Config ${{ matrix.config }}: ${{ matrix.config == 'A' && matrix.server || matrix.ui }}, shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})"
     needs: setup-ui
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -281,7 +298,8 @@ jobs:
         uses: ./.github/actions/compat-smoke-ui-run
         with:
           server_version: ${{ matrix.server }}
+          ui_version: ${{ matrix.ui }}
           full_suite: "true"
           shard_id: ${{ matrix.shard_id }}
           num_shards: ${{ matrix.num_shards }}
-          artifact_suffix: "-s${{ matrix.server }}-ui-shard${{ matrix.shard_id }}"
+          artifact_suffix: "-config${{ matrix.config }}-${{ matrix.config == 'A' && matrix.server || matrix.ui }}-shard${{ matrix.shard_id }}"
