@@ -1,6 +1,6 @@
 """Typed HTTP + SSE client for an ``opencode serve`` native server.
 
-Shaped from the pinned OpenCode OpenAPI (``opencode`` 1.17.x,
+Shaped from the pinned OpenCode OpenAPI (``opencode`` 1.17.x–1.18.x,
 ``packages/sdk/openapi.json``). This is a thin typed wrapper over the v1
 REST endpoints the Omnigent OpenCode-native harness needs plus the SSE
 ``GET /event`` stream — not a full generated SDK. Unknown response fields
@@ -29,10 +29,11 @@ from omnigent.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
-# Pinned OpenCode CLI/API version range. The source monorepo reports
-# 1.17.7; we accept 1.17.x and refuse 1.18+ until validated.
+# Supported OpenCode CLI/API version range. Accepts 1.17.7+ through the
+# entire 1.18.x line (validated against 1.18.x event/API shapes); refuses
+# 1.19+ until validated against that release.
 OPENCODE_MIN_VERSION = "1.17.7"
-OPENCODE_MAX_VERSION_EXCLUSIVE = "1.18.0"
+OPENCODE_MAX_VERSION_EXCLUSIVE = "1.19.0"
 
 _DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
