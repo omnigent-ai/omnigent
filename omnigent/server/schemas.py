@@ -2047,6 +2047,14 @@ class UpdateSessionRequest(BaseModel):
     project_id: str | None = None
     silent: bool = False
 
+    @field_validator("git_head_sha")
+    @classmethod
+    def _validate_git_head_sha(cls, v: str | None) -> str | None:
+        if v is not None and not re.fullmatch(r"[0-9a-f]{7,40}", v):
+            msg = "git_head_sha must be a 7-40 character hex SHA"
+            raise ValueError(msg)
+        return v
+
     model_config = ConfigDict(extra="forbid")
 
 

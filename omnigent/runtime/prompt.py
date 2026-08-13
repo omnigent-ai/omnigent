@@ -18,6 +18,22 @@ from omnigent.runtime.tool_result_replay import image_omitted_placeholder
 from omnigent.spec import AgentSpec
 
 
+def git_baseline_instruction(baseline_sha: str) -> str:
+    """Return the framework instruction for git-baseline scoping.
+
+    Centralised here so every ``build_instructions`` call site emits the
+    same text.  The instruction tells the model which commits pre-date
+    the current session so it only claims its own work.
+    """
+    short = baseline_sha[:12]
+    return (
+        f"gitBaseline: This session started at commit {short}. "
+        f"Only reference commits after this point as your own work. "
+        f"Commits before {short} belong to other sessions or "
+        f"were made outside this session."
+    )
+
+
 def append_framework_instructions(
     instructions: str | None,
     framework_instructions: Sequence[str],

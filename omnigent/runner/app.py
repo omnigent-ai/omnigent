@@ -646,6 +646,9 @@ def _response_body_preview(resp: object, *, limit: int = 500) -> str:
     return ""
 
 
+_GIT_SHA_RE = re.compile(r"[0-9a-f]{7,40}")
+
+
 def _resolve_git_head_from_workspace(workspace: str | None) -> str | None:
     if not workspace:
         return None
@@ -657,7 +660,9 @@ def _resolve_git_head_from_workspace(workspace: str | None) -> str | None:
             timeout=5,
         )
         if result.returncode == 0:
-            return result.stdout.decode("utf-8", errors="replace").strip()
+            sha = result.stdout.decode("utf-8", errors="replace").strip()
+            if _GIT_SHA_RE.fullmatch(sha):
+                return sha
     except (subprocess.TimeoutExpired, OSError):
         pass
     return None
@@ -6014,17 +6019,12 @@ def create_runner_app(
                 model_override=cast(str | None, msg_body.get("model_override")),
                 session_id=conv,
             )
-            from omnigent.runtime.prompt import build_instructions
+            from omnigent.runtime.prompt import build_instructions, git_baseline_instruction
 
             framework_instructions: list[str] = []
             baseline = _session_git_head_sha.get(conv)
             if baseline:
-                framework_instructions.append(
-                    f"gitBaseline: This session started at commit {baseline[:12]}. "
-                    f"Only reference commits after this point as your own work. "
-                    f"Commits before {baseline[:12]} belong to other sessions or "
-                    f"were made outside this session."
-                )
+                framework_instructions.append(git_baseline_instruction(baseline))
             instructions = build_instructions(
                 cached_spec, None, [], framework_instructions=framework_instructions
             )

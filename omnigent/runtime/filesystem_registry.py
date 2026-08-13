@@ -920,19 +920,29 @@ class GitFilesystemRegistry(FilesystemRegistry):
     ) -> list[dict[str, Any]]:
         """Return changed files in the working tree, newest first.
 
-        When *baseline_sha* is set, results are scoped to changes made after
-        that commit — both committed and uncommitted — so the files panel
-        reflects only this session's lifetime rather than global workspace
-        state.
+        When *baseline_sha* is set, results are scoped to changes that
+        differ from that commit (committed + uncommitted). This is a
+        time-based boundary, not a session-ownership boundary: changes
+        made by *any* actor after the baseline appear.  If the baseline
+        SHA is unreachable (rebase, gc, shallow clone) the method
+        degrades gracefully to the plain ``git status`` path.
 
         :param conversation_id: Ignored for git-backed registries.
         :param limit: Maximum number of records to return.
         :param baseline_sha: When set, only include files that differ from
-            this commit (committed + uncommitted changes since session start).
+            this commit (committed + uncommitted changes since that point).
         :returns: List of file-record dicts, newest first.
         """
         if baseline_sha:
-            return self._list_changed_files_since(baseline_sha, limit=limit)
+            try:
+                return self._list_changed_files_since(baseline_sha, limit=limit)
+            except GitStatusUnavailable:
+                _logger.warning(
+                    "Baseline SHA %s is unreachable (rebase/gc/shallow?); "
+                    "falling back to full git status",
+                    baseline_sha,
+                )
+                # Fall through to the plain git-status path below.
 
         argv = ["git", "status", "--porcelain", "--untracked-files=all"]
         argv.extend(self._skip_dir_pathspecs())
