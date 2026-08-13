@@ -27,7 +27,7 @@ import time
 import httpx
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.conftest import open_right_rail, seed_committed_turn
 
 _ADD_AGENT_BUTTON = '[data-testid="add-agent-button"]'
 _ADD_AGENT_DIALOG = '[data-testid="add-agent-dialog"]'
@@ -179,3 +179,126 @@ def test_add_subagent_from_dialog(
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name=re.compile("^Agents")).click()
     expect(rail.locator(_SUBAGENT_ROW)).to_have_count(1, timeout=30_000)
+
+
+# ── "Ask sub-agent" from a selection in an assistant response ──────────────────
+
+_ASSISTANT_TEXT_SECTION = '[data-testid="assistant-text-section"]'
+_REPLY_BUTTON = '[data-testid="selection-reply"]'
+_ASK_BUTTON = '[data-testid="selection-ask-subagent"]'
+_ASK_CONTEXT = '[data-testid="add-agent-context"]'
+_ASK_REPLY = "The token verifier checks the JWT signature before trusting any claims."
+_ASK_QUESTION = "Is that signature check constant-time?"
+# A sub-block fragment of the reply (no Markdown-special chars, so the derived
+# name is the fragment verbatim). Selecting only this keeps the surrounding
+# paragraph as a distinct excerpt in the composed prompt.
+_ASK_CONTEXT_FRAGMENT = "token verifier checks the JWT signature"
+# The dialog derives the child's name from the selection (normalize + cap); for
+# this short, clean fragment the derived name is the fragment verbatim.
+_ASK_DERIVED_NAME = "token verifier checks the JWT signature"
+
+
+def _select_context_fragment(page: Page) -> None:
+    """Select only ``_ASK_CONTEXT_FRAGMENT`` inside the assistant response, then
+    notify the selection popover.
+
+    The popover shows on ``mouseup`` (a finished drag-select); programmatic
+    tests set the range within the fragment's text node, then dispatch the same
+    ``selectionchange`` + ``mouseup`` the real drag emits.
+    """
+    found = page.eval_on_selector(
+        _ASSISTANT_TEXT_SECTION,
+        """(section, fragment) => {
+          const walker = document.createTreeWalker(section, NodeFilter.SHOW_TEXT);
+          let node;
+          while ((node = walker.nextNode())) {
+            const idx = node.textContent.indexOf(fragment);
+            if (idx !== -1) {
+              const range = document.createRange();
+              range.setStart(node, idx);
+              range.setEnd(node, idx + fragment.length);
+              const selection = window.getSelection();
+              selection.removeAllRanges();
+              selection.addRange(range);
+              document.dispatchEvent(new Event('selectionchange'));
+              return true;
+            }
+          }
+          return false;
+        }""",
+        _ASK_CONTEXT_FRAGMENT,
+    )
+    assert found, f"fragment not found in assistant response: {_ASK_CONTEXT_FRAGMENT!r}"
+    page.dispatch_event("body", "mouseup")
+
+
+def test_ask_subagent_from_selection(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Select assistant text → Ask sub-agent → dialog prefilled → composed once."""
+    base_url, session_id = seeded_session
+    agent_id = _picker_hello_world_id(base_url, session_id)
+    # Seed a settled assistant reply to select (no LLM turn needed).
+    seed_committed_turn(session_id, prompt="How does auth work?", reply=_ASK_REPLY)
+    page.goto(f"{base_url}/c/{session_id}")
+
+    expect(page.locator(_ASSISTANT_TEXT_SECTION)).to_be_visible(timeout=30_000)
+
+    # Selecting a fragment of the response reveals ONE toolbar with both actions.
+    _select_context_fragment(page)
+    ask_button = page.locator(_ASK_BUTTON)
+    expect(page.locator(_REPLY_BUTTON)).to_be_visible(timeout=15_000)
+    expect(ask_button).to_be_visible(timeout=15_000)
+
+    # Dismissal: Escape hides the toolbar; re-selecting brings it back.
+    page.keyboard.press("Escape")
+    expect(ask_button).to_have_count(0)
+    _select_context_fragment(page)
+    expect(ask_button).to_be_visible(timeout=15_000)
+    ask_button.click()
+
+    # The Add Agent dialog opens prefilled with the selected text as context.
+    dialog = page.locator(_ADD_AGENT_DIALOG)
+    expect(dialog).to_be_visible(timeout=15_000)
+    expect(dialog.locator(_ASK_CONTEXT)).to_contain_text(_ASK_CONTEXT_FRAGMENT)
+
+    # Pick the agent; the name is derived from the selection (meaningful, not
+    # "ask"). Enter the question and submit.
+    dialog.locator(f'[data-testid="agent-card-{agent_id}"]').click()
+    expect(dialog.locator(_ADD_AGENT_NAME_INPUT)).to_have_value(_ASK_DERIVED_NAME)
+    task_input = dialog.locator(_ADD_AGENT_TASK_INPUT)
+    expect(task_input).to_be_visible()
+    task_input.fill(_ASK_QUESTION)
+    dialog.locator(_ADD_AGENT_SUBMIT).click()
+
+    # Navigate into the new child.
+    page.wait_for_url(re.compile(r"/c/(?!" + re.escape(session_id) + r"$)[^/]+$"), timeout=30_000)
+    child_id = page.url.rsplit("/c/", 1)[1]
+    assert child_id != session_id, f"expected to land on a child, still on {session_id}"
+
+    # The composed prompt reaches the child exactly once, carrying both the
+    # exact selection and the full surrounding excerpt. Poll until it lands,
+    # then hold a short window to catch a duplicate auto-send.
+    def _composed_hits() -> int:
+        return sum(
+            1
+            for prompt in _child_user_prompts(base_url, child_id)
+            if "Selected from the source response:" in prompt
+            and _ASK_CONTEXT_FRAGMENT in prompt
+            and _ASK_REPLY in prompt
+            and _ASK_QUESTION in prompt
+        )
+
+    appear_deadline = time.time() + 30.0
+    while time.time() < appear_deadline:
+        if _composed_hits() >= 1:
+            break
+        time.sleep(0.5)
+    else:
+        raise AssertionError(f"composed ask prompt never reached child {child_id}")
+
+    stabilize_deadline = time.time() + 5.0
+    while time.time() < stabilize_deadline:
+        assert _composed_hits() == 1, "composed ask prompt delivered more than once"
+        time.sleep(0.5)

@@ -1378,8 +1378,9 @@ function SessionLayout({ mainAgent }: SessionLayoutProps) {
   );
 }
 
-// SelectionPopup (the floating Reply action) moved to ./SelectionPopup so it
-// can grow and be unit-tested in isolation.
+// SelectionPopup (the contextual Reply / Ask-sub-agent toolbar) moved to
+// ./SelectionPopup so it can be unit-tested in isolation and consume the
+// AskSubagentContext directly.
 
 interface MainAgentSurfaceProps {
   /**

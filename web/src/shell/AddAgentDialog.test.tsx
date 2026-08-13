@@ -1,4 +1,5 @@
 import type * as ReactRouterDomModule from "react-router-dom";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,6 +10,8 @@ import { AddAgentDialog } from "./AddAgentDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { createSession } from "@/lib/sessionsApi";
 import { setPendingInitialPrompt } from "@/store/chatStore";
+import { useChildSessions } from "@/hooks/useChildSessions";
+import type { AskSubagentSelection } from "@/shell/AskSubagentContext";
 
 const navigateMock = vi.fn();
 vi.mock("react-router-dom", async (importOriginal) => {
@@ -23,10 +26,16 @@ vi.mock("@/lib/sessionsApi", () => ({ createSession: vi.fn() }));
 // Only ``setPendingInitialPrompt`` is used from the store, and nothing else in
 // the dialog's import graph needs the real module, so a bare stub is enough.
 vi.mock("@/store/chatStore", () => ({ setPendingInitialPrompt: vi.fn() }));
+// The dialog reads existing children to prefill a collision-free "ask" name.
+vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
+  useChildSessions: vi.fn(() => ({ children: [], isLoading: false, error: null })),
+}));
 
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
 const createSessionMock = vi.mocked(createSession);
 const setPendingInitialPromptMock = vi.mocked(setPendingInitialPrompt);
+const useChildSessionsMock = vi.mocked(useChildSessions);
 
 const AGENTS: AvailableAgent[] = [
   {
@@ -53,13 +62,24 @@ function mockAgents(agents: AvailableAgent[]) {
   } as unknown as ReturnType<typeof useAvailableAgents>);
 }
 
-function renderDialog(parentSessionId = "conv_parent", onOpenChange = vi.fn()) {
+function renderDialog(
+  parentSessionId = "conv_parent",
+  onOpenChange = vi.fn(),
+  initialContext?: AskSubagentSelection,
+  existingNames?: readonly string[],
+) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const invalidateSpy = vi.spyOn(client, "invalidateQueries");
   const utils = render(
     <QueryClientProvider client={client}>
       <MemoryRouter>
-        <AddAgentDialog parentSessionId={parentSessionId} open onOpenChange={onOpenChange} />
+        <AddAgentDialog
+          parentSessionId={parentSessionId}
+          open
+          onOpenChange={onOpenChange}
+          initialContext={initialContext}
+          existingNames={existingNames}
+        />
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -80,6 +100,11 @@ beforeEach(() => {
   createSessionMock.mockReset();
   setPendingInitialPromptMock.mockReset();
   navigateMock.mockReset();
+  useChildSessionsMock.mockReturnValue({
+    children: [],
+    isLoading: false,
+    error: null,
+  } as unknown as ReturnType<typeof useChildSessions>);
   mockAgents(AGENTS);
 });
 
@@ -243,5 +268,93 @@ describe("AddAgentDialog", () => {
     // Let it settle so the test doesn't leak a pending promise.
     resolveCreate?.({ id: "conv_child" });
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_child"));
+  });
+
+  describe("Ask sub-agent flow (initialContext)", () => {
+    it("shows the selected context, labels the field Question, and derives the name from the selection", () => {
+      renderDialog("conv_parent", vi.fn(), {
+        selectedText: "the auth flow validates tokens",
+        surroundingExcerpt: null,
+      });
+
+      expect(screen.getByTestId("add-agent-context")).toHaveTextContent(
+        "the auth flow validates tokens",
+      );
+      // Name + Question appear once an agent is picked; the name is derived
+      // from the selected text (editable).
+      fireEvent.click(screen.getByTestId("agent-card-ag_claude"));
+      expect(screen.getByTestId("add-agent-name-input")).toHaveValue(
+        "the auth flow validates tokens",
+      );
+      expect(screen.getByText("Question")).toBeInTheDocument();
+    });
+
+    it("disambiguates a colliding derived name across the root tree with ' (2)'", () => {
+      renderDialog("conv_parent", vi.fn(), { selectedText: "Snappy", surroundingExcerpt: null }, [
+        "Snappy",
+      ]);
+      fireEvent.click(screen.getByTestId("agent-card-ag_codex"));
+      expect(screen.getByTestId("add-agent-name-input")).toHaveValue("Snappy (2)");
+    });
+
+    it("keeps a user-edited name even when tree names change later (editable override)", () => {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const selection = { selectedText: "Snappy", surroundingExcerpt: null };
+      const tree = (names: readonly string[]) => (
+        <QueryClientProvider client={client}>
+          <MemoryRouter>
+            <AddAgentDialog
+              parentSessionId="conv_parent"
+              open
+              onOpenChange={vi.fn()}
+              initialContext={selection}
+              existingNames={names}
+            />
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+      const { rerender } = render(tree([]));
+      fireEvent.click(screen.getByTestId("agent-card-ag_codex"));
+      expect(screen.getByTestId("add-agent-name-input")).toHaveValue("Snappy");
+      // User overrides the derived name.
+      fireEvent.change(screen.getByTestId("add-agent-name-input"), {
+        target: { value: "my reviewer" },
+      });
+      // A late tree-name arrival would re-derive to "Snappy (2)" — the edit wins.
+      rerender(tree(["Snappy"]));
+      expect(screen.getByTestId("add-agent-name-input")).toHaveValue("my reviewer");
+    });
+
+    it("delivers the composed context + question exactly once, under the derived-name title", async () => {
+      createSessionMock.mockResolvedValue({ id: "conv_child" } as unknown as Awaited<
+        ReturnType<typeof createSession>
+      >);
+      renderDialog("conv_parent", vi.fn(), {
+        selectedText: "auth flow validates tokens",
+        surroundingExcerpt: "The auth flow validates tokens before trusting claims.",
+      });
+
+      fireEvent.click(screen.getByTestId("agent-card-ag_codex"));
+      // Name is derived from the selection; type the question and submit.
+      fireEvent.change(screen.getByTestId("add-agent-initial-prompt-input"), {
+        target: { value: "is the check constant-time?" },
+      });
+      fireEvent.click(screen.getByTestId("add-agent-submit"));
+
+      await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalledTimes(1));
+      const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
+      const text = (payload as { text: string }).text;
+      expect(text).toContain("Selected from the source response:");
+      expect(text).toContain("> auth flow validates tokens");
+      expect(text).toContain("Surrounding excerpt:");
+      expect(text).toContain("> The auth flow validates tokens before trusting claims.");
+      expect(text).toContain("Question: is the check constant-time?");
+      // createSession uses empty initial_items; the title carries the derived name.
+      expect(createSessionMock).toHaveBeenCalledWith("ag_codex", [], {
+        parentSessionId: "conv_parent",
+        subAgentName: null,
+        title: "ui:codex:auth flow validates tokens",
+      });
+    });
   });
 });
