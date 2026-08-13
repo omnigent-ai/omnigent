@@ -45,6 +45,7 @@ from omnigent.claude_native_bridge import (
     write_active_session_id,
 )
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
+from omnigent.claude_native_status import sync_raw_status_context
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 
@@ -782,6 +783,9 @@ async def forward_claude_transcript_to_session(
     # the per-poll cost reconciliation from re-parsing unchanged transcripts.
     # Reset on /clear and /fork rotations alongside ``dedupe``.
     cost_cache: dict[Path, _TranscriptCostCacheEntry] = {}
+    # (mtime_ns, size) of the statusLine shim's raw capture last normalized
+    # into context.json (see claude_native_status.sync_raw_status_context).
+    status_raw_sig: tuple[int, int] | None = None
     # Per-process latch: once we PATCH the conversation with the
     # Claude-native session id, never PATCH again. Persists for the
     # lifetime of the forwarder task; the server's idempotence handles
@@ -901,6 +905,9 @@ async def forward_claude_transcript_to_session(
                             session_id=current_session_id,
                             bridge_dir=bridge_dir,
                         )
+                    # Normalize the statusLine shim's raw capture into
+                    # context.json (one stat when nothing changed).
+                    status_raw_sig = sync_raw_status_context(bridge_dir, status_raw_sig)
                     transcript_path = read_transcript_path(bridge_dir)
                     if transcript_path is not None:
                         state = await _ensure_state_for_transcript(

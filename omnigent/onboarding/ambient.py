@@ -23,11 +23,13 @@ logins, then a local server). The caller maps each detection's
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import shlex
 import socket
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -617,8 +619,50 @@ def _ollama_reachable() -> bool:
         return False
 
 
+# One-shot prewarmed detection result, produced by
+# :func:`prewarm_detect_providers` and consumed by the next
+# :func:`detect_providers` call. Guarded by ``_prewarm_lock``.
+_prewarm_lock = threading.Lock()
+_prewarmed_detection: concurrent.futures.Future[list[DetectedProvider]] | None = None
+
+
+def prewarm_detect_providers() -> None:
+    """Start :func:`detect_providers` on a background thread.
+
+    The next ``detect_providers()`` call consumes the result instead of
+    re-running the sweep — on macOS the Claude Keychain fallback shells out
+    to ``claude auth status`` (~0.6-0.9s), which a claude-native runner
+    would otherwise pay inside terminal creation while the user watches the
+    "Starting up…" spinner.
+
+    One-shot by design: the result is a point-in-time snapshot, so only the
+    first detection after the prewarm uses it and later calls run fresh.
+    Call it only from short-lived processes (the runner) where the prewarm
+    and its consumer are seconds apart. No-op when a prewarm is already
+    pending.
+    """
+    global _prewarmed_detection
+    with _prewarm_lock:
+        if _prewarmed_detection is not None:
+            return
+        future: concurrent.futures.Future[list[DetectedProvider]] = concurrent.futures.Future()
+        _prewarmed_detection = future
+
+    def _run() -> None:
+        try:
+            future.set_result(_detect_providers_now())
+        except BaseException as exc:  # the future must always complete
+            future.set_exception(exc)
+
+    threading.Thread(target=_run, name="ambient-detect-prewarm", daemon=True).start()
+
+
 def detect_providers() -> list[DetectedProvider]:
     """Detect credentials already present on the machine.
+
+    Consumes (one-shot) a pending :func:`prewarm_detect_providers` result
+    when one exists, waiting for it to finish if needed; otherwise runs the
+    sweep inline.
 
     Checks, in a stable priority order:
 
@@ -646,6 +690,22 @@ def detect_providers() -> list[DetectedProvider]:
     :returns: One :class:`DetectedProvider` per credential found, in the
         priority order above. Empty when nothing is detected.
     """
+    global _prewarmed_detection
+    with _prewarm_lock:
+        prewarmed = _prewarmed_detection
+        _prewarmed_detection = None
+    if prewarmed is not None:
+        try:
+            return prewarmed.result()
+        except Exception:
+            # A failed speculative sweep must never make detection worse —
+            # fall through to a fresh one.
+            pass
+    return _detect_providers_now()
+
+
+def _detect_providers_now() -> list[DetectedProvider]:
+    """Run the ambient-credential sweep (see :func:`detect_providers`)."""
     detected: list[DetectedProvider] = []
 
     # 1. Environment API keys.

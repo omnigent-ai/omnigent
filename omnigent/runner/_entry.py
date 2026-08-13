@@ -1731,6 +1731,29 @@ def _install_crash_logging() -> None:
     sys.excepthook = _log_uncaught
 
 
+def _maybe_prewarm_ambient_detection() -> None:
+    """Prewarm ambient provider detection for claude-native launches.
+
+    Terminal auto-create resolves the session's provider config, and on a
+    machine with no explicit provider that runs ambient detection — on macOS
+    a ``claude auth status`` subprocess (~0.6-0.9s) — inside the
+    user-visible "Starting up…" window. Starting the sweep at boot overlaps
+    it with tunnel connect and session init instead.
+
+    Gated on the launch-harness stamp the host injects (absent for CLI-local
+    runners and hosts that predate it), so other harnesses don't pay a
+    speculative subprocess on every launch.
+    """
+    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+    from omnigent.runner.identity import RUNNER_LAUNCH_HARNESS_ENV_VAR
+
+    if os.environ.get(RUNNER_LAUNCH_HARNESS_ENV_VAR) != CLAUDE_NATIVE_CODING_AGENT.harness:
+        return
+    from omnigent.onboarding.ambient import prewarm_detect_providers
+
+    prewarm_detect_providers()
+
+
 def main() -> None:
     """Console entry point for the runner tunnel process.
 
@@ -1747,6 +1770,7 @@ def main() -> None:
 
     configure_process_logging("runner", force=True)
     _install_crash_logging()
+    _maybe_prewarm_ambient_detection()
     try:
         asyncio.run(_run_tunnel_from_env())
     except RuntimeError as exc:

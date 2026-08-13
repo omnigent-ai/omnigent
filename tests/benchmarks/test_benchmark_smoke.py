@@ -33,6 +33,7 @@ _SMOKE_JOURNEYS = [
     "list_project_sessions",
     "fork_session",
     "add_comment",
+    "native_hook_spawn",
 ]
 
 
@@ -446,6 +447,13 @@ async def test_benchmark_smoke_end_to_end() -> None:
         # readable: each HTTP journey issues at least one request per op.
         per_op = _d(block["summary"]).get("avg_http_requests_per_op")
         assert per_op is not None, f"{name} produced no request count"
+        if name == "native_hook_spawn":
+            # Subprocess-only by design: a nonzero request count or any
+            # attributed route would mean the hook spawn path grew a server
+            # round-trip.
+            assert cast(float, per_op) == 0.0, f"{name}: {per_op} requests/op"
+            assert not _d(block["summary"]).get("network_routes")
+            continue
         assert cast(float, per_op) >= 1.0, f"{name}: {per_op} requests/op"
         # Per-route appendix: at least one endpoint attributed, and its
         # per-op figures sum to roughly the aggregate per-op count.

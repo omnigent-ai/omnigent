@@ -52,6 +52,7 @@ from omnigent.host.frames import (
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
     decode_host_frame,
+    encode_host_frame,
 )
 from omnigent.host.identity import HostIdentity
 from omnigent.host.runner_zygote import ZygoteUnavailable
@@ -59,6 +60,7 @@ from omnigent.runner.identity import (
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_LAUNCH_HARNESS_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
@@ -66,6 +68,22 @@ from omnigent.runner.identity import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _no_real_zygote(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep these tests from forking a real runner zygote.
+
+    ``HostProcess.run()`` prewarms the zygote at daemon start, so without
+    this opt-out every test that drives ``run()`` would spawn a real
+    ``python -m omnigent.runner._zygote`` (a 1-2s import of the runner
+    graph). Zygote behavior itself is exercised via ``_FakeZygote`` here
+    and with real ``ZygoteManager`` instances in ``test_runner_zygote.py``
+    (which this construction-time gate does not affect).
+    """
+    from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
+
+    monkeypatch.setenv(ZYGOTE_ENABLED_ENV_VAR, "0")
 
 
 async def test_handle_model_options_uses_host_claude_configuration(
@@ -3413,6 +3431,30 @@ def test_build_runner_env_carries_host_id() -> None:
     )
 
 
+def test_build_runner_env_carries_launch_harness() -> None:
+    """The runner is told its session's harness so it can prewarm at boot.
+
+    claude-native runners use the stamp to start ambient provider detection
+    (a ~0.6-0.9s ``claude auth status`` subprocess on macOS) during boot
+    instead of inside terminal auto-create. With no harness (an older server
+    that doesn't resolve one), the env var is omitted.
+    """
+
+    def _env(*, harness: str | None) -> dict[str, str]:
+        return _build_runner_env(
+            {},
+            server_url="http://127.0.0.1:6767",
+            runner_id="runner_abc",
+            binding_token="tok",
+            workspace="/ws",
+            parent_pid=123,
+            harness=harness,
+        )
+
+    assert _env(harness="claude-native")[RUNNER_LAUNCH_HARNESS_ENV_VAR] == "claude-native"
+    assert RUNNER_LAUNCH_HARNESS_ENV_VAR not in _env(harness=None)
+
+
 async def test_run_retries_on_login_redirect(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -4082,6 +4124,7 @@ class _FakeZygote:
         """
         self._fail_at = fail_at
         self._running = running
+        self.start_calls = 0
         self.stop_calls = 0
 
     @property
@@ -4095,6 +4138,7 @@ class _FakeZygote:
 
     def start(self) -> None:
         """Raise when scripted to fail at start."""
+        self.start_calls += 1
         if self._fail_at == "start":
             raise ZygoteUnavailable("scripted start failure")
 
@@ -4208,6 +4252,194 @@ def test_zygote_start_failure_disables_it(
     assert host._zygote_disabled is True
     assert zygote.stop_calls == 0
     assert len(popen_argvs) == 1
+
+
+async def test_run_prestarts_zygote_before_first_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run() warms the zygote so the first launch skips its cold import.
+
+    The zygote's one-time import of the runner graph (~1-2s) otherwise lands
+    inside the first session launch of the daemon's life, extending that
+    session's "Starting up…" window.
+    """
+    host = _make_host_process()
+    zygote = _FakeZygote(fail_at="none", running=True)
+    host._zygote = zygote  # type: ignore[assignment]
+    host._zygote_disabled = False
+
+    async def _fake_connect(self_: HostProcess) -> None:
+        # Hold the "connection" open until the prestart thread has run, then
+        # shut the daemon down.
+        for _ in range(500):
+            if zygote.start_calls:
+                break
+            await asyncio.sleep(0.01)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(HostProcess, "_connect_and_serve", _fake_connect)
+    # Keep run()'s shutdown sweep from reaping unrelated pytest children.
+    monkeypatch.setattr(HostProcess, "_reap_orphans_once", lambda self_: 0)
+
+    await host.run()
+
+    assert zygote.start_calls == 1
+    # run()'s finally still reaps the prewarmed zygote on shutdown.
+    assert zygote.stop_calls == 1
+
+
+class _CollectingWs:
+    """Duck-typed tunnel connection capturing every frame sent on it."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, data: str) -> None:
+        """Record one outbound frame."""
+        self.sent.append(data)
+
+
+async def _drain_frame_tasks(host: HostProcess) -> None:
+    """Await every in-flight frame task (handler failures are contained)."""
+    await asyncio.gather(*list(host._frame_tasks))
+
+
+async def test_slow_frame_does_not_head_of_line_block(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A slow handler must not delay the frames queued behind it.
+
+    The receive loop used to await each frame inline, so a create's own
+    background ``host.model_options`` CLI exec (measured 650-794ms) parked
+    the launch frame sent ~20ms later behind it on every session create —
+    0.3-1.3s of added "Starting up…" latency. Frames now run on their own
+    tasks: a stat arriving behind a parked handler completes immediately.
+    """
+    host = _make_host_process()
+    ws = _CollectingWs()
+    slow_started = asyncio.Event()
+    release_slow = asyncio.Event()
+
+    async def _parked_model_options(
+        self_: HostProcess, frame: HostModelOptionsFrame
+    ) -> HostModelOptionsResultFrame:
+        slow_started.set()
+        await release_slow.wait()
+        return HostModelOptionsResultFrame(request_id=frame.request_id, status="ok")
+
+    monkeypatch.setattr(HostProcess, "_handle_model_options", _parked_model_options)
+
+    host._start_frame_task(
+        ws,  # type: ignore[arg-type] — duck-typed ws
+        encode_host_frame(HostModelOptionsFrame(request_id="req_slow", harness="claude-native")),
+    )
+    await slow_started.wait()
+    host._start_frame_task(
+        ws,  # type: ignore[arg-type] — duck-typed ws
+        encode_host_frame(HostStatFrame(request_id="req_stat", path=str(tmp_path))),
+    )
+
+    # The stat result lands while the model-options handler is still parked.
+    for _ in range(500):
+        if ws.sent:
+            break
+        await asyncio.sleep(0.01)
+    assert ws.sent, "stat frame never answered while a slow frame was in flight"
+    assert '"req_stat"' in ws.sent[0]
+
+    release_slow.set()
+    await _drain_frame_tasks(host)
+    assert any('"req_slow"' in frame for frame in ws.sent)
+
+
+async def test_stop_frame_never_overtakes_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner lifecycle frames keep their arrival order under concurrency.
+
+    A session DELETE racing a slow create sends a stop while the launch is
+    mid-flight; if the stop ran first it would no-op on an unknown runner
+    and leave the launched runner orphaned. The lifecycle lock serializes
+    launch/stop in arrival order while other frames stay concurrent.
+    """
+    host = _make_host_process()
+    ws = _CollectingWs()
+    order: list[str] = []
+    release_launch = asyncio.Event()
+
+    async def _parked_launch(
+        self_: HostProcess, frame: HostLaunchRunnerFrame
+    ) -> HostLaunchRunnerResultFrame:
+        order.append("launch:start")
+        await release_launch.wait()
+        order.append("launch:end")
+        return HostLaunchRunnerResultFrame(
+            request_id=frame.request_id, status="launched", runner_id="runner_x"
+        )
+
+    async def _recording_stop(
+        self_: HostProcess, frame: HostStopRunnerFrame
+    ) -> HostStopRunnerResultFrame:
+        order.append("stop")
+        return HostStopRunnerResultFrame(request_id=frame.request_id, status="stopped")
+
+    monkeypatch.setattr(HostProcess, "_handle_launch", _parked_launch)
+    monkeypatch.setattr(HostProcess, "_handle_stop", _recording_stop)
+
+    host._start_frame_task(
+        ws,  # type: ignore[arg-type] — duck-typed ws
+        encode_host_frame(
+            HostLaunchRunnerFrame(request_id="rq1", binding_token="tok", workspace="/w")
+        ),
+    )
+    host._start_frame_task(
+        ws,  # type: ignore[arg-type] — duck-typed ws
+        encode_host_frame(HostStopRunnerFrame(request_id="rq2", runner_id="runner_x")),
+    )
+    await asyncio.sleep(0.05)
+    # The stop is parked behind the lifecycle lock, not run concurrently.
+    assert order == ["launch:start"]
+
+    release_launch.set()
+    await _drain_frame_tasks(host)
+    assert order == ["launch:start", "launch:end", "stop"]
+
+
+async def test_frame_handler_failure_is_contained(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A crashing handler is logged; the tunnel and later frames survive.
+
+    Pre-concurrency, a handler exception propagated out of the receive loop
+    and tore the tunnel down (a reconnect for one bad request).
+    """
+    host = _make_host_process()
+    ws = _CollectingWs()
+
+    def _boom(self_: HostProcess, frame: HostStatFrame) -> HostStatResultFrame:
+        raise RuntimeError("scripted stat failure")
+
+    monkeypatch.setattr(HostProcess, "_handle_stat", _boom)
+    with caplog.at_level(logging.ERROR, logger="omnigent.host.connect"):
+        host._start_frame_task(
+            ws,  # type: ignore[arg-type] — duck-typed ws
+            encode_host_frame(HostStatFrame(request_id="req_boom", path=str(tmp_path))),
+        )
+        await _drain_frame_tasks(host)
+
+    assert ws.sent == []
+    assert any("host frame handler failed" in record.message for record in caplog.records)
+
+    # A later frame on the same connection is still handled.
+    host._start_frame_task(
+        ws,  # type: ignore[arg-type] — duck-typed ws
+        encode_host_frame(HostListDirFrame(request_id="req_ls", path=str(tmp_path))),
+    )
+    await _drain_frame_tasks(host)
+    assert ws.sent and '"req_ls"' in ws.sent[0]
 
 
 def test_direct_spawn_keeps_the_workspace_off_sys_path(

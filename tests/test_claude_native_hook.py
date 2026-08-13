@@ -280,7 +280,7 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -463,7 +463,7 @@ def test_fork_session_start_hook_forks_before_printing_conversation_url(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -591,7 +591,7 @@ def test_resume_session_start_without_branch_marker_does_not_fork(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FailingHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FailingHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -727,7 +727,7 @@ def test_permission_request_hook_posts_to_active_session_from_bridge_config(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_old",
         bridge_id="bridge_shared",
@@ -866,7 +866,7 @@ def test_permission_request_hook_retries_transport_cut_with_same_id(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FlakyHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FlakyHttpxClient)
     # Zero backoff keeps the retry loop instant in tests; production
     # waits between attempts.
     monkeypatch.setattr(claude_native_hook, "_PERMISSION_RETRY_INITIAL_BACKOFF_S", 0.0)
@@ -959,7 +959,7 @@ def test_permission_request_hook_does_not_retry_rejections(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _RejectingHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RejectingHttpxClient)
     monkeypatch.setattr(claude_native_hook, "_PERMISSION_RETRY_INITIAL_BACKOFF_S", 0.0)
     bridge_dir = _prepare_permission_bridge(tmp_path, "conv_reject")
     payload = {"hook_event_name": "PermissionRequest", "tool_name": "Bash"}
@@ -1059,11 +1059,12 @@ def test_build_hook_settings_registers_message_display_hook(
 
     Without this entry, Claude never invokes the deltas-appender and live
     token streaming silently does nothing (the web UI falls back to the
-    whole-message-on-completion behavior). It must route to the dedicated
-    stdlib-only module — NOT the heavier observer hook — so the per-chunk
-    hot path stays cheap, and it must NOT depend on ``ap_server_url``
-    (streaming works for local servers too). Fails if the registration
-    is dropped or pointed at the wrong module.
+    whole-message-on-completion behavior). It must be the /bin/sh
+    one-liner appending to ``message_deltas.jsonl`` — never an
+    interpreter spawn, since Claude blocks on it once per streamed
+    chunk — and it must NOT depend on ``ap_server_url`` (streaming
+    works for local servers too). Fails if the registration is dropped
+    or pointed at something heavier.
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
@@ -1076,11 +1077,11 @@ def test_build_hook_settings_registers_message_display_hook(
         "MessageDisplay hook not registered — live token streaming is dead"
     )
     command = hooks["MessageDisplay"][0]["hooks"][0]["command"]
-    # Routes to the dedicated lightweight module with this bridge dir...
-    assert "omnigent.claude_native_message_display_hook" in command
+    # Appends straight to this bridge dir's deltas file from shell...
+    assert "message_deltas.jsonl" in command
     assert str(bridge_dir) in command
-    # ...and NOT through the heavier observer/policy subcommands (which
-    # would import claude_native_bridge on every streamed chunk).
+    # ...with no interpreter or server dependency on the per-chunk path.
+    assert "python" not in command
     assert "evaluate-policy" not in command
     assert "permission-request" not in command
 
@@ -1275,7 +1276,7 @@ def test_evaluate_policy_stamps_live_model_from_context_json(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
@@ -1365,7 +1366,7 @@ def test_evaluate_policy_post_tool_use_converts_and_returns_context(
 
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir(
         "conv_abc",
         bridge_id="bridge_shared",
@@ -1467,7 +1468,7 @@ def test_ask_user_question_hook_noop_in_non_bypass_mode(
                 "PermissionRequest hook should own the elicitation instead"
             )
 
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _RaisesIfCalled)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _RaisesIfCalled)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="b1", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_abc")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
@@ -1577,7 +1578,7 @@ def test_ask_user_question_hook_posts_and_returns_pre_tool_use_output_in_bypass_
                 request=_httpx.Request("POST", url),
             )
 
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir("conv_bypass", bridge_id="b2", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_bypass")
     build_hook_settings(
@@ -1693,7 +1694,7 @@ def test_ask_user_question_hook_returns_deny_without_updated_input(
                 request=_httpx.Request("POST", url),
             )
 
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _FakeHttpxClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _FakeHttpxClient)
     bridge_dir = prepare_bridge_dir("conv_deny", bridge_id="b3", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_deny")
     build_hook_settings(bridge_dir, ap_server_url="http://127.0.0.1:8787")
@@ -1735,7 +1736,7 @@ def test_evaluate_policy_pre_tool_use_fails_closed_when_verdict_unavailable(
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client(mode))
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client(mode))
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
@@ -1770,7 +1771,7 @@ def test_evaluate_policy_user_prompt_submit_fails_closed_on_error(
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client("connect_error"))
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client("connect_error"))
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
@@ -1802,7 +1803,7 @@ def test_evaluate_policy_post_tool_use_fails_open_on_error(
     """
     monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", make_failing_client("connect_error"))
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_failing_client("connect_error"))
     monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 0.0)
     bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
     write_active_session_id(bridge_dir, "conv_active")
@@ -2196,7 +2197,7 @@ def test_reattach_bounds_consecutive_hard_failures(monkeypatch: pytest.MonkeyPat
     ``None`` (caller fails-ask) — not spin until the day-long budget.
     """
     client = _scripted_client(script=[("connect", 0.0)], monkeypatch=monkeypatch)
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2218,7 +2219,7 @@ def test_reattach_5xx_counts_as_hard_failure(monkeypatch: pytest.MonkeyPatch) ->
     unreachable one, so it must hit the same cap.
     """
     client = _scripted_client(script=[("5xx", 0.0)], monkeypatch=monkeypatch)
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2243,7 +2244,7 @@ def test_reattach_cap_is_env_overridable(monkeypatch: pytest.MonkeyPatch) -> Non
     reloaded = importlib.reload(claude_native_hook)
     try:
         client = _scripted_client(script=[("connect", 0.0)], monkeypatch=monkeypatch)
-        monkeypatch.setattr(reloaded.httpx, "Client", client)
+        monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
 
         resp = reloaded._post_hook_with_reattach(
             url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2318,7 +2319,7 @@ def test_reattach_proxy_severed_held_poll_never_caps(monkeypatch: pytest.MonkeyP
                 raise httpx.RemoteProtocolError("proxy severed idle poll", request=req)
             return httpx.Response(200, json={"ok": True}, request=req)
 
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _SeverThenAnswerClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _SeverThenAnswerClient)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2344,7 +2345,7 @@ def test_reattach_fast_flapping_connection_is_hard_failure(
     tight loop is still bounded (it must not masquerade as a parked poll).
     """
     client = _scripted_client(script=[("severed", 0.0)], monkeypatch=monkeypatch)
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2411,7 +2412,7 @@ def test_reattach_never_resolving_severs_are_bounded_by_deadline(
     # stop it. Fake clock advances 15s per attempt + 30s backoff.
     held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 5.0  # 15s: a held sever
     client = _scripted_client(script=[("severed", held)], monkeypatch=monkeypatch)
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", client)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
@@ -2461,7 +2462,7 @@ def test_reattach_returns_response_on_success(monkeypatch: pytest.MonkeyPatch) -
             type(self).calls += 1
             return httpx.Response(200, json={"ok": True}, request=httpx.Request("POST", url))
 
-    monkeypatch.setattr(claude_native_hook.httpx, "Client", _OkClient)
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _OkClient)
 
     resp = claude_native_hook._post_hook_with_reattach(
         url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",

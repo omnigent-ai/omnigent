@@ -55,23 +55,22 @@ from urllib import error, request
 from omnigent._platform import stable_user_id
 from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
+from omnigent.claude_native_status import CONTEXT_RAW_FILE
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.kiro_native_bridge import bridge_root as kiro_bridge_root
 
 if TYPE_CHECKING:
     import httpx
 
+    from omnigent.inner.datamodel import OSEnvSandboxSpec
+    from omnigent.inner.os_env import OSEnvironment
     from omnigent.llms.context_window import ModelPricing
 
-from omnigent.inner.bundle_skills import claude_native_skill_args
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.hook_scripts.subagent_router import (
     AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
 )
-from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.reasoning_effort import CLAUDE_EFFORTS
 from omnigent.tools.base import Tool, ToolContext
-from omnigent.tools.builtins.os_env import build_os_env_tools
 
 _logger = logging.getLogger(__name__)
 
@@ -96,6 +95,10 @@ _RECENT_LOCAL_COMMAND_LINE_LIMIT = 200
 _RECENT_LOCAL_COMMAND_WINDOW_S = 10.0
 _FORKED_FROM_LINE_LIMIT = 200
 _TOOL_RELAY_FILE = "tool_relay.json"
+# Shell-sourceable sibling of tool_relay.json so the curl-based hook
+# commands can discover the live relay without a JSON parser. Re-written
+# on every relay start, so hooks survive runner restarts (new port).
+_TOOL_RELAY_ENV_FILE = "tool_relay.env"
 _TMUX_FILE = "tmux.json"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
@@ -181,6 +184,32 @@ _DRAFT_NEEDLE_MAX_CHARS = 24
 # picker the person opened by hand covers the input box, so an injection would
 # be lost; the readiness gate treats it as "not ready".
 _MODEL_PICKER_OPEN_HINT = "use this session only"
+# Header of the ctrl+r prompt-history search. Like the picker it covers the
+# input box, but its selected history row renders the composer's ``❯`` glyph
+# above the filter box's frame rule, so the readiness scan alone reads it as
+# a mounted input box — keystrokes would land in the filter field, and the
+# submit Enter would replay whatever old prompt is selected.
+_REVERSE_SEARCH_OPEN_HINT = "Search prompts ·"
+# Surfaces a person can leave covering the composer from the embedded
+# terminal. Each documents Escape as its dismissal ("Esc to cancel"), which
+# closes it without committing anything and restores the empty input box, so
+# an injected web-UI message reclaims the pane instead of typing into the
+# surface. Shell mode (``!``) also occupies the composer but has no safe
+# textual marker: its footer line ("! for shell mode") appears verbatim in
+# the ``?`` shortcuts panel while the composer is fully usable.
+_OCCUPIED_INPUT_HINTS: tuple[str, ...] = (
+    _REVERSE_SEARCH_OPEN_HINT,
+    _MODEL_PICKER_OPEN_HINT,
+)
+# How long to keep dismissing an occupying surface that verifiably stays on
+# screen, and the spacing between repeated Escapes — a busy repaint can
+# swallow one (same reasoning as ``_SUBMIT_RETRY_INTERVAL_S``). The spacing
+# also bounds a residual hazard: were a successful Escape's repaint to
+# outlast it, the stale hint would draw a retry onto the bare composer
+# (interrupting a turn). 0.75s dwarfs a TUI repaint, so that window is
+# accepted rather than confirmation-gated.
+_OCCUPIED_INPUT_DISMISS_TIMEOUT_S = 3.0
+_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 0.75
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -1356,22 +1385,18 @@ def build_hook_settings(
         "command": command,
     }
     # ``MessageDisplay`` fires once per streamed assistant-text chunk and
-    # Claude blocks on the hook, so it gets a dedicated stdlib-only
-    # appender module instead of the heavier observer ``hook`` above —
-    # the per-chunk subprocess must stay cheap. It just appends the
-    # chunk to ``<bridge_dir>/message_deltas.jsonl``; the forwarder tails
-    # that file and publishes ``response.output_text.delta`` events.
-    message_display_command_parts = [
-        python,
-        "-I",
-        "-m",
-        "omnigent.claude_native_message_display_hook",
-        "--bridge-dir",
-        str(bridge_dir),
-    ]
+    # Claude blocks on the hook, so the hot path must not even pay an
+    # interpreter spawn: a /bin/sh appender writes Claude's raw payload
+    # (flattened to one line — JSON strings never carry literal newlines)
+    # to ``message_deltas.jsonl``. The reader parses records by key and
+    # skips non-delta lines, so raw envelopes need no Python-side shaping.
+    deltas_quoted = shlex.quote(str(bridge_dir / MESSAGE_DELTAS_FILE))
     message_display_hook = {
         "type": "command",
-        "command": shlex.join(message_display_command_parts),
+        "command": (
+            "p=$(cat | tr -d '\\r\\n'); "
+            f'[ -n "$p" ] && printf \'%s\\n\' "$p" >> {deltas_quoted}; :'
+        ),
     }
     hooks: dict[str, list[_JsonObject]] = {
         "SessionStart": [{"hooks": [session_start_hook]}],
@@ -1462,19 +1487,43 @@ def build_hook_settings(
         hooks["PermissionRequest"] = [{"hooks": [permission_hook]}]
 
         # Policy-gate native Claude Code tools, not just relay/MCP tools.
-        evaluate_policy_command_parts = [
-            python,
-            "-I",
-            "-m",
-            "omnigent.claude_native_hook",
-            "evaluate-policy",
-            "--bridge-dir",
-            str(bridge_dir),
-        ]
+        # The hook is a bare curl against the relay's evaluate-policy
+        # endpoint (which owns all transformation and verdict logic), so
+        # Claude's blocking tool-call path pays no interpreter spawn. The
+        # relay's coordinates are re-read from tool_relay.env on every
+        # event, so hooks survive runner restarts. Before the relay exists
+        # (it starts in the background at session create — a very early
+        # hook can beat it) or when curl fails, the same stdin is
+        # replayed into the Python hook, which owns the direct-server
+        # path and the phase-aware fail-closed contract — exactly the
+        # pre-curl behavior.
+        relay_env_quoted = shlex.quote(str(bridge_dir / _TOOL_RELAY_ENV_FILE))
+        evaluate_policy_python = shlex.join(
+            [
+                python,
+                "-I",
+                "-m",
+                "omnigent.claude_native_hook",
+                "evaluate-policy",
+                "--bridge-dir",
+                str(bridge_dir),
+            ]
+        )
+        evaluate_policy_command = (
+            "p=$(cat); "
+            f"if [ -r {relay_env_quoted} ]; then . {relay_env_quoted}; "
+            "out=$(printf '%s' \"$p\" | curl -sf --max-time 86400 "
+            '-H "Authorization: Bearer $OMNIGENT_RELAY_TOKEN" '
+            "-H 'Content-Type: application/json' --data-binary @- "
+            '"$OMNIGENT_RELAY_URL/hook/claude/evaluate-policy" 2>/dev/null) '
+            "&& { printf '%s' \"$out\"; exit 0; }; fi; "
+            f"printf '%s' \"$p\" | {evaluate_policy_python}"
+        )
         evaluate_policy_hook: _JsonObject = {
             "type": "command",
-            "command": shlex.join(evaluate_policy_command_parts),
+            "command": evaluate_policy_command,
         }
+
         # In bypassPermissions mode PermissionRequest never fires, so
         # AskUserQuestion needs its own PreToolUse hook to surface the
         # form. It's a no-op in other modes to avoid double-surfacing.
@@ -1559,20 +1608,20 @@ def build_hook_settings(
     if api_key_helper:
         settings["apiKeyHelper"] = api_key_helper
     # Override Claude Code's statusLine so we receive its stdin (the
-    # only place ``context_window`` surfaces). Chain to whatever the
-    # user had globally so claude-hud / their bar still renders.
-    status_parts = [
-        python,
-        "-I",
-        "-m",
-        "omnigent.claude_native_status",
-        "--bridge-dir",
-        str(bridge_dir),
-    ]
+    # only place ``context_window`` surfaces). A /bin/sh shim captures
+    # the raw payload atomically (no interpreter spawn on Claude's
+    # blocking statusLine path — the forwarder normalizes it into
+    # ``context.json``) and chains to whatever the user had globally so
+    # claude-hud / their bar still renders.
+    raw_quoted = shlex.quote(str(bridge_dir / CONTEXT_RAW_FILE))
+    status_command = (
+        f"p=$(cat); printf '%s' \"$p\" > {raw_quoted}.$$.tmp"
+        f" && mv -f {raw_quoted}.$$.tmp {raw_quoted}"
+    )
     chain_command = read_user_status_line_command()
     if chain_command is not None:
-        status_parts.extend(["--chain", chain_command])
-    settings["statusLine"] = {"type": "command", "command": shlex.join(status_parts)}
+        status_command += f"; printf '%s' \"$p\" | ( {chain_command} )"
+    settings["statusLine"] = {"type": "command", "command": status_command}
     return settings
 
 
@@ -1730,6 +1779,9 @@ def augment_claude_args(
     )
     if append_system_prompt:
         args.extend(["--append-system-prompt", append_system_prompt])
+    # Imported here: bundle-skills parsing rides the spec graph; launch-only.
+    from omnigent.inner.bundle_skills import claude_native_skill_args
+
     args.extend(
         claude_native_skill_args(
             bundle_dir,
@@ -2871,6 +2923,11 @@ def inject_user_message(
     (see :func:`_wait_for_claude_prompt_ready`). The second gate closes
     a race on freshly-created sessions where the first message would
     otherwise be typed into a still-booting TUI and silently dropped.
+    Between the two, any surface the person left covering the composer
+    from the embedded terminal — a ctrl+r history search, a hand-opened
+    ``/model`` picker — is dismissed with Escape
+    (see :func:`_restore_occupied_input`), so the message reclaims the
+    input box instead of typing into that surface.
 
     Delivered as one bracketed paste via ``tmux load-buffer`` (from a
     temp file) + ``paste-buffer -p`` so interior newlines ride as raw CR
@@ -2904,6 +2961,11 @@ def inject_user_message(
         after repeated submit Enters (message not delivered).
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    # A ctrl+r history search or hand-opened /model picker left covering
+    # the composer swallows everything typed below — and can hide the
+    # prompt glyph, wedging the readiness gate — so reclaim the input box
+    # before waiting on it.
+    _restore_occupied_input(info["socket_path"], info["tmux_target"])
     # tmux.json only means the tmux session exists; Claude Code's input
     # box mounts a few seconds later. Block until the prompt renders so
     # the first message isn't typed into a still-booting TUI and dropped.
@@ -3123,6 +3185,11 @@ def inject_slash_command(
     """
     Type a Claude Code slash command into the tmux pane and submit it.
 
+    A surface the person left covering the composer from the embedded
+    terminal (ctrl+r history search, hand-opened ``/model`` picker) is
+    dismissed first — see :func:`_restore_occupied_input` — so the
+    command cannot be typed into it.
+
     :param bridge_dir: Bridge directory path, e.g.
         ``/tmp/omnigent/claude-native/<digest>``.
     :param command: Single-line slash command including the leading
@@ -3159,6 +3226,10 @@ def inject_slash_command(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
+    # Same reclaim as inject_user_message: a ctrl+r search or hand-opened
+    # /model picker left covering the composer would swallow the C-u and
+    # the typed command.
+    _restore_occupied_input(socket_path, tmux_target)
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # paste below concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
@@ -3514,6 +3585,55 @@ def claude_pane_ready(bridge_dir: Path) -> bool:
     return _claude_prompt_rendered(pane)
 
 
+def _restore_occupied_input(socket_path: str, tmux_target: str) -> None:
+    """
+    Dismiss a terminal-opened surface occupying Claude's input box.
+
+    A person can leave the composer covered from the embedded terminal —
+    the ctrl+r prompt-history search, or a hand-opened ``/model`` picker
+    (:data:`_OCCUPIED_INPUT_HINTS`). Keystrokes injected while one is up
+    land in that surface instead of the chat input: the history search
+    filters on the pasted text and its Enter replays whatever old prompt
+    is selected. Each surface documents Escape as its dismissal ("Esc to
+    cancel"), closing it without committing anything and restoring the
+    empty input box, so the web-UI message wins the pane.
+
+    Escape is only sent while a hint is verifiably in the current
+    capture — never blind, because on the bare composer Escape interrupts
+    an in-flight turn. An empty (torn) capture means "unknown" and gets
+    no Escape. A swallowed Escape is re-sent while the surface remains,
+    spaced by :data:`_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S`.
+    Best-effort: a surface that outlives
+    :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S` is left on screen and the
+    caller's readiness gate or delivery verification fails loud, exactly
+    as it did before this restore existed.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: None.
+    """
+    deadline = time.monotonic() + _OCCUPIED_INPUT_DISMISS_TIMEOUT_S
+    last_escape: float | None = None
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        hint = next((text for text in _OCCUPIED_INPUT_HINTS if text in pane), None)
+        if hint is None:
+            return
+        now = time.monotonic()
+        if now >= deadline:
+            _logger.warning(
+                "claude-native: input box still occupied (%r) after %.1fs; proceeding",
+                hint,
+                _OCCUPIED_INPUT_DISMISS_TIMEOUT_S,
+            )
+            return
+        if last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
+            _logger.info("claude-native: dismissing %r covering the input box", hint)
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+            last_escape = now
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
 def _claude_prompt_rendered(pane: str) -> bool:
     """
     Return whether Claude Code's input prompt is rendered in a pane.
@@ -3856,6 +3976,7 @@ def start_tool_relay(
         loop,
         policy_client=policy_client,
         session_id=session_id,
+        bridge_dir=bridge_dir,
     )
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     host, port = _http_server_host_port(httpd)
@@ -3869,6 +3990,13 @@ def start_tool_relay(
     if session_id is not None:
         relay_info["session_id"] = session_id
     _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
+    # token_urlsafe's alphabet is [A-Za-z0-9_-], safe inside single quotes.
+    env_path = bridge_dir / _TOOL_RELAY_ENV_FILE
+    env_path.write_text(
+        f"OMNIGENT_RELAY_URL='http://{host}:{port}'\nOMNIGENT_RELAY_TOKEN='{token}'\n",
+        encoding="utf-8",
+    )
+    os.chmod(env_path, 0o600)
     thread = threading.Thread(
         target=httpd.serve_forever,
         name="claude-native-tool-relay",
@@ -4069,6 +4197,7 @@ def _tool_relay_handler_factory(
     *,
     policy_client: httpx.AsyncClient | None = None,
     session_id: str | None = None,
+    bridge_dir: Path | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class for active-turn tool calls.
@@ -4103,7 +4232,11 @@ def _tool_relay_handler_factory(
 
             :returns: None.
             """
-            if self.path not in ("/tool", "/policies/evaluate"):
+            if self.path not in (
+                "/tool",
+                "/policies/evaluate",
+                "/hook/claude/evaluate-policy",
+            ):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             if self.headers.get("Authorization") != f"Bearer {token}":
@@ -4112,6 +4245,9 @@ def _tool_relay_handler_factory(
             payload = self._read_json_body()
             if payload is None:
                 self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            if self.path == "/hook/claude/evaluate-policy":
+                self._handle_hook_evaluate(payload)
                 return
             if self.path == "/policies/evaluate":
                 self._handle_policy_evaluate(payload)
@@ -4124,6 +4260,89 @@ def _tool_relay_handler_factory(
             if not isinstance(arguments, dict):
                 arguments = {}
             self._send_json(_run_relay_tool(tool_executor, loop, name, arguments))
+
+        def _respond_hook_output(self, output: dict[str, object] | None) -> None:
+            """Answer a hook-evaluate request with final hook output JSON.
+
+            :param output: Hook output dict, or ``None`` for "no opinion"
+                (empty body — Claude proceeds).
+            """
+            raw = b"" if output is None else json.dumps(output).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            if raw:
+                self.wfile.write(raw)
+
+        def _handle_hook_evaluate(self, payload: _JsonObject) -> None:
+            """Serve one Claude policy hook event end to end.
+
+            The hook subprocess is a bare curl: this endpoint does the
+            payload→EvaluationRequest transform, the upstream evaluate
+            call, and the EvaluationResponse→hook-output transform, so the
+            blocking hook path pays no interpreter spawn. Responses are
+            always 200; enforcement failures are expressed as fail-closed
+            hook output.
+            """
+            # Heavy policy imports stay off this module's import path (hook
+            # subprocesses import it); the relay runs inside the runner
+            # process where these modules are already loaded.
+            from omnigent.native_policy_hook import (
+                evaluation_response_to_hook_output,
+                fail_closed_hook_output,
+                hook_payload_to_evaluation_request,
+            )
+
+            raw_event = payload.get("hook_event_name")
+            hook_event = raw_event if isinstance(raw_event, str) else ""
+            if policy_client is None or session_id is None:
+                self._respond_hook_output(None)
+                return
+            eval_request = hook_payload_to_evaluation_request(hook_event, payload)
+            if eval_request is None:
+                self._respond_hook_output(None)
+                return
+            context = eval_request["event"]["context"]
+            context["harness"] = "claude-native"
+            if bridge_dir is not None:
+                status_model = read_claude_status_model(bridge_dir)
+                if status_model:
+                    context["model"] = status_model
+            # Stable re-attach id: a retried long-poll reattaches to the
+            # same parked ASK instead of raising a second approval card.
+            request_body = {
+                **eval_request,
+                "_omnigent_elicitation_id": f"elicit_evaluate_{secrets.token_hex(16)}",
+            }
+            import urllib.parse as _up
+
+            url = f"/v1/sessions/{_up.quote(session_id, safe='')}/policies/evaluate"
+            verdict: object = None
+            last_error: str | None = None
+            for attempt in range(3):
+                if attempt:
+                    time.sleep(0.4)
+                future = asyncio.run_coroutine_threadsafe(
+                    policy_client.post(url, json=request_body), loop
+                )
+                try:
+                    resp = future.result(timeout=86400.0)
+                except Exception as exc:  # noqa: BLE001 — shaped fail-closed below
+                    last_error = str(exc).strip() or type(exc).__name__
+                    continue
+                if resp.status_code != HTTPStatus.OK:
+                    last_error = f"server returned HTTP {resp.status_code}"
+                    continue
+                try:
+                    verdict = json.loads(resp.content)
+                except (ValueError, TypeError):
+                    last_error = "malformed EvaluationResponse body"
+                break
+            if not isinstance(verdict, dict) or not verdict.get("result"):
+                self._respond_hook_output(fail_closed_hook_output(hook_event, last_error))
+                return
+            self._respond_hook_output(evaluation_response_to_hook_output(hook_event, verdict))
 
         def _handle_policy_evaluate(self, payload: _JsonObject) -> None:
             if policy_client is None or session_id is None:
@@ -4692,6 +4911,14 @@ def _build_tools(config: _JsonObject) -> tuple[dict[str, Tool], Callable[[], Non
     :returns: ``(tools, close_tools)`` where ``close_tools``
         releases any helper processes.
     """
+    # Imported here, not at module top: this drags the tools/spec/pydantic
+    # graph (~300 ms of interpreter startup), and this module is on the
+    # import path of every per-chunk/per-tool-call Claude hook subprocess.
+    # Only the bridge MCP server (launch path) ever builds these tools.
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import create_os_environment
+    from omnigent.tools.builtins.os_env import build_os_env_tools
+
     workspace_raw = config.get("workspace")
     workspace = Path(workspace_raw) if isinstance(workspace_raw, str) and workspace_raw else None
     os_env: OSEnvironment | None = None

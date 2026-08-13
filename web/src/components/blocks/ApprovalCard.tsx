@@ -48,6 +48,7 @@ import {
   castAskUserQuestionPayload,
   parseAskUserQuestionPreview,
 } from "@/lib/askUserQuestion";
+import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
 import type { RememberScope } from "@/lib/types";
@@ -245,6 +246,18 @@ export function ApprovalCard({
   // external MCP server, etc.) — show a link. Our own /approve/...
   // paths are handled inline with approve/reject buttons.
   const isExternalUrl = typeof url === "string" && url.length > 0 && !url.startsWith("/approve/");
+  // What the header's "· <tag>" slot shows. Native bridges stamp a synthetic
+  // `policy_name` (provenance, not a policy anyone wrote), so name the product
+  // that asked — and show nothing when the stamp names no vendor. A real policy
+  // name renders verbatim so users can tell which of their policies asked.
+  const isNativePolicy = isNativePolicyName(policyName);
+  const policyLabel = isNativePolicy
+    ? (nativeCodingAgentForPolicyName(policyName)?.displayName ?? "")
+    : policyName;
+  // Native prompts also stamp a constant, internal-sounding phase
+  // ("pre_tool_use", "codex_command_approval", ...). It carries no
+  // information the card doesn't already show, so hide it for them.
+  const showPhase = phase !== "" && !isNativePolicy;
   const askUserQuestionTitle =
     policyName.startsWith("agy_") || phase.startsWith("agy_")
       ? "Antigravity needs your input"
@@ -410,7 +423,7 @@ export function ApprovalCard({
         <AlertTitle className="flex items-center gap-2 text-ui">
           {icon}
           {label}
-          {policyName && <span className="text-muted-foreground text-sm">· {policyName}</span>}
+          {policyLabel && <span className="text-muted-foreground text-sm">· {policyLabel}</span>}
         </AlertTitle>
         <AlertDescription className="flex flex-col gap-1 text-sm">
           {isCodexCommandApproval ? (
@@ -475,10 +488,10 @@ export function ApprovalCard({
               : isMultiChoice
                 ? "Choose an option"
                 : "Approval required"}
-        {policyName && !isAskUserQuestion && !isExitPlanMode && (
-          <span className="text-muted-foreground text-sm">· {policyName}</span>
+        {policyLabel && !isAskUserQuestion && !isExitPlanMode && (
+          <span className="text-muted-foreground text-sm">· {policyLabel}</span>
         )}
-        {phase && !isMultiChoice && !isAskUserQuestion && !isExitPlanMode && (
+        {showPhase && !isMultiChoice && !isAskUserQuestion && !isExitPlanMode && (
           <span className="text-muted-foreground text-sm">({phase})</span>
         )}
       </AlertTitle>

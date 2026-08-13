@@ -3119,6 +3119,27 @@ def create_runner_app(
             if harness_name == "claude-native":
                 terminal_ready = _launch_result
 
+                # Start the loopback relay now instead of at the first
+                # web-dispatched turn: a prompt typed directly in the TUI
+                # fires policy hooks immediately, and without the relay every
+                # hook falls back to a Python spawn + WAN round trip. In the
+                # background so session create doesn't wait on it — hooks
+                # that beat it use that same fallback.
+                async def _start_claude_relay_early() -> None:
+                    try:
+                        await _ensure_comment_relay_started(
+                            session_id, session_labels=init_context.labels
+                        )
+                    except Exception:
+                        _logger.exception("Failed to pre-start comment relay for %s", session_id)
+
+                _relay_task = asyncio.create_task(
+                    _start_claude_relay_early(),
+                    name=f"claude-comment-relay:{session_id}",
+                )
+                _relay_task.add_done_callback(_background_tasks.discard)
+                _background_tasks.add(_relay_task)
+
         if (
             spec is not None
             and not is_native_harness(harness_name)
