@@ -2438,6 +2438,16 @@ class SessionUsage(BaseModel):
     title: str | None = None
     cost_usd: float = 0.0
     models: dict[str, float] = Field(default_factory=dict)
+    harness: str | None = None
+    llm_model: str | None = None
+    agent_name: str | None = None
+
+
+class DailyCost(BaseModel):
+    """One day's LLM spend for the daily timeline chart."""
+
+    day: str
+    cost_usd: float = 0.0
 
 
 class UsageReport(BaseModel):
@@ -2470,6 +2480,7 @@ class UsageReport(BaseModel):
     cost_last_7d: float = 0.0
     cost_last_30d: float = 0.0
     total_cost_usd: float = 0.0
+    daily_costs: list[DailyCost] = Field(default_factory=list)
     sessions: list[SessionUsage] = Field(default_factory=list)
 
 

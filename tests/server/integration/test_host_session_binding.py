@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.entities import Conversation
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HostHelloFrame,
     HostLaunchRunnerFrame,
@@ -1080,7 +1081,7 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A paused Islo host wakes even while its DB liveness row is still fresh."""
+    """A paused Islo host wakes and signals re-address when online cross-replica."""
     from omnigent.server.routes import sessions as sessions_module
 
     host_store = HostStore(db_uri)
@@ -1132,15 +1133,14 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
     )
 
     assert host_store.is_online("40bb7200abc8ed27d5b2fcbfad8e89d2") is True
-    assert (
+    with pytest.raises(OmnigentError) as exc:
         await sessions_module._maybe_relaunch_managed_sandbox(
             session_id=conv.id,
             conv=conv,
             app_state=app_state,
             conversation_store=conv_store,
         )
-        is True
-    )
+    assert exc.value.code == ErrorCode.WRONG_REPLICA
     assert calls == ["wake"]
 
 
@@ -1148,7 +1148,7 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A paused Islo host can wake before local tunnel liveness notices."""
+    """A paused Islo host wakes stale tunnels and signals re-address when online cross-replica."""
     from omnigent.server.routes import sessions as sessions_module
 
     host_store = HostStore(db_uri)
@@ -1222,15 +1222,14 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
         ),
     )
 
-    assert (
+    with pytest.raises(OmnigentError) as exc:
         await sessions_module._maybe_wake_stale_resumable_managed_sandbox(
             session_id=conv.id,
             conv=conv,
             app_state=app_state,
             conversation_store=conv_store,
         )
-        is True
-    )
+    assert exc.value.code == ErrorCode.WRONG_REPLICA
     assert calls == ["wake"]
     assert host_deregistered == ["055e31f38d07908f171ebad4ff5cbe9c"]
     assert runner_deregistered == ["runner_stale_tunnel"]

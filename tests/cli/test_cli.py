@@ -6596,3 +6596,36 @@ def test_manage_kimi_harness_login_runs_kimi_login(
     _manage_kimi_harness()
 
     login.assert_called_once_with(hi.KIMI_KEY)
+
+
+def test_runner_online_map_keys_status_by_runner_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each runner-status check names the runner's host.
+
+    The status endpoint reads the in-memory tunnel registry, so the check must
+    reach the replica holding that runner's tunnel or it reports the runner
+    offline. A runner is spawned on exactly one host, taken here from the
+    session rows that reference it; a runner with no host row is left unkeyed.
+    """
+    import omnigent.cli as cli
+
+    seen: dict[str, str | None] = {}
+
+    def _fake(*, base_url: str, method: str, path: str, host_id: str | None = None, **_kw):
+        seen[path.rsplit("/", 2)[1]] = host_id  # /v1/runners/{rid}/status
+        return cli._HostHttpResult(status_code=200, body={"online": True})
+
+    monkeypatch.setattr(cli, "_host_http_json", _fake)
+
+    sessions = [
+        {"id": "conv_1", "runner_id": "runner_a", "host_id": "host_1"},
+        {"id": "conv_2", "runner_id": "runner_b", "host_id": "host_2"},
+        {"id": "conv_3", "runner_id": "runner_c"},  # hostless → unkeyed
+    ]
+    result = cli._runner_online_map(
+        base_url="https://ws.example.com/api/2.0/omnigent", sessions=sessions
+    )
+
+    assert result == {"runner_a": True, "runner_b": True, "runner_c": True}
+    assert seen == {"runner_a": "host_1", "runner_b": "host_2", "runner_c": None}

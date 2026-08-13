@@ -116,6 +116,14 @@ dependencies = [
     # onto the core server boot path via app.py; previously only a transitive
     # dep, declared directly now that we import it.
     "python-dateutil>=2.8,<3",
+    # IANA time-zone database for `zoneinfo`. Windows ships no system tz
+    # database, so `ZoneInfo("UTC")` raises ZoneInfoNotFoundError there
+    # unless this package is installed. Evaluated at module top in
+    # omnigent/server/scheduled/rrule.py and scheduler.py, both pulled onto
+    # the core server boot path via app.py, so a Windows install crashes on
+    # `omnigent server start` without it. POSIX platforms use the system
+    # database and don't need the wheel.
+    "tzdata>=2024.1; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]

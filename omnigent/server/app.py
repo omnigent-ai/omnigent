@@ -908,9 +908,17 @@ def create_app(
     from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 
     tunnel_registry = TunnelRegistry()
+    host_registry = HostRegistry()
     runner_router = RunnerRouter(
         registry=tunnel_registry,
         conversation_store=conversation_store,
+        # host_registry answers "is the host on this replica"; host_store adds
+        # the "is it alive anywhere" gate. Together they classify a wrong-replica
+        # miss (re-addressable WRONG_REPLICA) apart from a genuinely offline
+        # runner (RUNNER_UNAVAILABLE) — a host reaped locally but dead everywhere
+        # is the latter, not a false wrong-replica.
+        host_registry=host_registry,
+        host_store=host_store,
     )
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
@@ -920,7 +928,6 @@ def create_app(
         conversation_store,
         RunnerBackgroundTitleGenerator(runner_router),
     )
-    host_registry = HostRegistry()
     # Shared between the host tunnel (which records ``host.runner_exited``
     # reports from daemons) and the runner status endpoint (which surfaces
     # them to clients waiting for a launched runner to connect).

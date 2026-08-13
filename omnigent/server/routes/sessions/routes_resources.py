@@ -144,11 +144,15 @@ def register_resources_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        if access.conversation is None:
+        conv = access.conversation
+        if conv is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
-        runner_client = await _get_runner_client_for_resource_access(session_id)
+        runner_client = await _get_runner_client_for_resource_access(
+            session_id,
+            conversation=conv,
+        )
         if runner_client is not None:
             page = await _proxy_get_session_resources_to_runner(
                 runner_client, session_id, resource_type=type
@@ -245,12 +249,14 @@ def register_resources_routes(
     async def _proxy_get_to_runner(
         session_id: str,
         path: str,
+        conversation: Conversation,
         params: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Proxy a GET request to the runner and return parsed JSON.
 
         :param session_id: Session/conversation identifier.
         :param path: Runner-relative URL path.
+        :param conversation: Conversation loaded during authorization.
         :param params: Optional query params forwarded to the runner,
             e.g. ``{"order": "asc"}``. ``None`` sends no query string.
         :returns: Parsed JSON response body.
@@ -258,6 +264,7 @@ def register_resources_routes(
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
+            conversation=conversation,
         )
         if runner_client is None:
             raise HTTPException(
@@ -302,6 +309,7 @@ def register_resources_routes(
 
     async def _fs_get_with_host_fallback(
         session_id: str,
+        conversation: Conversation,
         *,
         op: str,
         host_params: dict[str, Any],
@@ -320,6 +328,7 @@ def register_resources_routes(
         same JSON the runner would, so the response shape is identical.
 
         :param session_id: Session/conversation identifier.
+        :param conversation: Conversation loaded during authorization.
         :param op: Host-side op name — ``"list_or_read"`` / ``"changes"``
             / ``"diff"`` / ``"search"``.
         :param host_params: Op-specific args for the host reader.
@@ -339,7 +348,12 @@ def register_resources_routes(
         :raises HTTPException: On host-reported filesystem failures.
         """
         try:
-            return await _proxy_get_to_runner(session_id, runner_path, params=runner_params)
+            return await _proxy_get_to_runner(
+                session_id,
+                runner_path,
+                conversation,
+                params=runner_params,
+            )
         except OmnigentError as exc:
             # Only the runner-offline case is a candidate for the host
             # fallback; a real 404 / git error from a live runner must
@@ -350,7 +364,11 @@ def register_resources_routes(
 
         host_workspace = await host_workspace_resolver() if host_workspace_resolver else None
         payload = await _read_workspace_via_host(
-            session_id, op, host_params, workspace_override=host_workspace
+            session_id,
+            conversation,
+            op,
+            host_params,
+            workspace_override=host_workspace,
         )
         if payload is None:
             # No reachable host either — surface the original offline
@@ -359,7 +377,7 @@ def register_resources_routes(
         return payload
 
     async def _environment_reach_for_session(
-        session_id: str,
+        conversation: Conversation,
     ) -> tuple[list[Any], bool, str] | None:
         """Compute a session's browse reach without consulting the runner.
 
@@ -369,22 +387,29 @@ def register_resources_routes(
         trusted to enforce this — it reads whatever root it is handed, so
         the decision has to be made here.
 
-        :param session_id: Session/conversation identifier.
+        :param conversation: Conversation loaded during authorization.
         :returns: ``(roots, unconfined, workspace)``, or ``None`` when the
             session has no workspace or spec to resolve.
         """
         from omnigent.inner.sandbox import is_unconfined, reachable_roots, resolve_sandbox
 
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if conv is None or not conv.workspace:
+        if not conversation.workspace:
             return None
-        spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+        spec = await asyncio.to_thread(
+            _load_agent_spec_for_session,
+            conversation,
+            agent_store,
+        )
         spec_os_env = getattr(spec, "os_env", None) if spec is not None else None
         if spec_os_env is None:
             return None
-        root = Path(conv.workspace)
+        root = Path(conversation.workspace)
         policy = resolve_sandbox(spec_os_env, root)
-        return reachable_roots(root, policy), is_unconfined(policy), conv.workspace
+        return (
+            reachable_roots(root, policy),
+            is_unconfined(policy),
+            conversation.workspace,
+        )
 
     def _mutating_runner_path(
         session_id: str,
@@ -453,10 +478,13 @@ def register_resources_routes(
         """
         return LEVEL_OWNER if ntpath.isabs(client_path) else within_workspace
 
-    async def _authorize_absolute_browse(session_id: str, absolute_path: str) -> str:
+    async def _authorize_absolute_browse(
+        conversation: Conversation,
+        absolute_path: str,
+    ) -> str:
         """Authorize an absolute browse target for the host-served path.
 
-        :param session_id: Session/conversation identifier.
+        :param conversation: Conversation loaded during authorization.
         :param absolute_path: Absolute path the caller asked for.
         :returns: The resolved, authorized absolute path.
         :raises HTTPException: 403 when no grant covers it and the
@@ -465,7 +493,7 @@ def register_resources_routes(
         from omnigent.entities.environment_filesystem import PathUnreachable
         from omnigent.runner.environment_filesystem import resolve_browse_target
 
-        reach = await _environment_reach_for_session(session_id)
+        reach = await _environment_reach_for_session(conversation)
         if reach is None:
             raise HTTPException(status_code=403, detail="session has no browsable environment")
         roots, unconfined, _workspace = reach
@@ -476,6 +504,7 @@ def register_resources_routes(
 
     async def _read_workspace_via_host(
         session_id: str,
+        conversation: Conversation,
         op: str,
         host_params: dict[str, Any],
         *,
@@ -484,6 +513,7 @@ def register_resources_routes(
         """Read the session's workspace over its host tunnel.
 
         :param session_id: Session/conversation identifier.
+        :param conversation: Conversation loaded during authorization.
         :param op: Host-side op name.
         :param host_params: Op-specific args for the host reader.
         :returns: The runner-shaped result, or ``None`` when no host is
@@ -499,10 +529,9 @@ def register_resources_routes(
 
         if host_registry is None:
             return None
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if conv is None or not conv.host_id or not conv.workspace:
+        if not conversation.host_id or not conversation.workspace:
             return None
-        host_conn = host_registry.get(conv.host_id)
+        host_conn = host_registry.get(conversation.host_id)
         if host_conn is None:
             return None
         try:
@@ -510,7 +539,7 @@ def register_resources_routes(
                 host_registry=host_registry,
                 host_conn=host_conn,
                 op=op,
-                workspace=workspace_override or conv.workspace,
+                workspace=workspace_override or conversation.workspace,
                 session_id=session_id,
                 params=host_params,
             )
@@ -531,17 +560,20 @@ def register_resources_routes(
         session_id: str,
         path: str,
         body: dict[str, Any],
+        conversation: Conversation,
     ) -> tuple[int, dict[str, Any]]:
         """Proxy a POST request to the runner and return status + JSON.
 
         :param session_id: Session/conversation identifier.
         :param path: Runner-relative URL path.
         :param body: JSON body to forward.
+        :param conversation: Conversation loaded during authorization.
         :returns: Tuple of (status_code, parsed_json_body).
         :raises HTTPException: 502 on transport failure.
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
+            conversation=conversation,
         )
         if runner_client is None:
             raise HTTPException(
@@ -564,16 +596,19 @@ def register_resources_routes(
     async def _proxy_delete_to_runner(
         session_id: str,
         path: str,
+        conversation: Conversation,
     ) -> tuple[int, dict[str, Any]]:
         """Proxy a DELETE request to the runner and return status + JSON.
 
         :param session_id: Session/conversation identifier.
         :param path: Runner-relative URL path.
+        :param conversation: Conversation loaded during authorization.
         :returns: Tuple of (status_code, parsed_json_body).
         :raises HTTPException: 502 on transport failure.
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
+            conversation=conversation,
         )
         if runner_client is None:
             raise HTTPException(
@@ -593,17 +628,20 @@ def register_resources_routes(
         session_id: str,
         path: str,
         body: dict[str, Any],
+        conversation: Conversation,
     ) -> tuple[int, dict[str, Any]]:
         """Proxy a PUT request to the runner.
 
         :param session_id: Session/conversation identifier.
         :param path: Runner-relative URL path.
         :param body: JSON body to forward.
+        :param conversation: Conversation loaded during authorization.
         :returns: Tuple of (status_code, parsed_json_body).
         :raises HTTPException: 502 on transport failure.
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
+            conversation=conversation,
         )
         if runner_client is None:
             raise HTTPException(
@@ -627,17 +665,20 @@ def register_resources_routes(
         session_id: str,
         path: str,
         body: dict[str, Any],
+        conversation: Conversation,
     ) -> tuple[int, dict[str, Any]]:
         """Proxy a PATCH request to the runner.
 
         :param session_id: Session/conversation identifier.
         :param path: Runner-relative URL path.
         :param body: JSON body to forward.
+        :param conversation: Conversation loaded during authorization.
         :returns: Tuple of (status_code, parsed_json_body).
         :raises HTTPException: 502 on transport failure.
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
+            conversation=conversation,
         )
         if runner_client is None:
             raise HTTPException(
@@ -675,9 +716,9 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :returns: ``PaginatedList`` of environment resources.
         """
-        await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _validate_session(session_id, request, LEVEL_READ)
         path = f"/v1/sessions/{session_id}/resources/environments"
-        return await _proxy_get_to_runner(session_id, path)
+        return await _proxy_get_to_runner(session_id, path, conv)
 
     @router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}",
@@ -697,23 +738,23 @@ def register_resources_routes(
             e.g. ``"default"``.
         :returns: The environment resource object.
         """
-        await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _validate_session(session_id, request, LEVEL_READ)
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}"
         try:
-            return await _proxy_get_to_runner(session_id, path)
+            return await _proxy_get_to_runner(session_id, path, conv)
         except OmnigentError as exc:
             if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
                 raise
             # Runner offline but host-bound: synthesize the default
             # environment so the file panel (which gates on this metadata)
             # keeps browsing the host-served workspace at ``conv.workspace``.
-            synthesized = await _synthesize_offline_environment(session_id, environment_id)
+            synthesized = await _synthesize_offline_environment(conv, environment_id)
             if synthesized is None:
                 raise
             return synthesized
 
     async def _synthesize_offline_environment(
-        session_id: str,
+        conversation: Conversation,
         environment_id: str,
     ) -> dict[str, Any] | None:
         """Build a default-environment resource from the bound workspace.
@@ -722,7 +763,7 @@ def register_resources_routes(
         the file panel's environment probe resolves and browsing can
         proceed against the host-served workspace.
 
-        :param session_id: Session/conversation identifier.
+        :param conversation: Conversation loaded during authorization.
         :param environment_id: Requested environment id; only the default
             environment is synthesized.
         :returns: An environment resource dict carrying ``metadata.root``
@@ -731,21 +772,20 @@ def register_resources_routes(
         """
         if environment_id != "default" or host_registry is None:
             return None
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if conv is None or not conv.host_id or not conv.workspace:
+        if not conversation.host_id or not conversation.workspace:
             return None
-        if host_registry.get(conv.host_id) is None:
+        if host_registry.get(conversation.host_id) is None:
             return None
 
         from omnigent.inner.sandbox import reach_payload
 
-        metadata: dict[str, Any] = {"root": conv.workspace}
+        metadata: dict[str, Any] = {"root": conversation.workspace}
         # Advertise the same reach the runner would. Without it the file
         # panel reads "nothing else reachable" and silently drops its
         # navigation affordance the moment the agent sleeps -- even though
         # the host-served path authorizes and serves absolute browsing
         # exactly as the live runner does.
-        reach = await _environment_reach_for_session(session_id)
+        reach = await _environment_reach_for_session(conversation)
         if reach is not None:
             roots, unconfined, _workspace = reach
             metadata["reachable"] = reach_payload(roots, unconfined=unconfined)
@@ -779,14 +819,19 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :returns: ``PaginatedList`` of terminal resources.
         """
-        await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _validate_session(session_id, request, LEVEL_READ)
         path = f"/v1/sessions/{session_id}/resources/terminals"
         forwarded = {
             key: value
             for key, value in request.query_params.items()
             if key in ("limit", "after", "before", "order")
         }
-        return await _proxy_get_to_runner(session_id, path, params=forwarded or None)
+        return await _proxy_get_to_runner(
+            session_id,
+            path,
+            conv,
+            params=forwarded or None,
+        )
 
     @router.post(
         "/sessions/{session_id}/resources/terminals",
@@ -854,9 +899,9 @@ def register_resources_routes(
         # the wakeable states recover; a non-host-bound stranded session or an
         # offline external host still falls through to the 502 below (the CLI
         # reconnect path owns those).
-        # Called for its reconnect side effect; the proxy below re-resolves the
-        # (now-live) runner client itself, so neither return value is bound.
-        await ensure_runner_connected(
+        # Reuse the refreshed row returned after any wake or relaunch because
+        # the runner binding may have changed.
+        _, conv = await ensure_runner_connected(
             session_id=session_id,
             conv=conv,
             app_state=request.app.state,
@@ -868,6 +913,7 @@ def register_resources_routes(
             session_id,
             path,
             body,
+            conv,
         )
         if status >= 400:
             error = payload.get("error", {})
@@ -903,9 +949,9 @@ def register_resources_routes(
         :param terminal_id: Opaque terminal resource id.
         :returns: The terminal resource object.
         """
-        await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _validate_session(session_id, request, LEVEL_READ)
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}"
-        return await _proxy_get_to_runner(session_id, path)
+        return await _proxy_get_to_runner(session_id, path, conv)
 
     @router.post(
         "/sessions/{session_id}/resources/terminals/{terminal_id}/transfer",
@@ -936,7 +982,7 @@ def register_resources_routes(
             e.g. ``"terminal_claude_main"``.
         :returns: The terminal resource object under the target session.
         """
-        await _validate_session(session_id, request, LEVEL_EDIT)
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
         body = await request.json()
         target_session_id = body.get("target_session_id") if isinstance(body, dict) else None
         if not isinstance(target_session_id, str) or not target_session_id:
@@ -951,6 +997,7 @@ def register_resources_routes(
             session_id,
             path,
             {"target_session_id": target_session_id},
+            conv,
         )
         if status == 404:
             error = payload.get("error", {})
@@ -1009,11 +1056,12 @@ def register_resources_routes(
         :param terminal_id: Opaque terminal resource id.
         :returns: Deletion confirmation object.
         """
-        await _validate_session(session_id, request, LEVEL_EDIT)
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}"
         status, payload = await _proxy_delete_to_runner(
             session_id,
             path,
+            conv,
         )
         if status == 404:
             error = payload.get("error", {})
@@ -1511,31 +1559,35 @@ def register_resources_routes(
             are common and cannot be distinguished cheaply here.
         :returns: Parsed JSON response.
         """
-        await _validate_session(session_id, request, required_level)
+        conv = await _validate_session(session_id, request, required_level)
         if method == "GET":
-            return await _proxy_get_to_runner(session_id, path)
+            return await _proxy_get_to_runner(session_id, path, conv)
         if method == "PUT":
             status, payload = await _proxy_put_to_runner(
                 session_id,
                 path,
                 body or {},
+                conv,
             )
         elif method == "PATCH":
             status, payload = await _proxy_patch_to_runner(
                 session_id,
                 path,
                 body or {},
+                conv,
             )
         elif method == "POST":
             status, payload = await _proxy_post_to_runner(
                 session_id,
                 path,
                 body or {},
+                conv,
             )
         elif method == "DELETE":
             status, payload = await _proxy_delete_to_runner(
                 session_id,
                 path,
+                conv,
             )
         else:
             raise HTTPException(status_code=405)
@@ -1609,11 +1661,12 @@ def register_resources_routes(
             params["before"] = before
         qs = urllib.parse.urlencode(params)
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem?{qs}"
-        await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _validate_session(session_id, request, LEVEL_READ)
         return _skip_gzip_for_binary(
             request,
             await _fs_get_with_host_fallback(
                 session_id,
+                conv,
                 op="list_or_read",
                 host_params={
                     "path": "",
@@ -1733,7 +1786,7 @@ def register_resources_routes(
             params["exclude"] = exclude
 
         absolute = path.startswith("/")
-        await _validate_session(
+        conv = await _validate_session(
             session_id, request, _browse_level(path, within_workspace=LEVEL_READ)
         )
 
@@ -1745,11 +1798,10 @@ def register_resources_routes(
             f"/v1/sessions/{session_id}/resources/environments"
             f"/{environment_id}/search{suffix}?{qs}"
         )
-        resolver = (
-            functools.partial(_authorize_absolute_browse, session_id, path) if absolute else None
-        )
+        resolver = functools.partial(_authorize_absolute_browse, conv, path) if absolute else None
         return await _fs_get_with_host_fallback(
             session_id,
+            conv,
             op="search",
             host_params={
                 "q": q,
@@ -1784,9 +1836,10 @@ def register_resources_routes(
         :returns: Flat list of changed filesystem entries with ``status``.
         """
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/changes"
-        await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _validate_session(session_id, request, LEVEL_READ)
         return await _fs_get_with_host_fallback(
             session_id,
+            conv,
             op="changes",
             host_params={},
             runner_path=path,
@@ -1821,9 +1874,10 @@ def register_resources_routes(
             f"/v1/sessions/{session_id}/resources/environments"
             f"/{environment_id}/diff/{relative_path}"
         )
-        await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _validate_session(session_id, request, LEVEL_READ)
         return await _fs_get_with_host_fallback(
             session_id,
+            conv,
             op="diff",
             host_params={"path": relative_path},
             runner_path=path,
@@ -1870,7 +1924,7 @@ def register_resources_routes(
         # `_mutating_level` for why anything weaker would make this route a
         # way around the owner-scoped host filesystem endpoint.
         absolute = relative_path.startswith("/")
-        await _validate_session(
+        conv = await _validate_session(
             session_id, request, _browse_level(relative_path, within_workspace=LEVEL_READ)
         )
 
@@ -1889,7 +1943,7 @@ def register_resources_routes(
         # a live runner does its own authorization, and a runner-only session has
         # no recorded workspace for this to resolve against.
         resolver = (
-            functools.partial(_authorize_absolute_browse, session_id, relative_path)
+            functools.partial(_authorize_absolute_browse, conv, relative_path)
             if absolute
             else None
         )
@@ -1899,6 +1953,7 @@ def register_resources_routes(
             request,
             await _fs_get_with_host_fallback(
                 session_id,
+                conv,
                 op="list_or_read",
                 host_params={
                     "path": "" if absolute else relative_path,
@@ -2061,9 +2116,9 @@ def register_resources_routes(
         :param resource_id: Opaque resource id.
         :returns: The resource object regardless of type.
         """
-        await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _validate_session(session_id, request, LEVEL_READ)
         path = f"/v1/sessions/{session_id}/resources/{resource_id}"
-        return await _proxy_get_to_runner(session_id, path)
+        return await _proxy_get_to_runner(session_id, path, conv)
 
     # Mount the gzip-wrapped file reads. Appended after every sibling route so
     # the `{relative_path:path}` catch-alls cannot shadow a more specific

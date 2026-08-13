@@ -6,7 +6,30 @@ import react from "@vitejs/plugin-react";
 import type { Plugin, ProxyOptions } from "vite";
 import { defineConfig } from "vitest/config";
 
-const OMNIGENT_URL = process.env.OMNIGENT_URL ?? "http://localhost:6767";
+// Databricks workspace-hosted omnigent is mounted behind the api-proxy at this
+// path; a local / self-hosted server mounts at the root. Mirrors the Python
+// WORKSPACE_API_PATH (omnigent/cli_auth.py) so both sides agree on the shape of
+// a workspace URL.
+const WORKSPACE_API_PATH = "/api/2.0/omnigent";
+
+function isWorkspaceHost(hostname: string): boolean {
+  return hostname.endsWith(".databricks.com") || hostname.endsWith(".azuredatabricks.net");
+}
+
+// Resolve the proxy target. Point OMNIGENT_URL at a bare workspace origin
+// (https://<ws>.databricks.com) and the api-proxy mount is filled in
+// automatically, so the browser's relative /v1/... paths reach the
+// workspace-hosted server without hand-typing the /api/2.0/omnigent prefix. An
+// explicit non-root path is respected (a custom mount, or a local server).
+function resolveTarget(raw: string): string {
+  const url = new URL(raw);
+  if (isWorkspaceHost(url.hostname) && (url.pathname === "" || url.pathname === "/")) {
+    url.pathname = WORKSPACE_API_PATH;
+  }
+  return url.toString().replace(/\/$/, "");
+}
+
+const OMNIGENT_URL = resolveTarget(process.env.OMNIGENT_URL ?? "http://localhost:6767");
 
 let cachedToken: string | null | undefined;
 
@@ -112,15 +135,25 @@ function createProxyConfig(target: string, useAuth: boolean): Record<string, Pro
 }
 
 const parsed = new URL(OMNIGENT_URL);
-const useAuth =
-  !!process.env.OMNIGENT_AUTH_TOKEN ||
-  parsed.hostname.endsWith(".databricks.com") ||
-  parsed.hostname.endsWith(".azuredatabricks.net");
+const useAuth = !!process.env.OMNIGENT_AUTH_TOKEN || isWorkspaceHost(parsed.hostname);
+
+// A Databricks workspace-hosted server sits behind the multi-replica sharding
+// layer, so the dev bundle must emit the host_id slice key on host-scoped
+// traffic — same as the embedded (managed) UI — or requests scatter across
+// replicas and a host's runner tunnel becomes unreachable ("host is offline").
+// Surface it to the browser as a build-time flag (inlined into import.meta.env);
+// the embed path keys off its host fetcher instead (see isDatabricksWorkspace in
+// host.ts). Keyed off the resolved mount so pointing at a bare workspace origin
+// turns it on.
+const isDatabricksWorkspaceEnv = parsed.pathname.replace(/\/$/, "") === WORKSPACE_API_PATH;
+if (isDatabricksWorkspaceEnv) process.env.VITE_DATABRICKS_WORKSPACE = "true";
 
 if (useAuth) {
   const token = resolveToken(parsed.origin);
   if (token) {
-    console.log(`[dev-proxy] target=${OMNIGENT_URL} (authenticated)`);
+    console.log(
+      `[dev-proxy] target=${OMNIGENT_URL} (authenticated${isDatabricksWorkspaceEnv ? ", databricks-workspace" : ""})`,
+    );
   } else {
     console.error(
       `\n[dev-proxy] ERROR: No auth token for ${parsed.origin}.\n` +

@@ -3352,6 +3352,67 @@ def test_build_connect_headers_retains_auth_factory(
     assert token_calls == [1, 1, 1]
 
 
+def test_build_connect_headers_slice_key_only_on_workspace_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The slice key rides the handshake only on a host-sharded mount.
+
+    A host-sharded server (``/api/2.0/omnigent``) routes through the
+    sharding layer, so the host pins its tunnel with the slice key (its host_id).
+    An unsharded / local server has no sharding layer, so the key is omitted to
+    keep that server's logs clean.
+
+    :param monkeypatch: The pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import omnigent.runner._entry as entry_mod
+
+    # Isolate the slice-key branch from the bearer/managed-token paths.
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
+
+    workspace = _host("https://acme.databricks.com/api/2.0/omnigent")._build_connect_headers()
+    assert workspace["X-Databricks-Omnigent-Slice-Key"] == "host_test_connect"
+
+    self_hosted = _host("http://127.0.0.1:6767")._build_connect_headers()
+    assert "X-Databricks-Omnigent-Slice-Key" not in self_hosted
+
+
+def test_build_runner_env_carries_host_id() -> None:
+    """The runner is told its host id so its tunnel co-locates with the host's.
+
+    The env var carries the host_id whenever one is present, regardless of the
+    server — the runner forwards it to ``databricks_request_headers``, which
+    emits the routing header only on a host-sharded deployment (see
+    ``test_cli_auth.test_databricks_request_headers_slice_key``). With no
+    host_id (a CLI-local runner), the env var is omitted.
+    """
+    from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
+
+    def _env(*, server_url: str, host_id: str | None) -> dict[str, str]:
+        return _build_runner_env(
+            {},
+            server_url=server_url,
+            runner_id="runner_abc",
+            binding_token="tok",
+            workspace="/ws",
+            parent_pid=123,
+            host_id=host_id,
+        )
+
+    # Set from host_id on any server (gating lives in the header builder).
+    for server_url in (
+        "https://acme.databricks.com/api/2.0/omnigent",
+        "http://127.0.0.1:6767",
+    ):
+        assert _env(server_url=server_url, host_id="host_x")[RUNNER_SLICE_KEY_ENV_VAR] == "host_x"
+
+    # No host (CLI-local runner) → omitted.
+    assert RUNNER_SLICE_KEY_ENV_VAR not in _env(
+        server_url="https://acme.databricks.com/api/2.0/omnigent", host_id=None
+    )
+
+
 async def test_run_retries_on_login_redirect(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

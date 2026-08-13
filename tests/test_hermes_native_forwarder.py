@@ -502,27 +502,15 @@ async def test_forward_loop_patches_external_session_id_once(tmp_path, monkeypat
     import contextlib
 
     @contextlib.asynccontextmanager
-    async def _make_client(**_kw):
+    async def _make_client(*_a, **_kw):
         yield _Client()
 
-    # Patch the module attribute that ``forward_hermes_store_to_session`` reads
-    # at call time (``httpx.AsyncClient``).  Using ``monkeypatch.setattr`` on
-    # the *module* object the forwarder imports (``f.httpx``) guarantees the
-    # right target and automatic undo.
-    monkeypatch.setattr(
-        f,
-        "httpx",
-        type(
-            "_httpx",
-            (),
-            {
-                "AsyncClient": _make_client,
-                "Timeout": lambda *a, **kw: None,
-                "Auth": None,
-                "HTTPError": Exception,
-            },
-        ),
-    )
+    # The forward loop opens its server client through the cli_auth factory
+    # (``open_server_client``, which folds the host_id slice-key + routing
+    # headers), so intercept that — the loop no longer constructs
+    # ``httpx.AsyncClient`` directly, so patching ``f.httpx`` would leave the
+    # real factory client (and a real network call) in place.
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", _make_client)
 
     async def _sleep(_s):
         iteration["n"] += 1
