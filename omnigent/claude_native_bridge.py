@@ -181,6 +181,28 @@ _DRAFT_NEEDLE_MAX_CHARS = 24
 # picker the person opened by hand covers the input box, so an injection would
 # be lost; the readiness gate treats it as "not ready".
 _MODEL_PICKER_OPEN_HINT = "use this session only"
+# Header of the ctrl+r prompt-history search. Like the picker it covers the
+# input box, but its selected history row renders the composer's ``❯`` glyph
+# above the filter box's frame rule, so the readiness scan alone reads it as
+# a mounted input box — keystrokes would land in the filter field, and the
+# submit Enter would replay whatever old prompt is selected.
+_REVERSE_SEARCH_OPEN_HINT = "Search prompts ·"
+# Surfaces a person can leave covering the composer from the embedded
+# terminal. Each documents Escape as its dismissal ("Esc to cancel"), which
+# closes it without committing anything and restores the empty input box, so
+# an injected web-UI message reclaims the pane instead of typing into the
+# surface. Shell mode (``!``) also occupies the composer but has no safe
+# textual marker: its footer line ("! for shell mode") appears verbatim in
+# the ``?`` shortcuts panel while the composer is fully usable.
+_OCCUPIED_INPUT_HINTS: tuple[str, ...] = (
+    _REVERSE_SEARCH_OPEN_HINT,
+    _MODEL_PICKER_OPEN_HINT,
+)
+# How long to keep dismissing an occupying surface that verifiably stays on
+# screen, and the spacing between repeated Escapes — a busy repaint can
+# swallow one (same reasoning as ``_SUBMIT_RETRY_INTERVAL_S``).
+_OCCUPIED_INPUT_DISMISS_TIMEOUT_S = 3.0
+_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 0.75
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -2871,6 +2893,11 @@ def inject_user_message(
     (see :func:`_wait_for_claude_prompt_ready`). The second gate closes
     a race on freshly-created sessions where the first message would
     otherwise be typed into a still-booting TUI and silently dropped.
+    Between the two, any surface the person left covering the composer
+    from the embedded terminal — a ctrl+r history search, a hand-opened
+    ``/model`` picker — is dismissed with Escape
+    (see :func:`_restore_occupied_input`), so the message reclaims the
+    input box instead of typing into that surface.
 
     Delivered as one bracketed paste via ``tmux load-buffer`` (from a
     temp file) + ``paste-buffer -p`` so interior newlines ride as raw CR
@@ -2904,6 +2931,11 @@ def inject_user_message(
         after repeated submit Enters (message not delivered).
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    # A ctrl+r history search or hand-opened /model picker left covering
+    # the composer swallows everything typed below — and can hide the
+    # prompt glyph, wedging the readiness gate — so reclaim the input box
+    # before waiting on it.
+    _restore_occupied_input(info["socket_path"], info["tmux_target"])
     # tmux.json only means the tmux session exists; Claude Code's input
     # box mounts a few seconds later. Block until the prompt renders so
     # the first message isn't typed into a still-booting TUI and dropped.
@@ -3123,6 +3155,11 @@ def inject_slash_command(
     """
     Type a Claude Code slash command into the tmux pane and submit it.
 
+    A surface the person left covering the composer from the embedded
+    terminal (ctrl+r history search, hand-opened ``/model`` picker) is
+    dismissed first — see :func:`_restore_occupied_input` — so the
+    command cannot be typed into it.
+
     :param bridge_dir: Bridge directory path, e.g.
         ``/tmp/omnigent/claude-native/<digest>``.
     :param command: Single-line slash command including the leading
@@ -3159,6 +3196,10 @@ def inject_slash_command(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
+    # Same reclaim as inject_user_message: a ctrl+r search or hand-opened
+    # /model picker left covering the composer would swallow the C-u and
+    # the typed command.
+    _restore_occupied_input(socket_path, tmux_target)
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # paste below concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
@@ -3512,6 +3553,55 @@ def claude_pane_ready(bridge_dir: Path) -> bool:
     if any(text in pane for text in _CONFIRM_DIALOG_HINTS):
         return False
     return _claude_prompt_rendered(pane)
+
+
+def _restore_occupied_input(socket_path: str, tmux_target: str) -> None:
+    """
+    Dismiss a terminal-opened surface occupying Claude's input box.
+
+    A person can leave the composer covered from the embedded terminal —
+    the ctrl+r prompt-history search, or a hand-opened ``/model`` picker
+    (:data:`_OCCUPIED_INPUT_HINTS`). Keystrokes injected while one is up
+    land in that surface instead of the chat input: the history search
+    filters on the pasted text and its Enter replays whatever old prompt
+    is selected. Each surface documents Escape as its dismissal ("Esc to
+    cancel"), closing it without committing anything and restoring the
+    empty input box, so the web-UI message wins the pane.
+
+    Escape is only sent while a hint is verifiably in the current
+    capture — never blind, because on the bare composer Escape interrupts
+    an in-flight turn. An empty (torn) capture means "unknown" and gets
+    no Escape. A swallowed Escape is re-sent while the surface remains,
+    spaced by :data:`_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S`.
+    Best-effort: a surface that outlives
+    :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S` is left on screen and the
+    caller's readiness gate or delivery verification fails loud, exactly
+    as it did before this restore existed.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: None.
+    """
+    deadline = time.monotonic() + _OCCUPIED_INPUT_DISMISS_TIMEOUT_S
+    last_escape: float | None = None
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        hint = next((text for text in _OCCUPIED_INPUT_HINTS if text in pane), None)
+        if hint is None:
+            return
+        now = time.monotonic()
+        if now >= deadline:
+            _logger.warning(
+                "claude-native: input box still occupied (%r) after %.1fs; proceeding",
+                hint,
+                _OCCUPIED_INPUT_DISMISS_TIMEOUT_S,
+            )
+            return
+        if last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
+            _logger.info("claude-native: dismissing %r covering the input box", hint)
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+            last_escape = now
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
 def _claude_prompt_rendered(pane: str) -> bool:

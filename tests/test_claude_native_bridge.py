@@ -6817,6 +6817,31 @@ _IDLE_PANE = """\
   ? for shortcuts
 """
 
+# The ctrl+r prompt-history search, as Claude Code 2.1.231 renders it. Its
+# selected row carries the composer's ❯ glyph above the filter box's frame
+# rule, so the readiness scan alone reads it as a mounted input box.
+_REVERSE_SEARCH_PANE = """\
+  Search prompts · everywhere
+  ↑ 23m ago  When I run a claude code session in O…
+    4m ago   continue
+  ❯ 1m ago   [Pasted text #1 +22 lines]
+  ╭──────────────────────────────────────────────╮
+  │ ⌕ Filter history…                            │
+  ╰──────────────────────────────────────────────╯
+  ↑/↓ to nav · Enter to use · Esc to cancel · ctrl+s to scope
+"""
+
+# The expanded ``?`` shortcuts panel: the composer above it is fully usable,
+# and its "! for shell mode" row is why shell mode has no occupied-input
+# hint — matching it here would send Escape at a perfectly injectable pane.
+_SHORTCUTS_PANEL_PANE = """\
+──────────────────────────────
+❯
+──────────────────────────────
+  ! for shell mode        double tap esc to clear input
+  / for commands          shift + tab to auto-accept edits
+"""
+
 
 def _draft_pane(command: str) -> str:
     """A pane whose composer holds *command*, typed but not yet submitted."""
@@ -6907,9 +6932,16 @@ def test_a_model_switch_types_the_argument_form_and_confirms(
     dialog = "  Switch model?\n  This will invalidate the prompt cache.\n"
     sends = _fake_tmux(
         monkeypatch,
-        # Typed command renders, the submit pops the dialog, the accept
-        # clears it — one capture per delivery stage.
-        [_draft_pane("/model databricks-claude-sonnet-5"), dialog, dialog, _IDLE_PANE],
+        # Idle at the occupied-input check, then the typed command
+        # renders, the submit pops the dialog, the accept clears it —
+        # one capture per delivery stage.
+        [
+            _IDLE_PANE,
+            _draft_pane("/model databricks-claude-sonnet-5"),
+            dialog,
+            dialog,
+            _IDLE_PANE,
+        ],
     )
 
     claude_native_bridge.inject_slash_command(
@@ -7239,7 +7271,8 @@ def test_a_slash_command_submit_waits_for_the_command_to_render(
 
     first_enter = events.index("send:Enter")
     captures_before = sum(1 for event in events[:first_enter] if event == "capture")
-    # Blank + idle + draft: three captures before the Enter may fire.
+    # Blank (occupied-input check) + idle + draft: three captures before
+    # the Enter may fire.
     assert captures_before == 3, (
         f"Enter must wait for the command to render (expected 3 captures first); events: {events}"
     )
@@ -7259,7 +7292,7 @@ def test_a_swallowed_slash_submit_enter_is_retried_while_the_draft_persists(
     bridge_dir = _picker_bridge_dir(tmp_path)
     sends = _fake_tmux(
         monkeypatch,
-        [_draft_pane("/effort high")] * 8 + [_IDLE_PANE],
+        [_IDLE_PANE] + [_draft_pane("/effort high")] * 8 + [_IDLE_PANE],
     )
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
@@ -7374,7 +7407,10 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
 ) -> None:
     """The no-dialog case: the fallback Enter lands on an empty prompt, harmlessly."""
     bridge_dir = _picker_bridge_dir(tmp_path)
-    sends = _fake_tmux(monkeypatch, [_draft_pane("/effort high"), _IDLE_PANE])
+    sends = _fake_tmux(
+        monkeypatch,
+        [_IDLE_PANE, _draft_pane("/effort high"), _IDLE_PANE],
+    )
 
     claude_native_bridge.inject_slash_command(
         bridge_dir,
@@ -7384,6 +7420,178 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
     )
 
     assert [args[-1] for args in sends] == ["C-u", "/effort high", "Enter", "Enter"]
+
+
+@pytest.mark.parametrize(
+    "occupied_pane",
+    [_REVERSE_SEARCH_PANE, _MODEL_PICKER_PANE],
+    ids=["reverse-search", "model-picker"],
+)
+def test_inject_user_message_restores_an_occupied_input_box_first(
+    occupied_pane: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A surface left covering the composer is dismissed before typing.
+
+    A ctrl+r history search (or hand-opened ``/model`` picker) left up
+    from the embedded terminal swallows injected keystrokes — the search
+    even replays an old prompt on Enter — so a chat message silently
+    never arrived. The injection must Escape the surface first (its own
+    documented dismissal), restoring the empty input box, then deliver
+    the message normally.
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    captured: list[list[str]] = []
+    # The surface covers the pane until Escape dismisses it; afterwards
+    # the fake behaves like the live input box (paste deposits the
+    # draft, Enter clears it).
+    tui = {"pane": occupied_pane}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a pane whose occupying surface closes on Escape.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if cmd[-1] == "Escape":
+            tui["pane"] = "❯ "
+        if "paste-buffer" in cmd:
+            tui["pane"] = "❯ restore my composer"
+        if cmd[-1] == "Enter":
+            tui["pane"] = "❯ "
+        captured.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="restore my composer")
+
+    tails = [cmd[-1] for cmd in captured]
+    # Escape (dismiss the surface) must precede every delivery keystroke.
+    assert tails[:3] == ["Escape", "C-a", "C-k"], (
+        f"Expected the occupying surface to be Escaped before the clear; got {tails}."
+    )
+    assert tails.count("Escape") == 1, f"One sighting, one Escape — got {tails.count('Escape')}."
+    assert tails[-1] == "Enter"
+
+
+def test_inject_user_message_retries_a_swallowed_occupied_input_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An Escape the busy TUI dropped is re-sent while the surface remains.
+
+    A repaint can swallow the dismissal exactly like it swallows submit
+    Enters. A one-shot Escape would then paste into the still-open
+    search filter — the original lost-message bug, made intermittent.
+    Retries fire only while the surface is verifiably on screen, so none
+    can reach the restored composer (where Escape interrupts a turn).
+    """
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S", 0.0
+    )
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    escapes = {"n": 0}
+    tui = {"pane": _REVERSE_SEARCH_PANE}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Swallow the first Escape; dismiss the search on the second.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if cmd[-1] == "Escape":
+            escapes["n"] += 1
+            if escapes["n"] >= 2:
+                tui["pane"] = "❯ "
+        if "paste-buffer" in cmd:
+            tui["pane"] = "❯ hello"
+        if cmd[-1] == "Enter":
+            tui["pane"] = "❯ "
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="hello")
+
+    assert escapes["n"] == 2, (
+        f"Expected the swallowed Escape to be retried exactly once, got {escapes['n']}."
+    )
+
+
+def test_inject_slash_command_restores_an_occupied_input_box_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The same reclaim guards slash commands (e.g. a routed model switch).
+
+    Without it, a ``/model`` typed while the ctrl+r search is up lands in
+    the search filter and the pane silently keeps its old model.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        # Search up at the occupied-input check, idle after the Escape,
+        # then the typed command renders and the submit clears it.
+        [_REVERSE_SEARCH_PANE, _IDLE_PANE, _draft_pane("/effort high"), _IDLE_PANE],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert [args[-1] for args in sends] == ["Escape", "C-u", "/effort high", "Enter"]
+
+
+def test_the_shortcuts_panel_is_not_treated_as_an_occupied_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    No Escape at a usable composer, even with the ``?`` panel expanded.
+
+    The panel lists "! for shell mode" verbatim — the string shell mode
+    itself renders — while the composer right above it is injectable. An
+    Escape here would be the blind press the restore must never make
+    (mid-turn it interrupts the response).
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(
+        monkeypatch,
+        [_SHORTCUTS_PANEL_PANE, _draft_pane("/effort high"), _IDLE_PANE],
+    )
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert [args[-1] for args in sends] == ["C-u", "/effort high", "Enter"]
 
 
 def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
