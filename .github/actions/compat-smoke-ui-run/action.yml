@@ -1,17 +1,17 @@
-name: "Run UI compat smoke test"
+name: "Run UI compat tests (smoke or full suite)"
 description: >
-  Run tests/e2e_ui/test_server_compat_smoke.py with the server subprocess
-  pinned to an older released build (server_version) while the SPA and
-  runner stay on the checked-out code.
+  Run tests/e2e_ui/ with the server subprocess pinned to an older released
+  build (server_version) while the SPA and runner stay on the checked-out code.
 
-  This guards the one meaningful cross-version ordering for the UI: the
-  SPA (HEAD) running against an older server. The inverse direction (old
-  SPA, new server) is not a separate compat concern because the SPA is
-  always served by the server binary itself in production.
+  Two modes:
+  - full_suite=false (default): run only @pytest.mark.compat_smoke tests — fast
+    PR gate (~10 min).
+  - full_suite=true: run the complete tests/e2e_ui/ suite, sharded — used by
+    the overnight backcompat-e2e-ui matrix.
 
   The action mirrors the setup from e2e-ui.yml's e2e-ui job (Python, uv,
   pnpm, Playwright, bubblewrap, tmux, SPA build) but skips the Codex
-  parity sidecar (Rust), which is not needed for the openai-agents smoke.
+  parity sidecar (Rust), which is not needed for the openai-agents suite.
 
 inputs:
   server_version:
@@ -20,6 +20,20 @@ inputs:
       subprocess is pinned to this build via OMNIGENT_COMPAT_SERVER_PYTHON.
       Required.
     required: true
+  full_suite:
+    description: >
+      "true" = run the full tests/e2e_ui/ suite with sharding (overnight matrix).
+      "false" (default) = run only @pytest.mark.compat_smoke tests (PR gate).
+    required: false
+    default: "false"
+  shard_id:
+    description: "0-based shard index (only used when full_suite=true)."
+    required: false
+    default: "0"
+  num_shards:
+    description: "Total shard count (only used when full_suite=true)."
+    required: false
+    default: "1"
   artifact_suffix:
     description: >
       Appended to uploaded-artifact names (e.g. "-ui-config"). Default empty.
@@ -108,19 +122,39 @@ runs:
         echo "OMNIGENT_COMPAT_SERVER_PYTHON=$venv/bin/python" >> "$GITHUB_ENV"
         echo "OMNIGENT_COMPAT_SERVER_VERSION=${tag#v}" >> "$GITHUB_ENV"
 
-    - name: Run UI compat smoke test
+    - name: Run UI compat tests
       shell: bash
       env:
+        FULL_SUITE: ${{ inputs.full_suite }}
+        SHARD_ID: ${{ inputs.shard_id }}
+        NUM_SHARDS: ${{ inputs.num_shards }}
         E2E_TMP_BASE: /tmp/omnigent-compat-ui-${{ github.run_id }}
       run: |
         mkdir -p "$E2E_TMP_BASE"
-        uv run pytest tests/e2e_ui/test_server_compat_smoke.py \
-          --ui-skip-build \
-          -v --tb=long --showlocals --log-level=INFO \
-          --timeout=120 \
-          --timeout-method=thread \
-          --basetemp="$E2E_TMP_BASE" \
-          --junitxml="$E2E_TMP_BASE/junit.xml"
+        if [[ "$FULL_SUITE" == "true" ]]; then
+          uv run pytest tests/e2e_ui/ \
+            -m "not visual and not nightly" \
+            --ui-skip-build \
+            --splits="$NUM_SHARDS" \
+            --group="$((SHARD_ID + 1))" \
+            --tracing=retain-on-failure \
+            --screenshot=only-on-failure \
+            -v --tb=long --showlocals --log-level=INFO \
+            --timeout=180 \
+            --timeout-method=thread \
+            --basetemp="$E2E_TMP_BASE" \
+            --junitxml="$E2E_TMP_BASE/junit.xml" \
+            || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
+        else
+          uv run pytest tests/e2e_ui/ \
+            -m compat_smoke \
+            --ui-skip-build \
+            -v --tb=long --showlocals --log-level=INFO \
+            --timeout=120 \
+            --timeout-method=thread \
+            --basetemp="$E2E_TMP_BASE" \
+            --junitxml="$E2E_TMP_BASE/junit.xml"
+        fi
 
     - name: Upload logs on failure
       if: ${{ failure() || cancelled() }}

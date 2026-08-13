@@ -41,6 +41,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 
+@pytest.mark.compat_smoke
 @pytest.mark.min_server_version("0.9.0")
 def test_ui_turn_completes_against_old_server(
     page: Page,

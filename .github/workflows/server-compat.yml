@@ -147,9 +147,10 @@ jobs:
           artifact_suffix: "-ui"
 
   # ── Full pairwise matrix (schedule + dispatch only) ────────────────────────
-  # Compute the full pairwise (server, runner) matrices. Integration is the
-  # single openai-agents leg (claude-sdk/codex reject the mock LLM's
-  # "mock-model"); e2e is sharded per cell. See backcompat-pairwise-matrix.sh.
+  # Compute the full pairwise (server, runner) and UI matrices.
+  # Integration is the single openai-agents leg (claude-sdk/codex reject the
+  # mock LLM's "mock-model"); e2e is sharded per cell.
+  # UI matrix is server-only (runner is always main; the SPA is always HEAD).
   setup:
     name: setup
     # The full pairwise matrix is expensive — skip it on PR triggers (the
@@ -243,3 +244,49 @@ jobs:
           harness: ${{ matrix.harness }}
           model: ${{ matrix.model }}
           workers: ${{ matrix.workers }}
+
+  # tests/e2e_ui for every old server tag × shard (server axis only).
+  setup-ui:
+    name: setup-ui
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ui_matrix: ${{ steps.matrix.outputs.ui_matrix }}
+    steps:
+      - name: Check out CI scripts + tags
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          sparse-checkout: .github/scripts/ci
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Compute UI matrix
+        id: matrix
+        env:
+          VERSIONS: ${{ github.event.inputs.versions }}
+          NUM_SHARDS: "3"
+        run: bash .github/scripts/ci/backcompat-ui-matrix.sh
+
+  backcompat-e2e-ui:
+    name: Backcompat e2e-ui (server ${{ matrix.server }}, shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
+    needs: setup-ui
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.setup-ui.outputs.ui_matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - name: Run e2e-ui suite for this cell
+        uses: ./.github/actions/compat-smoke-ui-run
+        with:
+          server_version: ${{ matrix.server }}
+          full_suite: "true"
+          shard_id: ${{ matrix.shard_id }}
+          num_shards: ${{ matrix.num_shards }}
+          artifact_suffix: "-s${{ matrix.server }}-ui-shard${{ matrix.shard_id }}"

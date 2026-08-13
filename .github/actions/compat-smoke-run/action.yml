@@ -1,14 +1,14 @@
-name: "Run compat smoke tests"
+name: "Run e2e compat smoke tests"
 description: >
-  Run tests/e2e/test_server_runner_compat_smoke.py in one configuration:
+  Run @pytest.mark.compat_smoke tests from tests/e2e/ in one configuration:
   either the server or the runner subprocess is pinned to an older released
   build while the other side stays on the checked-out code. Exactly one of
   server_version / runner_version must be set.
 
   Reuses the same install steps as .github/actions/e2e-run so the two
   never drift on Python/uv/binary-dep setup. Unlike e2e-run this action
-  is not sharded and runs only the smoke-test file, keeping wall-clock
-  time under ~5 minutes.
+  is not sharded and runs only the compat_smoke marker, keeping wall-clock
+  time under ~15 minutes.
 
 inputs:
   server_version:
@@ -120,7 +120,8 @@ runs:
         E2E_TMP_BASE: /tmp/omnigent-compat-smoke-${{ github.run_id }}
       run: |
         mkdir -p "$E2E_TMP_BASE"
-        uv run pytest tests/e2e/test_server_runner_compat_smoke.py \
+        uv run pytest tests/e2e/ \
+          -m compat_smoke \
           -v --tb=long --showlocals --log-level=INFO \
           --timeout=120 \
           --timeout-method=thread \
