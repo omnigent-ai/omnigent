@@ -152,7 +152,6 @@ runs:
           echo "Invalid ui_version: '$tag'" >&2; exit 1
         fi
         src="$RUNNER_TEMP/ui-spa-src"
-        dist="$RUNNER_TEMP/ui-spa-dist"
         git worktree add --detach "$src" "$tag"
         # Build the old SPA in its own directory. pnpm install uses the
         # old lock file; the build output lands in web/dist/ inside src.
@@ -172,7 +171,13 @@ runs:
           echo "Could not locate built SPA under $src" >&2; exit 1
         fi
         cp -r "$built" "$dist"
-        echo "OMNIGENT_WEB_UI_DIST=$dist" >> "$GITHUB_ENV"
+        # Also copy into the HEAD checkout's static dir so --ui-skip-build's
+        # _assert_service_worker_tombstone check (which always looks at
+        # omnigent/server/static/web-ui/) finds a populated build.
+        head_static="${GITHUB_WORKSPACE}/omnigent/server/static/web-ui"
+        rm -rf "$head_static"
+        cp -r "$built" "$head_static"
+        echo "OMNIGENT_WEB_UI_DIST=$head_static" >> "$GITHUB_ENV"
 
     - name: Run UI compat tests
       shell: bash
