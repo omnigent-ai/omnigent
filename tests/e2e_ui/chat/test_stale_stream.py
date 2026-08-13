@@ -21,6 +21,7 @@ import subprocess
 import time
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 
@@ -45,6 +46,7 @@ def _find_runner_pids() -> list[int]:
     return [int(line.strip()) for line in result.stdout.strip().splitlines() if line.strip()]
 
 
+@pytest.mark.compat_smoke
 def test_stale_banner_on_runner_crash(
     page: Page,
     seeded_session: tuple[str, str],

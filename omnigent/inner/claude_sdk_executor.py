@@ -90,6 +90,7 @@ logger = logging.getLogger(__name__)
 # unset. Not Databricks-specific: the same fallback applies to any gateway
 # producer (Databricks AI gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
+_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 
 # Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
 # request headers. The Databricks AI gateway only serves Claude requests
@@ -1554,19 +1555,21 @@ class ClaudeSDKExecutor(Executor):
         # construction time.
         self._extra_env: dict[str, str] = {}
         if gateway:
-            self._extra_env = _resolve_gateway_env(
+            gateway_env = _resolve_gateway_env(
                 databricks_profile,
                 host_override=self._gateway_host,
                 base_url_override=base_url_override,
                 auth_command_override=self._gateway_auth_command,
                 auth_refresh_interval_ms=self._gateway_auth_refresh_interval_ms,
             )
-            if not self._extra_env:
+            if not gateway_env:
                 raise OSError(
                     "ClaudeSDKExecutor(gateway=True) requires gateway credentials "
                     "from the gateway base URL / auth command or a valid "
                     "~/.databrickscfg profile."
                 )
+            self._extra_env.update(gateway_env)
+        self._extra_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
 
         # Retry policy → Anthropic SDK env vars passed to the Claude
         # CLI subprocess. ``ANTHROPIC_MAX_RETRIES`` and
@@ -2309,9 +2312,9 @@ class ClaudeSDKExecutor(Executor):
         # via its own conversation store.
         # OS-environment tools are provided via Omnigent ``sys_os_*``
         # MCP tools (declared via ``os_env`` in the spec), not the
-        # SDK's native Bash/Read/Edit/Write.  Only the Skill tool
-        # needs to be in the SDK's base set.
-        base_tools: list[str] = ["Skill"]
+        # SDK's native Bash/Read/Edit/Write. Keep Skill and ToolSearch in
+        # the base set so MCP definitions can be discovered on demand.
+        base_tools: list[str] = ["Skill", "ToolSearch"]
         # Translate the spec's host-skill filter into the SDK
         # options. Falls back to ``"all"`` semantics when the
         # field is malformed (the parser already validates, so

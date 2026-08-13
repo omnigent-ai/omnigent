@@ -4711,7 +4711,7 @@ function committedUserBlock(
       // Client clock — see blockStream.ctx; keeps server-stamped
       // `createdAtS` comparisons single-clock. A promoted optimistic
       // bubble keeps its send-time stamp rather than re-stamping now.
-      clientCreatedAtS: createdAtS ?? Math.floor(Date.now() / 1000),
+      ...(createdAtS !== undefined ? { clientCreatedAtS: createdAtS } : {}),
     },
     content,
     stableKey,

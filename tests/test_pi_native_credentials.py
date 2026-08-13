@@ -1155,6 +1155,129 @@ def test_fetch_pi_model_lists_falls_back_on_http_error() -> None:
     assert gemini == []
 
 
+def test_fetch_pi_model_lists_carries_catalog_token_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The interactive path advertises the catalog's context and output limits.
+
+    Pi defaults an entry with no ``contextWindow``/``maxTokens`` to 128000 /
+    16384, so a 1M-context gateway model registered bare is silently capped —
+    the harness path already carries the real limits, and both surfaces must
+    agree. Regression guard for the two fields going missing again.
+    """
+    import json
+    import unittest.mock
+
+    import httpx
+
+    from omnigent import model_catalog
+    from omnigent.model_metadata import ModelMetadata
+
+    payload = {
+        "model_services": [
+            {
+                "name": "model-services/system.ai.claude-opus-4-8",
+                "supported_api_types": ["mlflow/v1/chat/completions"],
+            }
+        ]
+    }
+
+    def _catalog(provider_name: str) -> tuple[model_catalog.ModelEntry, ...]:
+        """Stand in for the MLflow catalog, which reports the limits.
+
+        :param provider_name: The catalog provider being queried.
+        :returns: One entry, keyed by the ``databricks-`` alias spelling so the
+            alias match is exercised too.
+        """
+        assert provider_name == "databricks"
+        return (
+            model_catalog.ModelEntry(
+                id="databricks-claude-opus-4-8",
+                family="claude",
+                metadata=ModelMetadata(context_window=1000000, max_output_tokens=128000),
+            ),
+        )
+
+    monkeypatch.setattr(model_catalog, "catalog_model_entries", _catalog)
+
+    class _MockTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            """Serve the model-services page.
+
+            :param request: The outgoing request.
+            :returns: The canned response.
+            """
+            return httpx.Response(200, content=json.dumps(payload).encode())
+
+    _real_client = httpx.Client
+    with unittest.mock.patch(
+        "httpx.Client",
+        lambda **kw: _real_client(transport=_MockTransport()),
+    ):
+        claude, _gpt, _completions, _gemini = creds._fetch_pi_model_lists(
+            "https://wkspc.example.com", "tok"
+        )
+
+    assert [m["id"] for m in claude] == ["system.ai.claude-opus-4-8"]
+    assert claude[0]["contextWindow"] == 1000000
+    assert claude[0]["maxTokens"] == 128000
+
+
+def test_fetch_pi_model_lists_survives_catalog_outage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An MLflow catalog outage drops the limits, never the models.
+
+    Live availability is authoritative: losing the metadata lookup must leave
+    the picker fully populated (Pi then applies its own defaults) rather than
+    failing the launch.
+    """
+    import json
+    import unittest.mock
+
+    import httpx
+
+    from omnigent import model_catalog
+
+    payload = {
+        "model_services": [
+            {
+                "name": "model-services/system.ai.claude-opus-4-8",
+                "supported_api_types": ["mlflow/v1/chat/completions"],
+            }
+        ]
+    }
+
+    def _boom(provider_name: str) -> tuple[model_catalog.ModelEntry, ...]:
+        """Fail the metadata lookup.
+
+        :param provider_name: The catalog provider being queried.
+        :returns: Never returns.
+        """
+        raise RuntimeError("catalog unavailable")
+
+    monkeypatch.setattr(model_catalog, "catalog_model_entries", _boom)
+
+    class _MockTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            """Serve the model-services page.
+
+            :param request: The outgoing request.
+            :returns: The canned response.
+            """
+            return httpx.Response(200, content=json.dumps(payload).encode())
+
+    _real_client = httpx.Client
+    with unittest.mock.patch(
+        "httpx.Client",
+        lambda **kw: _real_client(transport=_MockTransport()),
+    ):
+        claude, _gpt, _completions, _gemini = creds._fetch_pi_model_lists(
+            "https://wkspc.example.com", "tok"
+        )
+
+    assert [m["id"] for m in claude] == ["system.ai.claude-opus-4-8"]
+    assert "contextWindow" not in claude[0]
+
+
 def _mock_databricks_profile(monkeypatch: pytest.MonkeyPatch) -> None:
     """Point the Databricks profile path at a fake workspace with fake creds."""
     from omnigent.inner import databricks_executor
