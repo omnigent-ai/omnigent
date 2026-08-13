@@ -200,7 +200,11 @@ _OCCUPIED_INPUT_HINTS: tuple[str, ...] = (
 )
 # How long to keep dismissing an occupying surface that verifiably stays on
 # screen, and the spacing between repeated Escapes — a busy repaint can
-# swallow one (same reasoning as ``_SUBMIT_RETRY_INTERVAL_S``).
+# swallow one (same reasoning as ``_SUBMIT_RETRY_INTERVAL_S``). The spacing
+# also bounds a residual hazard: were a successful Escape's repaint to
+# outlast it, the stale hint would draw a retry onto the bare composer
+# (interrupting a turn). 0.75s dwarfs a TUI repaint, so that window is
+# accepted rather than confirmation-gated.
 _OCCUPIED_INPUT_DISMISS_TIMEOUT_S = 3.0
 _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 0.75
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
