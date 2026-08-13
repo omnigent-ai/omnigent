@@ -37,17 +37,12 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
-      - "omnigent/runner/session_init_protocol.py"
-      - "omnigent/runner/app.py"
-      - "omnigent/host/frames.py"
-      - "omnigent/runner/transports/**"
-      - "omnigent/server/app.py"
-      - "web/src/lib/sessionsApi.ts"
-      - "web/src/lib/sse.ts"
-      - "web/src/lib/capabilities.ts"
-      - "tests/e2e/test_server_runner_compat_smoke.py"
-      - "tests/e2e_ui/test_server_compat_smoke.py"
-      - "tests/e2e_ui/conftest.py"
+      - "omnigent/runner/**"
+      - "omnigent/server/**"
+      - "omnigent/host/**"
+      - "web/src/**"
+      - "tests/e2e/**"
+      - "tests/e2e_ui/**"
       - "tests/_helpers/compat.py"
       - ".github/actions/compat-smoke-run/**"
       - ".github/actions/compat-smoke-ui-run/**"
