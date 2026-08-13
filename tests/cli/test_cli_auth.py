@@ -6,6 +6,7 @@ by ``omnigent login``.
 
 from __future__ import annotations
 
+import contextlib
 import time
 
 import pytest
@@ -526,3 +527,262 @@ def test_databricks_record_overwrites_jwt_record(token_dir) -> None:
         load_databricks_workspace_host("https://server.example.com")
         == "https://example.databricks.com"
     )
+
+
+# ── Login-issued refresh grants (client side) ─────────────────────
+
+
+def test_store_token_persists_refresh_material(token_dir) -> None:
+    """A refresh token stored at login survives the round trip."""
+    import json
+
+    from omnigent.cli_auth import store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="jwt",
+        user_id="a@x",
+        expires_at=time.time() + 3600,
+        refresh_token="refresh-1",
+    )
+    data = json.loads((token_dir / "auth_tokens.json").read_text())
+    assert data["http://localhost:6767"]["refresh_token"] == "refresh-1"
+
+
+def test_stored_token_status_classification(token_dir) -> None:
+    """absent / expired / ok are distinguished — the host uses this to say
+    "your login expired" instead of dialing into a misleading 403."""
+    from omnigent.cli_auth import store_token, stored_token_status
+
+    assert stored_token_status("http://localhost:6767") == "absent"
+    store_token("http://localhost:6767", token="jwt", user_id="a@x", expires_at=time.time() - 10)
+    assert stored_token_status("http://localhost:6767") == "expired"
+    store_token("http://localhost:6767", token="jwt", user_id="a@x", expires_at=time.time() + 3600)
+    assert stored_token_status("http://localhost:6767") == "ok"
+
+
+def test_refresh_stored_token_renews_and_rotates(token_dir, monkeypatch) -> None:
+    """An expired entry with refresh material renews via /oauth/token and
+    persists the rotated pair."""
+    import json
+
+    import httpx
+
+    from omnigent.cli_auth import load_token, refresh_stored_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    assert load_token("http://localhost:6767") is None  # expired
+
+    posted: dict[str, object] = {}
+
+    def _fake_post(url, *, data=None, timeout=None):
+        posted["url"] = url
+        posted["data"] = data
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "fresh",
+                "refresh_token": "refresh-2",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            },
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    assert refresh_stored_token("http://localhost:6767") == "fresh"
+    assert posted["url"] == "http://localhost:6767/oauth/token"
+    assert posted["data"] == {"grant_type": "refresh_token", "refresh_token": "refresh-1"}
+    # Rotated pair persisted; the fresh token now loads normally.
+    data = json.loads((token_dir / "auth_tokens.json").read_text())
+    entry = data["http://localhost:6767"]
+    assert entry["token"] == "fresh" and entry["refresh_token"] == "refresh-2"
+    assert load_token("http://localhost:6767") == "fresh"
+
+
+def test_refresh_stored_token_no_material_is_none(token_dir) -> None:
+    """Nothing to refresh (no entry, or no refresh token) → None, no I/O."""
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    assert refresh_stored_token("http://localhost:6767") is None
+    store_token("http://localhost:6767", token="jwt", user_id="a@x", expires_at=time.time() - 10)
+    assert refresh_stored_token("http://localhost:6767") is None
+
+
+def test_refresh_stored_token_refused_leaves_entry(token_dir, monkeypatch) -> None:
+    """A server refusal (revoked / aged-out grant / old server 404) returns
+    None and leaves the stored entry untouched."""
+    import json
+
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+
+    def _fake_post(url, *, data=None, timeout=None):
+        return httpx.Response(
+            400, json={"error": "invalid_grant"}, request=httpx.Request("POST", url)
+        )
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    assert refresh_stored_token("http://localhost:6767") is None
+    entry = json.loads((token_dir / "auth_tokens.json").read_text())["http://localhost:6767"]
+    assert entry["refresh_token"] == "refresh-1"
+
+
+def test_refresh_stored_token_skips_when_already_fresh(token_dir, monkeypatch) -> None:
+    """A concurrent refresher already renewed → return the valid token
+    without a network call (the lock-then-recheck path)."""
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="already-fresh",
+        user_id="a@x",
+        expires_at=time.time() + 3600,
+        refresh_token="refresh-1",
+    )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("no network call expected")
+
+    monkeypatch.setattr(httpx, "post", _boom)
+    assert refresh_stored_token("http://localhost:6767") == "already-fresh"
+
+
+def test_refresh_no_material_does_not_touch_lock_file(token_dir, monkeypatch) -> None:
+    """With no refresh material, the refresh must not create a lock file.
+
+    Regression: creating the lock before checking raised OSError on a
+    read-only state directory, which the runner's auth factory caught —
+    skipping its Databricks SDK fallback and leaving valid credentials
+    unused.
+    """
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    store_token("http://localhost:6767", token="jwt", user_id="a@x", expires_at=time.time() - 10)
+
+    def _boom(*_a, **_kw):
+        raise AssertionError("lock file must not be created when nothing to refresh")
+
+    monkeypatch.setattr("builtins.open", _boom)
+    assert refresh_stored_token("http://localhost:6767") is None
+    assert not (token_dir / "auth_tokens.lock").exists()
+
+
+def test_refresh_survives_unwritable_state_dir(token_dir, monkeypatch) -> None:
+    """A lock/persist failure degrades to None instead of raising, so the
+    caller can still fall back to its other credential sources."""
+    import omnigent.cli_auth as ca
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+
+    @contextlib.contextmanager
+    def _unwritable():
+        raise OSError("read-only file system")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(ca, "_token_file_lock", _unwritable)
+    assert refresh_stored_token("http://localhost:6767") is None
+
+
+def test_load_token_min_remaining_declines_near_expiry(token_dir) -> None:
+    """A token inside the renewal window reads as unusable so the caller
+    refreshes instead of sending one that lapses mid-handshake."""
+    from omnigent.cli_auth import REFRESH_MIN_REMAINING_SECONDS, load_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="jwt",
+        user_id="a@x",
+        expires_at=time.time() + (REFRESH_MIN_REMAINING_SECONDS / 2),
+    )
+    # Default (0) still accepts a not-yet-expired token — unchanged behaviour.
+    assert load_token("http://localhost:6767") == "jwt"
+    # The renewal-aware caller declines it.
+    assert (
+        load_token("http://localhost:6767", min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS)
+        is None
+    )
+
+
+def test_load_entry_tolerates_wrong_shaped_json(token_dir) -> None:
+    """A token file holding valid JSON of the wrong shape reads as empty
+    rather than raising AttributeError into the caller."""
+    from omnigent.cli_auth import load_token, stored_token_status
+
+    for bad in ("[]", "null", '"a string"'):
+        (token_dir / "auth_tokens.json").write_text(bad)
+        assert load_token("http://localhost:6767") is None
+        assert stored_token_status("http://localhost:6767") == "absent"
+
+
+def test_refresh_rejects_unusable_response_fields(token_dir, monkeypatch) -> None:
+    """A 200 with null/non-string tokens or a non-finite expires_in must not
+    clobber the working stored credential."""
+    import json
+
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    def _seed():
+        store_token(
+            "http://localhost:6767",
+            token="stale",
+            user_id="a@x",
+            expires_at=time.time() - 10,
+            refresh_token="refresh-1",
+        )
+
+    # null access_token → decline, stored pair untouched.
+    _seed()
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, **_kw: httpx.Response(
+            200,
+            json={"access_token": None, "refresh_token": "r2"},
+            request=httpx.Request("POST", url),
+        ),
+    )
+    assert refresh_stored_token("http://localhost:6767") is None
+    entry = json.loads((token_dir / "auth_tokens.json").read_text())["http://localhost:6767"]
+    assert entry["token"] == "stale" and entry["refresh_token"] == "refresh-1"
+
+    # Non-finite expires_in → falls back to a sane lifetime, not "never expires".
+    _seed()
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, **_kw: httpx.Response(
+            200,
+            json={"access_token": "fresh", "refresh_token": "r2", "expires_in": "NaN"},
+            request=httpx.Request("POST", url),
+        ),
+    )
+    assert refresh_stored_token("http://localhost:6767") == "fresh"
+    entry = json.loads((token_dir / "auth_tokens.json").read_text())["http://localhost:6767"]
+    assert entry["expires_at"] < time.time() + 4000

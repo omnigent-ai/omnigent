@@ -53,6 +53,9 @@ _TRUTHY_STRINGS = ("1", "true", "yes")
 # any path not covered here, so it can never touch admin / user-management
 # endpoints (``/auth/users``, ``/auth/invite``, ``/auth/setup`` …) even if
 # its underlying identity is an admin. Delegated clients only need these.
+# First-party login-grant tokens carry no ``scope`` and are NOT restricted
+# here — they renew the session JWT and keep its authority (see
+# ``_check_cookie`` and ``routes/device_auth.LOGIN_GRANT_CLIENT_ID``).
 _DELEGATED_ALLOWED_PREFIXES = (
     "/health",
     "/v1/agents",
@@ -601,17 +604,21 @@ class UnifiedAuthProvider(AuthProvider):
         if not isinstance(user_id, str) or not user_id or user_id in _RESERVED_USERS:
             return None
 
-        # Delegated (device-grant) tokens carry a ``grant_id`` claim.
-        # They get two extra, request-scoped checks — a fail-closed path
-        # allowlist and a live revocation lookup — so they are never
-        # served from the plain user-id cache (which would skip both).
+        # Grant-derived tokens carry a ``grant_id`` claim. They get
+        # request-scoped checks — a live revocation lookup, plus (for
+        # restricted tokens) a fail-closed path allowlist — so they are
+        # never served from the plain user-id cache (which would skip both).
         grant_id = payload.get("grant_id")
         if grant_id is not None:
-            if not isinstance(grant_id, str):
-                return None
-            if not delegated_path_allowed(request.url.path):
-                return None
             if self._grant_revoked is not None and self._grant_revoked(grant_id):
+                return None
+            # The allowlist restricts DELEGATED tokens — a third-party
+            # client (e.g. Slack) acting on a user's behalf, marked by the
+            # ``scope`` claim. A first-party login grant carries no scope:
+            # its bearer is the user's own CLI/host, and the token renews
+            # the session JWT it replaced, so it keeps that same authority
+            # (still revocable via ``grant_id`` above).
+            if payload.get("scope") is not None and not delegated_path_allowed(request.url.path):
                 return None
             return user_id
 

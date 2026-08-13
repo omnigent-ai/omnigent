@@ -1807,7 +1807,13 @@ def test_cli_accounts_login_happy_path_stores_token(
         calls["n"] += 1
         assert url.endswith("/auth/login")
         body = kw["json"]
-        assert body == {"username": "alice", "password": "alice-pw-1234"}
+        assert body == {
+            "username": "alice",
+            "password": "alice-pw-1234",
+            # The CLI asks for a login-issued refresh grant so hosts can
+            # renew unattended; older servers ignore the field.
+            "issue_refresh": True,
+        }
         return _FakeResponse(
             200,
             {

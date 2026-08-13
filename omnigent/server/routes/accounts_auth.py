@@ -37,6 +37,7 @@ from starlette.responses import JSONResponse, RedirectResponse, Response
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
 from omnigent.server.auth import _RESERVED_USERS, RESERVED_USER_LOCAL, UnifiedAuthProvider
+from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.oidc import mint_session_cookie
 from omnigent.server.passwords import (
     InvalidPasswordError,
@@ -44,6 +45,7 @@ from omnigent.server.passwords import (
     needs_rehash,
     verify_password,
 )
+from omnigent.server.routes.device_auth import issue_login_grant
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -74,6 +76,9 @@ class LoginRequest(BaseModel):
 
     username: str = Field(min_length=1, max_length=128)
     password: str = Field(min_length=1, max_length=1024)
+    # Set by the CLI (never the web form): also issue a refresh grant so
+    # the unattended credential holder can renew past session-JWT expiry.
+    issue_refresh: bool = False
 
 
 class RegisterRequest(BaseModel):
@@ -206,6 +211,7 @@ def create_accounts_auth_router(
     account_store: SqlAlchemyAccountStore,
     admin_list: AdminList,
     permission_store: PermissionStore | None = None,
+    device_grant_store: DeviceGrantStore | None = None,
 ) -> APIRouter:
     """Build the ``/auth/*`` router for the accounts provider.
 
@@ -306,11 +312,23 @@ def create_accounts_auth_router(
         # against a row that exists. Defensive-coding the dereference
         # would only mask a SqlAlchemy bug, which we want to surface.
         assert user is not None
-        body_payload = {
+        body_payload: dict[str, object] = {
             "token": session_jwt,
             "expires_in": _session_max_age,
             "user": {"id": user.id, "is_admin": user.is_admin},
         }
+        # CLI opt-in only — a browser login must never receive refresh
+        # material. Best-effort: a grant-store failure must not break
+        # login itself.
+        if body.issue_refresh and device_grant_store is not None:
+            try:
+                body_payload["refresh_token"] = issue_login_grant(
+                    device_grant_store,
+                    user_id=username,
+                    cookie_secret=config.cookie_secret,
+                )
+            except Exception:
+                _logger.exception("auth/login: refresh grant issuance failed")
         resp = JSONResponse(status_code=200, content=body_payload)
         _set_session_cookie(
             resp,
