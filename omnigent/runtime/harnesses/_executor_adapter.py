@@ -47,6 +47,7 @@ from fastapi import Response
 from omnigent.errors import ElicitationDeclinedError
 from omnigent.inner.executor import (
     CompactionComplete,
+    CompactionStarted,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -1021,17 +1022,17 @@ class ExecutorAdapter(HarnessApp):
             # payload to populate TurnComplete.usage on the Omnigent side.
             if event.usage is not None:
                 ctx.provider_usage = event.usage
-        elif isinstance(event, CompactionComplete):
-            from omnigent.server.schemas import (
-                CompactionCompletedEvent,
-                CompactionInProgressEvent,
-            )
+        elif isinstance(event, CompactionStarted):
+            from omnigent.server.schemas import CompactionInProgressEvent
 
             ctx.emit(
                 CompactionInProgressEvent(
                     type="response.compaction.in_progress",
                 )
             )
+        elif isinstance(event, CompactionComplete):
+            from omnigent.server.schemas import CompactionCompletedEvent
+
             ctx.emit(
                 CompactionCompletedEvent(
                     type="response.compaction.completed",
