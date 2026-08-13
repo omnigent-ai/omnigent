@@ -136,18 +136,26 @@ function EmbedCapabilitiesProvider({ children }: { children: ReactNode }) {
   const [info, setInfo] = useState<ServerInfo | "loading">("loading");
   useEffect(() => {
     let alive = true;
-    // Fail open to "accounts off" on a slow/missing probe (same 1.5s budget as
-    // main.tsx) so the chat UI still paints instead of hanging on "loading".
-    void Promise.race([
-      resolveServerInfo(),
-      new Promise<ServerInfo>((resolve) => {
-        setTimeout(() => resolve(SERVER_INFO_OFFLINE_FALLBACK), 1500);
-      }),
-    ]).then((resolved) => {
-      if (alive) setInfo(resolved);
+    let resolved = false;
+    // First paint must not hang on "loading": if the probe is still in flight
+    // after 1.5s, paint the offline fallback so the chat UI appears. Unlike a
+    // Promise.race, we do NOT stop there — when the real /v1/info value lands
+    // (even later, on a slow-but-successful probe) we adopt it. Otherwise a
+    // probe that loses the 1.5s race pins the fallback for the whole mount,
+    // hiding capability-gated UI (e.g. the managed-sandbox host option) until a
+    // full re-navigation. resolveServerInfo never rejects (its failure path
+    // resolves to the OFF sentinel), so the real value always arrives.
+    const fallbackTimer = setTimeout(() => {
+      if (alive && !resolved) setInfo(SERVER_INFO_OFFLINE_FALLBACK);
+    }, 1500);
+    void resolveServerInfo().then((real) => {
+      resolved = true;
+      clearTimeout(fallbackTimer);
+      if (alive) setInfo(real);
     });
     return () => {
       alive = false;
+      clearTimeout(fallbackTimer);
     };
   }, []);
   return <CapabilitiesContext.Provider value={info}>{children}</CapabilitiesContext.Provider>;

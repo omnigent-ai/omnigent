@@ -30,6 +30,23 @@ on:
   schedule:
     # Every 12 hours (00:00 and 12:00 UTC).
     - cron: "0 */12 * * *"
+  # Fast smoke on PRs that touch the server↔runner contract surface.
+  # Runs both Config 1 (new server, old runner) and Config 2 (new runner,
+  # old server) against the latest stable release so protocol regressions
+  # surface before merge, not in the overnight full matrix.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "omnigent/runner/**"
+      - "omnigent/server/**"
+      - "omnigent/host/**"
+      - "web/src/**"
+      - "tests/e2e/**"
+      - "tests/e2e_ui/**"
+      - "tests/_helpers/compat.py"
+      - ".github/actions/compat-smoke-run/**"
+      - ".github/actions/compat-smoke-ui-run/**"
+      - ".github/workflows/server-compat.yml"
 
 concurrency:
   group: backcompat-${{ github.workflow }}-${{ github.sha }}
@@ -39,11 +56,118 @@ permissions:
   contents: read
 
 jobs:
-  # Compute the full pairwise (server, runner) matrices. Integration is the
-  # single openai-agents leg (claude-sdk/codex reject the mock LLM's
-  # "mock-model"); e2e is sharded per cell. See backcompat-pairwise-matrix.sh.
+  # ── Fast smoke: both compat configs against the latest stable release ──────
+  # Runs on every PR that touches the server↔runner contract surface (paths
+  # filter above), plus every schedule/dispatch run. Resolves the latest
+  # final (non-prerelease) tag once, then fans out to Config 1 and Config 2.
+  # The full pairwise matrix (backcompat-e2e / backcompat-integration) still
+  # runs on schedule/dispatch and covers the broader version history.
+  resolve-latest:
+    name: Resolve latest stable tag
+    # PRs: always. Schedule/dispatch: always.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      latest_tag: ${{ steps.tag.outputs.latest_tag }}
+    steps:
+      - name: Checkout (tags only)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 0
+          sparse-checkout: .github/scripts/ci
+          persist-credentials: false
+      - name: Resolve latest final tag
+        id: tag
+        shell: bash
+        run: |
+          # Latest final (non-prerelease) tag by version sort.
+          tag=$(git tag --sort=-v:refname \
+            | grep -viE '(^|[^a-z])(rc|dev|pre)[0-9]' \
+            | head -1)
+          if [ -z "$tag" ]; then
+            echo "No stable release tag found" >&2; exit 1
+          fi
+          echo "latest_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved latest stable tag: $tag" >&2
+
+  compat-smoke-config1:
+    name: "Compat smoke – Config 1 (new server / old runner ${{ needs.resolve-latest.outputs.latest_tag }})"
+    needs: resolve-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+          fetch-depth: 0
+      - name: Run compat smoke (Config 1)
+        uses: ./.github/actions/compat-smoke-run
+        with:
+          runner_version: ${{ needs.resolve-latest.outputs.latest_tag }}
+          artifact_suffix: "-config1"
+
+  compat-smoke-config2:
+    name: "Compat smoke – Config 2 (new runner / old server ${{ needs.resolve-latest.outputs.latest_tag }})"
+    needs: resolve-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+          fetch-depth: 0
+      - name: Run compat smoke (Config 2)
+        uses: ./.github/actions/compat-smoke-run
+        with:
+          server_version: ${{ needs.resolve-latest.outputs.latest_tag }}
+          artifact_suffix: "-config2"
+
+  compat-smoke-ui-config-a:
+    name: "Compat smoke – UI Config A (new SPA / old server ${{ needs.resolve-latest.outputs.latest_tag }})"
+    needs: resolve-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+          fetch-depth: 0
+      - name: Run UI compat smoke (Config A)
+        uses: ./.github/actions/compat-smoke-ui-run
+        with:
+          server_version: ${{ needs.resolve-latest.outputs.latest_tag }}
+          artifact_suffix: "-ui-config-a"
+
+  compat-smoke-ui-config-b:
+    name: "Compat smoke – UI Config B (old SPA ${{ needs.resolve-latest.outputs.latest_tag }} / new server)"
+    needs: resolve-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+          fetch-depth: 0
+      - name: Run UI compat smoke (Config B)
+        uses: ./.github/actions/compat-smoke-ui-run
+        with:
+          ui_version: ${{ needs.resolve-latest.outputs.latest_tag }}
+          artifact_suffix: "-ui-config-b"
+
+  # ── Full pairwise matrix (schedule + dispatch only) ────────────────────────
+  # Compute the full pairwise (server, runner) and UI matrices.
+  # Integration is the single openai-agents leg (claude-sdk/codex reject the
+  # mock LLM's "mock-model"); e2e is sharded per cell.
+  # UI matrix is server-only (runner is always main; the SPA is always HEAD).
   setup:
     name: setup
+    # The full pairwise matrix is expensive — skip it on PR triggers (the
+    # fast smoke jobs above cover the PR case).
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -132,3 +256,50 @@ jobs:
           harness: ${{ matrix.harness }}
           model: ${{ matrix.model }}
           workers: ${{ matrix.workers }}
+
+  # tests/e2e_ui for every old server tag × shard (server axis only).
+  setup-ui:
+    name: setup-ui
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ui_matrix: ${{ steps.matrix.outputs.ui_matrix }}
+    steps:
+      - name: Check out CI scripts + tags
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          sparse-checkout: .github/scripts/ci
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Compute UI matrix
+        id: matrix
+        env:
+          VERSIONS: ${{ github.event.inputs.versions }}
+          NUM_SHARDS: "3"
+        run: bash .github/scripts/ci/backcompat-ui-matrix.sh
+
+  backcompat-e2e-ui:
+    name: "Backcompat e2e-ui (Config ${{ matrix.config }}: ${{ matrix.config == 'A' && matrix.server || matrix.ui }}, shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})"
+    needs: setup-ui
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.setup-ui.outputs.ui_matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - name: Run e2e-ui suite for this cell
+        uses: ./.github/actions/compat-smoke-ui-run
+        with:
+          server_version: ${{ matrix.server }}
+          ui_version: ${{ matrix.ui }}
+          full_suite: "true"
+          shard_id: ${{ matrix.shard_id }}
+          num_shards: ${{ matrix.num_shards }}
+          artifact_suffix: "-config${{ matrix.config }}-${{ matrix.config == 'A' && matrix.server || matrix.ui }}-shard${{ matrix.shard_id }}"

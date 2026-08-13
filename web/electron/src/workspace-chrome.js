@@ -2,6 +2,11 @@
 // Omnigent SPA. Kept in its own Electron-free module so the injection logic is
 // unit-testable (test/workspace-chrome.test.js calls applyWorkspaceChromeHideCss
 // with a fake webContents) without requiring main.js, which boots the app.
+//
+// The mobile shells carry the same logic in
+// web/android/.../WorkspaceChromeScript.kt and
+// web/ios/Omnigent/WorkspaceChromeScript.swift. Keep the CSS identical in all
+// three so a fix in one shell isn't silently missing from the others.
 
 /**
  * CSS that hides the Databricks workspace navigation chrome.

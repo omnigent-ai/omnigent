@@ -231,7 +231,9 @@ def test_hosts_changed_frame_updates_host_badge(
 
     badge = page.get_by_test_id("host-badge")
     expect(badge).to_be_visible(timeout=15_000)
-    expect(badge).to_have_attribute("title", "Host push-e2e-host, online", timeout=15_000)
+    expect(badge).to_have_attribute(
+        "title", "Host push-e2e-host, online — click to switch", timeout=15_000
+    )
 
     # Flip the stub to "offline" before pushing the invalidation frame.
     # The client will re-fetch /v1/hosts on invalidation and see the new value.
@@ -244,7 +246,9 @@ def test_hosts_changed_frame_updates_host_badge(
     # KEY ASSERTION: badge reflects the new status well below the 60 s fallback.
     # Only the WS-push → invalidate → refetch path delivers this fast; a dead
     # push path would leave the badge stale and time out here.
-    expect(badge).to_have_attribute("title", "Host push-e2e-host, offline", timeout=15_000)
+    expect(badge).to_have_attribute(
+        "title", "Host push-e2e-host, offline — click to switch", timeout=15_000
+    )
 
 
 def test_host_badge_not_polled_frequently(

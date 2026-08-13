@@ -1698,6 +1698,9 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Antigravity",
         "Qwen Code",
         "Goose",
+        # Builtin ACP CLI rows (ACP_CLI_HARNESSES) render after Goose, the other
+        # ACP-family builtin, and before the non-ACP harnesses.
+        "Grok Build",
         "Copilot",
         "Kiro",
         "Kimi Code",
@@ -1825,7 +1828,7 @@ def test_setup_imports_openclaw_agents(isolated_config) -> None:
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["13", "", "", "q"]) + "\n"
+    stdin = "\n".join(["14", "", "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1847,7 +1850,7 @@ def test_setup_imports_openclaw_agents_from_user_selected_path(isolated_config) 
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["13", "", str(selected), "", "q"]) + "\n"
+    stdin = "\n".join(["14", "", str(selected), "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1864,7 +1867,7 @@ def test_setup_rejects_user_selected_unrelated_file(isolated_config) -> None:
     selected = isolated_config / "package.json"
     selected.write_text('{"name": "unrelated"}', encoding="utf-8")
 
-    stdin = "\n".join(["13", "", str(selected), "2", "q"]) + "\n"
+    stdin = "\n".join(["14", "", str(selected), "2", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -2055,10 +2058,13 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("5", "_manage_hermes_harness"),
         ("8", "_manage_qwen_harness"),
         ("9", "_manage_goose_harness"),
-        ("10", "_manage_copilot_harness"),
-        ("11", "_manage_kiro_harness"),
-        ("12", "_manage_kimi_harness"),
-        ("14", "_add_acp_agent"),
+        # 10 is the builtin ACP CLI row (Grok Build); every row after it shifted
+        # down by one when that block landed.
+        ("10", "_show_acp_cli_harness"),
+        ("11", "_manage_copilot_harness"),
+        ("12", "_manage_kiro_harness"),
+        ("13", "_manage_kimi_harness"),
+        ("15", "_add_acp_agent"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(

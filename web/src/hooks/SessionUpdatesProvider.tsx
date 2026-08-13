@@ -28,6 +28,7 @@ import {
   nullsToUndefined,
   removeIdsFromPages,
 } from "@/lib/sessionListCache";
+import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 
 // Coalesce bursts of structural changes / watch-set recomputes into one
@@ -202,8 +203,48 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     pushWatched();
   }, [pushWatched, activeId]);
 
+  // Freeze the fallback slice key (the modal host over all seen sessions) once
+  // the session list first loads, then start the updates socket — which keys
+  // its `?omnigent_slice_key=` off that frozen value. Gating start() on the
+  // latch (rather than starting eagerly) matters ONLY for this WS: it's a
+  // persistent connection, so starting pre-latch (empty map → no key) and then
+  // re-keying would force a reconnect. Ordinary `authenticatedFetch` fallback
+  // routes (e.g. /v1/hosts) don't gate — they just read the frozen value and a
+  // pre-latch miss self-corrects on their next refetch.
+  //
+  // Latch on the first SUCCESSFUL conversations query, not merely a settled one:
+  // the queryFn seeds `_sessionHosts` from every row before it resolves, so a
+  // success means the map already reflects this user's hosts (an empty map is
+  // then a genuinely zero-session user → null fallback, gate still releases). An
+  // error settle is NOT latched — freezing a null key there would pin the page
+  // even after a retry loads real hosts; react-query retries the list, and the
+  // socket starts on that first success (nothing to stream before the list loads
+  // anyway). The session list itself is NOT gated on the modal (it populates the
+  // map the modal reads; gating it on the modal would deadlock).
   useEffect(() => {
-    sessionUpdatesSocket.start();
+    let cacheUnsub: (() => void) | null = null;
+    const tryResolveAndStart = (): boolean => {
+      const succeeded = queryClient
+        .getQueryCache()
+        .getAll()
+        .some(
+          (q) =>
+            Array.isArray(q.queryKey) &&
+            q.queryKey[0] === "conversations" &&
+            q.state.status === "success",
+        );
+      if (!succeeded) return false;
+      resolveModalHost();
+      sessionUpdatesSocket.start();
+      return true;
+    };
+    // Already succeeded (cache warm from a prior mount)? Start immediately.
+    // Otherwise wait for the first success, then start once and unsubscribe.
+    if (!tryResolveAndStart()) {
+      cacheUnsub = queryClient.getQueryCache().subscribe(() => {
+        if (isModalHostResolved() || tryResolveAndStart()) cacheUnsub?.();
+      });
+    }
 
     let invalidateTimer: ReturnType<typeof setTimeout> | null = null;
     const scheduleInvalidate = () => {

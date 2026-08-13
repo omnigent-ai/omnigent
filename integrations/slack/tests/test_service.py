@@ -938,7 +938,7 @@ async def test_exhausted_reconnect_shows_non_alarming_text(tmp_path: Path) -> No
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_posts(slack, 1)
+    await _wait_for_ack_deleted(slack)
     await service.shutdown()
 
     # The notice is a public post (not ephemeral): the non-alarming stream-drop
@@ -1717,6 +1717,16 @@ async def _wait_for_posts(client: FakeSlackClient, count: int) -> None:
             return
         await asyncio.sleep(0.02)
     raise AssertionError(f"Timed out waiting for {count} posts")
+
+
+async def _wait_for_ack_deleted(client: FakeSlackClient) -> None:
+    # Wait until the "Working on it…" ack has been deleted and a follow-up post
+    # has landed — i.e. stop_with() fully completed (delete then postMessage).
+    for _ in range(50):
+        if client.deleted_ts and client.posts:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("Timed out waiting for ack deletion and follow-up post")
 
 
 async def test_unreachable_server_prompts_config_command(tmp_path: Path) -> None:

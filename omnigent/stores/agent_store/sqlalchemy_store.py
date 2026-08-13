@@ -69,20 +69,34 @@ class SqlAlchemyAgentStore(AgentStore):
 
     def _session_id_for_agent(self, agent_id: str) -> str | None:
         """
-        Reverse-lookup the conversation bound to a session-scoped agent.
+        Resolve a session-scoped agent to a conversation in its spawn tree.
 
-        ``conversations.agent_id`` is the sole link (the agent row carries no
-        back-pointer), and the ``conversations`` table lives in the AP DB — so
-        this must run on the conversation engine, not the Omnigent engine that
-        owns the ``agents`` table.
+        The returned id backs the owning-session authorization in
+        ``validate_session_agent``: the caller must have READ on the agent's
+        session, so no one can run another user's private agent by guessing its
+        raw id. Access is resolved at the spawn-tree ROOT —
+        ``check_session_access`` walks ``parent_conversation_id`` up to the root
+        and grants on the root's ACL — so any conversation in the tree
+        authorizes identically.
+
+        That is what makes this a single bounded query. Named ``sys_session_send``
+        children are created bound to the *same* ``agent_id`` as their mint, so
+        several conversation rows can share it — but they all carry the SAME
+        ``root_conversation_id`` (children inherit their parent's root, and the
+        mint's own root when it is itself a child). So selecting the root from
+        *any one* of them (an unordered ``LIMIT 1``) is unambiguous and O(1):
+        there is no "wrong row" to return. It also sidesteps read-replica lag —
+        the root is the oldest node in the tree, never a just-written child that
+        a replica has not caught up to. ``conversations`` lives on the AP DB, so
+        this runs on the conversation engine.
 
         :param agent_id: Agent identifier, e.g. ``"ag_abc123"``.
-        :returns: Owning conversation id, or ``None`` when no
-            conversation points at this agent.
+        :returns: The agent's spawn-tree root conversation id, or ``None`` when
+            no conversation points at this agent.
         """
         with self._conv_session("select_session_id_for_agent") as conv_sess:
             return conv_sess.execute(
-                select(SqlConversation.id)
+                select(SqlConversation.root_conversation_id)
                 .where(
                     SqlConversation.workspace_id == current_workspace_id(),
                     SqlConversation.agent_id == agent_id,

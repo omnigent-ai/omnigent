@@ -148,6 +148,12 @@ HERMES_KEY = "hermes"
 
 _HERMES_INSTALL_HINT = "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
 
+# Anthropic recommends its native installer over ``npm install -g``: it writes
+# to a user-writable ``~/.local/bin`` and self-updates, so it sidesteps the
+# EACCES failure on a root-owned npm global prefix.
+# See https://code.claude.com/docs/en/setup#native-install-recommended
+_CLAUDE_INSTALL_HINT = "curl -fsSL https://claude.ai/install.sh | bash"
+
 
 # Keyed by harness family (Claude=anthropic, Codex=openai) plus the pi
 # fallback. Binaries/packages mirror ucode's ``TOOL_SPECS`` so the two tools
@@ -155,14 +161,20 @@ _HERMES_INSTALL_HINT = "curl -fsSL https://hermes-agent.nousresearch.com/install
 # subcommands (``claude auth login --claudeai`` / ``codex login``), so the user
 # can sign in to a subscription from ``configure harnesses`` directly.
 _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
+    # Claude ships a vendor installer, so like Hermes it carries an
+    # ``install_hint`` + ``install_command`` and no ``package``. ``package is
+    # None`` is what routes :func:`harness_setup_hint` and the runner's
+    # missing-CLI error to the installer instead of the npm command.
     ANTHROPIC_FAMILY: HarnessInstallSpec(
         "Claude",
         "claude",
-        "@anthropic-ai/claude-code",
+        package=None,
         login_args=("auth", "login", "--claudeai"),
         logout_args=("auth", "logout"),
         status_args=("auth", "status"),
         login_status_key="loggedIn",
+        install_hint=_CLAUDE_INSTALL_HINT,
+        install_command=("bash", "-c", _CLAUDE_INSTALL_HINT),
         # The native bridge injects Omnigent's MCP relay via `--mcp-config`;
         # that flag first shipped in Claude Code 0.2.75.
         min_version=_CLAUDE_MIN_VERSION,
@@ -189,17 +201,17 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         # ``pi >= 0.79.0``; older CLIs would prompt mid-session.
         min_version=_PI_MIN_VERSION,
     ),
-    # Pin the install to the supported 1.17.x range: opencode-ai's npm ``latest``
+    # Pin the install to the supported 1.18.x range: opencode-ai's npm ``latest``
     # is a ``0.0.0-beta-*`` pre-release, so a bare ``opencode-ai`` would install a
     # version the runtime version-check (``check_opencode_version``,
-    # >=1.17.7,<1.18.0) then rejects. ``~1.17.7`` mirrors that exact range.
+    # >=1.17.7,<1.19.0) then rejects. ``~1.18.0`` resolves to the latest 1.18.x.
     # The same version bounds are enforced in setup via ``min_version`` /
     # ``max_version_exclusive`` so the install/upgrade prompt fires before
     # the runtime gate does.
     OPENCODE_KEY: HarnessInstallSpec(
         "OpenCode",
         "opencode",
-        "opencode-ai@~1.17.7",
+        "opencode-ai@~1.18.0",
         min_version=OPENCODE_MIN_VERSION,
         max_version_exclusive=OPENCODE_MAX_VERSION_EXCLUSIVE,
     ),
@@ -897,8 +909,9 @@ def harness_install_command(key: str) -> list[str]:
 
     :param key: A harness family or :data:`PI_KEY`.
     :returns: The install command, e.g. ``["npm", "install", "-g",
-        "@anthropic-ai/claude-code"]`` or an explicitly configured vendor
-        installer command.
+        "@openai/codex"]`` or an explicitly configured vendor installer command,
+        wrapped as ``["bash", "-c", <script>]``. For the form to show a user,
+        see :func:`harness_install_display`.
     :raises KeyError: If *key* has no install spec (caller should gate on
         :func:`harness_install_spec`).
     :raises ValueError: If *key* has a spec but no npm ``package`` (a CLI
@@ -913,6 +926,26 @@ def harness_install_command(key: str) -> list[str]:
     if package is None:
         raise ValueError(f"{key!r} has no npm package; show its install_hint instead")
     return ["npm", "install", "-g", package]
+
+
+def harness_install_display(key: str) -> str:
+    """Return the install command in the form to show a user.
+
+    A vendor installer publishes the runnable one-liner in ``install_hint``,
+    while :func:`harness_install_command` wraps it as ``bash -c <script>`` for
+    ``subprocess``; showing that joined argv would print the wrapper for the
+    user to strip by hand. npm harnesses render from the argv as before.
+
+    :param key: A harness family or :data:`PI_KEY`.
+    :returns: e.g. ``"curl -fsSL https://claude.ai/install.sh | bash"``.
+    :raises KeyError: If *key* has no install spec.
+    :raises ValueError: If *key* has neither an ``install_hint`` nor a
+        ``package``.
+    """
+    spec = harness_install_spec(key)
+    if spec is not None and spec.install_hint:
+        return spec.install_hint
+    return " ".join(harness_install_command(key))
 
 
 class HarnessInstallResult(NamedTuple):

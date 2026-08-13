@@ -17,7 +17,7 @@ my-agent/
 ├── config.yaml          required — LLM config, interaction contract, tools
 ├── AGENTS.md            optional — agent identity and behavior instructions
 ├── skills/              optional — agent skills
-│   └── <skill-name>/
+│   └── <dir>/           free-form; the skill's name comes from SKILL.md
 │       └── SKILL.md
 ├── tools/               optional — packaged tools
 │   ├── python/          local Python tools (auto-discovered)
@@ -27,7 +27,7 @@ my-agent/
 │   └── mcp/             MCP server declarations
 │       └── *.yaml
 └── agents/              optional — sub-agent images (recursive)
-    └── <agent-name>/
+    └── <dir>/           free-form; the sub-agent's name comes from config.yaml
         ├── config.yaml
         └── ...
 ```
@@ -63,7 +63,7 @@ interaction:
 
 tools:
   agents:                     # sub-agents this agent is allowed to call
-    - researcher              # must match a directory name under agents/
+    - researcher              # the sub-agent's declared name (see agents/)
 
 params:                       # arbitrary key-value; readable by skills and tools
   max_results: 10             # not interpreted by the runtime
@@ -113,9 +113,15 @@ validate that the underlying model actually supports the requested modalities.
 ### `tools.agents`
 
 Declares which sub-agents this agent is allowed to call. Any name listed here
-must have a corresponding directory under `agents/`. Listing an agent in
-`tools.agents` is sufficient to call it — no additional builtin declaration is
-needed.
+must match the `name` of a sub-agent discovered under `agents/`. That name is
+the one declared in the sub-agent's own `config.yaml`, which need not equal its
+directory name — `agents/web-researcher/config.yaml` may declare
+`name: researcher`, and `tools.agents` then lists `researcher`.
+
+The directory is still what the sub-agent's assets resolve against: its skills,
+local tools and nested `agents/` are read from its own directory, not the
+parent's. Listing an agent in `tools.agents` is sufficient to call it — no
+additional builtin declaration is needed.
 
 ### `tools.builtins`
 
@@ -200,10 +206,12 @@ part of `AgentSpec` and must not be encoded into an agent image.
 
 ---
 
-## Skills — `skills/<name>/SKILL.md`
+## Skills — `skills/<dir>/SKILL.md`
 
 A skill is a named chunk of instructions the agent can load on demand. Each
-skill lives in its own subdirectory under `skills/`.
+skill lives in its own subdirectory under `skills/`. The directory name is
+free-form; the skill's identity comes from the `name` in its frontmatter, and
+the two need not match.
 
 ```markdown
 ---
@@ -221,7 +229,7 @@ When asked to research a topic:
 
 | Field | Required | Constraints |
 |---|---|---|
-| `name` | yes | max 64 chars; lowercase letters, digits, hyphens; must match directory name |
+| `name` | yes | max 64 chars; lowercase letters, digits, hyphens; need not match the directory name |
 | `description` | yes | max 1024 chars; one-line description of when to use this skill |
 
 Everything after the frontmatter is markdown content passed to the model.
@@ -290,20 +298,21 @@ documentation for the exact loading convention.
 
 ---
 
-## Sub-agents — `agents/<name>/`
+## Sub-agents — `agents/<dir>/`
 
 Each subdirectory under `agents/` is itself a full agent image (recursive).
-The parent declares which sub-agents it is allowed to call via `tools.agents`.
+The parent declares which sub-agents it is allowed to call via `tools.agents`,
+using each sub-agent's declared `name` — the directory it lives in may differ.
 
 ```
 parent/
 ├── config.yaml          tools.agents: [researcher, critic]
 └── agents/
-    ├── researcher/
+    ├── researcher/      config.yaml declares name: researcher
     │   ├── config.yaml
     │   └── skills/
-    └── critic/
-        ├── config.yaml
+    └── code-critic/     config.yaml declares name: critic
+        ├── config.yaml  (directory and name differ — both resolve fine)
         └── skills/
 ```
 
@@ -311,8 +320,11 @@ parent/
 
 1. The called name must appear in `tools.agents` — names not listed are
    rejected at call time.
-2. The runtime resolves `agents/<name>/` relative to the calling agent's root.
-   There is no global registry and no parent-walking.
+2. The runtime resolves the name against the sub-agents discovered under the
+   calling agent's own `agents/` — matched on each sub-agent's declared
+   `name`, which need not equal its directory name. The directory it was
+   parsed from is what its skills, local tools and nested `agents/` load
+   from. There is no global registry and no parent-walking.
 3. Sub-agents are isolated by default — they see only tools declared in their
    own `config.yaml`. Tool inheritance is not supported in v1.
 4. Each sub-agent call produces its own trace span under the parent span.
@@ -325,15 +337,14 @@ The validator (`validator.py`) enforces:
 
 - `spec_version` must be `1`
 - `llm.model` must be present if the `llm` block is present
-- Skill `name` in frontmatter must match the directory name
 - Skill `name`: max 64 chars, pattern `[a-z0-9-]+`
 - Skill `description`: max 1024 chars
 - MCP configs must have `transport: http` and a non-empty `url` (presence checked, not format)
 - No duplicate skill names across `skills/`
 - No duplicate tool names across `tools/mcp/`, `tools/python/`, and
   `tools/typescript/`
-- Sub-agent names in `tools.agents` must have a corresponding directory under
-  `agents/`
+- Every name in `tools.agents` must be the declared `name` of a sub-agent
+  discovered under `agents/` (the directory name may differ)
 
 ---
 
@@ -424,11 +435,11 @@ The validator (`validator.py`) enforces:
 
 - **Flexible skill content sources** — similar to how `instructions` can be
   inline text or a file reference, skills could support an `instructions` key
-  pointing to an arbitrary file instead of requiring `skills/<name>/SKILL.md`.
+  pointing to an arbitrary file instead of requiring `skills/<dir>/SKILL.md`.
   Whether inlining skill text directly in `config.yaml` should also be
   supported is an open question — it trades discoverability and
   separation-of-concerns for convenience in simple single-skill agents. In v1,
-  skills must live in `skills/<name>/SKILL.md`.
+  skills must live in `skills/<dir>/SKILL.md`.
 
 - **Tool environment declarations** — specifying dependencies for local tools,
   e.g. a `requirements.txt` for Python tools or `package.json` for TypeScript.

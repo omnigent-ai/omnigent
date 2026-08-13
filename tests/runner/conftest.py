@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,27 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig
 from tests.runner.helpers import NullServerClient
+
+# Project root: two parents up from this conftest (tests/runner/ → repo root).
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(autouse=True)
+def _ensure_subprocess_pythonpath(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Put the project root on ``PYTHONPATH`` for spawned harness children.
+
+    Harnesses are spawned with ``-P``, so the child's cwd is deliberately kept
+    off ``sys.path`` (a workspace that is an omnigent checkout must not shadow
+    the installed package). Tests that register a fixture harness module such as
+    ``tests._fixtures.runner_test_harness`` therefore have to hand the child that
+    path through the environment, exactly as ``tests/runtime/harnesses/conftest``
+    already does. Prepend rather than overwrite so a developer-set value stays.
+
+    :param monkeypatch: Pytest monkeypatch fixture, scoping this to one test.
+    """
+    existing = os.environ.get("PYTHONPATH", "")
+    new_path = f"{_PROJECT_ROOT}{os.pathsep}{existing}" if existing else str(_PROJECT_ROOT)
+    monkeypatch.setenv("PYTHONPATH", new_path)
 
 
 def _drain_session_event_queue(queue: asyncio.Queue[Any] | None) -> list[dict[str, Any]]:

@@ -120,11 +120,15 @@ def test_right_panel_terminals_and_file_viewer(
         close_tab = rail.get_by_role("button", name="Close zsh · main", exact=True)
         expect(close_tab).to_be_visible(timeout=20_000)
         # The shell's xterm mounts in the rail and connects; the chat main
-        # column is not replaced.
+        # column is not replaced. Assert no VISIBLE main terminal surface:
+        # terminal-first sessions keep a hidden pre-warmed surface mounted
+        # (data-visible="false"), which is not a takeover.
         terminal_view = rail.get_by_test_id("terminal-view")
         expect(terminal_view.last).to_be_visible(timeout=20_000)
         expect(terminal_view.last).to_have_attribute("data-state", "connected", timeout=20_000)
-        expect(page.get_by_test_id("main-terminal-view")).to_have_count(0)
+        expect(
+            page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
+        ).to_have_count(0)
         # The tab's x closes the shell — its xterm unmounts and the rail
         # falls back to the Shells list for the Files steps below.
         close_tab.click()

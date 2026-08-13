@@ -1281,6 +1281,10 @@ async def test_cli_cold_start_falls_back_when_port_unattributable(
         "resolve_pane_agy_rpc_port_state",
         lambda _sock, _tgt: rpc.PaneAgyResolution(agy_found=True, port=None),
     )
+    # Restricted /proc: lsof attributes no port for ANY agy, so the lone
+    # candidate really is ours. Pinned so the branch never reads the host's
+    # process table (where a live agy would mean "still booting" instead).
+    monkeypatch.setattr(rpc, "_can_attribute_any_agy_port", lambda: False)
     monkeypatch.setattr(rpc, "_candidate_agy_rpc_ports", lambda: [52548])
     started: list[tuple[int, str]] = []
     monkeypatch.setattr(_mod, "start_cascade", lambda port, cid: started.append((port, cid)))

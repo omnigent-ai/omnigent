@@ -63,9 +63,11 @@ vi.mock("@/hooks/useHosts", () => ({
 // is the data source under test, so it's a controllable mock.
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
+  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
@@ -550,6 +552,20 @@ describe("Sidebar session list", () => {
     expect(collapse).toHaveAttribute("data-size", "icon-xs");
     expect(collapse).toHaveClass("size-6", "rounded-[var(--radius-md)]");
     expect(within(headerActions).queryByTestId("inbox-button")).toBeNull();
+  });
+
+  it("omits the desktop server picker outside the Electron shell", async () => {
+    // The picker is Electron-only: it self-hides when the native bridge
+    // reports no connected server (a plain browser tab, as in tests), leaving
+    // the sidebar ending with the session list exactly as before.
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    // Anchor on something that DOES render, so a silently-empty sidebar can't
+    // make this assertion pass for the wrong reason.
+    expect(await screen.findByTestId("settings-button")).toBeInTheDocument();
+    expect(screen.queryByTestId("sidebar-server-picker")).toBeNull();
+    expect(screen.queryByTestId("sidebar-server-picker-row")).toBeNull();
   });
 
   it("renders Inbox as its own primary navigation row", () => {

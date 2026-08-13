@@ -14,6 +14,7 @@ from omnigent.entities import (
     MessageData,
     NativeToolData,
 )
+from omnigent.runtime.tool_result_replay import image_omitted_placeholder
 from omnigent.spec import AgentSpec
 
 
@@ -121,19 +122,6 @@ def _strip_output_annotations(
     return result
 
 
-def _image_omitted_placeholder(media_type: str | None) -> str:
-    """Return the placeholder text for a stripped inline image.
-
-    :param media_type: Image MIME type when known, e.g. ``"image/png"``.
-    :returns: Human/agent-readable placeholder naming how to recover it.
-    """
-    label = f"{media_type} image" if isinstance(media_type, str) and media_type else "image"
-    return (
-        f"[{label} omitted from history to save context — "
-        "re-run the tool call above (e.g. Read the same path) to view it again]"
-    )
-
-
 def _strip_output_image_data(value: Any) -> Any:
     """Rewrite inline base64 image blocks to a text placeholder.
 
@@ -153,7 +141,7 @@ def _strip_output_image_data(value: Any) -> Any:
         if value.get("type") == "image" and isinstance(source, dict):
             return {
                 "type": "text",
-                "text": _image_omitted_placeholder(source.get("media_type")),
+                "text": image_omitted_placeholder(source.get("media_type")),
             }
         return {key: _strip_output_image_data(val) for key, val in value.items()}
     return value
@@ -206,7 +194,7 @@ def _dedupe_tool_output_images(output: str) -> str:
         # Truncated/invalid JSON (e.g. clipped at the store byte cap): fall back
         # to an in-place regex rewrite of any image source block.
         def _replace(match: re.Match[str]) -> str:
-            placeholder = _image_omitted_placeholder(match.group("media"))
+            placeholder = image_omitted_placeholder(match.group("media"))
             return json.dumps({"type": "text", "text": placeholder}, separators=(",", ":"))
 
         return _IMAGE_SOURCE_RE.sub(_replace, output)

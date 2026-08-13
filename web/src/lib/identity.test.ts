@@ -207,6 +207,113 @@ describe("authenticatedFetch", () => {
     expect(init.method).toBe("DELETE");
     expect(init.signal).toBe(controller.signal);
   });
+
+  describe("slice-key routing (host sharding)", () => {
+    it("stamps X-Databricks-Omnigent-Slice-Key on host-scoped URLs", async () => {
+      // Mock sessionHost module before importing identity
+      vi.doMock("./sessionHost", () => ({
+        getSessionHost: vi.fn(() => "host_123"),
+        setSessionHost: vi.fn(),
+        isHostKeyless: vi.fn(() => false),
+        markHostKeyless: vi.fn(),
+        clearHostKeyless: vi.fn(),
+        modalHostId: vi.fn(() => null),
+        resolveModalHost: vi.fn(),
+        isModalHostResolved: vi.fn(() => true),
+      }));
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+      }));
+
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+      const { authenticatedFetch } = await import("./identity");
+
+      await authenticatedFetch("/v1/hosts/host_123/runners");
+
+      const init = fetchMock.mock.calls[0][1] as RequestInit;
+      const headers = new Headers(init.headers);
+      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_123");
+    });
+
+    it("stamps the slice-key header in standalone dev against a workspace", async () => {
+      // `npm run dev` pointed at a workspace URL installs no fetcher, but it's
+      // still a Databricks workspace (sharded) — the VITE_DATABRICKS_WORKSPACE
+      // build flag drives the key so dev traffic reaches the right replica (no
+      // manual step).
+      vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
+      vi.doMock("./sessionHost", () => ({
+        getSessionHost: vi.fn(() => null),
+        setSessionHost: vi.fn(),
+        isHostKeyless: vi.fn(() => false),
+        markHostKeyless: vi.fn(),
+        clearHostKeyless: vi.fn(),
+        modalHostId: vi.fn(() => null),
+        resolveModalHost: vi.fn(),
+        isModalHostResolved: vi.fn(() => true),
+      }));
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({})),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+      }));
+
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+      const { authenticatedFetch } = await import("./identity");
+
+      await authenticatedFetch("/v1/hosts/host_abc/runners", { method: "POST" });
+
+      const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_abc");
+    });
+
+    it("retries keyless on wrong_replica 400 response", async () => {
+      vi.doMock("./sessionHost", () => ({
+        getSessionHost: vi.fn(() => "host_789"),
+        setSessionHost: vi.fn(),
+        isHostKeyless: vi.fn(() => false),
+        markHostKeyless: vi.fn(),
+        clearHostKeyless: vi.fn(),
+        modalHostId: vi.fn(() => null),
+        resolveModalHost: vi.fn(),
+        isModalHostResolved: vi.fn(() => true),
+      }));
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+      }));
+
+      const wrongReplicaResponse = {
+        ok: false,
+        status: 400,
+        statusText: "Bad Request",
+        json: async () => ({ error: { code: "wrong_replica" } }),
+        clone: function () {
+          return this;
+        },
+      } as unknown as Response;
+
+      fetchMock.mockResolvedValueOnce(wrongReplicaResponse);
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+
+      const { authenticatedFetch } = await import("./identity");
+      const response = await authenticatedFetch("/v1/sessions/sess_xyz/resources/terminals");
+
+      // Should retry after the wrong_replica response
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      // First call should have the slice key
+      const firstInit = fetchMock.mock.calls[0][1] as RequestInit;
+      const firstHeaders = new Headers(firstInit.headers);
+      expect(firstHeaders.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_789");
+      // Second call (retry) should NOT have the slice key
+      const secondInit = fetchMock.mock.calls[1][1] as RequestInit;
+      const secondHeaders = new Headers(secondInit.headers);
+      expect(secondHeaders.get("X-Databricks-Omnigent-Slice-Key")).toBeNull();
+      expect(response.status).toBe(200);
+    });
+  });
 });
 
 describe("getCurrentAuthorId", () => {

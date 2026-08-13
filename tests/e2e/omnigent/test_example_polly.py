@@ -137,7 +137,7 @@ def test_pi_subagent_is_headless_scaffold_worker(polly_spec: AgentSpec) -> None:
 
 
 def test_spine_skills_present(polly_spec: AgentSpec) -> None:
-    """All spine skills are discovered from skills/<name>/SKILL.md."""
+    """All spine skills are discovered from skills/<dir>/SKILL.md."""
     assert sorted(s.name for s in polly_spec.skills) == [
         "cross-review",
         "fanout",

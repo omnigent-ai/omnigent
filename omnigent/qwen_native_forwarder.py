@@ -318,9 +318,9 @@ async def forward_qwen_events_to_session(
     offset = persisted.offset
     seen = _new_seen(persisted.seen_uuids)
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
-    ) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
                 items, new_offset = await asyncio.to_thread(
@@ -516,9 +516,9 @@ async def supervise_qwen_compaction_mirror(
     except OSError:
         offset = 0  # not created yet; first poll reads from the start
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
-    ) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
                 statuses, offset = await asyncio.to_thread(
