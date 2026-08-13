@@ -35,6 +35,9 @@ _USER_BUBBLE = '[data-testid="message-bubble"][data-role="user"]'
 _ASSISTANT_BUBBLE = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'
 _TIMESTAMP = '[data-testid="message-timestamp"]'
+# Generous budget for the mock-LLM roundtrip: the shards run 120+ tests
+# against one server, and a 60s wait proved tight under CI load.
+_ASSISTANT_TIMEOUT_MS = 120_000
 # en-US renders "2:55 PM"; 24-hour locales render "14:55". Both are valid —
 # the assertion is about a clock-shaped value, not a specific locale.
 _TIME_RE = re.compile(r"^\d{1,2}:\d{2}(\s?[AP]M)?$")
@@ -104,8 +107,8 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
 
     # --- assistant bubble ---
     assistant_bubble = page.locator(_ASSISTANT_BUBBLE).first
-    expect(assistant_bubble).to_be_visible(timeout=60_000)
-    expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
+    expect(assistant_bubble).to_be_visible(timeout=_ASSISTANT_TIMEOUT_MS)
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=_ASSISTANT_TIMEOUT_MS)
     assistant_ts = assistant_bubble.locator(_TIMESTAMP)
     expect(assistant_ts).to_have_count(1)
     expect(assistant_ts).to_have_text(_TIME_RE)
@@ -161,8 +164,8 @@ def test_touch_viewport_keeps_timestamp_row_discoverable(
         assert _opacity(_action_row(user_ts)) == "0.4"
 
         assistant_bubble = page.locator(_ASSISTANT_BUBBLE).first
-        expect(assistant_bubble).to_be_visible(timeout=60_000)
-        expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
+        expect(assistant_bubble).to_be_visible(timeout=_ASSISTANT_TIMEOUT_MS)
+        expect(page.locator(_WORKING)).to_have_count(0, timeout=_ASSISTANT_TIMEOUT_MS)
         assistant_ts = assistant_bubble.locator(_TIMESTAMP)
         expect(assistant_ts).to_have_count(1)
         expect(assistant_ts).to_have_text(_TIME_RE)
