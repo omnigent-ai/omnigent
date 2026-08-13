@@ -80,6 +80,7 @@ import type {
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
+import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
 import { parseEvent, parseSseStream, type SseStreamResult } from "@/lib/sse";
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
@@ -570,6 +571,20 @@ export interface AppChatState {
    * The composer drains this on change and clears it.
    */
   pendingComposerAttachments: ComposerAttachment[];
+  /**
+   * True when this tab could not take an origin-wide stream slot for a
+   * conversation it needed to open: every slot is held by other tabs and this
+   * tab had no background stream of its own to reclaim. The active conversation
+   * still opens (over budget), so the app keeps working; the banner warns the
+   * user to close tabs. Cleared once this tab holds a slot again.
+   */
+  streamBudgetExceeded: boolean;
+  /**
+   * Whether the user dismissed the too-many-tabs banner for the CURRENT
+   * over-budget episode. Reset when `streamBudgetExceeded` goes false→true, so a
+   * fresh episode re-shows it rather than nagging within one episode.
+   */
+  streamBudgetBannerDismissed: boolean;
 }
 
 /** Actions exposed on the root store. */
@@ -722,6 +737,8 @@ export interface ChatActions {
    * snapshot. No-ops for inactive or missing conversations.
    */
   refreshSessionState: (conversationId?: string) => Promise<void>;
+  /** Dismiss the too-many-tabs banner for the current over-budget episode. */
+  dismissStreamBudgetBanner: () => void;
 }
 
 /**
@@ -1074,6 +1091,9 @@ export function initChatStore(client: QueryClient): void {
   // Drop every live conversation: their streams must not outlive the app (or,
   // in tests, leak into the next case).
   conversationRegistry.clear();
+  // Drop this tab's held stream slots; disposed pumps release their own locks,
+  // and a boot/reset starts from an empty set.
+  heldStreamSlots.clear();
   // Reset the POST-ordering chains so a prior run's unresolved send can't block
   // the next one (production calls this once at boot; tests call it per case).
   sendChains.clear();
@@ -1211,6 +1231,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   oldestItemId: null,
   flashItemId: null,
   pendingComposerAttachments: [],
+  streamBudgetExceeded: false,
+  streamBudgetBannerDismissed: false,
   failedSendDraft: null,
   llmModel: null,
   sessionHarness: null,
@@ -1963,6 +1985,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
   clearPendingComposerAttachments: () => setActive({ pendingComposerAttachments: [] }),
 
+  dismissStreamBudgetBanner: () => rootSetState({ streamBudgetBannerDismissed: true }),
+
   markRunnerLaunched: () => setActive({ runnerLaunchedAt: Date.now() }),
 
   compact: async () => {
@@ -2226,6 +2250,68 @@ type Getter = () => ChatState;
 // replaces it. Writes the root store's own fields with no re-splitting — used by
 // the mirror and by the app-global half of a routed patch.
 const rootSetState = useChatStore.setState;
+
+// ── Origin-wide stream slots ─────────────────────────────
+//
+// One held slot == one live stream this tab is counted for against the shared,
+// cross-tab cap (see `streamSlots`). Keyed by conversation id.
+const heldStreamSlots = new Map<string, StreamSlot>();
+
+/**
+ * Take an origin-wide stream slot for `id` before opening its stream.
+ *
+ * Tries for a free slot; if the origin is saturated, reclaims one of THIS tab's
+ * own background streams (LRU, unpinned) and retries — awaiting the reclaimed
+ * slot's release so the freed lock is observable before the re-check, rather
+ * than racing it and over-evicting. Returns whether a slot is now held.
+ *
+ * Returns false only when a fresh tab finds every slot held by OTHER tabs and
+ * has nothing of its own to reclaim; the active conversation then opens over
+ * budget (the caller proceeds anyway) and the too-many-tabs banner is raised.
+ */
+async function acquireStreamSlot(id: string): Promise<boolean> {
+  if (heldStreamSlots.has(id)) return true; // rebinding a still-slotted stream
+  let slot = await getStreamSlotManager().tryAcquire();
+  // Inherently sequential: each iteration must fully release a reclaimed slot
+  // (so the freed lock is observable) before re-checking, or we'd over-evict.
+  /* eslint-disable no-await-in-loop */
+  while (slot === null) {
+    const evictedId = conversationRegistry.evictLruEvictable(id);
+    if (evictedId === null) break;
+    const evictedSlot = heldStreamSlots.get(evictedId);
+    if (evictedSlot !== undefined) {
+      heldStreamSlots.delete(evictedId);
+      await evictedSlot.release();
+    }
+    slot = await getStreamSlotManager().tryAcquire();
+  }
+  /* eslint-enable no-await-in-loop */
+  if (slot !== null) heldStreamSlots.set(id, slot);
+  setStreamBudgetExceeded(slot === null);
+  return slot !== null;
+}
+
+/** Hand back `id`'s stream slot when its stream ends (pump exits / disposed). */
+function releaseStreamSlot(id: string): void {
+  const slot = heldStreamSlots.get(id);
+  if (slot === undefined) return;
+  heldStreamSlots.delete(id);
+  void slot.release();
+}
+
+/**
+ * Raise or clear the too-many-tabs banner. A fresh over-budget episode
+ * (false→true) un-dismisses it; clearing leaves the dismissed flag alone since
+ * the banner is hidden while within budget regardless.
+ */
+function setStreamBudgetExceeded(exceeded: boolean): void {
+  if (useChatStore.getState().streamBudgetExceeded === exceeded) return;
+  rootSetState(
+    exceeded
+      ? { streamBudgetExceeded: true, streamBudgetBannerDismissed: false }
+      : { streamBudgetExceeded: false },
+  );
+}
 
 // ── Conversation entries ─────────────────────────────────
 //
@@ -2824,6 +2910,16 @@ async function bindStream(
 ): Promise<void> {
   racedNativeModelOptions.delete(id);
   const controller = new AbortController();
+  // Take an origin-wide stream slot before opening the connection, evicting our
+  // own LRU background stream to make room. A fresh tab that finds every slot
+  // held by other tabs opens over budget (no slot) and raises the banner.
+  await acquireStreamSlot(id);
+  if (isConversationDisposed(id)) {
+    // Switched away / evicted while awaiting the slot — don't open a dead
+    // entry's stream, and hand any slot we took back to the origin.
+    releaseStreamSlot(id);
+    return;
+  }
   set({ abortController: controller });
 
   // Opening a conversation URL with no session list loaded yet leaves the
@@ -2835,8 +2931,7 @@ async function bindStream(
   // retry). When sharded (a host fetcher is wired), resolve the session's host_id
   // FIRST (one fast metadata GET that populates the map via sessionFromWire) so
   // the stream keys correctly. Best-effort: a failed resolve falls through to the
-  // unkeyed open (no worse than pre-fix); the conversationId guard bails if the
-  // user navigated away during the resolve. Re-apply after every resync, see
+  // unkeyed open (no worse than pre-fix). Re-apply after every resync, see
   // agentbricks/mas/.claude/skills/sync-omnigents/SKILL.md.
   if (getOmnigentHostConfig().fetcher && getSessionHost(id) === null) {
     try {
@@ -2845,10 +2940,18 @@ async function bindStream(
       // Best-effort: a failed resolve (bad id, transient) falls through to the
       // unkeyed open; the snapshot fetch surfaces the real error.
     }
-    if (get().conversationId !== id) return;
+    // Liveness, not the visible id: a background bind must survive a switch away
+    // (that is the whole feature). Only a dispose (evicted) bails — and then the
+    // slot taken above has to go back to the origin.
+    if (isConversationDisposed(id)) {
+      releaseStreamSlot(id);
+      return;
+    }
   }
 
-  void startStreamPump(id, controller, set, get);
+  // The slot is held for the pump's whole lifetime; released when it exits (a
+  // terminal close, an abort from switchTo/dispose, or eviction).
+  void startStreamPump(id, controller, set, get).finally(() => releaseStreamSlot(id));
 
   // Background tabs can miss the `response.elicitation_resolved` SSE event
   // (browser throttling), so a pending ApprovalCard that was answered on

@@ -117,16 +117,6 @@ export class ConversationRegistry {
   private readonly listeners = new Set<ChangeListener>();
   /** Conversation currently on screen; exempt from eviction. */
   private activeId: string | null = null;
-  /** How many entries may be live. Injectable so tests can pin a small cap. */
-  private readonly capacity: () => number;
-
-  /**
-   * :param capacity: live-entry budget, read on each eviction check. Defaults
-   *     to the transport-derived {@link maxLiveConversations}.
-   */
-  constructor(capacity: () => number = maxLiveConversations) {
-    this.capacity = capacity;
-  }
 
   /**
    * Subscribe to state changes across all entries.
@@ -163,16 +153,13 @@ export class ConversationRegistry {
    * Mark which conversation is on screen.
    *
    * Only used to exempt it from eviction — no behaviour is gated on being
-   * active. Pass `null` on the landing route.
-   *
-   * Re-trims, because moving the exemption can make the OUTGOING conversation
-   * evictable: an over-cap registry that only stayed over-cap to protect it
-   * must shrink now, not wait for an unrelated acquire.
+   * active. Pass `null` on the landing route. Eviction is slot-driven now (see
+   * `evictLruEvictable`), so switching between already-live conversations opens
+   * no stream and frees nothing; there is nothing to trim here.
    */
   setActive(id: string | null): void {
     this.activeId = id;
     if (id !== null) this.touch(id);
-    this.evictIfOverBudget(id ?? undefined);
   }
 
   /** The conversation on screen, or `null`. */
@@ -185,7 +172,8 @@ export class ConversationRegistry {
    * Get or create the entry for `id`, marking it most-recently-viewed.
    *
    * A fresh entry starts from `createInitialConversationState()`; the caller
-   * binds its stream. Creating one may evict the least-recently-viewed entry.
+   * binds its stream, which is where the origin-wide stream slot is taken (see
+   * `evictLruEvictable`). Creating an entry does not itself evict anything.
    */
   acquire(id: string): ConversationEntry {
     const existing = this.entries.get(id);
@@ -195,7 +183,6 @@ export class ConversationRegistry {
     }
     const entry = this.createEntry(id);
     this.entries.set(id, entry);
-    this.evictIfOverBudget(id);
     return entry;
   }
 
@@ -226,33 +213,29 @@ export class ConversationRegistry {
   }
 
   /**
-   * Evict least-recently-viewed entries until within budget.
+   * Dispose the least-recently-viewed *evictable* entry to free its stream slot,
+   * returning the id disposed (so the caller can release that entry's slot) or
+   * `null` when nothing was evictable.
    *
-   * Protected from eviction: the conversation on screen, the entry just
-   * acquired (evicting it would hand the caller a disposed entry), and any
-   * entry holding work the server does not know about yet — see
-   * `hasUnsentWork`. When every candidate is protected the map is allowed to
-   * exceed the cap: going over budget costs memory and a connection slot, while
-   * evicting would destroy a user's message.
+   * The slot layer calls this when it can't take a free origin-wide slot, so a
+   * tab reclaims one of ITS OWN background streams before it either gives up
+   * (leaving the new conversation cold) or opens over budget.
    *
-   * Runs from every path that can make an entry evictable — `acquire`, a
-   * clearing pin, and `setActive` (which moves the on-screen exemption) —
-   * because an over-cap registry has to shrink at that moment rather than
-   * waiting for an unrelated acquire. Otherwise repeated send-and-switch leaves
-   * the excess streams open indefinitely and can exhaust an HTTP/1.1 pool.
-   *
-   * :param justAcquiredId: entry the caller is about to be handed, if any.
+   * Never evicts: the conversation on screen, `exemptId` (the one being bound —
+   * disposing it would hand back a dead entry), or an entry holding work the
+   * server has no record of yet (`hasUnsentWork` — evicting that loses the
+   * user's message). When nothing is evictable, returns `null` and the caller
+   * decides what to do with a saturated origin.
    */
-  private evictIfOverBudget(justAcquiredId?: string): void {
-    const budget = this.capacity();
-    for (const id of [...this.entries.keys()]) {
-      if (this.entries.size <= budget) return;
-      if (id === this.activeId || id === justAcquiredId) continue;
-      const entry = this.entries.get(id);
-      if (entry === undefined || hasUnsentWork(entry.getState())) continue;
+  evictLruEvictable(exemptId?: string): string | null {
+    for (const [id, entry] of this.entries) {
+      if (id === this.activeId || id === exemptId) continue;
+      if (hasUnsentWork(entry.getState())) continue;
       this.entries.delete(id);
       entry.dispose();
+      return id;
     }
+    return null;
   }
 
   private createEntry(id: string): ConversationEntry {
@@ -266,7 +249,6 @@ export class ConversationRegistry {
         // unwind cleanly, but writes are dropped: nothing should be able to
         // resurrect state for a conversation that has been evicted.
         if (entry.disposed) return;
-        const wasPinned = hasUnsentWork(state);
         const patch = typeof partial === "function" ? partial(state) : partial;
         let changed = false;
         const next = { ...state };
@@ -288,10 +270,6 @@ export class ConversationRegistry {
         }
         if (!changed) return;
         state = next;
-        // A pin that just cleared may have been the only thing holding the map
-        // over budget — see `evictIfOverBudget`. Trim before notifying, so a
-        // listener never observes an over-cap registry that is about to shrink.
-        if (wasPinned && !hasUnsentWork(state)) this.evictIfOverBudget();
         for (const listener of this.listeners) listener(id);
       },
       dispose: () => {

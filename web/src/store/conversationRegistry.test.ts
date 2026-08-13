@@ -68,11 +68,9 @@ describe("getConnectionProtocol", () => {
 
 describe("ConversationRegistry", () => {
   let registry: ConversationRegistry;
-  /** Small enough that eviction is reachable without opening 30 entries. */
-  const CAPACITY = 3;
 
   beforeEach(() => {
-    registry = new ConversationRegistry(() => CAPACITY);
+    registry = new ConversationRegistry();
   });
 
   it("creates an entry on first acquire and returns the same one after", () => {
@@ -130,15 +128,19 @@ describe("ConversationRegistry", () => {
     }
   });
 
-  it("evicts the least-recently-viewed entry once over budget", () => {
-    // Cap is 3 on HTTP/1.1. conv_a is oldest, so it goes.
+  it("evictLruEvictable disposes the least-recently-viewed entry and returns its id", () => {
+    // The slot layer calls this to reclaim one of this tab's own background
+    // streams when the origin is saturated. conv_a is oldest → it goes.
     const a = registry.acquire("conv_a");
     registry.acquire("conv_b");
     registry.acquire("conv_c");
-    registry.acquire("conv_d");
-    expect(registry.ids()).toEqual(["conv_b", "conv_c", "conv_d"]);
+    expect(registry.evictLruEvictable()).toBe("conv_a");
     expect(a.disposed).toBe(true);
-    expect(registry.has("conv_a")).toBe(false);
+    expect(registry.ids()).toEqual(["conv_b", "conv_c"]);
+  });
+
+  it("returns null when there is nothing to evict", () => {
+    expect(registry.evictLruEvictable()).toBeNull();
   });
 
   it("treats acquire as a recency touch, so a revisited entry is not the victim", () => {
@@ -146,146 +148,59 @@ describe("ConversationRegistry", () => {
     registry.acquire("conv_b");
     registry.acquire("conv_c");
     registry.acquire("conv_a"); // revisit → conv_b is now oldest
-    registry.acquire("conv_d");
-    expect(registry.ids()).toEqual(["conv_c", "conv_a", "conv_d"]);
+    expect(registry.evictLruEvictable()).toBe("conv_b");
+    expect(registry.ids()).toEqual(["conv_c", "conv_a"]);
   });
 
   it("never evicts the conversation on screen, even when it is oldest", () => {
-    registry.acquire("conv_a");
+    const a = registry.acquire("conv_a");
     registry.setActive("conv_a");
     registry.acquire("conv_b");
-    registry.acquire("conv_c");
-    registry.acquire("conv_d");
+    // conv_a is oldest but on screen → skipped; conv_b is reclaimed instead.
+    expect(registry.evictLruEvictable()).toBe("conv_b");
     expect(registry.has("conv_a")).toBe(true);
+    expect(a.disposed).toBe(false);
+  });
+
+  it("never evicts the conversation being bound (exemptId)", () => {
+    // The entry whose stream the slot layer is opening must survive — evicting
+    // it would hand back a dead entry.
+    registry.acquire("conv_a");
+    registry.acquire("conv_d");
+    expect(registry.evictLruEvictable("conv_d")).toBe("conv_a");
+    expect(registry.has("conv_d")).toBe(true);
   });
 
   it("never evicts an entry holding a send the server has not acknowledged", () => {
     // The one case where eviction is NOT equivalent to a cold load: until the
-    // POST returns, the message exists nowhere but this tab.
+    // POST returns, the message exists nowhere but this tab. Skip it, take next.
     const a = registry.acquire("conv_a");
     a.setState({ pendingUserMessages: [unsentBubble()] });
     registry.acquire("conv_b");
-    registry.acquire("conv_c");
-    registry.acquire("conv_d");
+    expect(registry.evictLruEvictable()).toBe("conv_b");
     expect(registry.has("conv_a")).toBe(true);
     expect(a.disposed).toBe(false);
-    // conv_b was the next-oldest unprotected entry.
-    expect(registry.has("conv_b")).toBe(false);
   });
 
   it("does evict an entry whose sends have all settled", () => {
     // Once the POST returns, the server can account for the message — the
-    // navigate-back snapshot re-seeds it, so dropping the entry is safe.
+    // navigate-back snapshot re-seeds it, so reclaiming its slot is safe.
     const a = registry.acquire("conv_a");
     a.setState({ pendingUserMessages: [postedBubble()] });
-    registry.acquire("conv_b");
-    registry.acquire("conv_c");
-    registry.acquire("conv_d");
-    expect(registry.has("conv_a")).toBe(false);
+    expect(registry.evictLruEvictable()).toBe("conv_a");
+    expect(a.disposed).toBe(true);
   });
 
-  it("exceeds the cap rather than destroying unsent work", () => {
-    // Pathological: every entry is pinned. Going over budget costs a
-    // connection slot; evicting would lose the user's messages.
-    for (const id of ["conv_a", "conv_b", "conv_c"]) {
-      registry.acquire(id).setState({ pendingUserMessages: [unsentBubble(`pend_${id}`)] });
-    }
-    registry.acquire("conv_d");
-    expect(registry.ids()).toHaveLength(4);
-  });
-
-  it("shrinks back to the cap as soon as a pin clears", () => {
-    // Eviction used to run only from `acquire`, so an over-cap registry stayed
-    // over-cap — every excess SSE connection held open until the user happened
-    // to open another conversation. Enough send-and-switch cycles could then
-    // exhaust the HTTP/1.1 pool despite the advertised cap.
-    for (const id of ["conv_a", "conv_b", "conv_c"]) {
-      registry.acquire(id).setState({ pendingUserMessages: [unsentBubble(`pend_${id}`)] });
-    }
-    const d = registry.acquire("conv_d");
-    registry.setActive("conv_d");
-    expect(registry.ids()).toHaveLength(4);
-
-    // conv_a's POST returns: the server owns the message now, so the pin that
-    // was holding the registry over budget is gone.
-    registry.peek("conv_a")!.setState({ pendingUserMessages: [postedBubble("pend_conv_a")] });
-
-    expect(registry.ids()).toEqual(["conv_b", "conv_c", "conv_d"]);
-    expect(registry.has("conv_a")).toBe(false);
-    expect(d.disposed).toBe(false);
-  });
-
-  it("does not evict the entry whose own pin just cleared when it is still needed", () => {
-    // The settling entry is the one being written to; trimming must pick a
-    // different victim (here: the next-oldest unpinned entry) rather than
-    // disposing the entry mid-write.
+  it("returns null when every entry is protected rather than destroying unsent work", () => {
+    // The slot layer reads this null as "origin saturated, nothing of mine to
+    // reclaim" and opens the active conversation over budget with the
+    // too-many-tabs banner.
     const a = registry.acquire("conv_a");
     a.setState({ pendingUserMessages: [unsentBubble("pend_a")] });
     registry.acquire("conv_b").setState({ pendingUserMessages: [unsentBubble("pend_b")] });
-    registry.acquire("conv_c").setState({ pendingUserMessages: [unsentBubble("pend_c")] });
-    registry.acquire("conv_d");
-    registry.setActive("conv_d");
-    // conv_b settles — it is now the oldest unpinned entry, so it is the victim.
-    registry.peek("conv_b")!.setState({ pendingUserMessages: [postedBubble("pend_b")] });
-    expect(registry.has("conv_b")).toBe(false);
-    expect(registry.has("conv_a")).toBe(true);
-    expect(a.disposed).toBe(false);
-  });
-
-  it("trims the outgoing conversation when switching back to an existing one", () => {
-    // Moving the on-screen exemption can itself make an entry evictable. A/B/C
-    // pinned, then cold-opening D leaves four entries — correct, D is protected
-    // as both active and just-acquired. Switching back to A makes the now-unpinned
-    // D a valid victim, but `setActive` used not to trim and `acquire(A)` returns
-    // early for an existing entry, so D's excess SSE connection stayed open until
-    // something unrelated happened.
-    for (const id of ["conv_a", "conv_b", "conv_c"]) {
-      registry.acquire(id).setState({ pendingUserMessages: [unsentBubble(`pend_${id}`)] });
-    }
-    const d = registry.acquire("conv_d");
-    registry.setActive("conv_d");
-    expect(registry.ids()).toHaveLength(4);
-
-    // Back to A, which is still live. D is no longer active or pinned.
-    registry.setActive("conv_a");
-
-    expect(registry.has("conv_d")).toBe(false);
-    expect(d.disposed).toBe(true);
-    expect(registry.ids()).toHaveLength(3);
-    expect(registry.has("conv_a")).toBe(true);
-  });
-
-  it("never evicts the conversation being switched TO", () => {
-    // The incoming conversation is about to be painted, so the new `setActive`
-    // trim must never take it. Here every entry is pinned, so the sweep finds no
-    // legal victim and the registry correctly stays over budget rather than
-    // disposing the entry the user is switching to.
-    const a = registry.acquire("conv_a");
-    a.setState({ pendingUserMessages: [unsentBubble("pend_a")] });
-    registry.acquire("conv_b").setState({ pendingUserMessages: [unsentBubble("pend_b")] });
-    registry.acquire("conv_c").setState({ pendingUserMessages: [unsentBubble("pend_c")] });
-    registry.acquire("conv_d").setState({ pendingUserMessages: [unsentBubble("pend_d")] });
-    registry.setActive("conv_d");
-    expect(registry.ids()).toHaveLength(4);
-
-    registry.setActive("conv_a");
-
-    expect(registry.has("conv_a")).toBe(true);
-    expect(a.disposed).toBe(false);
-    expect(registry.ids()).toHaveLength(4);
-  });
-
-  it("never hands back an entry it just evicted", () => {
-    // Eviction runs after insertion, so the entry being acquired is itself a
-    // candidate. With every older entry pinned, the sweep would otherwise reach
-    // the new one and dispose it — returning a dead entry whose writes are
-    // silently dropped, which is worse than exceeding the cap.
-    for (const id of ["conv_a", "conv_b", "conv_c"]) {
-      registry.acquire(id).setState({ pendingUserMessages: [unsentBubble(`pend_${id}`)] });
-    }
-    const fresh = registry.acquire("conv_d");
-    expect(fresh.disposed).toBe(false);
-    expect(registry.has("conv_d")).toBe(true);
+    registry.setActive("conv_b"); // conv_b on screen, conv_a pinned
+    expect(registry.evictLruEvictable()).toBeNull();
+    expect(registry.ids()).toEqual(["conv_a", "conv_b"]);
   });
 
   it("aborts the stream when an entry is disposed", () => {

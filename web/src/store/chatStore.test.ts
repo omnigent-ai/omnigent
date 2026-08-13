@@ -62,6 +62,12 @@ import {
   releaseConversation,
 } from "./chatStore";
 import { conversationRegistry } from "./conversationRegistry";
+import {
+  resetStreamSlotManager,
+  setStreamSlotManagerForTest,
+  type StreamSlot,
+  type StreamSlotManager,
+} from "./streamSlots";
 import { useTerminalActivityStore } from "./terminalActivity";
 
 // The real `send` action, captured before any test stubs it via
@@ -392,6 +398,47 @@ function readConversationRows(): Conversation[] {
   return data?.pages.flatMap((p) => p.data) ?? [];
 }
 
+/**
+ * Deterministic origin-wide slot manager for tests (jsdom has no
+ * `navigator.locks`). `capacity` total slots, of which `externallyHeld` model
+ * other tabs' holds; the rest are grantable to this tab.
+ */
+interface FakeSlotManager extends StreamSlotManager {
+  heldByTab: () => number;
+  setCapacity: (n: number) => void;
+  setExternallyHeld: (n: number) => void;
+}
+function makeFakeSlotManager(
+  opts: { capacity?: number; externallyHeld?: number } = {},
+): FakeSlotManager {
+  let capacity = opts.capacity ?? 100;
+  let externallyHeld = opts.externallyHeld ?? 0;
+  let held = 0;
+  return {
+    tryAcquire: (): Promise<StreamSlot | null> => {
+      if (externallyHeld + held >= capacity) return Promise.resolve(null);
+      held += 1;
+      let released = false;
+      return Promise.resolve({
+        release: () => {
+          if (!released) {
+            released = true;
+            held -= 1;
+          }
+          return Promise.resolve();
+        },
+      });
+    },
+    heldByTab: () => held,
+    setCapacity: (n) => {
+      capacity = n;
+    },
+    setExternallyHeld: (n) => {
+      externallyHeld = n;
+    },
+  };
+}
+
 beforeEach(() => {
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   sessionSnapshots = new Map();
@@ -402,6 +449,9 @@ beforeEach(() => {
   sessionSubagentRoutingOverrides = new Map();
   sessionLabels = new Map();
   initChatStore(client);
+  // Generous, deterministic slots for tests that aren't about the cap; the
+  // dedicated stream-slot tests install their own small-capacity manager.
+  setStreamSlotManagerForTest(makeFakeSlotManager());
   useChatStore.setState({
     conversationId: null,
     blocks: [],
@@ -417,6 +467,8 @@ beforeEach(() => {
     subagentRoutingOverride: null,
     codexPlanMode: false,
     abortController: null,
+    streamBudgetExceeded: false,
+    streamBudgetBannerDismissed: false,
     // Restore the real send action; a prior test may have stubbed it.
     send: realSend,
   });
@@ -435,6 +487,7 @@ afterEach(() => {
   // plumbing, so nothing errors the body and `parseSseStream` stays parked on
   // `reader.read()`. Close the streams so those reads actually settle.
   closeOpenEmptyStreams();
+  resetStreamSlotManager();
   vi.useRealTimers();
   vi.unstubAllGlobals();
   // Reset the stubbed viewer identity to the default (null) so a value set
@@ -10632,5 +10685,82 @@ describe("chatStore — attributing pre-turn blocks to the turn", () => {
 
     const rids = useChatStore.getState().blocks.map((b) => b.ctx.responseId);
     expect(rids).toEqual(["", "codex_prev", "codex_now"]);
+  });
+});
+
+describe("chatStore — origin-wide stream slots", () => {
+  it("holds one slot per live stream while within budget", async () => {
+    const slots = makeFakeSlotManager({ capacity: 5 });
+    setStreamSlotManagerForTest(slots);
+    seedSession("conv_a", []);
+    seedSession("conv_b", []);
+
+    await useChatStore.getState().switchTo("conv_a");
+    await useChatStore.getState().switchTo("conv_b");
+
+    // Both stream, neither over budget: one held slot each.
+    expect(slots.heldByTab()).toBe(2);
+    expect(useChatStore.getState().streamBudgetExceeded).toBe(false);
+    expect(conversationRegistry.has("conv_a")).toBe(true);
+    expect(conversationRegistry.has("conv_b")).toBe(true);
+  });
+
+  it("reclaims this tab's own LRU background stream when the origin is saturated", async () => {
+    // Two total slots. Opening a third conversation can't take a free slot, so
+    // the tab evicts its own oldest background stream (conv_a) to make room —
+    // no banner, because it stayed within budget by reclaiming its own.
+    const slots = makeFakeSlotManager({ capacity: 2 });
+    setStreamSlotManagerForTest(slots);
+    for (const id of ["conv_a", "conv_b", "conv_c"]) seedSession(id, []);
+
+    await useChatStore.getState().switchTo("conv_a");
+    await useChatStore.getState().switchTo("conv_b");
+    await useChatStore.getState().switchTo("conv_c");
+
+    expect(conversationRegistry.has("conv_a")).toBe(false); // evicted (LRU)
+    expect(conversationRegistry.has("conv_b")).toBe(true);
+    expect(conversationRegistry.has("conv_c")).toBe(true);
+    expect(slots.heldByTab()).toBe(2); // exactly the budget, no more
+    expect(useChatStore.getState().streamBudgetExceeded).toBe(false);
+  });
+
+  it("opens the active conversation over budget, with the banner, when a fresh tab finds every slot held by others", async () => {
+    // Every slot held by other tabs; this fresh tab has nothing of its own to
+    // reclaim. The conversation must still open (you have to be able to use
+    // what you're looking at), and the too-many-tabs banner is raised.
+    const slots = makeFakeSlotManager({ capacity: 3, externallyHeld: 3 });
+    setStreamSlotManagerForTest(slots);
+    seedSession("conv_new_tab", []);
+
+    await useChatStore.getState().switchTo("conv_new_tab");
+
+    expect(useChatStore.getState().conversationId).toBe("conv_new_tab");
+    expect(useChatStore.getState().abortController).not.toBeNull(); // stream opened
+    expect(slots.heldByTab()).toBe(0); // over budget — no slot held
+    expect(useChatStore.getState().streamBudgetExceeded).toBe(true);
+  });
+
+  it("re-shows the banner on a fresh over-budget episode after the user dismissed it", async () => {
+    const slots = makeFakeSlotManager({ capacity: 2, externallyHeld: 2 });
+    setStreamSlotManagerForTest(slots);
+    for (const id of ["conv_a", "conv_b", "conv_c"]) seedSession(id, []);
+
+    // Fresh tab, every slot held elsewhere → over budget + banner.
+    await useChatStore.getState().switchTo("conv_a");
+    expect(useChatStore.getState().streamBudgetExceeded).toBe(true);
+
+    useChatStore.getState().dismissStreamBudgetBanner();
+    expect(useChatStore.getState().streamBudgetBannerDismissed).toBe(true);
+
+    // A tab closes → a slot frees; the next open takes it and the episode ends.
+    slots.setExternallyHeld(1);
+    await useChatStore.getState().switchTo("conv_b");
+    expect(useChatStore.getState().streamBudgetExceeded).toBe(false);
+
+    // Origin saturates again → a NEW episode re-shows the banner (un-dismissed).
+    slots.setExternallyHeld(2);
+    await useChatStore.getState().switchTo("conv_c");
+    expect(useChatStore.getState().streamBudgetExceeded).toBe(true);
+    expect(useChatStore.getState().streamBudgetBannerDismissed).toBe(false);
   });
 });
