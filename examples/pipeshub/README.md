@@ -36,7 +36,7 @@ pipeshub/
 
 ```bash
 export PIPESHUB_MCP_URL=https://my-org.pipeshub.com/mcp
-export PIPESHUB_MCP_TOKEN=pat_...
+export PIPESHUB_MCP_TOKEN=phpat_...
 
 omnigent run examples/pipeshub/   # opens the UI; then ask your question
 ```

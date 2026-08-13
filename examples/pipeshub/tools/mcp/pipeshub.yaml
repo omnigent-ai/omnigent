@@ -19,5 +19,7 @@ headers:
 
 # NOTE: this `tools:` allow-list only applies to inline MCP entries in
 # config.yaml — directory configs like this one currently expose every tool
-# the server advertises. PipesHub's MCP surface is six tools today, so this
-# isn't limiting anything yet; worth revisiting if that surface grows.
+# the server advertises. PipesHub's MCP surface is seven tools today
+# (sources, chat, search, download_record, get_record_content, directory,
+# agents), so this isn't limiting anything yet; worth revisiting if that
+# surface grows.
