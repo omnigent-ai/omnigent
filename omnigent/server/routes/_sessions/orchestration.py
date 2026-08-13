@@ -112,7 +112,7 @@ from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerEx
 from omnigent.server.managed_hosts import (
     ManagedHostLaunch,
     ManagedLaunchTracker,
-    ManagedSandboxConfig,
+    ManagedSandboxDeployment,
     RepoWorkspace,
     host_resume_supported,
     host_sandbox_is_running,
@@ -2635,7 +2635,7 @@ async def _run_managed_launch(
     *,
     session_id: str,
     owner: str,
-    sandbox_config: ManagedSandboxConfig,
+    sandbox_config: ManagedSandboxDeployment,
     repo: RepoWorkspace | None,
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
@@ -2643,6 +2643,7 @@ async def _run_managed_launch(
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
     relaunch_host: Host | None = None,
+    provider: str | None = None,
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
 ) -> None:
@@ -2701,6 +2702,8 @@ async def _run_managed_launch(
     re-derived on every launch through the built-in gate, so there is no
     stored classifier to keep in sync — or to forge.
 
+    :param provider: Sandbox provider the create chose, or ``None`` for
+        the default. Ignored on a relaunch.
     :param agent_store: Store the classifier is resolved from, or
         ``None`` (a stripped test wiring) to leave the runner
         unclassified.
@@ -2726,6 +2729,7 @@ async def _run_managed_launch(
         tracker=tracker,
         host_store=host_store,
         relaunch_host=relaunch_host,
+        provider=provider,
         agent_name=agent_name,
     )
     if managed is None:
@@ -2746,7 +2750,7 @@ async def _bind_and_launch_managed_runner(
     *,
     session_id: str,
     managed: ManagedHostLaunch,
-    sandbox_config: ManagedSandboxConfig,
+    sandbox_config: ManagedSandboxDeployment,
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
     host_store: HostStore,
@@ -2929,6 +2933,33 @@ async def _maybe_relaunch_managed_sandbox(
         launch = tracker.get(session_id)
     if launch is not None:
         await _await_settled_managed_launch(launch)
+    # A wake settles SUCCESSFULLY even when the host came online on a DIFFERENT
+    # replica — and this one then holds no tunnel to write ``host.launch_runner``
+    # to, so letting the caller fall through would spend its whole runner budget
+    # waiting for a launch that cannot happen here. Raise WRONG_REPLICA instead:
+    # the client re-addresses without the routing key, lands on the replica that
+    # owns the tunnel, and the message-dispatch relaunch path there finds it in
+    # its LOCAL registry and launches the runner inline (``routes_events``, gated
+    # only on host presence, rebinding a stale ``runner_id`` on the way) — so the
+    # turn completes on the retry, through machinery that already exists.
+    #
+    # Safe to raise: the rendezvous resolves before the handler persists anything,
+    # so the re-addressed request is not a double-send. Skipped when there is
+    # nothing to re-address — no host binding, no registry wired (single replica,
+    # nothing can misroute), the tunnel IS here, or the host is dead everywhere
+    # rather than merely elsewhere.
+    local_host_registry = getattr(app_state, "host_registry", None)
+    if (
+        conv.host_id is not None
+        and local_host_registry is not None
+        and local_host_registry.get(conv.host_id) is None
+        and await asyncio.to_thread(host_store.is_online, conv.host_id)
+    ):
+        raise OmnigentError(
+            f"host {conv.host_id} is live on another replica after its managed "
+            "launch; retry without the routing key",
+            code=ErrorCode.WRONG_REPLICA,
+        )
     return True
 
 
@@ -3071,7 +3102,11 @@ async def ensure_runner_connected(
         return refreshed if refreshed is not None else conv
 
     # Fast path: a live runner tunnel is already reachable.
-    runner_client = await _get_runner_client(session_id, runner_router)
+    runner_client = await _get_runner_client(
+        session_id,
+        runner_router,
+        conversation=conv,
+    )
     if runner_client is not None:
         return runner_client, conv
 
@@ -3088,7 +3123,11 @@ async def ensure_runner_connected(
         conversation_store=conversation_store,
     ):
         conv = await _reread()
-        runner_client = await _get_runner_client(session_id, runner_router)
+        runner_client = await _get_runner_client(
+            session_id,
+            runner_router,
+            conversation=conv,
+        )
         if runner_client is not None:
             return runner_client, conv
 
@@ -3155,7 +3194,11 @@ async def ensure_runner_connected(
             conversation_store=conversation_store,
         ):
             conv = await _reread()
-            runner_client = await _get_runner_client(session_id, runner_router)
+            runner_client = await _get_runner_client(
+                session_id,
+                runner_router,
+                conversation=conv,
+            )
 
         if runner_client is None:
             runner_client = await _wait_for_runner_client(
@@ -3176,7 +3219,7 @@ def _kick_managed_relaunch(
     session_id: str,
     conv: Conversation,
     host: Host,
-    sandbox_config: ManagedSandboxConfig,
+    sandbox_config: ManagedSandboxDeployment,
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
     host_store: HostStore,
@@ -3268,7 +3311,7 @@ def _kick_managed_wake(
     *,
     session_id: str,
     conv: Conversation,
-    sandbox_config: ManagedSandboxConfig,
+    sandbox_config: ManagedSandboxDeployment,
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
     host_store: HostStore,
@@ -3297,7 +3340,7 @@ def _kick_managed_wake_impl(
     *,
     session_id: str,
     conv: Conversation,
-    sandbox_config: ManagedSandboxConfig,
+    sandbox_config: ManagedSandboxDeployment,
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
     host_store: HostStore,
@@ -3351,7 +3394,7 @@ async def _run_managed_wake(
     *,
     session_id: str,
     conv: Conversation,
-    sandbox_config: ManagedSandboxConfig,
+    sandbox_config: ManagedSandboxDeployment,
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
     host_store: HostStore,
@@ -3425,14 +3468,38 @@ async def _run_managed_wake(
             # this replica's in-memory tunnel registry — the woken host's tunnel
             # can lag here (or land on another replica). Poll briefly so the runner
             # launches once it reconnects, instead of settling "ready" with no
-            # runner; fail clearly if it never shows rather than losing the turn.
+            # runner; fail only if it turns out to be online nowhere.
             _host_reconnect_deadline = (
                 time.monotonic() + _facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S
             )
+            _cross_replica_online_poll_s = 3.0
+            _next_cross_replica_check = time.monotonic() + _cross_replica_online_poll_s
+            online_elsewhere = False
             while host_conn is None and time.monotonic() < _host_reconnect_deadline:
                 await asyncio.sleep(0.5)
                 host_conn = host_registry.get(host_id)
+                if host_conn is not None:
+                    break
+                if time.monotonic() >= _next_cross_replica_check:
+                    _next_cross_replica_check = time.monotonic() + _cross_replica_online_poll_s
+                    if await asyncio.to_thread(host_store.is_online, host_id):
+                        online_elsewhere = True
+                        break
             if host_conn is None:
+                # A host that reads live CROSS-REPLICA means the wake SUCCEEDED: the
+                # sandbox booted and its tunnel registered, just not here. Publishing
+                # a terminal "failed" for that is wrong AND it outlives the recovery —
+                # sandbox_status is cached PER POD and only "ready" evicts it, so the
+                # false failure is served back by every later keyed snapshot read (a
+                # 200, with no wrong-replica signal to correct it). Settle as ready
+                # instead; it clears any stale entry. The runner still has to launch
+                # from the replica that owns the tunnel — the request parked on this
+                # rendezvous is sent there by the WRONG_REPLICA raised in
+                # _maybe_relaunch_managed_sandbox.
+                if online_elsewhere or await asyncio.to_thread(host_store.is_online, host_id):
+                    tracker.finish(session_id)
+                    _publish_sandbox_status(session_id, "ready")
+                    return
                 tracker.fail(session_id, "managed host did not reconnect after wake")
                 _publish_sandbox_status(
                     session_id, "failed", "managed host did not reconnect after wake"
@@ -8853,7 +8920,7 @@ async def _get_session_snapshot(
     runner_exit_reports: RunnerExitReports | None = None,
     refresh_state: bool = False,
     host_store: HostStore | None = None,
-    sandbox_config: ManagedSandboxConfig | None = None,
+    sandbox_config: ManagedSandboxDeployment | None = None,
     viewer_id: str | None = None,
 ) -> SessionResponse:
     """

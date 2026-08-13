@@ -411,6 +411,9 @@ and they're in. Signup is invite-only.
 
 - **Share a live session.** Hit **Share** in the web UI and send the link;
   teammates watch your agent work and chat with it in real time.
+- **Leave a shared session.** Done with a session someone shared with you?
+  Pick **Leave session** from its sidebar row menu to drop it from your
+  sidebar. Nothing is deleted — the owner keeps it and can share it again.
 - **Co-drive.** A teammate co-attaches to your running session; their
   messages execute on **your** machine. Great for pairing or handing the
   keyboard to a domain expert mid-investigation.

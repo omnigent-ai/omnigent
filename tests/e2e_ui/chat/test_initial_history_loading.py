@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 
@@ -88,6 +89,7 @@ def _seed_long_transcript(base_url: str, session_id: str, latest_prompt: str) ->
         )
 
 
+@pytest.mark.compat_smoke
 def test_opening_a_session_fetches_history_once_and_then_stops(
     page: Page,
     seeded_session: tuple[str, str],

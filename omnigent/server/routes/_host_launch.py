@@ -23,11 +23,12 @@ from dataclasses import dataclass
 from fastapi import HTTPException
 
 from omnigent.entities import Conversation
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.stores import ConversationStore
-from omnigent.stores.host_store import Host, HostStore
+from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
 
@@ -115,7 +116,10 @@ def resolve_host_launch(
     :raises HTTPException: 404 if the host or session is missing (or the
         session is not owned by the caller — 404, not 403, so other
         users' sessions aren't enumerable); 403 if the host is owned by
-        a different user; 409 if the host is offline.
+        a different user.
+    :raises OmnigentError: 409 (CONFLICT) if the host is genuinely offline,
+        or 400 (WRONG_REPLICA) if it is live but its tunnel is on another
+        replica (a wrong-replica landing — the caller re-addresses keyless).
     """
     host = resolve_host_owner(
         user_id=user_id,
@@ -125,7 +129,15 @@ def resolve_host_launch(
 
     conn = host_registry.get(host_id)
     if conn is None:
-        raise HTTPException(status_code=409, detail="host is offline")
+        # The host's tunnel isn't on this replica. If the store shows it still
+        # live (online + fresh heartbeat), it's up on another replica — a
+        # wrong-replica landing — so surface WRONG_REPLICA (400, distinct code)
+        # and let the client re-address keyless. Otherwise it's genuinely
+        # offline → CONFLICT (409). Mirrors RunnerRouter._runner_absent_code
+        # and hosts._host_absent_error.
+        if host_is_live(host):
+            raise OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
+        raise OmnigentError("host is offline", code=ErrorCode.CONFLICT)
 
     conv = conversation_store.get_conversation(session_id)
     if conv is None:

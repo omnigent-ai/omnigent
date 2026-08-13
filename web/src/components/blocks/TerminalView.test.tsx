@@ -87,16 +87,28 @@ describe("buildAttachPath", () => {
     );
   });
 
+  it("appends ?omnigent_slice_key=host_id for host-sharded routing", () => {
+    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, "host_123")).toBe(
+      "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?omnigent_slice_key=host_123",
+    );
+  });
+
   it("appends ?transport= when a transport override is given", () => {
-    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, "control")).toBe(
+    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, undefined, "control")).toBe(
       "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?transport=control",
     );
   });
 
-  it("combines read_only and transport params", () => {
-    const path = buildAttachPath("conv_abc", "terminal_bash_s1", true, "control");
+  it("combines read_only, slice_key, and transport params", () => {
+    const path = buildAttachPath("conv_abc", "terminal_bash_s1", true, "host_789", "control");
     expect(path).toContain("read_only=true");
+    expect(path).toContain("omnigent_slice_key=host_789");
     expect(path).toContain("transport=control");
+  });
+
+  it("omits ?omnigent_slice_key when no hostId is provided", () => {
+    const path = buildAttachPath("conv_abc", "terminal_bash_s1", false);
+    expect(path.includes("omnigent_slice_key")).toBe(false);
   });
 
   it("omits ?transport when no override is given", () => {

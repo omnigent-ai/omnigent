@@ -10,6 +10,7 @@
 // falls back to the default when that host is gone or offline.
 
 const STORAGE_KEY = "omnigent:last-host-choice";
+const SANDBOX_PROVIDER_KEY = "omnigent:last-sandbox-provider";
 
 // Stored in place of a host id when the user picked the managed-sandbox option,
 // which has no host id of its own (the server provisions the host at create
@@ -40,6 +41,40 @@ export function writeLastHostChoice(choice: string): void {
   if (typeof window === "undefined") return;
   try {
     window.localStorage.setItem(STORAGE_KEY, choice);
+  } catch {
+    // localStorage quota or access errors shouldn't break the composer.
+  }
+}
+
+/**
+ * Read the user's last explicit sandbox-provider pick (e.g. `"modal"`), or
+ * `null` when nothing is stored, on a server render, or when storage is
+ * inaccessible — never throws. Paired with {@link SANDBOX_HOST_CHOICE}: when
+ * the last host choice was the sandbox, this names which provider it launched
+ * on so the composer reopens on it.
+ */
+export function readLastSandboxProvider(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage.getItem(SANDBOX_PROVIDER_KEY);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Persist the user's last sandbox-provider pick, or clear it when `provider`
+ * is `null` (a provider-less server default). Swallows quota/access errors so
+ * a failed write can't break session creation.
+ */
+export function writeLastSandboxProvider(provider: string | null): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (provider === null) {
+      window.localStorage.removeItem(SANDBOX_PROVIDER_KEY);
+    } else {
+      window.localStorage.setItem(SANDBOX_PROVIDER_KEY, provider);
+    }
   } catch {
     // localStorage quota or access errors shouldn't break the composer.
   }

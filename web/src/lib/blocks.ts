@@ -46,6 +46,11 @@ export interface BlockContext {
    *  relative `performance.now()` seconds, live streaming only) — never
    *  mix the two; each is only compared against itself. */
   createdAtS?: number;
+  /** Client-side creation time (unix epoch seconds) for LIVE blocks, which
+   *  carry no server stamp yet. Display-only (bubble timestamps) — a THIRD
+   *  clock that must never feed `turnWorkedForS`/`turnLastActivityAtS`,
+   *  whose same-clock guards assume `createdAtS` is server-stamped. */
+  clientCreatedAtS?: number;
 }
 
 /** Per-message-item content blocks. Both user input and assistant output. */

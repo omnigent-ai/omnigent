@@ -48,6 +48,7 @@ import {
   SquareCheckIcon,
   SquarePenIcon,
   Trash2Icon,
+  WalletIcon,
   XIcon,
 } from "lucide-react";
 import {
@@ -107,9 +108,11 @@ import {
   useArchiveConversation,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
+  useBulkMoveToProject,
   useProjects,
   useProjectSessions,
   useConversations,
+  useLeaveSession,
   useMoveToProject,
   useDeleteProject,
   useRenameProject,
@@ -294,6 +297,7 @@ function useActiveNavItem(): {
   isNewChatPage: boolean;
   isInboxPage: boolean;
   isTasksPage: boolean;
+  isUsagePage: boolean;
   newSessionProjectName: string | null;
 } {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
@@ -301,16 +305,18 @@ function useActiveNavItem(): {
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isInboxPage = leaf === "inbox";
   const isTasksPage = leaf === "tasks";
-  const isNewSessionRoute = activeConversationId == null && !isInboxPage && !isTasksPage;
+  const isUsagePage = leaf === "usage";
+  const isNewSessionRoute =
+    activeConversationId == null && !isInboxPage && !isTasksPage && !isUsagePage;
   const requestedProject = isNewSessionRoute
     ? new URLSearchParams(location.search).get("project")
     : null;
   const newSessionProjectName = requestedProject || null;
-  // Exclude inbox/tasks: they also have no `:conversationId`, so they would
-  // otherwise light up the "New session" button. A project-prefilled new
-  // session belongs to that project row instead of the global nav item.
+  // Exclude inbox/tasks/usage: they also have no `:conversationId`, so they
+  // would otherwise light up the "New session" button. A project-prefilled
+  // new session belongs to that project row instead of the global nav item.
   const isNewChatPage = isNewSessionRoute && newSessionProjectName == null;
-  return { isNewChatPage, isInboxPage, isTasksPage, newSessionProjectName };
+  return { isNewChatPage, isInboxPage, isTasksPage, isUsagePage, newSessionProjectName };
 }
 
 /**
@@ -583,7 +589,8 @@ export function Sidebar({
   }
 
   // Which top-level nav button to highlight for the current route.
-  const { isNewChatPage, isInboxPage, isTasksPage, newSessionProjectName } = useActiveNavItem();
+  const { isNewChatPage, isInboxPage, isTasksPage, isUsagePage, newSessionProjectName } =
+    useActiveNavItem();
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -909,6 +916,29 @@ export function Sidebar({
                     {inboxCount}
                   </span>
                 )}
+              </Link>
+            </Button>
+            <Button
+              asChild
+              variant="ghost"
+              className={cn(
+                SIDEBAR_ROW,
+                "w-full justify-start border-0 font-normal",
+                SIDEBAR_HOVER_HIGHLIGHT,
+                isUsagePage && SIDEBAR_ACTIVE_HIGHLIGHT,
+              )}
+              data-testid="usage-nav"
+            >
+              <Link to="/usage" onClick={onNavClick}>
+                <WalletIcon
+                  className={cn(
+                    "ui-icon",
+                    isUsagePage
+                      ? "text-[var(--sidebar-active-foreground)]"
+                      : "text-muted-foreground",
+                  )}
+                />
+                Usage
               </Link>
             </Button>
           </div>
@@ -1869,6 +1899,7 @@ function ConversationList({
                         allConversations={projectSessionPool}
                         onDeselectAll={onDeselectAll}
                         onExit={onExitSelectionMode}
+                        onProjectAssigned={expandProject}
                       />
                     ) : undefined
                   }
@@ -1952,6 +1983,7 @@ function ConversationList({
                             allConversations={sections.sessions}
                             onDeselectAll={onDeselectAll}
                             onExit={onExitSelectionMode}
+                            onProjectAssigned={expandProject}
                           />
                         ) : undefined
                       }
@@ -2603,6 +2635,7 @@ function ConversationMenuItems({
   setIsEditing,
   setStopOpen,
   setDeleteOpen,
+  setLeaveOpen,
   setMenuOpen,
   runArchive,
 }: {
@@ -2631,6 +2664,7 @@ function ConversationMenuItems({
   setIsEditing: (editing: boolean) => void;
   setStopOpen: (open: boolean) => void;
   setDeleteOpen: (open: boolean) => void;
+  setLeaveOpen: (open: boolean) => void;
   // Closes the controlled kebab after a project pick; a no-op for the
   // (uncontrolled) context menu, which Radix closes on select automatically.
   setMenuOpen: (open: boolean) => void;
@@ -2872,7 +2906,14 @@ function ConversationMenuItems({
           </TooltipContent>
         </Tooltip>
       )}
-      {isOwner ? (
+      {/* One destructive slot, resolved by ownership — NOT two items. The owner
+          deletes the session; a shared-with viewer leaves it (gives up their own
+          grant). Non-owners used to get Delete rendered disabled here, an
+          always-dead row; Leave is the action that row should have offered all
+          along, so it reuses the slot, the trash icon, and the destructive
+          styling rather than adding a button beneath it. Single-user mode has no
+          sharing, so it keeps the plain owner Delete. */}
+      {isOwner || isSingleUser ? (
         <C.Item
           data-testid="delete-conversation"
           variant="destructive"
@@ -2882,19 +2923,14 @@ function ConversationMenuItems({
           Delete
         </C.Item>
       ) : (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <div>
-              <C.Item data-testid="delete-conversation" disabled>
-                <Trash2Icon className="size-3.5" />
-                Delete
-              </C.Item>
-            </div>
-          </TooltipTrigger>
-          <TooltipContent side="left">
-            Only the session owner can delete this session
-          </TooltipContent>
-        </Tooltip>
+        <C.Item
+          data-testid="leave-conversation"
+          variant="destructive"
+          onSelect={() => setLeaveOpen(true)}
+        >
+          <Trash2Icon className="size-3.5" />
+          Leave session
+        </C.Item>
       )}
     </>
   );
@@ -3005,6 +3041,7 @@ function ConversationRow({
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
+  const leave = useLeaveSession();
   const moveToProject = useMoveToProject();
   // The kebab's user-facing "Stop session" action. Archiving does NOT go
   // through here — the server stops the session itself once the archived
@@ -3033,6 +3070,7 @@ function ConversationRow({
   // Opt-in "delete local branch" checkbox (worktree sessions only).
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
+  const [leaveOpen, setLeaveOpen] = useState(false);
   // True while an archive is in flight. Drives the "Archiving…" status
   // row — without it the row shows nothing while the archive completes.
   // Delete needs no counterpart: it drops its row optimistically.
@@ -3042,7 +3080,11 @@ function ConversationRow({
   // effective-permission level, so rename/share/move/drag are owner-only and
   // non-owners get a read-only row. (Finer-grained edit/manage affordances
   // live on the open-session view, which fetches the caller's real level.)
-  const isOwner = isOwnedByViewer(conversation, useViewerId());
+  // Also the id Leave revokes: leaving is a self-revoke, so it needs the
+  // viewer's own id — resolved by the time a non-owned row renders, since
+  // `isOwner` below is derived from it.
+  const viewerId = useViewerId();
+  const isOwner = isOwnedByViewer(conversation, viewerId);
   // Server-wide sharing kill switch (OMNIGENT_SHARING_MODE=off) reported by
   // /v1/info — disables the row's Share item even for managers. Fail open
   // (share enabled) while the capability probe is still loading.
@@ -3262,8 +3304,36 @@ function ConversationRow({
       {
         // Point the user at where the session went — it's no longer in
         // the sidebar list, so surface its new home in Settings.
-        onSuccess: showArchivedToast,
+        onSuccess: () => {
+          if (isActive) navigate("/", { replace: true });
+          showArchivedToast();
+        },
         onError: () => setIsArchiving(false),
+      },
+    );
+  }
+
+  function confirmLeave() {
+    // Leave is a self-revoke, so it needs the viewer's own id. The menu item is
+    // gated on the row NOT being owned by the viewer, which is only decidable
+    // once the id has resolved — so this is non-null wherever it's reachable.
+    if (viewerId === null) return;
+    // Close immediately — the row drops out of the list on success, so there's
+    // nothing left to show progress against. A failure surfaces as a toast
+    // (the row is still there to retry from).
+    setLeaveOpen(false);
+    leave.mutate(
+      { id: conversation.id, viewerId },
+      {
+        onSuccess: () => {
+          // The session 404s for this user now, so don't leave them staring at
+          // its chat surface. Mirrors delete/archive's post-mutation navigate.
+          if (isActive) navigate("/", { replace: true });
+        },
+        onError: (err) => {
+          const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
+          showToast(`Couldn't leave the session${detail}`);
+        },
       },
     );
   }
@@ -3291,6 +3361,7 @@ function ConversationRow({
     setIsEditing,
     setStopOpen,
     setDeleteOpen,
+    setLeaveOpen,
     runArchive,
   };
 
@@ -3618,6 +3689,41 @@ function ConversationRow({
               disabled={del.isPending}
             >
               Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={leaveOpen} onOpenChange={setLeaveOpen}>
+        <DialogContent
+          // Keep dialog clicks off the surrounding Link (same defensive
+          // handling as the delete dialog above).
+          onClick={(e) => e.stopPropagation()}
+        >
+          <DialogHeader>
+            <DialogTitle>Leave session?</DialogTitle>
+            <DialogDescription>
+              <span className="font-medium break-all">{label}</span> will be removed from your
+              sidebar. Nothing is deleted — the session and its history stay with its owner, who can
+              share it with you again.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="border-t-0 bg-transparent">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setLeaveOpen(false)}
+              disabled={leave.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              data-testid="confirm-leave-conversation"
+              onClick={confirmLeave}
+              disabled={leave.isPending}
+            >
+              Leave
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -4184,16 +4290,20 @@ function BulkActionBar({
   allConversations,
   onDeselectAll,
   onExit,
+  onProjectAssigned,
 }: {
   selectedIds: Set<string>;
   allConversations: Conversation[];
   onDeselectAll: () => void;
   onExit: () => void;
+  onProjectAssigned?: (projectName: string) => void;
 }) {
   const navigate = useNavigate();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
   const bulkDelete = useBulkDeleteConversations();
+  const bulkMove = useBulkMoveToProject();
+  const { data: projects = [] } = useProjects();
   const viewerId = useViewerId();
 
   const selectedConversations = useMemo(
@@ -4220,7 +4330,7 @@ function BulkActionBar({
     ownedSelected.length > 0 && (archivedSelected.length === 0 || nonArchivedSelected.length === 0);
 
   const count = selectedIds.size;
-  const isBusy = bulkArchive.isPending || bulkDelete.isPending;
+  const isBusy = bulkArchive.isPending || bulkDelete.isPending || bulkMove.isPending;
 
   // Delete acts only on owned rows, so surface that count on the control when it
   // differs from "N selected" — otherwise a mixed-ownership selection (reachable
@@ -4235,6 +4345,21 @@ function BulkActionBar({
       : "Delete";
 
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const [moveSearch, setMoveSearch] = useState("");
+
+  function handleMoveToProject(project: string) {
+    const ids = ownedSelected.map((c) => c.id);
+    if (ids.length === 0) return;
+    bulkMove.mutate(
+      { ids, project },
+      {
+        onSuccess: () => {
+          if (project) onProjectAssigned?.(project);
+          onExit();
+        },
+      },
+    );
+  }
 
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
@@ -4242,6 +4367,8 @@ function BulkActionBar({
       { ids: nonArchivedSelected.map((c) => c.id), archived: true },
       {
         onSuccess: () => {
+          if (activeId && nonArchivedSelected.some((c) => c.id === activeId))
+            navigate("/", { replace: true });
           onDeselectAll();
         },
       },
@@ -4345,6 +4472,65 @@ function BulkActionBar({
                 <TooltipContent side="bottom">Unarchive</TooltipContent>
               </Tooltip>
             )}
+            <DropdownMenu
+              onOpenChange={(open) => {
+                if (!open) setMoveSearch("");
+              }}
+            >
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      className="shrink-0"
+                      disabled={isBusy || ownedSelected.length === 0}
+                      aria-label="Move to project"
+                      data-testid="bulk-move-to-project"
+                    >
+                      {bulkMove.isPending ? (
+                        <Loader2Icon className="size-3.5 animate-spin" />
+                      ) : (
+                        <FolderInputIcon className="size-3.5" />
+                      )}
+                    </Button>
+                  </DropdownMenuTrigger>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Move to project</TooltipContent>
+              </Tooltip>
+              <DropdownMenuContent align="end" className="w-52">
+                <div className="flex items-center gap-2 border-b px-2 py-1.5">
+                  <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                  <input
+                    className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+                    placeholder="Search projects"
+                    value={moveSearch}
+                    onChange={(e) => setMoveSearch(e.target.value)}
+                    onKeyDown={(e) => e.stopPropagation()}
+                  />
+                </div>
+                <div className="max-h-48 overflow-y-auto">
+                  {(moveSearch
+                    ? projects.filter((p) =>
+                        p.name.toLowerCase().includes(moveSearch.toLowerCase()),
+                      )
+                    : projects
+                  ).map((p) => (
+                    <DropdownMenuItem
+                      key={p.name}
+                      className="px-2 py-1"
+                      onSelect={() => handleMoveToProject(p.name)}
+                    >
+                      <span className="flex-1 truncate text-left">{p.name}</span>
+                    </DropdownMenuItem>
+                  ))}
+                  {projects.length === 0 && (
+                    <p className="px-2 py-1.5 text-sm text-muted-foreground">No projects yet.</p>
+                  )}
+                </div>
+              </DropdownMenuContent>
+            </DropdownMenu>
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
@@ -4369,7 +4555,7 @@ function BulkActionBar({
           </div>
         </div>
 
-        {(bulkArchive.isError || bulkDelete.isError) && (
+        {(bulkArchive.isError || bulkDelete.isError || bulkMove.isError) && (
           <p className="text-sm text-destructive" role="alert">
             Some actions failed. Retry or dismiss.
           </p>
