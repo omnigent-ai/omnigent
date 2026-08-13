@@ -22,6 +22,36 @@ def _fips_safe_md5(*args, **kwargs):  # type: ignore[no-untyped-def]
 
 _fips_safe_hashlib.md5 = _fips_safe_md5
 
+# websockets>=15 sets proxy=True by default, so connect() auto-detects the
+# system/env proxy. On macOS, loopback addresses (127.0.0.1) are NOT in the
+# default no-proxy bypass list, so omnigent's internal tunnels get routed
+# through any configured proxy and stall until open_timeout (issue #1514).
+# Patch connect() at the package boundary — once, here — so all call sites
+# inherit proxy=None without each needing to remember the kwarg.
+import functools as _functools  # noqa: E402
+
+import websockets as _websockets  # noqa: E402
+import websockets.asyncio.client as _ws_asyncio_client  # noqa: E402
+
+_ws_orig_connect = _websockets.connect
+_ws_asyncio_orig_connect = _ws_asyncio_client.connect
+
+
+@_functools.wraps(_ws_orig_connect)
+def _ws_connect_no_proxy(*args, **kwargs):  # type: ignore[no-untyped-def]
+    kwargs.setdefault("proxy", None)
+    return _ws_orig_connect(*args, **kwargs)
+
+
+@_functools.wraps(_ws_asyncio_orig_connect)
+def _ws_asyncio_connect_no_proxy(*args, **kwargs):  # type: ignore[no-untyped-def]
+    kwargs.setdefault("proxy", None)
+    return _ws_asyncio_orig_connect(*args, **kwargs)
+
+
+_websockets.connect = _ws_connect_no_proxy  # type: ignore[attr-defined]
+_ws_asyncio_client.connect = _ws_asyncio_connect_no_proxy  # type: ignore[attr-defined]
+
 # Mirror legacy ``OMNIAGENTS_*`` env vars onto their new ``OMNIGENT_*`` names
 # before any submodule below reads the environment, so the dual-read
 # backward-compat fallback is in effect for the entire package.

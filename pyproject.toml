@@ -32,18 +32,17 @@ dependencies = [
     "pyyaml>=6.0,<7",
     # OpenClaw stores its wrapped acpx registry as JSON5.
     "json5>=0.10,<1",
-    # openai-agents<0.18.2 omits a field required by openai>=2.45.
-    # Keep this cap until the websockets<15 compatibility pin can be lifted.
-    "openai>=1.0,<2.45",
+    "openai>=2.45,<3",
     # >=14: the `e2b` extra's SDK (>=2.26) needs rich>=14 (was >=13,<14).
     "rich>=14,<15",
     "prompt_toolkit>=3.0,<4",
     "mcp>=1.0,<2",
     "starlette>=1.0.1,<2",
     "uvicorn[standard]>=0.30,<1",
-    # websockets >=15 asyncio client hangs on macOS before emitting any handshake
-    # bytes; pin below 15 until upstream fixes the regression (see issue #1514).
-    "websockets>=10.4,<15",
+    # websockets>=15 introduced proxy=True by default; all omnigent connect()
+    # calls now pass proxy=None explicitly so loopback tunnels bypass any system
+    # proxy (fixes macOS hang from issue #1514).
+    "websockets>=15,<17",
     "httpx>=0.27,<1",
     "ftfy>=6.0",
     # Portable zombie-aware PID liveness checks for the host daemon
@@ -94,7 +93,7 @@ dependencies = [
     # least one of them, so making them optional just forces every user
     # to remember `--extra all`. Issue #406.
     "claude-agent-sdk>=0.1.62",
-    "openai-agents>=0.0.17",
+    "openai-agents>=0.19.0",
     "PyJWT[crypto]>=2.8,<3",
     "argon2-cffi>=23.1,<24",
     # PEP 440 version comparison for the update check / `omni upgrade`
@@ -198,7 +197,7 @@ tracing = [
     "opentelemetry-instrumentation-sqlalchemy>=0,<1",
 ]
 agents-sdk = [
-    "openai-agents>=0.1,<1",
+    "openai-agents>=0.19.0,<1",
     "opentelemetry-instrumentation-openai-agents-v2>=0.1",
 ]
 # Google Antigravity SDK harness (`harness: antigravity`). Optional: the
