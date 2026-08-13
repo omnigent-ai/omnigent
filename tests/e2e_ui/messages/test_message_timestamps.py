@@ -28,6 +28,7 @@ from __future__ import annotations
 import re
 import time
 
+import httpx
 from playwright.sync_api import Browser, Locator, Page, expect
 
 _COMPOSER_PLACEHOLDER = "Ask the agent anything…"
@@ -49,6 +50,30 @@ def _send(page: Page, text: str) -> None:
     expect(composer).to_be_visible()
     composer.fill(text)
     page.get_by_role("button", name="Send", exact=True).click()
+
+
+def _seed_assistant_text(base_url: str, session_id: str, text: str) -> None:
+    """Append one deterministic assistant message to ``session_id``.
+
+    Same events-API seeding as ``test_adjacent_assistant_text_spacing``:
+    the store stamps ``created_at`` at append time, so the bubble renders
+    with a server-stamped timestamp without depending on a live mock-LLM
+    turn (which proved flaky under full-shard load when driven from a
+    second, touch-sized browser context).
+    """
+    resp = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_assistant_message",
+            "data": {
+                "agent": "hello_world",
+                "response_id": "resp_message_timestamps_touch",
+                "text": text,
+            },
+        },
+        timeout=10.0,
+    )
+    resp.raise_for_status()
 
 
 def _action_row(timestamp: Locator) -> Locator:
@@ -147,10 +172,16 @@ def test_touch_viewport_keeps_timestamp_row_discoverable(
     ``opacity-40`` touch fallback regressed.
     """
     base_url, session_id = seeded_session
+    _seed_assistant_text(base_url, session_id, "Touch probe assistant reply.")
     ctx = browser.new_context(viewport={"width": 375, "height": 812}, has_touch=True)
     try:
         page = ctx.new_page()
         page.goto(f"{base_url}/c/{session_id}")
+
+        # The seeded reply is already on screen; the composer send still
+        # exercises the real touch UI path for the user bubble.
+        assistant_bubble = page.locator(_ASSISTANT_BUBBLE).first
+        expect(assistant_bubble).to_be_visible(timeout=30_000)
 
         _send(page, "Touch timestamp probe: say anything.")
         user_bubble = page.locator(_USER_BUBBLE).first
@@ -163,9 +194,6 @@ def test_touch_viewport_keeps_timestamp_row_discoverable(
         # No hover performed: the row must still be partially visible.
         assert _opacity(_action_row(user_ts)) == "0.4"
 
-        assistant_bubble = page.locator(_ASSISTANT_BUBBLE).first
-        expect(assistant_bubble).to_be_visible(timeout=_ASSISTANT_TIMEOUT_MS)
-        expect(page.locator(_WORKING)).to_have_count(0, timeout=_ASSISTANT_TIMEOUT_MS)
         assistant_ts = assistant_bubble.locator(_TIMESTAMP)
         expect(assistant_ts).to_have_count(1)
         expect(assistant_ts).to_have_text(_TIME_RE)
