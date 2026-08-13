@@ -956,6 +956,26 @@ class SysSessionCreateTool(Tool):
                                 "agent's default."
                             ),
                         },
+                        "reasoning_effort": {
+                            "type": "string",
+                            "enum": [
+                                "none",
+                                "minimal",
+                                "low",
+                                "medium",
+                                "high",
+                                "xhigh",
+                                "max",
+                                "ultra",
+                            ],
+                            "description": (
+                                "Optional reasoning level for the child "
+                                "session, e.g. 'high'. Only valid with "
+                                "'agent_id', and only for harnesses with "
+                                "effort plumbing; omit to use the agent's "
+                                "default."
+                            ),
+                        },
                     },
                     # Only the always-optional fields are listed in
                     # ``required`` (none): the agent_id-vs-config_path

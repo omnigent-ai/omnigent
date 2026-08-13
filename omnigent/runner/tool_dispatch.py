@@ -2333,15 +2333,23 @@ def _build_session_create_body(
     title: object,
     message: object,
     model: object = None,
+    reasoning_effort: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
 
     ``parent_session_id`` is hard-forced to ``conversation_id`` — this is
     what makes the write child-only (an orchestrator cannot create a
-    top-level or sibling session). A non-empty ``title``, ``message``, and
-    ``model`` are included when provided; the message becomes the child's
-    first queued user turn via ``initial_items``.
+    top-level or sibling session). A non-empty ``title``, ``message``,
+    ``model``, and ``reasoning_effort`` are included when provided; the
+    message becomes the child's first queued user turn via
+    ``initial_items``.
+
+    ``model`` and ``reasoning_effort`` are passed through unvalidated:
+    this path never resolves the child's harness (the agent is named by
+    id and resolved server-side), so neither can be checked against the
+    harness's capabilities here. The server validates both against their
+    vocabularies at create.
 
     :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``.
     :param conversation_id: The caller's session id — the forced parent.
@@ -2351,6 +2359,8 @@ def _build_session_create_body(
         non-empty string.
     :param model: Optional model override, e.g. ``"databricks-glm-5-2"``;
         written as ``model_override`` on the session.
+    :param reasoning_effort: Optional reasoning level, e.g. ``"high"``;
+        written as ``reasoning_effort`` on the session.
     :returns: The JSON request body.
     """
     body: _JsonObject = {
@@ -2361,6 +2371,8 @@ def _build_session_create_body(
         body["title"] = title
     if isinstance(model, str) and model:
         body["model_override"] = model
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        body["reasoning_effort"] = reasoning_effort
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -2500,6 +2512,18 @@ async def _execute_session_create(
             }
         )
     if has_config_path:
+        # The multipart create carries only the config bundle, so an effort
+        # passed here would never reach the child. Refuse instead of dropping it.
+        if args.get("reasoning_effort") is not None:
+            return json.dumps(
+                {
+                    "error": (
+                        "sys_session_create 'reasoning_effort' is supported only "
+                        "with 'agent_id'; the 'config_path' create cannot carry "
+                        "it. Set the effort in the config you upload instead."
+                    )
+                }
+            )
         return await _session_create_from_config_path(
             str(config_path),
             args,
@@ -2515,6 +2539,7 @@ async def _execute_session_create(
         args.get("title"),
         args.get("message"),
         model=args.get("model"),
+        reasoning_effort=args.get("reasoning_effort"),
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)

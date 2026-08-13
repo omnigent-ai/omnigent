@@ -6452,6 +6452,85 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sys_session_create_persists_reasoning_effort() -> None:
+    """
+    ``sys_session_create`` threads ``reasoning_effort`` onto the create
+    body, so a self-spawned child starts at the requested effort instead
+    of the harness default — parity with ``sys_session_send``'s
+    create-time override. The server validates the value against the
+    shared effort vocabulary; this path cannot check harness support
+    because it never resolves the child's harness (same as ``model``).
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    captured: dict[str, Any] = {}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={
+                    "id": "conv_child",
+                    "agent_id": "ag_x",
+                    "agent_name": "researcher",
+                    "status": "idle",
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "reasoning_effort": "high"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert captured["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_rejects_reasoning_effort_with_config_path(
+    tmp_path: Path,
+) -> None:
+    """
+    The ``config_path`` create is multipart and carries only the agent
+    bundle, so an effort passed with it could never reach the child.
+    Refuse loudly rather than accept-and-drop.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    config = tmp_path / "helper.yaml"
+    config.write_text("spec_version: 1\nname: helper\n", encoding="utf-8")
+
+    posted = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal posted
+        posted = True
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "helper.yaml", "reasoning_effort": "high"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    assert "reasoning_effort" in json.loads(output)["error"]
+    assert not posted, "rejected create must not reach the server"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "arguments",
     [
