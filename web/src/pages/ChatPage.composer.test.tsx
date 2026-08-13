@@ -1530,6 +1530,20 @@ describe("Composer file-attachment focus", () => {
 
     expect(document.activeElement).not.toBe(ta);
   });
+
+  it("clears the rejection notice once the user types", () => {
+    // The rejected file is never attached, so there is no chip to remove and
+    // nothing else clears the notice. Left sticky it reads as a blocker on a
+    // composer that can actually be submitted.
+    render(<Composer {...composerProps()} />);
+    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    fireEvent.change(fileInput(), { target: { files: [bad] } });
+    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+
+    fireEvent.change(textarea(), { target: { value: "never mind, just a question" } });
+
+    expect(screen.queryByText(/can't be attached/)).toBeNull();
+  });
 });
 
 // The "Chatting with sub-agent …" tray peeks above the composer only when a

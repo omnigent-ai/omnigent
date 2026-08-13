@@ -42,6 +42,13 @@ _MCP_BRIDGE_CONFIG_FILE = "bridge.json"
 # (confirmed against kiro-cli 2.10.0). Mirrors cursor-native's ``.cursor/mcp.json``.
 _WORKSPACE_MCP_CONFIG_REL = Path(".kiro") / "settings" / "mcp.json"
 _TMUX_READY_TIMEOUT_S = 30.0
+# kiro's TUI shows "Initializing · type to queue a message" while it boots its
+# JS renderer; on a slow or degraded network that boot measured 35-38s, past the
+# 30s gate, so the first web turn failed on an otherwise healthy TUI. While that
+# banner is on the pane kiro is provably still coming up, so keep waiting up to
+# this longer ceiling instead of giving up at ``_TMUX_READY_TIMEOUT_S``.
+_KIRO_BOOT_READY_TIMEOUT_S = 120.0
+_KIRO_BOOT_MARKERS = ("Initializing",)
 _TMUX_SEND_TIMEOUT_S = 10.0
 _POLL_INTERVAL_S = 0.2
 _TYPE_SETTLE_S = 0.3
@@ -517,13 +524,45 @@ def _wait_for_kiro_input_ready(
     *,
     timeout_s: float,
 ) -> None:
-    """Wait until Kiro has rendered an input prompt before typing."""
+    """Wait until Kiro has rendered an input prompt before typing.
+
+    Extends the wait to :data:`_KIRO_BOOT_READY_TIMEOUT_S` while kiro's
+    "Initializing" banner is still on the pane, so a slow TUI boot delays the
+    first turn instead of failing it. A pane that is neither ready nor booting
+    still fails at *timeout_s*.
+    """
     deadline = time.monotonic() + timeout_s
+    boot_deadline = time.monotonic() + max(timeout_s, _KIRO_BOOT_READY_TIMEOUT_S)
+    pane = ""
     while time.monotonic() < deadline:
-        if _kiro_input_ready(_capture_pane(socket_path, tmux_target)):
+        pane = _capture_pane(socket_path, tmux_target)
+        if _kiro_input_ready(pane):
             return
+        if _kiro_still_booting(pane) and time.monotonic() < boot_deadline:
+            deadline = boot_deadline
         time.sleep(_POLL_INTERVAL_S)
-    raise RuntimeError("kiro-native TUI input prompt was not ready before injection")
+    # A kiro-cli that refused its own argv (e.g. an unsupported flag) leaves the
+    # error on the pane and never renders a prompt; quote it so the surfaced
+    # failure names the real cause instead of just the readiness timeout.
+    raise RuntimeError(
+        "kiro-native TUI input prompt was not ready before injection"
+        + (f"; kiro terminal showed: {detail}" if (detail := _kiro_pane_error(pane)) else "")
+    )
+
+
+def _kiro_still_booting(pane: str) -> bool:
+    """Return whether Kiro's input region shows it is still initializing."""
+    region = _kiro_input_region(pane)
+    return any(marker in region for marker in _KIRO_BOOT_MARKERS)
+
+
+def _kiro_pane_error(pane: str) -> str:
+    """Return the last error-looking line from the pane, or an empty string."""
+    for raw_line in reversed(pane.splitlines()):
+        line = raw_line.strip()
+        if line.lower().startswith(("error:", "warning: ", "thread '")):
+            return line[:200]
+    return ""
 
 
 def _paste_payload_bytes(text: str) -> bytes:

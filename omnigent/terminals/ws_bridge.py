@@ -86,6 +86,14 @@ WS_CLOSE_TERMINAL_NOT_FOUND: Final[int] = 4404
 # treat this as a terminal-gone exit: a detach misread as 4404 would
 # tear the whole session (and runner) down.
 WS_CLOSE_TERMINAL_DETACHED: Final[int] = 4405
+# 4400 is the WS analogue of the HTTP 400 ``wrong_replica`` (the 44xx band
+# mirrors HTTP 4xx, as 4500 mirrors 5xx): the runner tunnel is bound but not on
+# this replica (the ``?omnigent_slice_key=`` reached a replica that doesn't hold
+# the tunnel — the key doesn't match where it lives). Unlike 4500 (a genuine
+# failure), the request is valid and just misrouted: the client re-dials keyless
+# and reaches the replica the tunnel actually lives on. Mirrors the fetch path's
+# keyless re-address on a ``wrong_replica`` 400.
+WS_CLOSE_WRONG_REPLICA: Final[int] = 4400
 WS_CLOSE_INTERNAL_ERROR: Final[int] = 4500
 
 # A ``tmux has-session`` liveness probe is local and near-instant; cap

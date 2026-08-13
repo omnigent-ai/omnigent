@@ -911,7 +911,21 @@ def test_native_tui_registered_and_gates(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.setattr("tests.harness_bench.runtime_env._profile_from_config", lambda: None)
+    # An omnigent-credential native (claude-native routes its model through the
+    # gateway) still skips when no creds resolve.
     assert NativeTuiDriver.unavailable(claude_native, databricks_profile=None) is not None
+
+    # An own_auth native (agy logs its own model in) is NOT skipped for missing
+    # gateway creds — the creds gate is bypassed; only a missing vendor CLI can.
+    agy_native = BenchProfile(
+        harness="antigravity-native",
+        model="m",
+        env_prefix="HARNESS_ANTIGRAVITY_NATIVE_",
+        marker="X",
+    )
+    assert native_vendor("antigravity-native").own_auth is True
+    agy_reason = NativeTuiDriver.unavailable(agy_native, databricks_profile=None)
+    assert agy_reason is None or "gateway creds" not in agy_reason
 
 
 def test_transport_resolution_family_default_and_fast() -> None:

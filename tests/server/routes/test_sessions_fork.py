@@ -543,14 +543,13 @@ async def test_fork_session_404_missing_source() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fork_session_400_sub_agent() -> None:
-    """POST /sessions/{id}/fork returns 400 when source is a sub-agent session.
+async def test_fork_session_promotes_sub_agent() -> None:
+    """POST /sessions/{id}/fork accepts a sub-agent source.
 
-    Sub-agent conversations are internal execution artifacts owned by a
-    parent session. Forking one would produce a zombie that appears in
-    the parent's ``/children`` list and might collide with the
-    ``(parent_conversation_id, title)`` uniqueness index. The fork
-    endpoint must reject them.
+    Forking a sub-agent is how it is promoted to a top-level session:
+    the store always builds the fork parentless, so the copy reaches the
+    sidebar and outlives the parent. The route must not reject the
+    source for being a child.
     """
     conv = _make_conversation(kind="sub_agent")
     store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
@@ -558,12 +557,33 @@ async def test_fork_session_400_sub_agent() -> None:
 
     resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
 
-    assert resp.status_code == 400, (
-        f"Expected 400 for sub-agent source, got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 201, (
+        f"Expected 201 promoting a sub-agent, got {resp.status_code}: {resp.text}"
     )
-    error = resp.json().get("error", {})
-    assert "sub-agent" in error.get("message", "").lower(), (
-        f"Error message should mention 'sub-agent', got: {error}"
+    assert len(store.fork_calls) == 1, f"Expected one fork call, got {store.fork_calls}"
+
+
+@pytest.mark.asyncio
+async def test_fork_session_sub_agent_replaces_presentation_labels() -> None:
+    """Promoting a sub-agent recomputes the fork's UI-mode labels.
+
+    A sub-agent carries a wrapper label marking it as somebody's child
+    (no terminal of its own — the parent owns the tmux pane). Copying
+    that onto a top-level fork would strand it in a child's UI mode, so
+    the route supplies the labels for the harness the fork actually
+    binds — here an SDK agent, i.e. plain chat (``{}``).
+    """
+    conv = _make_conversation(kind="sub_agent")
+    store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    client = TestClient(_build_app(store))
+
+    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+
+    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    # None would mean "keep the source's labels" — the child's wrapper.
+    assert store.fork_calls[0]["presentation_labels"] == {}, (
+        "Promoting a sub-agent must replace its UI-mode labels, got "
+        f"{store.fork_calls[0]['presentation_labels']!r}"
     )
 
 

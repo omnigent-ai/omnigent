@@ -126,6 +126,24 @@ export class RunnerOfflineError extends Error {
   }
 }
 
+/**
+ * The requested path lies outside everything this session can browse.
+ *
+ * Only raised for a confined agent (one whose sandbox declares path grants);
+ * an unconfined session can browse anywhere its shell can read. Carries the
+ * reachable roots so the panel can say what IS available rather than showing
+ * an empty tree that reads as "this directory is empty".
+ */
+export class PathUnreachableError extends Error {
+  readonly reachableRoots: string[];
+
+  constructor(message: string, reachableRoots: string[]) {
+    super(message);
+    this.name = "PathUnreachableError";
+    this.reachableRoots = reachableRoots;
+  }
+}
+
 // ── Runner-boot retry policy ──────────────────────────────────────────────────
 //
 // A freshly-bound session whose runner is still booting/connecting its WS
@@ -301,23 +319,62 @@ interface FilesystemListResponse {
   has_more: boolean;
 }
 
-/** Normalize a raw filesystem list payload into `WorkspaceFile[]`. */
-function mapFilesystemEntries(json: FilesystemListResponse): WorkspaceFile[] {
-  return json.data.map((e) => ({
-    path: e.path,
-    name: e.name,
-    type: e.type === "directory" ? "directory" : "file",
-    bytes: e.bytes,
-    modified_at: e.modified_at,
-  }));
+/**
+ * Normalize a raw filesystem list payload into `WorkspaceFile[]` whose paths
+ * are relative to the browsed location.
+ *
+ * The two wire forms of a location disagree about the shape they list back: a
+ * RELATIVE target is echoed as a prefix on every entry (``"reports"`` yields
+ * ``"reports/summary.md"``) while an absolute one is not (``"summary.md"``).
+ * Stripping the relative prefix makes them interchangeable, so the panel can
+ * choose the wire form on authorization grounds alone.
+ *
+ * @param json Raw list payload.
+ * @param target Location that was listed, ``""`` for the workspace root.
+ * @param prefix Path re-attached to every entry, for callers whose paths must
+ *   stay relative to a shallower root than the directory they listed.
+ */
+function mapFilesystemEntries(
+  json: FilesystemListResponse,
+  target = "",
+  prefix = "",
+): WorkspaceFile[] {
+  const echoed = target && !target.startsWith("/") ? `${target}/` : "";
+  return json.data.map((e) => {
+    const relative = echoed && e.path.startsWith(echoed) ? e.path.slice(echoed.length) : e.path;
+    return {
+      path: joinBrowseLocation(prefix, relative),
+      name: e.name,
+      type: e.type === "directory" ? "directory" : "file",
+      bytes: e.bytes,
+      modified_at: e.modified_at,
+    };
+  });
 }
 
-async function fetchWorkspaceAllFiles(conversationId: string): Promise<WorkspaceAllFilesResult> {
+async function fetchWorkspaceAllFiles(
+  conversationId: string,
+  location = "",
+): Promise<WorkspaceAllFilesResult> {
+  const segment = browseLocationSegment(location);
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem?limit=1000&order=asc`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem${segment ? `/${segment}` : ""}?limit=1000&order=asc`,
   );
   if (res.status === 404) {
     return { available: false, data: [] };
+  }
+  // The caller asked for somewhere this session may not browse. Surfaced as a
+  // typed error so the panel can name what IS reachable instead of rendering
+  // an empty tree that looks like an empty directory.
+  if (res.status === 403) {
+    const body = (await res.json().catch(() => ({}))) as {
+      error?: { message?: string; reachable_roots?: string[] };
+      detail?: string;
+    };
+    throw new PathUnreachableError(
+      body.error?.message ?? body.detail ?? "Path is outside this session's reach",
+      body.error?.reachable_roots ?? [],
+    );
   }
   // See fetchWorkspaceChangedFiles: only the app's runner_unavailable 503
   // (not an infra/front-door 503) is the offline runner, and the hook
@@ -327,7 +384,7 @@ async function fetchWorkspaceAllFiles(conversationId: string): Promise<Workspace
   }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as FilesystemListResponse;
-  return { available: true, data: mapFilesystemEntries(json) };
+  return { available: true, data: mapFilesystemEntries(json, location) };
 }
 
 /**
@@ -341,6 +398,7 @@ async function fetchWorkspaceAllFiles(conversationId: string): Promise<Workspace
 export function useWorkspaceAllFiles(
   conversationId: string | undefined,
   options: WorkspaceQueryOptions = {},
+  location = "",
 ) {
   const queryEnabled = options.enabled ?? true;
   const serveable = useWorkspaceServeable(conversationId);
@@ -350,8 +408,8 @@ export function useWorkspaceAllFiles(
   const sessionActive = useSessionActive(conversationId);
   useTrailingInvalidate(conversationId, sessionActive, "workspace-all-files");
   return useQuery({
-    queryKey: ["workspace-all-files", conversationId],
-    queryFn: () => fetchWorkspaceAllFiles(conversationId!),
+    queryKey: ["workspace-all-files", conversationId, location],
+    queryFn: () => fetchWorkspaceAllFiles(conversationId!, location),
     enabled:
       queryEnabled &&
       !!conversationId &&
@@ -366,6 +424,68 @@ export function useWorkspaceAllFiles(
   });
 }
 
+/**
+ * Encode a browse location into the filesystem route's path segment.
+ *
+ * A location is either workspace-relative (``"src/shell"``, the historical
+ * contract) or absolute (``"/etc"``). Absolute locations keep their leading
+ * slash — that is what marks them absolute — but it is sent percent-encoded:
+ * a literal ``//`` in the URL is what proxies collapse, which would silently
+ * turn ``/etc`` back into a workspace-relative ``etc``. Interior slashes stay
+ * literal so the path is still readable in logs.
+ *
+ * @param location Browse location, ``""`` for the workspace root.
+ * @returns The encoded path segment to append to a filesystem route.
+ */
+export function browseLocationSegment(location: string): string {
+  if (location === "" || location === "/") {
+    return location === "/" ? "%2F" : "";
+  }
+  const absolute = location.startsWith("/");
+  const encoded = location.replace(/^\//, "").split("/").map(encodeURIComponent).join("/");
+  return absolute ? `%2F${encoded}` : encoded;
+}
+
+/**
+ * Join a browse location with a path relative to it.
+ *
+ * @param location Current browse location, ``""`` for the workspace root.
+ * @param relative Path relative to that location, e.g. ``"src/app.ts"``.
+ * @returns The combined location.
+ */
+export function joinBrowseLocation(location: string, relative: string): string {
+  if (!relative) return location;
+  if (!location) return relative;
+  return location === "/" ? `/${relative}` : `${location}/${relative}`;
+}
+
+/**
+ * Express a browsed absolute path as a location relative to the workspace,
+ * falling back to the absolute form when it lies outside.
+ *
+ * The two forms are not interchangeable on the wire: the server authorizes an
+ * absolute location at owner level (it can name any path on the host) but a
+ * relative one at the viewer's normal read level. Sending a subfolder of the
+ * workspace in absolute form would therefore refuse every collaborator, even
+ * though the folder sits inside the workspace they can already list.
+ *
+ * @param browsed Absolute path being browsed, or ``null`` for the root.
+ * @param workspaceRoot Absolute workspace root, or ``null`` when unknown.
+ * @returns ``""`` for the root, a relative path when inside, else absolute.
+ */
+export function relativizeToWorkspace(
+  browsed: string | null,
+  workspaceRoot: string | null,
+): string {
+  if (!browsed) return "";
+  if (!workspaceRoot) return browsed;
+  const root = workspaceRoot.replace(/\/$/, "");
+  if (browsed === root) return "";
+  // The separator guard keeps a sibling like "/work/project-old" from being
+  // read as a child of "/work/project".
+  return browsed.startsWith(`${root}/`) ? browsed.slice(root.length + 1) : browsed;
+}
+
 // ── Recursive file search ──────────────────────────────────────────────────────
 
 async function fetchWorkspaceFileSearch(
@@ -373,20 +493,22 @@ async function fetchWorkspaceFileSearch(
   query: string,
   include: string,
   exclude: string,
+  location: string,
 ): Promise<WorkspaceFile[]> {
   const params = new URLSearchParams({ limit: "500" });
   if (query) params.set("q", query);
   if (include) params.set("include", include);
   if (exclude) params.set("exclude", exclude);
+  const segment = browseLocationSegment(location);
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/search?${params}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/search${segment ? `/${segment}` : ""}?${params}`,
   );
   // 404 means the runner has no OS environment for this session (cloud-only
   // agent).  Mirror the behaviour of useWorkspaceAllFiles: return empty
   // results rather than surfacing an error.
   if (res.status === 404) return [];
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return mapFilesystemEntries((await res.json()) as FilesystemListResponse);
+  return mapFilesystemEntries((await res.json()) as FilesystemListResponse, location);
 }
 
 /**
@@ -409,15 +531,23 @@ export function useWorkspaceFileSearch(
   include: string | undefined = undefined,
   exclude: string | undefined = undefined,
   options: WorkspaceQueryOptions = {},
+  location = "",
 ) {
   const serveable = useWorkspaceServeable(conversationId);
   const trimmed = query.trim();
   const trimmedInclude = include?.trim() ?? "";
   const trimmedExclude = exclude?.trim() ?? "";
   return useQuery({
-    queryKey: ["workspace-file-search", conversationId, trimmed, trimmedInclude, trimmedExclude],
+    queryKey: [
+      "workspace-file-search",
+      conversationId,
+      trimmed,
+      trimmedInclude,
+      trimmedExclude,
+      location,
+    ],
     queryFn: () =>
-      fetchWorkspaceFileSearch(conversationId!, trimmed, trimmedInclude, trimmedExclude),
+      fetchWorkspaceFileSearch(conversationId!, trimmed, trimmedInclude, trimmedExclude, location),
     enabled:
       (options.enabled ?? true) && !!conversationId && trimmed.length > 0 && serveable !== false,
     staleTime: 5_000,
@@ -430,13 +560,17 @@ export function useWorkspaceFileSearch(
 async function fetchWorkspaceDirectory(
   conversationId: string,
   dirPath: string,
+  location = "",
 ): Promise<WorkspaceFile[]> {
-  const encodedPath = dirPath.split("/").map(encodeURIComponent).join("/");
+  const target = joinBrowseLocation(location, dirPath);
+  const encodedPath = browseLocationSegment(target);
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}?limit=1000&order=asc`,
   );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return mapFilesystemEntries((await res.json()) as FilesystemListResponse);
+  // The tree addresses children relative to the location it is rooted at, one
+  // level shallower than the directory just listed.
+  return mapFilesystemEntries((await res.json()) as FilesystemListResponse, target, dirPath);
 }
 
 // ── Path existence check (parent-directory listing) ──────────────────────────
@@ -622,21 +756,53 @@ export interface WorkspaceEnvironment {
    * paths before resolving them against {@link root}.
    */
   home: string | null;
+  /**
+   * What this session's file browsing can reach.
+   *
+   * ``unconfined`` reports that no OS-level sandbox is applied, so the
+   * session's shell already reads anything the runner can and the panel may
+   * navigate anywhere. ``roots`` always names the declared grants, workspace
+   * first — the anchor the panel opens at, not a ceiling when unconfined.
+   * ``null`` while the environment metadata is still loading, or when an
+   * older server doesn't report it.
+   */
+  reachable: WorkspaceReach | null;
+}
+
+/** A path this session's file tools may reach, and how. */
+export interface WorkspaceReachRoot {
+  path: string;
+  access: "read" | "write";
+  origin: "cwd" | "read_paths" | "write_paths" | "write_files";
+}
+
+export interface WorkspaceReach {
+  unconfined: boolean;
+  roots: WorkspaceReachRoot[];
 }
 
 async function fetchWorkspaceEnvironment(conversationId: string): Promise<WorkspaceEnvironment> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}`,
   );
-  if (res.status === 404) return { available: false, root: null, home: null };
+  if (res.status === 404) {
+    return { available: false, root: null, home: null, reachable: null };
+  }
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
   }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const json = (await res.json()) as { metadata?: { root?: string; home?: string } };
+  const json = (await res.json()) as {
+    metadata?: { root?: string; home?: string; reachable?: WorkspaceReach };
+  };
   const root = json.metadata?.root ?? null;
   const home = json.metadata?.home ?? null;
-  return { available: root !== null, root, home };
+  return {
+    available: root !== null,
+    root,
+    home,
+    reachable: json.metadata?.reachable ?? null,
+  };
 }
 
 /**
@@ -668,11 +834,15 @@ export function useWorkspaceEnvironment(
  * when the user expands a directory node.  The query is disabled when
  * `dirPath` is null (collapsed or not yet requested).
  */
-export function useWorkspaceDirectory(conversationId: string | undefined, dirPath: string | null) {
+export function useWorkspaceDirectory(
+  conversationId: string | undefined,
+  dirPath: string | null,
+  location = "",
+) {
   const serveable = useWorkspaceServeable(conversationId);
   return useQuery({
-    queryKey: ["workspace-dir", conversationId, dirPath],
-    queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath!),
+    queryKey: ["workspace-dir", conversationId, dirPath, location],
+    queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath!, location),
     enabled: !!conversationId && !!dirPath && serveable !== false,
     staleTime: 5_000,
   });

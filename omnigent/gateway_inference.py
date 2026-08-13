@@ -29,19 +29,44 @@ _CODEX_GATEWAY_PATH_SUFFIX = "/codex/v1"
 def claude_gateway_inference_backed() -> bool:
     """Whether a claude-native launch on this host resolves gateway-backed inference.
 
-    A gateway-backed launch pins ``ANTHROPIC_BASE_URL`` and delivers its bearer
-    token through Claude Code's ``apiKeyHelper``. The Bedrock path sets
-    ``ANTHROPIC_BEDROCK_BASE_URL`` with no helper, and a subscription / CLI
-    login resolves no config at all — neither is routable.
+    A gateway-backed launch pins a Databricks AI Gateway ``ANTHROPIC_BASE_URL``
+    and delivers its bearer token through Claude Code's ``apiKeyHelper``. The
+    base URL must be a genuine Databricks AI Gateway (validated with
+    :func:`is_databricks_ai_gateway_url`, parity with the Codex check), since
+    the external router's picks are Databricks catalog ids only that endpoint
+    serves. The Bedrock path sets ``ANTHROPIC_BEDROCK_BASE_URL`` with no
+    helper — not routable.
 
-    :returns: ``True`` iff the resolved config is AI-Gateway-backed.
+    A subscription / CLI login resolves no omnigent config, yet Claude Code
+    still routes all inference through an AI Gateway when an enterprise managed
+    settings file pins it. Managed settings win at the actual launch, so that
+    signal counts too: it flips the answer to ``True`` even when resolution
+    yields nothing.
+
+    :returns: ``True`` iff a claude-native launch resolves AI-Gateway-backed
+        inference, from omnigent config or managed settings.
     """
-    from omnigent.claude_native import resolve_native_claude_config
+    from omnigent.claude_native import (
+        managed_claude_gateway_signal,
+        resolve_native_claude_config,
+    )
+    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 
     config = resolve_native_claude_config(spec=None, refresh_models=False)
-    if config is None:
-        return False
-    return bool(config.env.get("ANTHROPIC_BASE_URL")) and bool(config.api_key_helper)
+    if config is not None:
+        base_url = config.env.get("ANTHROPIC_BASE_URL")
+        if base_url and config.api_key_helper and is_databricks_ai_gateway_url(base_url):
+            return True
+
+    managed_base_url, managed_has_credential = managed_claude_gateway_signal()
+    if (
+        managed_base_url is not None
+        and managed_has_credential
+        and is_databricks_ai_gateway_url(managed_base_url)
+    ):
+        return True
+
+    return False
 
 
 def codex_gateway_inference_backed() -> bool:

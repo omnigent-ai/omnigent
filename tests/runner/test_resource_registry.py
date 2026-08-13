@@ -16,11 +16,16 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpe
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner.resource_registry import (
+    _TERMINAL_EXIT_OUTPUT_MAX_CHARS,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
     TerminalExitEvent,
     TerminalLifecycle,
+    _sanitize_session_id,
+    _session_workspace,
+    _terminal_exit_diagnostics,
+    _trim_terminal_exit_output,
 )
 from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import make_test_terminal_instance
@@ -402,25 +407,29 @@ async def _observe_native_agent_terminal_and_capture(
 class _FakeStatusPoller:
     """Controllable stand-in for the claude-native status-file poller.
 
-    Lets a test flip :attr:`active` (file resolved vs. falling back), flip
-    :attr:`running_level` (the file freshly reports running vs. its value
-    having gone stale), and fire status edges through the registry's
-    callback, without touching a real ``sessions/<pid>.json``.
+    Lets a test flip :attr:`active` (file resolved and therefore owning the
+    session's status, vs. the PTY watcher falling back) and fire status edges
+    through the registry's callback, without touching a real
+    ``sessions/<pid>.json``.
     """
 
     def __init__(self, on_status: object) -> None:
         self._on_status = on_status
         self.active = False
-        self.running_level = False
         self.blocked_on: str | None = None
         self.ticks = 0
+        self.retired = False
+        self.resyncs = 0
 
     def tick(self) -> None:
         self.ticks += 1
 
-    def asserts_running(self, *, ttl_s: float, now: float | None = None) -> bool:
-        del ttl_s, now
-        return self.running_level
+    def retire(self) -> None:
+        self.retired = True
+        self.active = False
+
+    def resync(self) -> None:
+        self.resyncs += 1
 
     def emit(self, status: str, blocked_on: str | None = None) -> None:
         """Simulate the file reporting a new status."""
@@ -498,53 +507,60 @@ async def test_claude_native_wires_status_poller_tick(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_pty_activity_publishes_running_even_with_active_status_file(
-    tmp_path: Path,
-) -> None:
-    """Pane activity publishes ``running`` even while the file poller is active.
+async def test_pane_publishes_no_status_while_the_file_owns_it(tmp_path: Path) -> None:
+    """An active file poller is the only status source; the pane publishes none.
 
-    Claude rewrites ``sessions/<pid>.json`` only when its value *changes*, so a
-    turn that starts while the file already reads ``busy`` produces no write at
-    all. If the file were allowed to mute the pane watcher, nothing could
-    publish ``running`` and the session would sit on a stale ``idle`` — no
-    working indicator, no stop button — for the whole turn.
+    Claude redraws its prompt after a turn and blinks a cursor, so the pane
+    keeps changing once the file has already said ``idle``. Letting both
+    publish is what made that redraw contradict the file and needed a
+    freshness window to arbitrate — so while the file is readable it decides,
+    and the pane's edges are dropped.
     """
     callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
-        tmp_path, "conv_pre"
+        tmp_path, "conv_file_owns"
     )
     poller = pollers[0]
     poller.active = True
 
-    # The file already holds ``busy`` from an earlier turn, so it emits nothing.
-    callbacks["on_activity"]()
-
-    # Status edges publish via loop.call_soon_threadsafe; let them drain.
+    poller.emit("running")
+    callbacks["on_activity"]()  # pane redraws mid-turn — no second edge
     await asyncio.sleep(0)
     assert statuses == ["running"]
+
+    poller.emit("idle")
+    callbacks["on_activity"]()  # post-turn prompt redraw is not a new turn
+    callbacks["on_idle"]()  # nor does a quiet pane re-assert idle
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle"]
 
 
 @pytest.mark.asyncio
-async def test_pty_idle_deferred_only_while_file_freshly_running(tmp_path: Path) -> None:
-    """A quiet pane goes idle unless the file *freshly* reports running.
+async def test_parked_pane_stays_running_then_recovers_on_pane_death(tmp_path: Path) -> None:
+    """A dialog keeps the session running; a dead pane still ends it.
 
-    A dialog owning Claude's input quiets the pane without ending the turn, so
-    a fresh ``running`` level holds the idle edge back. Once that level goes
-    stale — a ``busy`` left standing by a background task outlives its turn —
-    the pane decides again, so the session can never be pinned to ``running``.
+    While Claude is parked on a prompt the pane is quiet but the turn is not
+    over, and only the file knows that — so the quiet pane must not publish
+    ``idle``. But a killed Claude leaves that ``waiting`` record behind, so
+    pane death retires the poller and the PTY side owns the outcome. Without
+    that, the session would spin forever.
     """
     callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
-        tmp_path, "conv_idle_gate"
+        tmp_path, "conv_parked"
     )
     poller = pollers[0]
     poller.active = True
-    poller.running_level = True
 
-    callbacks["on_activity"]()  # → running
-    callbacks["on_idle"]()  # suppressed: file freshly says running
+    poller.emit("running", "permission prompt")
+    callbacks["on_idle"]()  # pane quiet under the dialog — turn is NOT over
     await asyncio.sleep(0)
     assert statuses == ["running"]
 
-    poller.running_level = False  # the file's level went stale
+    # Claude is killed at the prompt. Its file survives holding ``waiting``.
+    callbacks["on_exit"]()
+    assert poller.retired is True
+    assert poller.active is False
+
+    # The pane now owns status again, so the session can settle.
     callbacks["on_idle"]()
     await asyncio.sleep(0)
     assert statuses == ["running", "idle"]
@@ -552,29 +568,93 @@ async def test_pty_idle_deferred_only_while_file_freshly_running(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
-    """A forwarder's hook-derived edge rebases the watcher's dedup.
+    """A forwarder's hook-derived edge rebases the shared dedup baseline.
 
     ``Stop`` → ``idle`` is posted to the server by the claude-native forwarder,
-    bypassing this watcher. Without adopting it as the baseline the watcher
-    still believes ``running`` is live and swallows the next turn's genuine
-    ``running`` as a duplicate, leaving the session stuck on the hook's idle.
+    bypassing this watcher. Adopting it as the baseline is what makes the pair
+    idempotent: the file's own ``idle`` lands on the same edge and is collapsed,
+    so the two agree regardless of which arrives first.
     """
     callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_resync"
     )
-    pollers[0].active = True
+    poller = pollers[0]
+    poller.active = True
 
-    callbacks["on_activity"]()
+    poller.emit("running")
     await asyncio.sleep(0)
     assert statuses == ["running"]
 
     # The forwarder posts Stop → idle straight to the server.
     registry.note_external_session_status("conv_resync", "idle")
 
-    # Next turn: the pane moves again and must re-publish ``running``.
-    callbacks["on_activity"]()
+    # The file catches up moments later with the same edge — deduped away, so
+    # the user sees one idle rather than a flicker.
+    poller.emit("idle")
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    # Next turn: the file reports work again and must publish.
+    poller.emit("running")
     await asyncio.sleep(0)
     assert statuses == ["running", "running"]
+    del callbacks
+
+
+@pytest.mark.asyncio
+async def test_reconnect_resync_republishes_a_running_session(tmp_path: Path) -> None:
+    """A server restart mid-turn must not strand the session on a stale status.
+
+    The tunnel reconnecting means the *listener* restarted and lost its status
+    cache. This runner did not, so its dedup baseline still asserts ``running``
+    was delivered — and Claude's file is written only when its value *changes*,
+    so nothing re-asserts on its own. Without the resync the session would show
+    no spinner and no stop button for the rest of the turn.
+    """
+    _callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_restart"
+    )
+    poller = pollers[0]
+    poller.active = True
+
+    poller.emit("running")
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    # Mid-turn, the file's value is unchanged, so a re-read publishes nothing:
+    # this is exactly what leaves the restarted server on a stale status.
+    poller.emit("running")
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    registry.resync_session_statuses()
+    assert poller.resyncs == 1
+
+    # The same value now republishes, so the fresh server learns the truth.
+    poller.emit("running")
+    await asyncio.sleep(0)
+    assert statuses == ["running", "running"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_resync_keeps_the_exit_classification_memo(tmp_path: Path) -> None:
+    """The resync clears published edges, not the exit memo.
+
+    ``_last_session_status`` decides whether a terminal exit reads as a clean
+    shutdown or a mid-turn crash. It tracks what the PANE last did, not what the
+    server has heard, so a reconnect must leave it alone — clearing it would make
+    a crash right after a reconnect look like a tidy exit.
+    """
+    _callbacks, _statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_memo"
+    )
+    pollers[0].active = True
+    pollers[0].emit("running")
+    await asyncio.sleep(0)
+
+    registry.resync_session_statuses()
+
+    assert registry._take_session_status_memo("conv_memo") == "running"
 
 
 @pytest.mark.asyncio
@@ -675,6 +755,53 @@ async def test_required_terminal_exit_while_running_is_failure(tmp_path: Path) -
 
     assert len(exits) == 1
     assert exits[0].session_was_idle is False
+
+
+def test_trim_terminal_exit_output_drops_whole_leading_lines() -> None:
+    # Over the char budget: the first surviving line must be a WHOLE line, never
+    # a mid-word fragment (the "rity reasons" cut). The final line — the one that
+    # matters — stays intact.
+    filler = "\n".join(f"line {i} " + "x" * 80 for i in range(200))
+    text = filler + "\n--dangerously-skip-permissions cannot be run for security reasons"
+    trimmed = _trim_terminal_exit_output(text)
+    assert trimmed is not None
+    assert len(trimmed) <= _TERMINAL_EXIT_OUTPUT_MAX_CHARS + 60  # + the omitted-lines marker
+    assert trimmed.startswith("... omitted ")
+    # The last line survived whole (not clipped mid-word).
+    assert trimmed.endswith("for security reasons")
+    # The first content line after the marker is a complete line.
+    first_content = trimmed.splitlines()[1]
+    assert first_content.startswith("line ")
+
+
+def test_trim_terminal_exit_output_hard_clips_single_overlong_line() -> None:
+    # A single line longer than the budget has no line boundary to snap to, so
+    # it's clipped from the tail as a last resort.
+    line = "y" * (_TERMINAL_EXIT_OUTPUT_MAX_CHARS + 500)
+    trimmed = _trim_terminal_exit_output(line)
+    assert trimmed is not None
+    assert len(trimmed) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
+
+
+def test_terminal_exit_diagnostics_reads_exit_status(tmp_path: Path) -> None:
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    instance.command = "claude"
+    instance.args = ["--dangerously-skip-permissions"]
+    instance._remember_pane_snapshot("boom")
+    # Simulate tmux having reported a dead pane with a captured status.
+    instance._remember_exit_status("1 42")
+    command, args_count, _cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
+    assert command == "claude"
+    assert args_count == 1
+    assert last_output == "boom"
+    assert exit_status == 42
+
+
+def test_remember_exit_status_ignores_live_pane() -> None:
+    instance = make_test_terminal_instance("claude", "main", tmp_path=Path("/tmp"))
+    # Live pane: pane_dead=0, empty status → nothing recorded.
+    instance._remember_exit_status("0 ")
+    assert instance.last_exit_status() is None
 
 
 @pytest.mark.asyncio
@@ -1284,13 +1411,13 @@ def test_resolve_environment_runner_workspace_overrides_absolute_spec_cwd(
 
 
 @pytest.mark.asyncio
-async def test_blocked_reason_rides_pane_edges(tmp_path: Path) -> None:
-    """The parked reason travels with every edge, not just the file's own.
+async def test_blocked_reason_survives_pane_redraws(tmp_path: Path) -> None:
+    """The parked reason survives the pane redrawing underneath the dialog.
 
-    Claude reports ``waitingFor`` once, when the dialog opens. The pane keeps
-    redrawing underneath it, so if a pane-derived ``running`` shipped without
-    the reason it would immediately erase what the file just said and the UI
-    would fall back to a bare spinner.
+    Claude reports ``waitingFor`` once, when the dialog opens, and the pane
+    keeps redrawing while it is up. Because the file owns status outright the
+    pane publishes nothing, so there is no bare ``running`` to erase the reason
+    — it stands until the file itself drops it.
     """
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
@@ -1335,16 +1462,65 @@ async def test_blocked_reason_rides_pane_edges(tmp_path: Path) -> None:
 
     poller = pollers[0]
     poller.active = True
-    poller.running_level = True
     poller.blocked_on = "permission prompt"
 
     poller.emit("running", "permission prompt")
     callbacks["on_activity"]()  # pane redraw under the dialog
+    callbacks["on_idle"]()  # and the quiet spells between redraws
     await asyncio.sleep(0)
     assert edges == [("running", "permission prompt")]
 
-    # Dialog answered: the file drops the reason and the pane keeps moving.
+    # Dialog answered: the file drops the reason on its own edge.
     poller.blocked_on = None
     poller.emit("running", None)
     await asyncio.sleep(0)
     assert edges == [("running", "permission prompt"), ("running", None)]
+
+
+@pytest.mark.parametrize(
+    "raw,expected,why",
+    [
+        ("conv_abc123", "conv_abc123", "an ordinary id is untouched"),
+        ("a" * 32, "a" * 32, "a uuid4().hex id is untouched"),
+        ("a/b", "a_b", "a POSIX separator cannot survive"),
+        ("a\\b", "a_b", "a Windows separator cannot survive either"),
+        ("../..", ".._..", "separators go, leaving no traversal component"),
+        ("..", "__", "a bare parent reference never survives"),
+        (".", "_", "a bare self reference never survives"),
+        ("", "_", "an empty id still yields a usable component"),
+        ("a\x00b", "a_b", "a NUL cannot reach os.path.join"),
+        ("a b", "a_b", "whitespace is normalized rather than quoted downstream"),
+    ],
+)
+def test_sanitize_session_id_yields_one_safe_component(raw: str, expected: str, why: str) -> None:
+    """``_sanitize_session_id`` must return a single, non-traversing path component.
+
+    The id reaches the filesystem as a directory name under the runner
+    workspace, so anything that could act as a separator or a parent reference
+    has to be neutralized here. Uses an allowlist: the previous denylist
+    stopped ``/`` and ``..`` but let a backslash through.
+    """
+    got = _sanitize_session_id(raw)
+
+    assert got == expected, why
+    # The invariants that actually matter, restated independently of the
+    # table above so a wrong `expected` cannot make this vacuous.
+    assert got, "must never be empty — it becomes a path component"
+    assert "/" not in got and "\\" not in got, "must be a single component"
+    assert set(got) != {"."}, "must not be '.' or '..'"
+
+
+def test_sanitize_session_id_keeps_traversal_out_of_the_workspace_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A hostile id cannot walk the session workspace out of the runner root.
+
+    The unit test above pins the component; this pins the property callers
+    actually depend on — that the joined path stays under the root.
+    """
+    monkeypatch.setenv("OMNIGENT_RUNNER_OS_ENV_ROOT", str(tmp_path))
+
+    resolved = Path(_session_workspace("../../../../etc")).resolve()
+
+    assert resolved.is_relative_to(tmp_path.resolve()), f"escaped the root: {resolved}"

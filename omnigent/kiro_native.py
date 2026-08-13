@@ -26,6 +26,7 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
+    open_daemon_client,
     wait_for_host_online,
     wait_for_runner_online,
 )
@@ -280,7 +281,7 @@ def _run_with_remote_server(
     from omnigent.cli import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
-    headers = _remote_headers(server_url=base_url)
+    headers = _remote_headers(server_url=base_url, host_id=None)
     try:
         resolved_session_id = _resolve_session_id_for_resume(
             base_url=base_url,
@@ -355,9 +356,10 @@ async def _prepare_kiro_terminal_via_daemon(
     if prompt:
         persist_args.append(prompt)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         reattached = False
         cold_resumed = False
+        fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Kiro session requires a session bundle.")
@@ -414,6 +416,7 @@ async def _prepare_kiro_terminal_via_daemon(
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _update_startup_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
