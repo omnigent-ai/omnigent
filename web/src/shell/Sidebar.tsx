@@ -4598,7 +4598,7 @@ function BulkActionBar({
           if (!open) setBranchesToDelete(new Set());
         }}
       >
-        <DialogContent>
+        <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>Delete {ownedSelected.length} session(s)?</DialogTitle>
             <DialogDescription>
@@ -4608,22 +4608,20 @@ function BulkActionBar({
           </DialogHeader>
           {worktreeSelected.length > 0 && (
             <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
-              <div className="flex items-start justify-between gap-2">
-                <p className="text-sm text-muted-foreground">
-                  Optionally delete the local git branches for these worktree sessions. These
-                  actions are <span className="font-semibold text-destructive">irreversible</span>.
-                </p>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="xs"
-                  className="shrink-0"
-                  onClick={toggleAllBranches}
-                  data-testid="bulk-delete-branch-toggle-all"
-                >
-                  {allBranchesSelected ? "Clear all" : "Select all"}
-                </Button>
-              </div>
+              <p className="text-sm text-muted-foreground">
+                Optionally delete the local git branches for these worktree sessions. These actions
+                are <span className="font-semibold text-destructive">irreversible</span>.
+              </p>
+              <Button
+                type="button"
+                variant="ghost"
+                size="xs"
+                className="self-start"
+                onClick={toggleAllBranches}
+                data-testid="bulk-delete-branch-toggle-all"
+              >
+                {allBranchesSelected ? "Clear all" : "Select all"}
+              </Button>
               <ul className="flex max-h-40 flex-col gap-1 overflow-y-auto">
                 {worktreeSelected.map((c) => (
                   <li key={c.id}>
