@@ -739,7 +739,7 @@ class TestGenerateExtensionJs(unittest.TestCase):
         self.assertIn("block: true", js)
 
 
-def test_generate_handover_extension_uses_tools_disabled_completion() -> None:
+def test_generate_handover_extension_reuses_the_live_prompt() -> None:
     js = _generate_handover_extension_js(
         SmartCompactionConfig(
             enabled=True,
@@ -751,7 +751,13 @@ def test_generate_handover_extension_uses_tools_disabled_completion() -> None:
 
     assert 'pi.on("session_before_compact"' in js
     assert "ctx.modelRegistry.complete" in js
-    assert "registerTool" not in js
+    assert "ctx.sessionManager.buildSessionContext()" in js
+    assert "ctx.getSystemPrompt()" in js
+    assert "pi.getActiveTools()" in js
+    assert 'tool_choice: "none"' in js
+    assert 'type: "json_schema"' in js
+    assert 'cacheRetention: "none"' not in js
+    assert "<conversation>" not in js
     assert "handoverMaxTokens" in js
     assert "__omnigent_handover_v1__" in js
 
@@ -833,9 +839,18 @@ def test_generated_handover_extension_returns_structured_compaction(
             f"""
             const extension = require(process.argv[2]);
             let handler;
+            let captured;
             extension({{
               on(event, fn) {{
                 if (event === "session_before_compact") handler = fn;
+              }},
+              getActiveTools() {{ return ["sys_os_read"]; }},
+              getAllTools() {{
+                return [{{
+                  name: "sys_os_read",
+                  description: "Read a file.",
+                  parameters: {{ type: "object", properties: {{}} }}
+                }}];
               }}
             }});
 
@@ -843,7 +858,12 @@ def test_generated_handover_extension_returns_structured_compaction(
               const result = await handler(
                 {{
                   customInstructions: "OMNIGENT_STRUCTURED_HANDOVER_V1\\n"
-                    + JSON.stringify({{ original_directive: "Exact directive." }}),
+                    + JSON.stringify({{
+                      original_directive: "Exact directive.",
+                      agent_instructions: "Preserve completed outcomes.",
+                      authoritative_repository_state: null,
+                      schema: {{ type: "object" }}
+                    }}),
                   branchEntries: [
                     {{
                       type: "message",
@@ -855,15 +875,32 @@ def test_generated_handover_extension_returns_structured_compaction(
                 }},
                 {{
                   model: {{ provider: "mock", id: "mock-model" }},
-                  modelRegistry: {{
-                    complete: async () => ({{
-                      content: [{{ type: "text", text: {json.dumps(json.dumps(draft))} }}],
-                      usage: {{ input: 10, output: 5, totalTokens: 15 }}
+                  sessionManager: {{
+                    buildSessionContext: () => ({{
+                      messages: [{{
+                        role: "user",
+                        content: [{{ type: "text", text: "Exact directive." }}],
+                        timestamp: 1
+                      }}]
                     }})
+                  }},
+                  getSystemPrompt: () => "live system prompt",
+                  modelRegistry: {{
+                    complete: async (_model, context, options) => {{
+                      captured = {{
+                        context,
+                        payload: options.onPayload({{ model: "mock-model" }}),
+                        cacheRetention: options.cacheRetention ?? null
+                      }};
+                      return {{
+                        content: [{{ type: "text", text: {json.dumps(json.dumps(draft))} }}],
+                        usage: {{ input: 10, output: 5, totalTokens: 15 }}
+                      }};
+                    }}
                   }}
                 }}
               );
-              process.stdout.write(JSON.stringify(result));
+              process.stdout.write(JSON.stringify({{ result, captured }}));
             }})().catch((error) => {{
               process.stderr.write(error && error.stack ? error.stack : String(error));
               process.exit(1);
@@ -882,10 +919,16 @@ def test_generated_handover_extension_returns_structured_compaction(
     )
     payload = json.loads(result.stdout)
 
-    compaction = payload["compaction"]
+    compaction = payload["result"]["compaction"]
     assert compaction["firstKeptEntryId"] == "__omnigent_handover_v1__"
     assert compaction["details"]["type"] == "omnigent_session_handover"
     assert compaction["details"]["draft"]["original_directive"] == "Exact directive."
+    assert payload["captured"]["context"]["systemPrompt"] == "live system prompt"
+    assert len(payload["captured"]["context"]["messages"]) == 2
+    assert payload["captured"]["context"]["tools"][0]["name"] == "sys_os_read"
+    assert payload["captured"]["payload"]["tool_choice"] == "none"
+    assert payload["captured"]["payload"]["response_format"]["type"] == "json_schema"
+    assert payload["captured"]["cacheRetention"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -5650,13 +5693,7 @@ def _handover_lines() -> list[str]:
 
 
 def test_waiting_for_a_handover_reports_progress() -> None:
-    """A handover that outlives the poll interval says so, once per poll.
-
-    The scaffold fails a turn that goes quiet for 240 seconds. A handover is
-    one uninterrupted model call with a 300-second budget of its own, so
-    without a progress event on every poll the outer watchdog always wins and
-    the larger budget never applies.
-    """
+    """A timed-out handover reports progress and continues from a fallback."""
 
     async def _test() -> None:
         executor, rpc = _executor_and_scripted_rpc(_handover_lines())
@@ -5681,6 +5718,36 @@ def test_waiting_for_a_handover_reports_progress() -> None:
             return None
 
         rpc.read_line = read_line
+        interrupted: list[str] = []
+
+        async def fake_interrupt(session_key: str) -> bool:
+            interrupted.append(session_key)
+            return True
+
+        executor.interrupt_session = fake_interrupt
+
+        continuation_rpc = _PiRpcSession()
+        continuation_rpc._line_queue = asyncio.Queue()
+        continuation_rpc.process = _FakeProcess()
+        continuation_rpc._stderr_lines = []
+        for event in (
+            {"type": "response", "success": True},
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "text_delta",
+                    "delta": "Continued from the fallback.",
+                },
+            },
+            {"type": "agent_end", "messages": []},
+        ):
+            continuation_rpc._line_queue.put_nowait(json.dumps(event))
+
+        async def fake_restart(**kwargs):
+            assert "<session_handover>" in kwargs["continuation"]
+            return continuation_rpc
+
+        executor._restart_rpc_for_handover = fake_restart
 
         events = [
             event
@@ -5691,8 +5758,88 @@ def test_waiting_for_a_handover_reports_progress() -> None:
 
         progress = [event for event in events if isinstance(event, ExecutorProgress)]
         assert progress, "a silent poll loop is what the idle watchdog kills"
-        errors = [event for event in events if isinstance(event, ExecutorError)]
-        assert errors and "handover did not complete" in errors[-1].message
+        assert interrupted
+        compacted = [event for event in events if isinstance(event, CompactionComplete)]
+        assert len(compacted) == 1
+        assert compacted[0].handover["mode"] == "generic"
+        completed = [event for event in events if isinstance(event, TurnComplete)]
+        assert len(completed) == 1
+        assert completed[0].response == "Continued from the fallback."
+
+    _run(_test())
+
+
+def test_handover_drains_a_ready_completion_before_declaring_timeout() -> None:
+    """A completion already in the RPC queue wins the deadline race."""
+
+    async def _test() -> None:
+        executor, _rpc = _executor_and_scripted_rpc(
+            [
+                *_handover_lines(),
+                json.dumps({"type": "compaction_start", "reason": "manual"}),
+                json.dumps(
+                    {
+                        "type": "compaction_end",
+                        "reason": "manual",
+                        "aborted": False,
+                        "result": {
+                            "summary": "structured handover",
+                            "estimatedTokensAfter": 800,
+                            "details": {
+                                "type": "omnigent_session_handover",
+                                "version": 1,
+                                "draft": {
+                                    "objective": "Finish the task.",
+                                    "phase": "validate",
+                                    "remaining_work": ["Run validation."],
+                                    "next_action": "Run validation.",
+                                },
+                            },
+                        },
+                    }
+                ),
+            ]
+        )
+        executor._smart_compaction = SmartCompactionConfig(
+            enabled=True,
+            trigger_tokens=1_000,
+            timeout_seconds=1e-9,
+            poll_interval_seconds=0.05,
+        )
+
+        continuation_rpc = _PiRpcSession()
+        continuation_rpc._line_queue = asyncio.Queue()
+        continuation_rpc.process = _FakeProcess()
+        continuation_rpc._stderr_lines = []
+        for event in (
+            {"type": "response", "success": True},
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "text_delta",
+                    "delta": "Validated.",
+                },
+            },
+            {"type": "agent_end", "messages": []},
+        ):
+            continuation_rpc._line_queue.put_nowait(json.dumps(event))
+
+        async def fake_restart(**kwargs):
+            return continuation_rpc
+
+        executor._restart_rpc_for_handover = fake_restart
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "keep going"}], [], "system"
+            )
+        ]
+
+        compacted = [event for event in events if isinstance(event, CompactionComplete)]
+        assert len(compacted) == 1
+        assert compacted[0].handover["mode"] == "structured"
+        assert not any(isinstance(event, ExecutorError) for event in events)
 
     _run(_test())
 
@@ -5764,9 +5911,7 @@ def test_a_completed_turn_does_not_interrupt_the_session() -> None:
 
         events = [
             event
-            async for event in executor.run_turn(
-                [{"role": "user", "content": "hi"}], [], "system"
-            )
+            async for event in executor.run_turn([{"role": "user", "content": "hi"}], [], "system")
         ]
 
         assert any(isinstance(event, TurnComplete) for event in events)

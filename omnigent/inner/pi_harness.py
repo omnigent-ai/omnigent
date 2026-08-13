@@ -301,12 +301,7 @@ def _resolve_smart_compaction() -> SmartCompactionConfig:
             instructions=instructions,
         )
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        _logger.warning(
-            "Ignoring invalid %s value: %s",
-            _ENV_SMART_COMPACTION,
-            exc,
-        )
-        return SmartCompactionConfig()
+        raise ValueError(f"Invalid {_ENV_SMART_COMPACTION} value: {exc}") from exc
 
 
 def create_app() -> FastAPI:

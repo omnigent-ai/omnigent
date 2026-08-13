@@ -616,11 +616,10 @@ module.exports = function(pi) {{
 
 
 def _generate_handover_extension_js(config: SmartCompactionConfig) -> str:
-    """Generate the tools-disabled structured handover extension."""
+    """Generate the cache-aligned structured handover extension."""
     settings_json = json.dumps(
         {
             "handoverMaxTokens": config.handover_max_tokens,
-            "sourceMaxChars": config.source_max_chars,
         },
         indent=2,
     )
@@ -629,42 +628,6 @@ def _generate_handover_extension_js(config: SmartCompactionConfig) -> str:
 const SETTINGS = {settings_json};
 const REQUEST_PREFIX = "OMNIGENT_STRUCTURED_HANDOVER_V1\\n";
 const FIRST_KEPT_SENTINEL = "__omnigent_handover_v1__";
-
-function renderEntry(entry) {{
-  if (!entry || typeof entry !== "object") return "";
-  if (entry.type === "message" && entry.message) {{
-    return JSON.stringify(entry.message);
-  }}
-  if (entry.type === "compaction" && typeof entry.summary === "string") {{
-    return JSON.stringify({{ role: "compactionSummary", summary: entry.summary }});
-  }}
-  if (entry.type === "custom_message") {{
-    return JSON.stringify({{
-      role: "custom",
-      customType: entry.customType,
-      content: entry.content
-    }});
-  }}
-  return "";
-}}
-
-function boundedTranscript(entries) {{
-  const full = entries.map(renderEntry).filter(Boolean).join("\\n");
-  if (full.length <= SETTINGS.sourceMaxChars) return full;
-  const headChars = Math.min(48000, Math.floor(SETTINGS.sourceMaxChars / 4));
-  const tailChars = SETTINGS.sourceMaxChars - headChars;
-  return full.slice(0, headChars)
-    + "\\n[older context omitted at the handover boundary]\\n"
-    + full.slice(-tailChars);
-}}
-
-function extractJson(text) {{
-  const trimmed = String(text || "").trim();
-  const start = trimmed.indexOf("{{");
-  const end = trimmed.lastIndexOf("}}");
-  if (start < 0 || end <= start) throw new Error("handover response did not contain JSON");
-  return JSON.parse(trimmed.slice(start, end + 1));
-}}
 
 module.exports = function(pi) {{
   pi.on("session_before_compact", async (event, ctx) => {{
@@ -679,34 +642,64 @@ module.exports = function(pi) {{
       return;
     }}
 
-    const transcript = boundedTranscript(event.branchEntries || []);
+    if (typeof ctx.sessionManager.buildSessionContext !== "function") return;
+    const sessionContext = ctx.sessionManager.buildSessionContext();
+    const activeToolNames = new Set(pi.getActiveTools());
+    const tools = pi.getAllTools()
+      .filter((tool) => activeToolNames.has(tool.name))
+      .map((tool) => ({{
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters
+      }}));
+    const handoverInput = {{
+      original_directive: request.original_directive,
+      agent_instructions: request.agent_instructions,
+      authoritative_repository_state: request.authoritative_repository_state
+    }};
+    const messages = [
+      ...sessionContext.messages,
+      {{
+        role: "user",
+        content: [{{
+          type: "text",
+          text: [
+            "Create a task handover for a fresh context.",
+            "Return only one JSON object matching the response schema.",
+            "Preserve goals and outcomes, failed approaches and retry conditions,",
+            "working theories with evidence, remaining work, and one exact next action.",
+            JSON.stringify(handoverInput)
+          ].join("\\n")
+        }}],
+        timestamp: Date.now()
+      }}
+    ];
     let response;
     try {{
       const completionOptions = {{
         signal: event.signal,
-        cacheRetention: "none"
+        onPayload(payload) {{
+          return {{
+            ...payload,
+            tool_choice: "none",
+            response_format: {{
+              type: "json_schema",
+              json_schema: {{
+                name: "omnigent_session_handover",
+                strict: true,
+                schema: request.schema
+              }}
+            }}
+          }};
+        }}
       }};
       completionOptions["max" + "Tokens"] = SETTINGS.handoverMaxTokens;
       response = await ctx.modelRegistry.complete(
         ctx.model,
         {{
-          systemPrompt: [
-            "Create a task handover for a fresh context.",
-            "Return one JSON object that matches the supplied schema.",
-            "Describe goals and outcomes, not a transcript of calls.",
-            "Separate verified facts from theories. Preserve failures, retry conditions,",
-            "remaining work, the exact next action, blockers, active waits, and loaded skills.",
-            "Do not use markdown fences or add text outside the JSON object."
-          ].join(" "),
-          messages: [{{
-            role: "user",
-            content: [{{
-              type: "text",
-              text: JSON.stringify(request) + "\\n\\n<conversation>\\n"
-                + transcript + "\\n</conversation>"
-            }}],
-            timestamp: Date.now()
-          }}]
+          systemPrompt: ctx.getSystemPrompt(),
+          messages,
+          tools
         }},
         completionOptions
       );
@@ -721,7 +714,7 @@ module.exports = function(pi) {{
 
     let draft;
     try {{
-      draft = extractJson(text);
+      draft = JSON.parse(text.trim());
     }} catch (_error) {{
       return;
     }}
@@ -1377,6 +1370,15 @@ class _PiRpcSession:
         except asyncio.TimeoutError:
             self._last_read_timed_out = True
             return None
+
+    def read_ready_line(self) -> tuple[bool, str | None]:
+        """Return one already-buffered line without waiting."""
+        try:
+            line = self._line_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return False, None
+        self._last_read_timed_out = False
+        return True, line
 
     async def close(self) -> None:
         for task in (self._read_task, self._stderr_task):
@@ -2101,14 +2103,42 @@ def _handover_from_compaction(
                 created_at=datetime.now(UTC).isoformat(),
             )
 
+    fallback = result.get("fallback")
+    fallback_payload = fallback if isinstance(fallback, Mapping) else {}
     fallback_text = summary or "The structured handover was unavailable."
+    draft = SemanticHandoverDraft.model_validate(
+        {
+            "original_directive": original_directive,
+            "objective": fallback_payload.get(
+                "objective",
+                "Complete the original task from the current repository state.",
+            ),
+            "phase": fallback_payload.get("phase", "investigate"),
+            "completed_outcomes": fallback_payload.get("completed_outcomes", []),
+            "verified_facts": fallback_payload.get("verified_facts", []),
+            "validations": fallback_payload.get("validations", []),
+            "failed_approaches": fallback_payload.get("failed_approaches", []),
+            "decisions": fallback_payload.get("decisions", []),
+            "remaining_work": fallback_payload.get(
+                "remaining_work",
+                ["Continue the first unfinished part of the original task."],
+            ),
+            "next_action": fallback_payload.get(
+                "next_action",
+                "Review the current repository state and continue the first unfinished task.",
+            ),
+            "theories": fallback_payload.get("theories", []),
+            "do_not_repeat": fallback_payload.get("do_not_repeat", []),
+            "blockers": fallback_payload.get("blockers", []),
+            "user_questions": fallback_payload.get("user_questions", []),
+            "active_waits": fallback_payload.get("active_waits", []),
+            "evidence_refs": fallback_payload.get("evidence_refs", []),
+            "loaded_skills": fallback_payload.get("loaded_skills", []),
+        }
+    )
     return SessionHandover(
+        **draft.model_dump(mode="python"),
         mode="generic",
-        original_directive=original_directive,
-        objective="Continue the original task from the fallback compaction summary.",
-        phase="investigate",
-        remaining_work=["Reconcile the fallback summary with current repository state."],
-        next_action="Read the fallback summary, then take the first unfinished action.",
         repository_state=repository_state,
         context_tokens=context_tokens,
         fallback_summary=fallback_text,
@@ -2934,6 +2964,8 @@ class PiExecutor(Executor):
         handover_llm_started = False
         handover_count = 0
         printed_tool_recoveries = 0
+        completed_tool_names: list[str] = []
+        failed_tool_names: list[str] = []
         registered_tool_names = tuple(
             name for name in (tool.get("name") for tool in tools) if isinstance(name, str)
         )
@@ -2976,6 +3008,8 @@ class PiExecutor(Executor):
             return None
 
         while True:
+            line_ready = False
+            line: str | None = None
             # After an errored message the only thing left to drain is the
             # already-emitted agent_end, so don't wait the full idle budget.
             if pending_error is not None:
@@ -2992,22 +3026,62 @@ class PiExecutor(Executor):
                     time.monotonic() - started_at
                 )
                 if remaining <= 0:
-                    error_text = (
-                        "Pi structured handover did not complete within "
-                        f"{int(self._smart_compaction.timeout_seconds)} seconds."
-                    )
-                    if handover_llm_started:
-                        yield LLMCallComplete(
-                            model=model,
-                            error=error_text,
+                    line_ready, line = rpc.read_ready_line()
+                    if not line_ready:
+                        error_text = (
+                            "Pi structured handover did not complete within "
+                            f"{int(self._smart_compaction.timeout_seconds)} seconds."
                         )
-                    yield ExecutorError(
-                        message=error_text,
-                        retryable=True,
+                        logger.warning(
+                            "Pi structured handover timed out for %s after %.1fs; "
+                            "continuing with a generic handover",
+                            session_key,
+                            self._smart_compaction.timeout_seconds,
+                        )
+                        if handover_llm_started:
+                            yield LLMCallComplete(
+                                model=model,
+                                error=error_text,
+                            )
+                            handover_llm_started = False
+                        with contextlib.suppress(Exception):
+                            await self.interrupt_session(session_key)
+                        line = json.dumps(
+                            {
+                                "type": "compaction_end",
+                                "reason": "manual",
+                                "aborted": True,
+                                "errorMessage": error_text,
+                                "result": {
+                                    "summary": response_text or error_text,
+                                    "estimatedTokensAfter": 0,
+                                    "fallback": {
+                                        "completed_outcomes": [
+                                            f"Tool `{name}` completed."
+                                            for name in completed_tool_names
+                                        ],
+                                        "failed_approaches": [
+                                            f"Tool `{name}` failed." for name in failed_tool_names
+                                        ],
+                                        "remaining_work": [
+                                            "Continue the first unfinished part of the task."
+                                        ],
+                                        "next_action": (
+                                            "Review the current repository state and continue "
+                                            "the first unfinished task."
+                                        ),
+                                    },
+                                },
+                            }
+                        )
+                        line_ready = True
+                if not line_ready:
+                    read_timeout = min(
+                        self._smart_compaction.poll_interval_seconds,
+                        max(remaining, 0.001),
                     )
-                    return
-                read_timeout = min(self._smart_compaction.poll_interval_seconds, remaining)
-            line = await rpc.read_line(timeout=read_timeout)
+            if not line_ready:
+                line = await rpc.read_line(timeout=read_timeout)
             if line is None:
                 if handover_in_progress:
                     # Say so, the way a long-running tool call does above.
@@ -3265,6 +3339,11 @@ class PiExecutor(Executor):
                     status = ToolCallStatus.ERROR
                 else:
                     status = ToolCallStatus.SUCCESS
+                tool_outcomes = (
+                    completed_tool_names if status == ToolCallStatus.SUCCESS else failed_tool_names
+                )
+                if tool_name not in tool_outcomes:
+                    tool_outcomes.append(tool_name)
                 completion_text_ready = False
                 last_tool_failed = status in (ToolCallStatus.BLOCKED, ToolCallStatus.ERROR)
                 failure_recovery_requested = False
@@ -3299,6 +3378,13 @@ class PiExecutor(Executor):
                     handover_command_id = f"handover_{id(messages)}_{handover_count + 1}"
                     handover_in_progress = True
                     handover_started_at = time.monotonic()
+                    logger.info(
+                        "Pi structured handover started for %s at %d context tokens "
+                        "(timeout %.1fs)",
+                        session_key,
+                        handover_due_context_tokens,
+                        self._smart_compaction.timeout_seconds,
+                    )
                     try:
                         await rpc.send_command(
                             {
@@ -3371,6 +3457,16 @@ class PiExecutor(Executor):
                         repository_state=handover_repository_state,
                         context_tokens=handover_due_context_tokens,
                     )
+                logger.info(
+                    "Pi structured handover completed for %s in mode=%s after %.1fs",
+                    session_key,
+                    handover.mode,
+                    (
+                        time.monotonic() - handover_started_at
+                        if handover_started_at is not None
+                        else 0.0
+                    ),
+                )
                 continuation = _handover_continuation(handover)
                 handover_count += 1
                 cmd_id = f"turn_{id(messages)}_handover_{handover_count}"

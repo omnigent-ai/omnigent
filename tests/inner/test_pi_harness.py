@@ -356,7 +356,7 @@ def test_smart_compaction_env_threads_typed_config(
     assert config.instructions == "Keep semantic progress."
 
 
-def test_invalid_smart_compaction_env_disables_feature(
+def test_invalid_smart_compaction_env_fails_startup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(
@@ -364,9 +364,8 @@ def test_invalid_smart_compaction_env_disables_feature(
         '{"enabled":true,"trigger_tokens":0}',
     )
 
-    config = pi_harness._resolve_smart_compaction()
-
-    assert config.enabled is False
+    with pytest.raises(ValueError, match="Invalid HARNESS_PI_SMART_COMPACTION"):
+        pi_harness._resolve_smart_compaction()
 
 
 def test_bundle_dir_and_agent_name_env_vars_thread_through(
