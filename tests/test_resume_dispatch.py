@@ -614,7 +614,7 @@ def test_read_wrapper_label_remote_returns_label_when_present(
     monkeypatch.setattr(httpx, "get", _fake_get)
     monkeypatch.setattr(
         "omnigent.chat._remote_headers",
-        lambda *, server_url: {},
+        lambda *, server_url, host_id=None: {},
     )
 
     result = resume_dispatch._read_wrapper_label_remote(
@@ -651,7 +651,7 @@ def test_read_wrapper_label_remote_returns_none_when_label_missing(
     monkeypatch.setattr(httpx, "get", _fake_get)
     monkeypatch.setattr(
         "omnigent.chat._remote_headers",
-        lambda *, server_url: {},
+        lambda *, server_url, host_id=None: {},
     )
 
     result = resume_dispatch._read_wrapper_label_remote(
@@ -680,7 +680,7 @@ def test_read_wrapper_label_remote_raises_on_404(
     monkeypatch.setattr(httpx, "get", _fake_get)
     monkeypatch.setattr(
         "omnigent.chat._remote_headers",
-        lambda *, server_url: {},
+        lambda *, server_url, host_id=None: {},
     )
 
     with pytest.raises(click.ClickException) as excinfo:

@@ -16,7 +16,7 @@
  */
 
 import { getCachedServerInfo } from "./capabilities";
-import { getOmnigentHostConfig, hostFetch } from "./host";
+import { getOmnigentHostConfig, hostFetch, isDatabricksWorkspace } from "./host";
 import {
   clearHostKeyless,
   getSessionHost,
@@ -382,9 +382,10 @@ export async function authenticatedFetch(
   // Pin host- and session-scoped requests to the replica holding that host's
   // runner tunnel (key = host_id). Derived centrally so no call site has to
   // thread it; a caller that set the header explicitly wins, and non-host-scoped
-  // requests get no key (any replica). Only when a host fetcher is installed —
-  // a single-replica deployment doesn't shard by host, so the key would just
-  // dirty its logs.
+  // requests get no key (any replica). Only against a Databricks workspace-hosted
+  // server — the embedded (managed) UI, or `npm run dev` pointed at a workspace URL.
+  // A standalone/self-hosted server has no Dicer, so the key would just dirty
+  // its logs (see isDatabricksWorkspace).
   const url = typeof input === "string" ? input : input.toString();
   // Resolve this session's host BEFORE deriving the slice key below, so a fresh
   // session sub-path request keys to the right replica on the first attempt
@@ -400,7 +401,7 @@ export async function authenticatedFetch(
   // The host this request is FOR, even when we deliberately send it keyless
   // (demoted). Lets the retry logic below demote/un-demote the right host.
   let derivedHostId: string | null = null;
-  if (!headers.has(SLICE_KEY_HEADER) && getOmnigentHostConfig().fetcher) {
+  if (!headers.has(SLICE_KEY_HEADER) && isDatabricksWorkspace()) {
     // Key by the request's OWN host when it's host-scoped; otherwise (a
     // cross-host / DB-backed read) fall back to the modal host as a
     // cache-affinity hint. The distinction matters: a host-scoped request whose

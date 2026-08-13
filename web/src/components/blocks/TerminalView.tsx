@@ -12,7 +12,7 @@ import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
-import { getOmnigentHostConfig, resolveWebSocketUrl } from "@/lib/host";
+import { isDatabricksWorkspace, resolveWebSocketUrl } from "@/lib/host";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import {
   readTerminalThemeMode,
@@ -211,11 +211,11 @@ export function TerminalView({
         if (cancelled) return;
         // Route this WS to the replica holding the session's runner tunnel
         // (key = the session's host_id). A browser WS can't set request
-        // headers, so the key rides the query string. Only when a host
-        // fetcher is installed — an unsharded server needs no key, and a
-        // hostless session yields none.
+        // headers, so the key rides the query string. Only against a
+        // Databricks workspace-hosted server — an unsharded server needs no key,
+        // and a hostless session yields none.
         const computedHostId = (() => {
-          if (keylessRef.current || !getOmnigentHostConfig().fetcher) return undefined;
+          if (keylessRef.current || !isDatabricksWorkspace()) return undefined;
           const h = getSessionHost(sessionId);
           return h && !isHostKeyless(h) ? h : undefined;
         })();

@@ -1590,9 +1590,9 @@ def test_remote_daemon_run_attaches_without_cli_forwarder(
     monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
     monkeypatch.setattr(
         "omnigent.chat._remote_headers",
-        lambda server_url=None: {"Authorization": "Bearer tok"},
+        lambda server_url=None, **_kw: {"Authorization": "Bearer tok"},
     )
-    monkeypatch.setattr("omnigent.chat._server_auth", lambda server_url=None: None)
+    monkeypatch.setattr("omnigent.chat._server_auth", lambda server_url=None, **_kw: None)
     monkeypatch.setattr("omnigent.cli._ensure_host_daemon", lambda base_url: None)
     monkeypatch.setattr(
         "omnigent.host.identity.load_or_create_host_identity",
@@ -5501,7 +5501,7 @@ def test_is_claude_native_conversation_returns_true_on_matching_label(
         )
 
     monkeypatch.setattr(chat.httpx, "get", _fake_get)
-    monkeypatch.setattr(chat, "_remote_headers", lambda server_url=None: {})
+    monkeypatch.setattr(chat, "_remote_headers", lambda server_url=None, **_kw: {})
 
     assert (
         chat._is_claude_native_conversation(
@@ -5538,7 +5538,7 @@ def test_is_claude_native_conversation_returns_false_on_non_matching_label(
         return httpx.Response(200, json={"labels": labels})
 
     monkeypatch.setattr(chat.httpx, "get", _fake_get)
-    monkeypatch.setattr(chat, "_remote_headers", lambda server_url=None: {})
+    monkeypatch.setattr(chat, "_remote_headers", lambda server_url=None, **_kw: {})
 
     assert (
         chat._is_claude_native_conversation(
@@ -5573,7 +5573,7 @@ def test_is_claude_native_conversation_logs_warning_on_non_200(
 
     captured_warnings: list[str] = []
     monkeypatch.setattr(chat.httpx, "get", _fake_get)
-    monkeypatch.setattr(chat, "_remote_headers", lambda server_url=None: {})
+    monkeypatch.setattr(chat, "_remote_headers", lambda server_url=None, **_kw: {})
     monkeypatch.setattr(
         chat.logger,
         "warning",
@@ -5613,7 +5613,7 @@ def test_is_claude_native_conversation_returns_false_on_transport_error(
 
     captured_warnings: list[str] = []
     monkeypatch.setattr(chat.httpx, "get", _raises)
-    monkeypatch.setattr(chat, "_remote_headers", lambda server_url=None: {})
+    monkeypatch.setattr(chat, "_remote_headers", lambda server_url=None, **_kw: {})
     monkeypatch.setattr(
         chat.logger,
         "warning",

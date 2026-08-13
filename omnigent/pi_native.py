@@ -15,7 +15,6 @@ from tempfile import TemporaryDirectory
 import click
 import httpx
 import yaml
-from omnigent_client._http import is_loopback_url
 
 from omnigent._native_resume_hint import echo_native_resume_hint
 from omnigent._platform import resolve_cli_binary
@@ -27,6 +26,7 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
+    open_daemon_client,
     wait_for_host_online,
     wait_for_runner_online,
 )
@@ -293,7 +293,7 @@ def _run_with_remote_server(
     from omnigent.cli import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
-    headers = _remote_headers(server_url=base_url)
+    headers = _remote_headers(server_url=base_url, host_id=None)
     try:
         resolved_session_id = _resolve_session_id_for_resume(
             base_url=base_url,
@@ -370,12 +370,7 @@ async def _prepare_pi_terminal_via_daemon(
     """
     persist_args = list(pi_args)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(
-        base_url=base_url,
-        headers=headers,
-        timeout=timeout,
-        trust_env=not is_loopback_url(base_url),
-    ) as client:
+    async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         reattached = session_id is not None
         fresh_session = session_id is None
         if session_id is None:
