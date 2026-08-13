@@ -3369,6 +3369,29 @@ def _spec_with_subagent_harness(harness: str) -> SimpleNamespace:
     )
 
 
+def _spec_with_subagent_effort(harness: str, effort: str | None) -> SimpleNamespace:
+    """
+    Build a parent-spec stub whose ``worker`` declares a default effort.
+
+    :param harness: The sub-agent's declared harness, e.g.
+        ``"claude-native"``.
+    :param effort: The sub-agent's ``executor.reasoning_effort``.
+    :returns: A structural parent-spec stub for ``execute_tool``.
+    """
+    return SimpleNamespace(
+        sub_agents=[
+            SimpleNamespace(
+                name="worker",
+                executor=SimpleNamespace(
+                    type="omnigent",
+                    config={"harness": harness},
+                    reasoning_effort=effort,
+                ),
+            )
+        ]
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("harness", "model"),
@@ -3452,6 +3475,145 @@ async def test_sys_session_send_model_lands_in_child_create_body(
     assert len(create_bodies) == 1, "fresh named send must create exactly one child"
     assert create_bodies[0]["model_override"] == model
     assert create_bodies[0]["sub_agent_name"] == "worker"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("spec_effort", "dispatch_effort", "expected"),
+    [
+        # Nothing asked for: the worker's declared default applies.
+        pytest.param("high", None, "high", id="spec-default-applies"),
+        # An explicit dispatch value outranks the spec default.
+        pytest.param("high", "low", "low", id="dispatch-overrides-spec"),
+        # No default declared and none dispatched: nothing is persisted,
+        # so the harness keeps whatever default the host CLI carries.
+        pytest.param(None, None, None, id="neither"),
+    ],
+)
+async def test_sys_session_send_effort_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+    spec_effort: str | None,
+    dispatch_effort: str | None,
+    expected: str | None,
+) -> None:
+    """
+    Dispatch effort beats the sub-agent spec's, which beats the host default.
+
+    Declaring the default once per worker is what keeps a fleet's effort
+    policy out of the orchestrator's prompt, where it depends on the model
+    remembering to pass an argument on every dispatch.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param spec_effort: The worker spec's ``executor.reasoning_effort``.
+    :param dispatch_effort: Per-dispatch ``args.reasoning_effort``.
+    :param expected: Effort expected on the child create body, or
+        ``None`` when the key must be absent.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_bodies: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """Serve fresh-create child lookup, create, and message POSTs."""
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent_effort/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_child_effort"})
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_child_effort/events"
+        ):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    send_args: dict[str, Any] = {"input": "fix the auth bug"}
+    if dispatch_effort is not None:
+        send_args["reasoning_effort"] = dispatch_effort
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"agent": "worker", "title": "fix-auth", "args": send_args}),
+                server_client=server_client,
+                conversation_id="conv_parent_effort",
+                agent_spec=_spec_with_subagent_effort("claude-native", spec_effort),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child_effort")
+            runner_app._session_inboxes_ref.pop("conv_parent_effort", None)
+
+    assert json.loads(output)["status"] == "launching"
+    assert len(create_bodies) == 1
+    assert create_bodies[0].get("reasoning_effort") == expected
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_rejects_out_of_family_spec_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A spec default the worker's harness cannot accept fails loud, naming the spec.
+
+    The spec value is applied on the caller's behalf, so the error has to
+    say where it came from — otherwise an operator reads "invalid
+    reasoning_effort" against a dispatch that never mentioned one.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_posts = 0
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """Serve the child lookup; count any create that slips through."""
+        nonlocal create_posts
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent_bad_effort/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_posts += 1
+            return httpx.Response(201, json={"id": "conv_child_bad_effort"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"agent": "worker", "title": "t", "args": {"input": "go"}}),
+                server_client=server_client,
+                conversation_id="conv_parent_bad_effort",
+                # "none" is a legal effort value, but not an Anthropic one.
+                agent_spec=_spec_with_subagent_effort("claude-native", "none"),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_parent_bad_effort", None)
+
+    assert output.startswith("Error:"), output
+    assert "spec" in output, f"error must name the spec as the source: {output}"
+    assert create_posts == 0, "a rejected effort must not create the child"
 
 
 @pytest.mark.asyncio

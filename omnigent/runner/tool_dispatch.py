@@ -1989,14 +1989,28 @@ async def _execute_subagent_tool(
                 agent_spec=agent_spec,
                 harness=child_harness,
             )
-        if reasoning_effort is not None:
+        # A dispatch that names no effort inherits the sub-agent spec's
+        # ``executor.reasoning_effort``, so a worker's default is declared
+        # once in its config instead of depending on the orchestrator
+        # remembering to pass it on every dispatch.
+        effective_effort = reasoning_effort
+        effort_source = "sys_session_send"
+        if effective_effort is None:
+            sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
+            # ``getattr``: sub-specs also arrive as structural stubs that
+            # carry only the fields a caller needed.
+            spec_effort = getattr(getattr(sub_spec, "executor", None), "reasoning_effort", None)
+            if isinstance(spec_effort, str) and spec_effort:
+                effective_effort = spec_effort
+                effort_source = f"sub-agent {sub_agent_name!r} spec"
+        if effective_effort is not None:
             try:
                 create_body["reasoning_effort"] = _validate_subagent_reasoning_effort(
-                    reasoning_effort,
+                    effective_effort,
                     child_harness,
                 )
             except ValueError as exc:
-                return f"Error: sys_session_send invalid 'reasoning_effort': {exc}"
+                return f"Error: invalid 'reasoning_effort' from {effort_source}: {exc}"
         resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
         if resp.status_code >= 400:
             return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
