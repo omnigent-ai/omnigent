@@ -95,8 +95,8 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
+    LEVEL_EDIT,
     LEVEL_OWNER,
-    LEVEL_READ,
     RESERVED_USER_PUBLIC,
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
@@ -8397,13 +8397,15 @@ async def _authorize_bundled_parent_and_inherit_runner(
     """
     Authorize a bundled create's parent link and resolve runner affinity.
 
-    The caller must have READ access to the parent session
-    before inheriting anything, mirroring the JSON create path —
-    without this, a forged parent link lets the caller inherit runner
-    bindings and parent a session they don't control. On success the
-    parent's runner binding is inherited (sub-agent co-location),
-    subject to a defense-in-depth ownership check: a runner the
-    caller doesn't own is not inherited.
+    The caller must have EDIT (write) access to the parent session
+    before inheriting anything, mirroring the JSON create path — a child
+    inherits the parent's runner binding and inserts a working sub-agent
+    into the parent's session tree, so READ alone is insufficient.
+    Requiring EDIT also subsumes the anti-forgery concern: a read-only
+    viewer can't forge a parent link to a session they don't control and
+    spend its runner. On success the parent's runner binding is inherited
+    (sub-agent co-location), subject to a defense-in-depth ownership
+    check: a runner the caller doesn't own is not inherited.
 
     :param parent_session_id: The requested parent session id,
         e.g. ``"conv_abc123"``.
@@ -8421,7 +8423,7 @@ async def _authorize_bundled_parent_and_inherit_runner(
     await _require_access(
         user_id,
         parent_session_id,
-        LEVEL_READ,
+        LEVEL_EDIT,
         permission_store,
         conversation_store,
     )

@@ -100,7 +100,7 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
-    LEVEL_READ,
+    LEVEL_EDIT,
     local_single_user_enabled,
 )
 from omnigent.server.background_session_titles import (
@@ -7629,16 +7629,14 @@ async def _create_session_from_existing_agent(
             body, request, user_id, _fixed_native_harness
         )
 
-    # Authorize parent_session_id before inheriting anything.
-    # The caller must own or have READ access to the parent session;
-    # otherwise a forged parent link lets them inherit runner
-    # bindings and establish a parent-child relationship with a
-    # session they don't control.
+    # A child inherits the parent's runner and inserts a sub-agent into the
+    # parent's tree, so require EDIT (not READ); this also blocks a read-only
+    # viewer from forging a parent link. Automatic spawns run as owner.
     if body.parent_session_id is not None:
         await _require_access(
             user_id,
             body.parent_session_id,
-            LEVEL_READ,
+            LEVEL_EDIT,
             permission_store,
             conversation_store,
         )

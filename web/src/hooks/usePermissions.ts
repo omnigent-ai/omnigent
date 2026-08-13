@@ -10,6 +10,7 @@ import {
   derivePermissionLevel,
   getSessionOwner,
   grantPermission,
+  hasEditAccess,
   listPermissions,
   revokePermission,
 } from "@/lib/permissionsApi";
@@ -90,7 +91,7 @@ export function useCanEdit(conversationId: string): boolean {
       conversationId,
       conversationsData !== undefined,
     );
-    return permissionLevel == null || permissionLevel >= 2;
+    return hasEditAccess(permissionLevel);
   }, [conversationsData, conversationId, activeSession, sessionLoading]);
 }
 
