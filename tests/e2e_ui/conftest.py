@@ -286,52 +286,6 @@ def pytest_configure(config: pytest.Config) -> None:
         )
 
 
-# ── Server-version skip (mirrors tests/e2e/conftest.py) ──────────────────────
-
-
-@pytest.fixture(scope="session")
-def server_version(live_server: str) -> str:
-    """Version reported by the live server (``GET /v1/info``).
-
-    In compat mode the server is a pinned older build, so this can differ
-    from the installed (test-process) version.
-
-    :param live_server: Base URL of the live server.
-    :returns: The server version string, e.g. ``"0.9.0"``.
-    """
-    from tests._helpers.compat import resolve_server_version
-
-    return resolve_server_version(live_server)
-
-
-@pytest.fixture(autouse=True)
-def _enforce_min_server_version(request: pytest.FixtureRequest) -> None:
-    """Skip tests marked ``@pytest.mark.min_server_version(X)`` on older servers.
-
-    Only resolves ``server_version`` (and starts the live server) when
-    the marker is present or a compat run is active
-    (``OMNIGENT_COMPAT_SERVER_VERSION`` set).
-
-    :param request: The pytest request.
-    """
-    import os as _os
-
-    from tests._helpers.compat import meets_min_server_version
-
-    marker = request.node.get_closest_marker("min_server_version")
-    compat_pinned = _os.environ.get("OMNIGENT_COMPAT_SERVER_VERSION")
-    if marker is None and not compat_pinned:
-        return
-    server_ver = request.getfixturevalue("server_version")
-    if marker is None:
-        return
-    if not marker.args:
-        raise pytest.UsageError("min_server_version marker requires a version argument")
-    required = marker.args[0]
-    if not meets_min_server_version(server_ver, required):
-        pytest.skip(f"requires server >= {required}; running {server_ver}")
-
-
 @pytest.fixture(scope="session")
 def browser_type_launch_args(
     browser_type_launch_args: dict[str, Any],
