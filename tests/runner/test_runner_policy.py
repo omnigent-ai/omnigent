@@ -111,3 +111,57 @@ async def test_success_deny_verdict_passed_through() -> None:
     verdict = await _run(server, "PHASE_TOOL_CALL")
     assert verdict["action"] == "POLICY_ACTION_DENY", verdict
     assert verdict["reason"] == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# _evaluate_policies — ASK data snapshot
+# ---------------------------------------------------------------------------
+
+
+async def test_ask_verdict_carries_data_from_ask_policy_not_later_allow() -> None:
+    """ASK verdict data must be the snapshot at ASK time, not overwritten by a later ALLOW.
+
+    An ASK policy may return transformed/redacted data (e.g. PII-scrubbed args)
+    for the approval prompt. A subsequent ALLOW policy that returns its own data
+    must not overwrite that snapshot — doing so would defeat the redaction and
+    show the user unredacted args.
+    """
+    from omnigent.policies import FunctionPolicy
+    from omnigent.policies.types import PolicyResult
+    from omnigent.runner.policy import Phase, RunnerToolPolicyGate, _GatedPolicy
+    from omnigent.spec.types import FunctionPolicySpec, PolicyAction
+
+    redacted = {"name": "tool", "arguments": {"query": "<REDACTED>"}}
+    original = {"name": "tool", "arguments": {"query": "secret search term"}}
+
+    def ask_with_redacted(ctx: object, cfg: object) -> PolicyResult:
+        return PolicyResult(action=PolicyAction.ASK, reason="approve?", data=redacted)
+
+    def allow_with_original(ctx: object, cfg: object) -> PolicyResult:
+        return PolicyResult(action=PolicyAction.ALLOW, data=original)
+
+    spec_ask = FunctionPolicySpec(name="redactor", on=None)
+    spec_allow = FunctionPolicySpec(name="logger", on=None)
+
+    gate = RunnerToolPolicyGate(
+        [
+            _GatedPolicy(
+                name="redactor",
+                policy=FunctionPolicy(spec=spec_ask, callable_obj=ask_with_redacted),
+                phases=frozenset([Phase.TOOL_CALL]),
+            ),
+            _GatedPolicy(
+                name="logger",
+                policy=FunctionPolicy(spec=spec_allow, callable_obj=allow_with_original),
+                phases=frozenset([Phase.TOOL_CALL]),
+            ),
+        ]
+    )
+
+    verdict = await gate.evaluate_tool_call("tool", {"query": "secret search term"})
+
+    assert verdict.action == "ask"
+    assert verdict.data is redacted, (
+        "ASK verdict must carry the redacted data from the ASK policy, "
+        f"not the post-loop data from the ALLOW policy; got {verdict.data!r}"
+    )
