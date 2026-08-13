@@ -1209,8 +1209,11 @@ def _validate_subagent_reasoning_effort(effort: str, harness: str | None) -> str
     """
     Validate *effort* against the child harness's declared effort family.
 
-    A harness whose family is ``NONE`` has no effort plumbing, so an
-    override would be silently dropped — reject it instead.
+    A harness whose family is ``NONE`` has no effort plumbing, and an
+    unrecognized one cannot be checked at all — the caller asked for this
+    explicitly, so reject rather than accept-and-drop. (Delivery of a
+    persisted effort takes the opposite tack and filters quietly; see the
+    reasoning guard in :mod:`omnigent.runner.app`.)
 
     :param effort: Requested effort, e.g. ``"high"``.
     :param harness: Resolved child harness, e.g. ``"claude-native"``.
@@ -1218,27 +1221,11 @@ def _validate_subagent_reasoning_effort(effort: str, harness: str | None) -> str
     :raises ValueError: If the harness supports no effort override, or
         the value falls outside its vocabulary.
     """
-    from omnigent.harness_capabilities import EffortFamily
-    from omnigent.harness_plugins import harness_capabilities
-    from omnigent.reasoning_effort import (
-        ANTHROPIC_EFFORTS,
-        COPILOT_EFFORTS,
-        GEMINI_EFFORTS,
-        OPENAI_EFFORTS,
-        validate_effort,
-    )
+    from omnigent.reasoning_effort import efforts_for_harness, validate_effort
 
     canonical = canonicalize_harness(harness) if harness is not None else None
-    capabilities = harness_capabilities().get(canonical or "")
-    family = capabilities.effort if capabilities is not None else EffortFamily.NONE
-    supported_by_family = {
-        EffortFamily.ANTHROPIC: ANTHROPIC_EFFORTS,
-        EffortFamily.OPENAI: OPENAI_EFFORTS,
-        EffortFamily.GEMINI: GEMINI_EFFORTS,
-        EffortFamily.COPILOT: COPILOT_EFFORTS,
-    }
-    supported = supported_by_family.get(family)
-    if supported is None:
+    supported = efforts_for_harness(harness)
+    if not supported:
         raise ValueError(
             f"harness {canonical or harness or 'unknown'!r} does not support "
             "a reasoning-effort override"

@@ -175,3 +175,33 @@ def test_routing_settings_effort_caps_reach_the_clamp() -> None:
         assert clamp_effort_for_model("xhigh", "system.ai.glm-5-2") == "xhigh"
     # Outside that deployment the frozen default is back.
     assert clamp_effort_for_model("xhigh", "system.ai.glm-5-2") == "medium"
+
+
+def test_efforts_for_harness_distinguishes_unsupported_from_unknown() -> None:
+    """The three outcomes are distinct, and the last two must not be conflated.
+
+    A harness with no effort plumbing returns an empty set (callers should
+    refuse or filter), while a harness absent from the capability registry
+    returns ``None`` (callers cannot classify it, so a filter must pass the
+    value through rather than drop what a plugin harness might accept).
+    """
+    from omnigent.reasoning_effort import ANTHROPIC_EFFORTS, GEMINI_EFFORTS, efforts_for_harness
+
+    assert efforts_for_harness("claude-sdk") == ANTHROPIC_EFFORTS
+    assert efforts_for_harness("claude-native") == ANTHROPIC_EFFORTS
+    assert efforts_for_harness("antigravity-native") == GEMINI_EFFORTS
+    # Known, but declared EffortFamily.NONE.
+    assert efforts_for_harness("pi") == frozenset()
+    assert efforts_for_harness("opencode-native") == frozenset()
+    # Not in the registry at all — unclassifiable, not unsupported.
+    assert efforts_for_harness("some-plugin-harness") is None
+    assert efforts_for_harness(None) is None
+
+
+def test_efforts_for_harness_resolves_aliases() -> None:
+    """An alias resolves to the same vocabulary as its canonical name."""
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.reasoning_effort import efforts_for_harness
+
+    canonical = canonicalize_harness("claude-code") or "claude-code"
+    assert efforts_for_harness("claude-code") == efforts_for_harness(canonical)

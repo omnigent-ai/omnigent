@@ -34,6 +34,44 @@ ANTIGRAVITY_EFFORTS = GEMINI_EFFORTS
 COPILOT_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 
 
+def efforts_for_harness(harness: str | None) -> frozenset[str] | None:
+    """
+    Return the effort vocabulary *harness* accepts.
+
+    Three outcomes, and the difference between the last two matters:
+
+    - a non-empty set — the harness takes an effort from that vocabulary;
+    - an empty set — the harness is known and has no effort plumbing
+      (``EffortFamily.NONE``), so any effort is meaningless to it;
+    - ``None`` — the harness is not in the capability registry, so it
+      cannot be classified. Callers that filter should pass the value
+      through rather than drop it, since a plugin-registered harness may
+      handle an effort this process knows nothing about.
+
+    :param harness: Harness name or alias, e.g. ``"claude-native"``.
+    :returns: Accepted values, an empty set, or ``None`` when unknown.
+    """
+    # Imported inside the function: harness_plugins pulls in a large slice
+    # of the package, and a module-level edge from here has produced an
+    # import cycle before.
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harness_capabilities import EffortFamily
+    from omnigent.harness_plugins import harness_capabilities
+
+    if harness is None:
+        return None
+    canonical = canonicalize_harness(harness) or harness
+    capabilities = harness_capabilities().get(canonical)
+    if capabilities is None:
+        return None
+    return {
+        EffortFamily.ANTHROPIC: ANTHROPIC_EFFORTS,
+        EffortFamily.OPENAI: OPENAI_EFFORTS,
+        EffortFamily.GEMINI: GEMINI_EFFORTS,
+        EffortFamily.COPILOT: COPILOT_EFFORTS,
+    }.get(capabilities.effort, frozenset())
+
+
 def format_supported(values: Iterable[str]) -> str:
     """Return a stable comma-separated supported-values string."""
     order = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]

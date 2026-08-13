@@ -5414,7 +5414,27 @@ def create_runner_app(
         _reasoning = msg_body.get("reasoning")
         _effort = _reasoning.get("effort") if isinstance(_reasoning, dict) else None
         if isinstance(_effort, str) and _effort:
-            harness_body["reasoning"] = {"effort": _effort}
+            # Deliver only what this harness can accept. The persisted effort is
+            # validated at create against the union vocabulary, so a value that
+            # is legal there ("none" on an Anthropic-family harness) can still be
+            # foreign here — and the executors reject an unsupported value by
+            # failing the turn. The native launch path already filters the same
+            # way (see native/orchestration.py's ``--effort`` guard); an unknown
+            # harness is passed through rather than dropped, since a plugin
+            # harness may accept efforts this registry has never heard of.
+            from omnigent.reasoning_effort import efforts_for_harness, format_supported
+
+            _supported = efforts_for_harness(harness_name)
+            if _supported is None or _effort in _supported:
+                harness_body["reasoning"] = {"effort": _effort}
+            else:
+                _logger.warning(
+                    "_run_turn_bg: conv=%s dropping reasoning effort %r — harness %s accepts %s",
+                    conv,
+                    _effort,
+                    harness_name,
+                    format_supported(_supported) if _supported else "no effort override",
+                )
         if _session_histories[conv]:
             harness_body["content"] = _session_histories[conv]
         else:

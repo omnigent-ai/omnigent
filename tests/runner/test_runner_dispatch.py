@@ -1480,6 +1480,99 @@ async def test_runner_background_turn_omits_unusable_reasoning(
     )
 
 
+async def _claude_sdk_spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+    """
+    Resolve a minimal spec on a harness with a known effort family.
+
+    :param agent_id: Agent id the runner resolved (unused).
+    :param session_id: Session id (unused).
+    :returns: A minimal spec whose harness is ``claude-sdk``
+        (``EffortFamily.ANTHROPIC``).
+    """
+    del agent_id, session_id
+    return AgentSpec(
+        spec_version=1,
+        name="reasoning-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("effort", "delivered"),
+    [
+        # In the Anthropic vocabulary → delivered untouched.
+        pytest.param("high", True, id="in-family"),
+        # Valid at session create (the union vocabulary) but foreign to
+        # this harness: the executor would reject it and fail the turn.
+        pytest.param("none", False, id="out-of-family"),
+        pytest.param("minimal", False, id="out-of-family-minimal"),
+    ],
+)
+async def test_runner_background_turn_filters_effort_by_harness_family(
+    effort: str,
+    delivered: bool,
+) -> None:
+    """An effort the target harness cannot accept is dropped, not delivered.
+
+    ``reasoning_effort`` is validated at session create against the union
+    vocabulary, so ``none`` / ``minimal`` persist happily on a session
+    whose harness is Anthropic-family. Once the field actually reaches the
+    executor it is re-validated against that family and an unsupported
+    value fails the whole turn — a session that merely *ignored* the
+    setting before would start erroring on every turn.
+
+    The native launch path already filters this way (it appends
+    ``--effort`` only for values in the harness's vocabulary), so this
+    keeps the two dispatch paths symmetric: explicit requests fail loud at
+    dispatch, replayed session state degrades quietly at delivery.
+
+    :param effort: Inbound effort value.
+    :param delivered: Whether it should survive to the harness body.
+    """
+    from omnigent.runner import app as runner_app
+
+    conv = "conv_reasoning_family"
+    captured: dict[str, Any] = {}
+    reached = asyncio.Event()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _ContentCapturingProcessManager(captured, reached),
+        ),
+        spec_resolver=_claude_sdk_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    runner_app._session_histories_ref.pop(conv, None)
+    try:
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_reasoning",
+                    "model": "x",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                    "reasoning": {"effort": effort},
+                },
+            )
+            assert response.status_code == 202
+            await asyncio.wait_for(reached.wait(), timeout=10.0)
+    finally:
+        runner_app._session_histories_ref.pop(conv, None)
+
+    body = captured["body"]
+    if delivered:
+        assert body.get("reasoning") == {"effort": effort}
+    else:
+        assert "reasoning" not in body, (
+            f"effort {effort!r} is outside claude-sdk's family but was "
+            f"delivered as {body.get('reasoning')!r} — the executor would "
+            "fail the turn"
+        )
+
+
 @pytest.mark.asyncio
 async def test_runner_post_returns_503_when_spec_resolver_fails(
     caplog: pytest.LogCaptureFixture,
