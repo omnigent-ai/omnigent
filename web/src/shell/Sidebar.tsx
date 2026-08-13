@@ -4614,7 +4614,7 @@ function BulkActionBar({
               </p>
               <Button
                 type="button"
-                variant="ghost"
+                variant="outline"
                 size="xs"
                 className="self-start"
                 onClick={toggleAllBranches}
@@ -4622,7 +4622,7 @@ function BulkActionBar({
               >
                 {allBranchesSelected ? "Clear all" : "Select all"}
               </Button>
-              <ul className="flex max-h-40 flex-col gap-1 overflow-y-auto">
+              <ul className="flex max-h-56 flex-col gap-3 overflow-y-auto">
                 {worktreeSelected.map((c) => (
                   <li key={c.id}>
                     <label className="flex cursor-pointer items-start gap-2 text-ui">
