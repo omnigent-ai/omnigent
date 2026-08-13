@@ -146,6 +146,9 @@ export type Bubble =
       content: MessageContentBlock[];
       /** Human author email, when known. */
       createdBy?: string;
+      /** Epoch seconds of this message, when known — server-stamped from
+       *  history, client-stamped while live. Display-only. */
+      createdAtS?: number;
       /**
        * Stable React key when promoted from an optimistic
        * `pendingUserMessages` entry — carries that entry's client temp
@@ -185,6 +188,9 @@ export type Bubble =
        * trailing answer of its own.
        */
       continued?: boolean;
+      /** Epoch seconds of the first block in the group — server-stamped
+       *  from history, client-stamped while live. Display-only. */
+      createdAtS?: number;
     }
   | { kind: "compaction_loading"; itemId: string }
   | { kind: "compaction"; itemId: string }
@@ -767,6 +773,11 @@ function walkBubbles(
         itemId: b.ctx.itemId ?? `user_${i}`,
         content: b.content,
         ...(b.ctx.createdBy !== undefined ? { createdBy: b.ctx.createdBy } : {}),
+        // Server stamp on cold load, client stamp while live — display
+        // only, so either clock is correct here.
+        ...(b.ctx.createdAtS !== undefined || b.ctx.clientCreatedAtS !== undefined
+          ? { createdAtS: b.ctx.createdAtS ?? b.ctx.clientCreatedAtS }
+          : {}),
         // Carry the optimistic temp id (when promoted) so bubbleKey holds
         // steady across the optimistic→committed swap — no remount/flink.
         stableKey: b.stableKey,
@@ -924,6 +935,10 @@ function walkBubbles(
     lastBubbleCount = 1;
     const workedForS = turnWorkedForS(groupBlocks);
     const lastActivityAtS = turnLastActivityAtS(groupBlocks);
+    // Server stamp on cold load, client stamp while live — display only.
+    const groupCreatedAtS = groupBlocks
+      .map((bk) => bk.ctx.createdAtS ?? bk.ctx.clientCreatedAtS)
+      .find((v) => v !== undefined);
     bubbles.push({
       kind: "assistant",
       responseId: groupResponseId,
@@ -941,6 +956,7 @@ function walkBubbles(
       ),
       ...(workedForS !== undefined ? { workedForS } : {}),
       ...(lastActivityAtS !== undefined ? { lastActivityAtS } : {}),
+      ...(groupCreatedAtS !== undefined ? { createdAtS: groupCreatedAtS } : {}),
     });
   }
 
@@ -1620,6 +1636,9 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.stableId !== b.stableId ||
       a.lifecycle !== b.lifecycle ||
       a.error !== b.error ||
+      // Render-affecting timestamp — must stay visible to the memo like
+      // the user branch's `createdAtS` comparison below.
+      a.createdAtS !== b.createdAtS ||
       // Flips when a later bubble continues this turn — the fold depends on it.
       Boolean(a.continued) !== Boolean(b.continued)
     ) {
@@ -1637,6 +1656,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
     if (
       a.itemId !== b.itemId ||
       a.createdBy !== b.createdBy ||
+      a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
       a.content.length !== b.content.length
     )

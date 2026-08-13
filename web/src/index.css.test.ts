@@ -185,6 +185,55 @@ describe("index.css table link wrapping rule", () => {
   });
 });
 
+/* Pins the table-cell `overflow-wrap: break-word` override so it applies to the cells and never leaks into prose outside a table. */
+describe("index.css table cell wrapping rule", () => {
+  const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find(
+    (block) =>
+      /\[data-streamdown="table-cell"\],?\s*\n?\s*\[data-streamdown="table-header-cell"\]\s*\{/.test(
+        block,
+      ) && /overflow-wrap\s*:/.test(block),
+  );
+
+  const selector = (rule ?? "")
+    .slice(0, rule ? rule.indexOf("{") : 0)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .trim();
+
+  it("has the rule this test exists to protect", () => {
+    expect(rule, "the table-cell wrapping rule is gone from index.css").toBeDefined();
+    expect(rule).toMatch(/overflow-wrap\s*:\s*break-word/);
+  });
+
+  function makeCell(cellAttr: string): HTMLElement {
+    const cell = document.createElement("div");
+    cell.setAttribute("data-streamdown", cellAttr);
+    document.body.appendChild(cell);
+    return cell;
+  }
+
+  it.each(["table-cell", "table-header-cell"])("targets the %s itself", (cellAttr) => {
+    const cell = makeCell(cellAttr);
+    expect(cell.matches(selector)).toBe(true);
+    cell.remove();
+  });
+
+  it("leaves ordinary prose (outside a table) on the inherited wrap-anywhere", () => {
+    const paragraph = document.createElement("p");
+    document.body.appendChild(paragraph);
+    expect(paragraph.matches(selector)).toBe(false);
+    paragraph.remove();
+  });
+
+  it("is declared after the link-in-cell rule, consistent with it rather than fighting it", () => {
+    const linkRuleIndex = cssSource.indexOf(
+      '[data-streamdown="table-cell"], [data-streamdown="table-header-cell"])\n  [data-streamdown="link"]',
+    );
+    const cellRuleIndex = cssSource.indexOf(rule ?? " ");
+    expect(linkRuleIndex).toBeGreaterThan(-1);
+    expect(cellRuleIndex).toBeGreaterThan(linkRuleIndex);
+  });
+});
+
 describe("index.css sidebar canvas", () => {
   const omniLightRule = cssSource.match(
     /:root:not\(\.dark\):not\(\[data-theme\]\) \.conversations-sidebar \{[^}]*\}/,

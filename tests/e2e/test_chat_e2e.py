@@ -17,6 +17,7 @@ import uuid
 from pathlib import Path
 
 import httpx
+import pytest
 import yaml as _yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
@@ -127,6 +128,7 @@ def _make_inline_agent_yaml(
     return yaml_path
 
 
+@pytest.mark.compat_smoke
 def test_chat_local_starts_server_and_agent_responds(
     mock_llm_server_url: str | None,
     tmp_path: Path,
@@ -206,6 +208,7 @@ def test_chat_local_starts_server_and_agent_responds(
         _stop_local_server(server)
 
 
+@pytest.mark.compat_smoke
 def test_chat_local_accepts_omnigent_yaml_file(
     mock_llm_server_url: str | None,
     tmp_path: Path,

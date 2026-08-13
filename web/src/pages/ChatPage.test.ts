@@ -436,6 +436,30 @@ describe("buildPendingBubbles", () => {
     // p.author ("bob") wins over the viewer's selfAuthor ("alice").
     expect(bubble.createdBy).toBe("bob@example.com");
   });
+
+  it("carries the send-time stamp; replayed entries show no re-stamped time", () => {
+    // A fresh send was stamped once in the store at send time — the
+    // optimistic bubble shows THAT time, not a drifting render-time
+    // Date.now(). Snapshot-replayed entries carry no stamp (the server
+    // has none for pending inputs), so the bubble renders no timestamp
+    // rather than pretending the reload time was the send time.
+    const [stamped] = buildPendingBubbles(
+      [
+        {
+          tempId: "tmp_2",
+          content: [{ type: "input_text" as const, text: "hi" }],
+          createdAtS: 1_753_900_000,
+        },
+      ],
+      null,
+    ) as [Extract<Bubble, { kind: "user" }>];
+    expect(stamped.createdAtS).toBe(1_753_900_000);
+    const [replayed] = buildPendingBubbles(
+      [{ tempId: "tmp_3", content: [{ type: "input_text" as const, text: "hi" }] }],
+      null,
+    ) as [Extract<Bubble, { kind: "user" }>];
+    expect(replayed.createdAtS).toBeUndefined();
+  });
 });
 
 // ── mergePendingBubbles ────────────────────────────────────────────────────
