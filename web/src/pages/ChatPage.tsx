@@ -3779,7 +3779,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
         {(ts || text) && (
           <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
             {ts && (
-              <span className="select-none text-[11px] leading-4 text-foreground/56">{ts}</span>
+              <span
+                className="select-none text-[11px] leading-4 text-foreground/56"
+                data-testid="message-timestamp"
+              >
+                {ts}
+              </span>
             )}
             {text && (
               <MessageActions>
@@ -3910,7 +3915,12 @@ function AssistantBubble({
               </MessageActions>
             )}
             {ts && (
-              <span className="select-none text-[11px] leading-4 text-foreground/56">{ts}</span>
+              <span
+                className="select-none text-[11px] leading-4 text-foreground/56"
+                data-testid="message-timestamp"
+              >
+                {ts}
+              </span>
             )}
           </div>
         )}
