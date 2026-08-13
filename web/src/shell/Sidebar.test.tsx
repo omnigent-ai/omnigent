@@ -631,7 +631,7 @@ describe("Sidebar session list", () => {
     expect(badge).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
-  it("reveals session selection as an icon action on the Sessions header", () => {
+  it("keeps filtering visible while session selection remains hover-revealed", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
@@ -645,13 +645,18 @@ describe("Sidebar session list", () => {
     expect(selectSessions).toHaveAttribute("data-size", "icon-xs");
     expect(selectSessions).toHaveClass("text-muted-foreground", "hover:text-foreground");
     expect(selectSessions).not.toHaveTextContent("Select sessions");
-    // The select + filter buttons share a flex wrapper inside the header's
-    // hover-reveal slot, so the reveal classes sit on the grandparent.
-    expect(selectSessions.parentElement?.parentElement).toHaveClass(
+    expect(selectSessions.parentElement).toHaveClass(
       "md:opacity-0",
       "md:group-hover/header:opacity-100",
       "md:group-focus-within/header:opacity-100",
+      "md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
     );
+
+    const filterSessions = within(sessionsSection!).getByRole("button", {
+      name: "Filter sessions",
+    });
+    expect(filterSessions.parentElement).not.toHaveClass("md:opacity-0");
+    expect(filterSessions.parentElement).toHaveClass("absolute", "right-1", "flex");
 
     fireEvent.click(selectSessions);
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
