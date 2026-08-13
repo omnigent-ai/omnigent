@@ -3,7 +3,7 @@
 // closes the dialog, and leaves the row alone — the mutation itself
 // splices the row out of the cached lists on the next frame (see
 // `useStopAndDeleteConversation`), so the sidebar never shows an
-// in-flight status row for a delete the way it does for an archive.
+// in-flight status row for a delete — archive works the same way.
 // See ConversationRow.confirmDelete in Sidebar.tsx.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";

@@ -1,23 +1,21 @@
-// Tests for the archive flow in the sidebar. Contract: archiving sends ONLY
-// the archive PATCH (`archived: true`). The "Archiving…" status row stays up
-// until the row LEAVES the sidebar — on success it's held (the row unmounts
-// when the list refetch drops the archived row, taking the spinner with it),
-// and only an error clears it to restore the interactive row for retry.
-// Clearing on settle would flash the row back to its clickable form a
-// round-trip before it actually leaves. The runner stop is the server's job
-// once the flag commits — a client stop would race the server's against the
-// same runner, and it would also put the runner's stop timeouts in front of
-// the flag flip. The kebab's user-facing "Stop session" action is a separate
-// affordance covered by Sidebar.stop.test.tsx. Unarchiving flips the flag
-// back with no status row. See ConversationRow.runArchive in Sidebar.tsx.
+// Tests for the archive flow in the sidebar. Contract: clicking Archive
+// fires `useArchiveConversation` immediately — no client-side stop first
+// (the server stops the runner itself on archive) and no "Archiving…"
+// status row, because the mutation is optimistic: the hook's cache overlay
+// drops the row from the sidebar on the next frame (covered by the hook
+// tests in useConversations.test.ts; here the hook is mocked, so the row
+// stays). That unmount also means nothing can wait on a mutate-level
+// callback — the toast pointing at the session's new home and the
+// navigate-away run synchronously at click time, while the failure toast
+// lives in the hook. See ConversationRow.runArchive in Sidebar.tsx.
 //
 // Archived sessions are no longer listed in the sidebar (they moved to the
 // Settings page), so unarchiving is covered by SettingsPage.test.tsx; this
 // file exercises the archive path from a row's kebab.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -122,16 +120,18 @@ function renderSidebar() {
   );
 }
 
-/** Open the row's action dropdown and click the archive/unarchive item. */
-function clickArchive() {
+/** Open the row's action dropdown and click the archive item. */
+function clickArchive(row?: HTMLElement) {
+  const scope = row ? within(row) : screen;
   // Radix DropdownMenu opens on pointerdown, not click.
-  fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+  fireEvent.pointerDown(scope.getByTestId("conversation-actions"), { button: 0 });
   fireEvent.click(screen.getByTestId("archive-conversation"));
 }
 
 beforeEach(() => {
   mocks.archive.mutate.mockReset();
   mocks.stop.mutate.mockReset();
+  mockConversations([CONV]);
 });
 
 afterEach(() => {
@@ -139,36 +139,40 @@ afterEach(() => {
 });
 
 describe("archive flow", () => {
-  it("archives with a single PATCH and no client-side stop", () => {
-    mockConversations([CONV]);
+  it("fires the archive mutation immediately — no client-side stop first", () => {
     renderSidebar();
     clickArchive();
 
     expect(mocks.archive.mutate).toHaveBeenCalledTimes(1);
-    expect(mocks.archive.mutate).toHaveBeenCalledWith(
-      { id: "conv_1", archived: true },
-      expect.objectContaining({
-        onSuccess: expect.any(Function),
-        // Only an error restores the interactive row; success intentionally
-        // leaves the spinner up until the row unmounts (see the "keeps the
-        // 'Archiving…' row up after the archive succeeds" case below).
-        onError: expect.any(Function),
-      }),
-    );
-    // The server owns the stop. A client stop here would race it against
-    // the same runner and put its timeouts in front of the flag flip.
+    // Exactly one argument — no mutate-level callbacks. The hook's overlay
+    // unmounts this row on the next frame, and callbacks on an unmounted
+    // observer never fire, so everything lives in the hook or runs
+    // synchronously at click time (like confirmDelete).
+    expect(mocks.archive.mutate).toHaveBeenCalledWith({ id: "conv_1", archived: true });
+    // The server stops the runner itself once the archived flag commits,
+    // so the client must not gate the archive on a stop round-trip — that
+    // serialization was what made archiving feel slow.
     expect(mocks.stop.mutate).not.toHaveBeenCalled();
   });
 
-  it("toasts a pointer to Settings once the archive succeeds", () => {
-    mockConversations([CONV]);
+  it("shows no 'Archiving…' status row — the optimistic overlay removes the row", () => {
     renderSidebar();
     clickArchive();
 
-    // Drive the archive to its success callback.
-    const archiveArgs = mocks.archive.mutate.mock.calls[0];
-    act(() => (archiveArgs[1] as { onSuccess: () => void }).onSuccess());
+    // With the hook mocked the row stays rendered, but the old in-flight
+    // status row is gone for good: the real hook's cache overlay is what
+    // takes the row out of the list now.
+    expect(screen.queryByTestId("conversation-archiving")).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
+  });
 
+  it("toasts a pointer to the session's new home at click time", () => {
+    renderSidebar();
+    clickArchive();
+
+    // The mutate stub never resolves, so the toast can't be waiting on the
+    // server: the row leaves the sidebar immediately and the user needs to
+    // know where it went.
     const toast = screen.getByTestId("toast");
     expect(within(toast).getByText(/View archived sessions in/)).toBeInTheDocument();
     expect(within(toast).getByRole("link", { name: "Settings" })).toHaveAttribute(
@@ -176,62 +180,68 @@ describe("archive flow", () => {
       "/settings/archived",
     );
   });
+});
 
-  // Unarchive moved out of the sidebar: archived sessions no longer render
-  // here (they're on the Settings page), so the "Unarchive" affordance is
-  // covered by SettingsPage.test.tsx instead.
+// --- Active-session redirect on archive -------------------------------
+//
+// The row leaves the sidebar the moment Archive is clicked, so the
+// redirect runs then too: if the user is viewing the session being
+// archived, the chat surface would otherwise sit on a session that just
+// left their list. Archiving any other row must leave them where they
+// are. Mirrors the delete flow's redirect tests.
 
-  it("shows an 'Archiving…' status row while the archive is in flight", () => {
-    // The archive mock never settles (vi.fn() stub), so the row stays in
-    // its in-flight state — the window the user sees. Without the indicator
-    // the row would look idle while the archive ran.
-    mockConversations([CONV]);
-    renderSidebar();
-    clickArchive();
+const CONV_OTHER: Conversation = { ...CONV, id: "conv_2", title: "Other Session" };
 
-    const row = screen.getByTestId("conversation-archiving");
-    expect(within(row).getByText("Archiving…")).toBeInTheDocument();
-    // The interactive link is replaced by the status row, so the session
-    // can't be re-opened or re-archived mid-flight.
-    expect(screen.queryByRole("link", { name: /My Session/ })).not.toBeInTheDocument();
+function LocationProbe() {
+  const loc = useLocation();
+  return <div data-testid="loc">{loc.pathname}</div>;
+}
+
+/** Render the sidebar inside a router started at `path`, with a probe. */
+function renderSidebarRouted(path: string) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const tree = (
+    <>
+      <Sidebar open={true} onClose={vi.fn()} />
+      <LocationProbe />
+    </>
+  );
+  return render(
+    <QueryClientProvider client={qc}>
+      <TooltipProvider>
+        <MemoryRouter initialEntries={[path]}>
+          <Routes>
+            <Route path="/" element={tree} />
+            <Route path="/c/:conversationId" element={tree} />
+          </Routes>
+        </MemoryRouter>
+      </TooltipProvider>
+    </QueryClientProvider>,
+  );
+}
+
+describe("active-session redirect on archive", () => {
+  it("redirects to / when the archived conversation is the active one", () => {
+    mockConversations([CONV, CONV_OTHER]);
+    renderSidebarRouted("/c/conv_1");
+    expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_1");
+
+    clickArchive(screen.getByRole("link", { name: /My Session/ }).closest("li") as HTMLElement);
+
+    // Viewing conv_1 when it was archived → bounce to / immediately. The
+    // mutate stub never resolves, proving the redirect doesn't wait on it.
+    expect(screen.getByTestId("loc")).toHaveTextContent("/");
   });
 
-  it("keeps the 'Archiving…' row up after the archive succeeds", () => {
-    // On success the spinner must NOT be cleared: the row leaves the sidebar
-    // only when the ['conversations'] refetch drops the archived row (which
-    // unmounts this row and its spinner together). Clearing on success would
-    // flash the row back to its plain, clickable form for the round-trip until
-    // the refetch lands — the exact regression this guards. Here the mocked
-    // list still contains the row (no refetch modeled), so firing onSuccess
-    // must leave the status row in place.
-    mockConversations([CONV]);
-    renderSidebar();
-    clickArchive();
+  it("does NOT redirect when archiving a row the user isn't viewing", () => {
+    mockConversations([CONV, CONV_OTHER]);
+    renderSidebarRouted("/c/conv_2");
+    expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_2");
 
-    expect(screen.getByTestId("conversation-archiving")).toBeInTheDocument();
+    clickArchive(screen.getByRole("link", { name: /My Session/ }).closest("li") as HTMLElement);
 
-    const archiveOnSuccess = mocks.archive.mutate.mock.calls[0][1].onSuccess as () => void;
-    act(() => archiveOnSuccess());
-
-    // Still archiving, still no interactive link — the row hasn't left yet.
-    expect(screen.getByTestId("conversation-archiving")).toBeInTheDocument();
-    expect(screen.queryByRole("link", { name: /My Session/ })).not.toBeInTheDocument();
-  });
-
-  it("restores the interactive row when the archive errors", () => {
-    // The only escape hatch from the status row: a failed archive clears the
-    // flag so the user gets the clickable row back to retry. Success has no
-    // such clear (see above) — the row instead leaves via the refetch.
-    mockConversations([CONV]);
-    renderSidebar();
-    clickArchive();
-
-    expect(screen.getByTestId("conversation-archiving")).toBeInTheDocument();
-
-    const archiveOnError = mocks.archive.mutate.mock.calls[0][1].onError as () => void;
-    act(() => archiveOnError());
-
-    expect(screen.queryByTestId("conversation-archiving")).not.toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
+    // conv_2 is untouched, so the user stays in the chat they're reading —
+    // a redirect here would yank them out of an unrelated session.
+    expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_2");
   });
 });
