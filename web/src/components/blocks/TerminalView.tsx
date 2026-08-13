@@ -237,13 +237,7 @@ export function TerminalView({
           const h = getSessionHost(sessionId);
           return h && !isHostKeyless(h) ? h : undefined;
         })();
-        const relayUrl = buildAttachUrl(
-          sessionId,
-          terminalId,
-          readOnly,
-          computedHostId,
-          transport,
-        );
+        const relayUrl = buildAttachUrl(sessionId, terminalId, readOnly, computedHostId, transport);
         const directUrl = directAttachUrl
           ? withAttachParams(directAttachUrl, readOnly, transport)
           : undefined;
