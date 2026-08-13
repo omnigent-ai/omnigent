@@ -182,6 +182,33 @@ describe("ConversationRegistry", () => {
     expect(a.disposed).toBe(false);
   });
 
+  it("never evicts an entry holding a failed-send draft", () => {
+    // A send that failed rolls its optimistic bubble back but stashes the text
+    // + files as `failedSendDraft` — the only surviving copy, since the server
+    // never received it. If that failure settles after the conversation was
+    // backgrounded, the rolled-back bubble leaves nothing else pinning the
+    // entry, so eviction would drop the retry draft. Pin on the draft too.
+    const a = registry.acquire("conv_a");
+    a.setState({
+      pendingUserMessages: [], // bubble already rolled back
+      failedSendDraft: { conversationId: "conv_a", text: "retry me", files: [] },
+    });
+    registry.acquire("conv_b");
+    expect(registry.evictLruEvictable()).toBe("conv_b");
+    expect(registry.has("conv_a")).toBe(true);
+    expect(a.disposed).toBe(false);
+  });
+
+  it("evicts once a failed-send draft is cleared (composer restored it)", () => {
+    // The pin releases as soon as the draft is consumed on return, so the entry
+    // stops holding a slot the moment its retry copy is safe in the composer.
+    const a = registry.acquire("conv_a");
+    a.setState({ failedSendDraft: { conversationId: "conv_a", text: "x", files: [] } });
+    a.setState({ failedSendDraft: null });
+    expect(registry.evictLruEvictable()).toBe("conv_a");
+    expect(a.disposed).toBe(true);
+  });
+
   it("does evict an entry whose sends have all settled", () => {
     // Once the POST returns, the server can account for the message — the
     // navigate-back snapshot re-seeds it, so reclaiming its slot is safe.

@@ -382,6 +382,16 @@ export interface ConversationState {
    */
   failedSendDraft: { conversationId: string; text: string; files: File[] } | null;
   /**
+   * When a send last latched THIS conversation's `status` to "streaming", or
+   * `null`. Conversation-scoped, not a module global, because `status` is now
+   * per-conversation: two conversations can each hold a hung send, and a single
+   * shared timestamp would let recovering one strand the other (its `status`
+   * stays "streaming" but can no longer age out — see `sendLatchIsStranded`).
+   * Lives on the entry so the timestamp and the `status` it guards always
+   * travel together (adoption on new-chat, eviction, mirroring).
+   */
+  sendLatchedAt: number | null;
+  /**
    * LLM model identifier from the bound agent's spec for the active
    * session, e.g. ``"anthropic/claude-sonnet-4-6"``. Populated from
    * the session snapshot on bind; ``null`` before bind or when the
@@ -770,8 +780,9 @@ let queueSeq = 0;
 // When a send last latched local `status` to "streaming". Stamped on the way in
 // and never cleared on the way out: after a normal turn `status` settles to
 // "idle" on its own, so a leftover value is inert — only a `status` still
-// reading "streaming" long afterwards makes it meaningful.
-let sendLatchedAt: number | null = null;
+// reading "streaming" long afterwards makes it meaningful. The timestamp lives
+// on each conversation's entry (`ConversationState.sendLatchedAt`), not here,
+// so two hung sends can't share one scalar — see that field's note.
 
 // A chain link must never be able to deadlock its successors. `postEvent`
 // issues its fetch with no timeout, so a connection that dies mid-flight never
@@ -821,7 +832,8 @@ function cachedConversationStatus(conversationId: string): string | undefined {
  * session's own row disagrees with it. A live streaming response is never stale.
  */
 function sendLatchIsStranded(s: ChatState): boolean {
-  if (sendLatchedAt === null || Date.now() - sendLatchedAt < SEND_CHAIN_MAX_WAIT_MS) return false;
+  if (s.sendLatchedAt === null || Date.now() - s.sendLatchedAt < SEND_CHAIN_MAX_WAIT_MS)
+    return false;
   if (s.activeResponse?.state === "streaming") return false;
   return s.conversationId !== null && cachedConversationStatus(s.conversationId) === "idle";
 }
@@ -1096,8 +1108,8 @@ export function initChatStore(client: QueryClient): void {
   heldStreamSlots.clear();
   // Reset the POST-ordering chains so a prior run's unresolved send can't block
   // the next one (production calls this once at boot; tests call it per case).
+  // The send latch is per-conversation state now, cleared with the registry above.
   sendChains.clear();
-  sendLatchedAt = null;
   queryClient = client;
 }
 
@@ -1234,6 +1246,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   streamBudgetExceeded: false,
   streamBudgetBannerDismissed: false,
   failedSendDraft: null,
+  sendLatchedAt: null,
   llmModel: null,
   sessionHarness: null,
   subAgentName: null,
@@ -1348,14 +1361,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // ACTIVE conversation can wedge like this; `flushBackgroundQueues`
       // already drives every other queue off the server's own status.
       if (!sendLatchIsStranded(s)) return;
-      sendLatchedAt = null;
       // The stranded send still holds this conversation's chain link, so the
       // drain below would park on it for another SEND_CHAIN_MAX_WAIT_MS. Same
       // evidence, same conclusion: drop the link too. If that send ever does
       // settle, its `release` only clears an entry it still owns, so a fresh
       // chain started here is safe.
       sendChains.delete(s.conversationId);
-      setActive({ status: "idle" });
+      // Clear the latch on THIS conversation's entry only, alongside its status.
+      setActive({ status: "idle", sendLatchedAt: null });
     }
     // Flush the FIRST message OF THE BOUND CONVERSATION (FIFO within it), not
     // the global array head. The queue is one flat array across conversations,
@@ -1487,8 +1500,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // until its own `response.completed` arrives.
     const alreadyStreaming = get().status === "streaming";
     if (!alreadyStreaming) {
-      sendLatchedAt = Date.now();
-      setActive({ status: "streaming", activeResponse: null });
+      // Latch on the SAME entry as `status`, in one patch, so they can't
+      // diverge — a new chat buffers both on root and `adoptPreSessionState`
+      // moves them onto the entry together.
+      setActive({ status: "streaming", activeResponse: null, sendLatchedAt: Date.now() });
     }
 
     // Push to `pendingUserMessages` BEFORE the POST so the bubble
@@ -1690,8 +1705,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // serialization) so a skill invocation behaves like any other turn.
     const alreadyStreaming = get().status === "streaming";
     if (!alreadyStreaming) {
-      sendLatchedAt = Date.now();
-      setActive({ status: "streaming", activeResponse: null });
+      // See `send`: latch and status on one entry, in one patch.
+      setActive({ status: "streaming", activeResponse: null, sendLatchedAt: Date.now() });
     }
     // Optimistic echo of the typed command, mirroring `send`. Without it
     // the chat shows nothing until the server's `slash_command` receipt
@@ -5092,7 +5107,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     case "browser_action_request":
       // Embedded-browser action: fan out to the relay hook (which claims,
       // executes, posts the result). No store state; no-op without a relay.
-      emitBrowserActionRequest(event);
+      // Carry the delivering conversation so the relay claims/dispatches against
+      // the session that issued the action — a background conversation can emit
+      // one while a different conversation is on screen, and claiming at the
+      // visible session would be rejected as an owner mismatch.
+      emitBrowserActionRequest(event, sourceConversationId);
       return;
     case "session_status": {
       // Captured BEFORE the patch below adopts event.responseId, so a

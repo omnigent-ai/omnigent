@@ -57,6 +57,7 @@ import {
   setPendingInitialPrompt,
   startStreamPump,
   useChatStore,
+  type ConversationState,
   type FrameScheduler,
   bindConversationForTest,
   releaseConversation,
@@ -10131,6 +10132,44 @@ describe("chatStore — client-side message queue", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("recovers each conversation's own stranded send independently", () => {
+    // `status` and the latch are per-conversation now, so clearing ONE
+    // conversation's stranded latch must not disarm another's. A single shared
+    // timestamp let recovering A strand B — B stayed "streaming" but could no
+    // longer age out, so its composer and queue wedged until reload.
+    seedConversationsCache([conv("conv_a", "idle"), conv("conv_b", "idle")]);
+    // A stale timestamp is stranded without advancing timers (well past the
+    // 180s SEND_CHAIN_MAX_WAIT_MS window).
+    const stale = Date.now() - 10 * 60_000;
+    const wedged: Partial<ConversationState> = {
+      status: "streaming",
+      sessionStatus: "idle",
+      boundAgentId: "agent_xyz",
+      activeResponse: null,
+      sendLatchedAt: stale,
+    };
+    // Two conversations, each holding its own hung-send latch.
+    bindConversationForTest("conv_a", wedged);
+    bindConversationForTest("conv_b", wedged);
+
+    // Recover A (active): its stranded latch clears and its status settles.
+    bindConversationForTest("conv_a");
+    useChatStore.getState().maybeFlushQueuedHead();
+    expect(useChatStore.getState().status).toBe("idle");
+    expect(useChatStore.getState().sendLatchedAt).toBeNull();
+
+    // B is untouched — its own latch survived A's recovery.
+    const b = conversationRegistry.peek("conv_b")!.getState();
+    expect(b.status).toBe("streaming");
+    expect(b.sendLatchedAt).toBe(stale);
+
+    // And B is still independently recoverable. Pre-fix, A's recovery nulled the
+    // shared scalar, so B's latch read as absent and it could never age out.
+    bindConversationForTest("conv_b");
+    useChatStore.getState().maybeFlushQueuedHead();
+    expect(useChatStore.getState().status).toBe("idle");
   });
 });
 
