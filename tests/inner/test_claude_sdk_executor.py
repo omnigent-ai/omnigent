@@ -4500,9 +4500,9 @@ def test_precompact_hook_emits_compaction_started_before_complete() -> None:
         completed = [e for e in events if isinstance(e, CompactionComplete)]
         assert len(started) == 1, "expected exactly one CompactionStarted"
         assert len(completed) == 1, "expected exactly one CompactionComplete"
-        assert events.index(started[0]) < events.index(
-            completed[0]
-        ), "CompactionStarted must precede CompactionComplete"
+        assert events.index(started[0]) < events.index(completed[0]), (
+            "CompactionStarted must precede CompactionComplete"
+        )
 
     _run(_t())
 
