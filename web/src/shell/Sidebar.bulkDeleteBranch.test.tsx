@@ -30,6 +30,7 @@ vi.mock("@/hooks/useConversations", () => ({
     isPending: false,
     isError: false,
   }),
+  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
   usePinnedConversations: () => ({
     data: { conversations: [], filterHonored: true },
     isSuccess: true,
