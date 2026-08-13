@@ -904,7 +904,13 @@ export function Sidebar({
                         ? "1 inbox item waiting"
                         : `${inboxCount} inbox items waiting`
                     }
-                    className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--sidebar-active)] px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums"
+                    className={cn(
+                      "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
+                      // The active Inbox row already paints the translucent
+                      // --sidebar-active wash; repainting it on the nested
+                      // badge would double-composite to a darker fill.
+                      isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
+                    )}
                   >
                     {inboxCount}
                   </span>
