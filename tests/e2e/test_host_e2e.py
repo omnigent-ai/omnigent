@@ -291,6 +291,7 @@ def _wait_for_host_online_by_name(
                     if host["name"] == host_name and host["status"] == "online":
                         return host
         except httpx.ConnectError:
+            # The API may be temporarily unreachable during startup; retry until timeout.
             pass
         time.sleep(POLL_INTERVAL_S)
     raise AssertionError(f"Host named {host_name!r} did not appear online within {timeout}s")
