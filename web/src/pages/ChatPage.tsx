@@ -1825,15 +1825,6 @@ function MainAgentSurface({
     conversationRef.current = el;
     setContainerEl(el);
   }, []);
-  // How far the composer has grown past its resting height. The composer keeps
-  // that growth out of the flex column, so the wrapper's box never moves —
-  // this only lifts the overlays pinned to its bottom edge (the scroll-to-
-  // bottom button, the Working… tab, the message nav) clear of the taller
-  // card. Written straight to the DOM: a re-render per line of typing would
-  // re-render the whole transcript for a purely visual offset.
-  const publishComposerGrowth = useCallback((px: number) => {
-    conversationRef.current?.style.setProperty("--composer-growth", `${px}px`);
-  }, []);
   const [terminalSurfaceEl, setTerminalSurfaceEl] = useState<HTMLElement | null>(null);
   // True only while the chat/terminal surface is the frontmost thing on screen.
   // Drives both native overlays so neither floats over an opened drawer.
@@ -2210,7 +2201,6 @@ function MainAgentSurface({
             subagentRoutingEligible={subagentRoutingEligible}
             subAgentLabel={subAgentLabel}
             wrapperLabel={wrapperLabel}
-            onGrowthChange={publishComposerGrowth}
           />
 
           {/* Chat/Terminal toggle for terminal-first sessions, reconnect-or-
@@ -2315,9 +2305,7 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
       aria-live="polite"
       data-testid="working-indicator-pin"
       className={cn(
-        // bottom tracks --composer-growth so the tab keeps meeting the card's
-        // top edge while the composer is grown (it overlaps this wrapper).
-        "pointer-events-none absolute inset-x-0 bottom-[var(--composer-growth,0px)] z-20 transition-opacity duration-200",
+        "pointer-events-none absolute inset-x-0 bottom-0 z-20 transition-opacity duration-200",
         visible ? "opacity-100" : "opacity-0",
       )}
     >
@@ -2374,16 +2362,13 @@ function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
 
 /**
  * Preserves the transcript's distance-from-bottom whenever its scroll container
- * resizes on the iOS shell — so the content you're looking at stays put while
- * the soft keyboard opens/closes (and while the composer grows on focus).
+ * resizes — so the content you're looking at stays put while the composer grows
+ * or, on the iOS shell, while the soft keyboard opens and closes.
  *
- * Two things resize the container, and neither is handled by `use-stick-to-
- * bottom` (which only re-anchors on *content* resize): the keyboard, via
- * `useIOSViewportLock` shrinking the app-shell; and the composer growing taller
- * when focused (its send row / status line), which steals flex height from the
- * transcript a couple of lines at a time — *without* firing a visualViewport
- * resize. Watching only visualViewport missed the composer growth, which is why
- * the transcript crept up ~2 lines on focus.
+ * Neither resize is handled by `use-stick-to-bottom`, which only re-anchors on
+ * *content* resize. The composer steals flex height from the transcript on every
+ * platform; the iOS keyboard also shrinks the app shell through
+ * `useIOSViewportLock` without changing the transcript content.
  *
  * So we watch the scroll container itself with a `ResizeObserver` and, on any
  * size change, hold the scroll position relative to the bottom constant:
@@ -2402,7 +2387,6 @@ function PreserveScrollDistanceOnResize() {
   const scrollRef = ctx.scrollRef;
 
   useEffect(() => {
-    if (!isIOSShell()) return;
     const el = scrollRef?.current;
     if (!el) return;
 
@@ -4062,13 +4046,6 @@ interface ComposerProps {
    * keep using ``modelPickerKind`` / ``isNativeWrapper``.
    */
   wrapperLabel?: string | null;
-  /**
-   * Reports how many pixels taller than its resting height the composer has
-   * grown. The composer keeps that growth out of the column's flex layout
-   * (see the negative top margin below); the transcript uses the number to
-   * lift its bottom-anchored overlays clear of the taller card.
-   */
-  onGrowthChange?: (px: number) => void;
 }
 
 /**
@@ -4475,7 +4452,6 @@ export function Composer({
   subagentRoutingEligible = false,
   subAgentLabel = null,
   wrapperLabel = null,
-  onGrowthChange,
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -4511,7 +4487,6 @@ export function Composer({
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const formRef = useRef<HTMLFormElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
@@ -5004,20 +4979,9 @@ export function Composer({
   };
 
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
-  // The extra rows float over the transcript instead of shrinking it: a
-  // negative top margin holds the form's margin box at its resting height, so
-  // the transcript's scroll viewport — and with it the scrollbar's travel and
-  // the turn rail's centering — stays exactly where it was. Only the taller
-  // card overlaps, and it's opaque across the message column.
-  const applyGrowth = useCallback(
-    (px: number) => {
-      const form = formRef.current;
-      if (form) form.style.marginTop = px > 0 ? `${-px}px` : "";
-      onGrowthChange?.(px);
-    },
-    [onGrowthChange],
-  );
-  useAutoGrowTextarea(textareaRef, value, 10, applyGrowth);
+  // Growth stays in the flex column so the transcript viewport ends where the
+  // composer begins instead of letting the card cover visible output.
+  useAutoGrowTextarea(textareaRef, value, 10);
 
   // Scope recall to the active conversation so ArrowUp surfaces only this
   // chat's prompts, not the last thing typed in any other chat.
@@ -5307,12 +5271,9 @@ export function Composer({
 
   return (
     <form
-      ref={formRef}
       onSubmit={handleSubmit}
       className={cn(
-        // relative: the grown card overlaps the transcript above it, and a
-        // positioned box paints over that in-flow sibling.
-        "chat-composer-form relative px-4 md:px-6",
+        "chat-composer-form px-4 md:px-6",
         isTerminalFirst ? "terminal-first-composer-form pb-1.5" : "pb-3",
       )}
     >
