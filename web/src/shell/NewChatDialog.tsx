@@ -69,7 +69,7 @@ import {
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { attachmentKey } from "@/lib/attachments";
+import { attachmentKey, validateAttachments } from "@/lib/attachments";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
@@ -83,7 +83,7 @@ import {
 
 // Re-exported for tests that import the readiness helpers from this module.
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
-import { sandboxOptionLabel } from "@/lib/capabilities";
+import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import {
   isSlashCommandText,
   rankedSlashCommandNames,
@@ -106,6 +106,8 @@ import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import {
   readLastHostChoice,
   writeLastHostChoice,
+  readLastSandboxProvider,
+  writeLastSandboxProvider,
   SANDBOX_HOST_CHOICE,
 } from "@/lib/hostPreferences";
 import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
@@ -237,6 +239,33 @@ const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; descriptio
     value: "bypassPermissions",
     label: "Bypass permissions",
     description: "Runs everything; no prompts or safety checks",
+  },
+];
+
+// Antigravity (agy) permission control. agy exposes exactly ONE pre-emptive
+// knob — `--dangerously-skip-permissions`, an all-or-nothing bypass — with no
+// per-tool equivalent of acceptEdits/plan, so this is a two-value toggle rather
+// than Claude's graded selector. "default" sends no flags and leaves agy's own
+// request-review prompt in place. Keep in sync with `agy --help`.
+const AGY_NATIVE_DEFAULT_SKIP_MODE = "default";
+const AGY_NATIVE_SKIP_VALUE = "skip";
+const AGY_NATIVE_SKIP_MODES: {
+  value: string;
+  label: string;
+  description: string;
+  args: string[];
+}[] = [
+  {
+    value: AGY_NATIVE_DEFAULT_SKIP_MODE,
+    label: "Ask every time",
+    description: "Prompts before each tool runs",
+    args: [],
+  },
+  {
+    value: AGY_NATIVE_SKIP_VALUE,
+    label: "Skip permissions",
+    description: "Runs everything; no prompts or safety checks",
+    args: ["--dangerously-skip-permissions"],
   },
 ];
 
@@ -1272,7 +1301,7 @@ export function AgentHarnessPicker({
                     <DropdownMenuSub>
                       <DropdownMenuSubTrigger
                         data-testid="new-chat-landing-harness-more"
-                        className="items-center"
+                        className="cursor-pointer items-center"
                       >
                         <span className="flex-1">More</span>
                       </DropdownMenuSubTrigger>
@@ -1311,7 +1340,7 @@ export function AgentHarnessPicker({
                 <DropdownMenuSub>
                   <DropdownMenuSubTrigger
                     data-testid="new-chat-landing-custom-agents"
-                    className="items-center"
+                    className="cursor-pointer items-center"
                   >
                     <span className="flex-1">Custom agents</span>
                   </DropdownMenuSubTrigger>
@@ -1355,6 +1384,7 @@ function HarnessConfigModal({
   permissionMode,
   approvalMode,
   cursorExecMode,
+  agySkipMode,
   bypassSandbox,
   pickedModel,
   claudeModelOptions,
@@ -1367,6 +1397,7 @@ function HarnessConfigModal({
   setPermissionMode,
   setApprovalMode,
   setCursorExecMode,
+  setAgySkipMode,
   setBypassSandbox,
   setPickedModel,
   setPickedEffort,
@@ -1383,6 +1414,7 @@ function HarnessConfigModal({
   permissionMode: string;
   approvalMode: string;
   cursorExecMode: string;
+  agySkipMode: string;
   bypassSandbox: boolean;
   pickedModel: string;
   claudeModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
@@ -1395,6 +1427,7 @@ function HarnessConfigModal({
   setPermissionMode: (mode: string) => void;
   setApprovalMode: (mode: string) => void;
   setCursorExecMode: (mode: string) => void;
+  setAgySkipMode: (mode: string) => void;
   setBypassSandbox: (enabled: boolean) => void;
   setPickedModel: (model: string) => void;
   setPickedEffort: (effort: string) => void;
@@ -1408,6 +1441,7 @@ function HarnessConfigModal({
   const hasPermission = nativeAgentHasCapability(agent, "permissionMode");
   const hasApproval = nativeAgentHasCapability(agent, "approvalMode");
   const hasCursor = nativeAgentHasCapability(agent, "cursorMode");
+  const hasAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
   const isCodex = entryHarness === "codex-native";
   const modelOptions = isCodex ? codexModelOptions : claudeModelOptions;
   const modelsLoading = isCodex ? codexModelsLoading : claudeModelsLoading;
@@ -1421,6 +1455,7 @@ function HarnessConfigModal({
   const [draftPermission, setDraftPermission] = useState(permissionMode);
   const [draftApproval, setDraftApproval] = useState(approvalMode);
   const [draftCursor, setDraftCursor] = useState(cursorExecMode);
+  const [draftAgySkip, setDraftAgySkip] = useState(agySkipMode);
   const [draftBypass, setDraftBypass] = useState(bypassSandbox);
   const [draftHarness, setDraftHarness] = useState<string | null>(pickedHarness);
   const [draftRouting, setDraftRouting] = useState<CostControlMode>(costControlMode);
@@ -1432,6 +1467,7 @@ function HarnessConfigModal({
     setDraftPermission(permissionMode);
     setDraftApproval(approvalMode);
     setDraftCursor(cursorExecMode);
+    setDraftAgySkip(agySkipMode);
     setDraftBypass(bypassSandbox);
     setDraftHarness(pickedHarness);
     setDraftRouting(costControlMode);
@@ -1518,6 +1554,9 @@ function HarnessConfigModal({
     } else if (hasCursor) {
       setCursorExecMode(draftCursor);
       if (entryHarness) writeHarnessOption(entryHarness, { mode: draftCursor });
+    } else if (hasAgySkip) {
+      setAgySkipMode(draftAgySkip);
+      if (entryHarness) writeHarnessOption(entryHarness, { mode: draftAgySkip });
     } else if (brainDefault) {
       // Picking the spec default clears the override so the session tracks it.
       setPickedHarness(draftHarness === brainDefault ? null : draftHarness, agent.id);
@@ -1599,7 +1638,7 @@ function HarnessConfigModal({
                   disabled={smartRoutingOn}
                 >
                   <SelectTrigger
-                    className="w-full"
+                    className="w-full cursor-pointer"
                     data-testid="new-chat-landing-config-effort"
                     aria-label="Reasoning effort"
                   >
@@ -1682,20 +1721,6 @@ function HarnessConfigModal({
                   ariaLabel="Approval"
                 />
               </ConfigRow>
-              {/* Persistent danger banner while full-bypass is selected. */}
-              {isCodex && draftBypass && (
-                <div
-                  role="alert"
-                  data-testid="new-chat-landing-bypass-sandbox-banner"
-                  className="flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-sm font-medium leading-relaxed text-destructive"
-                >
-                  <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
-                  <span>
-                    Danger: this session runs Codex with approvals and the sandbox disabled. It can
-                    edit any file and run any command without asking.
-                  </span>
-                </div>
-              )}
             </>
           )}
 
@@ -1711,14 +1736,44 @@ function HarnessConfigModal({
             </ConfigRow>
           )}
 
+          {!autoRouting && hasAgySkip && (
+            <>
+              <ConfigRow label="Permissions" description="What the agent can do without asking">
+                <DescribedSelect
+                  value={draftAgySkip}
+                  onValueChange={setDraftAgySkip}
+                  options={AGY_NATIVE_SKIP_MODES}
+                  testId="new-chat-landing-config-agy-skip"
+                  ariaLabel="Permissions"
+                />
+              </ConfigRow>
+              {/* Persistent danger banner while the bypass is selected. agy has
+                  no firing pre-tool hook, so Omnigent cannot re-gate individual
+                  tools once this is on — the warning is the only guardrail. */}
+              {draftAgySkip === AGY_NATIVE_SKIP_VALUE && (
+                <div
+                  role="alert"
+                  data-testid="new-chat-landing-agy-skip-banner"
+                  className="flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium leading-relaxed text-destructive"
+                >
+                  <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+                  <span>
+                    Danger: this session runs Antigravity with all tool permission prompts disabled.
+                    It can edit any file and run any command without asking.
+                  </span>
+                </div>
+              )}
+            </>
+          )}
+
           {/* Stays rendered while Smart Routing is the pick: it is the control
           that selected it, so hiding it would strand the choice with no way to
           read it back or switch away without cancelling. */}
-          {!hasPermission && !hasApproval && !hasCursor && brainDefault && (
+          {!hasPermission && !hasApproval && !hasCursor && !hasAgySkip && brainDefault && (
             <ConfigRow label="Agent Harness" description="Underlying coding harness">
               <Select value={draftHarness ?? brainDefault} onValueChange={setDraftHarness}>
                 <SelectTrigger
-                  className="w-full"
+                  className="w-full cursor-pointer"
                   data-testid="new-chat-landing-config-harness"
                   aria-label="Agent Harness"
                 >
@@ -1811,6 +1866,7 @@ interface LandingDraft {
   pickedAgentId: string | null;
   selectedHostId: string | null;
   sandboxSelected: boolean;
+  sandboxProvider: string | null;
   sandboxRepoUrl: string;
   sandboxRepoBranch: string;
   workspace: string;
@@ -1820,6 +1876,7 @@ interface LandingDraft {
   approvalMode: string;
   bypassSandbox: boolean;
   cursorExecMode: string;
+  agySkipMode: string;
   pickedHarness: string | null;
   pickedModel: string;
   pickedEffort: string;
@@ -1894,9 +1951,21 @@ export function NewChatLandingScreen() {
   // composer (paperclip + paste); carried to ChatPage via the pending
   // initial prompt and sent with the auto-dispatched first turn.
   const [files, setFiles] = useState<File[]>(() => landingDraft?.files ?? []);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const addFiles = (incoming: File[]) => setFiles((prev) => [...prev, ...incoming]);
-  const removeFile = (index: number) => setFiles((prev) => prev.filter((_, i) => i !== index));
+  // Reject unsupported types (only images, PDF, and text/code) and oversized
+  // files here, before the session exists. Without this the upload only fails
+  // after the session is created and navigated into, where the first turn's
+  // 415 strands the typed message in a session the user never wanted.
+  const addFiles = (incoming: File[]) => {
+    const { accepted, errors } = validateAttachments(incoming);
+    if (accepted.length > 0) setFiles((prev) => [...prev, ...accepted]);
+    setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
+  };
+  const removeFile = (index: number) => {
+    setFiles((prev) => prev.filter((_, i) => i !== index));
+    setAttachmentError(null);
+  };
 
   // Drag-and-drop onto the composer — same behavior as the in-session
   // composer (drop files anywhere on the box; an inset ring + overlay
@@ -1956,6 +2025,22 @@ export function NewChatLandingScreen() {
   // falling back to the generic "New Sandbox" when the server names no
   // provider.
   const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
+  // One picker row per configured provider; a single-provider server
+  // yields exactly one.
+  const sandboxProviderRows = useMemo(
+    () => (info !== "loading" ? sandboxProviderOptions(info) : []),
+    [info],
+  );
+  // The provider a sandbox pick defaults to: the sticky last pick when the
+  // server still offers it, else the first offered row. Mirrors the sticky
+  // host choice — the composer reopens on the provider used last. Null until
+  // the rows load (info still resolving) so callers hold off seeding.
+  const defaultSandboxProvider = useCallback((): string | null => {
+    if (sandboxProviderRows.length === 0) return null;
+    const stored = readLastSandboxProvider();
+    if (stored !== null && sandboxProviderRows.includes(stored)) return stored;
+    return sandboxProviderRows[0];
+  }, [sandboxProviderRows]);
   // Embed-only docs seam: when the host passes additional docs and managed
   // sandboxes are unavailable, keep the sandbox row visible but disabled and
   // attach a help tooltip with a clickable link.
@@ -1988,6 +2073,12 @@ export function NewChatLandingScreen() {
   // (host_type: "managed"), so no host_id or workspace is sent.
   const [sandboxSelected, setSandboxSelected] = useState(
     () => landingDraft?.sandboxSelected ?? false,
+  );
+  // Provider the sandbox pick launches on. Seeded to the sticky last pick (or
+  // the first offered row) once the picker rows load; null both before that
+  // seed and for a single-provider server that names no provider.
+  const [sandboxProvider, setSandboxProvider] = useState<string | null>(
+    () => landingDraft?.sandboxProvider ?? null,
   );
   const { data: hostClaudeModelOptions, isLoading: hostClaudeModelsLoading } = useHostModelOptions(
     selectedHostId,
@@ -2090,6 +2181,11 @@ export function NewChatLandingScreen() {
   const [cursorExecMode, setCursorExecMode] = useState<string>(
     () => landingDraft?.cursorExecMode ?? CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   );
+  // agy's all-or-nothing `--dangerously-skip-permissions` toggle. Only
+  // meaningful for the antigravity-native wrapper; ignored otherwise.
+  const [agySkipMode, setAgySkipMode] = useState<string>(
+    () => landingDraft?.agySkipMode ?? AGY_NATIVE_DEFAULT_SKIP_MODE,
+  );
   // Per-session brain-harness override for bundle agents (polly / debby).
   // null = the agent spec's declared harness (no override sent). On agent
   // switch, seeded from the user's last stored pick for that agent.
@@ -2156,6 +2252,7 @@ export function NewChatLandingScreen() {
     pickedAgentId,
     selectedHostId,
     sandboxSelected,
+    sandboxProvider,
     sandboxRepoUrl,
     sandboxRepoBranch,
     workspace,
@@ -2165,6 +2262,7 @@ export function NewChatLandingScreen() {
     approvalMode,
     bypassSandbox,
     cursorExecMode,
+    agySkipMode,
     pickedHarness,
     pickedModel,
     pickedEffort,
@@ -2347,6 +2445,7 @@ export function NewChatLandingScreen() {
       if (info === "loading") return;
       if (managedSandboxesEnabled) {
         setSandboxSelected(true);
+        setSandboxProvider(defaultSandboxProvider());
         return;
       }
       // Sandbox no longer offered (e.g. an OSS server) — fall through.
@@ -2366,6 +2465,7 @@ export function NewChatLandingScreen() {
 
     if (managedSandboxesEnabled) {
       setSandboxSelected(true);
+      setSandboxProvider(defaultSandboxProvider());
       return;
     }
     const firstOnline = (hosts ?? []).find((h) => h.status === "online");
@@ -2378,6 +2478,7 @@ export function NewChatLandingScreen() {
     managedSandboxesEnabled,
     info,
     prefillSettled,
+    defaultSandboxProvider,
   ]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
@@ -2539,6 +2640,7 @@ export function NewChatLandingScreen() {
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
+  const supportsAgySkipPermissions = nativeAgentHasCapability(selectedAgent, "skipPermissions");
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
   // The selected native harness, used to persist/seed its option knobs (mode /
   // model / effort), which are harness-specific. null for non-native agents,
@@ -2580,6 +2682,7 @@ export function NewChatLandingScreen() {
     supportsPermissionMode ||
     supportsApprovalMode ||
     supportsCursorMode ||
+    supportsAgySkipPermissions ||
     smartRoutingEligible ||
     (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll);
   // Label/value pairs summarizing the selected agent's current run-config, for
@@ -2660,6 +2763,11 @@ export function NewChatLandingScreen() {
         CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.label ?? cursorExecMode;
       return [{ label: "Mode", value: modeValue }, ...routingRow];
     }
+    if (supportsAgySkipPermissions) {
+      const skipValue =
+        AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.label ?? agySkipMode;
+      return [{ label: "Permissions", value: skipValue }, ...routingRow];
+    }
     if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll) {
       const active = pickedHarness ?? selectedAgent.harness;
       return [
@@ -2673,6 +2781,7 @@ export function NewChatLandingScreen() {
     supportsPermissionMode,
     supportsApprovalMode,
     supportsCursorMode,
+    supportsAgySkipPermissions,
     selectedAgent,
     brainHarnessLabelsAll,
     routingOn,
@@ -2684,6 +2793,7 @@ export function NewChatLandingScreen() {
     approvalMode,
     bypassSandbox,
     cursorExecMode,
+    agySkipMode,
     pickedHarness,
   ]);
   // Reset per-agent-instance run-config that must not carry across an agent
@@ -2765,6 +2875,8 @@ export function NewChatLandingScreen() {
       if (storedRoutingOn) setPickedEffort("");
     } else if (supportsCursorMode) {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
+    } else if (supportsAgySkipPermissions) {
+      setAgySkipMode(resolve(AGY_NATIVE_SKIP_MODES, AGY_NATIVE_DEFAULT_SKIP_MODE));
     }
     // Reseed on harness changes and when the selected host's catalog resolves;
     // capability flags are derived from the same harness and stay omitted.
@@ -3049,7 +3161,10 @@ export function NewChatLandingScreen() {
     });
     if (step === null) return;
     const { writes } = step;
-    if (writes.selectSandbox) setSandboxSelected(true);
+    if (writes.selectSandbox) {
+      setSandboxSelected(true);
+      setSandboxProvider(defaultSandboxProvider());
+    }
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.agentId !== undefined) {
       setPickedAgentId((cur) => cur ?? writes.agentId!);
@@ -3070,6 +3185,7 @@ export function NewChatLandingScreen() {
     selectedHostId,
     pickedAgentId,
     prefillConfig,
+    defaultSandboxProvider,
   ]);
 
   // Opt-in worktree from the project's stored config. The inference machine
@@ -3275,13 +3391,16 @@ export function NewChatLandingScreen() {
   const workspaceLabel = workspaceTrimmed
     ? (workspaceTrimmed.split("/").filter(Boolean).pop() ?? workspaceTrimmed)
     : "Working directory";
+  // Names the picked provider, else the server's default label.
+  const selectedSandboxLabel =
+    sandboxProvider !== null ? sandboxOptionLabel(sandboxProvider) : sandboxLabel;
   const selectedHostDisplayName = selectedHost
     ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
     : null;
   const hostLabel = connectingThisMachine
     ? "Connecting…"
     : sandboxSelected
-      ? sandboxLabel
+      ? selectedSandboxLabel
       : (selectedHostDisplayName ?? (onlineHosts.length === 0 ? "No hosts" : "Choose host"));
   // The chip shows just the branch (the "(existing)" distinction lives in the
   // popover's warning; appending it here only gets clipped by the chip's cap).
@@ -3390,11 +3509,15 @@ export function NewChatLandingScreen() {
     seededHostRef.current = null;
   }
 
-  function selectSandbox() {
+  function selectSandbox(provider: string | null = null) {
     // Persist the explicit sandbox pick (as the reserved sentinel) even when
     // it's already selected, mirroring selectHost — so the sandbox becomes the
-    // sticky default for the next visit.
+    // sticky default for the next visit, on the provider just picked.
     writeLastHostChoice(SANDBOX_HOST_CHOICE);
+    writeLastSandboxProvider(provider);
+    // Recorded even when already selected, so re-picking a different
+    // provider still switches which one launches.
+    setSandboxProvider(provider);
     if (sandboxSelected) return;
     // Mirror selectHost: a managed session's host and workspace are both
     // server-chosen, so clear any prior host pick and its workspace.
@@ -3457,6 +3580,7 @@ export function NewChatLandingScreen() {
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
+      const agentSupportsAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
       // Smart Routing — server-side. The fully-auto harness always routes
       // (harness + model), so send "on" to keep the persisted state consistent
       // with the lit routing icon. Otherwise only send it when routing is
@@ -3587,6 +3711,8 @@ export function NewChatLandingScreen() {
               ? {
                   host_type: "managed",
                   workspace: composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch),
+                  // Omitted when null so a default create is unchanged.
+                  ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
                 }
               : {
                   host_id: selectedHostId,
@@ -3618,7 +3744,9 @@ export function NewChatLandingScreen() {
                   ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
                   : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
                     ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
-                    : undefined,
+                    : agentSupportsAgySkip && agySkipMode !== AGY_NATIVE_DEFAULT_SKIP_MODE
+                      ? (AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.args ?? [])
+                      : undefined,
             // Model + reasoning effort, persisted on the session row before
             // the runner launches. Claude and Codex read model_override at
             // terminal launch; an unselected ("") knob is omitted so the
@@ -3766,7 +3894,7 @@ export function NewChatLandingScreen() {
   const workspaceChip = (
     <button
       type="button"
-      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+      className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
       data-testid="new-chat-landing-workspace-chip"
     >
       <FolderIcon className="ui-icon" />
@@ -3774,6 +3902,7 @@ export function NewChatLandingScreen() {
           tight so a long working-directory path truncates instead of pushing
           the chip row onto a second line. */}
       <span className="hidden max-w-40 truncate text-sm sm:block">{workspaceLabel}</span>
+      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
     </button>
   );
 
@@ -3858,6 +3987,10 @@ export function NewChatLandingScreen() {
               value={message}
               onChange={(e) => {
                 setMessage(e.target.value);
+                // A rejected attachment is never added, so there's no chip to
+                // remove and nothing else would ever clear this. Left sticky it
+                // reads as a blocker on a composer the user can actually submit.
+                if (attachmentError !== null) setAttachmentError(null);
                 // Recompute the active "@"-mention from the caret each keystroke
                 // (native terminal agents with a workspace — ``mentionEnabled``).
                 setMention(
@@ -4048,6 +4181,15 @@ export function NewChatLandingScreen() {
                 ))}
               </div>
             )}
+            {/* Rejected-attachment feedback: unsupported type or too large */}
+            {attachmentError !== null && (
+              <div
+                className="px-4 pb-2 text-xs text-destructive whitespace-pre-wrap"
+                data-testid="new-chat-landing-attachment-error"
+              >
+                {attachmentError}
+              </div>
+            )}
             {/* No own bg — the pill paints the surface. An explicit bg-card
                 here would also catch the .dark .bg-card glass rule (border +
                 shadow) and visually split the pill in half. */}
@@ -4171,6 +4313,7 @@ export function NewChatLandingScreen() {
                     permissionMode={permissionMode}
                     approvalMode={approvalMode}
                     cursorExecMode={cursorExecMode}
+                    agySkipMode={agySkipMode}
                     bypassSandbox={bypassSandbox}
                     pickedModel={pickedModel}
                     claudeModelOptions={claudeModelOptions}
@@ -4187,6 +4330,7 @@ export function NewChatLandingScreen() {
                     setPermissionMode={setPermissionMode}
                     setApprovalMode={setApprovalMode}
                     setCursorExecMode={setCursorExecMode}
+                    setAgySkipMode={setAgySkipMode}
                     setBypassSandbox={setBypassSandbox}
                     setPickedModel={setPickedModel}
                     setPickedEffort={setPickedEffort}
@@ -4247,7 +4391,7 @@ export function NewChatLandingScreen() {
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+                    className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                     data-testid="new-chat-landing-host-chip"
                   >
                     {selectedHost?.status === "online" && !sandboxSelected ? (
@@ -4261,6 +4405,7 @@ export function NewChatLandingScreen() {
                       <MonitorIcon className="ui-icon" />
                     )}
                     <span className="hidden max-w-32 truncate text-sm sm:block">{hostLabel}</span>
+                    <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" className="min-w-52">
@@ -4270,17 +4415,28 @@ export function NewChatLandingScreen() {
                   {(managedSandboxesEnabled || showDisabledSandboxWithDocs) && (
                     <>
                       {managedSandboxesEnabled ? (
-                        <DropdownMenuItem
-                          onSelect={selectSandbox}
-                          data-testid="new-chat-landing-sandbox-option"
-                          data-active={sandboxSelected ? "true" : undefined}
-                          className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
-                        >
-                          <span className="flex items-center gap-2">
-                            <MonitorCloudIcon className="size-4 text-muted-foreground" />
-                            <span className="text-sm">{sandboxLabel}</span>
-                          </span>
-                        </DropdownMenuItem>
+                        sandboxProviderRows.map((provider, index) => (
+                          <DropdownMenuItem
+                            key={provider ?? "default"}
+                            onSelect={() => selectSandbox(provider)}
+                            // First row keeps the original testid; later
+                            // rows get a scoped one.
+                            data-testid={
+                              index === 0
+                                ? "new-chat-landing-sandbox-option"
+                                : `new-chat-landing-sandbox-option-${provider}`
+                            }
+                            data-active={
+                              sandboxSelected && sandboxProvider === provider ? "true" : undefined
+                            }
+                            className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                          >
+                            <span className="flex items-center gap-2">
+                              <MonitorCloudIcon className="size-4 text-muted-foreground" />
+                              <span className="text-sm">{sandboxOptionLabel(provider)}</span>
+                            </span>
+                          </DropdownMenuItem>
+                        ))
                       ) : (
                         <DropdownMenuItem
                           aria-disabled="true"
@@ -4420,13 +4576,14 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                       data-testid="new-chat-landing-repo-chip"
                     >
                       <GitBranchIcon className="ui-icon" />
                       <span className="hidden max-w-40 truncate text-sm sm:block">
                         {sandboxRepoLabel}
                       </span>
+                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
                   <PopoverContent align="start" className="w-96 p-3">
@@ -4527,13 +4684,14 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                       data-testid="new-chat-landing-branch-chip"
                     >
                       <GitBranchIcon className="ui-icon" />
                       <span className="hidden max-w-32 truncate text-sm sm:block">
                         {worktreeLabel}
                       </span>
+                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
                   <PopoverContent
@@ -4736,25 +4894,6 @@ export function NewChatLandingScreen() {
                   hostName: harnessWarningHost?.name,
                   fallbackAgentName: selectedAgent?.display_name,
                 })}
-              </span>
-            </p>
-          )}
-
-          {/* Persistent danger banner — stays under the composer while full
-              bypass is armed (the in-menu banner vanishes when the Advanced
-              tray closes), so the dangerous stance is always visible before
-              the session is created. Gated on the codex-native capability so
-              a stale toggle from a since-switched agent can't show it. */}
-          {supportsApprovalMode && bypassSandbox && (
-            <p
-              role="alert"
-              className="flex items-center gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-sm font-medium text-destructive"
-              data-testid="new-chat-landing-bypass-sandbox-active-banner"
-            >
-              <TriangleAlertIcon className="size-3.5 shrink-0" />
-              <span>
-                Codex will run with approvals and the sandbox disabled — it can edit any file and
-                run any command without asking.
               </span>
             </p>
           )}

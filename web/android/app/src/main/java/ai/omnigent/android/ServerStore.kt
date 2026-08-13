@@ -25,8 +25,16 @@ class ServerStore(
      */
     fun hasServer(): Boolean = !storedServerUrl().isNullOrBlank()
 
-    /** The current server, or the emulator-loopback debug default if unset. */
-    fun currentServerUrl(): String = storedServerUrl() ?: DEFAULT_DEBUG_SERVER
+    /**
+     * The current server, or the emulator-loopback debug default if unset. A bare
+     * Databricks workspace root resolves to its `/omnigent` mount so the shell
+     * lands on the app instead of the workspace landing page. Expanded on read,
+     * not on write, so the stored/offered entry stays what the user typed.
+     */
+    fun currentServerUrl(): String {
+        val stored = storedServerUrl() ?: return DEFAULT_DEBUG_SERVER
+        return databricksWorkspaceUiUrl(stored) ?: stored
+    }
 
     /**
      * The servers to offer in the UI: organization presets first, then recents

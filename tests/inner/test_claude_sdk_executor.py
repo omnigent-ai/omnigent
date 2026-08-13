@@ -4397,10 +4397,112 @@ def test_precompact_hook_emits_compaction_complete_with_session_messages() -> No
         assert ce.compacted_messages[0]["role"] == "user"
         assert ce.compacted_messages[1]["role"] == "assistant"
         mock_get_msgs.assert_called_once_with("claude-uuid-123", directory=None)
-        # CompactionComplete before TurnComplete
+        # CompactionStarted before CompactionComplete before TurnComplete
+        from omnigent.inner.executor import CompactionStarted
+
+        started_events = [e for e in events if isinstance(e, CompactionStarted)]
+        assert len(started_events) == 1
         turn_completes = [e for e in events if isinstance(e, TurnComplete)]
         assert len(turn_completes) == 1
+        assert events.index(started_events[0]) < events.index(compaction_events[0])
         assert events.index(compaction_events[0]) < events.index(turn_completes[0])
+
+    _run(_t())
+
+
+def test_precompact_hook_emits_compaction_started_before_complete() -> None:
+    """CompactionStarted is yielded when PreCompact fires, before CompactionComplete.
+
+    This ensures clients see the in-progress signal while compaction is
+    still happening, rather than both events arriving back-to-back after
+    the turn ends.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete, CompactionStarted
+
+    class _ResultMessage:
+        def __init__(self, session_id, result):
+            self.session_id = session_id
+            self.result = result
+            self.content = []
+            self.model = "claude-test"
+            self.usage = type(
+                "U",
+                (),
+                {"input_tokens": 500, "output_tokens": 100},
+            )()
+
+    class _SystemMessage:
+        def __init__(self, subtype, data, hook_event_name=None):
+            self.subtype = subtype
+            self.data = data
+            self.hook_event_name = hook_event_name
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = _SystemMessage
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+        messages: list = []
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                _FakeSDK.messages = [
+                    _SystemMessage(
+                        subtype="hook_started",
+                        data={"hook_event": "PreCompact"},
+                        hook_event_name="PreCompact",
+                    ),
+                    _ResultMessage("claude-uuid-456", "compacted result"),
+                ]
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._ensure_sdk",
+                return_value=_FakeSDK,
+            ),
+            patch(
+                "claude_agent_sdk.get_session_messages",
+                return_value=[],
+            ),
+        ):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        started = [e for e in events if isinstance(e, CompactionStarted)]
+        completed = [e for e in events if isinstance(e, CompactionComplete)]
+        assert len(started) == 1, "expected exactly one CompactionStarted"
+        assert len(completed) == 1, "expected exactly one CompactionComplete"
+        assert events.index(started[0]) < events.index(completed[0]), (
+            "CompactionStarted must precede CompactionComplete"
+        )
 
     _run(_t())
 

@@ -598,6 +598,7 @@ def _write_fake_dist_info(
     direct_url: dict[str, object] | None = None,
     uv_cache: dict[str, object] | None = None,
     dir_mtime_epoch: float | None = None,
+    version: str = "0.1.0",
 ) -> importlib.metadata.PathDistribution:
     """Build a real ``.dist-info/`` on disk and return a PathDistribution.
 
@@ -619,11 +620,14 @@ def _write_fake_dist_info(
     :param dir_mtime_epoch: When provided, ``os.utime`` is used to
         backdate the dist-info dir's mtime to this Unix timestamp —
         this is the fallback signal when ``uv_cache.json`` is absent.
+    :param version: Installed package version written to ``METADATA``.
     :returns: A ``PathDistribution`` constructed against the dir.
     """
-    dist_info = tmp_path / "omnigent-0.1.0.dist-info"
+    dist_info = tmp_path / f"omnigent-{version}.dist-info"
     dist_info.mkdir()
-    (dist_info / "METADATA").write_text("Metadata-Version: 2.1\nName: omnigent\nVersion: 0.1.0\n")
+    (dist_info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: omnigent\nVersion: {version}\n"
+    )
     if installer is not None:
         (dist_info / "INSTALLER").write_text(installer + "\n")
     if direct_url is not None:
@@ -1002,6 +1006,30 @@ def test_wheel_check_no_nag_when_up_to_date(
     assert capsys.readouterr().err == ""
 
 
+def test_wheel_check_no_nag_for_matching_dev_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A dev build from the latest release line is already current."""
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    _point_cache_at(tmp_path, monkeypatch)
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=0,
+            kind="wheel",
+            latest_version="0.9.0",
+        )
+    )
+    dist = _write_fake_dist_info(tmp_path, installer="uv", version="0.9.0.dev0")
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+
+    _run_installed_wheel_check()
+
+    assert capsys.readouterr().err == ""
+
+
 def test_wheel_check_nags_when_newer_release_available(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1232,6 +1260,15 @@ def test_is_newer_tolerates_garbage() -> None:
 
     assert _is_newer("not-a-version", "0.1.0") is True  # falls back to != and non-empty
     assert _is_newer("", "0.1.0") is False
+
+
+def test_should_notify_release_treats_dev_build_as_current_release() -> None:
+    """Matching finals stay quiet without hiding later release lines."""
+    from omnigent.update_check import _should_notify_release
+
+    assert _should_notify_release("0.9.0", "0.9.0.dev0") is False
+    assert _should_notify_release("0.9.1", "0.9.0.dev0") is True
+    assert _should_notify_release("0.9.0.post1", "0.9.0.dev0") is True
 
 
 class _FakeResp:

@@ -386,8 +386,9 @@ function AddDefaultPolicyDialog({
             </div>
           )}
           <div className="flex justify-end gap-2 pt-1">
-            <button
+            <Button
               type="button"
+              variant="outline"
               onClick={() => {
                 // With a policy selected, Cancel steps back to the list so the
                 // user can pick another; only close the dialog from the list.
@@ -399,18 +400,17 @@ function AddDefaultPolicyDialog({
                   onOpenChange(false);
                 }
               }}
-              className="rounded px-3 py-1.5 text-sm hover:bg-muted"
             >
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
               onClick={handleAdd}
-              disabled={!selected || addPolicy.isPending}
-              className="rounded bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-50"
+              loading={addPolicy.isPending}
+              disabled={!selected}
             >
-              {addPolicy.isPending ? "Adding..." : "Add"}
-            </button>
+              Add
+            </Button>
           </div>
         </div>
       </DialogContent>
@@ -645,9 +645,9 @@ export function PoliciesPage() {
             <Button
               variant="destructive"
               onClick={() => void onConfirmDelete()}
-              disabled={pendingAction}
+              loading={pendingAction}
             >
-              {pendingAction ? "Removing..." : "Remove"}
+              Remove
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -13,6 +13,7 @@ import type { HostFilesystemEntry } from "./useHostFilesystem";
 import {
   buildHostFilesystemUrl,
   createHostDirectory,
+  shouldRetryHostFilesystem,
   useHostFilesystem,
 } from "./useHostFilesystem";
 
@@ -175,13 +176,14 @@ describe("useHostFilesystem", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("throws a FetchError carrying the HTTP status on a non-OK response", async () => {
+  it("throws a friendly doesn't-exist error carrying the status on a 404", async () => {
     // WHY: the picker distinguishes 404 (no such dir) from other failures via
-    // err.status, so the thrown error must surface the response status.
+    // err.status, and a typed bad path is the common 404 — so the message must
+    // read as "doesn't exist" (naming the path), not a bare status code.
     fetchMock.mockResolvedValue({
       ok: false,
       status: 404,
-      json: async () => ({}),
+      json: async () => ({ detail: "path does not exist" }),
     } as unknown as Response);
 
     const { result } = renderHook(() => useHostFilesystem("host_1", "/missing"), {
@@ -191,7 +193,37 @@ describe("useHostFilesystem", () => {
     await waitFor(() => expect(result.current.isError).toBe(true));
     const err = result.current.error as (Error & { status?: number }) | null;
     expect(err?.status).toBe(404);
-    expect(err?.message).toContain("HTTP 404");
+    expect(err?.message).toContain("/missing");
+    expect(err?.message).toContain("doesn't exist");
+  });
+});
+
+// The listing must not retry a deterministic 4xx (retries keep the query
+// pending, leaving the previous directory's rows on screen behind the
+// placeholder), but must still retry transient failures up to the cap.
+describe("shouldRetryHostFilesystem", () => {
+  function withStatus(status: number): Error {
+    const err = new Error(`HTTP ${status}`) as Error & { status?: number };
+    err.status = status;
+    return err;
+  }
+
+  it("never retries a 4xx (missing path, bad path, not owner)", () => {
+    expect(shouldRetryHostFilesystem(0, withStatus(404))).toBe(false);
+    expect(shouldRetryHostFilesystem(0, withStatus(403))).toBe(false);
+    expect(shouldRetryHostFilesystem(0, withStatus(400))).toBe(false);
+  });
+
+  it("retries a transient 5xx up to the cap, then stops", () => {
+    expect(shouldRetryHostFilesystem(0, withStatus(502))).toBe(true);
+    expect(shouldRetryHostFilesystem(2, withStatus(502))).toBe(true);
+    expect(shouldRetryHostFilesystem(3, withStatus(502))).toBe(false);
+  });
+
+  it("retries a status-less error (network failure) up to the cap", () => {
+    // A thrown network error carries no HTTP status — treat it as transient.
+    expect(shouldRetryHostFilesystem(0, new Error("network down"))).toBe(true);
+    expect(shouldRetryHostFilesystem(3, new Error("network down"))).toBe(false);
   });
 });
 

@@ -365,6 +365,16 @@ def _rotate_session_on_clear(bridge_dir: Path) -> str | None:
         if isinstance(raw_headers, dict)
         else {}
     )
+    # Route the whole rotation sequence (GET old, POST /v1/sessions or /fork,
+    # PATCH new, DELETE old) to the replica holding this host's tunnel: a managed
+    # create/fork notifies the host inline over its pod-local tunnel, so an
+    # off-replica request can't reach it. This hook client carries no
+    # _RunnerDatabricksAuth, so key the reused headers dict from the runner-env
+    # host_id (databricks_request_headers reads OMNIGENT_RUNNER_SLICE_KEY when no
+    # explicit host_id; emitted only on the workspace mount).
+    from omnigent.cli_auth import databricks_request_headers
+
+    headers.update(databricks_request_headers(ap_server_url))
     try:
         with httpx.Client(
             headers=headers, timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S)
@@ -411,6 +421,16 @@ def _rotate_session_on_fork(bridge_dir: Path) -> str | None:
         if isinstance(raw_headers, dict)
         else {}
     )
+    # Route the whole rotation sequence (GET old, POST /v1/sessions or /fork,
+    # PATCH new, DELETE old) to the replica holding this host's tunnel: a managed
+    # create/fork notifies the host inline over its pod-local tunnel, so an
+    # off-replica request can't reach it. This hook client carries no
+    # _RunnerDatabricksAuth, so key the reused headers dict from the runner-env
+    # host_id (databricks_request_headers reads OMNIGENT_RUNNER_SLICE_KEY when no
+    # explicit host_id; emitted only on the workspace mount).
+    from omnigent.cli_auth import databricks_request_headers
+
+    headers.update(databricks_request_headers(ap_server_url))
     try:
         with httpx.Client(
             headers=headers, timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S)
@@ -826,6 +846,13 @@ def _main_permission_request(argv: list[str]) -> int:
         raw_headers = config.get("ap_auth_headers")
         if isinstance(raw_headers, dict):
             headers = {str(key): str(value) for key, value in raw_headers.items()}
+    # A permission request raises a web elicitation that parks in the pod-local
+    # registry on the replica holding this session's runner tunnel; an unkeyed
+    # POST lands elsewhere and the approval is silently lost. Key from the
+    # runner-env host_id (reads OMNIGENT_RUNNER_SLICE_KEY; workspace mount only).
+    from omnigent.cli_auth import databricks_request_headers
+
+    headers.update(databricks_request_headers(ap_server_url))
     url = (
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{url_component(session_id)}/hooks/permission-request"
@@ -898,6 +925,12 @@ def _main_ask_user_question(argv: list[str]) -> int:
         raw_headers = config.get("ap_auth_headers")
         if isinstance(raw_headers, dict):
             headers = {str(key): str(value) for key, value in raw_headers.items()}
+    # Same as the permission-request hook: the elicitation parks in the pod-local
+    # registry on the session's tunnel replica, so key the POST from the
+    # runner-env host_id or an off-replica landing silently drops the prompt.
+    from omnigent.cli_auth import databricks_request_headers
+
+    headers.update(databricks_request_headers(ap_server_url))
     url = (
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{url_component(session_id)}/hooks/permission-request"
@@ -1048,6 +1081,12 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         raw_headers = config.get("ap_auth_headers")
         if isinstance(raw_headers, dict):
             headers = {str(k): str(v) for k, v in raw_headers.items()}
+        # This posts to the session's policy registry on the replica holding its
+        # tunnel; key from the runner-env host_id so it isn't misrouted. (The
+        # relay branch above targets a relay token URL, so it needs no key.)
+        from omnigent.cli_auth import databricks_request_headers
+
+        headers.update(databricks_request_headers(ap_server_url))
         session_component = url_component(session_id)
         url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
         reauth = policy_hook_reauth(ap_server_url, headers)

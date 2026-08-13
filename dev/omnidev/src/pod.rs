@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::ports::Ports;
+use crate::profile::Profile;
 
 pub struct Pod {
     pub repo_root: PathBuf,
@@ -15,6 +16,7 @@ pub struct Pod {
     /// LAN origins to trust for device testing (`--trust-lan-origins`); empty
     /// otherwise. Fed to the server as `OMNIGENT_WS_ALLOWED_ORIGINS`.
     pub trusted_origins: Vec<String>,
+    pub profile: Option<Profile>,
 }
 
 impl Pod {
@@ -28,6 +30,17 @@ impl Pod {
         vite_host: String,
         trusted_origins: Vec<String>,
     ) -> Result<Pod> {
+        Self::create_with_profile(repo_root, dir, ports, vite_host, trusted_origins, None)
+    }
+
+    pub fn create_with_profile(
+        repo_root: PathBuf,
+        dir: PathBuf,
+        ports: Ports,
+        vite_host: String,
+        trusted_origins: Vec<String>,
+        profile: Option<Profile>,
+    ) -> Result<Pod> {
         for sub in ["data/omnigent", "artifacts", "logs", "config"] {
             let p = dir.join(sub);
             std::fs::create_dir_all(&p)
@@ -39,6 +52,7 @@ impl Pod {
             ports,
             vite_host,
             trusted_origins,
+            profile,
         };
         // Seed the pod's config from the developer's real one so it works out
         // of the box (keeps their providers). Best-effort: a copy failure just
@@ -87,14 +101,17 @@ impl Pod {
     }
 
     pub fn web_dir(&self) -> PathBuf {
-        self.repo_root.join("web")
+        self.repo_root.join(
+            self.profile
+                .as_ref()
+                .map(|profile| profile.web_dir.as_path())
+                .unwrap_or_else(|| Path::new("web")),
+        )
     }
 
-    /// Whether `web/` needs `pnpm install` before Vite can start: either
-    /// `node_modules/` is absent, or the lockfile / `package.json` is newer
-    /// than the installed tree (a dependency was added/changed since the last
-    /// install — the case that makes Vite's dependency scan fail).
-    pub fn needs_pnpm_install(&self) -> bool {
+    /// Whether web dependencies need preparation before Vite can start.
+    /// Profiles select their web directory and dependency manifests.
+    pub fn needs_web_prepare(&self) -> bool {
         let web = self.web_dir();
         let modules = web.join("node_modules");
         if !modules.is_dir() {
@@ -105,15 +122,42 @@ impl Pod {
             return true;
         };
         // Reinstall if either manifest is newer than node_modules.
-        [self.repo_root.join("pnpm-lock.yaml"), web.join("package.json")]
+        let manifests = self
+            .profile
+            .as_ref()
+            .map(|profile| {
+                profile
+                    .dependency_manifests
+                    .iter()
+                    .map(|path| web.join(path))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                vec![
+                    self.repo_root.join("pnpm-lock.yaml"),
+                    web.join("package.json"),
+                ]
+            });
+        manifests
             .into_iter()
             .filter_map(mtime)
             .any(|t| t > installed)
     }
 
     /// Directory to watch for backend source changes.
-    pub fn omnigent_dir(&self) -> PathBuf {
-        self.repo_root.join("omnigent")
+    pub fn backend_dir(&self) -> PathBuf {
+        self.repo_root.join(
+            self.profile
+                .as_ref()
+                .map(|profile| profile.backend_dir.as_path())
+                .unwrap_or_else(|| Path::new("omnigent")),
+        )
+    }
+
+    pub fn host_enabled(&self) -> bool {
+        self.profile
+            .as_ref()
+            .map_or(true, |profile| profile.host.is_some())
     }
 
     pub fn log_file(&self, name: &str) -> PathBuf {

@@ -185,6 +185,99 @@
     return `${url.origin}${WORKSPACE_UI_PATH}`;
   }
 
+  /**
+   * Path of the server's version manifest (RFC 8615 well-known URI). Served
+   * unauthed so the shell can read it before the SPA loads / any login.
+   */
+  const WELL_KNOWN_MANIFEST_PATH = "/.well-known/omnigent.json";
+
+  /**
+   * The manifest a pre-manifest server implies: every server older than the
+   * route, which 404s. NOT an error — the shell keeps its existing behavior.
+   * `manifestVersion: 0` means "older than version 1", so the ordinary `>=`
+   * gate excludes it without callers special-casing null.
+   */
+  const PRE_MANIFEST_BASELINE = Object.freeze({
+    manifestVersion: 0,
+    serverVersion: null,
+    minDesktopVersion: null,
+    ui: Object.freeze({}),
+  });
+
+  /**
+   * Timeout for the manifest fetch. Short and non-fatal for the same reason as
+   * the workspace probe: connecting must never stall behind it. On timeout we
+   * fall back to the pre-manifest baseline and connect anyway.
+   */
+  const MANIFEST_FETCH_TIMEOUT_MS = 5000;
+
+  /**
+   * Read a server's version manifest, so the shell can adapt to the server it
+   * actually reached instead of assuming its own release's behavior.
+   *
+   * TOTAL: this never throws and never blocks a connection. Anything short of a
+   * well-formed manifest — 404 (older server), unreachable host, HTML from an
+   * SPA catch-all, malformed JSON, wrong types — yields
+   * {@link PRE_MANIFEST_BASELINE}. "I could not learn anything" and "this
+   * server predates the manifest" are deliberately the same answer: both mean
+   * "use existing behavior", which is what keeps an older shell working
+   * against a newer server and vice versa.
+   *
+   * Callers gate with `manifestVersion >= N`, never `=== N`, so a server that
+   * bumps the envelope stays usable by a shell that predates the bump.
+   *
+   * @param {string} serverUrl A normalized absolute http(s) server URL.
+   * @returns {Promise<{manifestVersion: number, serverVersion: string | null,
+   *   minDesktopVersion: string | null, ui: Record<string, unknown>}>}
+   */
+  async function fetchServerManifest(serverUrl) {
+    let origin;
+    try {
+      origin = new URL(serverUrl).origin;
+    } catch {
+      return PRE_MANIFEST_BASELINE;
+    }
+    let response;
+    try {
+      response = await fetch(`${origin}${WELL_KNOWN_MANIFEST_PATH}`, {
+        // A redirect to a login page is not a manifest; don't follow it.
+        redirect: "manual",
+        signal: AbortSignal.timeout(MANIFEST_FETCH_TIMEOUT_MS),
+      });
+    } catch {
+      return PRE_MANIFEST_BASELINE;
+    }
+    if (!response.ok) return PRE_MANIFEST_BASELINE;
+    // Guard the content type explicitly: a server whose SPA catch-all swallows
+    // unknown paths answers 200 text/html, and parsing that as a manifest would
+    // be worse than not having one. (Servers with the route also exclude
+    // `.well-known` from the SPA fallback, so this is belt-and-braces for
+    // proxies and older builds.)
+    const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
+    if (!contentType.includes("json")) return PRE_MANIFEST_BASELINE;
+    let body;
+    try {
+      body = await response.json();
+    } catch {
+      return PRE_MANIFEST_BASELINE;
+    }
+    if (body === null || typeof body !== "object") return PRE_MANIFEST_BASELINE;
+    // An envelope whose version isn't a number tells us nothing we can gate
+    // on, so treat it as absent rather than trusting the rest of the document.
+    if (typeof body.manifest_version !== "number" || !Number.isFinite(body.manifest_version)) {
+      return PRE_MANIFEST_BASELINE;
+    }
+    return {
+      manifestVersion: body.manifest_version,
+      serverVersion: typeof body.server_version === "string" ? body.server_version : null,
+      minDesktopVersion:
+        typeof body.min_desktop_version === "string" ? body.min_desktop_version : null,
+      // Passed through as-is: unknown keys are the extension point, so the
+      // shell must not filter to the ones this release happens to know.
+      ui: body.ui !== null && typeof body.ui === "object" ? body.ui : {},
+    };
+  }
+
   return {
     LOCAL_HOSTS,
     defaultSchemeFor,
@@ -193,5 +286,9 @@
     WORKSPACE_UI_PATH,
     WORKSPACE_PROBE_TIMEOUT_MS,
     expandDatabricksWorkspaceUrl,
+    WELL_KNOWN_MANIFEST_PATH,
+    MANIFEST_FETCH_TIMEOUT_MS,
+    PRE_MANIFEST_BASELINE,
+    fetchServerManifest,
   };
 });

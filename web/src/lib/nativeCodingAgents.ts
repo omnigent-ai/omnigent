@@ -16,7 +16,8 @@ export type NativeCodingAgentIconKind =
   | "antigravity"
   | "kimi"
   | "hermes";
-export type NativeCodingAgentCapability = "permissionMode" | "approvalMode" | "cursorMode";
+export type NativeCodingAgentCapability =
+  "permissionMode" | "approvalMode" | "cursorMode" | "skipPermissions";
 
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
@@ -125,9 +126,14 @@ export const NATIVE_CODING_AGENTS = [
     agentName: "antigravity-native-ui",
     harness: "antigravity-native",
     wrapperLabel: "antigravity-native-ui",
+    subagentWrapperLabel: "antigravity-native-ui-subagent",
     displayName: "Antigravity",
     iconKind: "antigravity",
     sortRank: 45,
+    // agy's only pre-emptive control is the all-or-nothing
+    // `--dangerously-skip-permissions`, so it gets a two-value toggle rather
+    // than Claude's graded permissionMode selector.
+    capabilities: ["skipPermissions"],
   },
   {
     key: "goose",

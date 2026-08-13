@@ -123,7 +123,7 @@
             "type": "array"
           },
           "skills": {
-            "description": "Skills bundled in the agent spec (`skills/<name>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session (and its runner) exists. Host-discovered skills are runner-owned, so they are NOT listed here \u2014 the session snapshot's `skills` field carries the merged set once a runner is bound. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",
+            "description": "Skills bundled in the agent spec (`skills/<dir>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session (and its runner) exists. Host-discovered skills are runner-owned, so they are NOT listed here \u2014 the session snapshot's `skills` field carries the merged set once a runner is bound. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",
             "items": {
               "$ref": "#/components/schemas/SkillSummary"
             },
@@ -1286,6 +1286,25 @@
         "title": "CreatedEvent",
         "type": "object"
       },
+      "DailyCost": {
+        "description": "One day's LLM spend for the daily timeline chart.",
+        "properties": {
+          "cost_usd": {
+            "default": 0.0,
+            "title": "Cost Usd",
+            "type": "number"
+          },
+          "day": {
+            "title": "Day",
+            "type": "string"
+          }
+        },
+        "required": [
+          "day"
+        ],
+        "title": "DailyCost",
+        "type": "object"
+      },
       "ElicitationRequestEvent": {
         "description": "Synchronous request for a decision from upstream.\n\nEmitted by Omnigent (or, under the new contract, by a harness)\nwhen the LLM / a tool / a policy needs a verdict before\nproceeding. The consumer replies via\n`POST /v1/sessions/{session_id}/events` with\n`type == \"approval\"` and\n`omnigent.server.schemas.ElicitationResult` fields in\n`data`. This preserves MCP request/reply correlation by id\nwithout threading elicitations through PATCH.\n\nWire shape matches the existing emit at\n`omnigent/runtime/policies/approval.py:175`.",
         "properties": {
@@ -1506,15 +1525,54 @@
       "ErrorDetail": {
         "description": "Machine-readable error information attached to a failed response.",
         "properties": {
+          "cause": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional one/two-sentence explanation of why it failed. Paired with `title`.",
+            "title": "Cause"
+          },
           "code": {
             "description": "Error code string, e.g. `\"server_error\"`, `\"invalid_input\"`.",
             "title": "Code",
             "type": "string"
           },
           "message": {
-            "description": "Human-readable error description.",
+            "description": "Human-readable error description. Always populated; older clients render this verbatim.",
             "title": "Message",
             "type": "string"
+          },
+          "remediation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional concrete next step to fix it, e.g. a command to run. `None` when there is no single clear fix.",
+            "title": "Remediation"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional short headline naming what went wrong, e.g. `\"Claude Code can't run as root\"`. Present when the runner recognized the failure (see `omnigent.runner.launch_failure`); lets the UI show a clear card title instead of the raw `code`.",
+            "title": "Title"
           }
         },
         "required": [
@@ -2437,7 +2495,7 @@
               }
             ],
             "default": null,
-            "description": "`True` on the last chunk of a terminal-observed message; `None` otherwise. Signals the web UI that no further chunks for `message_id` will arrive.",
+            "description": "Optional provider completion marker for the message.",
             "title": "Final"
           },
           "index": {
@@ -2450,7 +2508,7 @@
               }
             ],
             "default": null,
-            "description": "0-based chunk order within the message, e.g. `3`. `None` when not terminal-observed streaming.",
+            "description": "0-based chunk order within the message, e.g. `3`. Used to suppress repeated chunks; `None` for in-process streaming.",
             "title": "Index"
           },
           "message_id": {
@@ -2463,7 +2521,7 @@
               }
             ],
             "default": null,
-            "description": "For terminal-observed streaming (claude-native), the vendor's stable per-message id, e.g. `\"2ca51d97-2f0f-493a-aed7-85a5b56c5747\"`. Lets the web UI scope an in-flight buffer to one assistant message and reconcile it against the final item. `None` for ordinary in-process task streaming, where deltas already group by the active response.",
+            "description": "For native terminal streaming, the provider's stable per-message id, e.g. `\"2ca51d97-2f0f-493a-aed7-85a5b56c5747\"`. `None` for ordinary in-process task streaming, where deltas group by the active response.",
             "title": "Message Id"
           },
           "sequence_number": {
@@ -5758,6 +5816,17 @@
       "SessionUsage": {
         "description": "One session's rolled-up LLM spend for the `GET /v1/usage` report.\n\n`cost_usd` is the subtree total \u2014 the session plus every sub-agent it\nspawned \u2014 read from `session_usage` via\n`omnigent.runtime.policies.builder.load_session_usage`. It is the\nauthoritative session figure (the same value the web session sidebar\nshows as \"Session cost\" and the daily rollup records).\n\n`models` is the per-model cost breakdown, mirroring the web session\nsidebar's per-model list. Deliberately **not guaranteed to sum to\n`cost_usd`**: native harnesses report a single cumulative session\ntotal and the server attributes it to the currently-active model, so on\na session that switched models mid-run each model's bucket is a snapshot\nof the running total rather than that model's own spend. The header\n`cost_usd` stays authoritative; the per-model values are shown\nfaithfully as recorded (same convention as the web UI).",
         "properties": {
+          "agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Name"
+          },
           "cost_usd": {
             "default": 0.0,
             "description": "Authoritative cumulative USD spend for this session's subtree.",
@@ -5769,10 +5838,32 @@
             "title": "Created At",
             "type": "integer"
           },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harness"
+          },
           "id": {
             "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
             "title": "Id",
             "type": "string"
+          },
+          "llm_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Model"
           },
           "models": {
             "additionalProperties": {
@@ -6886,6 +6977,13 @@
             "title": "Cost Today",
             "type": "number"
           },
+          "daily_costs": {
+            "items": {
+              "$ref": "#/components/schemas/DailyCost"
+            },
+            "title": "Daily Costs",
+            "type": "array"
+          },
           "object": {
             "const": "usage_report",
             "default": "usage_report",
@@ -6973,6 +7071,27 @@
   },
   "openapi": "3.2.0",
   "paths": {
+    "/.well-known/omnigent.json": {
+      "get": {
+        "description": "Version manifest for NON-BROWSER clients \u2014 chiefly the desktop shell.\n\nThe desktop shell ships and updates on its own cadence, so any\ninstalled build can meet any server version. The shell is the side\nthat must adapt (the user may not update it for months), and to adapt\nit first has to know what it is talking to. This endpoint is that\nanswer, fetched BEFORE the SPA loads \u2014 unlike `/v1/info`, which the\nSPA reads after boot and which is therefore useless to the shell when\ndeciding how to open a window in the first place.\n\nContract, in the order a client should apply it:\n\n1. `manifest_version` (int) versions this ENVELOPE. Clients gate on\n   `>=`, never `==`, so a newer server keeps working with an older\n   shell. See `WELL_KNOWN_MANIFEST_VERSION` for when it bumps \u2014\n   adding a field never does.\n2. `server_version` (str) is the installed omnigent package version,\n   the same value as `/api/version` and `/v1/info.server_version`.\n   Informational: for display and bug reports, NOT for gating. Gate on\n   the fields below, which state capability directly rather than making\n   every client hardcode \"which release added X\".\n3. `min_desktop_version` (str | null) is the oldest desktop build this\n   server still supports. Null means no floor \u2014 the overwhelmingly\n   common case, and what every shipped shell must treat as \"fine\".\n   A server sets it only to signal a genuinely breaking change.\n4. Everything else is additive detail an older client may ignore\n   wholesale. `ui` describes where server-driven chrome lives, so a\n   shell can place its own window furniture without guessing from the\n   version number: `server_picker` is `\"sidebar\"` on builds that\n   dock the picker at the sidebar's bottom (it was `\"titlebar\"`,\n   centered in the macOS title-bar strip, before this).\n\nUnknown fields MUST be ignored, and a missing manifest (404 \u2014 every\nserver older than this route) MUST be treated as the pre-manifest\nbaseline, not an error: the shell falls back to its current behavior.\nThat is what makes an old shell + new server and a new shell + old\nserver both work.\n\nAuthentication: intentionally UNAUTHED, like `/v1/info`. A client\nmust be able to read this before it holds a session cookie \u2014 the whole\npoint is to consult it before loading the app. It exposes only the\nversion already public via `/api/version` plus coarse UI-shape\nstrings, so there is nothing here to leak.\n\nServed under `/.well-known/` (RFC 8615) so it sits at a fixed,\nguessable path that never collides with an SPA client route.\n\n**Returns:** The manifest described above.",
+        "operationId": "well_known_manifest__well_known_omnigent_json_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Well Known Manifest  Well Known Omnigent Json Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Well Known Manifest"
+      }
+    },
     "/api/version": {
       "get": {
         "description": "Return the installed omnigent package version.\n\nUsed by the web UI to include version info in bug reports.\n\n**Returns:** `{\"version\": \"<semver string>\"}`, e.g. `{\"version\": \"0.1.0\"}`.",
@@ -10313,7 +10432,7 @@
     },
     "/v1/sessions/{session_id}/permissions/{target_user_id}": {
       "delete": {
-        "description": "Revoke a user's permission on a session.\n\nRequires manage-level access. Cannot revoke your own\nmanage grant (prevents orphaned sessions). Returns 204\nwhether or not the grant existed (idempotent).\n\n**Returns:** 204 No Content.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 403 if attempting to revoke own manage grant.",
+        "description": "Revoke a permission on a session \u2014 someone else's, or your own.\n\nTwo shapes, one endpoint:\n\n* *Revoke* \u2014 removing **another** user's grant is a management\n  action and needs manage access.\n* *Leave* \u2014 removing **your own** grant (\"unshare myself\", so a\n  shared session stops cluttering your sidebar) needs only read\n  access, since giving up access requires no privilege.\n\nEither way the owner grant is protected: it is what keeps the\nsession reachable, so revoking it would orphan the session. That\nguard covers the self case too \u2014 an owner cannot leave, and\narchives or deletes instead. A manage-level *grantee* is still a\nguest and may leave. Leaving records no lasting refusal, so the\nowner re-granting brings the session back.\n\nIdempotent: 204 whether or not a grant existed.\n\n**Returns:** 204 No Content.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 403 when the target holds the owner grant, 400 when leaving a sub-agent session, 401 if unauthenticated.",
         "operationId": "revoke_permission_v1_sessions__session_id__permissions__target_user_id__delete",
         "parameters": [
           {
@@ -10327,7 +10446,7 @@
             }
           },
           {
-            "description": "User whose grant to revoke, e.g. `\"alice@example.com\"`.",
+            "description": "User whose grant to revoke, or the caller's own id to leave, e.g. `\"alice@example.com\"`.",
             "in": "path",
             "name": "target_user_id",
             "required": true,
@@ -11451,6 +11570,127 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/environments/{environment_id}/search/{path}": {
+      "get": {
+        "description": "Search under a directory rather than the whole workspace.\n\nTakes the same path shape as the filesystem routes: relative to the\nworkspace, or absolute with a leading slash. Keeps search covering\nexactly what the file tree is showing.\n\n**Returns:** JSON list response with matching filesystem entries.",
+        "operationId": "search_environment_files_under_v1_sessions__session_id__resources_environments__environment_id__search__path__get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Environment resource id.",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "title": "Environment Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Directory to search under.",
+            "in": "path",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "title": "Path",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Case-insensitive search substring.",
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "pattern": ".*\\S.*",
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated include globs.",
+            "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Include"
+            }
+          },
+          {
+            "description": "Comma-separated exclude globs.",
+            "in": "query",
+            "name": "exclude",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Exclude"
+            }
+          },
+          {
+            "description": "Maximum number of results (1-500, default 500).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Search Environment Files Under",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/environments/{environment_id}/shell": {
       "post": {
         "description": "Execute a shell command in an environment.\n\n**Returns:** Shell result.",
@@ -12210,7 +12450,7 @@
     },
     "/v1/sessions/{source_id}/fork": {
       "post": {
-        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that built-in agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` is not a bindable built-in agent; 403 if the caller lacks read access; 400 if the source is a sub-agent session, has no agent binding, or `body.up_to_response_id` names no response in the source session.",
+        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that built-in agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` is not a bindable built-in agent; 403 if the caller lacks read access; 400 if the source has no agent binding, or `body.up_to_response_id` names no response in the source session.",
         "operationId": "fork_session_v1_sessions__source_id__fork_post",
         "parameters": [
           {

@@ -561,8 +561,8 @@ async def test_publish_withholds_committed_native_duplicate_from_live_stream() -
     A trailing chunk for an already-committed native message isn't fanned out.
 
     This is the LIVE half of the claude-native double-render fix:
-    ``record_publish`` returns a suppress verdict for a
-    ``response.output_text.delta`` whose message already committed, and
+    ``record_publish`` returns ``None`` for a native delta whose aggregate
+    is already covered by a committed message, and
     ``publish`` must WITHHOLD it from connected subscribers. The old order
     (fan out first, record after) could only scrub the reconnect snapshot
     — it could never un-send a delta already on a live subscriber's queue,
@@ -599,7 +599,7 @@ async def test_publish_withholds_committed_native_duplicate_from_live_stream() -
     task = asyncio.create_task(_collect(cid, expected=2))
     # Yield so the subscriber registers its slot before we publish.
     await asyncio.sleep(0)
-    session_stream.publish(cid, committed)  # broadcast; buffers the fingerprint
+    session_stream.publish(cid, committed)  # broadcast; remembers the text
     session_stream.publish(cid, duplicate_delta)  # matches commit → withheld
     session_stream.publish(cid, sentinel)  # broadcast
 
@@ -612,6 +612,41 @@ async def test_publish_withholds_committed_native_duplicate_from_live_stream() -
         "the duplicate trailing chunk of an already-committed native "
         f"message must be withheld from the live stream; got {received!r}"
     )
+    inflight_text.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_publish_fans_out_recovered_native_aggregate_on_divergence() -> None:
+    """The publish chokepoint broadcasts the reconciler's rewritten event."""
+    from omnigent.runtime import inflight_text
+
+    inflight_text.reset_for_tests()
+    cid = "conv_live_recovery"
+    committed = {
+        "type": "response.output_item.done",
+        "item": {
+            "type": "message",
+            "role": "assistant",
+            "id": "ci_1",
+            "content": [{"type": "output_text", "text": "OK"}],
+        },
+    }
+    hidden = {
+        "type": "response.output_text.delta",
+        "delta": "OK",
+        "message_id": "m2",
+        "index": 0,
+    }
+    divergent = {**hidden, "delta": " then", "index": 1}
+
+    task = asyncio.create_task(_collect(cid, expected=2))
+    await asyncio.sleep(0)
+    session_stream.publish(cid, committed)
+    session_stream.publish(cid, hidden)
+    session_stream.publish(cid, divergent)
+
+    received = await asyncio.wait_for(task, timeout=2.0)
+    assert received == [committed, {**divergent, "delta": "OK then"}]
     inflight_text.reset_for_tests()
 
 
