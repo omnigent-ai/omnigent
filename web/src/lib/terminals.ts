@@ -152,7 +152,7 @@ export async function queryLocalNetworkPermission(): Promise<LocalNetworkPermiss
   try {
     const permissions = (
       globalThis.navigator as Navigator & {
-        permissions?: { query(desc: { name: string }): Promise<{ state: string }> };
+        permissions?: { query: (desc: { name: string }) => Promise<{ state: string }> };
       }
     ).permissions;
     if (!permissions?.query) return "unknown";

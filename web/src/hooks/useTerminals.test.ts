@@ -301,14 +301,9 @@ describe("resolveInitialAttachUrl / watchDirectUpgrade", () => {
     // Safari throws a synchronous SecurityError for ws:// from an
     // https page; the resolver must treat it as an ordinary miss.
     stubPermission("granted");
-    vi.stubGlobal(
-      "WebSocket",
-      class {
-        constructor() {
-          throw new Error("SecurityError");
-        }
-      },
-    );
+    vi.stubGlobal("WebSocket", function ThrowingWebSocket() {
+      throw new Error("SecurityError");
+    });
     expect(await resolveInitialAttachUrl(DIRECT, RELAY)).toBe(RELAY);
   });
 });
