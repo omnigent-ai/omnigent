@@ -54,7 +54,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     background_title_prompt,
     prepare_background_session_title,
-    schedule_background_child_display_name,
+    schedule_background_child_task_summary,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
@@ -1456,12 +1456,12 @@ def register_events_routes(
         # the stable spawn-or-continue key).
         if (
             conv.parent_conversation_id is not None
-            and conv.display_name is None
+            and conv.task_summary is None
             and background_title_coordinator is not None
         ):
             _prompt_for_display = background_title_prompt(body)
             if _prompt_for_display:
-                schedule_background_child_display_name(
+                schedule_background_child_task_summary(
                     coordinator=background_title_coordinator,
                     session_id=session_id,
                     prompt=_prompt_for_display,

@@ -25,7 +25,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import open_right_rail, set_session_display_name
+from tests.e2e_ui.conftest import open_right_rail, set_session_task_summary
 
 
 @pytest.fixture
@@ -186,11 +186,11 @@ _STRUCTURED_NAME = "researcher-1"
 def labelled_subagent(
     seeded_session: tuple[str, str],
 ) -> Iterator[tuple[str, str]]:
-    """Seed a child carrying BOTH a structured title and a display_name.
+    """Seed a child carrying BOTH a structured title and a task_summary.
 
     The child's title is the structured spawn-or-continue key
     (``"researcher:researcher-1"``), from which the UI derives
-    ``session_name``; ``display_name`` is seeded straight into the store
+    ``session_name``; ``task_summary`` is seeded straight into the store
     because the background title coordinator is its only writer. Having
     both present is the point — it is what makes the label chain's
     preference observable.
@@ -215,14 +215,14 @@ def labelled_subagent(
     )
     child.raise_for_status()
     child_id = child.json()["id"]
-    set_session_display_name(child_id, _DISPLAY_NAME)
+    set_session_task_summary(child_id, _DISPLAY_NAME)
     try:
         yield (base_url, parent_id)
     finally:
         httpx.delete(f"{base_url}/v1/sessions/{child_id}", timeout=10.0)
 
 
-def test_subagent_rail_prefers_display_name_over_structured_name(
+def test_subagent_rail_prefers_task_summary_over_structured_name(
     page: Page,
     labelled_subagent: tuple[str, str],
 ) -> None:
@@ -230,7 +230,7 @@ def test_subagent_rail_prefers_display_name_over_structured_name(
 
     Sub-agents are named ``"{agent}-{ordinal}"`` so the parent has a stable
     key to spawn-or-continue against, but that key says nothing about what
-    the sub-agent is doing. ``display_name`` carries the task-derived label,
+    the sub-agent is doing. ``task_summary`` carries the task-derived label,
     and both the list and graph views resolve it ahead of the structured
     name — otherwise the rail reads as a row of ``researcher-1``,
     ``researcher-2`` with no way to tell them apart.

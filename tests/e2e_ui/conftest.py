@@ -628,8 +628,8 @@ def seed_committed_turn(
     )
 
 
-def set_session_display_name(session_id: str, display_name: str) -> None:
-    """Write a session's ``display_name`` straight into the store.
+def set_session_task_summary(session_id: str, task_summary: str) -> None:
+    """Write a session's ``task_summary`` straight into the store.
 
     The background title coordinator is the only writer of this column —
     there is no REST path for it — so a UI test that needs a settled label
@@ -637,7 +637,7 @@ def set_session_display_name(session_id: str, display_name: str) -> None:
     navigating; the sub-agents rail reads the label when it hydrates.
 
     :param session_id: Session to label, e.g. ``"conv_abc123"``.
-    :param display_name: Human-readable label, e.g. ``"Investigate auth flow"``.
+    :param task_summary: Human-readable label, e.g. ``"Investigate auth flow"``.
     :raises RuntimeError: If the server under test isn't one we spawned
         (``--ui-base-url``), so its database isn't reachable from here.
     """
@@ -648,10 +648,10 @@ def set_session_display_name(session_id: str, display_name: str) -> None:
     database_uri = _server_state.get("database_uri")
     if not database_uri:
         raise RuntimeError(
-            "set_session_display_name needs the spawned server's database; it "
+            "set_session_task_summary needs the spawned server's database; it "
             "is unavailable when running against --ui-base-url."
         )
-    SqlAlchemyConversationStore(str(database_uri)).set_display_name(session_id, display_name)
+    SqlAlchemyConversationStore(str(database_uri)).set_task_summary(session_id, task_summary)
 
 
 def set_fallback_mock_llm(

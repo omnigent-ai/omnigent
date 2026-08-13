@@ -440,7 +440,7 @@
             "description": "Status of the latest task, e.g. `\"completed\"`, `\"in_progress\"`, `\"failed\"`. `None` if no tasks exist.",
             "title": "Current Task Status"
           },
-          "display_name": {
+          "task_summary": {
             "anyOf": [
               {
                 "type": "string"
@@ -449,7 +449,7 @@
                 "type": "null"
               }
             ],
-            "title": "Display Name"
+            "title": "Task Summary"
           },
           "id": {
             "description": "Child conversation/session identifier, e.g. `\"conv_child123\"`.",

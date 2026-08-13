@@ -423,7 +423,7 @@ function childPrimaryLabel(child: ChildSessionInfo): string {
     if (titleSuffix) titleTask = titleSuffix;
   }
   return (
-    child.display_name ?? child.session_name ?? titleTask ?? child.title ?? child.tool ?? child.id
+    child.task_summary ?? child.session_name ?? titleTask ?? child.title ?? child.tool ?? child.id
   );
 }
 

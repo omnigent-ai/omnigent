@@ -112,7 +112,7 @@ class BackgroundSessionTitleCoordinator:
         self._generation_slots = asyncio.Semaphore(max_concurrency)
         self._pending: set[asyncio.Task[None]] = set()
         self._scheduled_session_ids: set[str] = set()
-        self._scheduled_display_name_ids: set[str] = set()
+        self._scheduled_task_summary_ids: set[str] = set()
 
     def schedule(
         self,
@@ -151,7 +151,7 @@ class BackgroundSessionTitleCoordinator:
 
         task.add_done_callback(_discard)
 
-    def schedule_display_name(
+    def schedule_task_summary(
         self,
         *,
         session_id: str,
@@ -161,12 +161,12 @@ class BackgroundSessionTitleCoordinator:
         model_override: str | None = None,
         sub_agent_name: str | None = None,
     ) -> None:
-        """Schedule a display-name attempt for a child session."""
-        if session_id in self._scheduled_display_name_ids:
+        """Schedule a task-summary attempt for a child session."""
+        if session_id in self._scheduled_task_summary_ids:
             return
-        self._scheduled_display_name_ids.add(session_id)
+        self._scheduled_task_summary_ids.add(session_id)
         task = asyncio.create_task(
-            self._run_display_name(
+            self._run_task_summary(
                 request=BackgroundTitleRequest(
                     session_id=session_id,
                     prompt=prompt,
@@ -176,13 +176,13 @@ class BackgroundSessionTitleCoordinator:
                     sub_agent_name=sub_agent_name,
                 ),
             ),
-            name=f"background-display-name-{session_id}",
+            name=f"background-task-summary-{session_id}",
         )
         self._pending.add(task)
 
         def _discard(completed: asyncio.Task[None]) -> None:
             self._pending.discard(completed)
-            self._scheduled_display_name_ids.discard(session_id)
+            self._scheduled_task_summary_ids.discard(session_id)
 
         task.add_done_callback(_discard)
 
@@ -261,12 +261,12 @@ class BackgroundSessionTitleCoordinator:
                 exc_info=True,
             )
 
-    async def _run_display_name(
+    async def _run_task_summary(
         self,
         *,
         request: BackgroundTitleRequest,
     ) -> None:
-        """Generate a display name for a child session and write it to display_name."""
+        """Generate a task summary for a child session and write it to task_summary."""
         started = time.perf_counter()
         try:
             async with self._generation_slots:
@@ -277,26 +277,26 @@ class BackgroundSessionTitleCoordinator:
             title = normalize_background_title(generated)
             if title is None:
                 _logger.info(
-                    "background display name skipped session=%s "
+                    "background task summary skipped session=%s "
                     "reason=invalid_title elapsed_ms=%.1f",
                     request.session_id,
                     (time.perf_counter() - started) * 1000,
                 )
                 return
             updated = await asyncio.to_thread(
-                self._conversation_store.set_display_name,
+                self._conversation_store.set_task_summary,
                 request.session_id,
                 title,
             )
             _logger.info(
-                "background display name completed session=%s set=%s elapsed_ms=%.1f",
+                "background task summary completed session=%s set=%s elapsed_ms=%.1f",
                 request.session_id,
                 updated is not None,
                 (time.perf_counter() - started) * 1000,
             )
         except TimeoutError:
             _logger.info(
-                "background display name timed out session=%s elapsed_ms=%.1f",
+                "background task summary timed out session=%s elapsed_ms=%.1f",
                 request.session_id,
                 (time.perf_counter() - started) * 1000,
             )
@@ -304,7 +304,7 @@ class BackgroundSessionTitleCoordinator:
             raise
         except Exception:  # noqa: BLE001
             _logger.warning(
-                "background display name failed session=%s elapsed_ms=%.1f",
+                "background task summary failed session=%s elapsed_ms=%.1f",
                 request.session_id,
                 (time.perf_counter() - started) * 1000,
                 exc_info=True,
@@ -390,7 +390,7 @@ def prepare_background_session_title(
     )
 
 
-def schedule_background_child_display_name(
+def schedule_background_child_task_summary(
     *,
     coordinator: BackgroundSessionTitleCoordinator | None,
     session_id: str,
@@ -398,10 +398,10 @@ def schedule_background_child_display_name(
     agent_id: str | None = None,
     sub_agent_name: str | None = None,
 ) -> None:
-    """Schedule a background display-name attempt for a child session."""
+    """Schedule a background task-summary attempt for a child session."""
     if coordinator is None or not prompt:
         return
-    coordinator.schedule_display_name(
+    coordinator.schedule_task_summary(
         session_id=session_id,
         prompt=prompt,
         agent_id=agent_id,

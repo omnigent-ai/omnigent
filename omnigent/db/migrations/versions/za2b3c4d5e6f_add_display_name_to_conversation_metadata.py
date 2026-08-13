@@ -1,15 +1,15 @@
-"""Add display_name to conversation metadata.
+"""Add task_summary to conversation metadata.
 
 Revision ID: za2b3c4d5e6f
 Revises: d5e9f1a2b3c4
 Create Date: 2026-08-10 00:00:00.000000
 
-Adds a nullable ``display_name`` column to ``omnigent_conversation_metadata``.
+Adds a nullable ``task_summary`` column to ``omnigent_conversation_metadata``.
 Sub-agent sessions use this column to store a human-readable, task-derived label
 (e.g. "Investigate auth token refresh") generated asynchronously by the
 background title coordinator. The structured title
 (``"{agent_type}:{agent_type}-{ordinal}"``) stays in ``conversations.title`` as
-the stable spawn-or-continue key; ``display_name`` is purely presentational.
+the stable spawn-or-continue key; ``task_summary`` is purely presentational.
 
 Additive. No existing data needs backfill.
 """
@@ -28,14 +28,14 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    """Add ``display_name`` to ``omnigent_conversation_metadata``."""
+    """Add ``task_summary`` to ``omnigent_conversation_metadata``."""
     op.add_column(
         "omnigent_conversation_metadata",
-        sa.Column("display_name", sa.String(128), nullable=True),
+        sa.Column("task_summary", sa.String(128), nullable=True),
     )
 
 
 def downgrade() -> None:
-    """Remove ``display_name`` from ``omnigent_conversation_metadata``."""
+    """Remove ``task_summary`` from ``omnigent_conversation_metadata``."""
     with op.batch_alter_table("omnigent_conversation_metadata") as batch_op:
-        batch_op.drop_column("display_name")
+        batch_op.drop_column("task_summary")

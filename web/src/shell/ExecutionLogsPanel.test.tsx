@@ -56,7 +56,7 @@ function mkChild(overrides: Partial<ChildSessionInfo>): ChildSessionInfo {
   return {
     id: "conv_child1",
     title: "researcher:auth",
-    display_name: null,
+    task_summary: null,
     tool: "researcher",
     session_name: "auth",
     current_task_status: "completed",

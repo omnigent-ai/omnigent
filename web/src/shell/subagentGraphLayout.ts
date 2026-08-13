@@ -154,7 +154,7 @@ export function buildTree(
             .map((child) => {
               const status = childActivity(child);
               const label =
-                child.display_name ?? child.session_name ?? child.title ?? child.tool ?? child.id;
+                child.task_summary ?? child.session_name ?? child.title ?? child.tool ?? child.id;
               return buildTree(
                 child.id,
                 label,

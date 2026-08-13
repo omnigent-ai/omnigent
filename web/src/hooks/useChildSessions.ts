@@ -28,7 +28,7 @@ export interface ChildSessionInfo {
   /** Full title, ``"{tool}:{session_name}"``, e.g. ``"researcher:auth"``. */
   title: string | null;
   /** Human-readable task-derived label, e.g. ``"Investigate auth flow"``. */
-  display_name: string | null;
+  task_summary: string | null;
   /** Sub-agent type prefix, e.g. ``"researcher"``. */
   tool: string | null;
   /** Sub-agent instance name suffix, e.g. ``"auth"``. */
@@ -69,7 +69,7 @@ export interface ChildSessionInfo {
 interface ChildSessionWire {
   id: string;
   title: string | null;
-  display_name?: string | null;
+  task_summary?: string | null;
   tool: string | null;
   session_name: string | null;
   labels?: Record<string, string>;
@@ -182,7 +182,7 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
   return json.data.map((row) => ({
     id: row.id,
     title: row.title,
-    display_name: row.display_name ?? null,
+    task_summary: row.task_summary ?? null,
     tool: row.tool,
     session_name: row.session_name,
     labels: row.labels ?? {},

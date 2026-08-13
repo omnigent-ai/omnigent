@@ -79,7 +79,7 @@ function renderPanel({
 function childInfo(overrides: Partial<ChildSessionInfo> & { id: string }): ChildSessionInfo {
   return {
     title: null,
-    display_name: null,
+    task_summary: null,
     tool: null,
     session_name: null,
     current_task_status: null,
@@ -451,7 +451,7 @@ describe("SubagentsPanel", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
-          display_name: null,
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -462,7 +462,7 @@ describe("SubagentsPanel", () => {
         {
           id: "conv_child_b",
           title: "frontend_engineer:rail",
-          display_name: null,
+          task_summary: null,
           tool: "frontend_engineer",
           session_name: "rail",
           current_task_status: "in_progress",
@@ -491,14 +491,14 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_child",
           title: "codex:auth-refactor",
-          display_name: null,
+          task_summary: null,
           tool: "codex",
           session_name: "auth-refactor",
         }),
         childInfo({
           id: "conv_title_only",
           title: "codex:fix-sse-error",
-          display_name: null,
+          task_summary: null,
           tool: "codex",
           session_name: null,
         }),
@@ -521,7 +521,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_child",
           title: "codex-native-ui-subagent:thread_child_alpha",
-          display_name: null,
+          task_summary: null,
           tool: "auth-auditor",
           session_name: "thread_child_alpha",
           labels: { "omnigent.wrapper": "codex-native-ui-subagent" },
@@ -542,7 +542,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_codex",
           title: "codex:auth-refactor",
-          display_name: null,
+          task_summary: null,
           tool: "codex",
           session_name: "auth-refactor",
           labels: { "omnigent.wrapper": "codex-native-ui" },
@@ -550,7 +550,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_opencode",
           title: "opencode:port-auth-refactor",
-          display_name: null,
+          task_summary: null,
           tool: "opencode",
           session_name: "port-auth-refactor",
           labels: { "omnigent.wrapper": "opencode-native-ui" },
@@ -558,7 +558,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_claude",
           title: "claude_code:review-auth-refactor",
-          display_name: null,
+          task_summary: null,
           tool: "claude_code",
           session_name: "review-auth-refactor",
           labels: { "omnigent.wrapper": "claude-code-native-ui" },
@@ -566,7 +566,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_kiro",
           title: "kiro:harden-auth",
-          display_name: null,
+          task_summary: null,
           tool: "kiro",
           session_name: "harden-auth",
           labels: { "omnigent.wrapper": "kiro-native-ui" },
@@ -631,7 +631,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_custom",
           title: "codex:custom-review",
-          display_name: null,
+          task_summary: null,
           tool: "codex",
           session_name: "custom-review",
         }),
@@ -653,7 +653,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_pi",
           title: "pi:review-auth",
-          display_name: null,
+          task_summary: null,
           tool: "pi",
           session_name: "review-auth",
         }),
@@ -661,7 +661,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_pipeline",
           title: "pipeline:build",
-          display_name: null,
+          task_summary: null,
           tool: "pipeline",
           session_name: "build",
         }),
@@ -688,7 +688,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_native_pi",
           title: "pi:port-fix",
-          display_name: null,
+          task_summary: null,
           tool: "pi",
           session_name: "port-fix",
           labels: { "omnigent.wrapper": "claude-code-native-ui" },
@@ -730,7 +730,7 @@ describe("SubagentsPanel", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
-          display_name: null,
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "in_progress",
@@ -741,7 +741,7 @@ describe("SubagentsPanel", () => {
         {
           id: "conv_child_b",
           title: "frontend_engineer:rail",
-          display_name: null,
+          task_summary: null,
           tool: "frontend_engineer",
           session_name: "rail",
           current_task_status: "completed",
@@ -772,7 +772,7 @@ describe("SubagentsPanel", () => {
         {
           id: "conv_child",
           title: "researcher:auth",
-          display_name: null,
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "failed",
@@ -797,7 +797,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_child",
           title: "researcher:auth",
-          display_name: null,
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           last_task_error: {
@@ -838,7 +838,7 @@ describe("SubagentsPanel", () => {
           childInfo({
             id: "conv_child",
             title: "researcher:auth",
-            display_name: null,
+            task_summary: null,
             tool: "researcher",
             session_name: "auth",
             current_task_status: "failed",
@@ -882,7 +882,7 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_child",
           title: "researcher:auth",
-          display_name: null,
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "failed",
@@ -1035,7 +1035,7 @@ describe("SubagentsPanel", () => {
         {
           id: "conv_child",
           title: "researcher:auth",
-          display_name: null,
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "in_progress",
@@ -1360,14 +1360,14 @@ describe("SubagentsPanel", () => {
         childInfo({
           id: "conv_added",
           title: "ui:claude-native-ui:jimmy",
-          display_name: null,
+          task_summary: null,
           tool: "claude-native-ui",
           session_name: "jimmy",
         }),
         childInfo({
           id: "conv_llm",
           title: "researcher:auth",
-          display_name: null,
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
         }),
