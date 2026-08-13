@@ -1491,7 +1491,7 @@ describe("SubagentsPanel", () => {
     expect(useChildSessionsMock).not.toHaveBeenCalledWith("c3");
   });
 
-  it("shows the model beside effort, including directly pinned children", () => {
+  it("shows model and effort in one cue, including directly pinned children", () => {
     // A routed child carries both the legacy routed field and the explicit
     // override. A directly pinned child exercises the path the old summary
     // could not expose to the rail.
@@ -1517,11 +1517,14 @@ describe("SubagentsPanel", () => {
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
     const routed = childRow(container, "conv_routed");
-    expect(within(routed).getByTestId("subagent-model").textContent).toBe("sonnet");
-    expect(within(routed).getByTestId("subagent-reasoning-effort").textContent).toBe("high");
+    const routedCue = within(routed).getByTestId("subagent-model-effort");
+    expect(routedCue).toHaveTextContent("sonnet | high");
+    expect(routedCue.querySelector(".text-muted-foreground")).toHaveTextContent("| high");
+    expect(routedCue.querySelector(".ml-1")).toHaveTextContent("| high");
     const pinned = childRow(container, "conv_pinned");
-    expect(within(pinned).getByTestId("subagent-model").textContent).toBe("gpt-5.6-luna");
-    expect(within(pinned).getByTestId("subagent-reasoning-effort").textContent).toBe("low");
+    expect(within(pinned).getByTestId("subagent-model-effort")).toHaveTextContent(
+      "gpt-5.6-luna | low",
+    );
     expect(within(childRow(container, "conv_plain")).queryByTestId("subagent-model")).toBeNull();
     expect(
       within(childRow(container, "conv_plain")).queryByTestId("subagent-reasoning-effort"),
