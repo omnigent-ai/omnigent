@@ -904,7 +904,7 @@ export function Sidebar({
                         ? "1 inbox item waiting"
                         : `${inboxCount} inbox items waiting`
                     }
-                    className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-brand-accent/15 px-1 text-10 font-medium text-brand-accent tabular-nums"
+                    className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--sidebar-active)] px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums"
                   >
                     {inboxCount}
                   </span>
