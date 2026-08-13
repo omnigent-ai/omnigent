@@ -4308,14 +4308,11 @@ function BulkActionBar({
       : "Delete";
 
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
-  const [moveMenuOpen, setMoveMenuOpen] = useState(false);
   const [moveSearch, setMoveSearch] = useState("");
 
   function handleMoveToProject(project: string) {
     const ids = ownedSelected.map((c) => c.id);
     if (ids.length === 0) return;
-    setMoveMenuOpen(false);
-    setMoveSearch("");
     bulkMove.mutate(
       { ids, project },
       {
@@ -4444,9 +4441,7 @@ function BulkActionBar({
               </Tooltip>
             )}
             <DropdownMenu
-              open={moveMenuOpen}
               onOpenChange={(open) => {
-                setMoveMenuOpen(open);
                 if (!open) setMoveSearch("");
               }}
             >
