@@ -54,7 +54,7 @@ Run it from anywhere inside the checkout — it walks up to the repo root
 
 Before Vite starts (and on a manual Vite restart), omnidev runs `pnpm install`
 in `web/` when needed — `node_modules/` is missing, or `package.json` /
-`package-lock.json` is newer than it — so a fresh checkout or a new dependency
+`pnpm-lock.yaml` is newer than it — so a fresh checkout or a new dependency
 doesn't make Vite fail its dependency scan. Output streams into the `vite` pane.
 
 Open the UI at the `ui` URL shown in the header (the Vite dev server).
@@ -219,3 +219,18 @@ and, on a terminal, prompts `Update omnigent now? [y/N]`; on yes it runs
 `omnidev update` in the foreground. Declining suppresses that same commit until
 a newer one lands. Set `OMNIGENT_NO_UPDATE_CHECK` in your environment if you want
 to silence omnigent's own separate notice.
+
+# External process profiles
+
+Integrations that embed the Omnigent server in another repository can reuse
+the supervisor without copying it:
+
+```bash
+omnidev --profile path/to/omnidev.toml
+```
+
+The profile supplies the server, optional host, Vite, and optional dependency
+preparation commands plus the backend and web directories. Command arguments
+may contain `{server_port}`, `{vite_port}`, `{vite_host}`, `{pod_dir}`, and
+`{repo_root}`. Environment variables from the launching integration are
+inherited; `OMNIGENT_URL` is set to the isolated backend as usual.

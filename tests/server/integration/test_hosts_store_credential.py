@@ -20,9 +20,11 @@ from typing import Any
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 
+from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
@@ -97,6 +99,18 @@ def cred_app(
     app = FastAPI()
     app.include_router(create_host_tunnel_router(registry, host_store), prefix="/v1")
     app.include_router(create_hosts_router(registry, host_store, conv_store), prefix="/v1")
+
+    @app.exception_handler(OmnigentError)
+    async def _handle_omnigent_error(
+        request: Request,
+        exc: OmnigentError,
+    ) -> JSONResponse:
+        """Convert application errors to structured JSON responses."""
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
     return app, registry, host_store, conv_store
 
 
@@ -464,9 +478,10 @@ async def test_unknown_host_returns_404(
 async def test_offline_host_returns_409(
     cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
-    """A registered-but-offline host returns 409 (no live tunnel to forward on)."""
+    """An offline host returns 409 (no live tunnel to forward on)."""
     app, _reg, host_store, _cs = cred_app
     host_store.upsert_on_connect(host_id=_HOST_ID, name=_HOST_NAME, user_id="local")
+    host_store.set_offline(_HOST_ID)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
             f"/v1/hosts/{_HOST_ID}/harnesses/claude/credential",

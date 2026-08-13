@@ -17,6 +17,7 @@ importing ``cli.py`` to keep that dependency direction clean.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import subprocess
 import sys
@@ -36,7 +37,15 @@ from omnigent.process_logging import (
     open_process_log_file,
 )
 
+_logger = logging.getLogger(__name__)
+
 _LOCAL_SERVER_READY_TIMEOUT_SECONDS = 45.0
+
+# Hard cap on waiting for a server that outlived the ready timeout with its
+# process still alive. A first boot (cold imports + DB migrations) has taken
+# ~40s in the wild; adopting a slow boot beats failing a server that is
+# seconds from healthy — and then leaking it.
+_LOCAL_SERVER_BOOT_CEILING_SECONDS = 120.0
 
 # Max seconds to wait for a bind-race-doomed server child's natural
 # EADDRINUSE exit before the terminate backstop. Matches the readiness
@@ -848,8 +857,16 @@ def _wait_for_local_omnigent_server(
     proc: subprocess.Popen[bytes],
     log_path: Path,
     timeout: float = _LOCAL_SERVER_READY_TIMEOUT_SECONDS,
+    boot_ceiling: float = _LOCAL_SERVER_BOOT_CEILING_SECONDS,
 ) -> None:
     """Poll the background local server's ``/health`` until ready.
+
+    A server that outlives *timeout* with its process still alive is treated
+    as a slow boot and adopted by waiting up to *boot_ceiling* total, instead
+    of failing a server that is seconds from healthy. On final failure the
+    spawned child is stopped before raising — a raise here must never leave a
+    running server behind that nothing tracks anymore (the failure path
+    clears the pidfile record).
 
     :param base_url: Loopback server URL, e.g. ``"http://127.0.0.1:8123"``.
     :param proc: The server subprocess; early exit is detected via
@@ -857,7 +874,8 @@ def _wait_for_local_omnigent_server(
     :param log_path: Captured stdout/stderr log surfaced on failure so the
         underlying traceback (spec parse error, port clash, import failure)
         is visible.
-    :param timeout: Max seconds to wait for readiness.
+    :param timeout: Seconds to wait before considering the boot slow.
+    :param boot_ceiling: Cap on the total wait for a slow-but-alive boot.
     :raises click.ClickException: If the server exits or never answers.
     """
     import time
@@ -865,9 +883,20 @@ def _wait_for_local_omnigent_server(
     import httpx
 
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    ceiling = time.monotonic() + max(timeout, boot_ceiling)
+    slow_boot_logged = False
+    while time.monotonic() < ceiling:
         if proc.poll() is not None:
             _raise_local_server_failed(base_url, log_path)
+        if not slow_boot_logged and time.monotonic() >= deadline:
+            slow_boot_logged = True
+            _logger.info(
+                "Local server (pid %d) not ready after %.0fs but still "
+                "running — likely a slow boot; waiting up to %.0fs total",
+                proc.pid,
+                timeout,
+                max(timeout, boot_ceiling),
+            )
         try:
             resp = httpx.get(f"{base_url}/health", timeout=2.0, trust_env=False)
             if resp.status_code == 200:
@@ -880,6 +909,17 @@ def _wait_for_local_omnigent_server(
             # rather than crash on.
             pass
         time.sleep(0.2)
+    # The child never became healthy: stop it before reporting failure so the
+    # raise does not strand a running, untracked server. Popen-reap it too —
+    # this process spawned it, so an unreaped kill would leave a zombie.
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=_STOP_GRACE_S)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5.0)
     _raise_local_server_failed(base_url, log_path)
 
 

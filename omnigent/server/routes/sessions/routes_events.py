@@ -75,6 +75,7 @@ from omnigent.server.routes._sessions.common import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
     _COMPACT_TYPE,
+    _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
     _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
@@ -114,6 +115,7 @@ from omnigent.server.routes._sessions.common import (
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import (
+    _TUI_INJECT_FORWARD_TIMEOUT_S,
     SessionLiveness,
     _apply_pending_policy_ask_writes,
     _await_settled_managed_launch,
@@ -173,6 +175,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _is_native_terminal_session,
     _maybe_relaunch_managed_sandbox,
     _maybe_wake_stale_resumable_managed_sandbox,
+    _persist_external_antigravity_subagent_start,
     _persist_external_codex_subagent_start,
     _persist_external_conversation_item,
     _persist_external_session_usage,
@@ -195,6 +198,7 @@ from omnigent.session_lifecycle import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
+from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
@@ -397,6 +401,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_TODOS_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+            _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
             _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
         ):
@@ -473,7 +478,6 @@ def register_events_routes(
                 # deny sentinel on the session stream so the
                 # client/REPL sees feedback.
                 reason = _input_verdict.get("reason", "Denied by policy")
-                _publish_status(session_id, "running")
                 _publish_policy_deny(session_id, reason)
                 await _persist_policy_deny_sentinel(
                     session_id,
@@ -482,8 +486,16 @@ def register_events_routes(
                     conversation_store,
                     agent_store,
                 )
-                # Terminal response.completed before idle so live-tail
-                # consumers (the headless ``-p`` client) unblock.
+                # Terminal ``response.completed`` renders the sentinel; the
+                # trailing ``idle`` ends the turn. A request-phase deny/refuse
+                # IS a turn boundary — the client optimistically went "working"
+                # on send — but the message never reached a harness, so nothing
+                # downstream (harness / interrupt / status file) emits the
+                # turn-end. This ``idle`` is that signal; clients that settle a
+                # turn only on a ``session.status`` edge (the REPL, the headless
+                # ``-p`` client) hang without it. No leading ``running``: the
+                # turn never dispatched, and a phantom ``running`` would fold a
+                # concurrent live bubble mid-stream.
                 _publish_input_deny_terminal(session_id, conv, reason)
                 _publish_status(session_id, "idle")
                 # Return the same shape the client expects from POST
@@ -505,7 +517,6 @@ def register_events_routes(
             )
             if _input_verdict is not None:
                 reason = _input_verdict.get("reason", "Denied by policy")
-                _publish_status(session_id, "running")
                 _publish_policy_deny(session_id, reason)
                 await _persist_policy_deny_sentinel(
                     session_id,
@@ -514,7 +525,9 @@ def register_events_routes(
                     conversation_store,
                     agent_store,
                 )
-                # Terminal response.completed before idle (see message branch).
+                # Terminal response.completed + trailing ``idle`` turn-end (see
+                # the message branch above for why the idle is required and the
+                # leading running is not).
                 _publish_input_deny_terminal(session_id, conv, reason)
                 _publish_status(session_id, "idle")
                 return {"queued": False, "denied": True, "reason": reason}
@@ -740,10 +753,15 @@ def register_events_routes(
             # attached) is surfaced as an error rather than silently
             # falling through to AP-side compaction, which would be
             # wrong for a terminal-owned session.
+            # TUI budget, not the 5s default: the claude-native handler
+            # drives a delivery-verified slash-command inject, and a timeout
+            # here falls through to AP-side compaction on top of the
+            # terminal's own still-running /compact.
             runner_result = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
                 {"type": _COMPACT_TYPE},
+                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
             if runner_result is not None and runner_result.status_code == 200:
                 return {"queued": False}
@@ -883,7 +901,9 @@ def register_events_routes(
             # A background-task ``waiting`` marks an ended turn, so deliver it
             # as ``idle``: the session takes a new message now, and for a
             # sub-agent the terminal-delivery branch below must fire (otherwise
-            # the orchestrator hangs). The tally still drives the spinner.
+            # the orchestrator hangs). The tally still drives the indicator.
+            # The claude-native forwarder no longer sends ``waiting`` at all —
+            # this normalizes it for runners that predate that change.
             effective_status = _background_task_delivery_status(status, bg_count, conv)
             if effective_status != status:
                 status = effective_status
@@ -1058,6 +1078,16 @@ def register_events_routes(
             # subsequent ``external_conversation_item`` /
             # ``external_session_status`` events to the child id.
             return {"queued": False, "child_session_id": child_id}
+        if body.type == _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE:
+            child_id = await _persist_external_antigravity_subagent_start(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+            )
+            # Returned to the agy reader so it can mirror the child cascade's
+            # steps into this id.
+            return {"queued": False, "child_session_id": child_id}
         if body.type == _EXTERNAL_CODEX_SUBAGENT_START_TYPE:
             child_id = await _persist_external_codex_subagent_start(
                 session_id,
@@ -1153,6 +1183,29 @@ def register_events_routes(
                 if conv is None:
                     raise _session_not_found()
                 runner_client = await _get_runner_client(session_id, runner_router)
+        # Check for wrong-replica routing miss before attempting healing or dispatch.
+        # The runner tunnel is registered on the same replica as its host; when the
+        # tunnel is absent here but the host is live elsewhere, the key routed to
+        # the wrong replica. Signal this to the client so it re-addresses without
+        # the key rather than repeatedly trying this replica.
+        # sub-agent heal below: a wrong-replica send must re-address without the
+        # key rather than attempt a heal against this replica's registry.
+        if runner_client is None and conv.host_id is not None:
+            _wrong_pod_host_reg = getattr(request.app.state, "host_registry", None)
+            _wrong_pod_host_store = getattr(request.app.state, "host_store", None)
+            if (
+                _wrong_pod_host_reg is not None
+                and _wrong_pod_host_store is not None
+                and _wrong_pod_host_reg.get(conv.host_id) is None
+            ):
+                _wrong_pod_host = await asyncio.to_thread(
+                    _wrong_pod_host_store.get_host, conv.host_id
+                )
+                if _wrong_pod_host is not None and host_is_live(_wrong_pod_host):
+                    raise OmnigentError(
+                        "session runner is on another replica; retry",
+                        code=ErrorCode.WRONG_REPLICA,
+                    )
         if runner_client is None and conv.kind == "sub_agent":
             # A sub-agent copies its parent's runner_id at creation and is
             # never repointed when the parent's runner is relaunched.  If the
@@ -1573,6 +1626,20 @@ def register_events_routes(
             session_id,
             runner_router,
         )
+        # Check for wrong-replica routing miss before streaming.
+        # If the host is wired and the runner is on another replica, signal 400
+        # so setups that don't wire hosts are unaffected.
+        if runner_client is None and conv.runner_id and conv.host_id:
+            host_registry_state = getattr(request.app.state, "host_registry", None)
+            host_store_state = getattr(request.app.state, "host_store", None)
+            if host_registry_state is not None and host_store_state is not None:
+                if host_registry_state.get(conv.host_id) is None:
+                    host = await asyncio.to_thread(host_store_state.get_host, conv.host_id)
+                    if host is not None and host_is_live(host):
+                        raise OmnigentError(
+                            "session stream is on another replica; retry",
+                            code=ErrorCode.WRONG_REPLICA,
+                        )
         await _ensure_runner_relay_ready(
             session_id,
             conv.runner_id,

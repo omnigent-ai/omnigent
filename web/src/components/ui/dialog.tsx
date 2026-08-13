@@ -3,6 +3,7 @@ import * as DialogPrimitive from "radix-ui/dialog";
 
 import { getEmbedRoot } from "@/lib/host";
 import { isIOSShell } from "@/lib/nativeBridge";
+import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { XIcon } from "lucide-react";
@@ -85,6 +86,9 @@ function DialogContent({
         style={{ ...iosViewportStyle, ...style }}
         {...props}
       >
+        {/* Hide the native browser view while this dialog is open (#3980).
+            Inside Content so it mounts only while the dialog is open. */}
+        <SuppressBrowserView />
         {children}
         {showCloseButton && (
           <DialogPrimitive.Close data-slot="dialog-close" asChild>

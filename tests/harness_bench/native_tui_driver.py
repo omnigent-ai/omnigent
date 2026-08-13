@@ -223,7 +223,12 @@ class NativeTuiDriver:
         vendor = native_vendor(profile.harness)
         if vendor is None:
             return f"{profile.harness!r} is not a native-tui harness"
-        creds_skip = bench_creds_skip_reason(databricks_profile)
+        # An own_auth vendor logs its own model in, so it needs no gateway creds
+        # to run — only the vendor CLI. Requiring them would wrongly skip every
+        # own_auth native for a contributor with no Databricks/OpenAI gateway.
+        creds_skip = bench_creds_skip_reason(
+            databricks_profile, require_gateway=not vendor.own_auth
+        )
         if creds_skip is not None:
             return creds_skip
         binary = profile.cli_binary
@@ -275,7 +280,9 @@ class NativeTuiDriver:
         self._base_url = f"http://localhost:{port}"
         binding_token = uuid.uuid4().hex
 
-        self._resolved_env = resolve_bench_env(self._db_profile)
+        self._resolved_env = resolve_bench_env(
+            self._db_profile, require_gateway=not self._vendor.own_auth
+        )
         base_env = {
             **self._resolved_env.base_env,
             "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,

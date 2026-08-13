@@ -45,14 +45,13 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize(
     "key,binary,package",
     [
-        (ANTHROPIC_FAMILY, "claude", "@anthropic-ai/claude-code"),
         (OPENAI_FAMILY, "codex", "@openai/codex"),
         (hi.PI_KEY, "pi", "@earendil-works/pi-coding-agent"),
         (hi.QWEN_KEY, "qwen", "@qwen-code/qwen-code"),
     ],
 )
 def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
-    """Each known harness maps to the ucode-matching binary + npm package.
+    """Each npm-installed harness maps to the ucode-matching binary + package.
 
     A drift in binary/package (e.g. a wrong npm name) would install the wrong
     thing or check the wrong PATH entry — caught here.
@@ -62,6 +61,45 @@ def test_install_spec_and_command(key: str, binary: str, package: str) -> None:
     assert spec.binary == binary
     assert spec.package == package
     assert hi.harness_install_command(key) == ["npm", "install", "-g", package]
+
+
+def test_claude_installs_via_anthropic_native_installer() -> None:
+    """Claude ships via Anthropic's installer, not ``npm install -g``.
+
+    ``package`` must stay ``None``: that is the flag :func:`harness_setup_hint`
+    and the runner's missing-CLI error branch on to name the vendor installer.
+    """
+    spec = hi.harness_install_spec(ANTHROPIC_FAMILY)
+    assert spec is not None
+    assert spec.binary == "claude"
+    assert spec.package is None
+    assert spec.install_hint == "curl -fsSL https://claude.ai/install.sh | bash"
+    assert hi.harness_install_command(ANTHROPIC_FAMILY) == [
+        "bash",
+        "-c",
+        spec.install_hint,
+    ]
+
+
+@pytest.mark.parametrize(
+    "key,expected",
+    [
+        (ANTHROPIC_FAMILY, "curl -fsSL https://claude.ai/install.sh | bash"),
+        (OPENAI_FAMILY, "npm install -g @openai/codex"),
+    ],
+)
+def test_install_display_hides_the_bash_c_wrapper(key: str, expected: str) -> None:
+    """The command shown to a user is runnable as-is, without the ``bash -c``
+    wrapper :func:`harness_install_command` adds for ``subprocess``."""
+    assert hi.harness_install_display(key) == expected
+
+
+def test_claude_setup_hint_names_the_native_installer() -> None:
+    """A machine missing the claude CLI is pointed at the working installer."""
+    hint = hi.harness_setup_hint("claude-native")
+    assert "claude.ai/install.sh" in hint
+    assert "npm" not in hint
+    assert "claude auth login --claudeai" in hint
 
 
 def test_kimi_install_spec_is_login_only_no_npm() -> None:
@@ -304,10 +342,13 @@ def test_setup_hint_for_native_kiro_points_at_vendor_installer(harness: str) -> 
     assert "omni setup" not in hint
 
 
-@pytest.mark.parametrize("harness", ["claude-native", "codex", "pi", "claude-sdk", None])
+@pytest.mark.parametrize("harness", ["codex", "pi", "claude-sdk", None])
 def test_setup_hint_defaults_to_omnigent_setup(harness: str | None) -> None:
     """Harnesses whose CLI ``omni setup`` installs (npm CLIs) — and the
-    SDK / unknown / ``None`` cases — route to the ``omni setup`` hint."""
+    SDK / unknown / ``None`` cases — route to the ``omni setup`` hint.
+
+    ``claude-native`` is absent: it names Anthropic's installer instead.
+    """
     hint = hi.harness_setup_hint(harness)
     assert "omni setup" in hint
 
@@ -412,7 +453,7 @@ def test_install_harness_cli_requires_npm(monkeypatch: pytest.MonkeyPatch) -> No
         raise AssertionError("subprocess.run reached despite missing npm")
 
     monkeypatch.setattr(hi.subprocess, "run", _explode)
-    assert hi.install_harness_cli(ANTHROPIC_FAMILY) is False
+    assert hi.install_harness_cli(OPENAI_FAMILY) is False
 
 
 def test_try_install_harness_cli_missing_npm(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -427,9 +468,13 @@ def test_try_install_harness_cli_missing_npm(monkeypatch: pytest.MonkeyPatch) ->
         "run",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not shell out")),
     )
-    installed, reason = hi.try_install_harness_cli(ANTHROPIC_FAMILY)
+    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
     assert installed is False
     assert reason is not None and "npm" in reason
+    # Claude's installer is bash-based, so its reason names bash, not npm.
+    installed, reason = hi.try_install_harness_cli(ANTHROPIC_FAMILY)
+    assert installed is False
+    assert reason is not None and "bash" in reason
 
 
 def test_try_install_harness_cli_manual_only() -> None:

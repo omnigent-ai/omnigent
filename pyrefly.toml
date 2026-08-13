@@ -20,6 +20,8 @@ disable-search-path-heuristics = true
 ignore-missing-imports = [
     "boxlite",
     "boxlite.*",
+    "blaxel",
+    "blaxel.*",
     "copilot",
     "copilot.*",
     "cursor_sdk",
@@ -43,6 +45,12 @@ ignore-missing-imports = [
     "numpy",
     "numpy.*",
     "omnigent.onboarding.internal_beta",
+    "opentelemetry.exporter",
+    "opentelemetry.exporter.*",
+    "opentelemetry.instrumentation",
+    "opentelemetry.instrumentation.*",
+    "opentelemetry.sdk",
+    "opentelemetry.sdk.*",
     "openshell",
     "openshell.*",
 ]

@@ -784,6 +784,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "copilot": "HARNESS_COPILOT_MODEL",
         "cursor": "HARNESS_CURSOR_MODEL",
         "goose": "HARNESS_GOOSE_MODEL",
+        "hermes": "HARNESS_HERMES_MODEL",
         "kimi": "HARNESS_KIMI_MODEL",
         "openai-agents": "HARNESS_OPENAI_AGENTS_MODEL",
         "pi": "HARNESS_PI_MODEL",
@@ -810,6 +811,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex": "Codex",
         "copilot": "Copilot",
         "cursor": "Cursor",
+        "hermes": "Hermes",
         # openai-agents is intentionally omitted from the picker catalog: it
         # stays a valid harness for YAML specs (and the credential-free
         # integration mock LLM), but is no longer offered as a UI pick.

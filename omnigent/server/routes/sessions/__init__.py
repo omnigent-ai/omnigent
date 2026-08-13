@@ -593,6 +593,7 @@ from omnigent.server.routes._sessions.helpers import (
 # Higher-layer orchestration flows (runner relay, session-event dispatch,
 # native-terminal launch, MCP tool calls) live in _sessions.orchestration.
 from omnigent.server.routes._sessions.orchestration import (
+    RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
     _accumulate_session_usage as _accumulate_session_usage,
     _best_effort_stop as _best_effort_stop,
     _bind_and_launch_managed_runner as _bind_and_launch_managed_runner,
