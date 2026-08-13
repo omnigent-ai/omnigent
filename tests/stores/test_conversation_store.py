@@ -5174,6 +5174,57 @@ def test_list_conversations_filters_by_pinned_label(
     assert conversation_store.list_conversations(pinned=True, pinned_owner="alice").data == []
 
 
+def test_list_conversations_filters_by_status(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``list_conversations(status=...)`` partitions on the persisted
+    ``live_status`` mirror plus the closed marker: ``"active"`` is
+    running/waiting and not closed; ``"completed"`` is everything else
+    (idle/failed/never-observed, plus any closed session even if its live
+    status still reads running)."""
+    running = conversation_store.create_conversation(title="running")
+    waiting = conversation_store.create_conversation(title="waiting")
+    idle = conversation_store.create_conversation(title="idle")
+    failed = conversation_store.create_conversation(title="failed")
+    never_observed = conversation_store.create_conversation(title="never-observed")
+    closed_but_running = conversation_store.create_conversation(title="closed-but-running")
+
+    conversation_store.set_session_live_status(running.id, "running")
+    conversation_store.set_session_live_status(waiting.id, "waiting")
+    conversation_store.set_session_live_status(idle.id, "idle")
+    conversation_store.set_session_live_status(failed.id, "failed")
+    conversation_store.set_session_live_status(closed_but_running.id, "running")
+    conversation_store.set_labels(closed_but_running.id, {"omnigent.closed": "true"})
+
+    active_ids = {c.id for c in conversation_store.list_conversations(status="active").data}
+    assert active_ids == {running.id, waiting.id}
+
+    completed_ids = {c.id for c in conversation_store.list_conversations(status="completed").data}
+    assert completed_ids == {idle.id, failed.id, never_observed.id, closed_but_running.id}
+
+    # status=None (default) disables the filter entirely.
+    all_ids = {c.id for c in conversation_store.list_conversations().data}
+    assert all_ids == active_ids | completed_ids
+
+
+def test_list_conversations_filters_by_status_split_db(
+    split_db_conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Same as ``test_list_conversations_filters_by_status``, but against a
+    split-DB store (``live_status`` lives on the Omnigent DB, ``conversations``
+    on the AP DB) — exercises the prefetch-then-filter branch rather than the
+    single-DB inline subquery."""
+    store = split_db_conversation_store
+    running = store.create_conversation(title="running")
+    idle = store.create_conversation(title="idle")
+
+    store.set_session_live_status(running.id, "running")
+    store.set_session_live_status(idle.id, "idle")
+
+    assert {c.id for c in store.list_conversations(status="active").data} == {running.id}
+    assert {c.id for c in store.list_conversations(status="completed").data} == {idle.id}
+
+
 def test_pinned_label_key_fits_column_for_long_user_ids() -> None:
     """The per-user pin key must never overflow the ``String(128)`` label-key
     column. Short ids stay verbatim (DB-readable); an over-long id (e.g. a long

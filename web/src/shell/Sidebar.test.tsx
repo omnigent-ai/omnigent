@@ -235,6 +235,17 @@ function selectSessionFilter(value: "all" | "mine" | "shared" | "archived") {
   fireEvent.click(screen.getByTestId(`session-filter-${value}`));
 }
 
+// Lifecycle status shares that same menu, as a second radio group below the
+// scope options (the default is "Any status").
+function selectStatusFilter(value: "all" | "active" | "completed") {
+  fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+    button: 0,
+    ctrlKey: false,
+    pointerType: "mouse",
+  });
+  fireEvent.click(screen.getByTestId(`session-status-filter-${value}`));
+}
+
 /** Show only sessions others shared with the viewer. */
 function showSharedTab() {
   selectSessionFilter("shared");
@@ -511,6 +522,76 @@ describe("Sidebar session list", () => {
     // button that opens it rather than an inline filter input.
     fireEvent.click(screen.getByTestId("sidebar-search-button"));
     expect(onOpenSearch).toHaveBeenCalledTimes(1);
+  });
+
+  it("filters the session list by status via the Sessions filter menu", () => {
+    mockConversations([
+      conv("conv_running", "Codex", { status: "running" }),
+      conv("conv_awaiting", "Codex", { pending_elicitations_count: 1 }),
+      conv("conv_idle", "Claude Code"),
+      conv("conv_closed_but_running", "Codex", {
+        status: "running",
+        labels: { "omnigent.closed": "true" },
+      }),
+    ]);
+    renderSidebar();
+
+    // Unfiltered by default: every row shows.
+    expect(screen.getByText("conv_running")).toBeInTheDocument();
+    expect(screen.getByText("conv_awaiting")).toBeInTheDocument();
+    expect(screen.getByText("conv_idle")).toBeInTheDocument();
+    expect(screen.getByText("conv_closed_but_running")).toBeInTheDocument();
+
+    selectStatusFilter("active");
+
+    // Active: running/awaiting and not closed.
+    expect(screen.getByText("conv_running")).toBeInTheDocument();
+    expect(screen.getByText("conv_awaiting")).toBeInTheDocument();
+    expect(screen.queryByText("conv_idle")).toBeNull();
+    // Closed always reads completed, even if its live status is "running".
+    expect(screen.queryByText("conv_closed_but_running")).toBeNull();
+
+    selectStatusFilter("completed");
+
+    // Completed: idle/failed/never-observed, plus closed regardless of status.
+    expect(screen.queryByText("conv_running")).toBeNull();
+    expect(screen.queryByText("conv_awaiting")).toBeNull();
+    expect(screen.getByText("conv_idle")).toBeInTheDocument();
+    expect(screen.getByText("conv_closed_but_running")).toBeInTheDocument();
+
+    selectStatusFilter("all");
+
+    // Back to unfiltered.
+    expect(screen.getByText("conv_running")).toBeInTheDocument();
+    expect(screen.getByText("conv_idle")).toBeInTheDocument();
+  });
+
+  it("composes the status filter with the scope filter", () => {
+    mockConversations([
+      conv("conv_mine_running", "Codex", { status: "running" }),
+      conv("conv_mine_idle", "Claude Code"),
+      conv("conv_shared_running", "Codex", { status: "running", owner: "other@example.com" }),
+    ]);
+    renderSidebar();
+
+    selectSessionFilter("mine");
+    selectStatusFilter("active");
+
+    // Both axes apply: owned AND running.
+    expect(screen.getByText("conv_mine_running")).toBeInTheDocument();
+    expect(screen.queryByText("conv_mine_idle")).toBeNull();
+    expect(screen.queryByText("conv_shared_running")).toBeNull();
+  });
+
+  it("lights the filter button while a non-default status is selected", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    // Ghost at rest, so a narrowed list is never mistaken for an empty one.
+    expect(screen.getByTestId("session-filter").className).not.toContain("bg-secondary");
+
+    selectStatusFilter("active");
+    expect(screen.getByTestId("session-filter").className).toContain("bg-secondary");
   });
 
   it("swaps the card content to the settings section nav on /settings", () => {

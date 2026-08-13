@@ -581,3 +581,44 @@ async def test_list_sessions_pinned_filter(
     assert plain.id not in ids
     # A pin belonging to another user must not appear for the caller.
     assert other_user_pin.id not in ids
+
+
+async def test_list_sessions_status_filter(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``?status=active`` / ``?status=completed`` partition the list by the
+    persisted live-status mirror; ``?status=all`` (and the param's absence)
+    disables the filter."""
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="status-agent", bundle_location="test:///bundle")
+    running = conv_store.create_conversation(agent_id=agent_id)
+    idle = conv_store.create_conversation(agent_id=agent_id)
+    conv_store.set_session_live_status(running.id, "running")
+    conv_store.set_session_live_status(idle.id, "idle")
+
+    active_resp = await client.get("/v1/sessions?status=active")
+    active_ids = {s["id"] for s in active_resp.json()["data"]}
+    assert running.id in active_ids
+    assert idle.id not in active_ids
+
+    completed_resp = await client.get("/v1/sessions?status=completed")
+    completed_ids = {s["id"] for s in completed_resp.json()["data"]}
+    assert idle.id in completed_ids
+    assert running.id not in completed_ids
+
+    all_resp = await client.get("/v1/sessions?status=all")
+    all_ids = {s["id"] for s in all_resp.json()["data"]}
+    assert {running.id, idle.id} <= all_ids
+
+    default_resp = await client.get("/v1/sessions")
+    default_ids = {s["id"] for s in default_resp.json()["data"]}
+    assert {running.id, idle.id} <= default_ids
+
+
+async def test_list_sessions_status_rejects_invalid_value(client: httpx.AsyncClient) -> None:
+    """An unrecognized ``status`` value 422s rather than silently no-oping."""
+    resp = await client.get("/v1/sessions?status=bogus")
+    assert resp.status_code == 422

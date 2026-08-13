@@ -26,6 +26,7 @@ import {
   CornerDownRightIcon,
   FileTextIcon,
   FlaskConicalIcon,
+  ListFilterIcon,
   ListIcon,
   NetworkIcon,
   PlusIcon,
@@ -34,6 +35,13 @@ import {
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Badge } from "@/components/ui/badge";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
@@ -61,9 +69,11 @@ import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodi
 import {
   activityDotClassName,
   childStatus,
+  matchesStatusFilter,
   sessionStatus,
   type AgentActivity,
   type AgentStatus,
+  type SubagentStatusFilter,
 } from "./subagentStatus";
 import { AddAgentDialog } from "./AddAgentDialog";
 
@@ -114,10 +124,19 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   const { children, isLoading, error } = useChildSessions(rootSessionId);
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
+  const [statusFilter, setStatusFilter] = useState<SubagentStatusFilter>("all");
   const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
   const toggleCollapsedRow = (id: string) => {
     setCollapsedRows((current) => ({ ...current, [id]: !current[id] }));
   };
+  // "main" (the root row) is always shown regardless of the filter — it's
+  // the panel's fixed navigation anchor, not a filterable agent row. Every
+  // level of the tree applies the same filter independently (see
+  // SubagentRow's own grandchildren filtering below), so a filtered-out
+  // branch's descendants are hidden along with it.
+  const visibleChildren = children.filter((child) =>
+    matchesStatusFilter(childStatus(child).activity, statusFilter),
+  );
 
   // Loading/error states only surface when there's no cached data to
   // show alongside the "main" row.
@@ -155,7 +174,12 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
-      <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+      <ViewModeToggle
+        viewMode={viewMode}
+        onViewModeChange={setViewMode}
+        statusFilter={statusFilter}
+        onStatusFilterChange={setStatusFilter}
+      />
       <button
         type="button"
         data-testid="add-agent-button"
@@ -167,7 +191,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
       </button>
       <ul className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-1">
         <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
-        {children.map((child) => (
+        {visibleChildren.map((child) => (
           <SubagentRow
             key={child.id}
             child={child}
@@ -175,6 +199,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
             conversationId={conversationId}
             collapsedRows={collapsedRows}
             onToggleCollapsed={toggleCollapsedRow}
+            statusFilter={statusFilter}
           />
         ))}
       </ul>
@@ -187,15 +212,60 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   );
 }
 
+const SUBAGENT_STATUS_FILTERS: { value: SubagentStatusFilter; label: string }[] = [
+  { value: "all", label: "Any status" },
+  { value: "active", label: "Active" },
+  { value: "completed", label: "Completed" },
+];
+
 function ViewModeToggle({
   viewMode,
   onViewModeChange,
+  statusFilter,
+  onStatusFilterChange,
 }: {
   viewMode: ViewMode;
   onViewModeChange: (mode: ViewMode) => void;
+  /** Omitted in graph view — the graph doesn't yet apply the filter. */
+  statusFilter?: SubagentStatusFilter;
+  onStatusFilterChange?: (filter: SubagentStatusFilter) => void;
 }) {
   return (
     <div className="flex shrink-0 items-center justify-end gap-0.5 border-b px-2 py-1">
+      {statusFilter != null && onStatusFilterChange != null && (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant={statusFilter !== "all" ? "secondary" : "ghost"}
+              size="icon-xs"
+              aria-label="Filter agents by status"
+              title="Filter agents by status"
+              data-testid="subagents-status-filter"
+              // mr-auto pushes this to the toolbar's left edge, away from the
+              // view-mode pair on the right.
+              className="mr-auto"
+            >
+              <ListFilterIcon className="size-3.5" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start" className="min-w-36 [&_[role=menuitemradio]]:text-xs">
+            <DropdownMenuRadioGroup
+              value={statusFilter}
+              onValueChange={(next) => onStatusFilterChange(next as SubagentStatusFilter)}
+            >
+              {SUBAGENT_STATUS_FILTERS.map((filter) => (
+                <DropdownMenuRadioItem
+                  key={filter.value}
+                  value={filter.value}
+                  data-testid={`subagents-status-filter-${filter.value}`}
+                >
+                  {filter.label}
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
       <Button
         variant={viewMode === "list" ? "secondary" : "ghost"}
         size="icon-xs"
@@ -582,6 +652,7 @@ function SubagentRow({
   conversationId,
   collapsedRows,
   onToggleCollapsed,
+  statusFilter,
 }: {
   child: ChildSessionInfo;
   /** Levels below the root, 1 = direct child of "main". */
@@ -590,6 +661,7 @@ function SubagentRow({
   conversationId: string;
   collapsedRows: Record<string, boolean>;
   onToggleCollapsed: (id: string) => void;
+  statusFilter: SubagentStatusFilter;
 }) {
   const collapsed = collapsedRows[child.id] ?? false;
   const status = childStatus(child);
@@ -604,7 +676,13 @@ function SubagentRow({
   // Disabled (null id) at the depth cap so the fan-out of fetches is
   // bounded; ``useChildSessions`` skips the query entirely for null.
   const { children: grandchildren } = useChildSessions(depth < MAX_TREE_DEPTH ? child.id : null);
+  // The collapse toggle and connector reflect the REAL tree shape, so they
+  // key off the unfiltered count; only the rendered rows below apply the
+  // filter (a filtered-out grandchild still counts toward "has children").
   const hasGrandchildren = grandchildren.length > 0;
+  const visibleGrandchildren = grandchildren.filter((grandchild) =>
+    matchesStatusFilter(childStatus(grandchild).activity, statusFilter),
+  );
   const ToggleIcon = collapsed ? ChevronRightIcon : ChevronDownIcon;
   return (
     <>
@@ -681,7 +759,7 @@ function SubagentRow({
         </Link>
       </li>
       {!collapsed &&
-        grandchildren.map((grandchild) => (
+        visibleGrandchildren.map((grandchild) => (
           <SubagentRow
             key={grandchild.id}
             child={grandchild}
@@ -689,6 +767,7 @@ function SubagentRow({
             conversationId={conversationId}
             collapsedRows={collapsedRows}
             onToggleCollapsed={onToggleCollapsed}
+            statusFilter={statusFilter}
           />
         ))}
     </>

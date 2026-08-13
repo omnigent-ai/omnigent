@@ -613,6 +613,7 @@ class ConversationStore(ABC):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        status: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -723,6 +724,20 @@ class ConversationStore(ABC):
             Powers the ``(agent, title)`` child-session lookup in
             ``sys_session_send`` so the server can resolve the target
             in a single indexed query instead of fetching all children.
+        :param status: Filter by lifecycle status derived from the
+            persisted ``live_status`` mirror
+            (``omnigent_conversation_metadata.live_status`` — see
+            :mod:`omnigent.server.session_live_state`) plus the closed
+            marker (:func:`omnigent.session_lifecycle.is_session_closed`).
+            ``"active"`` returns sessions whose live status is
+            ``running``/``waiting`` and that are not closed.
+            ``"completed"`` returns everything else — ``idle``/``failed``/
+            never-observed sessions, plus any closed session regardless of
+            its live status. ``None`` (default) disables the filter.
+            Powers ``GET /v1/sessions?status=``. Best-effort: the
+            persisted mirror can lag the in-memory status cache a live
+            replica serves for display, so a session may briefly filter
+            into the wrong bucket around a transition.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """

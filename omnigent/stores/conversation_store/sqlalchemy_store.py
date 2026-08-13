@@ -77,6 +77,11 @@ from omnigent.session_import.models import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
 )
+from omnigent.session_lifecycle import (
+    CLOSED_LABEL_KEY,
+    CLOSED_LABEL_VALUE,
+    CLOSED_TITLE_INFIX,
+)
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
@@ -2215,6 +2220,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        status: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -2278,6 +2284,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             (an ``owner``-level grant) — stricter than ``accessible_by``,
             which also matches sessions merely shared with them. Powers
             the per-project folder fetch. ``None`` disables the filter.
+        :param status: ``"active"`` restricts to sessions whose persisted
+            ``live_status`` mirror is ``running``/``waiting`` and that
+            carry no closed marker; ``"completed"`` returns everything
+            else (``idle``/``failed``/never-observed, plus any closed
+            session). ``None`` disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
@@ -2521,6 +2532,55 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                     )
                 )
+            if status in ("active", "completed"):
+                # "active" ⇔ the persisted live_status mirror reads running/waiting
+                # AND the session carries no closed marker; "completed" is every
+                # other row. live_status lives on the Omnigent-side metadata table
+                # (see the ``project`` filter above for the same split-DB
+                # colocated-vs-prefetch shape), so a single-DB deployment can push
+                # the whole check down as an inline subquery while a split-DB one
+                # prefetches ids scoped to ``qualifying_ids`` (when permission-
+                # filtered) first.
+                active_stmt = select(SqlConversationMetadata.id).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.live_status.in_(
+                        [
+                            encode_session_live_status("running"),
+                            encode_session_live_status("waiting"),
+                        ]
+                    ),
+                )
+                if self._conv_engine is self._engine:
+                    active_match: Any = active_stmt
+                else:
+                    if qualifying_ids is not None:
+                        active_stmt = active_stmt.where(
+                            SqlConversationMetadata.id.in_(qualifying_ids)
+                        )
+                    with self._session("list_conversations") as meta_sess:
+                        active_match = list(meta_sess.execute(active_stmt).scalars())
+                # Closed is derived from either the explicit label or the legacy
+                # title-suffix marker (see omnigent.session_lifecycle), both of
+                # which are colocated on the AP DB.
+                closed_predicate = or_(
+                    SqlConversation.title.like(f"%{CLOSED_TITLE_INFIX}%"),
+                    SqlConversation.id.in_(
+                        select(SqlConversationLabel.conversation_id).where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.key == CLOSED_LABEL_KEY,
+                            SqlConversationLabel.value == CLOSED_LABEL_VALUE,
+                        )
+                    ),
+                )
+                if status == "active":
+                    stmt = stmt.where(
+                        SqlConversation.id.in_(active_match),
+                        ~closed_predicate,
+                    )
+                else:
+                    stmt = stmt.where(
+                        or_(SqlConversation.id.not_in(active_match), closed_predicate)
+                    )
             if after:
                 stmt = self._apply_cursor(
                     stmt,

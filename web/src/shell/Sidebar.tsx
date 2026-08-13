@@ -141,7 +141,12 @@ import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { getSessionState, type SessionState } from "@/hooks/useSessionState";
+import {
+  getSessionState,
+  matchesSessionStatusFilter,
+  type SessionState,
+  type SessionStatusFilter,
+} from "@/hooks/useSessionState";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
@@ -156,6 +161,7 @@ import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
+  DEFAULT_SESSION_FILTER,
   type SessionFilter,
   readSessionFilter,
   writeSessionFilter,
@@ -237,6 +243,15 @@ const SIDEBAR_FILTERS: { value: SidebarTab; label: string }[] = [
   { value: "mine", label: "My sessions" },
   { value: "shared", label: "Shared sessions" },
   { value: "archived", label: "Archived sessions" },
+];
+
+// Lifecycle status, an axis orthogonal to the scope filters above: "Active" is
+// a session an agent is currently running or waiting on, "Completed" is the
+// rest (idle/failed, plus anything explicitly closed).
+const SESSION_STATUS_FILTERS: { value: SessionStatusFilter; label: string }[] = [
+  { value: "all", label: "Any status" },
+  { value: "active", label: "Active" },
+  { value: "completed", label: "Completed" },
 ];
 
 // Shown in place of the list when a filter matches nothing.
@@ -480,6 +495,10 @@ export function Sidebar({
   // (from the Sessions header or the Projects header kebab, respectively).
   const [selectionScope, setSelectionScope] = useState<SelectionScope>("sessions");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  // Status filter (all/active/completed) applied client-side to the already-
+  // loaded list — see ConversationList's `sections` useMemo, the same spot
+  // "archived" is peeled off.
+  const [statusFilter, setStatusFilter] = useState<SessionStatusFilter>("all");
   // A loopback-only server has one user, so "Shared" is meaningless there —
   // the filter menu drops that option. Mirrors AppShell's `shareDisabled`.
   // Read before the filter state, which validates a stored "shared" against it.
@@ -963,6 +982,8 @@ export function Sidebar({
               newSessionProjectName={newSessionProjectName}
               activeTab={activeTab}
               onActiveTabChange={switchTab}
+              statusFilter={statusFilter}
+              onStatusFilterChange={setStatusFilter}
               multiUser={multiUser}
               pinnedConversationIds={pinnedConversationIds}
               pinnedConversations={pinnedConversations}
@@ -1237,6 +1258,10 @@ interface ConversationListProps {
   newSessionProjectName: string | null;
   activeTab: SidebarTab;
   onActiveTabChange: (tab: SidebarTab) => void;
+  /** Status filter, applied to `allConversations` before it feeds into
+   *  `sections` (see the `sections` useMemo below). */
+  statusFilter: SessionStatusFilter;
+  onStatusFilterChange: (filter: SessionStatusFilter) => void;
   /** Multi-user server; gates the "Shared" filter option. */
   multiUser: boolean;
   pinnedConversationIds: string[];
@@ -1306,6 +1331,8 @@ function ConversationList({
   newSessionProjectName,
   activeTab,
   onActiveTabChange,
+  statusFilter,
+  onStatusFilterChange,
   multiUser,
   pinnedConversationIds,
   pinnedConversations,
@@ -1395,7 +1422,13 @@ function ConversationList({
     // Merge the server pinned set in, so a pinned session outside the loaded
     // paginated window still renders. Dedupe by id: a pinned session is usually
     // also present in the paginated list, and merging both would render it twice.
-    const allWithPinned = dedupeConversationsById([...allConversations, ...pinnedConversations]);
+    const allWithPinned = dedupeConversationsById([
+      ...allConversations,
+      ...pinnedConversations,
+      // Status applies before any sectioning, so it holds uniformly across
+      // Pinned / Projects / Sessions — "Active" hides a pinned-but-idle
+      // session just like an unpinned one.
+    ]).filter((c) => matchesSessionStatusFilter(c, statusFilter));
     const notArchived = allWithPinned.filter((c) => c.archived !== true);
     // The filter picks the slice; the Pinned / Projects / Sessions structure is
     // then built from it, so every filter reuses the same layout.
@@ -1471,6 +1504,7 @@ function ConversationList({
     projects,
     activeTab,
     viewerId,
+    statusFilter,
   ]);
 
   // Scope-active flags: which section owns the current selection UI (checkboxes
@@ -2022,6 +2056,8 @@ function ConversationList({
                           <SessionFilterMenu
                             value={activeTab}
                             onChange={onActiveTabChange}
+                            statusValue={statusFilter}
+                            onStatusChange={onStatusFilterChange}
                             multiUser={multiUser}
                           />
                         </div>
@@ -2259,15 +2295,20 @@ function SectionHeader({
   );
 }
 
-// Scope filter on the Sessions heading. A radio group: the options are
-// mutually exclusive slices of one list.
+// Scope and status filters on the Sessions heading. Two radio groups: the
+// options within each are mutually exclusive slices of one list, and the two
+// axes compose (e.g. "My sessions" + "Active").
 function SessionFilterMenu({
   value,
   onChange,
+  statusValue,
+  onStatusChange,
   multiUser,
 }: {
   value: SidebarTab;
   onChange: (value: SidebarTab) => void;
+  statusValue: SessionStatusFilter;
+  onStatusChange: (value: SessionStatusFilter) => void;
   multiUser: boolean;
 }) {
   const filters = multiUser
@@ -2280,7 +2321,11 @@ function SessionFilterMenu({
           <DropdownMenuTrigger asChild>
             <Button
               type="button"
-              variant="ghost"
+              // Any non-default filter keeps the button lit, so a narrowed
+              // list is never mistaken for an empty one.
+              variant={
+                value !== DEFAULT_SESSION_FILTER || statusValue !== "all" ? "secondary" : "ghost"
+              }
               size="icon-xs"
               aria-label="Filter sessions"
               data-testid="session-filter"
@@ -2303,6 +2348,22 @@ function SessionFilterMenu({
               key={filter.value}
               value={filter.value}
               data-testid={`session-filter-${filter.value}`}
+            >
+              {filter.label}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel className="text-muted-foreground text-sm">Status</DropdownMenuLabel>
+        <DropdownMenuRadioGroup
+          value={statusValue}
+          onValueChange={(next) => onStatusChange(next as SessionStatusFilter)}
+        >
+          {SESSION_STATUS_FILTERS.map((filter) => (
+            <DropdownMenuRadioItem
+              key={filter.value}
+              value={filter.value}
+              data-testid={`session-status-filter-${filter.value}`}
             >
               {filter.label}
             </DropdownMenuRadioItem>

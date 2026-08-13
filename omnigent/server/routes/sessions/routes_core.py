@@ -828,6 +828,7 @@ def register_core_routes(
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
+        status: str = Query(default="all", pattern="^(active|completed|all)$"),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -875,6 +876,15 @@ def register_core_routes(
             has pinned (the ``omnigent.pinned`` label). Lets the
             sidebar enumerate pinned sessions that fall outside the
             loaded pagination window. ``False`` (default) disables it.
+        :param status: Filter by lifecycle status. ``"active"``
+            returns sessions currently running/waiting on an agent
+            (and not closed); ``"completed"`` returns finished
+            (idle/failed) sessions and any explicitly closed session;
+            ``"all"`` (default) disables the filter. Resolved against
+            the persisted ``live_status`` mirror plus the closed
+            marker — see
+            :meth:`ConversationStore.list_conversations`'s ``status``
+            param for the exact semantics.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -921,6 +931,9 @@ def register_core_routes(
             pinned=pinned,
             # Pins are per-user: filter to the caller's own pin key.
             pinned_owner=user_id,
+            # The store treats ``None`` as "no status filter"; the API
+            # spells that ``status=all`` to keep the param pattern-validated.
+            status=None if status == "all" else status,
         )
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.

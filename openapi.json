@@ -8842,6 +8842,18 @@
               "title": "Pinned",
               "type": "boolean"
             }
+          },
+          {
+            "description": "Filter by lifecycle status. `\"active\"` returns sessions currently running/waiting on an agent (and not closed); `\"completed\"` returns finished (idle/failed) sessions and any explicitly closed session; `\"all\"` (default) disables the filter. Resolved against the persisted `live_status` mirror plus the closed marker \u2014 see `ConversationStore.list_conversations`'s `status` param for the exact semantics.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "pattern": "^(active|completed|all)$",
+              "title": "Status",
+              "type": "string"
+            }
           }
         ],
         "responses": {
