@@ -228,6 +228,8 @@ const VENDORLESS_NATIVE_POLICY_NAME = "native_permission";
 // stamp: `omnigent/server/routes/sessions/routes_hooks.py` (Claude, Cursor,
 // generic), `routes/_codex_elicitation.py`, `routes/_antigravity_elicitation.py`,
 // and the per-vendor `omnigent/<vendor>_native_permissions.py` hooks.
+// `<vendor>_native_` is reserved for those bridges: a user-authored policy in
+// that shape reads as provenance and loses its own name in the UI.
 const NATIVE_POLICY_PREFIXES: readonly (readonly [string, NativeCodingAgentSpec])[] =
   NATIVE_CODING_AGENTS.map((agent) => [
     `${POLICY_NAME_VENDORS[agent.key] ?? agent.key}_native_`,
