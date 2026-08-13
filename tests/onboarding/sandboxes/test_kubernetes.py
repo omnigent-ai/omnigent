@@ -584,9 +584,7 @@ class _FakeBatch:
             raise self.create_job_error
         self.created_jobs.append(body)
 
-    def delete_namespaced_job(
-        self, name, namespace, body=None, _request_timeout=None
-    ):
+    def delete_namespaced_job(self, name, namespace, body=None, _request_timeout=None):
         self.calls.append("delete_job")
         if self.delete_job_errors:
             err = self.delete_job_errors.pop(0)
@@ -828,7 +826,7 @@ def test_launch_host_invalid_config_home_fails_before_creating_secret(
     An out-of-HOME config dir must fail while the manifest is built — before the
     token Secret is created.
     """
-    core, batch = fake_clients
+    core, _batch = fake_clients
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", "/tmp/outside")
     launcher = KubernetesSandboxLauncher(
         in_cluster=True,
