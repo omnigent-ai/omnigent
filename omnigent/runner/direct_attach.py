@@ -35,7 +35,6 @@ which validates and closes without touching any terminal.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import secrets
 from collections.abc import Awaitable, Callable
@@ -187,6 +186,23 @@ def create_direct_attach_app(
     return app
 
 
+async def _await_quietly(task: asyncio.Task[None]) -> None:
+    """Await a finished or cancelled listener task without ever raising.
+
+    The listener is best-effort, so a server that died on its own is
+    logged rather than propagated into the runner's startup or shutdown.
+    ``asyncio.wait`` never re-raises the task's own failure, so the
+    outcome is read back off the task instead of caught.
+
+    :param task: The listener task, already exiting or cancelled.
+    """
+    await asyncio.wait({task}, timeout=_SHUTDOWN_TIMEOUT_S)
+    if not task.done() or task.cancelled():
+        return
+    if (exc := task.exception()) is not None:
+        _logger.warning("direct-attach listener exited with an error", exc_info=exc)
+
+
 class DirectAttachListener:
     """A running loopback listener: the uvicorn server, its task, and port."""
 
@@ -198,12 +214,12 @@ class DirectAttachListener:
     async def stop(self) -> None:
         """Signal the server to exit and await it briefly (best-effort)."""
         self._server.should_exit = True
-        with contextlib.suppress(asyncio.TimeoutError, Exception):
-            await asyncio.wait_for(self._task, timeout=_SHUTDOWN_TIMEOUT_S)
+        # asyncio.wait never re-raises the task's own failure, so a listener
+        # that already died cannot break the caller's shutdown path.
+        await asyncio.wait({self._task}, timeout=_SHUTDOWN_TIMEOUT_S)
         if not self._task.done():
             self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._task
+        await _await_quietly(self._task)
 
 
 async def start_direct_attach_listener(app: FastAPI) -> DirectAttachListener | None:
@@ -228,8 +244,7 @@ async def start_direct_attach_listener(app: FastAPI) -> DirectAttachListener | N
         if task.done() or asyncio.get_running_loop().time() >= deadline:
             _logger.warning("direct-attach listener failed to start; relay-only")
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
+            await _await_quietly(task)
             return None
         await asyncio.sleep(_STARTUP_POLL_S)
     try:
