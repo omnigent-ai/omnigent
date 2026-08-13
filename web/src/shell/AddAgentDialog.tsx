@@ -13,6 +13,8 @@ import { AgentCard } from "@/components/AgentCard";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 import { createSession } from "@/lib/sessionsApi";
+import { setPendingInitialPrompt } from "@/store/chatStore";
+import { sanitizeInitialPrompt } from "@/lib/initialPrompt";
 
 // Title sentinel marking a user-added agent. Mirrors the server's
 // ``_UI_ADDED_AGENT_TITLE_PREFIX`` in omnigent/server/routes/sessions.py:
@@ -28,9 +30,11 @@ const UI_ADDED_TITLE_PREFIX = "ui";
  * custom agent) as a child of the active session. On submit it creates a
  * child session via ``POST /v1/sessions`` with ``parent_session_id`` set
  * and ``sub_agent_name`` left null (so the runner resolves the child's own
- * bound agent rather than a parent sub-spec), then navigates into the new
- * child so the user can send its first message. The agent catalog is the
- * same ``GET /v1/agents`` list the new-session picker uses.
+ * bound agent rather than a parent sub-spec), queues the required first task
+ * (``setPendingInitialPrompt``), then navigates into the new child — whose
+ * bind flow sends that task exactly once, so it starts working without the
+ * user retyping. The agent catalog is the same ``GET /v1/agents`` list the
+ * new-session picker uses.
  *
  * @param parentSessionId - Session the new agent is added under.
  * @param open - Whether the dialog is visible.
@@ -52,6 +56,7 @@ export function AddAgentDialog({
   const agentList = agents ?? [];
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [name, setName] = useState("");
+  const [task, setTask] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -66,6 +71,7 @@ export function AddAgentDialog({
     if (!next) {
       setSelectedAgentId(null);
       setName("");
+      setTask("");
       setError(null);
       setSubmitting(false);
     }
@@ -79,6 +85,14 @@ export function AddAgentDialog({
       setError("Enter a name for the agent.");
       return;
     }
+    // The task is the child's first instruction. Sanitize it the same way the
+    // New Chat composer does (strip terminal-corrupting control chars, trim)
+    // before queueing, since a native-terminal child receives it via tmux.
+    const taskText = sanitizeInitialPrompt(task);
+    if (!taskText) {
+      setError("Enter a task for the agent.");
+      return;
+    }
     const title = `${UI_ADDED_TITLE_PREFIX}:${selectedAgent.name}:${trimmed}`;
     setSubmitting(true);
     setError(null);
@@ -88,8 +102,12 @@ export function AddAgentDialog({
         subAgentName: null,
         title,
       });
-      // Refresh the rail so the new child appears immediately, then jump
-      // into it for the first message.
+      // Queue the child's first message, then navigate: ChatPage's bind flow
+      // consumes it once (keyed by conversation id) and sends it, so the child
+      // starts working without the user retyping — the same path New Chat uses.
+      // ``initial_items`` stays empty (browser architecture; see sessionsApi).
+      setPendingInitialPrompt(session.id, { text: taskText, skill: null });
+      // Refresh the rail so the new child appears immediately, then jump into it.
       await queryClient.invalidateQueries({
         queryKey: childSessionsQueryKey(parentSessionId),
       });
@@ -136,23 +154,49 @@ export function AddAgentDialog({
           </div>
 
           {selectedAgent !== null && (
-            <div className="flex flex-col gap-1.5">
-              <label htmlFor="add-agent-name" className="text-sm font-medium text-muted-foreground">
-                Name
-              </label>
-              {/* Raw input matching NewChatDialog's "Name" field for a
-                  consistent look (rounded-md + border-tint focus, no
-                  heavy ring). */}
-              <input
-                id="add-agent-name"
-                data-testid="add-agent-name-input"
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="Name this agent"
-                className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
-              />
-            </div>
+            <>
+              <div className="flex flex-col gap-1.5">
+                <label
+                  htmlFor="add-agent-name"
+                  className="text-sm font-medium text-muted-foreground"
+                >
+                  Name
+                </label>
+                {/* Raw input matching NewChatDialog's "Name" field for a
+                    consistent look (rounded-md + border-tint focus, no
+                    heavy ring). */}
+                <input
+                  id="add-agent-name"
+                  data-testid="add-agent-name-input"
+                  type="text"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="Name this agent"
+                  className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
+                />
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <label
+                  htmlFor="add-agent-task"
+                  className="text-sm font-medium text-muted-foreground"
+                >
+                  Task
+                </label>
+                {/* The child's first instruction, delivered once after the
+                    child binds (see handleAdd). Multi-line so a longer brief
+                    fits; required, so submit stays disabled until it's typed. */}
+                <textarea
+                  id="add-agent-task"
+                  data-testid="add-agent-initial-prompt-input"
+                  value={task}
+                  onChange={(e) => setTask(e.target.value)}
+                  placeholder="Review the current diff and report correctness issues."
+                  rows={3}
+                  className="min-h-16 resize-y rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
+                />
+              </div>
+            </>
           )}
 
           {error !== null && (
@@ -170,7 +214,7 @@ export function AddAgentDialog({
             data-testid="add-agent-submit"
             onClick={handleAdd}
             loading={submitting}
-            disabled={selectedAgent === null || !name.trim()}
+            disabled={selectedAgent === null || !name.trim() || !task.trim()}
           >
             Add
           </Button>

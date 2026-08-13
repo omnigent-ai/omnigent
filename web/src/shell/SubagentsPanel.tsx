@@ -52,6 +52,7 @@ import { shortModelName } from "@/components/CostRoutingControl";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import type { SessionItem } from "@/lib/types";
+import { hasEditAccess } from "@/lib/permissionsApi";
 import { cn } from "@/lib/utils";
 
 const SubagentsGraphView = lazy(() =>
@@ -112,6 +113,11 @@ type ViewMode = "list" | "graph";
 
 export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
   const { children, isLoading, error } = useChildSessions(rootSessionId);
+  const { session: rootSession } = useSession(rootSessionId);
+  // Adding a sub-agent creates a child session (a write), so gate the affordance
+  // on edit access to the root; a read-only viewer must not see it. Permissive
+  // while the snapshot loads (null level), matching FilesPanel's gate.
+  const canAddAgent = hasEditAccess(rootSession?.permissionLevel ?? null);
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
@@ -136,10 +142,23 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
     );
   }
 
-  if (viewMode === "graph") {
-    return (
-      <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
-        <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+  return (
+    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
+      <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+      {canAddAgent && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          data-testid="add-agent-button"
+          onClick={() => setAddOpen(true)}
+          className="flex w-full shrink-0 items-center justify-start gap-1.5 rounded-none border-b px-2.5 py-2 font-normal text-muted-foreground hover:text-foreground"
+        >
+          <PlusIcon className="size-3.5 shrink-0" />
+          Add agent
+        </Button>
+      )}
+      {viewMode === "graph" ? (
         <Suspense
           fallback={
             <div className="flex h-full flex-1 items-center justify-center text-sm text-muted-foreground">
@@ -149,38 +168,26 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
         >
           <SubagentsGraphView conversationId={conversationId} rootSessionId={rootSessionId} />
         </Suspense>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
-      <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
-      <button
-        type="button"
-        data-testid="add-agent-button"
-        onClick={() => setAddOpen(true)}
-        className="hidden"
-      >
-        <PlusIcon className="size-3.5 shrink-0" />
-        Add agent
-      </button>
-      <ul className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-1">
-        <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
-        {children.map((child) => (
-          <SubagentRow
-            key={child.id}
-            child={child}
-            depth={1}
-            conversationId={conversationId}
-            collapsedRows={collapsedRows}
-            onToggleCollapsed={toggleCollapsedRow}
-          />
-        ))}
-      </ul>
+      ) : (
+        <ul className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-1">
+          <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
+          {children.map((child) => (
+            <SubagentRow
+              key={child.id}
+              child={child}
+              depth={1}
+              conversationId={conversationId}
+              collapsedRows={collapsedRows}
+              onToggleCollapsed={toggleCollapsedRow}
+            />
+          ))}
+        </ul>
+      )}
       {/* Mounted only while open so a closed rail issues no /v1/agents
-          fetch and carries none of the dialog's query dependencies. */}
-      {addOpen && (
+          fetch and carries none of the dialog's query dependencies. Also
+          guarded on ``canAddAgent`` so a permission change can't leave the
+          dialog reachable to a read-only viewer. */}
+      {addOpen && canAddAgent && (
         <AddAgentDialog parentSessionId={rootSessionId} open={addOpen} onOpenChange={setAddOpen} />
       )}
     </div>

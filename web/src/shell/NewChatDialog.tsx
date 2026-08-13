@@ -84,6 +84,12 @@ import {
 // Re-exported for tests that import the readiness helpers from this module.
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
 import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+// ``sanitizeInitialPrompt`` lives in a leaf module so the Agents-rail
+// AddAgentDialog can reuse it without importing this large module. Imported for
+// local use here and re-exported for existing importers/tests.
+import { sanitizeInitialPrompt } from "@/lib/initialPrompt";
+
+export { sanitizeInitialPrompt };
 import {
   isSlashCommandText,
   rankedSlashCommandNames,
@@ -760,28 +766,8 @@ function HarnessSetupNotice({
   );
 }
 
-/**
- * Sanitize a user-typed initial prompt before it is sent.
- *
- * Strips C0/C1 control characters that could corrupt a terminal
- * agent's input when the runner injects the text via ``tmux
- * send-keys`` (Claude Code / Codex native), while preserving newlines
- * (``\n``) and tabs (``\t``) so multi-line prompts survive. Mirrors
- * openui's server-side terminal-input sanitization. Trailing/leading
- * whitespace is trimmed so a whitespace-only prompt collapses to "".
- *
- * @param prompt Raw textarea value the user typed, e.g.
- *   ``"read the README\nand summarize"``.
- * @returns The sanitized prompt; ``""`` when there's nothing to send.
- */
-export function sanitizeInitialPrompt(prompt: string): string {
-  // Intentional control-char class: strips C0 (\x00-\x1f) and C1
-  // (\x7f-\x9f) ranges EXCEPT \t (\x09) and \n (\x0a), which multi-line
-  // prompts need. The control chars in the class are the point of the
-  // rule, so suppress no-control-regex here (oxlint honors this).
-  // eslint-disable-next-line no-control-regex
-  return prompt.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "").trim();
-}
+// ``sanitizeInitialPrompt`` now lives in ``@/lib/initialPrompt`` (imported and
+// re-exported above) so it can be shared with the Agents rail's AddAgentDialog.
 
 /**
  * Return true when ``url`` is acceptable as a sandbox repository URL.

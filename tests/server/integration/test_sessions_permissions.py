@@ -2428,8 +2428,11 @@ async def test_w5_01_parent_session_id_requires_access(
 async def test_w5_01_parent_session_id_allowed_with_access(
     auth_client: httpx.AsyncClient,
 ) -> None:
-    """Positive path: when Alice grants Bob read access to
+    """Positive path: when Alice grants Bob edit access to
     her session, Bob can reference it as ``parent_session_id``.
+
+    Creating a child inherits the parent's runner and inserts a working
+    sub-agent into the parent's tree, so EDIT (write) access is required.
     """
     agent = await create_test_agent(auth_client, user="bryan")
     alice_session = await _create_session_as(
@@ -2437,18 +2440,18 @@ async def test_w5_01_parent_session_id_allowed_with_access(
     )
     alice_session_id = alice_session["id"]
 
-    # Alice grants Bob read access.
+    # Alice grants Bob edit access.
     grant_resp = await _grant_permission(
         auth_client,
         alice_session_id,
         granter="alice",
         target_user="bob",
-        level=LEVEL_READ,
+        level=LEVEL_EDIT,
     )
     assert grant_resp.status_code == 200
 
     # Bob can now create a child session referencing Alice's session.
-    # Use Alice's session-scoped agent (Bob has read access to Alice's
+    # Use Alice's session-scoped agent (Bob has edit access to Alice's
     # owning session, so the agent access check passes).
     resp = await auth_client.post(
         "/v1/sessions",
@@ -2459,8 +2462,47 @@ async def test_w5_01_parent_session_id_allowed_with_access(
         headers={"X-Forwarded-Email": "bob"},
     )
     assert resp.status_code == 201, (
-        f"Expected 201 when Bob has read access to Alice's parent session, "
+        f"Expected 201 when Bob has edit access to Alice's parent session, "
         f"got {resp.status_code}: {resp.text}"
+    )
+
+
+async def test_w5_01_parent_session_id_read_access_insufficient(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """READ access to the parent is not enough to parent a child into it.
+
+    Creating a child spends the parent's runner and mutates the parent's
+    session tree, so it requires EDIT — a read-only collaborator is denied.
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    alice_session = await _create_session_as(
+        auth_client, agent["id"], "alice", title="alice-parent-read-only"
+    )
+    alice_session_id = alice_session["id"]
+
+    # Alice grants Bob only READ access.
+    grant_resp = await _grant_permission(
+        auth_client,
+        alice_session_id,
+        granter="alice",
+        target_user="bob",
+        level=LEVEL_READ,
+    )
+    assert grant_resp.status_code == 200
+
+    # READ is insufficient: parenting a child now requires EDIT.
+    resp = await auth_client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": alice_session["agent_id"],
+            "parent_session_id": alice_session_id,
+        },
+        headers={"X-Forwarded-Email": "bob"},
+    )
+    assert resp.status_code in (403, 404), (
+        f"Expected 403/404 when Bob has only read access to Alice's parent "
+        f"session, got {resp.status_code}: {resp.text}"
     )
 
 
@@ -2495,7 +2537,7 @@ async def test_w5_01_multipart_parent_session_id_requires_access(
 async def test_w5_01_multipart_parent_session_id_allowed_with_access(
     auth_client: httpx.AsyncClient,
 ) -> None:
-    """Positive path, multipart: with READ access to Alice's
+    """Positive path, multipart: with EDIT access to Alice's
     session, Bob's bundled create may parent into it.
 
     The created child must be linked to Alice's session — proving the
@@ -2510,7 +2552,7 @@ async def test_w5_01_multipart_parent_session_id_allowed_with_access(
         alice_session["id"],
         granter="alice",
         target_user="bob",
-        level=LEVEL_READ,
+        level=LEVEL_EDIT,
     )
     assert grant_resp.status_code == 200
 
@@ -2522,7 +2564,7 @@ async def test_w5_01_multipart_parent_session_id_allowed_with_access(
         headers={"X-Forwarded-Email": "bob"},
     )
     assert resp.status_code == 201, (
-        f"Expected 201 when Bob has read access to Alice's parent session, "
+        f"Expected 201 when Bob has EDIT access to Alice's parent session, "
         f"got {resp.status_code}: {resp.text}"
     )
     child_id = resp.json()["session_id"]
@@ -2532,6 +2574,41 @@ async def test_w5_01_multipart_parent_session_id_allowed_with_access(
     )
     assert snap.status_code == 200, snap.text
     assert snap.json()["parent_session_id"] == alice_session["id"]
+
+
+async def test_w5_01_multipart_parent_session_id_read_access_insufficient(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Multipart path: READ access to the parent is not enough to parent
+    a bundled child into it.
+
+    Mirrors the JSON create gate — a bundled child inherits the parent's
+    runner binding and inserts a sub-agent into the parent's tree, so it
+    requires EDIT. A read-only collaborator's bundled create is denied.
+    """
+    alice_session = await _create_session_as(
+        auth_client, "ignored", "alice", title="alice-multipart-parent-read-only"
+    )
+    grant_resp = await _grant_permission(
+        auth_client,
+        alice_session["id"],
+        granter="alice",
+        target_user="bob",
+        level=LEVEL_READ,
+    )
+    assert grant_resp.status_code == 200
+
+    bundle = build_agent_bundle(name="bob-read-only-bundle-agent")
+    resp = await auth_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"parent_session_id": alice_session["id"]})},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        headers={"X-Forwarded-Email": "bob"},
+    )
+    assert resp.status_code in (403, 404), (
+        f"Expected 403/404 when Bob has only read access to Alice's multipart "
+        f"parent session, got {resp.status_code}: {resp.text}"
+    )
 
 
 async def test_w7_2_session_scoped_agent_requires_access(
@@ -3251,9 +3328,9 @@ async def test_leave_rejects_a_sub_agent_session(
     agent = await create_test_agent(auth_client, user="bryan")
     parent = await _create_session_as(auth_client, agent["id"], "bryan", title="leave-parent")
     await _grant_permission(
-        auth_client, parent["id"], granter="bryan", target_user="carol", level=LEVEL_READ
+        auth_client, parent["id"], granter="bryan", target_user="carol", level=LEVEL_EDIT
     )
-    # Carol has read on the parent, so she may parent a child off it.
+    # Carol has edit on the parent, so she may parent a child off it.
     child_resp = await auth_client.post(
         "/v1/sessions",
         json={"agent_id": parent["agent_id"], "parent_session_id": parent["id"]},

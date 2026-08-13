@@ -1,6 +1,7 @@
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   BookOpenIcon,
   Code2Icon,
@@ -26,6 +27,20 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(),
+}));
+
+// The Add-agent dialog (mounted on click) reads the agent catalog; stub it so
+// the click-to-open test renders the dialog's empty state deterministically
+// without a real /v1/agents fetch. Unused by the tests that never open it.
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: vi.fn(() => ({ data: [] })),
+  prefetchAvailableAgentDetails: vi.fn(),
+}));
+
+// The graph view lazy-loads SubagentsGraphView; stub it so the "available in
+// graph view" test can switch views without importing the real graph.
+vi.mock("./SubagentsGraphView", () => ({
+  SubagentsGraphView: () => <div data-testid="subagents-graph-view-stub" />,
 }));
 
 // Stub the brand logos with plain SVGs so jsdom doesn't have to resolve
@@ -67,10 +82,13 @@ function renderPanel({
   rootSessionId = "conv_parent",
   initialEntries,
 }: RenderOptions & { initialEntries?: string[] } = {}) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
-    <MemoryRouter initialEntries={initialEntries}>
-      <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-    </MemoryRouter>,
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={initialEntries}>
+        <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 
@@ -322,7 +340,8 @@ describe("SubagentsPanel", () => {
     expect(screen.queryByTestId("subagent-main-preview")).toBeNull();
   });
 
-  it("renders an 'Add agent' button, with the dialog mounted only after a click", () => {
+  it("renders an 'Add agent' action for a user with edit access", () => {
+    // Default useSession mock (beforeEach) grants permissionLevel 4 (owner).
     useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
 
     renderPanel({ rootSessionId: "conv_root" });
@@ -332,6 +351,59 @@ describe("SubagentsPanel", () => {
     // none of the dialog's query dependencies — assert it's absent here.
     // (The dialog's own behavior is covered by AddAgentDialog.test.tsx.)
     expect(screen.queryByTestId("add-agent-dialog")).toBeNull();
+  });
+
+  it("hides the 'Add agent' action from a read-only viewer", () => {
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+    // Read-only (level 1) on the root session: creating a child is a write
+    // action, so the affordance must not render for this viewer.
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_root",
+        agentId: "ag_root",
+        agentName: null,
+        runnerId: null,
+        status: "idle",
+        createdAt: 0,
+        title: null,
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 1,
+        parentSessionId: null,
+        subAgentName: null,
+        kind: "default",
+      },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+
+    renderPanel({ rootSessionId: "conv_root" });
+
+    expect(screen.queryByTestId("add-agent-button")).toBeNull();
+    expect(screen.queryByTestId("add-agent-dialog")).toBeNull();
+  });
+
+  it("opens the Add agent dialog from the rail action", () => {
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+
+    renderPanel({ rootSessionId: "conv_root" });
+
+    // Closed until the action is used; opens on click.
+    expect(screen.queryByTestId("add-agent-dialog")).toBeNull();
+    fireEvent.click(screen.getByTestId("add-agent-button"));
+    expect(screen.getByTestId("add-agent-dialog")).toBeInTheDocument();
+  });
+
+  it("keeps the Add agent action available in graph view", () => {
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+
+    renderPanel({ rootSessionId: "conv_root" });
+
+    // The action lives in the shared rail header, so switching the body to the
+    // graph view leaves it available (it is not list-only).
+    fireEvent.click(screen.getByTestId("view-mode-graph"));
+    expect(screen.getByTestId("add-agent-button")).toHaveTextContent(/add agent/i);
   });
 
   const AGENT_KIND_CASES: {
@@ -480,6 +552,27 @@ describe("SubagentsPanel", () => {
     expect(rows[1]).toHaveAttribute("href", "/c/conv_child_b");
     // Status-word display (which states show a word vs. a bare dot) is owned
     // by the dedicated "shows the status word only for notable states" test.
+  });
+
+  it("renders ask-2 nested beneath ask-1 and links to each nested row", () => {
+    // main → ask-1 → ask-2 (a two-level Ask chain from selection asks).
+    mockChildTree({
+      conv_parent: [childInfo({ id: "ask_1", session_name: "ask", title: "ui:codex:ask" })],
+      ask_1: [childInfo({ id: "ask_2", session_name: "ask", title: "ui:codex:ask" })],
+    });
+
+    const { container } = renderPanel();
+
+    const ask1 = container.querySelector('[data-child-session-id="ask_1"]');
+    const ask2 = container.querySelector('[data-child-session-id="ask_2"]');
+    expect(ask1).not.toBeNull();
+    expect(ask2).not.toBeNull();
+    // ask-1 at depth 1; ask-2 nested one level deeper.
+    expect(ask1).toHaveAttribute("data-depth", "1");
+    expect(ask2).toHaveAttribute("data-depth", "2");
+    // Clicking any nested row navigates to that session.
+    expect(ask1).toHaveAttribute("href", "/c/ask_1");
+    expect(ask2).toHaveAttribute("href", "/c/ask_2");
   });
 
   it("uses spawned task titles as the primary child-row labels", () => {

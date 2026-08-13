@@ -32,6 +32,28 @@ export function isOwnerLevel(level: number | null): boolean {
 }
 
 /**
+ * Numeric permission level granting edit (write) access. Mirrors
+ * ``LEVEL_EDIT`` in ``omnigent/server/auth.py`` (READ=1, EDIT=2,
+ * MANAGE=3, OWNER=4).
+ */
+export const LEVEL_EDIT = 2;
+
+/**
+ * Return whether a permission level grants edit (write) access — sending a
+ * message, or creating a sub-agent under the session.
+ *
+ * A ``null`` level means "unknown / single-user / still loading" and is
+ * treated permissively (allowed), matching ``isOwnerLevel`` and
+ * ``derivePermissionLevel``. Read-only viewers (level ``1``) are denied.
+ *
+ * :param level: The effective permission level, e.g. ``1`` for read-only.
+ * :returns: ``true`` for edit access (level ``null`` or ``>= 2``).
+ */
+export function hasEditAccess(level: number | null): boolean {
+  return level == null || level >= LEVEL_EDIT;
+}
+
+/**
  * Derive the effective permission level for the active conversation.
  *
  * Resolution order:
