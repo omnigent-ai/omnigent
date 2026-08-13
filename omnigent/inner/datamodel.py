@@ -886,7 +886,7 @@ class AgentDef:
     terminals: dict[str, TerminalEnvSpec] = field(default_factory=dict)
     skills: SkillRegistry = field(default_factory=dict)
     # Materialized agent-bundle root on disk, when known. Used by
-    # the Claude SDK harness to expose ``<bundle>/skills/<name>/
+    # the Claude SDK harness to expose ``<bundle>/skills/<dir>/
     # SKILL.md`` files as plugin skills via the SDK's
     # ``--plugin-dir`` mechanism. Set by the AgentSpec → AgentDef
     # bridge from the spec's parsed ``skill_dir`` paths; left

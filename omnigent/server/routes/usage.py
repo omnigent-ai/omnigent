@@ -8,10 +8,16 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
+from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
+from omnigent.entities import Conversation
 from omnigent.runtime.policies.builder import load_session_usage
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.schemas import SessionUsage, UsageReport
+from omnigent.server.routes._sessions.helpers import (
+    _resolve_harness_impl,
+    _resolve_llm_model,
+)
+from omnigent.server.schemas import DailyCost, SessionUsage, UsageReport
 from omnigent.stores import ConversationStore
 
 # The daily rollup floor for an "all-time" sum: earlier than any real row, so
@@ -56,6 +62,24 @@ def _session_models(usage: dict[str, Any]) -> dict[str, float]:
         except (TypeError, ValueError):
             continue
     return models
+
+
+def _resolve_session_harness(conv: Conversation) -> str | None:
+    """
+    Best-effort harness resolution for the usage report.
+
+    Checks, in order: (1) per-session harness override, (2) the
+    ``omnigent.wrapper`` label stamped at creation by native wrappers,
+    (3) agent-spec resolution via the runtime (works when the server has
+    a live agent cache). Returns a display-friendly name or ``None``.
+    """
+    if conv.harness_override:
+        return conv.harness_override
+    wrapper = conv.labels.get(WRAPPER_LABEL_KEY)
+    if wrapper:
+        # Strip the "-ui" suffix for display: "claude-code-native-ui" → "claude-code-native"
+        return wrapper.removesuffix("-ui") if wrapper.endswith("-ui") else wrapper
+    return _resolve_harness_impl(conv)
 
 
 def _session_cost(usage: dict[str, Any]) -> float:
@@ -131,17 +155,23 @@ def _build_usage_report(
                     title=conv.title,
                     cost_usd=_session_cost(usage),
                     models=_session_models(usage),
+                    harness=_resolve_session_harness(conv),
+                    llm_model=conv.model_override or _resolve_llm_model(conv),
+                    agent_name=conv.sub_agent_name,
                 )
             )
         if not page.has_more:
             break
         after = page.last_id
 
+    daily_costs_raw = conversation_store.list_daily_costs(rollup_user, _EPOCH_DAY)
+
     return UsageReport(
         cost_today=cost_today,
         cost_last_7d=cost_7d,
         cost_last_30d=cost_30d,
         total_cost_usd=total,
+        daily_costs=[DailyCost(day=d, cost_usd=c) for d, c in daily_costs_raw],
         sessions=sessions,
     )
 

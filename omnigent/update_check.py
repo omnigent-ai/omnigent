@@ -296,7 +296,7 @@ def _run_installed_wheel_check() -> None:
         cache is not None
         and cache.kind == "wheel"
         and cache.latest_version
-        and _is_newer(cache.latest_version, info.package_version)
+        and _should_notify_release(cache.latest_version, info.package_version)
         and cache.latest_version != cache.last_notified_version
     ):
         _print_pypi_notice(info.package_version, cache.latest_version)
@@ -337,6 +337,31 @@ def _is_newer(latest: str, current: str) -> bool:
         return parse(latest) > parse(current)
     except InvalidVersion:
         return latest != current and bool(latest)
+
+
+def _should_notify_release(latest: str, current: str) -> bool:
+    """Return whether the passive update notice should report *latest*.
+
+    A development build is already on its corresponding release line, so
+    the notice stays quiet for that line's final release. Later releases and
+    post-releases still produce a notice.
+    """
+    from packaging.version import InvalidVersion, parse
+
+    try:
+        latest_version = parse(latest)
+        current_version = parse(current)
+    except InvalidVersion:
+        return _is_newer(latest, current)
+
+    if (
+        current_version.is_devrelease
+        and latest_version.epoch == current_version.epoch
+        and latest_version.release == current_version.release
+        and not latest_version.is_postrelease
+    ):
+        return False
+    return latest_version > current_version
 
 
 def _resolve_index_url() -> str:

@@ -1,0 +1,143 @@
+name: "Run e2e compat smoke tests"
+description: >
+  Run @pytest.mark.compat_smoke tests from tests/e2e/ in one configuration:
+  either the server or the runner subprocess is pinned to an older released
+  build while the other side stays on the checked-out code. Exactly one of
+  server_version / runner_version must be set.
+
+  Reuses the same install steps as .github/actions/e2e-run so the two
+  never drift on Python/uv/binary-dep setup. Unlike e2e-run this action
+  is not sharded and runs only the compat_smoke marker, keeping wall-clock
+  time under ~15 minutes.
+
+inputs:
+  server_version:
+    description: >
+      Release tag for the OLD server build (e.g. v0.9.0).
+      Set this for Config 1 (new runner, old server). Leave empty for Config 2.
+    required: false
+    default: ""
+  runner_version:
+    description: >
+      Release tag for the OLD runner build (e.g. v0.9.0).
+      Set this for Config 2 (new server, old runner). Leave empty for Config 1.
+    required: false
+    default: ""
+  artifact_suffix:
+    description: >
+      Appended to uploaded-artifact names to keep them unique across jobs
+      (e.g. "-config1"). Default empty — fine for single-run cases.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Configure environment
+      shell: bash
+      run: |
+        {
+          echo "OMNIGENT_SKIP_WEB_UI=true"
+          echo "ANTHROPIC_API_KEY="
+          echo "OPENAI_API_KEY="
+          echo "CODEX="
+          echo "CLAUDE_CODE="
+        } >> "$GITHUB_ENV"
+
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+      with:
+        python-version-file: ".python-version"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+      with:
+        enable-cache: true
+
+    - name: Cache virtualenv
+      uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+      with:
+        path: .venv
+        key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+
+    - name: Install project and dev dependencies
+      shell: bash
+      run: uv sync --locked --extra all --extra dev
+
+    - name: Install binary dependencies
+      working-directory: .github/ci-deps
+      shell: bash
+      run: |
+        sudo apt-get install -y tmux bubblewrap
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        npm install --ignore-scripts
+        node node_modules/@anthropic-ai/claude-code/install.cjs
+        echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
+
+    - name: "Build pinned old server (Config 2: new runner, old server)"
+      if: ${{ inputs.server_version != '' }}
+      shell: bash
+      env:
+        SERVER_VERSION_INPUT: ${{ inputs.server_version }}
+      run: |
+        tag="$SERVER_VERSION_INPUT"
+        if ! [[ "$tag" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([a-z0-9.]*)?$ ]]; then
+          echo "Invalid server_version: '$tag'" >&2; exit 1
+        fi
+        src="$RUNNER_TEMP/server-src"
+        venv="$RUNNER_TEMP/server-env"
+        git worktree add --detach "$src" "$tag"
+        uv venv --python 3.12 "$venv"
+        uv pip install --python "$venv/bin/python" \
+          -e "$src" -e "$src/sdks/python-client" -e "$src/sdks/ui"
+        "$venv/bin/omnigent" --version
+        echo "OMNIGENT_COMPAT_SERVER_PYTHON=$venv/bin/python" >> "$GITHUB_ENV"
+        echo "OMNIGENT_COMPAT_SERVER_VERSION=${tag#v}" >> "$GITHUB_ENV"
+
+    - name: "Build pinned old runner/host (Config 1: new server, old runner)"
+      if: ${{ inputs.runner_version != '' }}
+      shell: bash
+      env:
+        RUNNER_VERSION_INPUT: ${{ inputs.runner_version }}
+      run: |
+        tag="$RUNNER_VERSION_INPUT"
+        if ! [[ "$tag" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([a-z0-9.]*)?$ ]]; then
+          echo "Invalid runner_version: '$tag'" >&2; exit 1
+        fi
+        src="$RUNNER_TEMP/runner-src"
+        venv="$RUNNER_TEMP/runner-env"
+        git worktree add --detach "$src" "$tag"
+        uv venv --python 3.12 "$venv"
+        uv pip install --python "$venv/bin/python" \
+          -e "$src" -e "$src/sdks/python-client" -e "$src/sdks/ui"
+        "$venv/bin/omnigent" --version
+        echo "OMNIGENT_COMPAT_RUNNER_PYTHON=$venv/bin/python" >> "$GITHUB_ENV"
+        echo "OMNIGENT_COMPAT_RUNNER_VERSION=${tag#v}" >> "$GITHUB_ENV"
+
+    - name: Run compat smoke tests
+      shell: bash
+      env:
+        E2E_TMP_BASE: /tmp/omnigent-compat-smoke-${{ github.run_id }}
+      run: |
+        mkdir -p "$E2E_TMP_BASE"
+        uv run pytest tests/e2e/ \
+          -m compat_smoke \
+          -v --tb=long --showlocals --log-level=INFO \
+          --timeout=120 \
+          --timeout-method=thread \
+          --basetemp="$E2E_TMP_BASE" \
+          --junitxml="$E2E_TMP_BASE/junit.xml"
+
+    - name: Upload logs on failure
+      if: ${{ failure() || cancelled() }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      with:
+        name: compat-smoke-logs-${{ github.run_id }}${{ inputs.artifact_suffix }}
+        path: |
+          /tmp/omnigent-compat-smoke-${{ github.run_id }}/**/server.log
+          /tmp/omnigent-compat-smoke-${{ github.run_id }}/**/runner.log
+          /tmp/omnigent-compat-smoke-${{ github.run_id }}/**/.omnigent/logs/**/*.log
+          /tmp/omnigent-compat-smoke-${{ github.run_id }}/junit.xml
+        retention-days: 7
+        if-no-files-found: warn
+        include-hidden-files: true

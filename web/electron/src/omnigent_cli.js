@@ -135,12 +135,18 @@ function stateDir() {
 let cachedHostId = null;
 
 /**
- * This machine's Omnigent host id (e.g. "host_ab12…"), read from the machine
- * identity in `config.yaml` (`host: host_id:`, written by
+ * This machine's Omnigent host id (bare 32-char hex, e.g. "ab12…"), read from
+ * the machine identity in `config.yaml` (`host: host_id:`, written by
  * omnigent/host/identity.py) — instant, no subprocess. Present once generated,
  * even before connecting to any server. Returns null when no id exists yet;
  * after the first connect it resolves. Lets the renderer match "this machine"
  * against the server's /v1/hosts list and select it after an auto-connect.
+ *
+ * Installs predating the drop of the `host_` prefix still hold the legacy
+ * spelling on disk, while /v1/hosts always reports the bare form (`hosts.host_id`
+ * is a Uuid16 column). The renderer compares these as plain strings — it is the
+ * one consumer the server's own prefix-tolerance can't rescue — so strip the
+ * prefix here, mirroring `_normalize_host_id` in omnigent/host/identity.py.
  *
  * @returns {string | null}
  */
@@ -149,7 +155,7 @@ function localHostId() {
   try {
     const parsed = yaml.load(fs.readFileSync(path.join(localConfigDir(), "config.yaml"), "utf8"));
     const id = parsed && typeof parsed === "object" ? parsed.host?.host_id : null;
-    if (typeof id === "string" && id) cachedHostId = id;
+    if (typeof id === "string" && id) cachedHostId = id.replace(/^host_/, "");
   } catch {
     // No config yet, or unparseable.
   }

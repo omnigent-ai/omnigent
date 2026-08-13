@@ -380,6 +380,10 @@ def write_policy_hook_config(
         "omnigent": {
             "command": sys.executable,
             "args": [
+                # hermes launches MCP servers in the workspace; -I keeps that
+                # cwd off sys.path so a workspace that is an omnigent checkout
+                # can't shadow the installed package (as every other bridge does).
+                "-I",
                 "-m",
                 "omnigent.claude_native_bridge",
                 "serve-mcp",

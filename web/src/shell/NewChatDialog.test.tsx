@@ -2383,6 +2383,68 @@ describe("NewChatLandingScreen", () => {
     expect("git" in body).toBe(false);
   });
 
+  it("carries the picked provider in the managed create when several are offered", async () => {
+    // A multi-provider server renders one row per provider. Picking the
+    // second (non-default) row must ride into the POST as sandbox_provider,
+    // so the server launches on it rather than the deployment default.
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_providers: ["modal", "e2b"],
+    });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option-e2b"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "audit the repo" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.host_type).toBe("managed");
+    expect(body.sandbox_provider).toBe("e2b");
+  });
+
+  it("reopens on the last-picked provider and highlights its row", async () => {
+    // The sticky pick: choosing e2b persists it, so a fresh landing (module
+    // draft reset, storage kept) reselects e2b and lights its row up rather
+    // than falling back to the default (modal) first row.
+    const first = renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_providers: ["modal", "e2b"],
+    });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option-e2b"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("E2B Sandbox"),
+    );
+    first.unmount();
+    resetLandingDraft();
+
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_providers: ["modal", "e2b"],
+    });
+    // The chip reflects the sticky provider, not the default.
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("E2B Sandbox"),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    // The e2b row carries the active highlight; modal does not.
+    expect(
+      screen.getByTestId("new-chat-landing-sandbox-option-e2b").getAttribute("data-active"),
+    ).toBe("true");
+    expect(
+      screen.getByTestId("new-chat-landing-sandbox-option").getAttribute("data-active"),
+    ).toBeNull();
+  });
+
   it("shows host-provided git credentials tooltip content in the sandbox repo popover", async () => {
     setOmnigentHostConfig({
       docsLinks: { databricksGitCredentials: "Use Databricks Git credentials before cloning." },
@@ -2716,6 +2778,56 @@ describe("NewChatLandingScreen attachments", () => {
     // state clears rather than sticking when moving between child elements.
     fireEvent.dragLeave(composer, { dataTransfer: { files: [] } });
     expect(screen.queryByText("Drop files here")).toBeNull();
+  });
+
+  // An unsupported attachment has to be caught HERE, before the session
+  // exists. Letting it through means the upload only 415s after the session
+  // is created and navigated into — stranding the typed message in a session
+  // the user never wanted.
+  it("rejects an unsupported attachment instead of attaching it", () => {
+    renderLanding();
+    const zip = new File([new Uint8Array(10)], "photos.zip", { type: "application/zip" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [zip] },
+    });
+    expect(screen.queryByText("photos.zip")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
+      "only images, PDF, and text/code files are supported",
+    );
+  });
+
+  it("keeps the supported files from a mixed drop and names the rejected one", () => {
+    renderLanding();
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
+    const zip = new File([new Uint8Array(10)], "photos.zip", { type: "application/zip" });
+    fireEvent.drop(composer, { dataTransfer: { files: [ok, zip] } });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.queryByText("photos.zip")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
+      "photos.zip",
+    );
+    // Removing the accepted chip clears the stale rejection notice too.
+    fireEvent.click(screen.getByRole("button", { name: "Remove notes.txt" }));
+    expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
+  });
+
+  it("clears the rejection notice once the user types", () => {
+    // The rejected file is never attached, so there is no chip to remove and
+    // nothing else clears the notice. Left sticky it reads as a blocker on a
+    // composer that can actually be submitted.
+    renderLanding();
+    const zip = new File([new Uint8Array(10)], "photos.zip", { type: "application/zip" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [zip] },
+    });
+    expect(screen.getByTestId("new-chat-landing-attachment-error")).toBeTruthy();
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "never mind, just a question" },
+    });
+
+    expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
   });
 });
 

@@ -95,10 +95,11 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
             <Button
               type="button"
               data-testid="new-project-confirm"
-              disabled={createProject.isPending || name.trim() === ""}
+              loading={createProject.isPending}
+              disabled={name.trim() === ""}
               onClick={submit}
             >
-              {createProject.isPending ? "Creating…" : "Create"}
+              Create
             </Button>
           </DialogFooter>
         </DialogContent>

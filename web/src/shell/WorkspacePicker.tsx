@@ -1,4 +1,5 @@
 import {
+  FolderDotIcon,
   FolderIcon,
   FolderPlusIcon,
   FileIcon,
@@ -10,9 +11,11 @@ import {
   XIcon,
   AlertTriangleIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
 
 /**
@@ -184,6 +187,59 @@ export function listingFilter(
   return normalizeTypedPath(dirText, home) === currentAbsolute ? partial : null;
 }
 
+/**
+ * Icon button in the picker header, with a styled hover tooltip.
+ *
+ * The tooltip hangs off a wrapping span rather than the button so it still
+ * appears while the button is *disabled* — that is exactly when a user is
+ * most likely to hover asking "what is this, and why can't I click it?".
+ * A disabled button receives no pointer events of its own.
+ *
+ * @param label Tooltip text, also the accessible name.
+ * @param icon Rendered glyph.
+ * @param onClick Activation handler.
+ * @param disabled Whether the action is unavailable.
+ * @param testId ``data-testid`` for the button.
+ */
+function PickerIconButton({
+  label,
+  icon,
+  onClick,
+  disabled = false,
+  testId,
+}: {
+  label: string;
+  icon: ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+  testId: string;
+}) {
+  return (
+    // Provides its own context so the button works wherever it is rendered --
+    // the picker is mounted in dialogs and popovers, and in tests, not only
+    // under the app-root provider. Mirrors FilesPanel's hidden-files toggle.
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="shrink-0">
+            <button
+              type="button"
+              onClick={onClick}
+              disabled={disabled}
+              aria-label={label}
+              className="block rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
+              data-testid={testId}
+            >
+              {icon}
+            </button>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">{label}</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
+}
+
 interface WorkspacePickerProps {
   /** Host to browse, or ``null`` to render an empty state. */
   hostId: string | null;
@@ -221,6 +277,15 @@ interface WorkspacePickerProps {
    * disables the banner entirely.
    */
   occupancyForPath?: (absolutePath: string) => number;
+  /**
+   * Absolute path of the session's workspace, e.g.
+   * ``"/Users/corey/repo"``. When set, a "back to workspace" button appears
+   * beside Home so a user who has wandered off can return in one click.
+   * Omit where there is no workspace yet — the new-session / fork / project
+   * dialogs are *choosing* one, so for them Home (``~``) is the only
+   * meaningful anchor.
+   */
+  workspacePath?: string;
 }
 
 /**
@@ -251,6 +316,7 @@ export function WorkspacePicker({
   onNavigate,
   initialPath,
   occupancyForPath,
+  workspacePath,
 }: WorkspacePickerProps) {
   // "" means home — the server forwards ~ to list_dir. initialPath
   // seeds the start dir (read once at mount).
@@ -464,27 +530,28 @@ export function WorkspacePicker({
       data-testid="workspace-picker"
     >
       <div className="flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
-        <button
-          type="button"
+        <PickerIconButton
+          label="Up one level"
+          icon={<ArrowUpIcon className="size-4" />}
           onClick={() => parent !== null && navigateTo(parent)}
           disabled={parent === null}
-          aria-label="Up one level"
-          title="Up one level"
-          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
-          data-testid="workspace-picker-up"
-        >
-          <ArrowUpIcon className="size-4" />
-        </button>
-        <button
-          type="button"
+          testId="workspace-picker-up"
+        />
+        {workspacePath !== undefined && (
+          <PickerIconButton
+            label="Workspace root"
+            icon={<FolderDotIcon className="size-4" />}
+            onClick={() => navigateTo(workspacePath)}
+            disabled={currentAbsolute === workspacePath}
+            testId="workspace-picker-workspace"
+          />
+        )}
+        <PickerIconButton
+          label="Home"
+          icon={<HomeIcon className="size-4" />}
           onClick={() => navigateTo("")}
-          aria-label="Home"
-          title="Home"
-          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-          data-testid="workspace-picker-home"
-        >
-          <HomeIcon className="size-4" />
-        </button>
+          testId="workspace-picker-home"
+        />
         <input
           type="text"
           value={pathInput}
@@ -506,28 +573,19 @@ export function WorkspacePicker({
           className="min-w-0 flex-1 bg-transparent text-sm text-muted-foreground focus:outline-none"
           data-testid="workspace-picker-path-input"
         />
-        <button
-          type="button"
+        <PickerIconButton
+          label={showHidden ? "Hide hidden files" : "Show hidden files"}
+          icon={showHidden ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />}
           onClick={() => setShowHidden((v) => !v)}
-          aria-label={showHidden ? "Hide hidden" : "Show hidden"}
-          aria-pressed={showHidden}
-          title={showHidden ? "Hide hidden" : "Show hidden"}
-          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-          data-testid="workspace-picker-show-hidden"
-        >
-          {showHidden ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />}
-        </button>
-        <button
-          type="button"
+          testId="workspace-picker-show-hidden"
+        />
+        <PickerIconButton
+          label="New folder"
+          icon={<FolderPlusIcon className="size-4" />}
           onClick={openNewFolder}
           disabled={!canCreateFolder}
-          aria-label="New folder"
-          title="New folder"
-          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
-          data-testid="workspace-picker-new-folder"
-        >
-          <FolderPlusIcon className="size-4" />
-        </button>
+          testId="workspace-picker-new-folder"
+        />
         {onSelect && (
           <Button
             type="button"
@@ -543,16 +601,12 @@ export function WorkspacePicker({
           </Button>
         )}
         {onClose && (
-          <button
-            type="button"
+          <PickerIconButton
+            label="Close"
+            icon={<XIcon className="size-4" />}
             onClick={onClose}
-            aria-label="Close"
-            title="Close"
-            className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-            data-testid="workspace-picker-close"
-          >
-            <XIcon className="size-4" />
-          </button>
+            testId="workspace-picker-close"
+          />
         )}
       </div>
       {newFolderName !== null && (
@@ -596,7 +650,11 @@ export function WorkspacePicker({
               className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
               data-testid="workspace-picker-new-folder-create"
             >
-              <CheckIcon className="size-4" />
+              {createDir.isPending ? (
+                <Spinner className="size-4" />
+              ) : (
+                <CheckIcon className="size-4" />
+              )}
             </button>
             <button
               type="button"

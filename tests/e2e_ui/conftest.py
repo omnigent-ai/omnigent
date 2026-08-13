@@ -55,6 +55,7 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
+from tests._helpers.compat import apply_server_env, compat_server_cwd, server_executable
 from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
 from tests.codex_parity.sidecar_harness import (
     CodexResponsesSidecar,
@@ -669,61 +670,60 @@ def _codex_cli_supports_goal_mode(codex_path: str) -> bool:
     return tuple(int(part) for part in match.groups()) >= _CODEX_GOAL_MIN_VERSION
 
 
-def _assert_pwa_build(build_output: Path) -> None:
-    """Fail if the built SPA is missing the PWA outputs or the SW won't update.
+def _assert_service_worker_tombstone(build_output: Path) -> None:
+    """Fail if the built SPA ships anything but the tombstone service worker.
 
-    The standalone build must ship the installable-PWA assets, and the
-    hand-rolled service worker must (a) embed the per-build fingerprint so its
-    bytes change every deploy — or the update prompt never fires — and (b) NOT
-    cache or serve the app shell: Omnigent is a cloud app, so a stale cached
-    shell would white-screen users after every deploy.
+    The PWA is retired: ``sw.js`` exists only to unregister workers still
+    installed in browsers, and the manifest/version sentinel must be gone. The
+    dangerous direction matters most — a worker that intercepted requests could
+    serve a stale shell and white-screen users after a deploy, and an unscoped
+    cache purge could delete Cache Storage belonging to a future feature.
+
+    Delete this guard together with ``sw-src/sw.js`` in 0.11.0.
     """
-    for name in ("index.html", "sw.js", "manifest.webmanifest", "version.json"):
-        if not (build_output / name).is_file():
-            pytest.fail(f"SPA build is missing {name} at {build_output}")
-    build = json.loads((build_output / "version.json").read_text(encoding="utf-8")).get("build")
+    if not (build_output / "index.html").is_file():
+        pytest.fail(f"SPA build is missing index.html at {build_output}")
+    if not (build_output / "sw.js").is_file():
+        pytest.fail(
+            f"SPA build is missing the tombstone sw.js at {build_output} — without it, "
+            "service workers already registered in browsers are never unregistered"
+        )
+    for name in ("manifest.webmanifest", "version.json"):
+        if (build_output / name).is_file():
+            pytest.fail(f"SPA build still emits the retired PWA asset {name}")
+    # Strip line comments first so prose that mentions these tokens can neither
+    # fake nor mask a regression.
     sw = (build_output / "sw.js").read_text(encoding="utf-8")
-    if not build or build not in sw:
-        pytest.fail(
-            "sw.js does not embed the version.json build fingerprint — the PWA "
-            "update prompt would never fire on a JS-only deploy"
-        )
-    # Installability-only contract — enforce the *dangerous* direction too, not
-    # just "the fingerprint is present". The service worker must NOT precache or
-    # serve the app shell or intercept navigations; otherwise a deploy
-    # white-screens users behind a stale shell. Strip line comments first so
-    # prose that mentions these tokens can neither fake nor mask a regression.
     sw_code = re.sub(r"//[^\n]*", "", sw)
-    if "index.html" in sw_code:
-        pytest.fail("sw.js references index.html — it must not cache or serve the app shell")
-    shell_precache = re.search(r"(?:cache\.add|addAll|precache)[^\n]*\.(?:js|html)\b", sw_code)
-    if shell_precache is not None:
+    if "registration.unregister" not in sw_code:
         pytest.fail(
-            f"sw.js precaches an app-shell asset ({shell_precache.group(0)}) — "
-            "it must precache only version.json"
+            "sw.js does not call registration.unregister() — it must remove itself, "
+            "or the retired worker stays registered in users' browsers"
         )
-    # The architecture rests on "navigations always hit the network". Enforce it
-    # by marker AND structurally: the SW must call respondWith() exactly once,
-    # inside the /version.json branch. A fetch handler that serves navigations or
-    # the shell from cache would pass every check above yet white-screen users
-    # behind a stale shell after each deploy.
-    if re.search(r"request\.mode|NavigationRoute|navigationPreload", sw_code):
+    if "__BUILD_VERSION__" in sw:
         pytest.fail(
-            "sw.js inspects navigation requests — navigations must always reach "
-            "the network (a stale cached shell white-screens users after a deploy)"
+            "sw.js still carries the __BUILD_VERSION__ token but nothing substitutes "
+            "it any more; the tombstone is byte-stable and needs no fingerprint"
         )
     responders = sw_code.count("respondWith")
-    if responders != 1:
+    if responders:
         pytest.fail(
-            f"sw.js has {responders} respondWith() call(s); expected exactly 1 (the "
-            "/version.json sentinel). Any other responder risks serving a stale shell."
+            f"sw.js has {responders} respondWith() call(s); the tombstone must intercept "
+            "nothing — any responder risks serving a stale shell after a deploy"
         )
-    # The single respondWith must sit inside the `=== "/version.json"` block —
-    # i.e. no `}` (block close) between the pathname check and the respondWith.
-    if not re.search(r'"/version\.json"[^}]*?respondWith', sw_code, re.DOTALL):
+    # The purge must match the retired worker's exact cache-name shape
+    # (`omnigent-pwa-<8 lowercase hex>`), not a bare prefix: a tombstone lingering
+    # in some browser must not be able to delete a future feature's Cache Storage
+    # even if that feature reuses the prefix. Checked by marker rather than
+    # structurally — the pattern is held in a const, so a same-line regex would
+    # only be asserting the current formatting.
+    if "caches.delete" in sw_code and not (
+        r"/^omnigent-pwa-[0-9a-f]{8}$/" in sw_code and ".filter(" in sw_code
+    ):
         pytest.fail(
-            "sw.js's respondWith() is not guarded by a `/version.json` pathname "
-            "check — the service worker must not serve the shell or intercept navigations"
+            "sw.js deletes caches without filtering on the retired cache-name shape "
+            "/^omnigent-pwa-[0-9a-f]{8}$/ — the purge must not touch caches it does "
+            "not own, and a bare prefix match is too broad"
         )
 
 
@@ -746,7 +746,7 @@ def built_spa(request: pytest.FixtureRequest) -> None:
     if request.config.getoption("--ui-base-url"):
         return
     if request.config.getoption("--ui-skip-build"):
-        _assert_pwa_build(_BUILD_OUTPUT)
+        _assert_service_worker_tombstone(_BUILD_OUTPUT)
         return
 
     lock_path = _WEB_DIR / ".build.lock"
@@ -773,7 +773,7 @@ def built_spa(request: pytest.FixtureRequest) -> None:
             env=env,
         )
 
-    _assert_pwa_build(_BUILD_OUTPUT)
+    _assert_service_worker_tombstone(_BUILD_OUTPUT)
 
 
 def _spawn_runner_against_external_server(
@@ -952,9 +952,8 @@ def live_server(
     # OMNIGENT_RUNNER_TUNNEL_TOKEN lets the server accept
     # exactly the sibling runner's WebSocket tunnel.
     mock_url = mock_llm_server_url
-    env = {
+    env: dict[str, str] = {
         **os.environ,
-        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
         "OMNIGENT_BUILTIN_AGENT_DIRS": os.pathsep.join(builtin_dirs),
         # Point the openai-agents harness at the mock LLM server so no
@@ -967,11 +966,21 @@ def live_server(
         # WS /v1/dictation/stream transcribes any audio into FAKE_SCRIPT,
         # so chat/test_dictation.py needs no sherpa models or real ASR.
         "OMNIGENT_DICTATION_ENGINE": os.environ.get("OMNIGENT_DICTATION_ENGINE", "fake"),
+        # In compat mode the server binary runs from the pinned old venv, but
+        # the SPA was built from HEAD into _BUILD_OUTPUT. Point the old server
+        # at that directory so it serves the HEAD bundle instead of whatever
+        # stale (or absent) bundle ships in its own site-packages.
+        "OMNIGENT_WEB_UI_DIST": str(_BUILD_OUTPUT),
     }
+    # In normal runs, prepend the worktree so the server imports from the
+    # checked-out source. In compat mode (OMNIGENT_COMPAT_SERVER_PYTHON set),
+    # drop PYTHONPATH so the pinned old build in the compat venv resolves
+    # instead of being shadowed by the worktree.
+    apply_server_env(env, _REPO_ROOT)
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime; closed in finally
     proc = subprocess.Popen(
         [
-            sys.executable,
+            server_executable(),
             # Equivalent of the unit tests' ``monkeypatch.setattr(presence,
             # "_LEAVE_GRACE_S", ...)``, but applied INSIDE this spawned
             # interpreter — a monkeypatch in the test process can't reach a
@@ -997,6 +1006,9 @@ def live_server(
             str(agent_yaml_path),
         ],
         env=env,
+        # Compat mode: neutral CWD so the worktree doesn't shadow the pinned
+        # old server install via sys.path[0]. None (inherit) in normal runs.
+        cwd=compat_server_cwd(),
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )

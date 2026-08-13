@@ -391,6 +391,19 @@ async def forward_kimi_wire_to_session(
     first turn), then tails it, POSTing each new user/assistant turn and
     persisting the line offset after every post.
     """
+    # Route the transcript mirror to the replica holding this session's runner
+    # tunnel: the POST /events is published to that pod's in-process session
+    # stream, so an off-replica POST persists the item (shows on reload) but the
+    # live SSE tail never sees it ("no stream until refresh"). Unlike the other
+    # native forwarders, this client carries no _RunnerDatabricksAuth (whose
+    # auth_flow would stamp the key), so key the shared headers dict directly
+    # from the runner-env host_id (databricks_request_headers with no explicit
+    # host_id reads OMNIGENT_RUNNER_SLICE_KEY; emitted only on the workspace
+    # mount). One point covers the client default + every helper POST below,
+    # which all forward this same dict.
+    from omnigent.cli_auth import databricks_request_headers
+
+    headers = {**headers, **databricks_request_headers(base_url)}
     state = _read_state(bridge_dir)
     wire_path = Path(state.wire_path) if state is not None else None
     last_line = state.last_line if state is not None else 0

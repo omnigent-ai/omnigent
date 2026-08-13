@@ -10,6 +10,7 @@ import httpx
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 
 from ._files import FilesNamespace
+from ._http import is_loopback_url
 from ._query import QueryResult, QueryStream
 from ._responses import ResponsesNamespace
 from ._session import Session
@@ -78,6 +79,10 @@ class OmnigentClient:
             headers=default_headers,
             auth=auth,
             timeout=httpx.Timeout(timeout),
+            # A proxy cannot reach our loopback server, so bypass the
+            # environment for local targets. Loopback is plain HTTP with
+            # explicit headers, so losing netrc/CA env with it costs nothing.
+            trust_env=not is_loopback_url(self._base_url),
         )
 
         self.sessions = SessionsNamespace(self._http, self._base_url)
