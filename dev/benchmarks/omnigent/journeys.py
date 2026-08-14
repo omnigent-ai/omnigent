@@ -686,6 +686,12 @@ async def _measure_read_runner_file(env: BenchEnvironment, ctx: JourneyContext) 
 
 # ── policy evaluate ──────────────────────────────────────────
 
+
+def _bench_policy_allow(_event: dict) -> dict:  # type: ignore[type-arg]
+    """Benchmark policy function: always ALLOW. Self-contained in this module."""
+    return {"result": "allow"}
+
+
 _POLICY_EVALUATE_PAYLOAD = {
     "event": {
         "type": "PHASE_TOOL_CALL",
@@ -729,7 +735,7 @@ async def _setup_policy_evaluate_session(env: BenchEnvironment) -> str:
                 "allow_all": {
                     "type": "function",
                     "on": ["tool_call"],
-                    "function": "tests.runtime.policies.conftest._always_allow",
+                    "function": "dev.benchmarks.omnigent.journeys._bench_policy_allow",
                 }
             }
         },
