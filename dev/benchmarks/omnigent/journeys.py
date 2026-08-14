@@ -140,10 +140,13 @@ def _failure_reason(exc: Exception) -> str:
     """Classify an exception into a stable failure-breakdown label.
 
     HTTP status errors key off their status code (``"HTTP 500"``) so the same
-    server error groups across ops; anything else keys off its class name.
+    server error groups across ops; RuntimeErrors include the message so CI
+    failure breakdowns show the actual cause; anything else keys off class name.
     """
     if isinstance(exc, httpx.HTTPStatusError):
         return f"HTTP {exc.response.status_code}"
+    if isinstance(exc, RuntimeError):
+        return f"RuntimeError: {exc}"
     return exc.__class__.__name__
 
 
