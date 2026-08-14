@@ -55,12 +55,10 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        # pexpect and @anthropic-ai/claude-code are needed by the cli_startup
-        # journey, which is part of ALL_JOURNEYS.
+        # pexpect drives omnigent polly via PTY for the cli_startup journey.
         run: |
           uv sync --extra databricks
           uv pip install pexpect
-          npm install -g @anthropic-ai/claude-code
 
       # Use the same corpus size as the nightly so baseline numbers are
       # directly comparable. Cache the seeded DB on the schema head + seed

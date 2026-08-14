@@ -780,34 +780,30 @@ async def _measure_policy_evaluate(env: BenchEnvironment, ctx: JourneyContext) -
     resp.raise_for_status()
 
 
-# ── CLI startup (real omnigent binary against a remote server) ───────────────
+# ── CLI startup (omnigent polly against the local bench server) ──────────────
 
-# Signal that the Claude terminal is ready — emitted by the startup spinner
-# just before tmux attach. Visible on the pexpect PTY regardless of whether
-# tmux attach itself completes in the benchmark's environment.
-_CLI_STARTUP_READY_SIGNAL = "Claude terminal ready"
+# Signal that the REPL is ready — the last spinner message before the prompt.
+# polly (omnigent run) emits this just before the agent REPL appears.
+_CLI_STARTUP_READY_SIGNAL = "Launching your agent"
 
-# Generous per-attempt timeout: terminal boot can spike to ~30s under load.
-_CLI_STARTUP_TIMEOUT_S = 90
+# Per-attempt timeout. polly boots in ~3-5s locally; 30s is generous headroom.
+_CLI_STARTUP_TIMEOUT_S = 30
 
-# CLI startup is expensive (~10s per attempt); cap iterations the same way as
-# other full-turn journeys so a large --iterations doesn't blow the CI budget.
+# ~5s per attempt; cap so a large --iterations stays in budget.
 _CLI_STARTUP_MAX_ITERATIONS = 3
 
 
 async def _measure_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> None:
-    """Time ``omnigent claude --server`` from invocation to terminal ready.
+    """Time ``omnigent polly --server`` from invocation to REPL ready.
 
-    Spawns the real ``omnigent`` CLI binary (resolved from PATH, or
-    ``OMNIGENT_BIN`` env var) against the local benchmark server
-    (``env.base_url``). The CLI starts its own host daemon and runner — the
-    bench environment must NOT boot one itself (``needs_host=False``) or the
-    two daemons conflict on the same host registration.
+    Spawns ``omnigent polly --server <local>`` via pexpect and times until
+    ``"Launching your agent…"`` appears — the last spinner message before the
+    agent REPL. Using polly (the bundled openai-agents harness) avoids any
+    external binary dependency while exercising the same startup path as
+    ``omnigent claude``: daemon start, session create, runner launch, and
+    runner connect.
 
-    The timed span ends when ``"Claude terminal ready."`` appears on the PTY —
-    the spinner message emitted just before ``tmux attach``.
-
-    Requires ``pexpect`` and the ``claude`` (Claude Code) CLI binary on PATH.
+    Requires ``pexpect``. No external LLM binary needed.
 
     :param env: Benchmark environment — ``env.base_url`` is the local server URL.
     :param _ctx: Unused (no setup context).
@@ -826,7 +822,7 @@ async def _measure_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> N
 
     child = pexpect.spawn(
         omnigent_bin,
-        args=["claude", "--server", env.base_url],
+        args=["polly", "--server", env.base_url],
         timeout=_CLI_STARTUP_TIMEOUT_S,
         encoding="utf-8",
         codec_errors="ignore",
@@ -1064,9 +1060,9 @@ ALL_JOURNEYS: dict[str, Journey] = {
             measure=_measure_cli_startup,
             max_iterations=_CLI_STARTUP_MAX_ITERATIONS,
             description=(
-                "Spawn `omnigent claude --server` against the local bench server and time "
-                "invocation → terminal ready (daemon + session + runner + terminal boot). "
-                "Requires pexpect and the `claude` (Claude Code) CLI binary on PATH."
+                "Spawn `omnigent polly --server` against the local bench server and time "
+                "invocation → REPL ready (daemon + session + runner + runner connect). "
+                "No external LLM binary needed. Requires pexpect."
             ),
         ),
     )

@@ -180,12 +180,9 @@ jobs:
             --database-uri "${{ steps.db.outputs.uri }}" \
             --sessions "$SESSIONS" --items-per-session "$ITEMS"
 
-      # pexpect and claude are needed by the cli_startup journey, which is part
-      # of the default ALL_JOURNEYS run below.
+      # pexpect drives omnigent polly via PTY for the cli_startup journey.
       - name: Install CLI startup dependencies
-        run: |
-          uv pip install pexpect
-          npm install -g @anthropic-ai/claude-code
+        run: uv pip install pexpect
 
       - name: Run benchmark
         run: |
