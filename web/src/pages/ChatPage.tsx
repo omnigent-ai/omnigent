@@ -2429,7 +2429,16 @@ function PreserveScrollDistanceOnResize() {
       prevContentExtent = contentExtent;
     };
 
+    const syncBottomLock = () => {
+      const measuredDistance = Math.max(0, measure());
+      if (!state.isAtBottom && measuredDistance > 1) return false;
+      escaped = false;
+      distance = 1;
+      return true;
+    };
+
     const preserveEscapedState = () => {
+      if (syncBottomLock()) return;
       if (!escaped) return;
       stopScroll?.();
       state.escapedFromLock = true;
@@ -2534,6 +2543,7 @@ function PreserveScrollDistanceOnResize() {
         const ch = el.clientHeight;
         reconcileContentHeight(sh, ch);
         if (!userInitiated) {
+          if (syncBottomLock() && restoring) cancelRestore();
           if (ch !== prevCH) scheduleRestore();
           return;
         }

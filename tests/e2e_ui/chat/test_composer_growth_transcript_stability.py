@@ -115,6 +115,13 @@ def _scroll_to_distance_from_bottom(page: Page, distance: int) -> dict:
     )
 
 
+def _click_scroll_to_bottom(page: Page) -> None:
+    """Use the conversation's visible library-driven re-lock control."""
+    button = page.locator('[role="log"] button:has(svg.lucide-arrow-down)')
+    expect(button).to_be_visible()
+    button.click()
+
+
 def _append_streamed_output(page: Page, height: int) -> dict:
     """Grow transcript content without scrolling its container."""
     return page.evaluate(
@@ -379,4 +386,49 @@ def test_composer_growth_reflows_transcript_without_covering_output(
         same_frame_grown,
     )
     assert abs(same_frame_grown["overlap"]) <= 1, same_frame_grown
+    expect(composer).to_be_focused()
+
+    # A legitimate library re-lock must replace the local escaped-distance
+    # shadow. The next composer resize must keep the transcript at the bottom
+    # instead of restoring the stale reader distance from before the click.
+    composer.fill("")
+    _settled_geometry(page)
+    _scroll_to_distance_from_bottom(page, 400)
+    button_escaped = _settled_geometry(page)
+    assert abs(button_escaped["distanceFromBottom"] - 400) <= 1, button_escaped
+    _click_scroll_to_bottom(page)
+    button_relocked = _settled_geometry(page)
+    assert button_relocked["distanceFromBottom"] <= 1, button_relocked
+
+    composer.press("Shift+Enter")
+    button_relocked_grown = _settled_geometry(page)
+    assert button_relocked_grown["composerHeight"] > button_relocked["composerHeight"], (
+        button_relocked,
+        button_relocked_grown,
+    )
+    assert button_relocked_grown["distanceFromBottom"] <= 1, button_relocked_grown
+    assert abs(button_relocked_grown["overlap"]) <= 1, button_relocked_grown
+    _append_streamed_output(page, 80)
+    button_following_output = _settled_geometry(page)
+    assert button_following_output["distanceFromBottom"] <= 1, button_following_output
+
+    # Sending a multiline message uses ScrollToBottomOnSend while clearing the
+    # draft shrinks the composer. A subsequent draft growth must not resurrect
+    # the stale escaped distance or disable bottom-follow during the active turn.
+    composer.fill("")
+    _settled_geometry(page)
+    _scroll_to_distance_from_bottom(page, 320)
+    send_escaped = _settled_geometry(page)
+    assert abs(send_escaped["distanceFromBottom"] - 320) <= 1, send_escaped
+    composer.fill("round-three line one\nline two\nline three")
+    send_multiline = _settled_geometry(page)
+    assert send_multiline["distanceFromBottom"] >= 319, send_multiline
+    page.get_by_role("button", name="Send", exact=True).click()
+    send_relocked = _settled_geometry(page)
+    assert send_relocked["distanceFromBottom"] <= 1, send_relocked
+
+    composer.fill("next draft\nline two")
+    send_relocked_grown = _settled_geometry(page)
+    assert send_relocked_grown["distanceFromBottom"] <= 1, send_relocked_grown
+    assert abs(send_relocked_grown["overlap"]) <= 1, send_relocked_grown
     expect(composer).to_be_focused()
