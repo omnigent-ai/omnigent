@@ -4307,6 +4307,21 @@ async def _codex_discover_thread_and_forward(
             )
             return
 
+        app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
+        persist_user_hook_trust = getattr(app_server, "persist_user_hook_trust", None)
+        if callable(persist_user_hook_trust):
+            try:
+                # Hook review happens before thread creation. Persist here so
+                # the next concurrently-opened session inherits the approval;
+                # close() repeats this as a teardown fallback.
+                await asyncio.to_thread(persist_user_hook_trust)
+            except Exception:  # noqa: BLE001 - trust carry must not block chat startup
+                _logger.warning(
+                    "Could not persist Codex user hook trust for %s",
+                    session_id,
+                    exc_info=True,
+                )
+
         write_bridge_state(
             bridge_dir,
             CodexNativeBridgeState(

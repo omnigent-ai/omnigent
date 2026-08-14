@@ -3078,6 +3078,59 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
 
 
 @pytest.mark.asyncio
+async def test_codex_discovery_persists_hook_trust_before_bridge_ready(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Approval is shared immediately, without waiting for session teardown."""
+    from omnigent import codex_native_bridge, codex_native_forwarder
+    from omnigent.runner.app import (
+        _AUTO_CODEX_APP_SERVERS,
+        _codex_discover_thread_and_forward,
+    )
+
+    persisted = 0
+
+    class _StopAfterPersist(Exception):
+        pass
+
+    class _Client:
+        async def close(self) -> None:
+            return None
+
+    class _AppServer:
+        def persist_user_hook_trust(self) -> None:
+            nonlocal persisted
+            persisted += 1
+
+        async def close(self) -> None:
+            return None
+
+    async def _thread_started(_client: object) -> str:
+        return "thread-1"
+
+    def _stop_before_bridge_ready(*_args: object, **_kwargs: object) -> None:
+        assert persisted == 1
+        raise _StopAfterPersist
+
+    monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _thread_started)
+    monkeypatch.setattr(codex_native_bridge, "write_bridge_state", _stop_before_bridge_ready)
+
+    session_id = "4f49d70cecb04eeabdc7390a1e92b4af"
+    _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
+    with pytest.raises(_StopAfterPersist):
+        await _codex_discover_thread_and_forward(
+            session_id=session_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            codex_home=tmp_path / "codex-home",
+            event_client=_Client(),  # type: ignore[arg-type]
+            routing_summary="provider 'test'",
+        )
+
+    assert persisted == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("exc", "expected_cause"),
     [

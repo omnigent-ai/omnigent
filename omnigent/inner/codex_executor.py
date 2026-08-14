@@ -146,6 +146,7 @@ _CODEX_HOME_COPY_FILES = ("config.toml",)
 _CODEX_HOME_SYMLINK_DIRS = (Path("plugins") / "cache",)
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
+_CODEX_HOOK_TRUST_LOCK = threading.Lock()
 
 # Environment variables explicitly excluded from the codex subprocess even
 # when their prefix is in the allowlist. ``OPENAI_API_KEY`` is stripped so
@@ -1096,6 +1097,191 @@ def merge_codex_hook_payloads(payloads: Iterable[Mapping[str, Any]]) -> dict[str
     return {"hooks": merged_hooks}
 
 
+def _codex_hook_event_key(event: str) -> str:
+    """Return Codex's trust-key spelling for a hooks.json event name."""
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", event).lower()
+
+
+def _codex_user_hook_trust_key_map(
+    source_hooks_path: Path,
+    private_hooks_path: Path,
+) -> dict[str, str]:
+    """Map source user-hook trust keys to their indices in a merged private file."""
+    try:
+        source = json.loads(source_hooks_path.read_text(encoding="utf-8"))
+        private = json.loads(private_hooks_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    source_hooks = source.get("hooks") if isinstance(source, dict) else None
+    private_hooks = private.get("hooks") if isinstance(private, dict) else None
+    if not isinstance(source_hooks, dict) or not isinstance(private_hooks, dict):
+        return {}
+
+    source_path = str(source_hooks_path.absolute())
+    private_path = str(private_hooks_path.absolute())
+    mapped: dict[str, str] = {}
+    for event, source_groups in source_hooks.items():
+        private_groups = private_hooks.get(event)
+        if (
+            not isinstance(event, str)
+            or not isinstance(source_groups, list)
+            or not source_groups
+            or not isinstance(private_groups, list)
+            or len(private_groups) < len(source_groups)
+        ):
+            continue
+        offset = len(private_groups) - len(source_groups)
+        # Omnigent appends user groups after generated groups. Refuse to map
+        # when either file changed and that invariant no longer holds.
+        if private_groups[offset:] != source_groups:
+            continue
+        event_key = _codex_hook_event_key(event)
+        for source_group_index, group in enumerate(source_groups):
+            hooks = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(hooks, list):
+                continue
+            for hook_index in range(len(hooks)):
+                source_key = f"{source_path}:{event_key}:{source_group_index}:{hook_index}"
+                private_key = (
+                    f"{private_path}:{event_key}:{offset + source_group_index}:{hook_index}"
+                )
+                mapped[source_key] = private_key
+    return mapped
+
+
+def _write_codex_config_document(path: Path, document: Any) -> None:  # type: ignore[explicit-any]
+    """Atomically write one Codex TOML document with owner-only permissions."""
+    import tomlkit
+
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(tomlkit.dumps(document))
+        os.replace(tmp_name, path)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(tmp_name)
+
+
+def _retarget_codex_user_hook_trust(
+    private_config_path: Path,
+    source_hooks_path: Path,
+    private_hooks_path: Path,
+) -> None:
+    """Seed a merged private hooks file with trust already granted to user hooks."""
+    key_map = _codex_user_hook_trust_key_map(source_hooks_path, private_hooks_path)
+    if not key_map:
+        return
+    try:
+        import tomlkit
+
+        document = tomlkit.parse(private_config_path.read_text(encoding="utf-8"))
+        state = document.get("hooks", {}).get("state", {})
+    except (OSError, ValueError, TypeError):
+        return
+    if not isinstance(state, MutableMapping):
+        return
+
+    changed = False
+    for source_key, private_key in key_map.items():
+        source_entry = state.get(source_key)
+        trusted_hash = (
+            source_entry.get("trusted_hash") if isinstance(source_entry, MutableMapping) else None
+        )
+        if isinstance(trusted_hash, str) and state.get(private_key) != source_entry:
+            entry = tomlkit.table()
+            entry["trusted_hash"] = trusted_hash
+            state[private_key] = entry
+            changed = True
+    if changed:
+        try:
+            _write_codex_config_document(private_config_path, document)
+        except OSError:
+            logger.warning(
+                "could not carry user hook trust into %s",
+                private_config_path,
+                exc_info=True,
+            )
+
+
+def _merge_codex_user_hook_trust_back(private_home: Path, source_home: Path) -> None:
+    """Persist newly approved private user hooks into the shared Codex config."""
+    private_config_path = private_home / "config.toml"
+    source_hooks_path = source_home / _CODEX_HOOKS_FILENAME
+    private_hooks_path = private_home / _CODEX_HOOKS_FILENAME
+    key_map = _codex_user_hook_trust_key_map(source_hooks_path, private_hooks_path)
+    if not key_map:
+        return
+
+    try:
+        import tomlkit
+
+        private = tomlkit.parse(private_config_path.read_text(encoding="utf-8"))
+        private_state = private.get("hooks", {}).get("state", {})
+    except (OSError, ValueError, TypeError):
+        return
+    if not isinstance(private_state, MutableMapping):
+        return
+
+    approved: dict[str, str] = {}
+    for source_key, private_key in key_map.items():
+        private_entry = private_state.get(private_key)
+        trusted_hash = (
+            private_entry.get("trusted_hash")
+            if isinstance(private_entry, MutableMapping)
+            else None
+        )
+        if isinstance(trusted_hash, str):
+            approved[source_key] = trusted_hash
+    if not approved:
+        return
+
+    source_config_path = source_home / "config.toml"
+    write_path = (
+        source_config_path.resolve() if source_config_path.is_symlink() else source_config_path
+    )
+    with _CODEX_HOOK_TRUST_LOCK:
+        try:
+            source = (
+                tomlkit.parse(write_path.read_text(encoding="utf-8"))
+                if write_path.is_file()
+                else tomlkit.document()
+            )
+        except (OSError, ValueError, TypeError):
+            logger.warning("could not read shared Codex config for hook-trust persistence")
+            return
+        if "hooks" not in source:
+            source["hooks"] = tomlkit.table()
+        hooks = source["hooks"]
+        if not isinstance(hooks, MutableMapping):
+            return
+        if "state" not in hooks:
+            hooks["state"] = tomlkit.table()
+        state = hooks["state"]
+        if not isinstance(state, MutableMapping):
+            return
+        changed = False
+        for source_key, trusted_hash in approved.items():
+            current = state.get(source_key)
+            current_hash = (
+                current.get("trusted_hash") if isinstance(current, MutableMapping) else None
+            )
+            if current_hash == trusted_hash:
+                continue
+            entry = tomlkit.table()
+            entry["trusted_hash"] = trusted_hash
+            state[source_key] = entry
+            changed = True
+        if changed:
+            try:
+                _write_codex_config_document(write_path, source)
+            except OSError:
+                logger.warning(
+                    "could not persist user hook trust to %s", write_path, exc_info=True
+                )
+
+
 def write_codex_hooks_file(
     codex_home: Path,
     payloads: Sequence[Mapping[str, Any]],
@@ -1135,6 +1321,12 @@ def write_codex_hooks_file(
     finally:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
+    if merge_source is not None:
+        _retarget_codex_user_hook_trust(
+            codex_home / "config.toml",
+            merge_source,
+            path,
+        )
     return path
 
 

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import tomllib
 
 from omnigent.inner import codex_executor
 from omnigent.inner.codex_executor import (
@@ -17,12 +18,14 @@ from omnigent.inner.codex_executor import (
     CODEX_ROUTER_DIR_ENV_VAR,
     CODEX_ROUTER_SESSION_ID_ENV_VAR,
     _CodexAppServerSession,
+    _merge_codex_user_hook_trust_back,
     _populate_codex_home_config,
     codex_extended_catalog_requested,
     codex_router_bridge_dir,
     codex_router_hooks_settings,
     codex_router_session_id,
     merge_codex_user_hooks,
+    write_codex_hooks_file,
     write_codex_router_hooks_file,
 )
 from omnigent.inner.hook_scripts.subagent_router import REQUEST_TIMEOUT_S
@@ -307,6 +310,57 @@ def test_app_server_keeps_symlinked_hooks_when_routing_off(
 
     assert argv[:2] == ("/bin/echo", "app-server")
     assert hooks.is_symlink
+
+
+def test_generated_hooks_retarget_existing_user_hook_trust(tmp_path: Path) -> None:
+    """Previously approved user hooks stay trusted after generated hooks shift indices."""
+    source = _write_user_home(tmp_path, hooks=_USER_HOOKS)
+    source_key = f"{source / 'hooks.json'}:pre_tool_use:0:0"
+    source_config = (
+        f'model = "gpt-5.4-mini"\n[hooks.state."{source_key}"]\ntrusted_hash = "sha256:user-pre"\n'
+    )
+    (source / "config.toml").write_text(source_config)
+    private = tmp_path / "private-codex"
+    private.mkdir()
+    _populate_codex_home_config(private, source, inject_hooks=True)
+
+    generated = {
+        "hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "generated"}]}]}
+    }
+    write_codex_hooks_file(private, [generated], user_hooks_source=source / "hooks.json")
+
+    config = tomllib.loads((private / "config.toml").read_text())
+    state = config["hooks"]["state"]
+    private_user_key = f"{private / 'hooks.json'}:pre_tool_use:1:0"
+    private_generated_key = f"{private / 'hooks.json'}:pre_tool_use:0:0"
+    assert state[private_user_key]["trusted_hash"] == "sha256:user-pre"
+    assert private_generated_key not in state
+    assert (source / "config.toml").read_text() == source_config
+
+
+def test_user_hook_trust_merges_back_without_generated_hooks(tmp_path: Path) -> None:
+    """Session approval persists under source indices; generated trust does not leak back."""
+    source = _write_user_home(tmp_path, hooks=_USER_HOOKS)
+    private = tmp_path / "private-codex"
+    private.mkdir()
+    generated = {
+        "hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "generated"}]}]}
+    }
+    write_codex_hooks_file(private, [generated], user_hooks_source=source / "hooks.json")
+    private_config = (
+        f'[hooks.state."{private / "hooks.json"}:pre_tool_use:0:0"]\n'
+        'trusted_hash = "sha256:generated"\n'
+        f'[hooks.state."{private / "hooks.json"}:pre_tool_use:1:0"]\n'
+        'trusted_hash = "sha256:user-approved"\n'
+    )
+    (private / "config.toml").write_text(private_config)
+
+    _merge_codex_user_hook_trust_back(private, source)
+
+    config = tomllib.loads((source / "config.toml").read_text())
+    state = config["hooks"]["state"]
+    source_user_key = f"{source / 'hooks.json'}:pre_tool_use:0:0"
+    assert state == {source_user_key: {"trusted_hash": "sha256:user-approved"}}
 
 
 # ── The three codex session classes (SDK arm) ───────────────────────
