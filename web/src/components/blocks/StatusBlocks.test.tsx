@@ -40,9 +40,13 @@ describe("ErrorBanner", () => {
 
     const messageToggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
     expect(messageToggle).toHaveAttribute("aria-expanded", "false");
+    expect(messageToggle).not.toHaveAttribute("aria-controls");
+    expect(screen.getByTestId("error-headline")).toHaveClass("truncate");
     expect(screen.queryByText("Message")).toBeNull();
     fireEvent.click(messageToggle);
     expect(messageToggle).toHaveAttribute("aria-expanded", "true");
+    expect(messageToggle).toHaveAttribute("aria-controls");
+    expect(screen.getByTestId("error-headline")).not.toHaveClass("truncate");
     expect(screen.getByText("Message")).toBeInTheDocument();
     const message = screen.getByTestId("error-message-content");
     expect(message).toHaveClass("whitespace-pre-wrap");
@@ -172,8 +176,11 @@ describe("ErrorBanner", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    expect(await screen.findByText("Retry failed: Host is still offline")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent("Retry failed: Host is still offline"),
+    );
     expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Dismiss error" })).toHaveFocus();
     fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
     expect(screen.getByRole("button", { name: "View diagnostics" })).toBeInTheDocument();
   });
@@ -188,6 +195,54 @@ describe("ErrorBanner", () => {
       />,
     );
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it.each(["executor_error", "connection_error", "runner_error", "wrong_replica"])(
+    "does not offer reconnect for live-runner code %s",
+    (code) => {
+      render(
+        <ErrorBanner message="The turn failed." source="execution" code={code} onRetry={vi.fn()} />,
+      );
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    },
+  );
+
+  it("suppresses an explicitly unavailable last-output diagnostics tab", () => {
+    render(
+      <ErrorBanner
+        message={[
+          "Terminal failed.",
+          "",
+          "Terminal diagnostics:",
+          "pid: 42",
+          "",
+          "Last captured output: unavailable",
+        ].join("\n")}
+        source="execution"
+        code="required_terminal_exited"
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.queryByRole("tab", { name: "Last captured output" })).toBeNull();
+    expect(screen.getByTestId("error-diagnostics-content")).toHaveTextContent("pid: 42");
+  });
+
+  it("keeps the selected diagnostics tab valid when parsed sections change", () => {
+    const { rerender } = render(
+      <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Last captured output" }));
+    rerender(
+      <ErrorBanner
+        message={["Terminal failed.", "", "Terminal diagnostics:", "pid: 99"].join("\n")}
+        source="execution"
+        code="required_terminal_exited"
+      />,
+    );
+    expect(screen.getByTestId("error-diagnostics-content")).toHaveTextContent("pid: 99");
   });
 });
 

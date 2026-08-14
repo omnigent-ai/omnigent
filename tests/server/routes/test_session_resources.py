@@ -3224,6 +3224,36 @@ async def test_relay_persists_terminal_resource_created_from_runner() -> None:
 
 
 @pytest.mark.asyncio
+async def test_relay_does_not_persist_transient_terminal_resource_created() -> None:
+    """Retry recovery publishes terminal readiness without changing history."""
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    store = _ConversationStore()
+    client = _FakeStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "session.resource.created",
+                    "persist_resource_event": False,
+                    "resource": {
+                        "id": "terminal_claude_main",
+                        "type": "terminal",
+                        "name": "claude:main",
+                        "metadata": {"terminal_name": "claude", "session_key": "main"},
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
+
+    events = [item for item in store.appended_items if item.type == "resource_event"]
+    assert events == []
+
+
+@pytest.mark.asyncio
 async def test_relay_persists_terminal_resource_deleted_from_runner() -> None:
     """The relay persists a ``resource_event`` for a runner-emitted delete.
 

@@ -3838,7 +3838,10 @@ function AssistantBubble({
   const forkDialog = useForkDialog();
   const handleRetryError = useCallback(async () => {
     if (!conversationId) throw new Error("Session is not available");
-    await retrySession(conversationId);
+    const result = await retrySession(conversationId);
+    if (!result.recovered) {
+      throw new Error("The session is already connected; no recovery was performed");
+    }
   }, [conversationId]);
 
   if (bubble.items.length === 0) return null;

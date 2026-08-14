@@ -66,18 +66,15 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   connection_error: "The connection to the agent dropped mid-turn.",
   context_length_exceeded: "The conversation grew past the model's context window.",
   executor_error: "The agent runtime hit an error while running the turn.",
+  workspace_missing: "The session workspace no longer exists on the host.",
 };
 
 const RETRYABLE_ERROR_CODES = new Set([
   "required_terminal_exited",
   "terminal_launch_failed",
-  "runner_error",
   "runner_disconnected",
   "runner_failed_to_start",
   "runner_unavailable",
-  "connection_error",
-  "executor_error",
-  "wrong_replica",
 ]);
 
 interface ParsedErrorMessage {
@@ -88,6 +85,7 @@ interface ParsedErrorMessage {
 
 const DIAGNOSTICS_HEADING = /^(?:terminal|lifecycle) diagnostics:\s*$/i;
 const LAST_OUTPUT_HEADING = /^last captured (?:terminal )?output:\s*(.*)$/i;
+const UNAVAILABLE_OUTPUT = /^unavailable[.!]?$/i;
 
 function trimBlankBoundaryLines(lines: string[]): string | null {
   let start = 0;
@@ -122,6 +120,7 @@ function parseErrorMessage(rawMessage: string): ParsedErrorMessage {
     const headingMatch = lines[lastOutputIndex]!.trim().match(LAST_OUTPUT_HEADING);
     const headingValue = headingMatch?.[1]?.trim() ?? "";
     lastOutput = trimBlankBoundaryLines([headingValue, ...lines.slice(lastOutputIndex + 1)]);
+    if (lastOutput && UNAVAILABLE_OUTPUT.test(lastOutput.trim())) lastOutput = null;
   }
   return { message, terminal, lastOutput };
 }
@@ -174,11 +173,17 @@ export function ErrorBanner({
   const [dismissed, setDismissed] = useState(false);
   const copyResetRef = useRef<number>(0);
   const retryInFlightRef = useRef(false);
+  const dismissButtonRef = useRef<HTMLButtonElement>(null);
   const messageId = useId();
   const diagnosticsId = useId();
   const retryable = onRetry !== undefined && RETRYABLE_ERROR_CODES.has(code);
 
   useEffect(() => () => window.clearTimeout(copyResetRef.current), []);
+  useEffect(() => {
+    if (!diagnostics.some((item) => item.id === activeDiagnostics)) {
+      setActiveDiagnostics(diagnostics[0]?.id ?? "terminal");
+    }
+  }, [activeDiagnostics, diagnostics]);
 
   if (dismissed) return null;
 
@@ -201,6 +206,7 @@ export function ErrorBanner({
       retryInFlightRef.current = false;
       setRetryError(`Retry failed: ${error instanceof Error ? error.message : String(error)}`);
       setRetrying(false);
+      dismissButtonRef.current?.focus();
     }
   };
 
@@ -215,7 +221,7 @@ export function ErrorBanner({
           <button
             type="button"
             aria-expanded={expanded}
-            aria-controls={messageId}
+            aria-controls={expanded ? messageId : undefined}
             onClick={() => setExpanded((value) => !value)}
             className="group min-w-0 flex-1 cursor-pointer rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
           >
@@ -227,7 +233,13 @@ export function ErrorBanner({
                 )}
                 aria-hidden="true"
               />
-              <span className="min-w-0 break-words [overflow-wrap:anywhere]">
+              <span
+                data-testid="error-headline"
+                className={cn(
+                  "min-w-0",
+                  expanded ? "break-words [overflow-wrap:anywhere]" : "truncate",
+                )}
+              >
                 {headline}
                 {source ? (
                   <span className="font-normal text-destructive/75"> · {source}</span>
@@ -253,6 +265,7 @@ export function ErrorBanner({
             </Button>
           ) : null}
           <Button
+            ref={dismissButtonRef}
             type="button"
             variant="ghost"
             size="icon-xs"
@@ -269,7 +282,12 @@ export function ErrorBanner({
           </div>
         ) : null}
         {retryError ? (
-          <div className="mt-1 break-words text-xs text-destructive [overflow-wrap:anywhere]">
+          <div
+            role="status"
+            aria-live="assertive"
+            aria-atomic="true"
+            className="mt-1 break-words text-xs text-destructive [overflow-wrap:anywhere]"
+          >
             {retryError}
           </div>
         ) : null}
@@ -311,7 +329,7 @@ export function ErrorBanner({
                     type="button"
                     variant="ghost"
                     size="xs"
-                    aria-controls={diagnosticsId}
+                    aria-controls={diagnosticsOpen ? diagnosticsId : undefined}
                     className="px-0 text-muted-foreground hover:bg-transparent hover:text-foreground"
                   >
                     <ChevronRightIcon
