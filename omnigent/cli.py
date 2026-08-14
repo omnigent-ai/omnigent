@@ -2927,11 +2927,13 @@ def _claim_foreground_daemon_record(
     """
     conflict = _live_daemon_conflict(record)
     if conflict is not None:
+        # server_url is None in local mode; "" makes the hint say --server "".
+        stop_command = _host_stop_command(conflict.server_url or "")
         raise click.ClickException(
             "A host daemon is already running for this server "
             f"(pid={conflict.pid}, target={conflict.target}). "
-            "Run `omnigent host status` to inspect it or "
-            "`omnigent host stop --server ...` to stop it first."
+            f"Run `omnigent host status` to inspect it or `{stop_command}` "
+            "to stop it first."
         )
     previous = _find_daemon_record(record.target)
     if previous is not None and not _pid_alive(previous.pid):
