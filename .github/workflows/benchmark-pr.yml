@@ -55,7 +55,12 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --extra databricks
+        # pexpect and @anthropic-ai/claude-code are needed by the cli_startup
+        # journey, which is part of ALL_JOURNEYS.
+        run: |
+          uv sync --extra databricks
+          uv pip install pexpect
+          npm install -g @anthropic-ai/claude-code
 
       # Use the same corpus size as the nightly so baseline numbers are
       # directly comparable. Cache the seeded DB on the schema head + seed
