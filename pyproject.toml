@@ -280,20 +280,34 @@ databricks = [
     # fresh install on Python 3.14 tries (and fails) to build it from source.
     "databricks-ai-bridge>=0.19",
 ]
-# Load testing (dev/loadtest/). Locust drives the concurrency; the test also
-# needs the `dev` + `agents-sdk` extras (BenchEnvironment boots the stack and the
-# openai-agents harness runs the mocked turns). Opt-in — only load-test users
+# Load testing (dev/loadtest/). Locust drives the concurrency and the
+# openai-agents harness runs the mocked turns. Opt-in — only load-test users
 # need it.
 loadtest = [
     "locust>=2.30,<3",
 ]
-dev = [
+
+# Repository-only workflows use PEP 735 dependency groups so development
+# tooling is not published as an installable Omnigent capability.
+[dependency-groups]
+lint = [
+    "ruff>=0.6",
+    "pyrefly==1.1.1",
+    "pre-commit>=3.5",
+    # protoc + the well-known-type protos, for regenerating the routing API
+    # bindings (omnigent/api/routing/v1/routing_pb2.*). Bundles its own compiler so no
+    # system protoc is needed. Pinned to the 1.x line whose bundled gencode
+    # matches the runtime `protobuf>=6,<7` above, so `scripts/gen_routing_pb2.py`
+    # reproduces the committed output byte-for-byte (the routing-pb2-fresh
+    # pre-commit hook diffs against it). Generated code is committed, so neither
+    # the library nor its wheels depend on this.
+    "grpcio-tools>=1.68,<2",
+]
+test = [
     "pytest>=7.0",
-    # hindsight-client is opt-in (the `hindsight` extra), but the Hindsight
-    # memory tool tests import + mock it, so keep it in the dev set.
+    # These clients are optional product capabilities, but their tests import
+    # and execute the real packages against mocks.
     "hindsight-client>=0.4.0",
-    # nimble-python is opt-in (the `nimble` extra), but the nimble_research
-    # tests drive the real client against respx, so keep it in the dev set.
     "nimble-python>=1.2.0,<2",
     "pytest-asyncio>=0.21",
     "pytest-xdist>=3.6",
@@ -334,15 +348,6 @@ dev = [
     # "Runner stream relay exited before becoming ready" 503s).
     "pytest-rerunfailures==16.3",
     "filelock>=3.0",
-    "ruff>=0.6",
-    "mypy>=1.10",
-    "pyrefly==1.1.1",
-    "pre-commit>=3.5",
-    "types-PyYAML>=6.0",
-    "filelock>=3.0",
-    # gitwildmatch glob matching for repo tooling manifests. Declared
-    # explicitly rather than relied on transitively (via mypy).
-    "pathspec>=0.12",
     # Cloud-service mocks for the artifact-store / Cloudflare integration
     # tests: moto is the standard S3-compatible mock (used for R2), respx is
     # the standard HTTPX mock (used to back the Cloudflare D1 REST API with an
@@ -353,14 +358,10 @@ dev = [
     # The Cloudflare D1 SQLAlchemy dialect, exercised by the D1 FTS integration
     # test (tests/db/test_d1_fts_dialect.py) via respx + sqlite3.
     "sqlalchemy-cloudflare-d1==0.3.10",
-    # protoc + the well-known-type protos, for regenerating the routing API
-    # bindings (omnigent/api/routing/v1/routing_pb2.*). Bundles its own compiler so no
-    # system protoc is needed. Pinned to the 1.x line whose bundled gencode
-    # matches the runtime `protobuf>=6,<7` above, so `scripts/gen_routing_pb2.py`
-    # reproduces the committed output byte-for-byte (the routing-pb2-fresh
-    # pre-commit hook diffs against it). Dev-only: generated code is committed,
-    # so neither the library nor its wheels depend on this.
-    "grpcio-tools>=1.68,<2",
+]
+dev = [
+    { include-group = "lint" },
+    { include-group = "test" },
 ]
 
 [project.scripts]
@@ -372,6 +373,11 @@ dev = [
 # `omni` ship, internal and OSS alike.)
 omnigent = "omnigent.cli:main"
 omni = "omnigent.cli:main"
+
+[tool.uv]
+# Keep plain `uv sync` aligned with the published base package. Repository
+# workflows opt into the smallest dependency group they need.
+default-groups = []
 
 # Share the repository lockfile with standalone automation packages.
 [tool.uv.workspace]
@@ -621,241 +627,3 @@ known-first-party = ["omnigent"]
 # for registration, so F401 remains expected in this package.
 "omnigent/server/routes/sessions/__init__.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401"]
 "omnigent/server/routes/sessions/*.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401"]
-
-[tool.mypy]
-python_version = "3.12"
-strict = true
-# Ban explicit `Any` in annotations. `Any` defeats static typing; prefer
-# real types, Protocols, TypedDicts, or `object` with runtime checks. When
-# a genuine boundary needs it (opaque JSON shapes, foreign SDKs) annotate
-# with `# type: ignore[explicit-any]` *and a comment explaining why*.
-disallow_any_explicit = true
-# Vendored Google MCP server code — upstream code, not ours to type.
-# setup.py — build-time scaffolding that imports the (untyped) setuptools
-# build_py and subclasses it; not application code, so excluded from mypy
-# rather than pulling in types-setuptools just for one shim file.
-exclude = ["^omnigent/inner/databricks_mcps/google/", "^setup\\.py$", "_pb2\\.pyi?$"]
-# Incremental rollout: load imported modules for type info but don't
-# report their errors. Remove once every omnigent/ module is clean.
-follow_imports = "silent"
-
-[[tool.mypy.overrides]]
-module = "mcp.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "databricks.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "databricks_mcp.*"
-ignore_missing_imports = true
-
-# psycopg is an optional dep (only declared in the ``databricks``
-# extra, used by ``deploy/databricks/grant_sp_perms.py``). Previously installed
-# transitively via ``dbos``; after the DBOS removal, ``uv sync
-# --extra dev`` no longer pulls it, so the lint workflow can't
-# import it. Treat the missing module as silent — runtime use still
-# requires installing the ``databricks`` extra.
-[[tool.mypy.overrides]]
-module = "psycopg.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "openai.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "claude_agent_sdk.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["copilot", "copilot.*"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "agents.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "ftfy"
-ignore_missing_imports = true
-
-# modal is an optional dep (the `modal` extra); the sandbox launcher
-# imports it lazily so the base install never needs it.
-[[tool.mypy.overrides]]
-module = "modal.*"
-ignore_missing_imports = true
-
-# daytona is an optional dep (the `daytona` extra); same lazy-import
-# posture as modal above.
-[[tool.mypy.overrides]]
-module = "daytona.*"
-ignore_missing_imports = true
-
-# blaxel is an optional dep (the `blaxel` extra); same lazy-import
-# posture as modal above.
-[[tool.mypy.overrides]]
-module = "blaxel.*"
-ignore_missing_imports = true
-
-# islo is an optional dep (the `islo` extra); same lazy-import posture
-# as modal above.
-[[tool.mypy.overrides]]
-module = "islo.*"
-ignore_missing_imports = true
-
-# hindsight-client is an optional dep (the `hindsight` extra); the
-# hindsights tools import it lazily so the base install never needs it.
-[[tool.mypy.overrides]]
-module = "hindsight_client.*"
-ignore_missing_imports = true
-
-# nimble-python is an optional dep (the `nimble` extra); nimble_research
-# imports it lazily so the base install never needs it.
-[[tool.mypy.overrides]]
-module = "nimble_python.*"
-ignore_missing_imports = true
-
-# cwsandbox is an optional dep (the `cwsandbox` extra); same lazy-import
-# posture as modal above.
-[[tool.mypy.overrides]]
-module = "cwsandbox.*"
-ignore_missing_imports = true
-
-# e2b is an optional dep (the `e2b` extra); same lazy-import posture as
-# modal above.
-[[tool.mypy.overrides]]
-module = "e2b.*"
-ignore_missing_imports = true
-
-# openshell is an optional dep (the `openshell` extra); same lazy-import
-# posture as modal above. grpc rides in via the openshell SDK and is not
-# a base dependency, so its imports are unresolved in the default env too.
-[[tool.mypy.overrides]]
-module = "openshell.*"
-ignore_missing_imports = true
-
-# boxlite is an optional dep (the `boxlite` extra); same lazy-import posture
-# as modal above.
-[[tool.mypy.overrides]]
-module = "boxlite.*"
-ignore_missing_imports = true
-
-# kubernetes is an optional dep (the `kubernetes` extra); same lazy-import
-# posture as modal above. urllib3 rides in via the kubernetes client.
-[[tool.mypy.overrides]]
-module = "kubernetes.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "grpc.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "prompt_toolkit.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "yaml"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "pexpect"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "cachetools"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "httpx"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "boto3"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "botocore.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "google.*"
-ignore_missing_imports = true
-
-# protoc owns the checked-in routing stub. Its built-in pyi generator emits an
-# untyped Message base and bare Mapping hints that application code cannot fix.
-[[tool.mypy.overrides]]
-module = "omnigent.api.routing.v1.routing_pb2"
-disable_error_code = ["misc", "type-arg"]
-
-[[tool.mypy.overrides]]
-module = "opentelemetry.instrumentation.*"
-ignore_missing_imports = true
-
-# The Modal deploy glue (deploy/modal/modal_app.py) decorates with the
-# optional `modal` extra, which the lint env doesn't install — under the
-# modal.* ignore-missing-imports override above its decorators type as
-# Any and trip disallow_untyped_decorators. Relax just that flag.
-[[tool.mypy.overrides]]
-module = "modal_app"
-disallow_untyped_decorators = false
-
-# omnigent-derived repl code has its own relaxed typing config.
-[[tool.mypy.overrides]]
-module = "omnigent.repl.*"
-disallow_untyped_defs = false
-disallow_untyped_decorators = false
-warn_return_any = false
-check_untyped_defs = false
-
-# omnigent-derived code that pre-unification omnigent never
-# subjected to ``disallow_any_explicit`` (its pyproject.toml didn't
-# set that flag). Keep the rest of strict mypy on — just relax the
-# explicit-Any ban until these modules can be graduated.
-[[tool.mypy.overrides]]
-module = [
-    "omnigent.runtime.*",
-    "omnigent.server.*",
-    "omnigent.tools.*",
-    "omnigent.entities.*",
-    "omnigent.stores.*",
-    "omnigent.db.*",
-    "omnigent.llms.*",
-    "omnigent.onboarding.*",
-    "omnigent.terminals.*",
-    "omnigent.client_tools.*",
-    "omnigent.spec.omnigent",
-    "omnigent.spec._omnigent_compat",
-    "dump_openapi",
-]
-disallow_any_explicit = false
-
-[[tool.mypy.overrides]]
-module = "omnigent_ui_sdk.*"
-ignore_missing_imports = true
-follow_imports = "skip"
-
-# SDK shim aliases — ignore their own import resolution issues. These
-# are re-exports of omnigent_client/omnigent_ui_sdk (post-Stage-3)
-# via sys.modules aliasing.
-[[tool.mypy.overrides]]
-module = "omnigent_client.*"
-ignore_missing_imports = true
-disallow_any_explicit = false
-
-# Slack integration (omnigent-slack). slack_bolt / slack_sdk ship no type
-# stubs, and Slack event/view payloads are opaque JSON dicts the handlers
-# read positionally — so the code leans on ``Any`` at that boundary. Mirror
-# the client SDK: resolve the untyped imports and lift the Any ban here.
-[[tool.mypy.overrides]]
-module = "omnigent_slack.*"
-ignore_missing_imports = true
-disallow_any_explicit = false
-
-# Tests in the mypy allowlist predate the stricter omnigent
-# Any rule.
-[[tool.mypy.overrides]]
-module = "tests.*"
-disallow_any_explicit = false

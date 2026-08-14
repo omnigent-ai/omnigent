@@ -19,7 +19,7 @@ micro-benchmarks (not concurrency), that is a different tool: `dev/benchmarks/`.
 ## 1. Ensure deps (repo checkout)
 
 ```bash
-pip install -e '.[loadtest,dev,agents-sdk]'   # or: uv sync --extra loadtest --extra dev --extra agents-sdk
+uv sync --extra loadtest --extra agents-sdk
 ```
 
 Run with that same interpreter (e.g. `.venv/bin/python`), from the repo root.

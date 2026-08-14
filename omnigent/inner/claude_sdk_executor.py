@@ -138,10 +138,9 @@ SdkOptions: TypeAlias = Any  # type: ignore[explicit-any]
 # ---------------------------------------------------------------------------
 # SDK-private reach Protocols.
 #
-# ``claude_agent_sdk.*`` is listed as ``ignore_missing_imports`` in mypy
-# config, so every SDK-typed value mypy sees is ``Any``. We recover types
-# locally with Protocols for the handful of public and private attributes
-# this executor touches.
+# Some SDK surfaces are dynamic and the lifecycle reaches below its public
+# types. Protocols keep the handful of public and private attributes this
+# executor touches explicit.
 #
 # The private reaches (``_query``, ``_transport``, ``_process``,
 # ``_stderr_task`` / ``_stderr_task_group``, etc.) are necessary to tear

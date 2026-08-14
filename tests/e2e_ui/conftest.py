@@ -10,17 +10,17 @@ from the default ``pytest`` run via ``--ignore=tests/e2e_ui`` in
 Local usage::
 
     # one-time setup
-    uv sync --extra e2e-ui
-    uv run playwright install --with-deps chromium
+    uv sync --extra all --group test
+    uv run --no-sync playwright install --with-deps chromium
 
     # run against a freshly built SPA + spawned server
-    uv run pytest tests/e2e_ui -v
+    uv run --no-sync pytest tests/e2e_ui -v
 
     # iterate against an already-running server (dev hosts/ports need opt-in)
     cd web && npm run dev &
     omnigent server --agent examples/hello_world.yaml &
     OMNIGENT_E2E_ALLOW_DEV_BASE_URL=1 \
-      uv run pytest tests/e2e_ui --ui-base-url http://127.0.0.1:5173
+      uv run --no-sync pytest tests/e2e_ui --ui-base-url http://127.0.0.1:5173
 
 ``omnigent server`` is documented at ``omnigent/cli.py:server``:
 it spins up uvicorn with the Omnigent app and spawns an out-of-process

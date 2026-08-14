@@ -127,7 +127,7 @@ jobs:
 
       - name: Install dependencies
         # `databricks` extra carries psycopg[binary] for the Postgres backend.
-        run: uv sync --extra dev --extra databricks
+        run: uv sync --extra databricks
 
       - name: Install MySQL driver
         # mysqlclient (mysql+mysqldb://) needs the system client library and is
