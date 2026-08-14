@@ -115,57 +115,79 @@ def _scroll_to_distance_from_bottom(page: Page, distance: int) -> dict:
     )
 
 
-def _scroll_with_pointer_momentum(
-    page: Page,
-    pointer_distance: int,
-    settled_distance: int,
-) -> dict:
-    """Release a touch pointer, then deliver its trailing momentum scroll."""
-    return page.evaluate(
-        """async ({ pointerDistance, settledDistance }) => {
-            const form = document.querySelector(
-                'textarea[aria-label="Message the agent"]'
-            ).closest('form');
-            const scroller = form.parentElement.querySelector('[role="log"] > div');
-            const setDistance = (distance) => {
-                scroller.scrollTop =
-                    scroller.scrollHeight - scroller.clientHeight - distance;
-                scroller.dispatchEvent(new Event('scroll'));
-            };
-            const distance = () => Math.round(
-                scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
-            );
-
-            scroller.dispatchEvent(new PointerEvent('pointerdown', {
-                bubbles: true,
-                buttons: 1,
-                isPrimary: true,
-                pointerId: 1,
-                pointerType: 'touch',
-            }));
-            setDistance(pointerDistance);
-            await new Promise((resolve) => setTimeout(resolve, 20));
-            const whilePressed = distance();
-
-            window.dispatchEvent(new PointerEvent('pointerup', {
-                bubbles: true,
-                isPrimary: true,
-                pointerId: 1,
-                pointerType: 'touch',
-            }));
-            setDistance(settledDistance);
-            await new Promise((resolve) => setTimeout(resolve, 20));
-
-            return {
-                whilePressed,
-                afterRelease: distance(),
-            };
-        }""",
-        {
-            "pointerDistance": pointer_distance,
-            "settledDistance": settled_distance,
-        },
-    )
+def _scroll_with_native_touch(page: Page) -> dict:
+    """Scroll through Chromium's native touch-panning path."""
+    session = page.context.new_cdp_session(page)
+    try:
+        session.send(
+            "Emulation.setTouchEmulationEnabled",
+            {"enabled": True, "maxTouchPoints": 1},
+        )
+        target = page.evaluate(
+            """() => {
+                const form = document.querySelector(
+                    'textarea[aria-label="Message the agent"]'
+                ).closest('form');
+                const scroller = form.parentElement.querySelector('[role="log"] > div');
+                const rect = scroller.getBoundingClientRect();
+                const events = [];
+                const record = (event) => events.push(event.type);
+                for (const type of ['pointerdown', 'pointermove', 'pointercancel']) {
+                    window.addEventListener(type, record, { capture: true });
+                }
+                scroller.addEventListener('scroll', record);
+                scroller.addEventListener('scrollend', record);
+                window.__nativeTouchProbe = { events, scroller };
+                return {
+                    x: Math.round(rect.left + rect.width / 2),
+                    y: Math.round(rect.top + Math.min(rect.height * 0.35, 220)),
+                    initialScrollTop: Math.round(scroller.scrollTop),
+                };
+            }"""
+        )
+        point = {
+            "x": target["x"],
+            "y": target["y"],
+            "id": 1,
+            "radiusX": 2,
+            "radiusY": 2,
+            "force": 1,
+        }
+        session.send(
+            "Input.dispatchTouchEvent",
+            {"type": "touchStart", "touchPoints": [point]},
+        )
+        for offset in (35, 75, 120, 170, 225, 280):
+            session.send(
+                "Input.dispatchTouchEvent",
+                {
+                    "type": "touchMove",
+                    "touchPoints": [{**point, "y": point["y"] + offset}],
+                },
+            )
+            page.wait_for_timeout(16)
+        session.send(
+            "Input.dispatchTouchEvent",
+            {"type": "touchEnd", "touchPoints": []},
+        )
+        page.wait_for_timeout(600)
+        return page.evaluate(
+            """initialScrollTop => {
+                const { events, scroller } = window.__nativeTouchProbe;
+                return {
+                    events,
+                    initialScrollTop,
+                    settledScrollTop: Math.round(scroller.scrollTop),
+                    settledDistance: Math.round(
+                        scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
+                    ),
+                };
+            }""",
+            target["initialScrollTop"],
+        )
+    finally:
+        session.send("Emulation.setTouchEmulationEnabled", {"enabled": False})
+        session.detach()
 
 
 def _click_scroll_to_bottom(page: Page) -> None:
@@ -205,14 +227,14 @@ def _append_streamed_output(page: Page, height: int) -> dict:
     )
 
 
-def _append_output_while_growing_composer(
+def _append_output_during_composer_reflow(
     page: Page,
     initial_height: int,
-    restoring_height: int,
+    followup_height: int,
 ) -> dict:
-    """Grow output and composer together, then append again during restore."""
+    """Grow output and composer together, then append again while layout settles."""
     return page.evaluate(
-        """async ({ initialHeight, restoringHeight }) => {
+        """async ({ initialHeight, followupHeight }) => {
             const textarea = document.querySelector(
                 'textarea[aria-label="Message the agent"]'
             );
@@ -243,18 +265,17 @@ def _append_output_while_growing_composer(
             valueSetter.call(textarea, `${textarea.value}\n\n\n`);
             textarea.dispatchEvent(new InputEvent('input', { bubbles: true }));
 
-            // The first frame delivers the combined content/container resize
-            // and schedules restoration. The second runs while that restore is
-            // active, before its clear frame has completed.
+            // Let the combined content/container resize begin settling, then
+            // append another chunk before the layout has gone idle.
             await new Promise((resolve) => requestAnimationFrame(resolve));
             await new Promise((resolve) => requestAnimationFrame(resolve));
-            appendProbe(restoringHeight, 'during-restore-output-probe');
+            appendProbe(followupHeight, 'during-reflow-output-probe');
 
-            return { before, afterDuringRestore: geometry() };
+            return { before, afterDuringReflow: geometry() };
         }""",
         {
             "initialHeight": initial_height,
-            "restoringHeight": restoring_height,
+            "followupHeight": followup_height,
         },
     )
 
@@ -295,6 +316,25 @@ def test_composer_growth_reflows_transcript_without_covering_output(
         )
         assert state["formMarginTop"] == 0, (label, state)
         assert state["distanceFromBottom"] <= 1, (label, state)
+
+    def assert_reader_anchor(before: dict, after: dict, label: str) -> None:
+        """Composer reflow must not move the transcript under an escaped reader."""
+        assert abs(after["viewport"][2] - before["viewport"][2]) <= 1, (
+            label,
+            before,
+            after,
+        )
+        assert len(after["messageTops"]) == len(before["messageTops"]), (
+            label,
+            before,
+            after,
+        )
+        assert all(
+            abs(after_top - before_top) <= 1
+            for before_top, after_top in zip(
+                before["messageTops"], after["messageTops"], strict=True
+            )
+        ), (label, before, after)
 
     assert_clearance(baseline, "baseline")
 
@@ -351,9 +391,50 @@ def test_composer_growth_reflows_transcript_without_covering_output(
         )
     assert_clearance(shrunk, "after deleting")
 
+    # Chromium touch panning cancels pointer delivery before its native scroll
+    # events. Browser anchoring, not application pointer state, must preserve the
+    # settled transcript position when the composer later grows.
+    browser = page.context.browser
+    assert browser is not None
+    touch_context = browser.new_context(
+        viewport={"width": 500, "height": 713},
+        has_touch=True,
+    )
+    try:
+        touch_page = touch_context.new_page()
+        touch_page.goto(f"{base_url}/c/{session_id}")
+        expect(touch_page.locator(_TEXT_SECTION)).to_have_count(6, timeout=30_000)
+        touch_composer = touch_page.get_by_label("Message the agent")
+        expect(touch_composer).to_be_visible(timeout=30_000)
+        touch_composer.click()
+        touch_baseline = _settled_geometry(touch_page)
+        assert_clearance(touch_baseline, "native touch baseline")
+
+        touch = _scroll_with_native_touch(touch_page)
+        assert touch["settledDistance"] > 100, touch
+        assert touch["settledScrollTop"] < touch["initialScrollTop"], touch
+        assert "pointercancel" in touch["events"], touch
+        assert "scroll" in touch["events"], touch
+        assert touch["events"].index("pointercancel") < touch["events"].index("scroll"), touch
+        assert "scrollend" in touch["events"], touch
+        touch_settled = _settled_geometry(touch_page)
+        assert abs(touch_settled["distanceFromBottom"] - touch["settledDistance"]) <= 1, (
+            touch,
+            touch_settled,
+        )
+        expect(touch_composer).to_be_focused()
+
+        touch_composer.press("Shift+Enter")
+        touch_grown = _settled_geometry(touch_page)
+        assert_reader_anchor(touch_settled, touch_grown, "native touch composer growth")
+        assert abs(touch_grown["overlap"]) <= 1, touch_grown
+        expect(touch_composer).to_be_focused()
+    finally:
+        touch_context.close()
+
     # Escape bottom lock, then let output stream below the reader without
-    # moving the scroll container. Composer growth must preserve the real
-    # post-stream distance, not the distance cached before content grew.
+    # moving the scroll container. Native anchoring must keep the visible
+    # transcript stable when later composer growth shrinks the viewport.
     _scroll_to_distance_from_bottom(page, 180)
     escaped = _settled_geometry(page)
     assert abs(escaped["distanceFromBottom"] - 180) <= 1, escaped
@@ -374,22 +455,10 @@ def test_composer_growth_reflows_transcript_without_covering_output(
         composer.press("Shift+Enter")
     streamed_grown = _settled_geometry(page)
     assert abs(streamed_grown["overlap"]) <= 1, streamed_grown
-    assert abs(streamed_grown["distanceFromBottom"] - streamed["distanceFromBottom"]) <= 1, (
-        {
-            "before": {
-                "distance": streamed["distanceFromBottom"],
-                "viewport": streamed["viewport"],
-            },
-            "after": {
-                "distance": streamed_grown["distanceFromBottom"],
-                "viewport": streamed_grown["viewport"],
-            },
-        },
-    )
+    assert_reader_anchor(streamed, streamed_grown, "streamed composer growth")
 
-    # The first genuine user scroll after another content-height change must
-    # replace the reconciled distance instead of being mistaken for a synthetic
-    # content-resize scroll.
+    # A genuine reader scroll after more output must remain visually stable
+    # through the next composer reflow.
     for _ in range(3):
         composer.press("Backspace")
     _settled_geometry(page)
@@ -404,17 +473,11 @@ def test_composer_growth_reflows_transcript_without_covering_output(
         composer.press("Shift+Enter")
     after_user_scroll_grown = _settled_geometry(page)
     assert abs(after_user_scroll_grown["overlap"]) <= 1, after_user_scroll_grown
-    assert (
-        abs(
-            after_user_scroll_grown["distanceFromBottom"] - after_user_scroll["distanceFromBottom"]
-        )
-        <= 1
-    ), (after_user_scroll, after_user_scroll_grown)
+    assert_reader_anchor(after_user_scroll, after_user_scroll_grown, "reader composer growth")
 
-    # Output and composer growth may land in one ResizeObserver delivery while
-    # a follow-up stream chunk arrives before restoration clears. Preserve the
-    # real distance across both deltas instead of consuming either as resize
-    # bookkeeping.
+    # Output and composer growth may land in one layout delivery while a
+    # follow-up stream chunk arrives before the reflow settles. Neither change
+    # may move the visible transcript under an escaped reader.
     for _ in range(3):
         composer.press("Backspace")
     _settled_geometry(page)
@@ -422,7 +485,7 @@ def test_composer_growth_reflows_transcript_without_covering_output(
     same_frame_escaped = _settled_geometry(page)
     assert abs(same_frame_escaped["distanceFromBottom"] - 180) <= 1, same_frame_escaped
 
-    combined = _append_output_while_growing_composer(page, 240, 90)
+    combined = _append_output_during_composer_reflow(page, 240, 90)
     same_frame_grown = _settled_geometry(page)
     total_added_height = same_frame_grown["viewport"][1] - combined["before"]["scrollHeight"]
     assert total_added_height > 0, (combined, same_frame_grown)
@@ -431,19 +494,13 @@ def test_composer_growth_reflows_transcript_without_covering_output(
         same_frame_grown,
     )
     assert page.locator('[data-testid="same-frame-output-probe"]').count() == 1
-    assert page.locator('[data-testid="during-restore-output-probe"]').count() == 1
-    expected_same_frame_distance = same_frame_escaped["distanceFromBottom"] + total_added_height
-    assert abs(same_frame_grown["distanceFromBottom"] - expected_same_frame_distance) <= 1, (
-        same_frame_escaped,
-        combined,
-        same_frame_grown,
-    )
+    assert page.locator('[data-testid="during-reflow-output-probe"]').count() == 1
+    assert_reader_anchor(same_frame_escaped, same_frame_grown, "same-frame reflow")
     assert abs(same_frame_grown["overlap"]) <= 1, same_frame_grown
     expect(composer).to_be_focused()
 
-    # A legitimate library re-lock must replace the local escaped-distance
-    # shadow. The next composer resize must keep the transcript at the bottom
-    # instead of restoring the stale reader distance from before the click.
+    # The library's scroll control owns re-locking. The bottom bridge must keep
+    # that lock through the next composer resize and subsequent streamed output.
     composer.fill("")
     _settled_geometry(page)
     _scroll_to_distance_from_bottom(page, 400)
@@ -465,9 +522,8 @@ def test_composer_growth_reflows_transcript_without_covering_output(
     button_following_output = _settled_geometry(page)
     assert button_following_output["distanceFromBottom"] <= 1, button_following_output
 
-    # Sending a multiline message uses ScrollToBottomOnSend while clearing the
-    # draft shrinks the composer. A subsequent draft growth must not resurrect
-    # the stale escaped distance or disable bottom-follow during the active turn.
+    # Sending a multiline message re-locks through ScrollToBottomOnSend while
+    # clearing the draft shrinks the composer. Later growth must keep following.
     composer.fill("")
     _settled_geometry(page)
     _scroll_to_distance_from_bottom(page, 320)
@@ -484,26 +540,4 @@ def test_composer_growth_reflows_transcript_without_covering_output(
     send_relocked_grown = _settled_geometry(page)
     assert send_relocked_grown["distanceFromBottom"] <= 1, send_relocked_grown
     assert abs(send_relocked_grown["overlap"]) <= 1, send_relocked_grown
-    expect(composer).to_be_focused()
-
-    # A released touch gesture keeps scrolling through momentum. Every trailing
-    # scroll remains user-driven, so the final settled distance must replace the
-    # finger-down distance before a later composer resize restores anything.
-    page.set_viewport_size({"width": 500, "height": 713})
-    composer.fill("")
-    composer.focus()
-    _settled_geometry(page)
-    momentum = _scroll_with_pointer_momentum(page, 500, 650)
-    assert abs(momentum["whilePressed"] - 500) <= 1, momentum
-    assert abs(momentum["afterRelease"] - 650) <= 1, momentum
-    momentum_settled = _settled_geometry(page)
-    assert abs(momentum_settled["distanceFromBottom"] - 650) <= 1, momentum_settled
-
-    composer.press("Shift+Enter")
-    momentum_grown = _settled_geometry(page)
-    assert abs(momentum_grown["distanceFromBottom"] - 650) <= 1, (
-        momentum_settled,
-        momentum_grown,
-    )
-    assert abs(momentum_grown["overlap"]) <= 1, momentum_grown
     expect(composer).to_be_focused()

@@ -6,13 +6,15 @@ import { useChatStore } from "@/store/chatStore";
 import {
   HistoryAutoLoader,
   JumpToTopButton,
+  KeepBottomOnViewportResize,
   LatestTurnSpacer,
-  PreserveScrollDistanceOnResize,
 } from "./ChatPage";
 
 const stickContext = vi.hoisted(() => ({
   scrollRef: { current: null as HTMLElement | null },
   contentRef: { current: null as HTMLElement | null },
+  isAtBottom: false,
+  scrollToBottom: vi.fn(),
   state: { isAtBottom: false, escapedFromLock: true },
   stopScroll: undefined as (() => void) | undefined,
 }));
@@ -67,23 +69,21 @@ function setScrollMetrics(
   });
 }
 
-describe("PreserveScrollDistanceOnResize", () => {
+describe("KeepBottomOnViewportResize", () => {
   let resize: (() => void) | null;
   let disconnectSpy = vi.fn<() => void>();
   let nextFrameId: number;
   let frames: Map<number, FrameRequestCallback>;
 
   beforeEach(() => {
-    vi.useFakeTimers();
     resize = null;
     disconnectSpy.mockClear();
     nextFrameId = 1;
     frames = new Map();
     stickContext.scrollRef.current = null;
     stickContext.contentRef.current = null;
-    stickContext.state.isAtBottom = false;
-    stickContext.state.escapedFromLock = true;
-    stickContext.stopScroll = vi.fn();
+    stickContext.isAtBottom = false;
+    stickContext.scrollToBottom.mockReset();
 
     class StubResizeObserver {
       constructor(callback: ResizeObserverCallback) {
@@ -113,22 +113,17 @@ describe("PreserveScrollDistanceOnResize", () => {
 
   afterEach(() => {
     cleanup();
-    vi.clearAllTimers();
     vi.unstubAllGlobals();
-    vi.useRealTimers();
     stickContext.scrollRef.current = null;
     stickContext.contentRef.current = null;
-    stickContext.stopScroll = undefined;
+    stickContext.isAtBottom = false;
   });
 
-  function flushRestore() {
+  function flushFrames() {
     act(() => {
-      for (let pass = 0; pass < 5 && frames.size > 0; pass += 1) {
-        const callbacks = [...frames.values()];
-        frames.clear();
-        for (const callback of callbacks) callback(performance.now());
-        vi.advanceTimersByTime(3);
-      }
+      const callbacks = [...frames.values()];
+      frames.clear();
+      for (const callback of callbacks) callback(performance.now());
     });
   }
 
@@ -140,67 +135,51 @@ describe("PreserveScrollDistanceOnResize", () => {
     return { metrics, scrollRoot };
   }
 
-  it("preserves post-release momentum through scrollend and cancels an active restore", () => {
-    const { metrics, scrollRoot } = makeScrollRoot();
-    render(<PreserveScrollDistanceOnResize />);
-
-    fireEvent.pointerDown(scrollRoot);
-    fireEvent.scroll(scrollRoot);
-    act(() => vi.advanceTimersByTime(2));
-    fireEvent.pointerUp(window);
+  it("keeps a bottom-locked transcript pinned after its viewport shrinks", () => {
+    const { metrics } = makeScrollRoot();
+    stickContext.isAtBottom = true;
+    render(<KeepBottomOnViewportResize />);
 
     metrics.clientHeight = 650;
     act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).toHaveBeenCalledOnce();
+    expect(stickContext.scrollToBottom).toHaveBeenCalledWith("instant");
     expect(frames.size).toBe(1);
 
-    metrics.scrollTop = 700;
-    fireEvent.scroll(scrollRoot);
-    act(() => vi.advanceTimersByTime(2));
-    expect(cancelAnimationFrame).toHaveBeenCalled();
+    flushFrames();
+    expect(stickContext.scrollToBottom).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves an escaped reader anchored by the browser", () => {
+    const { metrics } = makeScrollRoot();
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.clientHeight = 650;
+    act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
     expect(frames.size).toBe(0);
-
-    fireEvent(scrollRoot, new Event("scrollend"));
-    act(() => vi.advanceTimersByTime(22));
-
-    metrics.clientHeight = 600;
-    act(() => resize?.());
-    flushRestore();
-
-    expect(metrics.scrollHeight - metrics.clientHeight - metrics.scrollTop).toBe(650);
-    expect(stickContext.state.escapedFromLock).toBe(true);
-    expect(stickContext.state.isAtBottom).toBe(false);
+    expect(metrics.scrollTop).toBe(800);
   });
 
-  it("keeps momentum active until the last-scroll debounce when scrollend is unavailable", () => {
-    const { metrics, scrollRoot } = makeScrollRoot();
-    render(<PreserveScrollDistanceOnResize />);
+  it("ignores content-only resize notifications", () => {
+    const { metrics } = makeScrollRoot();
+    stickContext.isAtBottom = true;
+    render(<KeepBottomOnViewportResize />);
 
-    fireEvent.pointerDown(scrollRoot);
-    fireEvent.scroll(scrollRoot);
-    act(() => vi.advanceTimersByTime(2));
-    fireEvent.pointerUp(window);
-
-    metrics.scrollTop = 700;
-    fireEvent.scroll(scrollRoot);
-    act(() => vi.advanceTimersByTime(142));
-
-    metrics.scrollTop = 650;
-    fireEvent.scroll(scrollRoot);
-    act(() => vi.advanceTimersByTime(152));
-
-    metrics.clientHeight = 600;
+    metrics.scrollHeight = 2200;
     act(() => resize?.());
-    flushRestore();
 
-    expect(metrics.scrollHeight - metrics.clientHeight - metrics.scrollTop).toBe(650);
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(frames.size).toBe(0);
   });
 
-  it("cleans up observer, pointer intent, timers, and queued restore frames", () => {
-    const { metrics, scrollRoot } = makeScrollRoot();
-    const { unmount } = render(<PreserveScrollDistanceOnResize />);
+  it("disconnects the observer and cancels a queued follow-up frame", () => {
+    const { metrics } = makeScrollRoot();
+    stickContext.isAtBottom = true;
+    const { unmount } = render(<KeepBottomOnViewportResize />);
 
-    fireEvent.pointerDown(scrollRoot);
-    fireEvent.pointerUp(window);
     metrics.clientHeight = 650;
     act(() => resize?.());
     expect(frames.size).toBe(1);
@@ -210,7 +189,6 @@ describe("PreserveScrollDistanceOnResize", () => {
     expect(disconnectSpy).toHaveBeenCalledOnce();
     expect(cancelAnimationFrame).toHaveBeenCalled();
     expect(frames.size).toBe(0);
-    expect(vi.getTimerCount()).toBe(0);
   });
 });
 
