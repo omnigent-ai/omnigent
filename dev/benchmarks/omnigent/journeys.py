@@ -712,9 +712,18 @@ async def _setup_policy_evaluate_session(env: BenchEnvironment) -> str:
 
     import yaml
 
+    # Build a bundle like BenchEnvironment._agent_bundle but with a policy
+    # declared so any_policies_apply is true and the full engine runs.
+    executor: dict[str, object] = {
+        "type": "omnigent",
+        "model": env.model,
+        "config": {"harness": env.harness},
+    }
     config: dict[str, object] = {
         "spec_version": 1,
         "name": "bench-policy-agent",
+        "prompt": "benchmark",
+        "executor": executor,
         "guardrails": {
             "policies": {
                 "allow_all": {
@@ -733,16 +742,17 @@ async def _setup_policy_evaluate_session(env: BenchEnvironment) -> str:
         tar.addfile(info, io.BytesIO(payload))
     bundle = buf.getvalue()
 
+    # Register the agent + create a session in one call via the bundle upload
+    # path (``POST /v1/sessions`` multipart). ``/v1/agents`` is GET-only.
     resp = await env.client.post(
-        "/v1/agents",
+        "/v1/sessions",
+        data={"metadata": "{}"},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
     )
     resp.raise_for_status()
-    agent_id = resp.json()["id"]
-
-    session_resp = await env.client.post("/v1/sessions", json={"agent_id": agent_id})
-    session_resp.raise_for_status()
-    session_id = session_resp.json()["id"]
+    body = resp.json()
+    # Bundle upload returns ``session_id`` (not ``id``).
+    session_id = body.get("session_id") or body["id"]
 
     # Warm the spec + policy caches — the measured iteration is steady-state.
     for _ in range(2):
@@ -1047,6 +1057,7 @@ ALL_JOURNEYS: dict[str, Journey] = {
             name="cli_startup",
             kind="latency",
             measure=_measure_cli_startup,
+            needs_runner=True,
             needs_host=True,
             max_iterations=_CLI_STARTUP_MAX_ITERATIONS,
             description=(
