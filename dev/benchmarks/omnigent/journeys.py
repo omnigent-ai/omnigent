@@ -1054,15 +1054,23 @@ ALL_JOURNEYS: dict[str, Journey] = {
             teardown=_teardown_hook_spawn,
             description="Spawn the per-chunk MessageDisplay hook exactly as Claude Code does.",
         ),
+    )
+}
+
+# Journeys excluded from the default ALL_JOURNEYS set because they require
+# special environment setup and must be run explicitly via --journeys.
+OPT_IN_JOURNEYS: dict[str, Journey] = {
+    j.name: j
+    for j in (
         Journey(
             name="cli_startup",
             kind="latency",
             measure=_measure_cli_startup,
             max_iterations=_CLI_STARTUP_MAX_ITERATIONS,
             description=(
-                "Spawn `omnigent polly --server` against the local bench server and time "
-                "invocation → REPL ready (daemon + session + runner + runner connect). "
-                "No external LLM binary needed. Requires pexpect."
+                "Spawn `omnigent polly --server` and time invocation → REPL ready "
+                "(daemon + session + runner connect). Opt-in only — run explicitly via "
+                "--journeys cli_startup. Requires pexpect."
             ),
         ),
     )
@@ -1070,15 +1078,21 @@ ALL_JOURNEYS: dict[str, Journey] = {
 
 
 def resolve_journeys(names: list[str] | None) -> list[Journey]:
-    """Resolve requested journey *names* (or all when ``None``/empty).
+    """Resolve requested journey *names* (or all default journeys when ``None``/empty).
 
-    :raises KeyError: If a requested name isn't registered.
+    Looks up *names* in both :data:`ALL_JOURNEYS` (run by default) and
+    :data:`OPT_IN_JOURNEYS` (excluded from the default set; must be named
+    explicitly). When *names* is empty or ``None``, returns only the default
+    journeys — opt-in journeys are never included automatically.
+
+    :raises KeyError: If a requested name isn't in either registry.
     """
+    _all = {**ALL_JOURNEYS, **OPT_IN_JOURNEYS}
     if not names:
         return list(ALL_JOURNEYS.values())
     resolved = []
     for name in names:
-        if name not in ALL_JOURNEYS:
-            raise KeyError(f"unknown journey {name!r}; known: {', '.join(ALL_JOURNEYS)}")
-        resolved.append(ALL_JOURNEYS[name])
+        if name not in _all:
+            raise KeyError(f"unknown journey {name!r}; known: {', '.join(_all)}")
+        resolved.append(_all[name])
     return resolved
