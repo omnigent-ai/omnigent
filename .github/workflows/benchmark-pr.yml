@@ -88,8 +88,6 @@ jobs:
             --sessions 5000 --items-per-session 200
 
       - name: Run benchmark (candidate)
-        env:
-          OMNIGENT_BENCH_SERVER: "https://dbc-a5d4177a-49dc.cloud.databricks.com/api/2.0/omnigent"
         run: |
           uv run --no-sync dev/benchmarks/omnigent/run.py \
             --database-uri "sqlite:///bench.db" \
