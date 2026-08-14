@@ -110,7 +110,12 @@ dependencies = [
     # Protobuf schema for the AI-gateway routing API
     # (omnigent/api/routing/v1/routing.proto).
     # Previously only a transitive dep; declared directly now that we ship a proto.
-    "protobuf>=6,<7",
+    # Upper bound widened to <8 so the google-antigravity extra can pull in
+    # protobuf 7.x without conflicting with this core floor.  Our own
+    # routing_pb2 gencode was compiled against protobuf 6.x; the protobuf
+    # runtime guarantee allows a newer runtime (7.x) to load older gencode, so
+    # a plain install stays on 6.x and an antigravity install upgrades to 7.x.
+    "protobuf>=6,<8",
     # RFC 5545 recurrence rules for the scheduled-task scheduler
     # (omnigent/server/scheduled/rrule.py). Imported at module top and pulled
     # onto the core server boot path via app.py; previously only a transitive
@@ -204,7 +209,11 @@ agents-sdk = [
 # Google Antigravity SDK harness (`harness: antigravity`). Optional: the
 # harness module imports the SDK lazily on first turn, so only users of the
 # harness need this extra. Early SDK (v0.1.x) — pin minor.
-antigravity = ["google-antigravity>=0.1,<1"]
+# google-antigravity ships proto gencode compiled against protobuf 7.x, so
+# the runtime must satisfy >=7 when this extra is installed; the core allows
+# >=6,<8, so this constraint selects the 7.x slot and prevents the
+# "gencode/runtime version mismatch" error at import time.
+antigravity = ["google-antigravity>=0.1,<1", "protobuf>=7,<8"]
 # GitHub Copilot SDK harness (`harness: copilot`). Optional: the harness module
 # imports the SDK lazily on first turn, so only users of the harness need this
 # extra. The wheel bundles the Copilot CLI binary it drives (~90MB), which is
@@ -296,12 +305,13 @@ lint = [
     "pre-commit>=3.5",
     # protoc + the well-known-type protos, for regenerating the routing API
     # bindings (omnigent/api/routing/v1/routing_pb2.*). Bundles its own compiler so no
-    # system protoc is needed. Pinned to the 1.x line whose bundled gencode
-    # matches the runtime `protobuf>=6,<7` above, so `scripts/gen_routing_pb2.py`
-    # reproduces the committed output byte-for-byte (the routing-pb2-fresh
-    # pre-commit hook diffs against it). Generated code is committed, so neither
-    # the library nor its wheels depend on this.
-    "grpcio-tools>=1.68,<2",
+    # system protoc is needed. Capped below 1.83 so the bundled libprotoc emits
+    # protobuf 6.x gencode; routing_pb2 must stay at gencode 6.x because
+    # cwsandbox/modal installs are pinned to a protobuf 6.x runtime and the
+    # protobuf runtime cannot be older than the gencode version. A 7.x runtime
+    # (antigravity) also loads 6.x gencode under the forward-compat guarantee,
+    # so 6.x gencode satisfies all install forks.
+    "grpcio-tools>=1.68,<=1.81.1",
 ]
 test = [
     "pytest>=7.0",
@@ -378,6 +388,24 @@ omni = "omnigent.cli:main"
 # Keep plain `uv sync` aligned with the published base package. Repository
 # workflows opt into the smallest dependency group they need.
 default-groups = []
+
+# `antigravity` requires protobuf>=7 (google-antigravity ships gencode
+# compiled against protobuf 7.x). The following extras/groups all cap their
+# own transitive deps at protobuf<7, making them mutually exclusive with
+# `antigravity`. Declaring conflicts lets uv resolve each set in an isolated
+# fork rather than failing the whole lockfile or silently downgrading
+# shared dependencies like databricks-sdk.
+#   cwsandbox:  protobuf<7 (cwsandbox itself)
+#   modal:      protobuf<7 (modal itself)
+#   databricks: protobuf<7 (databricks-sdk>=0.56 caps at <7.0)
+#   lint group: protobuf<7 (grpcio-tools<=1.81.1 requires protobuf<7) — only
+#               conflicts with antigravity, not with cwsandbox/modal/databricks
+conflicts = [
+    [{ extra = "antigravity" }, { extra = "cwsandbox" }],
+    [{ extra = "antigravity" }, { extra = "modal" }],
+    [{ extra = "antigravity" }, { extra = "databricks" }],
+    [{ group = "lint" }, { extra = "antigravity" }],
+]
 
 # Share the repository lockfile with standalone automation packages.
 [tool.uv.workspace]
