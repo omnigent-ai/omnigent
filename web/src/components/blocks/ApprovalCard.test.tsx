@@ -52,6 +52,9 @@ describe("ApprovalCard — binary approve/reject", () => {
     rerender(<ApprovalCard {...props} status="responded" response={{ action: "accept" }} />);
     expect(screen.getByText(/Claude Code/)).toBeDefined();
     expect(screen.queryByText(/claude_native_permission/)).toBeNull();
+    // A plain tool approval has no content of its own, so the gating
+    // message is the only record of WHAT was approved — it stays.
+    expect(screen.getByText(/wants to call/)).toBeDefined();
   });
 
   it("names every native vendor, and shows no tag when the stamp names none", () => {
@@ -1093,6 +1096,10 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
     expect(screen.getByText(/Submitted/)).toBeDefined();
     expect(screen.getByText(/Vue/)).toBeDefined();
+    // The user already answered, so the pending-tense gating message
+    // ("wants to call AskUserQuestion") would read as if the prompt
+    // were still outstanding.
+    expect(screen.queryByText(/wants to call/)).toBeNull();
   });
 });
 
@@ -1262,6 +1269,9 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
       />,
     );
     expect(screen.getByText("Plan approved")).toBeDefined();
+    // Same as an answered question: the plan was already reviewed, so
+    // the verdict label stands alone without the pending-tense ask.
+    expect(screen.queryByText(/wants to call/)).toBeNull();
 
     rerender(
       <ApprovalCard

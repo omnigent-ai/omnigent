@@ -33,6 +33,7 @@ import type { ConversationItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { buildBubbles } from "@/lib/renderItems";
 import { INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
+import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
 import type {
@@ -54,6 +55,7 @@ import {
   isStaleCompletedResponse,
   initChatStore,
   pumpStreamEvents,
+  SSE_STALE_RECYCLE_MS,
   setPendingInitialPrompt,
   startStreamPump,
   useChatStore,
@@ -169,12 +171,23 @@ function closeOpenEmptyStreams(): void {
 
 function mockResponse(
   body: unknown,
-  init?: { ok?: boolean; status?: number; bodyStream?: ReadableStream<Uint8Array> | null },
+  init?: {
+    ok?: boolean;
+    status?: number;
+    bodyStream?: ReadableStream<Uint8Array> | null;
+    contentType?: string;
+  },
 ): Response {
   return {
     ok: init?.ok ?? true,
     status: init?.status ?? 200,
     statusText: "OK",
+    // Stream responses default to the SSE content type the pump's
+    // non-SSE-answer guard expects; JSON handlers don't care.
+    headers: new Headers({
+      "content-type":
+        init?.contentType ?? (init?.bodyStream ? "text/event-stream" : "application/json"),
+    }),
     json: async () => body,
     text: async () => JSON.stringify(body),
     body: init?.bodyStream ?? null,
@@ -1089,6 +1102,70 @@ describe("chatStore — switchTo", () => {
       );
     expect(elicitation?.status).toBe("pending");
     expect(elicitation?.message).toBe("Approve stalled stream command?");
+  });
+
+  it("replaces an answered question card with the copy hydration rebuilt", async () => {
+    // The user answered a question live; the tool call it gated then
+    // persisted, so a rebind's hydration rebuilds the same card from the
+    // items. Both copies rendering would show the exchange twice — and
+    // they can't pair on ids, since the live elicitation id is never
+    // persisted.
+    const questions = {
+      questions: [
+        { question: "Which library?", options: [{ label: "date-fns" }], multiSelect: false },
+      ],
+    };
+    seedSession("conv_answered", [userMessage("resp_1", "pick one")]);
+    await useChatStore.getState().switchTo("conv_answered");
+    useChatStore.setState((s) => ({
+      blocks: [
+        ...s.blocks,
+        {
+          type: "elicitation",
+          ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_1", itemId: null },
+          elicitationId: "elicit_claude_native_deadbeef",
+          message: "Claude wants to call **AskUserQuestion**",
+          phase: "pre_tool_use",
+          policyName: "claude_native_permission",
+          contentPreview: "",
+          requestedSchema: {},
+          status: "responded",
+          response: { action: "accept", content: { "Which library?": "date-fns" } },
+          askUserQuestion: questions,
+        } satisfies ElicitationBlock,
+      ],
+    }));
+    seedSession("conv_answered", [
+      userMessage("resp_1", "pick one"),
+      {
+        id: "fc_ask",
+        response_id: "resp_1",
+        type: "function_call",
+        status: "completed",
+        name: "AskUserQuestion",
+        arguments: JSON.stringify(questions),
+        call_id: "call_ask",
+      },
+      {
+        id: "fco_ask",
+        response_id: "resp_1",
+        type: "function_call_output",
+        status: "completed",
+        call_id: "call_ask",
+        output: 'Your questions have been answered: "Which library?"="date-fns".',
+      },
+    ]);
+
+    // The stream died (idle disconnect): the send-triggered rebind
+    // re-hydrates the window alongside the live blocks.
+    useChatStore.setState({ abortController: null });
+    await useChatStore.getState().send("thanks", "agent_xyz");
+
+    const cards = useChatStore
+      .getState()
+      .blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.ctx.itemId).toBe("fc_ask:answer");
   });
 
   it("hydrates only the initial window and flags that older history remains", async () => {
@@ -5377,6 +5454,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
     const child = (overrides: Partial<ChildSessionInfo> = {}): Record<string, unknown> => ({
       id: "conv_child1",
       title: "researcher:auth",
+      task_summary: null,
       tool: "researcher",
       session_name: "auth",
       current_task_status: "in_progress",
@@ -5399,6 +5477,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
         {
           id: "conv_child1",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           labels: {},
@@ -5417,6 +5496,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
         {
           id: "conv_child1",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "in_progress",
@@ -5445,6 +5525,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
         {
           id: "conv_child1",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "in_progress",
@@ -5475,6 +5556,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
         {
           id: "conv_child1",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "in_progress",
@@ -5502,6 +5584,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
         {
           id: "conv_child1",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "in_progress",
@@ -5540,6 +5623,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
         {
           id: "conv_child1",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "failed",
@@ -7847,6 +7931,152 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     sinks[0]!.push("data: [DONE]\n\n");
     sinks[0]!.close();
     await vi.advanceTimersByTimeAsync(1);
+    await loop;
+  });
+
+  it("recycles a byte-silent stream via the stall guard and reconciles the gap", async () => {
+    const preGap = [userMessage("stall_pre", "before the stall")];
+    seedSession("conv_stall", preGap);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_stall",
+      abortController: controller,
+      blocks: itemsToBlocks(preGap),
+    });
+
+    const loop = startStreamPump("conv_stall", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // An item commits while the socket is half-open: no bytes, no close.
+    const gapItem = userMessage("stall_gap", "committed during the stall");
+    seedSessionItems("conv_stall", [...preGap, gapItem]);
+
+    // Nothing arrives for the full stall window. The guard must declare
+    // the transport dead and the loop must re-subscribe — a hung read
+    // never ends on its own, so pre-guard this tab stayed frozen forever.
+    await vi.advanceTimersByTimeAsync(SSE_STALL_TIMEOUT_MS + 1_000);
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    // The reconnect reconciled the committed snapshot: the gap item is in.
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toContain(gapItem.id);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("keeps a heartbeat-alive stream connected across many stall windows", async () => {
+    seedSession("conv_hb", []);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_hb", abortController: controller });
+
+    const loop = startStreamPump("conv_hb", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // Several stall windows of wall clock, with a heartbeat inside each
+    // one: the guard must keep re-arming rather than tripping.
+    /* oxlint-disable no-await-in-loop */
+    for (let i = 0; i < 8; i += 1) {
+      sinks[0]!.push(sse("session.heartbeat", {}));
+      await vi.advanceTimersByTimeAsync(20_000);
+    }
+    /* oxlint-enable no-await-in-loop */
+    expect(sinks).toHaveLength(1);
+
+    sinks[0]!.push("data: [DONE]\n\n");
+    sinks[0]!.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("backs off when the stream open answers with a non-SSE content type", async () => {
+    seedSession("conv_html", []);
+    let opens = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        opens += 1;
+        // An expired auth ingress: the fetch follows its redirect to a 200
+        // text/html login page instead of the SSE body.
+        const html = pushableStream();
+        html.push("<!doctype html><title>Login</title>");
+        html.close();
+        return mockResponse(null, { bodyStream: html.stream, contentType: "text/html" });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_html", abortController: controller });
+
+    const loop = startStreamPump("conv_html", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(6_000);
+
+    // Rejected as a failed open → retried WITH backoff. Pumping the HTML
+    // instead would read as a clean drop and reconnect with no delay — a
+    // hot loop hammering the login page (dozens of opens in this window).
+    expect(opens).toBeGreaterThan(1);
+    expect(opens).toBeLessThan(10);
+
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(6_000);
+    await loop;
+  });
+
+  it("recycles a stale stream on tab-visible / network-online, but never a fresh one", async () => {
+    seedSession("conv_wake", []);
+    // Sinks that honor the fetch abort signal like the real fetch does:
+    // aborting the attempt severs the in-flight body read.
+    const sinks: StreamSink[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        const sink = pushableStream();
+        sinks.push(sink);
+        init?.signal?.addEventListener("abort", () =>
+          sink.error(new DOMException("aborted", "AbortError")),
+        );
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_wake", abortController: controller });
+
+    const loop = startStreamPump("conv_wake", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // Fresh bytes → a visibility return must NOT churn the connection.
+    sinks[0]!.push(sse("session.heartbeat", {}));
+    await drainAsync();
+    document.dispatchEvent(new Event("visibilitychange"));
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // Silent past the stale window but before the stall guard's own
+    // ceiling: the wake check must recycle NOW, not wait out the guard.
+    await vi.advanceTimersByTimeAsync(SSE_STALE_RECYCLE_MS + 1_000);
+    document.dispatchEvent(new Event("visibilitychange"));
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    // Same staleness discovered via the browser regaining network.
+    await vi.advanceTimersByTimeAsync(SSE_STALE_RECYCLE_MS + 1_000);
+    window.dispatchEvent(new Event("online"));
+    await drainAsync();
+    expect(sinks).toHaveLength(3);
+
+    const last = sinks[2]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
     await loop;
   });
 

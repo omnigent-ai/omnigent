@@ -213,6 +213,7 @@ def _to_conversation(
         subagent_routing_override=overrides["subagent_routing_override"],
         harness_override=overrides["harness_override"],
         sub_agent_name=meta.sub_agent_name if meta else None,
+        task_summary=meta.task_summary if meta else None,
         external_session_id=meta.external_session_id if meta else None,
         # NULL → None; a stored JSON array (e.g. ``"[]"`` or
         # ``'["--foo"]'``) decodes back to a list. ``"[]"`` is a
@@ -2838,6 +2839,24 @@ class SqlAlchemyConversationStore(ConversationStore):
             if result.rowcount != 1:
                 return None
         # Bulk UPDATE leaves no in-session ORM row to reuse; re-read.
+        return self.get_conversation(conversation_id)
+
+    def set_task_summary(self, conversation_id: str, task_summary: str) -> Conversation | None:
+        """Set a human-readable task summary on a sub-agent conversation."""
+        with self._session("set_task_summary") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                    )
+                    .values(task_summary=task_summary)
+                ),
+            )
+            if result.rowcount != 1:
+                return None
         return self.get_conversation(conversation_id)
 
     def set_runner_id(self, conversation_id: str, runner_id: str) -> bool:

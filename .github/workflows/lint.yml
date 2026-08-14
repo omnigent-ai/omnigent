@@ -75,7 +75,15 @@ jobs:
         # `--locked` is the hard gate: fails if uv.lock is out of sync with
         # pyproject.toml (a bare `uv run pre-commit` would re-lock first and mask
         # a stale lockfile). Fix locally with `uv lock`.
-        run: uv sync --locked --extra dev
+        # Pyrefly checks optional integrations against their real packages.
+        # Compose capability extras with lint tooling instead of duplicating
+        # runtime dependencies in the repository-only lint group.
+        run: |
+          uv sync --locked --group lint \
+            --extra hindsight \
+            --extra nimble \
+            --extra s3 \
+            --extra tracing
 
       # Sets up Node 20 + pnpm, with pnpm dependency caching keyed on the
       # workspace lockfile. pnpm is pinned in .github/actions/setup-pnpm.

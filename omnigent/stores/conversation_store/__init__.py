@@ -842,6 +842,22 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_task_summary(
+        self,
+        conversation_id: str,
+        task_summary: str,
+    ) -> Conversation | None:
+        """Set a human-readable task summary on a sub-agent conversation.
+
+        :param conversation_id: Conversation to update.
+        :param task_summary: Short task-derived label, e.g.
+            ``"Investigate auth token refresh"``.
+        :returns: The updated conversation, or ``None`` when the row
+            does not exist.
+        """
+        ...
+
+    @abstractmethod
     def set_labels(
         self,
         conversation_id: str,

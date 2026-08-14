@@ -36,6 +36,7 @@ from omnigent.runtime import (
     get_terminal_registry,
     pending_elicitations,
     set_harness_process_manager,
+    set_runner_direct_attach_resolver,
     set_runner_router,
     set_runner_ws_factory,
 )
@@ -1024,9 +1025,18 @@ def create_app(
         # Install the tunnel-backed WS factory so browser terminal
         # attach can proxy frames over the same persistent WebSocket
         # the runner already uses for HTTP.
-        from omnigent.server._runner_ws_tunnel import make_tunnel_ws_factory
+        from omnigent.server._runner_ws_tunnel import (
+            make_direct_attach_resolver,
+            make_tunnel_ws_factory,
+        )
 
         set_runner_ws_factory(make_tunnel_ws_factory(runner_router, tunnel_registry))
+        # Companion resolver: lets the terminals API surface a runner's
+        # advertised loopback attach endpoint so a browser on the same
+        # machine can skip the relay entirely.
+        set_runner_direct_attach_resolver(
+            make_direct_attach_resolver(runner_router, tunnel_registry)
+        )
 
         # MCP execution moved to the runner (designs/RUNNER_MCP.md);
         # SessionFilesystemRegistry moved to the runner. Both
@@ -1148,6 +1158,7 @@ def create_app(
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
             set_runner_ws_factory(None)
+            set_runner_direct_attach_resolver(None)
             set_runner_router(None)
             await runner_router.aclose()
 

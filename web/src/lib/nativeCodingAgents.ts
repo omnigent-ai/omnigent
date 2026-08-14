@@ -276,6 +276,24 @@ export function nativeCodingAgentForAgentName(
   return name == null ? undefined : BY_AGENT_NAME.get(name);
 }
 
+/**
+ * The synthetic ``policy_name`` a native agent's permission prompts carry.
+ *
+ * History hydration rebuilds answered question / plan cards from persisted
+ * tool calls, which name the agent rather than the elicitation provenance
+ * the live card came with. Minting the id from the same prefix table
+ * :func:`nativeCodingAgentForPolicyName` reads keeps both directions on
+ * one source of truth, so the rebuilt card names the same vendor.
+ *
+ * @param name - Agent name from the item, e.g. ``"claude-native-ui"``.
+ * @returns The provenance id, or ``""`` for a non-native agent.
+ */
+export function nativePolicyNameForAgentName(name: string | null | undefined): string {
+  const spec = nativeCodingAgentForAgentName(name);
+  if (spec === undefined) return "";
+  return `${POLICY_NAME_VENDORS[spec.key] ?? spec.key}_native_permission`;
+}
+
 export function nativeCodingAgentForHarness(
   harness: string | null | undefined,
 ): NativeCodingAgentSpec | undefined {

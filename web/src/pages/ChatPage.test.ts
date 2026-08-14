@@ -478,9 +478,13 @@ const assistantText = (id: string): Bubble => ({
   error: null,
   items: [{ kind: "text", itemId: id, text: "hi", final: true }],
 });
-const elicitationBubble = (id: string, phase: string): Bubble => ({
+// A card with no turn to anchor to carries the `elicit_*` response id
+// blockStream stamps for exactly that case; pass `responseId` to model a
+// card that DOES belong to a turn (an inline approval, or a question card
+// the walker split into its own bubble).
+const elicitationBubble = (id: string, phase: string, responseId = `elicit_${id}`): Bubble => ({
   kind: "assistant",
-  responseId: id,
+  responseId,
   stableId: id,
   lifecycle: "completed",
   error: null,
@@ -645,6 +649,16 @@ describe("reorderCommittedRequestElicitations", () => {
 
   it("does NOT reorder a tool_call-phase card followed by a user message", () => {
     const committed = [elicitationBubble("e1", "tool_call"), userBubble("u1")];
+    const result = reorderCommittedRequestElicitations(committed);
+    expect(result).toBe(committed);
+    expect(bubbleIds(result)).toEqual(["e1", "u1"]);
+  });
+
+  it("does NOT reorder a card anchored to a turn", () => {
+    // A question/plan card the walker split out of its turn keeps that
+    // turn's response id. It gated nothing — the message after it is a NEW
+    // prompt — so lifting the prompt above it would reorder history.
+    const committed = [elicitationBubble("e1", "pre_tool_use", "resp_1"), userBubble("u1")];
     const result = reorderCommittedRequestElicitations(committed);
     expect(result).toBe(committed);
     expect(bubbleIds(result)).toEqual(["e1", "u1"]);

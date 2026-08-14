@@ -45,9 +45,8 @@ from typing import Final
 
 # fcntl/pty/termios are POSIX-only. This module drives tmux PTY ``attach``
 # sessions, a feature that is disabled on Windows (see the terminal
-# entrypoints), so importing it must not crash the server there. The
-# ``sys.platform`` guard is special-cased by mypy, which type-checks on Linux
-# and therefore still sees the real modules.
+# entrypoints), so importing it must not crash the server there. Static checking
+# still analyzes the POSIX branch and sees the real modules.
 if sys.platform != "win32":
     import fcntl
     import pty

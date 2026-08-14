@@ -79,6 +79,86 @@ export interface SseStreamResult {
   sawDone: boolean;
 }
 
+// The server heartbeats the session live-tail every 15 s of queue idleness
+// (`_SESSION_STREAM_HEARTBEAT_INTERVAL_S`), so a healthy connection is never
+// byte-silent for long. `fetch` has no read timeout: on a half-open socket
+// (laptop sleep, network path change, a proxy reaping the connection without
+// a close) `reader.read()` blocks forever and the transcript silently
+// freezes. Three missed heartbeats in a row trip the guard; one late
+// heartbeat doesn't.
+export const SSE_STALL_TIMEOUT_MS = 45_000;
+
+/**
+ * Wrap an SSE byte stream with a silence watchdog.
+ *
+ * Chunks pass through unchanged; a stall timer is armed while a read is
+ * pending on the wire. If no bytes arrive within `stallMs` the upstream
+ * reader is cancelled, which ends the wrapped stream cleanly — consumers
+ * see the same shape as a transport drop without `[DONE]`, so the chat
+ * pump's reconnect loop answers with its usual re-subscribe + snapshot
+ * reconcile.
+ *
+ * @param source The fetch response body to guard.
+ * @param opts.stallMs Silence window before the stream is declared dead;
+ *   defaults to {@link SSE_STALL_TIMEOUT_MS}.
+ * @param opts.onActivity Called on every received chunk — a liveness stamp
+ *   for callers that want to judge staleness on external signals (tab
+ *   visibility, network regained) without waiting out the full window.
+ * @param opts.onStall Called once when the guard trips.
+ * @returns The guarded stream to consume in place of `source`.
+ */
+export function withStallGuard(
+  source: ReadableStream<Uint8Array>,
+  opts: { stallMs?: number; onActivity?: () => void; onStall?: () => void } = {},
+): ReadableStream<Uint8Array> {
+  const stallMs = opts.stallMs ?? SSE_STALL_TIMEOUT_MS;
+  const reader = source.getReader();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const clearTimer = (): void => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      // Cancelling the reader resolves the pending read as `done`, which
+      // closes the wrapped stream through the normal path below.
+      timer = setTimeout(() => {
+        timer = null;
+        opts.onStall?.();
+        reader.cancel().catch(() => {});
+      }, stallMs);
+      let result: ReadableStreamReadResult<Uint8Array>;
+      try {
+        result = await reader.read();
+      } catch (err) {
+        clearTimer();
+        reader.releaseLock();
+        controller.error(err);
+        return;
+      }
+      clearTimer();
+      if (result.done) {
+        // Release the source on every terminal path: a consumer that
+        // re-reads the same body (a rebind against a mocked response)
+        // must find it unlocked, exactly as it did before the guard
+        // sat between it and the raw stream.
+        reader.releaseLock();
+        controller.close();
+        return;
+      }
+      opts.onActivity?.();
+      controller.enqueue(result.value);
+    },
+    async cancel(reason) {
+      clearTimer();
+      await reader.cancel(reason);
+      reader.releaseLock();
+    },
+  });
+}
+
 /**
  * Parse an SSE byte stream into typed events.
  *
