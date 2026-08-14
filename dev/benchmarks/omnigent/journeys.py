@@ -780,7 +780,7 @@ async def _measure_policy_evaluate(env: BenchEnvironment, ctx: JourneyContext) -
     resp.raise_for_status()
 
 
-# ── CLI startup (real omnigent binary against the local bench server) ────────
+# ── CLI startup (real omnigent binary against a remote server) ───────────────
 
 # Signal that the Claude terminal is ready — emitted by the startup spinner
 # just before tmux attach. Visible on the pexpect PTY regardless of whether
@@ -792,28 +792,42 @@ _CLI_STARTUP_TIMEOUT_S = 90
 
 # CLI startup is expensive (~10s per attempt); cap iterations the same way as
 # other full-turn journeys so a large --iterations doesn't blow the CI budget.
-_CLI_STARTUP_MAX_ITERATIONS = 5
+_CLI_STARTUP_MAX_ITERATIONS = 3
+
+# Env var pointing to the remote server to benchmark against. When absent the
+# journey skips with a clear message — the local bench server can't be used
+# because omnigent claude spawns its own host daemon which conflicts with the
+# bench environment's daemon.
+_CLI_STARTUP_SERVER_ENV = "OMNIGENT_BENCH_SERVER"
 
 
 async def _measure_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> None:
     """Time ``omnigent claude --server`` from invocation to terminal ready.
 
     Spawns the real ``omnigent`` CLI binary (resolved from PATH, or
-    ``OMNIGENT_BIN`` env var) against the local benchmark server
-    (``env.base_url``). The timed span ends when ``"Claude terminal ready."``
-    appears on the PTY — the spinner message emitted just before ``tmux attach``.
+    ``OMNIGENT_BIN`` env var) against the server named by
+    ``OMNIGENT_BENCH_SERVER``. Skips with a RuntimeError when that env var is
+    not set — the local bench server can't be used because ``omnigent claude``
+    spawns its own host daemon which conflicts with the bench environment's.
 
-    The benchmark environment boots a host daemon (``needs_host=True``) that the
-    CLI's startup sequence connects to. The bench mock runner and LLM are also
-    present (implied by ``needs_host``) but unused — ``omnigent claude`` launches
-    its own runner via the host daemon using the claude-native harness.
+    The timed span ends when ``"Claude terminal ready."`` appears on the PTY —
+    the spinner message emitted just before ``tmux attach``.
 
     Requires ``pexpect`` and the ``claude`` (Claude Code) CLI binary on PATH.
 
-    :param env: Benchmark environment — ``env.base_url`` is the local server URL.
+    :param env: Benchmark environment (unused — CLI targets the remote server).
     :param _ctx: Unused (no setup context).
-    :raises RuntimeError: On timeout or process exit before the ready signal.
+    :raises RuntimeError: When ``OMNIGENT_BENCH_SERVER`` is not set, on timeout,
+        or on process exit before the ready signal.
     """
+    del env
+    server = os.environ.get(_CLI_STARTUP_SERVER_ENV)
+    if not server:
+        raise RuntimeError(
+            f"cli_startup requires {_CLI_STARTUP_SERVER_ENV} to be set to a remote "
+            f"Omnigent server URL. The local bench server cannot be used (daemon conflict)."
+        )
+
     try:
         import pexpect
     except ImportError as exc:
@@ -827,7 +841,7 @@ async def _measure_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> N
 
     child = pexpect.spawn(
         omnigent_bin,
-        args=["claude", "--server", env.base_url],
+        args=["claude", "--server", server],
         timeout=_CLI_STARTUP_TIMEOUT_S,
         encoding="utf-8",
         codec_errors="ignore",
@@ -1063,12 +1077,11 @@ ALL_JOURNEYS: dict[str, Journey] = {
             name="cli_startup",
             kind="latency",
             measure=_measure_cli_startup,
-            needs_runner=True,
-            needs_host=True,
             max_iterations=_CLI_STARTUP_MAX_ITERATIONS,
             description=(
-                "Spawn `omnigent claude --server` against the local bench server and time "
-                "invocation → terminal ready (daemon + session + runner + terminal boot). "
+                "Spawn `omnigent claude --server $OMNIGENT_BENCH_SERVER` and time "
+                "invocation → terminal ready (auth + daemon + session + runner + terminal boot). "
+                "Skips when OMNIGENT_BENCH_SERVER is not set. "
                 "Requires pexpect and the `claude` (Claude Code) CLI binary on PATH."
             ),
         ),
