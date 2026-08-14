@@ -41,6 +41,10 @@ on:
         description: "Simulated client→server latency per request (ms; 0 = loopback)"
         required: false
         default: "0"
+      cli_startup_runs:
+        description: "CLI startup: timed runs per command (0 = skip)"
+        required: false
+        default: "5"
 
 permissions:
   contents: read
@@ -206,5 +210,82 @@ jobs:
         with:
           name: benchmark-results-${{ matrix.backend }}-${{ github.run_id }}
           path: benchmark-results-${{ matrix.backend }}.json
+          retention-days: 90
+          if-no-files-found: warn
+
+  cli-startup:
+    name: CLI startup latency
+    # Requires OMNIGENT_REMOTE_AUTH_TOKEN (a pre-minted bearer for the ai-devtools
+    # workspace) to be set as a repository secret. Skips gracefully when the
+    # secret is absent or when cli_startup_runs is 0 (dispatch only — the
+    # nightly schedule always runs it when the secret is configured).
+    if: >-
+      github.repository == 'omnigent-ai/omnigent' &&
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_dispatch' && inputs.cli_startup_runs != '0'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CLI_STARTUP_RUNS: ${{ github.event_name == 'workflow_dispatch' && inputs.cli_startup_runs || '5' }}
+      # Server URL for the ai-devtools managed Omnigent workspace.
+      OMNIGENT_BENCH_SERVER: "https://dbc-a5d4177a-49dc.cloud.databricks.com/api/2.0/omnigent"
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.checkout_sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: |
+          uv sync
+          uv pip install pexpect
+
+      - name: Check auth secret
+        id: auth
+        run: |
+          if [[ -z "${{ secrets.OMNIGENT_REMOTE_AUTH_TOKEN }}" ]]; then
+            echo "OMNIGENT_REMOTE_AUTH_TOKEN secret not set — skipping CLI startup benchmark."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run CLI startup benchmark
+        if: steps.auth.outputs.skip == 'false'
+        env:
+          OMNIGENT_REMOTE_AUTH_TOKEN: ${{ secrets.OMNIGENT_REMOTE_AUTH_TOKEN }}
+        run: |
+          uv run --no-sync dev/benchmarks/omnigent/cli_startup.py \
+            --server "$OMNIGENT_BENCH_SERVER" \
+            --runs "$CLI_STARTUP_RUNS" \
+            --verbose \
+            --output benchmark-results-cli-startup.json
+
+      - name: Render results to job summary
+        if: steps.auth.outputs.skip == 'false' && always()
+        run: |
+          if [[ -f benchmark-results-cli-startup.json ]]; then
+            uv run --no-sync dev/benchmarks/omnigent/report_markdown.py \
+              --title "CLI startup latency" \
+              benchmark-results-cli-startup.json >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload CLI startup results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.auth.outputs.skip == 'false' && always()
+        with:
+          name: benchmark-results-cli-startup-${{ github.run_id }}
+          path: benchmark-results-cli-startup.json
           retention-days: 90
           if-no-files-found: warn
