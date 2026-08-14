@@ -678,6 +678,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 "terminal": "claude",
                 "session_key": "main",
                 "ensure_native_terminal": True,
+                "persist_resource_event": True,
             },
         ),
         (
