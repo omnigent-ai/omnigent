@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -763,6 +764,79 @@ async def _measure_policy_evaluate(env: BenchEnvironment, ctx: JourneyContext) -
     resp.raise_for_status()
 
 
+# ── CLI startup (real omnigent binary against the local bench server) ────────
+
+# Signal that the Claude terminal is ready — emitted by the startup spinner
+# just before tmux attach. Visible on the pexpect PTY regardless of whether
+# tmux attach itself completes in the benchmark's environment.
+_CLI_STARTUP_READY_SIGNAL = "Claude terminal ready"
+
+# Generous per-attempt timeout: terminal boot can spike to ~30s under load.
+_CLI_STARTUP_TIMEOUT_S = 90
+
+# CLI startup is expensive (~10s per attempt); cap iterations the same way as
+# other full-turn journeys so a large --iterations doesn't blow the CI budget.
+_CLI_STARTUP_MAX_ITERATIONS = 5
+
+
+async def _measure_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> None:
+    """Time ``omnigent claude --server`` from invocation to terminal ready.
+
+    Spawns the real ``omnigent`` CLI binary (resolved from PATH, or
+    ``OMNIGENT_BIN`` env var) against the local benchmark server
+    (``env.base_url``). The timed span ends when ``"Claude terminal ready."``
+    appears on the PTY — the spinner message emitted just before ``tmux attach``.
+
+    The benchmark environment boots a host daemon (``needs_host=True``) that the
+    CLI's startup sequence connects to. The bench mock runner and LLM are also
+    present (implied by ``needs_host``) but unused — ``omnigent claude`` launches
+    its own runner via the host daemon using the claude-native harness.
+
+    Requires ``pexpect`` and the ``claude`` (Claude Code) CLI binary on PATH.
+
+    :param env: Benchmark environment — ``env.base_url`` is the local server URL.
+    :param _ctx: Unused (no setup context).
+    :raises RuntimeError: On timeout or process exit before the ready signal.
+    """
+    try:
+        import pexpect
+    except ImportError as exc:
+        raise RuntimeError(
+            "pexpect is required for cli_startup. Install with: pip install pexpect"
+        ) from exc
+
+    omnigent_bin = os.environ.get("OMNIGENT_BIN") or shutil.which("omnigent")
+    if omnigent_bin is None:
+        raise RuntimeError("omnigent binary not found. Set OMNIGENT_BIN or add omnigent to PATH.")
+
+    child = pexpect.spawn(
+        omnigent_bin,
+        args=["claude", "--server", env.base_url],
+        timeout=_CLI_STARTUP_TIMEOUT_S,
+        encoding="utf-8",
+        codec_errors="ignore",
+        env=dict(os.environ),
+    )
+    try:
+        idx = child.expect([pexpect.TIMEOUT, pexpect.EOF, _CLI_STARTUP_READY_SIGNAL])
+        if idx == 0:
+            raise RuntimeError(
+                f"Timed out after {_CLI_STARTUP_TIMEOUT_S}s waiting for "
+                f"{_CLI_STARTUP_READY_SIGNAL!r}"
+            )
+        if idx == 1:
+            output = (child.before or "").strip()
+            raise RuntimeError(
+                f"Process exited before {_CLI_STARTUP_READY_SIGNAL!r}. "
+                f"Last output: {output[-200:]!r}"
+            )
+        child.sendline("/exit")
+        child.expect([pexpect.EOF, pexpect.TIMEOUT], timeout=10)
+    finally:
+        if child.isalive():
+            child.terminate(force=True)
+
+
 # ── native hook spawn (no server involved) ───────────────────
 
 # Claude Code blocks its TUI on command hooks, so one hook subprocess's whole
@@ -968,6 +1042,18 @@ ALL_JOURNEYS: dict[str, Journey] = {
             setup=_setup_hook_spawn,
             teardown=_teardown_hook_spawn,
             description="Spawn the per-chunk MessageDisplay hook exactly as Claude Code does.",
+        ),
+        Journey(
+            name="cli_startup",
+            kind="latency",
+            measure=_measure_cli_startup,
+            needs_host=True,
+            max_iterations=_CLI_STARTUP_MAX_ITERATIONS,
+            description=(
+                "Spawn `omnigent claude --server` against the local bench server and time "
+                "invocation → terminal ready (daemon + session + runner + terminal boot). "
+                "Requires pexpect and the `claude` (Claude Code) CLI binary on PATH."
+            ),
         ),
     )
 }
