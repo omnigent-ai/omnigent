@@ -10490,7 +10490,7 @@
     },
     "/v1/sessions/{session_id}/policies": {
       "get": {
-        "description": "List all policies for a session.\n\nReturns both store-persisted (`source=\"session\"`) and\nspec-declared (`source=\"spec\"`) policies. Spec policies\nhave `id=None` and cannot be patched or deleted.\n\nRequires `LEVEL_READ` on the session in multi-user mode.\n\n**Returns:** `{\"object\": \"list\", \"data\": [...]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403 if the user lacks read permission, 404 if the session is not found.",
+        "description": "List all policies for a session.\n\nReturns server-wide defaults (`source=\"global\"`) followed by\nsession-scoped policies (`source=\"session\"`). Globals come\nfrom two places: the `--config` YAML (`id=None`) and the\npersisted store (real ids, enabled only). Neither can be\npatched or deleted through the session-scoped routes.\n\nRequires `LEVEL_READ` on the session in multi-user mode.\n\n**Returns:** `{\"object\": \"list\", \"data\": [...]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403 if the user lacks read permission, 404 if the session is not found.",
         "operationId": "list_policies_v1_sessions__session_id__policies_get",
         "parameters": [
           {

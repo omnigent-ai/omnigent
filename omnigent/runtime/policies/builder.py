@@ -288,11 +288,13 @@ def build_policy_engine(
     from the post-seed snapshot.
 
     Policy run order: session policies (from the CRUD API)
-    first, then agent spec policies, then *default_policies*
-    (server-wide admin policies). This lets user-configured
-    session policies short-circuit on DENY before agent or
-    admin policies run, and gives admin policies the last
-    word on ALLOW/ASK decisions.
+    first, then agent spec policies, then server-wide admin
+    policies. Admin policies include *default_policies* (parsed
+    from server YAML) plus persisted default policies from
+    ``policy_store.list_defaults()``. This lets user-configured
+    session policies short-circuit on DENY before agent or admin
+    policies run, and gives admin policies the last word on
+    ALLOW/ASK decisions.
 
     For sub-agent conversations, session policies from the
     root (top-level) conversation are inherited and prepended
@@ -334,7 +336,9 @@ def build_policy_engine(
     :param default_policies: Server-wide policies appended after
         per-agent policies. Sourced from ``RuntimeCaps.default_policies``
         (parsed from the server ``--config`` YAML at startup).
-        ``None`` and ``[]`` both mean no server-wide policies.
+        Persisted default policies from ``policy_store`` are
+        appended after these YAML policies. ``None`` and ``[]`` both
+        mean no YAML-defined server-wide policies.
     :param policy_store: Session-scoped policy store. When
         provided, enabled policies for ``conversation_id`` are
         loaded and inserted between agent and admin policies in
@@ -1518,7 +1522,7 @@ def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec:
     # Reject loudly and fail closed: a stored policy that silently never
     # enforces is worse than a visible failure the operator can act on.
     raise OmnigentError(
-        f"Session policy {policy.name!r} (id {policy.id!r}) has unsupported "
+        f"Stored policy {policy.name!r} (id {policy.id!r}) has unsupported "
         f"type {policy.type!r}; only type='python' policies can be evaluated "
         f"today. URL policy evaluation is a future extension. Remove or "
         f"disable this policy, since storing it does not enforce anything.",

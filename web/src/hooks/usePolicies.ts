@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 
-/** A session-scoped policy returned by the CRUD API. */
+/** A policy row returned by the session policy list API. */
 export interface SessionPolicy {
   id: string | null;
   object: "session.policy";
@@ -10,7 +10,7 @@ export interface SessionPolicy {
   handler: string | null;
   factory_params?: Record<string, unknown> | null;
   enabled: boolean;
-  source: "session" | "spec" | "admin";
+  source: "session" | "spec" | "global";
   description?: string | null;
   created_at: number;
   updated_at: number | null;
@@ -50,7 +50,7 @@ async function fetchRegistry(): Promise<PolicyRegistryEntry[]> {
 
 // ── Hooks ────────────────────────────────────────────────────────────────────
 
-/** Fetch session policies. Disabled when `sessionId` is falsy. */
+/** Fetch session-scoped policies plus read-only global defaults. */
 export function usePolicies(sessionId: string | null | undefined) {
   return useQuery({
     queryKey: policiesQueryKey(sessionId ?? ""),

@@ -22,6 +22,7 @@ from omnigent.runtime.policies.builder import (
     _load_default_policy_specs,
     _load_session_policy_specs,
     _stored_policy_to_spec,
+    any_policies_apply,
     build_policy_engine,
     invalidate_default_policy_specs_cache,
     invalidate_session_policy_specs_cache,
@@ -710,3 +711,55 @@ def test_build_engine_ordering_session_agent_db_default_admin(db_uri: str) -> No
         "yaml_admin_policy",
         "__ask_on_add_policy",
     ]
+
+
+# ── any_policies_apply (evaluate fast-path) ─────────────────────────────────
+
+
+def test_any_policies_apply_false_when_no_policies(db_uri: str) -> None:
+    """No guardrails, no YAML defaults, no stored policies → fast-path skip.
+
+    :param db_uri: Per-test SQLite URI.
+    """
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+
+    assert not any_policies_apply(
+        spec=_make_minimal_spec(),
+        conversation_id="ad563e906854634c49e1a6fd2fbb31d4",
+        default_policies=None,
+        policy_store=policy_store,
+    )
+
+
+def test_any_policies_apply_true_for_db_default(db_uri: str) -> None:
+    """A DB-backed global default alone must defeat the fast-path skip.
+
+    Regression: ``POST /policies/evaluate`` short-circuits to ALLOW when
+    ``any_policies_apply`` returns False, so a global default that is the
+    only policy on a session would never be enforced if this check ignored
+    ``_load_default_policy_specs``.
+
+    :param db_uri: Per-test SQLite URI.
+    """
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    policy_store.create_default(
+        policy_id="c0ffee00000000000000000000000001",
+        name="db_default_only",
+        type="python",
+        handler="myorg.policies.deny_all",
+        enabled=True,
+    )
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+
+    try:
+        assert any_policies_apply(
+            spec=_make_minimal_spec(),
+            conversation_id="ad563e906854634c49e1a6fd2fbb31d4",
+            default_policies=None,
+            policy_store=policy_store,
+        )
+    finally:
+        # The specs cache is module-level; leaving this unimportable handler
+        # behind would surface as a policy-evaluation error in later tests.
+        _DEFAULT_POLICY_SPECS_CACHE.clear()
