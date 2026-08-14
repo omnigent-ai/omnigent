@@ -115,6 +115,59 @@ def _scroll_to_distance_from_bottom(page: Page, distance: int) -> dict:
     )
 
 
+def _scroll_with_pointer_momentum(
+    page: Page,
+    pointer_distance: int,
+    settled_distance: int,
+) -> dict:
+    """Release a touch pointer, then deliver its trailing momentum scroll."""
+    return page.evaluate(
+        """async ({ pointerDistance, settledDistance }) => {
+            const form = document.querySelector(
+                'textarea[aria-label="Message the agent"]'
+            ).closest('form');
+            const scroller = form.parentElement.querySelector('[role="log"] > div');
+            const setDistance = (distance) => {
+                scroller.scrollTop =
+                    scroller.scrollHeight - scroller.clientHeight - distance;
+                scroller.dispatchEvent(new Event('scroll'));
+            };
+            const distance = () => Math.round(
+                scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
+            );
+
+            scroller.dispatchEvent(new PointerEvent('pointerdown', {
+                bubbles: true,
+                buttons: 1,
+                isPrimary: true,
+                pointerId: 1,
+                pointerType: 'touch',
+            }));
+            setDistance(pointerDistance);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            const whilePressed = distance();
+
+            window.dispatchEvent(new PointerEvent('pointerup', {
+                bubbles: true,
+                isPrimary: true,
+                pointerId: 1,
+                pointerType: 'touch',
+            }));
+            setDistance(settledDistance);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+
+            return {
+                whilePressed,
+                afterRelease: distance(),
+            };
+        }""",
+        {
+            "pointerDistance": pointer_distance,
+            "settledDistance": settled_distance,
+        },
+    )
+
+
 def _click_scroll_to_bottom(page: Page) -> None:
     """Use the conversation's visible library-driven re-lock control."""
     button = page.locator('[role="log"] button:has(svg.lucide-arrow-down)')
@@ -431,4 +484,26 @@ def test_composer_growth_reflows_transcript_without_covering_output(
     send_relocked_grown = _settled_geometry(page)
     assert send_relocked_grown["distanceFromBottom"] <= 1, send_relocked_grown
     assert abs(send_relocked_grown["overlap"]) <= 1, send_relocked_grown
+    expect(composer).to_be_focused()
+
+    # A released touch gesture keeps scrolling through momentum. Every trailing
+    # scroll remains user-driven, so the final settled distance must replace the
+    # finger-down distance before a later composer resize restores anything.
+    page.set_viewport_size({"width": 500, "height": 713})
+    composer.fill("")
+    composer.focus()
+    _settled_geometry(page)
+    momentum = _scroll_with_pointer_momentum(page, 500, 650)
+    assert abs(momentum["whilePressed"] - 500) <= 1, momentum
+    assert abs(momentum["afterRelease"] - 650) <= 1, momentum
+    momentum_settled = _settled_geometry(page)
+    assert abs(momentum_settled["distanceFromBottom"] - 650) <= 1, momentum_settled
+
+    composer.press("Shift+Enter")
+    momentum_grown = _settled_geometry(page)
+    assert abs(momentum_grown["distanceFromBottom"] - 650) <= 1, (
+        momentum_settled,
+        momentum_grown,
+    )
+    assert abs(momentum_grown["overlap"]) <= 1, momentum_grown
     expect(composer).to_be_focused()

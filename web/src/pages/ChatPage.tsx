@@ -2414,8 +2414,11 @@ function PreserveScrollDistanceOnResize() {
     let restorePasses = 0;
     let scrollTimer: number | null = null;
     let userIntentTimer: number | null = null;
+    let pointerScrollEndTimer: number | null = null;
     let userScrollIntent = false;
     let pointerScrolling = false;
+    let pointerReleased = false;
+    let pointerScrollObserved = false;
 
     const reconcileContentHeight = (scrollHeight: number, clientHeight: number) => {
       const delta = scrollHeight - prevSH;
@@ -2519,15 +2522,50 @@ function PreserveScrollDistanceOnResize() {
       }
     };
 
+    const clearPointerScrollIntent = () => {
+      if (pointerScrollEndTimer !== null) {
+        window.clearTimeout(pointerScrollEndTimer);
+        pointerScrollEndTimer = null;
+      }
+      pointerScrolling = false;
+      pointerReleased = false;
+      pointerScrollObserved = false;
+    };
+
+    const schedulePointerScrollEnd = (delay = 150) => {
+      if (!pointerScrolling || !pointerReleased) return;
+      if (pointerScrollEndTimer !== null) window.clearTimeout(pointerScrollEndTimer);
+      pointerScrollEndTimer = window.setTimeout(clearPointerScrollIntent, delay);
+    };
+
     const onPointerDown = () => {
+      if (pointerScrollEndTimer !== null) {
+        window.clearTimeout(pointerScrollEndTimer);
+        pointerScrollEndTimer = null;
+      }
       pointerScrolling = true;
+      pointerReleased = false;
+      pointerScrollObserved = false;
     };
 
     const onPointerUp = () => {
-      pointerScrolling = false;
+      if (!pointerScrolling) return;
+      if (!pointerScrollObserved) {
+        clearPointerScrollIntent();
+        return;
+      }
+      pointerReleased = true;
+      schedulePointerScrollEnd();
+    };
+
+    const onScrollEnd = () => {
+      // Let the debounced final scroll adopt its distance before ending intent.
+      schedulePointerScrollEnd(20);
     };
 
     const onScroll = () => {
+      if (pointerScrolling && !pointerReleased) pointerScrollObserved = true;
+      if (pointerReleased) schedulePointerScrollEnd();
       if (scrollTimer !== null) window.clearTimeout(scrollTimer);
       // Explicit wheel/key/pointer intent distinguishes genuine reader movement
       // from the library's own clamp and bottom-lock scrolls.
@@ -2568,6 +2606,7 @@ function PreserveScrollDistanceOnResize() {
     el.addEventListener("wheel", markUserScrollIntent, { passive: true });
     el.addEventListener("keydown", onKeyDown);
     el.addEventListener("pointerdown", onPointerDown, { passive: true });
+    el.addEventListener("scrollend", onScrollEnd, { passive: true });
     window.addEventListener("pointerup", onPointerUp, { passive: true });
     window.addEventListener("pointercancel", onPointerUp, { passive: true });
     observer.observe(el);
@@ -2577,11 +2616,13 @@ function PreserveScrollDistanceOnResize() {
       el.removeEventListener("wheel", markUserScrollIntent);
       el.removeEventListener("keydown", onKeyDown);
       el.removeEventListener("pointerdown", onPointerDown);
+      el.removeEventListener("scrollend", onScrollEnd);
       window.removeEventListener("pointerup", onPointerUp);
       window.removeEventListener("pointercancel", onPointerUp);
       observer.disconnect();
       if (scrollTimer !== null) window.clearTimeout(scrollTimer);
       if (userIntentTimer !== null) window.clearTimeout(userIntentTimer);
+      if (pointerScrollEndTimer !== null) window.clearTimeout(pointerScrollEndTimer);
       if (restoreFrame !== null) cancelAnimationFrame(restoreFrame);
       if (clearRestoreFrame !== null) cancelAnimationFrame(clearRestoreFrame);
       if (clearRestoreTimer !== null) window.clearTimeout(clearRestoreTimer);
