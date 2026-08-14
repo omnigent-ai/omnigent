@@ -2115,11 +2115,6 @@ def create_runner_app(
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
     _subagent_wake_pending: set[str] = set()
-    # parent_session_id -> the last stranded-inbox RE-WAKE notice delivered to
-    # that parent. A completion wake always fires; only a repeat re-wake that
-    # matches the previous re-wake verbatim (parent idled again without
-    # draining anything) is skipped, so the parent isn't re-notified with the
-    # same line at every turn boundary.
     _last_rewake_notice: dict[str, str] = {}
 
     _session_histories = _session_histories_ref
@@ -5674,10 +5669,6 @@ def create_runner_app(
             status=entry.status,
             pending=inbox.qsize(),
         )
-        # The first stranded-inbox re-wake still fires (it's the recovery nudge
-        # for a parent that idled without draining). Only a follow-up re-wake
-        # identical to the previous one is skipped — the parent idled again
-        # without draining, so repeating the same line just spams it.
         if is_rewake and notice == _last_rewake_notice.get(entry.parent_session_id):
             return
         _subagent_wake_pending.add(entry.parent_session_id)
