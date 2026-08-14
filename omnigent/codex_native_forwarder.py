@@ -6835,7 +6835,7 @@ def _thread_started_is_subagent(event: CodexMessage) -> bool:
 async def wait_for_thread_started(
     client: CodexAppServerClient,
     *,
-    timeout: float = _THREAD_START_TIMEOUT_SECONDS,
+    timeout: float | None = _THREAD_START_TIMEOUT_SECONDS,
 ) -> str:
     """
     Wait for a freshly launched Codex TUI to create its app-server thread.
@@ -6851,7 +6851,8 @@ async def wait_for_thread_started(
 
     :param client: A connected :class:`CodexAppServerClient` listening for
         app-server notifications.
-    :param timeout: Seconds to wait for ``thread/started`` before failing.
+    :param timeout: Seconds to wait for ``thread/started`` before failing;
+        ``None`` waits until a thread starts or the event stream ends.
     :returns: The Codex thread id, e.g.
         ``"019e8720-98d7-7b23-ac0a-bfb0eb02e0c9"``.
     :raises TimeoutError: If no ``thread/started`` arrives within *timeout*.

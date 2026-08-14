@@ -105,11 +105,6 @@ _TRUSTED_HOOK_STATUSES = frozenset({"trusted", "managed"})
 # — we detect the old version up front and skip registration with a loud
 # warning rather than crash startup on an un-trustable hook.
 _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
-# Minimum codex CLI version that accepts ``--dangerously-bypass-hook-trust``.
-# Older binaries exit immediately on the unknown flag, so below this floor
-# (including a version we could not parse) the flag is omitted and the
-# interactive trust prompt may appear instead.
-_MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
 
 
 def _string_object_dict(value: object) -> _JsonObject | None:

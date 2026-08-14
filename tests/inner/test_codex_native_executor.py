@@ -194,6 +194,52 @@ def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(
     ]
 
 
+def test_initial_turn_waits_for_late_thread_after_hook_review(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A cold chat turn survives while terminal hook review blocks thread creation."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    sleep_calls = 0
+
+    async def _approve_hooks_after_old_timeout(_seconds: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 61:
+            write_bridge_state(
+                tmp_path,
+                CodexNativeBridgeState(
+                    session_id="conv_123",
+                    socket_path=str(tmp_path / "app-server.sock"),
+                    thread_id="thread_after_review",
+                    codex_home=str(tmp_path / "codex-home"),
+                ),
+            )
+
+    monkeypatch.setattr(asyncio, "sleep", _approve_hooks_after_old_timeout)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "test")
+
+    assert sleep_calls == 61
+    assert [type(event) for event in events] == [TurnComplete]
+    assert _FakeCodexNativeClient.requests == [
+        (
+            "turn/start",
+            {
+                "threadId": "thread_after_review",
+                "input": [{"type": "text", "text": "test"}],
+            },
+        )
+    ]
+
+
 def test_goal_command_sets_goal_before_starting_objective_turn(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
