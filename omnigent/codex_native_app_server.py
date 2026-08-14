@@ -2283,8 +2283,9 @@ def resolve_native_codex_launch(
         config (issue #2744 — parity with the in-process codex harness).
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
+    from omnigent.onboarding.ambient import codex_config_detection
     from omnigent.onboarding.detected import (
-        codex_config_provider_dismissed,
+        dismissed_detection_names,
         effective_config_with_detected,
     )
     from omnigent.onboarding.provider_config import (
@@ -2296,14 +2297,17 @@ def resolve_native_codex_launch(
     from omnigent.spec.types import DatabricksAuth
 
     explicit = load_config()
+    config_detection = codex_config_detection()
+    config_provider_dismissed = (
+        config_detection is not None
+        and config_detection.name in dismissed_detection_names(explicit)
+    )
     # When the launch ends up on codex's own login with NO provider routing,
     # the bridged config.toml's custom default model_provider would still
     # apply — including one the user explicitly Removed (dismissed). Pin
     # codex's built-in provider in that case so the dismissal holds at run
     # time. An undetectable/undismissed custom provider keeps its routing.
-    no_provider_overrides = (
-        ['model_provider="openai"'] if codex_config_provider_dismissed(explicit) else []
-    )
+    no_provider_overrides = ['model_provider="openai"'] if config_provider_dismissed else []
     if spec is not None and (
         spec.executor.auth is not None
         or spec.executor.profile
@@ -2383,6 +2387,31 @@ def resolve_native_codex_launch(
                 summary="Codex CLI login (global auth block, non-Databricks; no provider routing)",
             )
         entry = default_provider_for_harness(effective_config_with_detected(explicit), "codex")
+
+    if (
+        entry is None
+        and config_detection is not None
+        and config_detection.model_provider is not None
+        and not config_provider_dismissed
+    ):
+        # An adopted cli-config entry can explicitly shadow the same ambient
+        # detection without being marked the Omnigent default. Codex still
+        # selects that provider from config.toml, so pin the already-resolved
+        # detection instead of describing this as an OpenAI-login launch.
+        # This keeps rollout metadata, app-server, and remote TUI routing on
+        # one immutable provider selection during cold resume.
+        provider_id = config_detection.model_provider
+        _logger.info(
+            "native-codex routing: config.toml provider %r (ambient fallback, model=%s)",
+            provider_id,
+            model,
+        )
+        return NativeCodexLaunch(
+            config_overrides=[f"model_provider={json.dumps(provider_id)}"],
+            model=model,
+            profile=None,
+            summary=f"Codex config.toml provider {provider_id!r} (ambient fallback)",
+        )
 
     if entry is None:
         _logger.info(
