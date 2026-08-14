@@ -587,22 +587,23 @@ def test_create_redeemed_grant_survives_pending_purge(store: DeviceGrantStore) -
     assert store.get_by_id("lg2") is None
 
 
-def test_accounts_login_issue_refresh_round_trip(disabled_app: TestClient) -> None:
-    """A CLI login (issue_refresh) yields refresh material that renews via
-    /oauth/token even with the device flow disabled — the core unattended-host
-    fix.
+def test_login_grant_refresh_round_trip(disabled_app: TestClient, tmp_path: Path) -> None:
+    """A login-issued refresh grant renews via /oauth/token even with the
+    device flow disabled — the core unattended-host fix.
 
     Login grants deliberately do NOT rotate: the same refresh token keeps
     working, so a lost response or a crash between the server committing and
     the client persisting cannot brick an unattended host.
     """
-    r = disabled_app.post(
-        "/auth/login",
-        json={"username": "admin", "password": "admin-pw-12345", "issue_refresh": True},
-    )
-    assert r.status_code == 200, r.text
-    refresh = r.json().get("refresh_token")
-    assert refresh, "login with issue_refresh must return a refresh token"
+    # A CLI/device login mints refresh material server-side; browser
+    # /auth/login never does (see test_web_login_never_issues_refresh).
+    import os
+
+    from omnigent.server.routes.device_auth import issue_login_grant
+
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/test.db")
+    secret = bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"])
+    refresh = issue_login_grant(store, user_id="admin", cookie_secret=secret)
 
     # Refresh: fresh access token, SAME refresh token handed back.
     r = disabled_app.post(
@@ -627,7 +628,9 @@ def test_accounts_login_issue_refresh_round_trip(disabled_app: TestClient) -> No
         assert again.json()["refresh_token"] == refresh
 
 
-def test_login_grant_token_keeps_session_authority(disabled_app: TestClient) -> None:
+def test_login_grant_token_keeps_session_authority(
+    disabled_app: TestClient, tmp_path: Path
+) -> None:
     """A refreshed login-grant token reaches routes OUTSIDE the delegated
     allowlist — it renews the session JWT and must keep its authority.
 
@@ -635,11 +638,13 @@ def test_login_grant_token_keeps_session_authority(disabled_app: TestClient) -> 
     ``/v1/usage``-style routes 401 after the first refresh, silently breaking
     agents and CLI commands on a long-lived host.
     """
-    r = disabled_app.post(
-        "/auth/login",
-        json={"username": "admin", "password": "admin-pw-12345", "issue_refresh": True},
-    )
-    refresh = r.json()["refresh_token"]
+    import os
+
+    from omnigent.server.routes.device_auth import issue_login_grant
+
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/test.db")
+    secret = bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"])
+    refresh = issue_login_grant(store, user_id="admin", cookie_secret=secret)
     r = disabled_app.post(
         "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": refresh}
     )
@@ -784,3 +789,34 @@ def test_oauth_token_router_oidc_mode(tmp_path: Path) -> None:
             "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": rotated}
         )
         assert r.status_code == 400 and r.json()["error"] == "invalid_grant"
+
+
+def test_redeemed_grant_persistence_regression(store: DeviceGrantStore) -> None:
+    """Regression test for P0 bug: create_redeemed_grant must persist the
+    grant to the database (not crash with TypeError on missing query_name).
+
+    This was broken when query_name was missing from self._session(), causing
+    the entire login-issued grant feature to silently fail (caught by
+    except Exception in the issuance sites).
+    """
+    refresh_hash = hash_secret("test-refresh", _KEY)
+
+    # Must not raise; must persist a row.
+    grant = store.create_redeemed_grant(
+        "lg-persist-test",
+        user_id="alice@example.com",
+        client_id="omnigent-cli",
+        refresh_token_hash=refresh_hash,
+        created_at=1000,
+    )
+
+    # Verify persistence: the grant should be retrievable.
+    retrieved = store.get_by_id(grant.id)
+    assert retrieved is not None
+    assert retrieved.user_id == "alice@example.com"
+    assert retrieved.status == "redeemed"
+
+    # Verify the refresh hash is usable.
+    by_hash = store.get_by_refresh_hash(refresh_hash)
+    assert by_hash is not None
+    assert by_hash.id == grant.id

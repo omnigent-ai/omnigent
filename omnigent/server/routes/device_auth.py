@@ -403,6 +403,7 @@ def create_oauth_token_router(
     device_grant_store: DeviceGrantStore,
     *,
     handle_device_code: Callable[[str], Response] | None = None,
+    client_secret_ok: Callable[[Request], bool] | None = None,
 ) -> APIRouter:
     """Build the ``/oauth/token`` + ``/oauth/revoke`` router.
 
@@ -419,10 +420,17 @@ def create_oauth_token_router(
         the full flow keeps one token endpoint; standalone mounts leave
         it ``None`` and ``device_code`` exchanges get
         ``unsupported_grant_type``.
+    :param client_secret_ok: Optional client-secret gate (callable that validates
+        the request). When ``None`` (standalone mounts), builds the gate from
+        the ``OMNIGENT_DEVICE_CLIENT_SECRET`` env var. When provided
+        (from :func:`create_device_auth_router`), reuses the gate to avoid
+        duplication.
     :returns: APIRouter to mount at the app root.
     """
     cookie_secret, provider_name = _resolve_signing_config(auth_provider)
-    _client_secret_ok = _make_client_secret_gate()
+    _client_secret_ok = client_secret_ok or _make_client_secret_gate()
+    # Resolve grant max lifetime once at mount time (not on every refresh).
+    _grant_max_lifetime = _grant_max_lifetime_seconds()
     router = APIRouter()
     # Throttle for the opportunistic grant purge (bounds the table without a
     # separate scheduler). Mutable one-field dict so the closures can update
@@ -443,7 +451,7 @@ def create_oauth_token_router(
         _last_purge["at"] = now_wall
         try:
             device_grant_store.purge_expired(
-                int(now_wall), max_lifetime_seconds=_grant_max_lifetime_seconds()
+                int(now_wall), max_lifetime_seconds=_grant_max_lifetime
             )
         except Exception:  # noqa: BLE001 — housekeeping must never fail a refresh
             _logger.debug("oauth/token: opportunistic grant purge failed", exc_info=True)
@@ -517,7 +525,7 @@ def create_oauth_token_router(
         # must re-consent. Checked before rotating so an aged grant simply
         # stops working (it is NOT reuse, so it must not revoke/oscillate).
         if grant.approved_at is not None and (
-            int(time.time()) - grant.approved_at >= _grant_max_lifetime_seconds()
+            int(time.time()) - grant.approved_at >= _grant_max_lifetime
         ):
             return _oauth_error("expired_token")
         if grant.user_id is None:
@@ -548,7 +556,7 @@ def create_oauth_token_router(
             expected_hash=presented_hash,
             new_hash=hash_secret(new_refresh, cookie_secret),
             now_epoch_seconds=int(time.time()),
-            max_lifetime_seconds=_grant_max_lifetime_seconds(),
+            max_lifetime_seconds=_grant_max_lifetime,
         )
         if rotated is None:
             # Lost a concurrent rotation race, or the grant aged out between
@@ -640,6 +648,8 @@ def create_device_auth_router(
     provider_name = auth_provider._source
 
     _client_secret_ok = _make_client_secret_gate()
+    # Resolve grant max lifetime once at mount (not on every purge).
+    _grant_max_lifetime = _grant_max_lifetime_seconds()
 
     router = APIRouter()
     _rate_limiter = _SlidingWindowRateLimiter(
@@ -687,7 +697,7 @@ def create_device_auth_router(
             _last_purge["at"] = now_wall
             try:
                 device_grant_store.purge_expired(
-                    int(now_wall), max_lifetime_seconds=_grant_max_lifetime_seconds()
+                    int(now_wall), max_lifetime_seconds=_grant_max_lifetime
                 )
             except Exception:  # housekeeping must never fail a request
                 _logger.exception("device grant purge failed")
@@ -951,6 +961,7 @@ def create_device_auth_router(
             auth_provider,
             device_grant_store,
             handle_device_code=_handle_device_code_grant,
+            client_secret_ok=_client_secret_ok,
         )
     )
 

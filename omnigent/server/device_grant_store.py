@@ -167,7 +167,7 @@ class DeviceGrantStore:
             anchor for the grant's absolute lifetime.
         :returns: The created :class:`DeviceGrant`.
         """
-        with self._session() as session:
+        with self._session("insert_redeemed_device_grant") as session:
             row = SqlDeviceGrant(
                 id=grant_id,
                 device_code_hash=secrets.token_urlsafe(32),

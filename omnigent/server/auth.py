@@ -610,6 +610,8 @@ class UnifiedAuthProvider(AuthProvider):
         # never served from the plain user-id cache (which would skip both).
         grant_id = payload.get("grant_id")
         if grant_id is not None:
+            if not isinstance(grant_id, str):
+                return None
             if self._grant_revoked is not None and self._grant_revoked(grant_id):
                 return None
             # The allowlist restricts DELEGATED tokens — a third-party

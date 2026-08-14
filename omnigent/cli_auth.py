@@ -144,6 +144,10 @@ def _store_entry(server_url: str, entry: dict[str, str | float]) -> None:
         except (json.JSONDecodeError, OSError):
             data = {}
 
+    # Corrupt token files (non-dict JSON) read as empty — never crash.
+    if not isinstance(data, dict):
+        data = {}
+
     data[_normalize_server_url(server_url)] = entry
 
     _write_tokens_file(path, data)
@@ -298,7 +302,8 @@ def _warn_expired_once(server_url: str, expires_at: float, *, has_refresh: bool)
     expired_on = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(expires_at))
     if has_refresh:
         _logger.warning(
-            "Stored login session for %s expired on %s — attempting automatic refresh",
+            "Stored login session for %s expired on %s; refresh will be "
+            "attempted on the next command if possible",
             normalized,
             expired_on,
         )
