@@ -48,6 +48,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
@@ -763,6 +764,7 @@ def create_app(
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
+    feature_flags: FeatureFlags | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -853,6 +855,9 @@ def create_app(
         open to ``ON`` when unset or unrecognized. Reported by
         ``GET /v1/info`` as ``sharing_mode`` so the web app can gate its
         Share controls to match.
+    :param feature_flags: Optional immutable release-feature snapshot.
+        When omitted, resolves the comma-separated ``OMNIGENT_FEATURES``
+        enabled set once at application construction.
     :param public_sharing: Whether public (anyone-with-the-link) read
         access may be granted — i.e. whether the ``__public__`` grant is
         allowed. Orthogonal to ``sharing_mode``: a server can keep normal
@@ -871,6 +876,8 @@ def create_app(
     """
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
+
+    resolved_feature_flags = feature_flags or resolve_feature_flags()
 
     # First-boot admin bootstrap for the accounts auth provider.
     # Runs before any route is mounted so the login page is never
@@ -1185,6 +1192,7 @@ def create_app(
     app.state.host_store = host_store
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
+    app.state.feature_flags = resolved_feature_flags
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -1888,17 +1896,10 @@ def create_app(
         except ImportError:
             smart_routing_enabled = False
             smart_routing_sources = {"external": False, "oss": False}
-        # harness_install_enabled gates the web UI's "Install" action for a
-        # missing, npm-installable harness on a connected host. Off by default
-        # (OMNIGENT_HARNESS_INSTALL_ENABLED=1 opts in) while the feature rolls
-        # out; when false the SPA keeps the prior "run omnigent setup" hint.
-        # Read live so flipping the env var takes effect without a rebuild.
-        # The env-var name is shared with the install route so the flag the UI
-        # sees and the flag the route enforces can never drift apart.
-        from omnigent.process_logging import env_truthy
-        from omnigent.server.routes.hosts import HARNESS_INSTALL_ENABLED_ENV
-
-        harness_install_enabled = env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV))
+        # The immutable feature snapshot is shared by capability
+        # advertisement and route enforcement, so frontend and backend cannot
+        # disagree during a process lifetime.
+        harness_install_enabled = app.state.feature_flags.enabled(Feature.HARNESS_INSTALL)
         # installable_harnesses: the exact harness ids the install route accepts
         # (bare ids + native spellings resolving to an npm-installable family),
         # so the SPA offers setup only where it will succeed and never has to
@@ -1930,6 +1931,8 @@ def create_app(
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
             "smart_routing_sources": smart_routing_sources,
+            "features": app.state.feature_flags.frontend_dict(),
+            # Compatibility fields for frontends predating the feature map.
             "harness_install_enabled": harness_install_enabled,
             "installable_harnesses": installable_harnesses,
             "dictation_available": dictation_available,
@@ -2032,6 +2035,7 @@ def create_app(
         create_usage_router(
             conversation_store,
             auth_provider=auth_provider,
+            feature_flags=resolved_feature_flags,
         ),
         prefix="/v1",
         tags=["usage"],
@@ -2498,6 +2502,7 @@ def create_app(
                 permission_store=permission_store,
                 agent_store=agent_store,
                 agent_cache=agent_cache,
+                feature_flags=resolved_feature_flags,
             ),
             prefix="/v1",
             tags=["hosts"],

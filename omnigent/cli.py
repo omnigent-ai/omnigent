@@ -2888,7 +2888,7 @@ def _foreground_daemon_record(
         started_at=int(time.time()),
         host_id=host_id,
         resolved_server_url=server_url.rstrip("/") if mode == "local" else None,
-        config_sig=server_config_signature(),
+        config_sig=server_config_signature(include_features=mode == "local"),
     )
 
 
@@ -3015,7 +3015,7 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     _persist_spawned_daemon(
         target=target,
         spawned=spawned,
-        config_sig=server_config_signature(),
+        config_sig=server_config_signature(include_features=not server_url),
     )
     return decision.config_changed
 

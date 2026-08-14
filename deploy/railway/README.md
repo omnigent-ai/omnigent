@@ -73,6 +73,14 @@ steps below are validated end-to-end:
 > visitor. Pre-seed `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`, or complete setup
 > promptly after the deploy goes live.
 
+## Release features
+
+In the Omnigent service's **Variables** tab, set `OMNIGENT_FEATURES` to a
+comma-separated enabled set such as `usage_page`. Railway redeploys the service
+automatically. Remove the key from the value to roll back, then reload the web
+app. See [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for known
+keys.
+
 ## Use your own IdP instead (OIDC)
 
 Prefer GitHub / Google / Okta login over built-in accounts? Switch the provider
