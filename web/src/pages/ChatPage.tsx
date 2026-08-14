@@ -2021,7 +2021,7 @@ function MainAgentSurface({
               <ConversationContent
                 scrollClassName="transcript-hide-native-scrollbar"
                 className={cn(
-                  "chat-conversation-content mx-auto w-full gap-4 px-4 pt-20 pb-6",
+                  "chat-conversation-content mx-auto w-full gap-4 px-4 pt-20 pb-[calc(1.5rem+var(--composer-growth,0px))]",
                   "md:pl-[clamp(1rem,(54rem-100cqi)*0.5+1rem,1.5rem)]",
                   CHAT_COLUMN_WIDTH,
                 )}
@@ -5004,8 +5004,9 @@ export function Composer({
   // The extra rows float over the transcript instead of shrinking it: a
   // negative top margin holds the form's margin box at its resting height, so
   // the transcript's scroll viewport — and with it the scrollbar's travel and
-  // the turn rail's centering — stays exactly where it was. Only the taller
-  // card overlaps, and it's opaque across the message column.
+  // the turn rail's centering — stays exactly where it was. The taller card
+  // overlaps, and the transcript's bottom padding grows by the same amount
+  // (via --composer-growth) so the last messages stay visible.
   const applyGrowth = useCallback(
     (px: number) => {
       const form = formRef.current;
