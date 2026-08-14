@@ -1129,6 +1129,12 @@ aside[aria-label="Workspace"][data-maximized] {
   overflow-wrap: break-word;
 }
 
+/* Resets table cells to `break-word` so the inherited `wrap-anywhere` from the chat prose root doesn't collapse a column's min-content. */
+[data-streamdown="table-cell"],
+[data-streamdown="table-header-cell"] {
+  overflow-wrap: break-word;
+}
+
 /* KaTeX lays out radicals/fractions with positioned spans. Wide display math
  * gets its own horizontal scroll surface instead of relying on the surrounding
  * chat bubble to clip or wrap it. (No overflow-y override: with overflow-x

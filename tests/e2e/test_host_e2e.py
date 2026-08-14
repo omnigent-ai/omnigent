@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import time
 import uuid
@@ -263,6 +264,103 @@ def test_host_connect_and_list(
     resp = http_client.get(f"/v1/hosts/{host_id}")
     if resp.status_code == 200:
         assert resp.json()["status"] == "offline", "Host should be offline after daemon is killed"
+
+
+def _wait_for_host_online_by_name(
+    client: httpx.Client,
+    host_name: str,
+    timeout: float = 30.0,
+) -> dict[str, object]:
+    """Poll GET /v1/hosts until a host with *host_name* is online.
+
+    Used when the host_id isn't known in advance (the daemon generates it),
+    so the test matches on the seeded name instead.
+
+    :param client: HTTP client pointed at the server.
+    :param host_name: Host name to wait for.
+    :param timeout: Max seconds to wait.
+    :returns: The matching host dict from the list response.
+    :raises AssertionError: If no such host appears online.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            resp = client.get("/v1/hosts")
+            if resp.status_code == 200:
+                for host in resp.json().get("hosts", []):
+                    if host["name"] == host_name and host["status"] == "online":
+                        return host
+        except httpx.ConnectError:
+            # The API may be temporarily unreachable during startup; retry until timeout.
+            pass
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"Host named {host_name!r} did not appear online within {timeout}s")
+
+
+def test_host_name_only_config_generates_host_id(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+    mock_llm_server_url: str,
+) -> None:
+    """
+    A config.yaml that names the host but omits host_id must register
+    end-to-end under the provided name with a freshly generated id.
+
+    Regression for the name-only path: the daemon used to overwrite the
+    chosen name with the machine hostname and mint a fresh id, so the
+    host showed up under the wrong name. It should now keep the name and
+    generate + persist only the missing host_id.
+    """
+    omni_dir = tmp_path / ".omnigent"
+    omni_dir.mkdir(parents=True, exist_ok=True)
+    config_path = omni_dir / "config.yaml"
+    # Unique name so the (owner, name) host row doesn't collide with the
+    # session-scoped server's other host rows.
+    host_name = f"e2e-nameonly-{uuid.uuid4().hex[:12]}"
+    config_path.write_text(
+        yaml.safe_dump({"host": {"name": host_name}}, default_flow_style=False, sort_keys=True)
+    )
+
+    daemon_log = tmp_path / "host-daemon.log"
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
+        "OPENAI_API_KEY": "mock-key",
+        PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
+    }
+    with open(daemon_log, "w") as log_fh:
+        proc = subprocess.Popen(
+            [runner_executable(), "-m", "omnigent.host._daemon_entry", "--server", live_server],
+            env=apply_runner_env(env),
+            cwd=compat_runner_cwd(),
+            stdout=subprocess.DEVNULL,
+            stderr=log_fh,
+        )
+    try:
+        host = _wait_for_host_online_by_name(http_client, host_name, timeout=30.0)
+        # The provided name survived — not replaced by the machine hostname.
+        assert host["name"] == host_name
+        assert host["name"] != socket.gethostname()
+
+        # The daemon generated + persisted a bare 32-char hex host_id.
+        cfg = yaml.safe_load(config_path.read_text())
+        persisted_id = cfg["host"]["host_id"]
+        assert isinstance(persisted_id, str) and len(persisted_id) == 32
+        int(persisted_id, 16)  # raises ValueError if not valid hex
+        # The name is kept in the persisted config too.
+        assert cfg["host"]["name"] == host_name
+
+        # The registered host_id is exactly what was written to config.yaml.
+        assert host["host_id"] == persisted_id
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
 
 def test_host_launch_runner_and_session_round_trip(

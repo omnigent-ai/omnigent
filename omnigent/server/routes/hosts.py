@@ -54,7 +54,7 @@ from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_launch
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.host_store import HostStore, host_is_live
+from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -84,6 +84,31 @@ _INSTALL_HARNESS_TIMEOUT_S = 420.0
 # off). Named once here and shared by the route (this file) and the /v1/info
 # flag in app.py so the two reads can never diverge on a typo.
 HARNESS_INSTALL_ENABLED_ENV = "OMNIGENT_HARNESS_INSTALL_ENABLED"
+
+
+def _host_absent_error(host: Host) -> OmnigentError:
+    """Classify a "host not on this replica" miss for a host-scoped route.
+
+    Every ``/v1/hosts/{id}/*`` route reaches the host over its live tunnel in
+    the local (this-replica) ``HostRegistry``. When replicas are sharded by
+    host, a request keyed to ``host_id`` can land on a replica that doesn't
+    hold the tunnel — the same wrong-replica case ``RunnerRouter`` handles for
+    runner dispatch (see ``_runner_absent_code``). Tell the two apart using the
+    host record the caller already loaded:
+
+    - still **live** (online + fresh heartbeat) → up on some replica, just not
+      here → :data:`~ErrorCode.WRONG_REPLICA` (400) so the client re-addresses
+      WITHOUT the key.
+    - otherwise → genuinely offline → ``CONFLICT`` (409).
+
+    :param host: The host's persistent record (owner-checked by the caller).
+    :returns: The ``OmnigentError`` to raise; the global handler maps its code
+        to the HTTP status and the ``{"error": {"code": ...}}`` body the
+        client's re-address matches on.
+    """
+    if host_is_live(host):
+        return OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
+    return OmnigentError("host is offline", code=ErrorCode.CONFLICT)
 
 
 async def _proxy_model_options(
@@ -672,7 +697,7 @@ def create_hosts_router(
             raise HTTPException(status_code=403, detail="not your host")
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         result = await _proxy_model_options(
             host_registry=host_registry,
@@ -1097,7 +1122,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         result = await _proxy_list_dir(
             host_registry=host_registry,
@@ -1188,7 +1213,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         result = await _proxy_create_dir(
             host_registry=host_registry,
@@ -1276,7 +1301,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         # Coalesce concurrent installs of the same harness FAMILY onto one
         # in-flight request so a double-click (or `codex` + `codex-native`, which
@@ -1392,7 +1417,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         frame = HostStoreSecretFrame(
             request_id=secrets.token_hex(8),
@@ -1472,7 +1497,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         result = await _proxy_detect_credentials(host_registry=host_registry, host_conn=conn)
         return {
@@ -1528,7 +1553,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         try:
             worktrees = await list_worktrees_on_host(

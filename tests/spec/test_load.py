@@ -458,13 +458,13 @@ def _write_parent_with_sub_agents(
     parent_agents: list[str],
     sub_agents: dict[str, dict],
 ) -> None:
-    """Write a ``config.yaml`` parent bundle with ``agents/<name>/`` children.
+    """Write a ``config.yaml`` parent bundle with ``agents/<dir>/`` children.
 
     :param root: Bundle root to populate.
     :param parent_agents: Names placed under the parent's
         ``tools.agents`` delegation list.
     :param sub_agents: Map of sub-agent name → its ``config.yaml`` dict,
-        each written to ``agents/<name>/config.yaml``.
+        each written to ``agents/<dir>/config.yaml``.
     """
     parent = {
         "spec_version": 1,

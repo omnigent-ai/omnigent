@@ -52,7 +52,9 @@ from omnigent.server.auth import (
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
+    background_title_prompt,
     prepare_background_session_title,
+    schedule_background_child_task_summary,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
@@ -198,6 +200,7 @@ from omnigent.session_lifecycle import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
+from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
@@ -1182,6 +1185,29 @@ def register_events_routes(
                 if conv is None:
                     raise _session_not_found()
                 runner_client = await _get_runner_client(session_id, runner_router)
+        # Check for wrong-replica routing miss before attempting healing or dispatch.
+        # The runner tunnel is registered on the same replica as its host; when the
+        # tunnel is absent here but the host is live elsewhere, the key routed to
+        # the wrong replica. Signal this to the client so it re-addresses without
+        # the key rather than repeatedly trying this replica.
+        # sub-agent heal below: a wrong-replica send must re-address without the
+        # key rather than attempt a heal against this replica's registry.
+        if runner_client is None and conv.host_id is not None:
+            _wrong_pod_host_reg = getattr(request.app.state, "host_registry", None)
+            _wrong_pod_host_store = getattr(request.app.state, "host_store", None)
+            if (
+                _wrong_pod_host_reg is not None
+                and _wrong_pod_host_store is not None
+                and _wrong_pod_host_reg.get(conv.host_id) is None
+            ):
+                _wrong_pod_host = await asyncio.to_thread(
+                    _wrong_pod_host_store.get_host, conv.host_id
+                )
+                if _wrong_pod_host is not None and host_is_live(_wrong_pod_host):
+                    raise OmnigentError(
+                        "session runner is on another replica; retry",
+                        code=ErrorCode.WRONG_REPLICA,
+                    )
         if runner_client is None and conv.kind == "sub_agent":
             # A sub-agent copies its parent's runner_id at creation and is
             # never repointed when the parent's runner is relaunched.  If the
@@ -1478,6 +1504,23 @@ def register_events_routes(
             conversation=conv,
             event=body,
         )
+        # Schedule display-name generation for child sessions (the
+        # title coordinator skips children because their title is
+        # the stable spawn-or-continue key).
+        if (
+            conv.parent_conversation_id is not None
+            and conv.task_summary is None
+            and background_title_coordinator is not None
+        ):
+            _prompt_for_display = background_title_prompt(body)
+            if _prompt_for_display:
+                schedule_background_child_task_summary(
+                    coordinator=background_title_coordinator,
+                    session_id=session_id,
+                    prompt=_prompt_for_display,
+                    agent_id=conv.agent_id,
+                    sub_agent_name=conv.sub_agent_name,
+                )
         if body.type == _SLASH_COMMAND_TYPE:
             if _agent is None:
                 raise OmnigentError(
@@ -1602,6 +1645,20 @@ def register_events_routes(
             session_id,
             runner_router,
         )
+        # Check for wrong-replica routing miss before streaming.
+        # If the host is wired and the runner is on another replica, signal 400
+        # so setups that don't wire hosts are unaffected.
+        if runner_client is None and conv.runner_id and conv.host_id:
+            host_registry_state = getattr(request.app.state, "host_registry", None)
+            host_store_state = getattr(request.app.state, "host_store", None)
+            if host_registry_state is not None and host_store_state is not None:
+                if host_registry_state.get(conv.host_id) is None:
+                    host = await asyncio.to_thread(host_store_state.get_host, conv.host_id)
+                    if host is not None and host_is_live(host):
+                        raise OmnigentError(
+                            "session stream is on another replica; retry",
+                            code=ErrorCode.WRONG_REPLICA,
+                        )
         await _ensure_runner_relay_ready(
             session_id,
             conv.runner_id,

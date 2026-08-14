@@ -34,6 +34,7 @@ function ctx(opts?: {
   timestamp?: number;
   createdBy?: string;
   createdAtS?: number;
+  clientCreatedAtS?: number;
 }): BlockContext {
   return {
     agent: opts?.agent ?? "test",
@@ -44,6 +45,7 @@ function ctx(opts?: {
     itemId: opts?.itemId === undefined ? null : opts.itemId,
     ...(opts?.createdBy !== undefined ? { createdBy: opts.createdBy } : {}),
     ...(opts?.createdAtS !== undefined ? { createdAtS: opts.createdAtS } : {}),
+    ...(opts?.clientCreatedAtS !== undefined ? { clientCreatedAtS: opts.clientCreatedAtS } : {}),
   };
 }
 
@@ -147,7 +149,7 @@ describe("buildBubbles — bubble grouping", () => {
     // The blockStream stamps a unique response id on REQUEST-phase
     // elicitations precisely so they do NOT fold into the previous turn's
     // assistant bubble. With that distinct id, the card is its own
-    // elicitation-only bubble, which is what `isRequestElicitationBubble`
+    // elicitation-only bubble, which is what `isStandaloneElicitationBubble`
     // (ChatPage) keys on to lift the prompt above it.
     const blocks: AnyBlock[] = [
       {
@@ -175,6 +177,142 @@ describe("buildBubbles — bubble grouping", () => {
     expect(answer.items.map((i) => i.kind)).toEqual(["text"]);
     const card = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
     expect(card.items.map((i) => i.kind)).toEqual(["elicitation"]);
+  });
+
+  it("an AskUserQuestion card splits its turn into work / card / work", () => {
+    // The user answering a question is a turn boundary, not a step of the
+    // agent's work: the card takes a bubble of its own (so it renders
+    // outside the "Worked for" fold) and the work after the answer folds
+    // under a NEW one. All three carry the SAME response id — the card
+    // arrives mid-turn, so blockStream stamps it with the turn's id.
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "resp_1" }),
+        content: [{ type: "input_text", text: "Set it up" }],
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "resp_1" }),
+        executions: [mkExec("ls", "c1")],
+        iteration: 0,
+      },
+      {
+        type: "elicitation",
+        ctx: ctx({ itemId: null, responseId: "resp_1" }),
+        elicitationId: "elic_ask",
+        message: "Claude wants to call **AskUserQuestion**",
+        phase: "pre_tool_use",
+        policyName: "claude_native_permission",
+        contentPreview: "AskUserQuestion({})",
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept", content: { Framework: "React" } },
+        askUserQuestion: {
+          questions: [
+            {
+              question: "Which framework?",
+              options: [{ label: "React" }, { label: "Vue" }],
+              multiSelect: false,
+            },
+          ],
+        },
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "resp_1" }),
+        executions: [mkExec("write", "c2")],
+        iteration: 0,
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "resp_1" }),
+        fullText: "Wired up React.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["user", "assistant", "assistant", "assistant"]);
+    const before = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
+    const card = bubbles[2] as Extract<Bubble, { kind: "assistant" }>;
+    const after = bubbles[3] as Extract<Bubble, { kind: "assistant" }>;
+    expect(before.items.map((i) => i.kind)).toEqual(["tool"]);
+    expect(card.items.map((i) => i.kind)).toEqual(["elicitation"]);
+    expect(after.items.map((i) => i.kind)).toEqual(["tool", "text"]);
+    // The pre-card work has no answer of its own, so it needs `continued`
+    // to fold behind its own "Worked for" row.
+    expect(before.continued).toBe(true);
+    expect(card.responseId).toBe("resp_1");
+  });
+
+  it("an ExitPlanMode card splits its turn the same way", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "resp_1" }),
+        executions: [mkExec("ls", "c1")],
+        iteration: 0,
+      },
+      {
+        type: "elicitation",
+        ctx: ctx({ itemId: null, responseId: "resp_1" }),
+        elicitationId: "elic_plan",
+        message: "Claude wants to call **ExitPlanMode**",
+        phase: "pre_tool_use",
+        policyName: "claude_native_permission",
+        contentPreview: "ExitPlanMode({...})",
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept" },
+        exitPlanMode: { plan: "# Plan\n\n1. Do the thing" },
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "resp_1" }),
+        fullText: "Done.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "assistant", "assistant"]);
+    expect((bubbles[1] as Extract<Bubble, { kind: "assistant" }>).items.map((i) => i.kind)).toEqual(
+      ["elicitation"],
+    );
+  });
+
+  it("an approval card stays inside the turn it gated", () => {
+    // Approvals are part of the work's history — they fold with the trace
+    // in document order. Only cards that ask the USER split the bubble.
+    const blocks: AnyBlock[] = [
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "resp_1" }),
+        executions: [mkExec("ls", "c1")],
+        iteration: 0,
+      },
+      {
+        type: "elicitation",
+        ctx: ctx({ itemId: null, responseId: "resp_1" }),
+        elicitationId: "elic_push",
+        message: "Allow `git push`?",
+        phase: "tool_call",
+        policyName: "blast_radius",
+        contentPreview: '{"command": "git push"}',
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept" },
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "resp_1" }),
+        fullText: "Pushed.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.length).toBe(1);
+    const turn = bubbles[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(turn.items.map((i) => i.kind)).toEqual(["tool", "elicitation", "text"]);
   });
 
   it("two response_ids produce two assistant bubbles in order", () => {
@@ -2836,7 +2974,7 @@ describe("buildBubbles — workedForS turn duration", () => {
   const textDone = (
     itemId: string,
     text: string,
-    stamps?: { timestamp?: number; createdAtS?: number },
+    stamps?: { timestamp?: number; createdAtS?: number; clientCreatedAtS?: number },
   ): AnyBlock => ({
     type: "text_done",
     ctx: ctx({ itemId, ...stamps }),
@@ -2884,6 +3022,92 @@ describe("buildBubbles — workedForS turn duration", () => {
         textDone("a2", "b", { createdAtS: 1_753_900_000 }),
       ]).workedForS,
     ).toBeUndefined();
+    // Post-timestamp-feature live shape: live blocks carry BOTH the
+    // page-relative clock and a client-epoch stamp. A mid-turn reload
+    // pairs a server-stamped first block with such a live last block —
+    // the epoch branch must not reach for the client stamp (it lives in
+    // `clientCreatedAtS` precisely so these guards stay single-clock).
+    expect(
+      assistantBubble([
+        textDone("a1", "a", { createdAtS: 1_753_900_000 }),
+        textDone("a2", "b", { timestamp: 42, clientCreatedAtS: 1_753_900_045 }),
+      ]).workedForS,
+    ).toBeUndefined();
+    // …reverse direction, live first block with both stamps.
+    expect(
+      assistantBubble([
+        textDone("a1", "a", { timestamp: 42, clientCreatedAtS: 1_753_900_045 }),
+        textDone("a2", "b", { createdAtS: 1_753_900_000 }),
+      ]).workedForS,
+    ).toBeUndefined();
+  });
+
+  it("spans live blocks that also carry client-epoch stamps via the page clock", () => {
+    // Pure-live turn post-timestamp-feature: every block has a
+    // clientCreatedAtS, but the page-relative branch still decides.
+    const bubble = assistantBubble([
+      textDone("a1", "working…", { timestamp: 10.25, clientCreatedAtS: 1_753_900_000 }),
+      textDone("a2", "done", { timestamp: 116.5, clientCreatedAtS: 1_753_900_106 }),
+    ]);
+    expect(bubble.workedForS).toBeCloseTo(106.25);
+  });
+});
+
+describe("buildBubbles — bubble display timestamps", () => {
+  const userBlock = (stamps: { createdAtS?: number; clientCreatedAtS?: number }): AnyBlock => ({
+    type: "user_message",
+    ctx: ctx({ itemId: "u1", responseId: "resp_1", ...stamps }),
+    content: [{ type: "input_text", text: "hi" }],
+  });
+  const textDone = (
+    itemId: string,
+    stamps?: { timestamp?: number; createdAtS?: number; clientCreatedAtS?: number },
+  ): AnyBlock => ({
+    type: "text_done",
+    ctx: ctx({ itemId, ...stamps }),
+    fullText: "text",
+    hasCodeBlocks: false,
+  });
+
+  it("prefers the server stamp, falls back to the client stamp", () => {
+    // Cold load: the server stamp flows straight through.
+    let bubble = buildBubbles([userBlock({ createdAtS: 1_753_900_000 })], null)[0] as Extract<
+      Bubble,
+      { kind: "user" }
+    >;
+    expect(bubble.createdAtS).toBe(1_753_900_000);
+    // Live: no server stamp yet, the client send-time stamp shows.
+    bubble = buildBubbles([userBlock({ clientCreatedAtS: 1_753_900_001 })], null)[0] as Extract<
+      Bubble,
+      { kind: "user" }
+    >;
+    expect(bubble.createdAtS).toBe(1_753_900_001);
+    // Neither: no timestamp rendered.
+    bubble = buildBubbles([userBlock({})], null)[0] as Extract<Bubble, { kind: "user" }>;
+    expect(bubble.createdAtS).toBeUndefined();
+  });
+
+  it("stamps an assistant group from its first stamped block", () => {
+    const bubble = buildBubbles(
+      [
+        textDone("a1", { clientCreatedAtS: 1_753_900_010 }),
+        textDone("a2", { clientCreatedAtS: 1_753_900_020 }),
+      ],
+      null,
+    )[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(bubble.createdAtS).toBe(1_753_900_010);
+    // The FIRST stamped block wins — the stamp marks when the response
+    // started, even when a later block carries a different clock (the
+    // live-first/server-tail mix can't occur in practice, but the walk
+    // is deterministic either way).
+    const reloaded = buildBubbles(
+      [
+        textDone("a1", { clientCreatedAtS: 1_753_900_010 }),
+        textDone("a2", { createdAtS: 1_753_900_005 }),
+      ],
+      null,
+    )[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(reloaded.createdAtS).toBe(1_753_900_010);
   });
 });
 

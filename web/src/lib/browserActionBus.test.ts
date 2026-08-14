@@ -12,14 +12,18 @@ afterEach(() => {
 });
 
 describe("browserActionBus", () => {
-  it("delivers an emitted event to a registered listener", () => {
-    const seen: BrowserActionRequestEvent[] = [];
-    const unsub = onBrowserActionRequest((e) => seen.push(e));
+  it("delivers an emitted event and its source conversation to a listener", () => {
+    const seen: { evt: BrowserActionRequestEvent; conversationId: string | null }[] = [];
+    const unsub = onBrowserActionRequest((e, conversationId) =>
+      seen.push({ evt: e, conversationId }),
+    );
     const evt = event();
 
-    emitBrowserActionRequest(evt);
+    emitBrowserActionRequest(evt, "conv_src");
 
-    expect(seen).toEqual([evt]);
+    // The delivering conversation rides alongside — the relay needs it to
+    // claim/dispatch against the right session.
+    expect(seen).toEqual([{ evt, conversationId: "conv_src" }]);
     unsub();
   });
 
@@ -29,7 +33,7 @@ describe("browserActionBus", () => {
     const unsubA = onBrowserActionRequest(a);
     const unsubB = onBrowserActionRequest(b);
 
-    emitBrowserActionRequest(event());
+    emitBrowserActionRequest(event(), "conv_src");
 
     expect(a).toHaveBeenCalledTimes(1);
     expect(b).toHaveBeenCalledTimes(1);
@@ -42,7 +46,7 @@ describe("browserActionBus", () => {
     const unsub = onBrowserActionRequest(listener);
     unsub();
 
-    emitBrowserActionRequest(event());
+    emitBrowserActionRequest(event(), "conv_src");
 
     expect(listener).not.toHaveBeenCalled();
   });
@@ -52,7 +56,7 @@ describe("browserActionBus", () => {
     const unsub1 = onBrowserActionRequest(listener);
     const unsub2 = onBrowserActionRequest(listener);
 
-    emitBrowserActionRequest(event());
+    emitBrowserActionRequest(event(), "conv_src");
 
     // Same function registered twice collapses to one Set entry.
     expect(listener).toHaveBeenCalledTimes(1);
@@ -70,7 +74,7 @@ describe("browserActionBus", () => {
     const unsubAfter = onBrowserActionRequest(after);
 
     // Must not throw despite the first listener throwing.
-    expect(() => emitBrowserActionRequest(event())).not.toThrow();
+    expect(() => emitBrowserActionRequest(event(), "conv_src")).not.toThrow();
     expect(boom).toHaveBeenCalledTimes(1);
     expect(after).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalled();
@@ -79,6 +83,6 @@ describe("browserActionBus", () => {
   });
 
   it("emitting with no listeners registered is a no-op", () => {
-    expect(() => emitBrowserActionRequest(event())).not.toThrow();
+    expect(() => emitBrowserActionRequest(event(), "conv_src")).not.toThrow();
   });
 });

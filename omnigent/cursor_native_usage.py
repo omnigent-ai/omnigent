@@ -311,9 +311,9 @@ async def forward_cursor_usage_to_session(
     # — the safe direction. Seeding from persisted usage would permanently skip a
     # wake whose idle POST crashed after the usage flush persisted.
     idle_posted_turns = 0
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
-    ) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
                 lines = await asyncio.to_thread(_read_usage_lines, bridge_dir)

@@ -820,8 +820,10 @@ class ToolsConfig:
     Declared tool references from config.yaml.
 
     :param agents: Names of sub-agents this agent can delegate to,
-        e.g. ``["summarizer", "code-reviewer"]``. Each name must
-        match a directory under ``agents/``.
+        e.g. ``["summarizer", "code-reviewer"]``. Each name must be
+        the declared ``name`` of a sub-agent under ``agents/``; the
+        directory it was parsed from may differ (see
+        :attr:`AgentSpec.source_rel_dir`).
     :param builtins: Built-in tools to enable, e.g.
         ``[BuiltinToolConfig(name="web_search")]``. Each
         entry carries the tool name and optional config fields
@@ -848,10 +850,14 @@ class ToolsConfig:
 @dataclass
 class SkillSpec:
     """
-    A parsed skill from ``skills/<name>/SKILL.md``.
+    A parsed skill from ``skills/<dir>/SKILL.md``.
+
+    The directory name is provenance only — it is recorded in
+    :attr:`skill_dir` and need not equal :attr:`name`.
 
     :param name: Lowercase kebab-case skill identifier, e.g.
-        ``"code-review"``. Must match ``[a-z0-9-]+``.
+        ``"code-review"``. Must match ``[a-z0-9-]+``. Taken from the
+        frontmatter, not from the directory name.
     :param description: Human-readable summary of what the skill
         does (max 1024 characters).
     :param content: The body of the SKILL.md file after the YAML
@@ -1417,13 +1423,13 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``{"max_retries": 3, "style": "concise"}``.
     :param instructions: Agent system prompt, typically from
         ``AGENTS.md``. ``None`` if no instructions file is present.
-    :param skills: Parsed skills from ``skills/<name>/SKILL.md``.
+    :param skills: Parsed skills from ``skills/<dir>/SKILL.md``.
     :param mcp_servers: MCP server declarations from
         ``tools/mcp/<name>.yaml``.
     :param local_tools: Discovered local tool files from
         ``tools/python/`` and ``tools/typescript/``.
     :param sub_agents: Recursively parsed child agents from
-        ``agents/<name>/``.
+        ``agents/<dir>/``.
     :param executor: Executor configuration (type, task timeout,
         max iterations). ``executor.type`` is the
         discriminator for the entire spec's validity.
@@ -1560,3 +1566,4 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     timers: bool = False
     spawn: bool = False
     agent_session_sharing: SharePolicy = SharePolicy.NONE
+    source_rel_dir: str | None = field(default=None, compare=False)

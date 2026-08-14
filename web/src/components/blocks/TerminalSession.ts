@@ -22,6 +22,12 @@ import { codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences
 const CARD_LIGHT = "#ffffff";
 const CARD_DARK = "#131517";
 
+// WebSocket close codes (RFC 6455 reserves 4xxx).
+// 4400 signals wrong-replica routing: the keyed request reached the wrong
+// replica (the ``?omnigent_slice_key=`` doesn't match where the tunnel lives).
+// Mirrors ``ws_bridge.py`` ``WS_CLOSE_WRONG_REPLICA``.
+export const WS_CLOSE_WRONG_REPLICA = 4400;
+
 /**
  * Return an xterm `ITheme` object matched to the app's light or dark palette.
  */

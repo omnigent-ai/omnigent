@@ -135,6 +135,18 @@ export function getOmnigentHostConfig(): OmnigentHostConfig {
 }
 
 /**
+ * True when host-scoped traffic must carry the host_id slice key: either the
+ * embed host fetcher is installed (managed UI) or the standalone dev bundle
+ * was pointed at a Databricks workspace via `npm run dev` (vite.config.ts sets
+ * `VITE_DATABRICKS_WORKSPACE=true`). No fetcher is installed in the dev case,
+ * so the flag is the signal. False for a bare local / self-hosted server
+ * (single replica, no sharding), where emitting the key would just dirty the log.
+ */
+export function isDatabricksWorkspace(): boolean {
+  return hostConfig.fetcher != null || import.meta.env.VITE_DATABRICKS_WORKSPACE === "true";
+}
+
+/**
  * The host-provided user search function, or `undefined` when none is
  * configured. Consumers use the absence to stay inert (plain text input).
  */

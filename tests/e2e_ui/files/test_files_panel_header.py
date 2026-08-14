@@ -15,6 +15,8 @@ The desktop Workspace rail renders ``FilesPanel`` in its ``frameless``
    becomes a button that opens the workspace directory browser, and picking a
    directory re-roots the file tree there — through the real server, runner,
    and filesystem, not a stub.
+4. Opening that browser does not flash a tooltip over the listing: the
+   popover focuses its first icon button, and only a hover may label it.
 
 None of them send a message — the header is rail state, not a function of any
 turn — so they all stay fast, LLM-free checks.
@@ -317,3 +319,49 @@ def test_files_panel_browses_to_a_directory_outside_the_workspace(
     path_button.click()
     page.get_by_test_id("workspace-picker-workspace").click()
     expect(rail.get_by_text("sentinel.txt")).to_have_count(0, timeout=30_000)
+
+
+def test_opening_the_directory_browser_does_not_flash_a_header_tooltip(
+    page: Page,
+    seeded_session: tuple[str, str],
+    tmp_path: Path,
+    _drop_routes: None,
+) -> None:
+    """Opening the browser leaves its header tooltips hidden; hovering an icon
+    still shows one.
+
+    The picker's popover focuses its first tabbable child — the Up button — so
+    a tooltip that opens on any focus would cover the listing the click was
+    meant to reveal. Only a deliberate hover should surface the label, which is
+    a real-browser distinction (focus rings and hover delays), hence an e2e
+    test rather than a jsdom one.
+    """
+    base_url, session_id = seeded_session
+
+    outside = tmp_path / "outside-workspace"
+    outside.mkdir()
+
+    _bind_host_with_listing(page, session_id, entry=outside)
+    page.goto(f"{base_url}/c/{session_id}")
+
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name=re.compile("^Files")).click()
+
+    path_button = rail.get_by_test_id("browse-location-path")
+    expect(path_button).to_be_visible(timeout=30_000)
+    path_button.click()
+
+    picker = page.get_by_test_id("workspace-picker")
+    expect(picker).to_be_visible(timeout=15_000)
+
+    # The focus that used to trigger the tooltip has landed, so a tooltip that
+    # opens on focus would already be on screen. Matching on text (the button
+    # carries the same string as its aria-label) finds only the tooltip.
+    up = picker.get_by_test_id("workspace-picker-up")
+    expect(up).to_be_focused()
+    expect(page.get_by_text("Up one level", exact=True)).to_have_count(0)
+
+    # A deliberate hover is still answered.
+    up.hover()
+    expect(page.get_by_text("Up one level", exact=True)).to_be_visible(timeout=15_000)

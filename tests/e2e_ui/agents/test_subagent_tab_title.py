@@ -25,6 +25,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.conftest import open_right_rail, set_session_task_summary
+
 
 @pytest.fixture
 def subagent_session(
@@ -169,3 +171,89 @@ def test_subagent_tab_title_uses_agent_name(
     # passes; the load-bearing part is the agent name, not the fallback.
     expect(page).to_have_title(re.compile(rf"^(?:● )?{re.escape(agent_name)}$"), timeout=30_000)
     assert "New session" not in page.title()
+
+
+_SUBAGENT_ROW = '[data-testid="subagent-row"]'
+
+# The task-derived label the background generator would produce, and the
+# structured spawn key it has to win over. Distinct strings so neither can
+# satisfy the other's assertion.
+_TASK_SUMMARY = "Investigate auth token refresh"
+_STRUCTURED_NAME = "researcher-1"
+
+
+@pytest.fixture
+def labelled_subagent(
+    seeded_session: tuple[str, str],
+) -> Iterator[tuple[str, str]]:
+    """Seed a child carrying BOTH a structured title and a task_summary.
+
+    The child's title is the structured spawn-or-continue key
+    (``"researcher:researcher-1"``), from which the UI derives
+    ``session_name``; ``task_summary`` is seeded straight into the store
+    because the background title coordinator is its only writer. Having
+    both present is the point — it is what makes the label chain's
+    preference observable.
+
+    :param seeded_session: ``(base_url, parent_id)`` from the shared fixture.
+    :returns: ``(base_url, parent_id)`` with one labelled child attached.
+    """
+    base_url, parent_id = seeded_session
+    parent = httpx.get(f"{base_url}/v1/sessions/{parent_id}", timeout=10.0)
+    parent.raise_for_status()
+    agent_id = parent.json()["agent_id"]
+
+    child = httpx.post(
+        f"{base_url}/v1/sessions",
+        json={
+            "agent_id": agent_id,
+            "parent_session_id": parent_id,
+            "sub_agent_name": "researcher",
+            "title": f"researcher:{_STRUCTURED_NAME}",
+        },
+        timeout=30.0,
+    )
+    child.raise_for_status()
+    child_id = child.json()["id"]
+    set_session_task_summary(child_id, _TASK_SUMMARY)
+    try:
+        yield (base_url, parent_id)
+    finally:
+        httpx.delete(f"{base_url}/v1/sessions/{child_id}", timeout=10.0)
+
+
+def test_subagent_rail_prefers_task_summary_over_structured_name(
+    page: Page,
+    labelled_subagent: tuple[str, str],
+) -> None:
+    """The rail labels a sub-agent by its task, not its spawn key.
+
+    Sub-agents are named ``"{agent}-{ordinal}"`` so the parent has a stable
+    key to spawn-or-continue against, but that key says nothing about what
+    the sub-agent is doing. ``task_summary`` carries the task-derived label,
+    and both the list and graph views resolve it ahead of the structured
+    name — otherwise the rail reads as a row of ``researcher-1``,
+    ``researcher-2`` with no way to tell them apart.
+    """
+    base_url, parent_id = labelled_subagent
+
+    page.goto(f"{base_url}/c/{parent_id}")
+
+    # Scope to the desktop "Workspace" rail so lookups don't also match the
+    # hidden mobile drawer, which mirrors the same testids.
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name=re.compile("^Agents")).click()
+
+    row = rail.locator(_SUBAGENT_ROW).first
+    expect(row).to_be_visible(timeout=30_000)
+
+    # List view: the task label wins, and the structured key it beat is
+    # nowhere in the row (a fallback regression would surface it here).
+    expect(row).to_contain_text(_TASK_SUMMARY, timeout=30_000)
+    assert _STRUCTURED_NAME not in row.inner_text()
+
+    # Graph view resolves the label through its own layout code, so it gets
+    # its own assertion rather than riding on the list's.
+    rail.locator('[data-testid="view-mode-graph"]').click()
+    expect(rail).to_contain_text(_TASK_SUMMARY, timeout=30_000)
