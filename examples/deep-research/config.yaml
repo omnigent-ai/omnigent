@@ -78,7 +78,7 @@ prompt: |
 #     #   api_key: ${NIMBLE_API_KEY}
 #     #   search_depth: deep
 #
-#     # Page reader — fetch a found URL's full text as markdown, past
-#     # JavaScript / bot protection (pair with any web_search above):
-#     # - name: web_scrape
-#     #   scrape_provider: jina         # keyless; or nimble / firecrawl with an api_key
+#     # Page reader — fetch a found URL's full text as markdown, with
+#     # JavaScript rendering (pair with any web_search above):
+#     # - name: web_read
+#     #   read_provider: jina         # keyless; or nimble / firecrawl with an api_key

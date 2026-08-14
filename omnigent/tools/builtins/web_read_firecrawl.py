@@ -1,19 +1,19 @@
-"""``web_scrape`` backend: Firecrawl single-URL scrape.
+"""``web_read`` backend: Firecrawl single-URL retrieval.
 
 Fetches one URL as clean markdown via Firecrawl's ``POST /v2/scrape``.
-Firecrawl renders JavaScript and, with ``proxy: auto``, retries through a
-stealth proxy when a basic fetch is blocked — an LLM-native alternative to
-Nimble that is also self-hostable (open-source core).
+Firecrawl renders JavaScript and, with ``proxy: auto``, escalates to a more
+capable proxy tier for higher reliability — an LLM-native alternative to Nimble
+that is also self-hostable (open-source core).
 
 Configured in the agent spec::
 
     tools:
       builtins:
-        - name: web_scrape
-          scrape_provider: firecrawl
+        - name: web_read
+          read_provider: firecrawl
           api_key: ${FIRECRAWL_API_KEY}
           # optional:
-          # proxy: auto            # basic | enhanced | auto (default; escalates on block)
+          # proxy: auto            # basic | enhanced | auto (default; escalates for reliability)
 
 See https://docs.firecrawl.dev/api-reference/endpoint/scrape
 """
@@ -26,8 +26,8 @@ from typing import Any
 import httpx
 
 _DEFAULT_BASE_URL = "https://api.firecrawl.dev"
-# Proxy tier, escalating: ``basic`` (datacenter) -> ``enhanced`` (residential /
-# harder targets) -> ``auto`` (start basic, retry enhanced on a block).
+# Proxy tier, escalating: ``basic`` (datacenter) -> ``enhanced`` (residential,
+# higher reliability) -> ``auto`` (start basic, escalate to enhanced if needed).
 _DEFAULT_PROXY = "auto"
 _VALID_PROXIES = frozenset({"basic", "enhanced", "auto"})
 _DEFAULT_TIMEOUT_S = 120.0
@@ -38,17 +38,17 @@ def _base_url() -> str:
     return os.environ.get("OMNIGENT_FIRECRAWL_BASE_URL", _DEFAULT_BASE_URL)
 
 
-def _scrape_firecrawl(url: str, config: dict[str, str]) -> str:
+def _read_firecrawl(url: str, config: dict[str, str]) -> str:
     """
     Fetch one URL as markdown via Firecrawl.
 
-    :param url: The page URL to scrape (validated by the caller).
+    :param url: The page URL to read (validated by the caller).
     :param config: Spec-level config; ``api_key`` (required), ``proxy`` (optional).
     :returns: Extracted markdown, or an error message (never raises).
     """
     api_key = config.get("api_key")
     if not api_key:
-        return "Error: api_key must be provided in the web_scrape config in config.yaml."
+        return "Error: api_key must be provided in the web_read config in config.yaml."
 
     proxy = config.get("proxy", _DEFAULT_PROXY)
     if proxy not in _VALID_PROXIES:
@@ -71,22 +71,22 @@ def _scrape_firecrawl(url: str, config: dict[str, str]) -> str:
         code = exc.response.status_code
         if code in (401, 402, 403):
             return (
-                f"Firecrawl scrape error: HTTP {code} (auth/quota — check the api_key "
-                "and plan in the web_scrape config)."
+                f"Firecrawl read error: HTTP {code} (auth/quota — check the api_key "
+                "and plan in the web_read config)."
             )
-        return f"Firecrawl scrape error: HTTP {code}"
+        return f"Firecrawl read error: HTTP {code}"
     except httpx.RequestError as exc:
         # Covers connect/timeout/redirect/protocol/decoding errors uniformly.
-        return f"Firecrawl scrape error: {exc}"
+        return f"Firecrawl read error: {exc}"
 
     try:
         payload = resp.json()
     except (ValueError, TypeError):
-        return "Firecrawl scrape error: non-JSON response."
-    return _format_scrape(payload, url)
+        return "Firecrawl read error: non-JSON response."
+    return _format_read(payload, url)
 
 
-def _format_scrape(payload: dict[str, Any], url: str) -> str:
+def _format_read(payload: dict[str, Any], url: str) -> str:
     """
     Pull the markdown out of Firecrawl's ``/v2/scrape`` response.
 
@@ -100,9 +100,9 @@ def _format_scrape(payload: dict[str, Any], url: str) -> str:
         applied by the dispatcher, not here.
     """
     if not isinstance(payload, dict) or not payload.get("success", False):
-        return f"Firecrawl scrape error: {url} was not scraped successfully."
+        return f"Firecrawl read error: {url} was not retrieved successfully."
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     markdown = data.get("markdown")
     if not isinstance(markdown, str) or not markdown.strip():
-        return f"web_scrape: no content extracted from {url} (page may be empty or blocked)."
+        return f"web_read: no content extracted from {url} (page may be empty or blocked)."
     return markdown.strip()

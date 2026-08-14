@@ -172,40 +172,39 @@ tools:
     - web_fetch                            # no config needed
 ```
 
-**`web_scrape` — read one page past bot protection / JavaScript:** Fetches a
-single URL's content as clean markdown through a managed backend that renders
-JavaScript and (on the keyed backends) gets past bot protection — where a plain
-`web_fetch` would get a 403 or an empty page. Use it to read a specific URL you
-already have; use `web_search` to find URLs first. The backend is chosen
-explicitly via `scrape_provider` (no default, no env-var fallback).
+**`web_read` — read one page's content as clean markdown:** Fetches a single
+URL's content through a managed retrieval backend that renders JavaScript (and,
+on the keyed backends, uses managed retrieval for higher reliability) — where a
+plain `web_fetch` would return an empty or error page. Use it to read a specific
+URL you already have; use `web_search` to find URLs first. The backend is chosen
+explicitly via `read_provider` (no default, no env-var fallback).
 
 ```yaml
 tools:
   builtins:
-    - name: web_scrape
-      scrape_provider: jina                # keyless (rate-limited); cheap default
-    - name: web_scrape
-      scrape_provider: nimble              # browser + anti-bot; keyed
+    - name: web_read
+      read_provider: jina                # keyless (rate-limited); cheap default
+    - name: web_read
+      read_provider: nimble              # browser-rendered; keyed
       api_key: ${NIMBLE_API_KEY}
       # optional: driver (vx6 | vx8 default | vx10); output_format (markdown | html)
-    - name: web_scrape
-      scrape_provider: firecrawl           # LLM-native markdown, self-hostable; keyed
+    - name: web_read
+      read_provider: firecrawl           # LLM-native markdown, self-hostable; keyed
       api_key: ${FIRECRAWL_API_KEY}
-      # optional: proxy (basic | enhanced | auto default; escalates on block)
+      # optional: proxy (basic | enhanced | auto default)
 ```
 
 - **`jina`** — Jina Reader. Keyless by default (an `api_key` only lifts the rate
-  limit). Fast and cheap for public, lightly-protected pages; does not fight
-  aggressive anti-bot.
-- **`nimble`** — Nimble Web API. Browser-driven (JS + anti-bot). Requires
-  `api_key`. Drivers, weakest→strongest: `vx6` (plain HTTP), `vx8` (default),
-  `vx10` (hardest targets).
+  limit). Fast and cheap for public pages; lightest-weight of the three.
+- **`nimble`** — Nimble Web API. Browser-rendered for higher reliability on
+  JavaScript-heavy pages. Requires `api_key`. Drivers, lightest→most capable:
+  `vx6` (plain HTTP), `vx8` (default), `vx10` (max).
 - **`firecrawl`** — Firecrawl. LLM-native markdown, self-hostable. Requires
-  `api_key`. Auto-escalating proxy on block.
+  `api_key`. Escalating proxy tiers.
 
-`web_scrape` reads a single page — it is not a crawler — and calls a
+`web_read` reads a single page — it is not a crawler — and calls a
 rate-limited or paid backend, so agents should use it deliberately. Only
-public, non-authenticated URLs are supported (http/https); it does not bypass
+public, non-authenticated URLs are supported (http/https); it does not access
 logins or paywalls. See the tool's "Responsible use" note for details.
 
 ---
