@@ -116,6 +116,43 @@ def _all_claude_models(model_ids: list[str], *, marker: str) -> tuple[str, ...]:
     return tuple(sorted(claude_ids, key=_natural_model_key, reverse=True))
 
 
+def preferred_served_claude_model(
+    served_ids: Iterable[str], *, preferred_model_id: str
+) -> str | None:
+    """Choose a served Claude id closest to *preferred_model_id*.
+
+    Equivalent ``databricks-`` and ``system.ai.`` spellings identify the same
+    endpoint. Otherwise, the newest served model in the requested family wins,
+    followed by the standard family order.
+
+    :param served_ids: Model ids an authoritative workspace listing returned.
+    :param preferred_model_id: The implicit catalog default to match.
+    :returns: A served id, or ``None`` when no compatible Claude id is known.
+    """
+    preferred_family = _claude_family_of(preferred_model_id, marker="claude-")
+    if preferred_family is None:
+        return None
+    claude_ids = _prefer_databricks_spelling(
+        model_id
+        for model_id in served_ids
+        if _claude_family_of(model_id, marker="claude-") is not None
+    )
+    if not claude_ids:
+        return None
+    preferred_bare_id = _bare_model_id(preferred_model_id)
+    equivalent = next(
+        (model_id for model_id in claude_ids if _bare_model_id(model_id) == preferred_bare_id),
+        None,
+    )
+    if equivalent is not None:
+        return equivalent
+    newest_by_family = _models_by_claude_family(claude_ids, marker="claude-")
+    for family in (preferred_family, *CLAUDE_MODEL_FAMILIES):
+        if family in newest_by_family:
+            return newest_by_family[family]
+    return None
+
+
 def _list_model_service_ids(
     client: httpx.Client,
     workspace_url: str,

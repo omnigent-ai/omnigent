@@ -1242,6 +1242,7 @@ def test_cli_config_databricks_registers_gpt_provider(
     """
     _write_codex_config(tmp_path, _DATABRICKS_CODEX_CONFIG)
     monkeypatch.setenv("HOME", str(tmp_path))
+    _set_catalog_default(monkeypatch, "databricks-claude-fable-5")
     # Workspace URL comes from resolve_databricks_workspace (DEFAULT profile),
     # but the token for the API call comes from the auth_command — the SDK's
     # minted token may not have serving-endpoints access.
@@ -1268,6 +1269,7 @@ def test_cli_config_databricks_registers_gpt_provider(
 
     provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config)
     assert provider is not None
+    assert provider.model == "databricks-claude-sonnet-4-6"
 
     cfg = provider.to_models_config()
     openai_entry = cfg["providers"].get("omnigent-openai")
@@ -1523,6 +1525,126 @@ def _mock_databricks_profile(monkeypatch: pytest.MonkeyPatch) -> None:
         "resolve_databricks_workspace",
         lambda profile: db_creds_mod.WorkspaceCreds(host="https://wkspc.example.com", token="tok"),
     )
+
+
+def _mock_databricks_model_lists(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    claude: list[str] | None = None,
+    gpt: list[str] | None = None,
+) -> None:
+    """Resolve a Databricks profile with deterministic live model lists."""
+    _mock_databricks_profile(monkeypatch)
+
+    def _entries(model_ids: list[str] | None) -> list[dict[str, object]]:
+        return [{"id": model_id, "input": ["text", "image"]} for model_id in (model_ids or [])]
+
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda *_: (_entries(claude), _entries(gpt), [], []),
+    )
+
+
+def _set_catalog_default(monkeypatch: pytest.MonkeyPatch, model_id: str) -> None:
+    """Set the release-curated Databricks Claude default for one test."""
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: SimpleNamespace(model_id=model_id),
+    )
+
+
+def test_unserved_catalog_default_falls_back_to_served_claude(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unavailable implicit default selects a model the workspace serves."""
+    _set_catalog_default(monkeypatch, "databricks-claude-fable-5")
+    _mock_databricks_model_lists(
+        monkeypatch,
+        claude=[
+            "system.ai.claude-opus-4-8",
+            "system.ai.claude-sonnet-4-6",
+            "system.ai.claude-opus-5",
+        ],
+    )
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.model == "system.ai.claude-opus-5"
+
+
+def test_unserved_catalog_default_prefers_same_claude_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A served model in the requested family wins over a newer other tier."""
+    _set_catalog_default(monkeypatch, "databricks-claude-sonnet-5")
+    _mock_databricks_model_lists(
+        monkeypatch,
+        claude=["system.ai.claude-opus-5", "system.ai.claude-sonnet-4-6"],
+    )
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.model == "system.ai.claude-sonnet-4-6"
+
+
+def test_served_catalog_default_accepts_equivalent_spelling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Equivalent Databricks/system spellings identify the same served default."""
+    _set_catalog_default(monkeypatch, "databricks-claude-sonnet-4-6")
+    _mock_databricks_model_lists(
+        monkeypatch,
+        claude=["system.ai.claude-opus-5", "system.ai.claude-sonnet-4-6"],
+    )
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.model == "system.ai.claude-sonnet-4-6"
+
+
+def test_explicit_databricks_model_is_not_substituted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit unavailable model remains the caller's verbatim choice."""
+    _mock_databricks_model_lists(monkeypatch, claude=["system.ai.claude-opus-5"])
+
+    provider = creds.resolve_pi_native_provider(
+        model="databricks-claude-fable-5",
+        config_loader=_databricks_config,
+    )
+
+    assert provider is not None
+    assert provider.model == "databricks-claude-fable-5"
+
+
+def test_empty_databricks_discovery_keeps_catalog_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty live listing gives no safe evidence for substitution."""
+    _set_catalog_default(monkeypatch, "databricks-claude-fable-5")
+    _mock_databricks_model_lists(monkeypatch)
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.model == "databricks-claude-fable-5"
+
+
+def test_non_claude_discovery_does_not_replace_claude_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-Claude-only listing cannot justify a cross-family substitution."""
+    _set_catalog_default(monkeypatch, "databricks-claude-fable-5")
+    _mock_databricks_model_lists(monkeypatch, gpt=["system.ai.gpt-5-5"])
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.model == "databricks-claude-fable-5"
 
 
 def _databricks_provider_without_catalog(
