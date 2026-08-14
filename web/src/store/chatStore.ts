@@ -53,6 +53,7 @@ import type {
   ToolGroup,
   UserMessageBlock,
 } from "@/lib/blocks";
+import { userInputElicitationKey } from "@/lib/askUserQuestion";
 import { LIVE_ITEM_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
@@ -81,7 +82,13 @@ import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
-import { parseEvent, parseSseStream, type SseStreamResult } from "@/lib/sse";
+import {
+  SSE_STALL_TIMEOUT_MS,
+  parseEvent,
+  parseSseStream,
+  withStallGuard,
+  type SseStreamResult,
+} from "@/lib/sse";
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
@@ -3151,7 +3158,11 @@ async function bindStream(
       // branches that used to live here served the transcript LRU's revisit
       // path, which no longer exists — a revisit finds a live entry and never
       // re-binds.)
-      const allBlocks = [...unique, ...state.blocks, ...uniquePendingElicitations];
+      const allBlocks = [
+        ...unique,
+        ...withoutRebuiltUserInputCards(state.blocks, unique),
+        ...uniquePendingElicitations,
+      ];
       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
       // Decide the optimistic user bubbles to render after this bind, and
       // (on cold load) keep the per-conversation stash consistent.
@@ -3560,6 +3571,40 @@ function reconcileElicitationBlocks(
 }
 
 /**
+ * Drop live question / plan cards that history has already rebuilt.
+ *
+ * An answered card stays in the block list, and history hydration
+ * reconstructs the same card from the persisted tool call once its
+ * result lands — so a merge that pulls fresh items in alongside the
+ * live tail would show the exchange twice. The two copies carry
+ * different elicitation ids (the live one is minted per prompt and
+ * never persisted), so they pair on what was asked instead. Only
+ * answered cards are dropped: a still-parked prompt is the one the
+ * user can act on, and no persisted item can rebuild it.
+ *
+ * @param liveBlocks - Blocks the live pump produced.
+ * @param historyBlocks - Blocks translated from persisted items.
+ * @returns `liveBlocks` without the copies history now carries.
+ */
+function withoutRebuiltUserInputCards(
+  liveBlocks: AnyBlock[],
+  historyBlocks: AnyBlock[],
+): AnyBlock[] {
+  const rebuilt = new Set<string>();
+  for (const b of historyBlocks) {
+    if (b.type !== "elicitation") continue;
+    const key = userInputElicitationKey(b);
+    if (key !== null) rebuilt.add(key);
+  }
+  if (rebuilt.size === 0) return liveBlocks;
+  return liveBlocks.filter((b) => {
+    if (b.type !== "elicitation" || b.status !== "responded") return true;
+    const key = userInputElicitationKey(b);
+    return key === null || !rebuilt.has(key);
+  });
+}
+
+/**
  * Snapshot the ids of currently rendered elicitation cards, split by
  * answerable state, BEFORE a snapshot fetch. `pending` cards are
  * eligible for the gap-resolved flip; `autoResolved` cards are
@@ -3627,10 +3672,8 @@ async function rehydrateWindowOnReconnect(
     const tailIds = new Set(
       tail.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
-    const merged = [
-      ...freshBlocks.filter((b) => !b.ctx.itemId || !tailIds.has(b.ctx.itemId)),
-      ...tail,
-    ];
+    const windowBlocks = freshBlocks.filter((b) => !b.ctx.itemId || !tailIds.has(b.ctx.itemId));
+    const merged = [...windowBlocks, ...withoutRebuiltUserInputCards(tail, windowBlocks)];
     return {
       ...reconnectStatusPatch(session, s),
       blocks:
@@ -3758,18 +3801,19 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
       // committed blocks, so before-its-first would invert the bubble.
       // No rid blocks at all: append; the later replay lands after.
       const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
+      // A card answered before the gap whose call the gap persisted comes
+      // back rebuilt in `unseen` — drop the live copy before anchoring.
+      const kept = withoutRebuiltUserInputCards(s.blocks, unseen);
       let at = -1;
       if (rid) {
-        at = s.blocks.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);
+        at = kept.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);
         if (at === -1) {
-          const lastRid = s.blocks.findLastIndex((b) => b.ctx.responseId === rid);
+          const lastRid = kept.findLastIndex((b) => b.ctx.responseId === rid);
           if (lastRid !== -1) at = lastRid + 1;
         }
       }
       nextBlocks =
-        at >= 0
-          ? [...s.blocks.slice(0, at), ...unseen, ...s.blocks.slice(at)]
-          : [...s.blocks, ...unseen];
+        at >= 0 ? [...kept.slice(0, at), ...unseen, ...kept.slice(at)] : [...kept, ...unseen];
     }
     // Recover elicitation state the dead socket swallowed: gap-fired
     // prompts, gap-resolved cards, and re-parked prompts whose card
@@ -3805,10 +3849,48 @@ const presenceIdle = createPresenceIdleTracker({
     for (const controller of [...presenceAttemptControllers]) controller.abort();
   },
 });
+
+// ── Stream liveness ─────────────────────────────────────────────────
+// When bytes last arrived on each live stream attempt (heartbeats
+// included), stamped from the moment the attempt starts. Lets the fast
+// paths below tell a stream that is merely quiet from one that is
+// probably dead — tracked per attempt, since background conversations
+// hold streams of their own.
+const streamAttemptActivity = new Map<AbortController, number>();
+
+// Two missed 15 s server heartbeats plus slack. Deliberately shorter than
+// the stall guard's own window (`SSE_STALL_TIMEOUT_MS`): the guard is the
+// ceiling; these event-driven checks make the common cases immediate.
+export const SSE_STALE_RECYCLE_MS = 35_000;
+
+/**
+ * Recycle every live stream attempt that looks dead — no bytes for
+ * `SSE_STALE_RECYCLE_MS` while its connection is supposedly up.
+ *
+ * Fired on the two moments a half-open socket is most likely to be
+ * discovered: the tab becoming visible again (wake from sleep) and the
+ * browser regaining network. Aborting only the per-attempt controller
+ * funnels each pump into its normal reconnect + snapshot reconcile
+ * (background pumps add their own jitter); a healthy stream (fresh
+ * bytes) is left untouched, so alt-tabbing never churns connections.
+ */
+function recycleStreamIfStale(): void {
+  const now = Date.now();
+  // Copy first: aborting settles each attempt's `finally`, which deletes
+  // from this map while we iterate it.
+  for (const [attempt, lastActivityAt] of [...streamAttemptActivity]) {
+    if (now - lastActivityAt > SSE_STALE_RECYCLE_MS) attempt.abort();
+  }
+}
+
 if (typeof document !== "undefined") {
-  document.addEventListener("visibilitychange", () =>
-    presenceIdle.handleVisibilityChange(document.hidden),
-  );
+  document.addEventListener("visibilitychange", () => {
+    presenceIdle.handleVisibilityChange(document.hidden);
+    if (!document.hidden) recycleStreamIfStale();
+  });
+}
+if (typeof window !== "undefined") {
+  window.addEventListener("online", () => recycleStreamIfStale());
 }
 
 /**
@@ -3878,6 +3960,9 @@ export async function startStreamPump(
       const onOuterAbort = () => attempt.abort();
       controller.signal.addEventListener("abort", onOuterAbort);
       presenceAttemptControllers.add(attempt);
+      // Stamped from attempt start so the wake fast-path can also recycle
+      // an open that has hung past the stale window, not just a dead body.
+      streamAttemptActivity.set(attempt, Date.now());
       try {
         const idle = presenceIdle.idleNow();
         let streamRes: Response;
@@ -3939,12 +4024,26 @@ export async function startStreamPump(
           failedOpens += 1;
           continue;
         }
+        // An auth layer in front of the server (e.g. an expired app-ingress
+        // session) can answer with a redirect the fetch follows to a 200
+        // text/html login page. Pumping that body would end instantly
+        // without `[DONE]` and reconnect with no backoff — a hot loop that
+        // leaves the transcript silently frozen. Treat a non-SSE content
+        // type as a failed open so it backs off like any other bad answer.
+        const contentType = streamRes.headers.get("content-type") ?? "";
+        if (!contentType.toLowerCase().includes("text/event-stream")) {
+          void streamRes.body.cancel().catch(() => {});
+          console.warn(`Session ${id}: stream open returned '${contentType}', will retry`);
+          failedOpens += 1;
+          continue;
+        }
 
         const reconnecting = hasConnected;
         hasConnected = true;
         failedOpens = 0;
         consecutive404s = 0;
         presenceIdle.noteReported(idle);
+        streamAttemptActivity.set(attempt, Date.now());
         if (reconnecting) {
           dropEphemeralInFlightBlocks(id, set);
         } else {
@@ -3952,9 +4051,25 @@ export async function startStreamPump(
           // a previous stream bind so the debug panel starts clean.
           clearSseLog(id);
         }
+        // Guard the byte stream with a silence watchdog: the server
+        // heartbeats every 15 s, so a longer gap means a half-open socket
+        // (laptop sleep, network path change, proxy reap). The guard ends
+        // the stream like a transport drop, and this loop's reconnect +
+        // reconcile resupplies whatever committed during the dead window —
+        // without it the pump blocks in read() forever and the transcript
+        // silently freezes until a page reload.
+        const guardedBody = withStallGuard(streamRes.body, {
+          onActivity: () => {
+            streamAttemptActivity.set(attempt, Date.now());
+          },
+          onStall: () =>
+            console.warn(
+              `Session ${id}: no stream bytes in ${SSE_STALL_TIMEOUT_MS} ms; reconnecting`,
+            ),
+        });
         // Start the pump, then reconcile the snapshot concurrently (race-safe
         // via itemId dedup) — mirrors bindStream's stream-then-snapshot order.
-        const pumpPromise = pumpStreamEvents(id, streamRes.body, controller, set, get);
+        const pumpPromise = pumpStreamEvents(id, guardedBody, controller, set, get);
         if (reconnecting) {
           await reconcileOnReconnect(id, set, get);
         }
@@ -3971,6 +4086,7 @@ export async function startStreamPump(
       } finally {
         controller.signal.removeEventListener("abort", onOuterAbort);
         presenceAttemptControllers.delete(attempt);
+        streamAttemptActivity.delete(attempt);
       }
     }
   } finally {
@@ -4711,7 +4827,7 @@ function committedUserBlock(
       // Client clock — see blockStream.ctx; keeps server-stamped
       // `createdAtS` comparisons single-clock. A promoted optimistic
       // bubble keeps its send-time stamp rather than re-stamping now.
-      clientCreatedAtS: createdAtS ?? Math.floor(Date.now() / 1000),
+      ...(createdAtS !== undefined ? { clientCreatedAtS: createdAtS } : {}),
     },
     content,
     stableKey,

@@ -3119,6 +3119,27 @@ def create_runner_app(
             if harness_name == "claude-native":
                 terminal_ready = _launch_result
 
+                # Start the loopback relay now instead of at the first
+                # web-dispatched turn: a prompt typed directly in the TUI
+                # fires policy hooks immediately, and without the relay every
+                # hook falls back to a Python spawn + WAN round trip. In the
+                # background so session create doesn't wait on it — hooks
+                # that beat it use that same fallback.
+                async def _start_claude_relay_early() -> None:
+                    try:
+                        await _ensure_comment_relay_started(
+                            session_id, session_labels=init_context.labels
+                        )
+                    except Exception:
+                        _logger.exception("Failed to pre-start comment relay for %s", session_id)
+
+                _relay_task = asyncio.create_task(
+                    _start_claude_relay_early(),
+                    name=f"claude-comment-relay:{session_id}",
+                )
+                _relay_task.add_done_callback(_background_tasks.discard)
+                _background_tasks.add(_relay_task)
+
         if (
             spec is not None
             and not is_native_harness(harness_name)
@@ -7769,6 +7790,12 @@ def create_runner_app(
             read_only=read_only,
             on_client_interaction=entry.instance.note_client_interaction,
         )
+
+    # Reused by the loopback direct-attach listener (see
+    # ``omnigent.runner.direct_attach``): same attach handler served on a
+    # token-gated 127.0.0.1 port so a same-machine browser can skip the
+    # server relay.
+    app.state.terminal_attach_handler = terminal_resource_attach_ws
 
     async def _require_os_env(session_id: str) -> AgentSpec | None:
         spec = await _resolve_session_agent_spec(session_id)

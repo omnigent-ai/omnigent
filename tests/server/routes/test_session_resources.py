@@ -15,7 +15,14 @@ from fastapi.responses import JSONResponse
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runtime import _globals, session_stream, set_runner_client, set_runner_router
+from omnigent.runtime import (
+    _globals,
+    session_stream,
+    set_runner_client,
+    set_runner_direct_attach_resolver,
+    set_runner_router,
+)
+from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 
@@ -428,11 +435,14 @@ class _FakeRunnerRouter:
 def runner_globals_reset() -> Iterator[None]:
     prior_client = _globals._runner_client
     prior_router = _globals._runner_router
+    prior_direct = _globals._runner_direct_attach_resolver
     set_runner_client(None)
     set_runner_router(None)
+    set_runner_direct_attach_resolver(None)
     yield
     set_runner_client(prior_client)
     set_runner_router(prior_router)
+    set_runner_direct_attach_resolver(prior_direct)
 
 
 @pytest.fixture
@@ -1050,6 +1060,85 @@ async def test_list_terminals_forwards_pagination_params_to_runner(
     # here means the proxy dropped the whole query string — the
     # refresh-flips-tab-order regression.
     assert fake_runner.get_params == [{"order": "asc", "limit": "1000"}]
+
+
+def _terminals_only_payload() -> dict[str, object]:
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "terminal_runner_s1",
+                "object": "session.resource",
+                "type": "terminal",
+                "session_id": "79b22ebd2309e48fdeb450c65611d51b",
+                "name": "runner:s1",
+                "metadata": {
+                    "terminal_name": "runner",
+                    "session_key": "s1",
+                    "running": True,
+                },
+            },
+        ],
+        "first_id": "terminal_runner_s1",
+        "last_id": "terminal_runner_s1",
+        "has_more": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_terminals_adds_direct_attach_url_when_advertised(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner-advertised loopback listener surfaces per-terminal URLs.
+
+    Permissions are disabled in this harness (single-user mode), which
+    the disclosure gate treats as owner — mirroring the relay's
+    write-attach behavior.
+    """
+    fake_runner = _FakeRunnerClient(payload=_terminals_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_direct_attach_resolver(
+        lambda conversation_id: DirectAttachEndpoint(port=54321, token="tok_abc")
+    )
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals")
+
+    assert resp.status_code == 200
+    (item,) = resp.json()["data"]
+    assert item["metadata"]["direct_attach_url"] == (
+        "ws://127.0.0.1:54321/v1/sessions/79b22ebd2309e48fdeb450c65611d51b"
+        "/resources/terminals/terminal_runner_s1/attach?token=tok_abc"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_terminals_without_resolver_leaves_payload_untouched(
+    client: httpx.AsyncClient,
+) -> None:
+    fake_runner = _FakeRunnerClient(payload=_terminals_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals")
+
+    assert resp.status_code == 200
+    (item,) = resp.json()["data"]
+    assert "direct_attach_url" not in item["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_list_terminals_without_runner_advert_leaves_payload_untouched(
+    client: httpx.AsyncClient,
+) -> None:
+    """A resolver miss (runner offline / no listener) adds nothing."""
+    fake_runner = _FakeRunnerClient(payload=_terminals_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_direct_attach_resolver(lambda conversation_id: None)
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals")
+
+    assert resp.status_code == 200
+    (item,) = resp.json()["data"]
+    assert "direct_attach_url" not in item["metadata"]
 
 
 @pytest.mark.asyncio

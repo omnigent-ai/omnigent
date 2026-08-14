@@ -247,7 +247,8 @@ jobs:
 
       - name: Install dependencies
         if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
-        run: uv sync --extra all --extra dev
+        # Agents classify or edit external-site prose; repository checks never run.
+        run: uv sync --extra all
 
       - name: Install Claude Code CLI
         if: steps.plan.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'

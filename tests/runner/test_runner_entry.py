@@ -2379,3 +2379,31 @@ async def test_install_signal_handlers_degrades_when_wakeup_fd_unusable(
 
     # First failure marks the loop degraded; SIGTERM is skipped, not retried.
     assert attempts == [signal.SIGINT]
+
+
+def test_maybe_prewarm_ambient_detection_gates_on_launch_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only claude-native launches prewarm ambient detection at boot.
+
+    Terminal auto-create resolves provider config with an ambient sweep (a
+    ~0.6-0.9s ``claude auth status`` subprocess on macOS); the boot prewarm
+    overlaps that with runner boot. Other harnesses never resolve it, so
+    they must not pay a speculative subprocess on every launch.
+    """
+    from omnigent.onboarding import ambient
+    from omnigent.runner._entry import _maybe_prewarm_ambient_detection
+    from omnigent.runner.identity import RUNNER_LAUNCH_HARNESS_ENV_VAR
+
+    prewarms: list[str] = []
+    monkeypatch.setattr(ambient, "prewarm_detect_providers", lambda: prewarms.append("prewarm"))
+
+    monkeypatch.delenv(RUNNER_LAUNCH_HARNESS_ENV_VAR, raising=False)
+    _maybe_prewarm_ambient_detection()
+    monkeypatch.setenv(RUNNER_LAUNCH_HARNESS_ENV_VAR, "codex-native")
+    _maybe_prewarm_ambient_detection()
+    assert prewarms == []
+
+    monkeypatch.setenv(RUNNER_LAUNCH_HARNESS_ENV_VAR, "claude-native")
+    _maybe_prewarm_ambient_detection()
+    assert prewarms == ["prewarm"]

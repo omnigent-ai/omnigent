@@ -45,12 +45,6 @@ ignore-missing-imports = [
     "numpy",
     "numpy.*",
     "omnigent.onboarding.internal_beta",
-    "opentelemetry.exporter",
-    "opentelemetry.exporter.*",
-    "opentelemetry.instrumentation",
-    "opentelemetry.instrumentation.*",
-    "opentelemetry.sdk",
-    "opentelemetry.sdk.*",
     "openshell",
     "openshell.*",
 ]

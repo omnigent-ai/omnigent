@@ -911,7 +911,13 @@ export function Sidebar({
                         ? "1 inbox item waiting"
                         : `${inboxCount} inbox items waiting`
                     }
-                    className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-brand-accent/15 px-1 text-10 font-medium text-brand-accent tabular-nums"
+                    className={cn(
+                      "ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-10 font-medium text-[var(--sidebar-active-foreground)] tabular-nums",
+                      // The active Inbox row already paints the translucent
+                      // --sidebar-active wash; repainting it on the nested
+                      // badge would double-composite to a darker fill.
+                      isInboxPage ? "bg-transparent" : "bg-[var(--sidebar-active)]",
+                    )}
                   >
                     {inboxCount}
                   </span>
@@ -1991,34 +1997,34 @@ function ConversationList({
                         // The filter stays reachable while bulk-selecting;
                         // switching scope just exits selection. Only the
                         // "select" entry point hides, being already active.
-                        <div className="flex items-center gap-0.5">
-                          {!selectionMode && (
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="icon-xs"
-                                  aria-label="Select sessions"
-                                  data-testid="toggle-selection-mode"
-                                  className="text-muted-foreground"
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    onEnterSelectionMode("sessions");
-                                  }}
-                                >
-                                  <ListChecksIcon className="size-3.5" />
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent side="bottom">Select sessions</TooltipContent>
-                            </Tooltip>
-                          )}
-                          <SessionFilterMenu
-                            value={activeTab}
-                            onChange={onActiveTabChange}
-                            multiUser={multiUser}
-                          />
-                        </div>
+                        !selectionMode ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon-xs"
+                                aria-label="Select sessions"
+                                data-testid="toggle-selection-mode"
+                                className="text-muted-foreground"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  onEnterSelectionMode("sessions");
+                                }}
+                              >
+                                <ListChecksIcon className="size-3.5" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent side="bottom">Select sessions</TooltipContent>
+                          </Tooltip>
+                        ) : undefined
+                      }
+                      persistentHeaderAction={
+                        <SessionFilterMenu
+                          value={activeTab}
+                          onChange={onActiveTabChange}
+                          multiUser={multiUser}
+                        />
                       }
                     />
                   </ChatsDropZone>
@@ -2455,6 +2461,7 @@ function ConversationSection({
   emptyMessage,
   indentRows,
   headerAction,
+  persistentHeaderAction,
   afterHeader,
   footer,
   onProjectAssigned,
@@ -2483,6 +2490,8 @@ function ConversationSection({
   /** Optional control overlaid at the header's right edge (e.g. a project's
       kebab). Hover/focus-revealed on desktop, always shown on mobile. */
   headerAction?: ReactNode;
+  /** Optional control that remains visible at the header's right edge. */
+  persistentHeaderAction?: ReactNode;
   /** Optional content rendered directly under the header, above the rows (and
       shown even when collapsed) — e.g. the bulk-selection action bar. */
   afterHeader?: ReactNode;
@@ -2507,13 +2516,18 @@ function ConversationSection({
             icon={icon}
             marker={marker}
             active={active}
-            hasAction={headerAction != null}
+            hasAction={headerAction != null || persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
           />
-          {headerAction && (
-            <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:has-[[aria-expanded=true]]:opacity-100">
-              {headerAction}
+          {(headerAction || persistentHeaderAction) && (
+            <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
+              {headerAction && (
+                <div className="flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 md:has-[[aria-expanded=true]]:opacity-100">
+                  {headerAction}
+                </div>
+              )}
+              {persistentHeaderAction}
             </div>
           )}
         </div>

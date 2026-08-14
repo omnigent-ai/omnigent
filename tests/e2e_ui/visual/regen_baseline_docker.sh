@@ -82,7 +82,7 @@ echo "Rendering + comparing the baselines in the pinned Playwright image ..."
   -e UV_PROJECT_ENVIRONMENT=/opt/uv-venv \
   "$PW_IMAGE" bash -c '
     pip install --quiet uv &&
-    uv sync --extra all --extra dev &&
+    uv sync --extra all --group test &&
     uv run pytest tests/e2e_ui/visual -m visual \
       -p no:rerunfailures --ui-skip-build
   ' || true

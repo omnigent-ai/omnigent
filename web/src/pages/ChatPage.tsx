@@ -90,6 +90,7 @@ import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useIOSNativeKeyboardVisible } from "@/hooks/useIOSNativeKeyboardInset";
 import type { MessageContentBlock } from "@/lib/blocks";
+import { ELICITATION_RESPONSE_PREFIX } from "@/lib/blocks";
 import {
   derivePermissionLevel,
   isOwnerLevel,
@@ -427,13 +428,15 @@ function isStandaloneElicitationBubble(bubble: Bubble): boolean {
   // turn to anchor to, so it must sit BELOW the user message it gated:
   //   • REQUEST-phase policy ASKs (gate the prompt before any turn), and
   //   • terminal-driven harness gates such as cursor-native `pre_tool_use`,
-  //     which never emit `response_created` (blockStream stamps these with
-  //     their own `elicit_*` id, so they land as standalone bubbles).
-  // A `tool_call` card inside an active SDK turn renders inline — it is grouped
-  // WITH the turn, so it is never an all-elicitation standalone bubble — and is
-  // intentionally excluded here.
+  //     which never emit `response_created`.
+  // The `elicit_*` response id blockStream stamps on exactly those cards IS the
+  // "no turn to anchor to" signal. A card carrying a real turn id belongs to
+  // that turn — an inline approval, or a question/plan card the walker split
+  // into its own bubble — and a user message after it is a NEW prompt, not the
+  // one the card gated, so it must not be lifted above the card.
   return (
     bubble.kind === "assistant" &&
+    bubble.responseId.startsWith(ELICITATION_RESPONSE_PREFIX) &&
     bubble.items.length > 0 &&
     bubble.items.every(
       (it) => it.kind === "elicitation" && (it.phase === "request" || it.phase === "pre_tool_use"),
