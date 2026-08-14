@@ -66,7 +66,9 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     AuthProvider,
+    local_single_user_enabled,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -898,7 +900,16 @@ def register_core_routes(
         # the store resolves the project NAME to the caller's own project id.
         # The flat list (project=None) and Unfiled (project="") stay unscoped so
         # shared sessions still surface for the "Shared with me" tab.
-        owned_by = user_id if project else None
+        #
+        # Local single-user mode is the machine owner's runtime: drop the
+        # access filters so they see every session, regardless of which user
+        # id owned it before a single ↔ multi-user toggle.
+        if user_id == RESERVED_USER_LOCAL and local_single_user_enabled():
+            accessible_by = None
+            owned_by = None
+        else:
+            accessible_by = user_id
+            owned_by = user_id if project else None
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -906,7 +917,7 @@ def register_core_routes(
             before=before,
             agent_id=agent_id,
             agent_name=agent_name,
-            accessible_by=user_id,
+            accessible_by=accessible_by,
             owned_by=owned_by,
             has_agent_id=True,
             # The store treats ``None`` as "no kind filter"; the API

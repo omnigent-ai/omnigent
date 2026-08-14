@@ -43,7 +43,13 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import session_live_state
-from omnigent.server.auth import AuthProvider, SharingMode
+from omnigent.server.auth import (
+    RESERVED_USER_LOCAL,
+    AuthProvider,
+    SharingMode,
+    UnifiedAuthProvider,
+    local_single_user_enabled,
+)
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
@@ -83,6 +89,11 @@ from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
+from omnigent.server.server_state import (
+    ServerState,
+    load_server_state,
+    save_server_state,
+)
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -99,6 +110,67 @@ from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
+
+
+def _current_auth_source(auth_provider: AuthProvider | None) -> str:
+    """Return the canonical auth source string for the current provider."""
+    if isinstance(auth_provider, UnifiedAuthProvider):
+        return auth_provider._source
+    return "none"
+
+
+def _is_header_single_user(auth_provider: AuthProvider | None) -> bool:
+    """Whether the active provider is header mode (the single-user default)."""
+    return isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "header"
+
+
+def _first_admin_username(account_store: Any) -> str | None:
+    """Return the first password-having admin, or None if no admin exists yet."""
+    users = [u for u in account_store.list_users() if u.has_password]
+    admins = [u for u in users if u.is_admin]
+    if admins:
+        return admins[0].id
+    if users:
+        return users[0].id
+    return None
+
+
+def _migrate_local_sessions_to_first_admin(
+    account_store: Any,
+    permission_store: PermissionStore,
+) -> None:
+    """Single-user → accounts: hand ``local`` session ownership to the first admin."""
+    admin_username = _first_admin_username(account_store)
+    if admin_username is None:
+        return
+    permission_store.ensure_user(admin_username, is_admin=True)
+    permission_store.reassign_user_grants(RESERVED_USER_LOCAL, admin_username)
+    _logger.info(
+        "auth-mode transition: migrated local sessions to admin %r",
+        admin_username,
+    )
+
+
+def _ensure_local_single_user_admin(
+    auth_provider: AuthProvider,
+    permission_store: PermissionStore,
+) -> None:
+    """Make the reserved ``local`` user an admin in single-user local mode.
+
+    Accounts → single-user header: the operator's machine owns every
+    session across auth-mode flips. Instead of rewriting ownership
+    grants (which would erase the record of who created what), we leave
+    the grants alone and promote the sentinel ``local`` user so the
+    existing admin bypass lets the machine owner see and manage every
+    session.
+    """
+    if not _is_header_single_user(auth_provider) or not local_single_user_enabled():
+        return
+    permission_store.ensure_user(RESERVED_USER_LOCAL, is_admin=True)
+    permission_store.set_admin(RESERVED_USER_LOCAL, True)
+    _logger.info(
+        "auth-mode transition: promoted local single-user sentinel to admin",
+    )
 
 
 def _server_version() -> str:
@@ -872,6 +944,10 @@ def create_app(
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
 
+    # Persistent transition markers for single-user ↔ multi-user flips.
+    # Loaded once at startup and saved (after migrations) before returning.
+    _prev_state = load_server_state()
+
     # First-boot admin bootstrap for the accounts auth provider.
     # Runs before any route is mounted so the login page is never
     # served against an empty user table (avoids the Immich-style
@@ -903,6 +979,28 @@ def create_app(
                 session_ttl_hours=_accounts_cfg.session_ttl_hours,
                 cookie_secret=_accounts_cfg.cookie_secret,
             )
+
+            # Single-user → accounts transition: hand pre-existing
+            # "local" sessions to the first admin. Only runs when the
+            # sidecar says the previous boot was a local single-user
+            # header runtime, so deployed accounts servers never pay
+            # for this check unless they really flipped.
+            if (
+                permission_store is not None
+                and _prev_state.last_auth_source == "header"
+                and _prev_state.last_local_single_user
+            ):
+                _migrate_local_sessions_to_first_admin(
+                    account_store,
+                    permission_store,
+                )
+
+    # Accounts → single-user header: promote the reserved "local" user to
+    # admin instead of rewriting grants. This lets the machine owner act
+    # on sessions created under any prior auth mode without destroying the
+    # original ownership record.
+    if permission_store is not None and auth_provider is not None:
+        _ensure_local_single_user_admin(auth_provider, permission_store)
 
     from omnigent.runner.routing import RunnerRouter
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
@@ -2654,6 +2752,15 @@ def create_app(
         async def root() -> FileResponse:
             """Serve the API-only landing page (no web UI bundle present)."""
             return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
+
+    # Record the posture we booted with so the next process can detect
+    # a transition and run the appropriate ownership migration.
+    save_server_state(
+        ServerState(
+            last_auth_source=_current_auth_source(auth_provider),
+            last_local_single_user=local_single_user_enabled(),
+        )
+    )
 
     return app
 
