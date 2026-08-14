@@ -4312,6 +4312,30 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
+    it("keeps the existing skills when the nudge refetch reports none", async () => {
+      // The nudge's plain refetch can dedupe onto an in-flight
+      // `refresh_state=true` query (shared `["session", id]` key) whose
+      // response reports `skills: []` because the refresh just cold-dropped
+      // the server's runner-skill cache. Applying that would blank the menu
+      // through a path the refresh-only guard never sees — so an empty list
+      // means "not yet known" on this path too.
+      useChatStore.setState({
+        conversationId: "conv_abc",
+        skills: [{ name: "kept-skill", description: "already resolved" }],
+      });
+      seedSnapshotSkills("conv_abc", []);
+
+      handleSessionEvent({
+        type: "session_skills",
+        conversationId: "conv_abc",
+      });
+      await tick();
+
+      expect(useChatStore.getState().skills).toEqual([
+        { name: "kept-skill", description: "already resolved" },
+      ]);
+    });
+
     it("ignores an event for a conversation that is not live", async () => {
       // Gated on liveness, not on being on screen: a nudge for a conversation
       // this tab holds no entry for has nowhere to land, so it must not fetch.
