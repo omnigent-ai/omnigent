@@ -245,15 +245,12 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
+        # pexpect drives the CLI binary via PTY; @anthropic-ai/claude-code is
+        # the `claude` binary that omnigent claude --server launches on startup.
         run: |
           uv sync
           uv pip install pexpect
-
-      - name: Install Claude Code CLI
-        # The cli_startup journey spawns `omnigent claude --server` which in
-        # turn launches the real `claude` binary. Install it from the official
-        # npm package so the runner is present on this CI image.
-        run: npm install -g @anthropic-ai/claude-code
+          npm install -g @anthropic-ai/claude-code
 
       - name: Run CLI startup benchmark
         run: |
