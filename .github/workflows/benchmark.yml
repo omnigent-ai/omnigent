@@ -209,16 +209,12 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
-      # CLI startup is backend-agnostic — run it only on the sqlite leg to
-      # avoid running 3× across the matrix. Needs pexpect + claude CLI.
       - name: Install CLI startup dependencies
-        if: matrix.backend == 'sqlite'
         run: |
           uv pip install pexpect
           npm install -g @anthropic-ai/claude-code
 
       - name: Run CLI startup benchmark
-        if: matrix.backend == 'sqlite'
         run: |
           uv run --no-sync dev/benchmarks/omnigent/run.py \
             --journeys cli_startup \
@@ -227,9 +223,9 @@ jobs:
 
       - name: Upload CLI startup results
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: matrix.backend == 'sqlite' && always()
+        if: always()
         with:
-          name: benchmark-results-cli-startup-${{ github.run_id }}
+          name: benchmark-results-cli-startup-${{ matrix.backend }}-${{ github.run_id }}
           path: benchmark-results-cli-startup.json
           retention-days: 90
           if-no-files-found: warn
