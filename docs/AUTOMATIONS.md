@@ -10,7 +10,7 @@ There are three surfaces, all writing the same rows.
 
 **Web UI.** Open the `/tasks` page (sidebar: *Automations*, or the command palette: *Go to Automations*). The create dialog takes the schedule, the agent, the prompt, and optionally a model and reasoning effort. Each row shows a live relative next-run time and the status of the last run.
 
-**REST API.** `POST /v1/scheduled-tasks`. Required: `name`, `prompt`, `rrule`, `agent_id`. Optional: `timezone` (defaults to `UTC`), `model_override`, `reasoning_effort`, `workspace`, `host_id`. Unknown fields are rejected.
+**REST API.** `POST /v1/scheduled-tasks`. Required: `name`, `prompt`, `rrule`, `agent_id`. Optional: `timezone` (defaults to `UTC`), `model_override`, `reasoning_effort`, `workspace`, `host_id`. Unknown fields are rejected. The two optional targeting fields are not independent: sending a `workspace` without a `host_id` is a 400 (`host_id required when workspace is set`), because only a host can resolve a path. Sending neither is fine -- the fire resolves both.
 
 ```jsonc
 {
@@ -52,7 +52,7 @@ Two timing caveats are worth knowing:
 ## What happens when a task fires
 
 1. **The row is re-read.** The armed timer is never trusted. A task deleted or paused between arming and firing is a no-op.
-2. **The launch target is resolved.** A task with no pinned `host_id` uses the owner's most-recently-active live host, chosen at fire time. A task with no pinned `workspace` starts the runner in that host's home directory, which is what makes chat-only, research, and MCP-only automations possible. A pinned host that is missing or offline -- or an owner with no live host at all -- records a failed or skipped run rather than a running one.
+2. **The launch target is resolved.** A task with no pinned `host_id` uses the owner's most-recently-active live host, chosen at fire time. A task with no pinned `workspace` starts the runner in that host's home directory, which is what makes chat-only, research, and MCP-only automations possible. A pinned host that is missing or offline -- or an owner with no live host at all -- records a **failed** run rather than a running one (`error_code` `host_offline`, `host_not_found`, or `no_online_host`).
 3. **A session is created**, bound to the task's agent and carrying the resolved workspace and host plus any `model_override` and `reasoning_effort`.
 4. **Ownership is granted.** The new session gets a `LEVEL_OWNER` grant for the task's owner (a reserved local user in single-user and OSS deployments). Without the grant the run would be invisible.
 5. **The runner launches and the prompt is dispatched**, so the agent actually works. A seeded prompt with no launched runner would just sit in history.
@@ -66,11 +66,12 @@ Firing is fire-and-forget: the guard steps run synchronously so a dead fire cost
 
 | `status` | Meaning |
 | --- | --- |
-| `scheduled` | Recorded, not yet dispatched. |
 | `running` | Dispatched; the turn is in flight. |
 | `succeeded` | The dispatched turn finished. |
 | `failed` | The firing or the turn failed; see `error_code`. |
-| `skipped` | The firing was deliberately not attempted -- for example no live host was available. |
+| `skipped` | The firing was deliberately not attempted -- for example an unsupported `execution_target`. |
+
+`ScheduledTaskRun` also declares a `scheduled` status, but no code path writes it: a run row is created at dispatch, so `running` is the earliest state a client can observe.
 
 ## Lifecycle
 
@@ -98,10 +99,10 @@ The scheduler is the timing engine only, and its behavior is deliberately simple
 
 - **Missed fires are not replayed.** On startup the scheduler arms the next future occurrence of every active task; occurrences that passed while the server was down are gone. There is no backfill or replay.
 - **No automatic retry.** A failed run is recorded and visible in history; the retry policy is that the next occurrence fires normally.
-- **Overlapping fires are skipped.** If the previous firing of the same task is still being dispatched when the next tick arrives, the tick is dropped.
+- **Overlapping fires are skipped.** If the previous firing of the same task is still being dispatched when the next tick arrives, the tick is dropped. No run row is recorded for it, so a dropped tick leaves no trace in history beyond the server log.
 - **Late ticks are skipped.** A tick arriving more than 30 seconds after its scheduled time (a blocked event loop, for instance) is skipped rather than fired late.
 - **One scheduler per server process.** Timers are in-process with no distributed leasing, so a multi-replica deployment would fire each task once per replica. Shared session-create orchestration is the intended path for that.
-- **Connected-host runs only.** Firing targets a connected host with an existing workspace. Managed sandboxes and git branch selection at fire time are not supported; the `base_branch` and `execution_target` columns are reserved and unused.
+- **Connected-host runs only.** Firing targets a connected host with an existing workspace. Managed sandboxes and git branch selection at fire time are not available: neither `base_branch` nor `execution_target` can be set through the API (both are rejected as unknown fields), and a row whose `execution_target` is anything other than `connected_host` records a `skipped` run with `error_code` `unsupported_target` rather than firing.
 
 ## Related
 
