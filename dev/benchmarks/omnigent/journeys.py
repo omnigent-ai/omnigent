@@ -794,40 +794,25 @@ _CLI_STARTUP_TIMEOUT_S = 90
 # other full-turn journeys so a large --iterations doesn't blow the CI budget.
 _CLI_STARTUP_MAX_ITERATIONS = 3
 
-# Env var pointing to the remote server to benchmark against. When absent the
-# journey skips with a clear message — the local bench server can't be used
-# because omnigent claude spawns its own host daemon which conflicts with the
-# bench environment's daemon.
-_CLI_STARTUP_SERVER_ENV = "OMNIGENT_BENCH_SERVER"
-
 
 async def _measure_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> None:
     """Time ``omnigent claude --server`` from invocation to terminal ready.
 
     Spawns the real ``omnigent`` CLI binary (resolved from PATH, or
-    ``OMNIGENT_BIN`` env var) against the server named by
-    ``OMNIGENT_BENCH_SERVER``. Skips with a RuntimeError when that env var is
-    not set — the local bench server can't be used because ``omnigent claude``
-    spawns its own host daemon which conflicts with the bench environment's.
+    ``OMNIGENT_BIN`` env var) against the local benchmark server
+    (``env.base_url``). The CLI starts its own host daemon and runner — the
+    bench environment must NOT boot one itself (``needs_host=False``) or the
+    two daemons conflict on the same host registration.
 
     The timed span ends when ``"Claude terminal ready."`` appears on the PTY —
     the spinner message emitted just before ``tmux attach``.
 
     Requires ``pexpect`` and the ``claude`` (Claude Code) CLI binary on PATH.
 
-    :param env: Benchmark environment (unused — CLI targets the remote server).
+    :param env: Benchmark environment — ``env.base_url`` is the local server URL.
     :param _ctx: Unused (no setup context).
-    :raises RuntimeError: When ``OMNIGENT_BENCH_SERVER`` is not set, on timeout,
-        or on process exit before the ready signal.
+    :raises RuntimeError: On timeout or process exit before the ready signal.
     """
-    del env
-    server = os.environ.get(_CLI_STARTUP_SERVER_ENV)
-    if not server:
-        raise RuntimeError(
-            f"cli_startup requires {_CLI_STARTUP_SERVER_ENV} to be set to a remote "
-            f"Omnigent server URL. The local bench server cannot be used (daemon conflict)."
-        )
-
     try:
         import pexpect
     except ImportError as exc:
@@ -841,7 +826,7 @@ async def _measure_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> N
 
     child = pexpect.spawn(
         omnigent_bin,
-        args=["claude", "--server", server],
+        args=["claude", "--server", env.base_url],
         timeout=_CLI_STARTUP_TIMEOUT_S,
         encoding="utf-8",
         codec_errors="ignore",
@@ -1079,9 +1064,8 @@ ALL_JOURNEYS: dict[str, Journey] = {
             measure=_measure_cli_startup,
             max_iterations=_CLI_STARTUP_MAX_ITERATIONS,
             description=(
-                "Spawn `omnigent claude --server $OMNIGENT_BENCH_SERVER` and time "
-                "invocation → terminal ready (auth + daemon + session + runner + terminal boot). "
-                "Skips when OMNIGENT_BENCH_SERVER is not set. "
+                "Spawn `omnigent claude --server` against the local bench server and time "
+                "invocation → terminal ready (daemon + session + runner + terminal boot). "
                 "Requires pexpect and the `claude` (Claude Code) CLI binary on PATH."
             ),
         ),
