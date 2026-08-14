@@ -178,7 +178,7 @@ _SUBAGENT_ROW = '[data-testid="subagent-row"]'
 # The task-derived label the background generator would produce, and the
 # structured spawn key it has to win over. Distinct strings so neither can
 # satisfy the other's assertion.
-_DISPLAY_NAME = "Investigate auth token refresh"
+_TASK_SUMMARY = "Investigate auth token refresh"
 _STRUCTURED_NAME = "researcher-1"
 
 
@@ -215,7 +215,7 @@ def labelled_subagent(
     )
     child.raise_for_status()
     child_id = child.json()["id"]
-    set_session_task_summary(child_id, _DISPLAY_NAME)
+    set_session_task_summary(child_id, _TASK_SUMMARY)
     try:
         yield (base_url, parent_id)
     finally:
@@ -250,10 +250,10 @@ def test_subagent_rail_prefers_task_summary_over_structured_name(
 
     # List view: the task label wins, and the structured key it beat is
     # nowhere in the row (a fallback regression would surface it here).
-    expect(row).to_contain_text(_DISPLAY_NAME, timeout=30_000)
+    expect(row).to_contain_text(_TASK_SUMMARY, timeout=30_000)
     assert _STRUCTURED_NAME not in row.inner_text()
 
     # Graph view resolves the label through its own layout code, so it gets
     # its own assertion rather than riding on the list's.
     rail.locator('[data-testid="view-mode-graph"]').click()
-    expect(rail).to_contain_text(_DISPLAY_NAME, timeout=30_000)
+    expect(rail).to_contain_text(_TASK_SUMMARY, timeout=30_000)

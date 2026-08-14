@@ -1837,12 +1837,17 @@ async def _execute_subagent_tool(
                 conversation_id=conversation_id,
                 tool=str(sub_agent_name),
             )
-            if not isinstance(_all_children, str):
-                _runner_app.recover_subagent_ordinals(
-                    conversation_id,
-                    str(sub_agent_name),
-                    _all_children,
+            if isinstance(_all_children, str):
+                return (
+                    f"Error: cannot allocate sub-agent name for "
+                    f"{sub_agent_name!r}: failed to list existing "
+                    f"children — {_all_children}"
                 )
+            _runner_app.recover_subagent_ordinals(
+                conversation_id,
+                str(sub_agent_name),
+                _all_children,
+            )
             ordinal = _runner_app.next_subagent_ordinal(
                 conversation_id,
                 str(sub_agent_name),
@@ -1992,15 +1997,6 @@ async def _execute_subagent_tool(
                     exc_info=True,
                 )
 
-        # Store the LLM's semantic title hint as a label so the
-        # background display-name generator can use it as context.
-        if llm_title_hint:
-            with contextlib.suppress(httpx.HTTPError):
-                await server_client.post(
-                    f"/v1/sessions/{child_session_id}/labels",
-                    json={"omnigent.subagent.hint": llm_title_hint},
-                    timeout=10.0,
-                )
 
     # Publish session.created on the parent's SSE stream so the
     # REPL debug panel and any client subscribers discover the
