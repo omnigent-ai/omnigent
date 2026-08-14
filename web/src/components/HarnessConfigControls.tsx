@@ -119,6 +119,25 @@ export const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
   { value: "max", label: "Max" },
 ];
 
+// User-facing labels for the Copilot reasoning-effort ladder. Which subset a
+// given model accepts comes from the model-options probe
+// (`supportedReasoningEfforts` per model); the modal renders only those, so
+// this map only spells labels and never gates a level.
+export const COPILOT_EFFORT_LABELS: Record<string, string> = {
+  none: "None",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "xHigh",
+  max: "Max",
+};
+
+/** Label for a Copilot effort value; unknown values pass through verbatim. */
+export function copilotEffortLabel(value: string): string {
+  return COPILOT_EFFORT_LABELS[value] ?? value;
+}
+
 /**
  * A labeled configuration row: bold label + muted sub-description on the left,
  * the control on the right. Mirrors the "Configure …" modal layout.
