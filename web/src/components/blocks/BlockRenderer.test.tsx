@@ -1158,7 +1158,7 @@ describe("BlockRenderer dispatch", () => {
   describe("math rendering", () => {
     it("normalizes explicit TeX delimiters outside code", () => {
       expect(normalizeExplicitMathDelimiters(String.raw`中文 \(\sqrt{x}\) 文本`)).toBe(
-        String.raw`中文 $\sqrt{x}$ 文本`,
+        String.raw`中文 $$\sqrt{x}$$ 文本`,
       );
       expect(normalizeExplicitMathDelimiters(String.raw`\[\sqrt{x}\]`)).toBe(
         String.raw`$$\sqrt{x}$$`,
@@ -1179,8 +1179,8 @@ describe("BlockRenderer dispatch", () => {
     });
 
     it("does not convert delimiters already inside a dollar-math span", () => {
-      const inline = String.raw`$\[x\]$`;
-      expect(normalizeExplicitMathDelimiters(inline)).toBe(inline);
+      const span = String.raw`$$\[x\]$$`;
+      expect(normalizeExplicitMathDelimiters(span)).toBe(span);
     });
 
     it("skips normalization inside multi-backtick inline code", () => {
@@ -1188,16 +1188,12 @@ describe("BlockRenderer dispatch", () => {
       expect(normalizeExplicitMathDelimiters(doubleTick)).toBe(doubleTick);
     });
 
-    it("escapes currency dollar amounts so prose isn't parsed as inline math", () => {
-      // With single-dollar math enabled, "it costs $5 or $10" would otherwise
-      // parse "5 or " as inline math. Escaping the digit-led `$` renders literal
-      // dollar figures and stops the run from flipping the math toggle.
-      expect(normalizeExplicitMathDelimiters("it costs $5 or $10")).toBe(
-        String.raw`it costs \$5 or \$10`,
-      );
-      // Delimiters after the currency text still normalize — the toggle didn't flip.
+    it("leaves prose dollar amounts verbatim", () => {
+      expect(normalizeExplicitMathDelimiters("it costs $5 or $10")).toBe("it costs $5 or $10");
+      // Delimiters after the currency text still normalize — the lone `$` didn't
+      // flip the math-span toggle.
       expect(normalizeExplicitMathDelimiters(String.raw`$5 then \(x\)`)).toBe(
-        String.raw`\$5 then $x$`,
+        String.raw`$5 then $$x$$`,
       );
     });
 
@@ -1234,6 +1230,30 @@ describe("BlockRenderer dispatch", () => {
         expect(source).toContain('import "streamdown/styles.css"');
       }
       expect(indexCss).toContain('@source "../node_modules/streamdown/dist/*.js"');
+    });
+
+    it("renders prose dollars as literal text, not math", async () => {
+      // `$/PR` and `$/session` are the shape that broke: a `$` before a slash is
+      // neither currency-with-a-digit nor a SCREAMING_CASE variable, so the old
+      // escaping heuristics missed them and single-dollar math paired them up,
+      // rendering the words between as letter-by-letter math soup.
+      const prose = "Costs $/PR versus $/session, a 60% saving on $LLM_API_KEY calls.";
+      const { container } = renderMarkdownText(prose);
+
+      await waitFor(() => expect(container.textContent).toContain("60%"));
+      expect(container.querySelector(".katex")).toBeNull();
+      expect(container.textContent).toContain(prose);
+    });
+
+    it("renders an explicit inline TeX span inline, not as a display block", async () => {
+      // `\(…\)` normalizes to `$$…$$`, which is a display block only when it
+      // opens its own line; mid-paragraph it must stay inline math.
+      const { container } = renderMarkdownText(String.raw`the value \(\sqrt{x + 1}\) holds`);
+
+      await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+      expect(container.querySelector(".katex-display")).toBeNull();
+      expect(container.textContent).toContain("the value");
+      expect(container.textContent).toContain("holds");
     });
 
     it("renders radicals, fractions, and superscripts without dropping the radicand", async () => {
