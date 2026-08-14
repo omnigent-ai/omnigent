@@ -22,7 +22,6 @@ import json
 import re
 
 import httpx
-import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import _build_hello_world_bundle, open_right_rail
