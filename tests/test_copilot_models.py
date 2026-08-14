@@ -26,10 +26,24 @@ def _isolate_copilot_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Any)
     monkeypatch.setattr(copilot_auth, "gh_cli_github_token", lambda host=None: None)
 
 
+class _Policy:
+    def __init__(self, state: str) -> None:
+        self.state = state
+
+
 class _Info:
-    def __init__(self, id: str, name: str | None = None) -> None:
+    def __init__(
+        self,
+        id: str,
+        name: str | None = None,
+        *,
+        policy: _Policy | None = None,
+        efforts: list[str] | None = None,
+    ) -> None:
         self.id = id
         self.name = name
+        self.policy = policy
+        self.supported_reasoning_efforts = efforts
 
 
 def _install_fake_sdk(
@@ -87,6 +101,78 @@ async def test_maps_backend_models_to_picker_options(
     assert state["started"] == 1
     # The bundled CLI subprocess must always be reaped.
     assert state["stopped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_policy_filters_only_explicitly_blocked_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only an explicit non-enabled policy filters a model out.
+
+    A ``policy`` object exists only for models GitHub tracks a terms opt-in
+    for; ``auto`` and e.g. ``gpt-5.3-codex`` ship without one and are usable,
+    so absence must allow (an enabled-only allowlist would drop them).
+    """
+    _install_fake_sdk(
+        monkeypatch,
+        infos=[
+            _Info("auto", "Auto"),
+            _Info("claude-sonnet-5", "Claude Sonnet 5", policy=_Policy("enabled")),
+            _Info("gpt-5.3-codex", "GPT-5.3-Codex"),
+            _Info("gpt-5.4", "GPT-5.4", policy=_Policy("disabled")),
+            _Info("gemini-3.6-flash", "Gemini 3.6 Flash", policy=_Policy("unconfigured")),
+        ],
+    )
+    options = await copilot_model_options()
+    assert [option["id"] for option in options] == ["auto", "claude-sonnet-5", "gpt-5.3-codex"]
+
+
+@pytest.mark.asyncio
+async def test_auto_is_marked_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``auto`` carries the default marker; ``models.list`` itself has none."""
+    _install_fake_sdk(
+        monkeypatch,
+        infos=[_Info("auto", "Auto"), _Info("gpt-5.4", "GPT-5.4")],
+    )
+    options = await copilot_model_options()
+    assert [(option["id"], option["isDefault"]) for option in options] == [
+        ("auto", True),
+        ("gpt-5.4", False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_efforts_are_emitted_in_ladder_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-model efforts ride along in canonical ladder order.
+
+    The backend's own order is not contractual, and unknown values append
+    after the known ladder instead of being dropped. A model without efforts
+    (``efforts=None``) omits the key entirely.
+    """
+    _install_fake_sdk(
+        monkeypatch,
+        infos=[
+            _Info("claude-sonnet-5", efforts=["max", "low", "xhigh", "medium", "high"]),
+            _Info("gpt-5.6-terra", efforts=["high", "supersonic", "none"]),
+            _Info("claude-haiku-4.5"),
+        ],
+    )
+    options = await copilot_model_options()
+    assert options[0]["supportedReasoningEfforts"] == [
+        {"reasoningEffort": "low"},
+        {"reasoningEffort": "medium"},
+        {"reasoningEffort": "high"},
+        {"reasoningEffort": "xhigh"},
+        {"reasoningEffort": "max"},
+    ]
+    assert options[1]["supportedReasoningEfforts"] == [
+        {"reasoningEffort": "none"},
+        {"reasoningEffort": "high"},
+        {"reasoningEffort": "supersonic"},
+    ]
+    assert "supportedReasoningEfforts" not in options[2]
 
 
 @pytest.mark.asyncio

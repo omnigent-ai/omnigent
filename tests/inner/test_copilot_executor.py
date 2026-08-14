@@ -252,14 +252,16 @@ def test_resolve_reasoning_effort() -> None:
     # No config / no effort -> None (model default).
     assert _resolve_reasoning_effort(None) is None
     assert _resolve_reasoning_effort(ExecutorConfig()) is None
-    # Supported Copilot levels pass through.
-    for level in ("low", "medium", "high", "xhigh"):
+    # The full CLI effort vocabulary passes through; which subset a given
+    # model takes is enforced by the Copilot backend, not here.
+    for level in ("none", "minimal", "low", "medium", "high", "xhigh", "max"):
         assert (
             _resolve_reasoning_effort(ExecutorConfig(extra={"reasoning_effort": level})) == level
         )
-    # Values Copilot can't honor (OpenAI-style) are dropped, not raised.
-    assert _resolve_reasoning_effort(ExecutorConfig(extra={"reasoning_effort": "minimal"})) is None
-    assert _resolve_reasoning_effort(ExecutorConfig(extra={"reasoning_effort": "none"})) is None
+    # A value outside the vocabulary is dropped, not raised.
+    assert (
+        _resolve_reasoning_effort(ExecutorConfig(extra={"reasoning_effort": "supersonic"})) is None
+    )
 
 
 def test_build_prompt_first_turn_history_and_latest() -> None:
