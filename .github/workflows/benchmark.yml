@@ -41,10 +41,6 @@ on:
         description: "Simulated client→server latency per request (ms; 0 = loopback)"
         required: false
         default: "0"
-      cli_startup_runs:
-        description: "CLI startup: timed runs per command (0 = skip)"
-        required: false
-        default: "5"
 
 permissions:
   contents: read
@@ -213,64 +209,25 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
-  cli-startup:
-    name: CLI startup latency
-    # Runs the cli_startup journey via run.py against a local bench server —
-    # same infrastructure as the HTTP journeys, no remote credentials needed.
-    # Requires the `claude` (Claude Code) CLI binary to be installed on the runner.
-    # Skips when cli_startup_runs is 0; runs on nightly schedule and dispatch.
-    if: >-
-      github.repository == 'omnigent-ai/omnigent' &&
-      (github.event_name == 'schedule' ||
-       (github.event_name == 'workflow_dispatch' && inputs.cli_startup_runs != '0'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      CLI_STARTUP_RUNS: ${{ github.event_name == 'workflow_dispatch' && inputs.cli_startup_runs || '5' }}
-    steps:
-      - name: Check out repo
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-          ref: ${{ inputs.checkout_sha || github.sha }}
-
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version-file: ".python-version"
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
-        with:
-          enable-cache: true
-
-      - name: Install dependencies
-        # pexpect drives the CLI binary via PTY; @anthropic-ai/claude-code is
-        # the `claude` binary that omnigent claude --server launches on startup.
+      # CLI startup is backend-agnostic — run it only on the sqlite leg to
+      # avoid running 3× across the matrix. Needs pexpect + claude CLI.
+      - name: Install CLI startup dependencies
+        if: matrix.backend == 'sqlite'
         run: |
-          uv sync
           uv pip install pexpect
           npm install -g @anthropic-ai/claude-code
 
       - name: Run CLI startup benchmark
+        if: matrix.backend == 'sqlite'
         run: |
           uv run --no-sync dev/benchmarks/omnigent/run.py \
             --journeys cli_startup \
-            --runs "$CLI_STARTUP_RUNS" \
+            --runs "$RUNS" \
             --output benchmark-results-cli-startup.json
-
-      - name: Render results to job summary
-        if: always()
-        run: |
-          if [[ -f benchmark-results-cli-startup.json ]]; then
-            uv run --no-sync dev/benchmarks/omnigent/report_markdown.py \
-              --title "CLI startup latency" \
-              benchmark-results-cli-startup.json >> "$GITHUB_STEP_SUMMARY"
-          fi
 
       - name: Upload CLI startup results
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
+        if: matrix.backend == 'sqlite' && always()
         with:
           name: benchmark-results-cli-startup-${{ github.run_id }}
           path: benchmark-results-cli-startup.json
