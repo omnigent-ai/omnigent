@@ -91,15 +91,11 @@ def test_build_job_manifest_runs_host_under_reaper_as_container_command() -> Non
     assert "os.wait()" in script
 
 
-def test_build_job_manifest_has_liveness_probe() -> None:
-    """The host container has a liveness probe checking for the omnigent process."""
+def test_build_job_manifest_has_no_liveness_probe() -> None:
+    """No liveness probe: the reaper propagates child exit, OnFailure handles restarts."""
     manifest = build_job_manifest(**_MANIFEST_KW)
     host = _pod_spec(manifest)["containers"][0]
-    probe = host["livenessProbe"]
-    assert probe["exec"]["command"] == ["pgrep", "-f", "omnigent host"]
-    assert probe["initialDelaySeconds"] == k8s._LIVENESS_INITIAL_DELAY_S
-    assert probe["periodSeconds"] == k8s._LIVENESS_PERIOD_S
-    assert probe["failureThreshold"] == k8s._LIVENESS_FAILURE_THRESHOLD
+    assert "livenessProbe" not in host
 
 
 def test_build_job_manifest_init_container_prepares_and_clones_workspace() -> None:
@@ -531,6 +527,8 @@ class _FakeCore:
         self.calls: list[str] = []
         self.created_secrets: list[dict[str, object]] = []
         self.deleted_secrets: list[str] = []
+        self.deleted_pods: list[str] = []
+        self.delete_pod_errors: list[Exception | None] = []
         self.events: list[object] = []
         self.logs: dict[str, str] = {}
         self.read_queue: list[object] = []
@@ -558,6 +556,14 @@ class _FakeCore:
     def delete_namespaced_secret(self, name, namespace, _request_timeout=None):
         self.calls.append("delete_secret")
         self.deleted_secrets.append(name)
+
+    def delete_namespaced_pod(self, name, namespace, _request_timeout=None):
+        self.calls.append("delete_pod")
+        if self.delete_pod_errors:
+            err = self.delete_pod_errors.pop(0)
+            if err is not None:
+                raise err
+        self.deleted_pods.append(name)
 
     def list_namespaced_event(self, namespace, field_selector=None, _request_timeout=None):
         return SimpleNamespace(items=self.events)
@@ -851,7 +857,7 @@ def test_launch_host_fast_fails_on_clone_failure_with_log_tail(
     fake_clients: tuple[_FakeCore, _FakeBatch],
 ) -> None:
     """A non-zero init container (clone failed) fails fast with the git error log tail."""
-    core, _batch = fake_clients
+    core, batch = fake_clients
     failed_pod = _pod(
         phase="Pending",
         init_statuses=[_terminated(128, name="workspace-prep")],
@@ -871,6 +877,9 @@ def test_launch_host_fast_fails_on_clone_failure_with_log_tail(
         )
     assert "workspace prep failed (exit 128" in exc.value.message
     assert "repository 'https://x/y.git' not found" in exc.value.message
+    # The orphaned Job and Secret are cleaned up on failure.
+    assert "delete_job" in batch.calls
+    assert core.deleted_secrets == ["omnigent-job-4-token"]
 
 
 def test_launch_host_times_out_with_reason(
@@ -906,20 +915,23 @@ def test_launch_host_times_out_with_reason(
 def test_terminate_deletes_job_and_secret(
     fake_clients: tuple[_FakeCore, _FakeBatch],
 ) -> None:
-    """Terminate deletes both the Job and its token Secret."""
+    """Terminate deletes the Job, attempts bare-Pod fallback, and deletes the Secret."""
     core, batch = fake_clients
     _launcher().terminate("omnigent-job-6")
     assert batch.deleted_jobs == ["omnigent-job-6"]
+    assert core.deleted_pods == ["omnigent-job-6"]
     assert core.deleted_secrets == ["omnigent-job-6-token"]
 
 
 def test_terminate_is_idempotent_on_404(
     fake_clients: tuple[_FakeCore, _FakeBatch],
 ) -> None:
-    """A Job that no longer exists (404) is treated as success, and the Secret too."""
-    _core, batch = fake_clients
+    """A Job 404 still deletes the bare Pod fallback and the Secret."""
+    core, batch = fake_clients
     batch.delete_job_errors = [_FakeApiException(status=404, reason="Not Found")]
     _launcher().terminate("omnigent-job-7")  # must not raise
+    assert core.deleted_pods == ["omnigent-job-7"]
+    assert core.deleted_secrets == ["omnigent-job-7-token"]
 
 
 def test_terminate_retries_transient_then_gives_up_best_effort(

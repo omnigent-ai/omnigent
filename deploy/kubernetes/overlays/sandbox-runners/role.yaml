@@ -21,10 +21,13 @@ rules:
     resources: ["jobs"]
     verbs: ["create", "get", "delete"]
   # The launcher lists Pods by job-name label to find the Job's child Pod,
-  # then reads it to poll for Running phase.
+  # then reads it to poll for Running phase.  create/delete are retained for
+  # one release so old-server (bare Pod) + new-Role doesn't break, and so
+  # terminate() can fall back to deleting a bare Pod created before the Job
+  # migration.  TODO: remove create/delete after the next release.
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["list", "get"]
+    verbs: ["create", "list", "get", "delete"]
   # Start-failure diagnostics ONLY: tails the failed container's log.
   - apiGroups: [""]
     resources: ["pods/log"]

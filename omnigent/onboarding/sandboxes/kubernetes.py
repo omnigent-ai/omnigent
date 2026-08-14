@@ -196,13 +196,6 @@ _JOB_BACKOFF_LIMIT: int = 3
 # launch-token TTL.
 _JOB_ACTIVE_DEADLINE_S: int = 7 * 24 * 3600
 
-# Liveness probe settings: the host process should respond to a simple
-# process check within these bounds.  A restart is triggered after
-# failure_threshold consecutive missed probes.
-_LIVENESS_INITIAL_DELAY_S: int = 30
-_LIVENESS_PERIOD_S: int = 15
-_LIVENESS_FAILURE_THRESHOLD: int = 3
-
 # Lines of container log tail surfaced in a start-failure message (e.g. the git
 # clone error from the init container).
 _LOG_TAIL_LINES: int = 20
@@ -552,10 +545,12 @@ def build_job_manifest(
     a container restart.  Combined with the runner's durable conversation
     checkpointing, an incomplete turn is auto-recovered on session re-init.
 
-    A liveness probe on the host container detects stuck (not crashed)
-    processes: it checks that the PID-1 reaper's child (``omnigent host``) is
-    alive.  A missed probe triggers a container restart within the Job's
-    retry budget.
+    No liveness probe is added: the PID-1 reaper propagates the child's exit
+    status (``_REAPER_SRC``), so a crashed host exits the container and
+    ``OnFailure`` restarts it.  A ``pgrep``-based probe would match the
+    reaper's own argv (which contains ``omnigent host``), making it unable to
+    detect a dead child — and it would also require ``procps`` in the image,
+    which custom operator images may omit.
 
     The encoded design:
 
@@ -581,7 +576,12 @@ def build_job_manifest(
       container sees only HOME, so nothing external is exposed at clone time.
     - Operator *secret_mounts* become ``secret`` volumes mounted read-only on
       the **host container only** — a runtime lane; clone-time credentials
-      still ride ``envFrom``.
+      still ride ``envFrom``. A Secret projected as a volume (no ``subPath``)
+      is refreshed in place by the kubelet, so a long-lived runner picks up a
+      rotated credential without a restart — unlike ``envFrom``, read once at
+      container start. Refresh is eventually consistent (kubelet sync, up to
+      ~1 min), so the in-sandbox consumer must re-read the file each use — a
+      value cached at start defeats the rotation.
 
     :param job_name: DNS-label-safe Job name (see :func:`_new_pod_name`).
     :param namespace: Namespace the Job is created in.
@@ -605,6 +605,10 @@ def build_job_manifest(
     :param repo_branch: Branch to clone, or ``None`` for the default branch.
     :param host_config: Deployment-supplied config content merged in by the
         init container under the host's resolved config directory, or ``None``.
+        Non-secret by design:
+        credentials stay behind ``api_key_ref: env:`` indirection (resolved in
+        the sandbox against the ``envFrom`` harness Secret), so embedding the
+        content in the init container's command is as safe as the clone URL.
     :param resources: Configured resources block, or ``None`` for the defaults.
     :param pvc_mounts: Normalized PVC mounts (``{claim_name, mount_path,
         read_only}``) added as ``persistentVolumeClaim`` volumes on the host
@@ -613,7 +617,11 @@ def build_job_manifest(
         mount_path}``) added as read-only ``secret`` volumes on the host
         container only, or ``None``.
     :param agent_name: Server-resolved built-in agent name the session runs,
-        added as the ``omnigent.ai/agent`` classifier label.
+        added as the ``omnigent.ai/agent`` classifier label. Stamped verbatim
+        when it is already a valid label value, otherwise omitted (extending the
+        ``None``/empty → omit fail-safe): the value selects which credential an
+        admission policy injects, so it must equal the agent name exactly rather
+        than be coerced into a collision with a different name.
     :param backoff_limit: Maximum container restart attempts before the Job
         is marked Failed.
     :param active_deadline_seconds: Hard lifetime cap for the Job.
@@ -628,12 +636,16 @@ def build_job_manifest(
     pvc_volumes: list[dict[str, object]] = []
     pvc_volume_mounts: list[dict[str, object]] = []
     for i, mount in enumerate(pvc_mounts or ()):
+        # Index-based names sidestep DNS-label collisions between similar claim
+        # names and with the reserved "home" volume.
         claim_source: dict[str, object] = {"claimName": mount["claim_name"]}
         volume_mount: dict[str, object] = {
             "name": f"pvc-{i}",
             "mountPath": mount["mount_path"],
         }
         if mount["read_only"]:
+            # readOnly on the volume source too, so even a future second mount
+            # of the same volume cannot write through it.
             claim_source["readOnly"] = True
             volume_mount["readOnly"] = True
         pvc_volumes.append({"name": f"pvc-{i}", "persistentVolumeClaim": claim_source})
@@ -642,16 +654,25 @@ def build_job_manifest(
     secret_volumes: list[dict[str, object]] = []
     secret_volume_mounts: list[dict[str, object]] = []
     for i, mount in enumerate(secret_mounts or ()):
+        # Index-based names sidestep DNS-label collisions between similar Secret
+        # names and with the reserved "home" / pvc-* volumes.
         secret_volumes.append(
             {
                 "name": f"secret-{i}",
                 "secret": {
                     "secretName": mount["secret_name"],
+                    # optional=False so a missing Secret fails the mount — the
+                    # Pod never goes Running, and the runner can't boot without
+                    # the credential it was configured to hold.
                     "optional": False,
+                    # defaultMode 0440 so the non-root runner reads it via
+                    # fsGroup and nothing else in the container can — it is a
+                    # credential, not a world-readable file.
                     "defaultMode": 0o440,
                 },
             }
         )
+        # A Secret volume is read-only regardless; readOnly makes that explicit.
         secret_volume_mounts.append(
             {"name": f"secret-{i}", "mountPath": mount["mount_path"], "readOnly": True}
         )
@@ -659,6 +680,19 @@ def build_job_manifest(
     init_env = [{"name": "HOME", "value": _HOME_DIR}]
     config_home = env_literals.get("OMNIGENT_CONFIG_HOME")
     if config_home is not None:
+        # Init and host containers share ONLY the HOME emptyDir, and both run
+        # with workingDir=_HOME_DIR. The injected config the init container
+        # writes is visible to the host only if its directory resolves under
+        # HOME — otherwise the write lands in the init container's private
+        # filesystem and the host silently boots without its providers. An empty
+        # value is falsy: the writer (and host loader) treat it as unset
+        # (~/.omnigent), so only a non-empty override is checked. Resolve
+        # relative to HOME (the shared workingDir) and normalize so a ``..``
+        # segment can't slip past the prefix check, then fail the launch loudly.
+        # A runtime symlink under HOME pointing elsewhere can still defeat this
+        # lexical check, so an operator must not aim OMNIGENT_CONFIG_HOME inside
+        # the cloned workspace. Use posixpath: the target is always a POSIX Pod,
+        # even when the server building this manifest runs on Windows.
         resolved_home = posixpath.normpath(posixpath.join(_HOME_DIR, config_home))
         if (
             config_home
@@ -684,6 +718,7 @@ def build_job_manifest(
         "volumeMounts": home_mount,
     }
     if harness_secret:
+        # The clone may need GIT_TOKEN (private repos) from the harness Secret.
         init_container["envFrom"] = [{"secretRef": {"name": harness_secret}}]
 
     host_env: list[dict[str, object]] = [
@@ -698,17 +733,6 @@ def build_job_manifest(
     ]
     host_env.extend({"name": name, "value": value} for name, value in env_literals.items())
 
-    # Liveness probe: verify the PID-1 reaper's child (omnigent host) is alive.
-    # pgrep checks for a process matching "omnigent" — if the host has crashed
-    # but the reaper hasn't exited (shouldn't happen, but guards against edge
-    # cases), the probe fails and the kubelet restarts the container.
-    liveness_probe: dict[str, object] = {
-        "exec": {"command": ["pgrep", "-f", "omnigent host"]},
-        "initialDelaySeconds": _LIVENESS_INITIAL_DELAY_S,
-        "periodSeconds": _LIVENESS_PERIOD_S,
-        "failureThreshold": _LIVENESS_FAILURE_THRESHOLD,
-    }
-
     host_container: dict[str, object] = {
         "name": _CONTAINER_NAME,
         "image": image,
@@ -718,7 +742,6 @@ def build_job_manifest(
         "resources": pod_resources,
         "securityContext": container_security,
         "volumeMounts": [*home_mount, *pvc_volume_mounts, *secret_volume_mounts],
-        "livenessProbe": liveness_probe,
     }
     if harness_secret:
         host_container["envFrom"] = [{"secretRef": {"name": harness_secret}}]
@@ -727,6 +750,9 @@ def build_job_manifest(
         "restartPolicy": "OnFailure",
         "automountServiceAccountToken": False,
         "serviceAccountName": service_account,
+        # amd64 default first so existing deployments keep their placement; an
+        # operator "kubernetes.io/arch" entry overrides it (e.g. arm64 nodes —
+        # the host image is published multi-arch).
         "nodeSelector": {"kubernetes.io/arch": "amd64", **(node_selector or {})},
         "securityContext": {
             "runAsNonRoot": True,
@@ -741,11 +767,16 @@ def build_job_manifest(
         "containers": [host_container],
     }
 
+    # Reserved pair first (never overridable). The classifier is echo-or-omit:
+    # never coerced, since a lossy collision would map two agents onto one
+    # credential an admission policy injects.
     labels = {_MANAGED_BY_LABEL: _MANAGED_BY_VALUE, _ROLE_LABEL: _ROLE_VALUE}
     if agent_name:
         if _is_valid_label_value(agent_name):
             labels[_AGENT_LABEL] = agent_name
         else:
+            # Warned, not silent: the resolve upstream already logged this agent
+            # as classified, so a quiet drop would contradict it.
             _logger.warning(
                 "agent %r is not a valid %s value; runner Job %s stays unclassified",
                 agent_name,
@@ -959,6 +990,15 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         pvc_mounts: Sequence[Mapping[str, object]] | None = None,
         secret_mounts: Sequence[Mapping[str, object]] | None = None,
     ) -> None:
+        """
+        Store provider config for lazy use by :meth:`start_host` / :meth:`terminate`.
+
+        No Kubernetes client is created here — the ``ApiClient`` and its two
+        typed wrappers are built on first use by :meth:`_load_clients` so that
+        constructing the launcher is always safe (no cluster reachability
+        required) and so tests can inject fakes before the real client is
+        created.
+        """
         self._image_ref = image
         self._namespace = namespace
         self._env_names = tuple(env) if env is not None else None
@@ -1563,7 +1603,17 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             try:
                 delete()
             except ApiException as exc:
-                if getattr(exc, "status", None) != 404:
+                if getattr(exc, "status", None) == 404:
+                    if kind == "job":
+                        # No Job exists — try deleting a bare Pod left by the
+                        # pre-Job launcher so in-flight sandboxes are cleaned up.
+                        with contextlib.suppress(ApiException, HTTPError):
+                            core.delete_namespaced_pod(
+                                job_name,
+                                namespace,
+                                _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+                            )
+                else:
                     _warn(kind, _api_reason(exc))
             except HTTPError as exc:
                 _warn(kind, _api_reason(exc))
@@ -1596,6 +1646,18 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                         sandbox_id,
                         namespace,
                         body=delete_opts,
+                        _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+                    ),
+                ),
+                # Fall back to deleting a bare Pod left by the pre-Job launcher.
+                # If the Job existed, its cascading delete already removed the
+                # child Pod; this second delete harmlessly 404s.
+                (
+                    "pod",
+                    sandbox_id,
+                    lambda: self._load_core().delete_namespaced_pod(
+                        sandbox_id,
+                        namespace,
                         _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
                     ),
                 ),
