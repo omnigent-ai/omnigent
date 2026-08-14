@@ -93,6 +93,59 @@ def _settled_geometry(page: Page, timeout_s: float = 15.0) -> dict:
     raise AssertionError(f"layout never settled; last reading: {previous}")
 
 
+def _scroll_to_distance_from_bottom(page: Page, distance: int) -> dict:
+    """Scroll the transcript to a precise distance from its bottom."""
+    return page.evaluate(
+        """distance => {
+            const form = document.querySelector(
+                'textarea[aria-label="Message the agent"]'
+            ).closest('form');
+            const scroller = form.parentElement.querySelector('[role="log"] > div');
+            scroller.dispatchEvent(new WheelEvent('wheel', { deltaY: -100 }));
+            scroller.scrollTop = scroller.scrollHeight - scroller.clientHeight - distance;
+            scroller.dispatchEvent(new Event('scroll'));
+            return {
+                scrollTop: Math.round(scroller.scrollTop),
+                distanceFromBottom: Math.round(
+                    scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
+                ),
+            };
+        }""",
+        distance,
+    )
+
+
+def _append_streamed_output(page: Page, height: int) -> dict:
+    """Grow transcript content without scrolling its container."""
+    return page.evaluate(
+        """height => {
+            const form = document.querySelector(
+                'textarea[aria-label="Message the agent"]'
+            ).closest('form');
+            const scroller = form.parentElement.querySelector('[role="log"] > div');
+            const content = scroller.firstElementChild;
+            const before = {
+                scrollHeight: scroller.scrollHeight,
+                scrollTop: scroller.scrollTop,
+            };
+            const streamed = document.createElement('div');
+            streamed.dataset.testid = 'streamed-output-probe';
+            streamed.style.flex = '0 0 auto';
+            streamed.style.height = `${height}px`;
+            streamed.textContent = 'Additional streamed output below the reader.';
+            content.append(streamed);
+            return {
+                before,
+                after: {
+                    scrollHeight: scroller.scrollHeight,
+                    scrollTop: scroller.scrollTop,
+                },
+            };
+        }""",
+        height,
+    )
+
+
 def test_composer_growth_reflows_transcript_without_covering_output(
     page: Page,
     seeded_session: tuple[str, str],
@@ -184,3 +237,63 @@ def test_composer_growth_reflows_transcript_without_covering_output(
             shrunk[key],
         )
     assert_clearance(shrunk, "after deleting")
+
+    # Escape bottom lock, then let output stream below the reader without
+    # moving the scroll container. Composer growth must preserve the real
+    # post-stream distance, not the distance cached before content grew.
+    _scroll_to_distance_from_bottom(page, 180)
+    escaped = _settled_geometry(page)
+    assert abs(escaped["distanceFromBottom"] - 180) <= 1, escaped
+
+    appended = _append_streamed_output(page, 240)
+    streamed = _settled_geometry(page)
+    added_height = appended["after"]["scrollHeight"] - appended["before"]["scrollHeight"]
+    assert added_height > 0, appended
+    assert appended["after"]["scrollTop"] == appended["before"]["scrollTop"], appended
+    expected_streamed_distance = escaped["distanceFromBottom"] + added_height
+    assert abs(streamed["distanceFromBottom"] - expected_streamed_distance) <= 1, (
+        escaped,
+        appended,
+        streamed,
+    )
+
+    for _ in range(3):
+        composer.press("Shift+Enter")
+    streamed_grown = _settled_geometry(page)
+    assert abs(streamed_grown["overlap"]) <= 1, streamed_grown
+    assert abs(streamed_grown["distanceFromBottom"] - streamed["distanceFromBottom"]) <= 1, (
+        {
+            "before": {
+                "distance": streamed["distanceFromBottom"],
+                "viewport": streamed["viewport"],
+            },
+            "after": {
+                "distance": streamed_grown["distanceFromBottom"],
+                "viewport": streamed_grown["viewport"],
+            },
+        },
+    )
+
+    # The first genuine user scroll after another content-height change must
+    # replace the reconciled distance instead of being mistaken for a synthetic
+    # content-resize scroll.
+    for _ in range(3):
+        composer.press("Backspace")
+    _settled_geometry(page)
+    _append_streamed_output(page, 120)
+    after_more_output = _settled_geometry(page)
+    user_distance = after_more_output["distanceFromBottom"] + 70
+    _scroll_to_distance_from_bottom(page, user_distance)
+    after_user_scroll = _settled_geometry(page)
+    assert abs(after_user_scroll["distanceFromBottom"] - user_distance) <= 1, after_user_scroll
+
+    for _ in range(3):
+        composer.press("Shift+Enter")
+    after_user_scroll_grown = _settled_geometry(page)
+    assert abs(after_user_scroll_grown["overlap"]) <= 1, after_user_scroll_grown
+    assert (
+        abs(
+            after_user_scroll_grown["distanceFromBottom"] - after_user_scroll["distanceFromBottom"]
+        )
+        <= 1
+    ), (after_user_scroll, after_user_scroll_grown)

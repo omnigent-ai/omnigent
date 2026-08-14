@@ -136,9 +136,8 @@ describe("useAutoGrowTextarea", () => {
   });
 
   it("reports how far past one row the box has grown", () => {
-    // The in-session composer subtracts this from its own top margin, keeping
-    // the extra rows out of the flex column so the transcript's scroll
-    // viewport — and the scrollbar and turn rail drawn from it — hold still.
+    // Callers use this to react to the textarea's capped growth without
+    // remeasuring its content independently.
     const growth: number[] = [];
     const { getByTestId } = render(<Harness value="x" onGrowth={(px) => growth.push(px)} />);
     const ta = getByTestId("ta") as HTMLTextAreaElement;

@@ -2372,56 +2372,114 @@ function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
  *
  * So we watch the scroll container itself with a `ResizeObserver` and, on any
  * size change, hold the scroll position relative to the bottom constant:
- * `scrollTop = scrollHeight - clientHeight - distance`. `distance` is tracked
- * from genuine user scrolls only — scrolls that coincide with a dimension change
- * (the resize's own clamp, or our restore) are ignored so they can't corrupt it.
- * At the bottom (distance 0) you stay at the bottom; scrolled up reading
- * history, you keep seeing the same messages. New messages still go through the
- * library (content resize doesn't change the container's box). Stateless across
- * any number of keyboard cycles.
+ * `scrollTop = scrollHeight - clientHeight - distance`. We also observe the
+ * transcript content: output can keep growing while an escaped reader's
+ * `scrollTop` stays still, so that growth must increase the stored distance
+ * before a later composer resize restores it. An explicit restore target
+ * distinguishes our own scroll from the next genuine user scroll.
  */
 function PreserveScrollDistanceOnResize() {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    contentRef?: React.RefObject<HTMLElement>;
     scrollRef?: React.RefObject<HTMLElement>;
   };
+  const contentRef = ctx.contentRef;
   const scrollRef = ctx.scrollRef;
+  const state = ctx.state;
 
   useEffect(() => {
     const el = scrollRef?.current;
     if (!el) return;
 
     const measure = () => el.scrollHeight - el.clientHeight - el.scrollTop;
-    let distance = Math.max(0, measure());
+    let distance = state.escapedFromLock ? Math.max(0, measure()) : 1;
     let prevSH = el.scrollHeight;
     let prevCH = el.clientHeight;
+    let restoring = false;
+    let restoreFrame: number | null = null;
+    let clearRestoreFrame: number | null = null;
+    let restorePasses = 0;
+    let scrollTimer: number | null = null;
+
+    const reconcileContentHeight = (scrollHeight: number) => {
+      const delta = scrollHeight - prevSH;
+      if (delta === 0) return;
+      distance = state.escapedFromLock ? Math.max(0, distance + delta) : 1;
+      prevSH = scrollHeight;
+    };
+
+    const applyRestore = () => {
+      restoreFrame = null;
+      const scrollHeight = el.scrollHeight;
+      const clientHeight = el.clientHeight;
+      const maxScrollTop = Math.max(0, scrollHeight - clientHeight);
+      el.scrollTop = Math.max(0, Math.min(maxScrollTop, maxScrollTop - distance));
+      prevSH = el.scrollHeight;
+      prevCH = el.clientHeight;
+      clearRestoreFrame = requestAnimationFrame(() => {
+        clearRestoreFrame = null;
+        if (Math.abs(Math.max(0, measure()) - distance) > 1 && restorePasses < 3) {
+          restorePasses += 1;
+          restoreFrame = requestAnimationFrame(applyRestore);
+          return;
+        }
+        restoring = false;
+        restorePasses = 0;
+      });
+    };
+
+    const scheduleRestore = () => {
+      if (!restoring) restorePasses = 0;
+      restoring = true;
+      if (restoreFrame !== null) cancelAnimationFrame(restoreFrame);
+      if (clearRestoreFrame !== null) cancelAnimationFrame(clearRestoreFrame);
+      restoreFrame = requestAnimationFrame(applyRestore);
+    };
 
     const onScroll = () => {
-      const sh = el.scrollHeight;
-      const ch = el.clientHeight;
-      // A scroll that lands on the same frame as a size change is resize-induced
-      // (the browser's clamp, or our own restore below) — not the user. Skip it
-      // so it can't overwrite the distance we're trying to preserve.
-      if (sh !== prevSH || ch !== prevCH) {
+      if (scrollTimer !== null) window.clearTimeout(scrollTimer);
+      // The library updates `escapedFromLock` one millisecond after its scroll
+      // listener runs. Read its stable mutable state after that classification
+      // so scrollbar drags and the first post-stream user scroll are genuine,
+      // while its own bottom-lock scrolls remain synthetic here.
+      scrollTimer = window.setTimeout(() => {
+        scrollTimer = null;
+        if (restoring) return;
+        const sh = el.scrollHeight;
+        const ch = el.clientHeight;
+        if (ch !== prevCH) {
+          scheduleRestore();
+          return;
+        }
+        distance = state.escapedFromLock ? Math.max(0, measure()) : 1;
         prevSH = sh;
         prevCH = ch;
-        return;
-      }
-      distance = Math.max(0, measure());
+      }, 2);
     };
 
     const observer = new ResizeObserver(() => {
-      el.scrollTop = el.scrollHeight - el.clientHeight - distance;
-      prevSH = el.scrollHeight;
-      prevCH = el.clientHeight;
+      const sh = el.scrollHeight;
+      const ch = el.clientHeight;
+      if (restoring) {
+        scheduleRestore();
+        return;
+      }
+      if (ch !== prevCH) scheduleRestore();
+      else reconcileContentHeight(sh);
     });
 
     el.addEventListener("scroll", onScroll, { passive: true });
     observer.observe(el);
+    const content = contentRef?.current ?? el.firstElementChild;
+    if (content) observer.observe(content);
     return () => {
       el.removeEventListener("scroll", onScroll);
       observer.disconnect();
+      if (scrollTimer !== null) window.clearTimeout(scrollTimer);
+      if (restoreFrame !== null) cancelAnimationFrame(restoreFrame);
+      if (clearRestoreFrame !== null) cancelAnimationFrame(clearRestoreFrame);
     };
-  }, [scrollRef]);
+  }, [contentRef, scrollRef, state]);
 
   return null;
 }
