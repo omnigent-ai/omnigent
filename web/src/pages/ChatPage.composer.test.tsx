@@ -1834,6 +1834,31 @@ describe("Composer config gear", () => {
     expect(screen.getByTestId("composer-config-model")).toHaveTextContent("Default");
   });
 
+  it("names the model Codex's Default resolves to, like the new-session gear", async () => {
+    const options = [
+      { id: "gpt-5.6-sol", displayName: "GPT-5.6-Sol" },
+      { id: "gpt-5.6-luna", displayName: "GPT-5.6-Luna", isDefault: true },
+    ];
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: false,
+          showModels: true,
+          modelPickerKind: "codex",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+    fireEvent.click(screen.getByTestId("composer-config-model"));
+    // A bare "Default" was the bug: this gear and the new-session gear named
+    // the same unpinned session's model differently, so neither told the user
+    // which model Codex would actually run.
+    expect(screen.getByRole("option", { name: "Default (GPT-5.6-Luna)" })).toBeTruthy();
+  });
+
   it("does not open the modal via bare /model when the gear is disabled (unreachable)", async () => {
     // Bare /model bumps the open nonce; on an unreachable session the gear is
     // inert, so the nonce must NOT open a modal that can't apply a change.

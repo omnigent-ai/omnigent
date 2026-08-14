@@ -21,6 +21,7 @@ from omnigent._native_post_delivery import (
     post_external_session_status,
     post_may_have_been_delivered,
 )
+from omnigent.claude_model_vocabulary import CUSTOM_MODEL_OPTION_ENV_VAR
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     ClaudeHookRecord,
@@ -36,6 +37,7 @@ from omnigent.claude_native_bridge import (
     read_hook_events_from_offset,
     read_hook_events_since_with_position,
     read_message_deltas_from_offset,
+    read_model_env,
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
     read_transcript_path,
@@ -3573,7 +3575,7 @@ async def _forward_available_items(
         client,
         session_id=session_id,
         dedupe=dedupe,
-        alias=_model_alias_for(result.latest_model),
+        alias=_model_alias_for(result.latest_model, read_model_env(bridge_dir)),
     )
     return updated
 
@@ -4157,37 +4159,44 @@ def _gen_ai_usage_tokens(usage: Mapping[str, float | str] | None) -> dict[str, i
     return tokens
 
 
-def _model_alias_for(model: str | None) -> str | None:
+def _model_alias_for(
+    model: str | None,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
     """
-    Collapse a concrete Claude model id to the picker's tier alias.
+    Collapse a concrete Claude model id to the session's picker alias.
 
-    The web model picker speaks Claude Code's version-agnostic aliases
-    (``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``), plus the one
-    extra concrete-id slot ``"sonnet_5"`` (see
-    :data:`omnigent.claude_native._UCODE_CLAUDE_CUSTOM_TIER`) for the newer
-    Sonnet generation offered alongside the default ``"sonnet"`` tier; the
-    transcript records the resolved concrete id (e.g.
-    ``"claude-opus-4-8"`` or ``"databricks-claude-sonnet-5"``).
-    Mapping to the tier keeps the mirrored value in the picker's
-    vocabulary and makes a web→TUI round-trip a no-op. The older Sonnet
-    (``sonnet-4-6``) collapses to the generic ``"sonnet"`` alias — it is the
-    default that row is bound to.
+    The picker's vocabulary is the session catalog's row ids: the family
+    aliases (``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"haiku"``), their
+    bracket variants (``"sonnet[1m]"``) — and, only on a config whose
+    custom slot pins it, the legacy ``"sonnet_5"`` opt-in row (see
+    :data:`omnigent.claude_native._UCODE_CLAUDE_CUSTOM_TIER`). The
+    transcript/statusLine record the resolved concrete id
+    (``"databricks-claude-sonnet-5[1m]"``); mapping back to the alias
+    keeps the mirrored value renderable and makes a web→TUI round-trip a
+    no-op against the persisted override.
 
-    :param model: Concrete model id from the transcript, e.g.
-        ``"claude-opus-4-8"``; ``None`` when none observed yet.
-    :returns: ``"fable"`` / ``"opus"`` / ``"sonnet"`` / ``"sonnet_5"`` /
-        ``"haiku"`` when the id carries a known tier token, else ``None``
-        (the caller skips the post rather than surface an id the picker
-        can't render).
+    :param model: Concrete model id from the transcript or statusLine,
+        e.g. ``"claude-opus-4-8"``; ``None`` when none observed yet.
+    :param env: The session's launch pins (``read_model_env``), consulted
+        only to decide whether the legacy custom-slot row exists.
+    :returns: The picker alias, else ``None`` (the caller skips the post
+        rather than surface an id the picker can't render).
     """
     if not model:
         return None
     lowered = model.lower()
-    if "sonnet-5" in lowered or "sonnet_5" in lowered:
-        return "sonnet_5"
+    marker = "[1m]" if lowered.endswith("[1m]") else ""
+    base = lowered.removesuffix("[1m]")
+    if not marker and ("sonnet-5" in base or "sonnet_5" in base):
+        custom = str((env or {}).get(CUSTOM_MODEL_OPTION_ENV_VAR, "")).lower()
+        if "sonnet-5" in custom or "sonnet_5" in custom:
+            # Only this config's picker has the opt-in row; everywhere else
+            # the generic sonnet row IS this model, so the family alias wins.
+            return "sonnet_5"
     for tier in ("fable", "opus", "sonnet", "haiku"):
-        if tier in lowered:
-            return tier
+        if tier in base:
+            return tier + marker
     return None
 
 
@@ -4304,7 +4313,10 @@ async def _forward_model_from_status(
     if status_state is None:
         return
     model = status_state.get("model")
-    alias = _model_alias_for(model if isinstance(model, str) else None)
+    alias = _model_alias_for(
+        model if isinstance(model, str) else None,
+        read_model_env(bridge_dir),
+    )
     await _post_model_change_if_new(
         client,
         session_id=session_id,

@@ -162,6 +162,14 @@ def claude_model_alias(
     candidate = model.strip().lower()
     if candidate in CLAUDE_MODEL_ALIASES:
         return candidate
+    # Bracket variants of the family aliases (``sonnet[1m]``) are settable
+    # aliases in their own right — the harness enumerates them in /model's
+    # usage line and resolves the marker itself (the family pin plus the
+    # marker on a pinned env). Stepping one down to its family would
+    # silently drop the marker; refusing it blocks a switch the pane accepts.
+    base, bracket, marker = candidate.partition("[")
+    if bracket and marker.endswith("]") and base in CLAUDE_MODEL_ALIASES:
+        return candidate
     pins = alias_pins(env)
     normalized = normalized_model_id(model)
     for alias, pinned in pins.items():

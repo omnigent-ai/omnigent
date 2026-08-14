@@ -37,6 +37,39 @@ const CODEX_MODEL_OPTIONS: NativeModelOption[] = [
   },
 ];
 
+// Codex's bundled rows spell the version with a dot and repeat that spelling in
+// `model`, where the catalog spells the same models `databricks-gpt-5-6-…`.
+// Sol carries an "ultra" rung Luna does not.
+const CODEX_BUNDLED_OPTIONS: NativeModelOption[] = [
+  {
+    id: "gpt-5.6-sol",
+    model: "gpt-5.6-sol",
+    displayName: "GPT-5.6-Sol",
+    supportedReasoningEfforts: [
+      { reasoningEffort: "low" },
+      { reasoningEffort: "medium" },
+      { reasoningEffort: "high" },
+      { reasoningEffort: "xhigh" },
+      { reasoningEffort: "max" },
+      { reasoningEffort: "ultra" },
+    ],
+    isDefault: true,
+  },
+  {
+    id: "gpt-5.6-luna",
+    model: "gpt-5.6-luna",
+    displayName: "GPT-5.6-Luna",
+    supportedReasoningEfforts: [
+      { reasoningEffort: "low" },
+      { reasoningEffort: "medium" },
+      { reasoningEffort: "high" },
+      { reasoningEffort: "xhigh" },
+      { reasoningEffort: "max" },
+    ],
+    isDefault: false,
+  },
+];
+
 describe("CLAUDE_NATIVE_MODELS", () => {
   it("offers Claude Code tier aliases, not pinned version IDs", () => {
     // Pinned IDs ("claude-opus-4-7") break the moment a user's Claude
@@ -60,7 +93,7 @@ describe("CLAUDE_NATIVE_MODELS", () => {
     expect(CLAUDE_NATIVE_MODELS.map((m) => m.label)).toEqual([
       "Fable",
       "Opus",
-      "Sonnet 4.6",
+      "Sonnet",
       "Sonnet 5",
       "Haiku",
     ]);
@@ -82,12 +115,31 @@ describe("Codex model-list helpers", () => {
       "low",
       "medium",
     ]);
-    expect(codexEffortLevelsForModel(CODEX_MODEL_OPTIONS, null)).toEqual([
+  });
+
+  it("resolves a catalog-spelled session model onto its Codex row", () => {
+    // A Databricks launch records `databricks-gpt-5-6-luna` while Codex lists
+    // `gpt-5.6-luna`, so comparing the spellings verbatim finds nothing and the
+    // session inherits Sol's ladder — including "ultra", which Luna rejects.
+    expect(findNativeModelOption(CODEX_BUNDLED_OPTIONS, "databricks-gpt-5-6-luna")?.id).toBe(
+      "gpt-5.6-luna",
+    );
+    expect(codexEffortLevelsForModel(CODEX_BUNDLED_OPTIONS, "databricks-gpt-5-6-luna")).toEqual([
       "low",
       "medium",
       "high",
       "xhigh",
+      "max",
     ]);
+  });
+
+  it("offers no effort levels until the model resolves to a Codex row", () => {
+    // Codex reports `isDefault` off its bundled catalog, so it stays put even
+    // when the session launched on something else. Borrowing that row's ladder
+    // offers levels the running model rejects — "xhigh" here is only GPT-5.5's.
+    // Both an unresolved model and an id Codex never advertised get nothing.
+    expect(codexEffortLevelsForModel(CODEX_MODEL_OPTIONS, null)).toEqual([]);
+    expect(codexEffortLevelsForModel(CODEX_MODEL_OPTIONS, "gpt-5.4")).toEqual([]);
   });
 });
 

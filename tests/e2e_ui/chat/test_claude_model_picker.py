@@ -608,6 +608,175 @@ def test_composer_model_label_never_shows_the_previous_sessions_model(
     )
 
 
+def test_claude_model_label_never_claims_a_version_the_catalog_didnt_give(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Pre-catalog, the composer label is friendly but version-free.
+
+    The chip prefers the catalog's display name; before the catalog
+    arrives it must fall back to a mechanical rendering of the alias
+    (``sonnet[1m]`` → "Sonnet (1M context)") — never the raw id, and
+    never a version claim (the old fallback said "Sonnet 4.6" while the
+    catalog resolves the alias to Sonnet 5). Every label the page ever
+    paints is recorded, so a transient wrong label can't hide from a
+    retrying ``expect()``.
+    """
+    base_url, session_id = seeded_session
+    catalog_state = {"ready": False}
+    one_m_catalog = [
+        *_MODEL_OPTIONS,
+        {
+            "id": "sonnet[1m]",
+            "model": "system.ai.claude-sonnet-5[1m]",
+            "displayName": "Sonnet 5 (1M context)",
+            "isDefault": False,
+        },
+    ]
+    _patch_session_as_claude_native(
+        page,
+        session_id,
+        model_override="sonnet[1m]",
+        catalog_state=catalog_state,
+        model_options=one_m_catalog,
+    )
+    stream_script = """
+        (() => {
+          const sessionId = __SESSION_ID__;
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const url = typeof input === "string" ? input : input.url;
+            const streamPath = `/v1/sessions/${sessionId}/stream`;
+            if (new URL(url, window.location.origin).pathname === streamPath) {
+              const body = new ReadableStream({
+                start(controller) {
+                  window.__claudeModelStreamController = controller;
+                },
+              });
+              return Promise.resolve(new Response(body, {
+                status: 200,
+                headers: { "content-type": "text/event-stream" },
+              }));
+            }
+            return originalFetch(input, init);
+          };
+        })()
+        """.replace("__SESSION_ID__", json.dumps(session_id))
+    page.add_init_script(stream_script)
+    page.add_init_script(_LABEL_RECORDER)
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    # Pre-catalog: the mechanical fallback, alias rendered friendly.
+    label = page.get_by_test_id("composer-model-effort-label")
+    expect(label).to_contain_text("Sonnet (1M context)", timeout=15_000)
+    page.wait_for_function("window.__claudeModelStreamController !== undefined")
+
+    # The catalog lands: its display name supersedes the fallback.
+    catalog_state["ready"] = True
+    page.evaluate(
+        """
+        ({ sessionId }) => {
+          const frame = `event: session.model_options\ndata: ${JSON.stringify({
+            conversation_id: sessionId,
+          })}\n\n`;
+          window.__claudeModelStreamController.enqueue(new TextEncoder().encode(frame));
+        }
+        """,
+        {"sessionId": session_id},
+    )
+    expect(label).to_contain_text("Sonnet 5 (1M context)", timeout=10_000)
+
+    log = page.evaluate("window.__modelLabelLog")
+    labels = [entry["text"] for entry in log if entry["text"]]
+    assert labels, "the recorder never saw a composer label"
+    offending = [
+        text
+        for text in labels
+        if "sonnet[1m]" in text.lower() or "4.6" in text or text.strip().startswith("sonnet")
+    ]
+    assert not offending, (
+        f"the composer painted a raw id or an invented version: {offending} "
+        f"(full label sequence: {labels}). Pre-catalog labels must render the "
+        "alias mechanically; versions come only from the catalog."
+    )
+    _screenshot(page, "one-m-label-settled")
+
+
+def test_union_catalog_pick_patches_the_row_id_verbatim(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Picking a probe-contributed row saves exactly that row's id.
+
+    A gateway session's catalog is the configured∪probe union: pinned
+    family rows carrying gateway model ids next to probe rows like
+    ``sonnet[1m]``. Picking the probe row must PATCH its id verbatim —
+    the id is the launch contract the runner types into the pane, so any
+    client-side rewrite here switches the session to a model the user
+    did not choose (the bug this guards showed a Fable pick landing on
+    Opus; the web layer was innocent, and must stay that way).
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` for a real
+        server-backed session; the browser snapshot is patched to a
+        claude-native shape with the union catalog.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    union_catalog = [
+        {
+            "id": "opus",
+            "model": "databricks-claude-opus-5",
+            "displayName": "Opus 5",
+            "isDefault": True,
+        },
+        {
+            "id": "sonnet",
+            "model": "databricks-claude-sonnet-5",
+            "displayName": "Sonnet 5",
+            "isDefault": False,
+        },
+        {
+            "id": "sonnet[1m]",
+            "model": "databricks-claude-sonnet-5[1m]",
+            "displayName": "Sonnet 5 (1M context)",
+        },
+    ]
+    # No fixture-pinned model_override: the route fake would force it back
+    # onto every response, including the PATCH echo the store adopts. The
+    # bound ``llm_model`` already implicitly selects the sonnet row.
+    patch_bodies = _patch_session_as_claude_native(
+        page,
+        session_id,
+        model_options=union_catalog,
+        llm_model="databricks-claude-sonnet-5",
+    )
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible(timeout=15_000)
+    gear.click()
+    page.get_by_test_id("composer-config-model").click()
+    bracket_row = page.locator('[role="option"][data-model-id="sonnet[1m]"]')
+    expect(bracket_row).to_contain_text("Sonnet 5 (1M context)")
+    bracket_row.click()
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == f"/v1/sessions/{session_id}"
+            and response.status == 200
+        )
+    ):
+        page.get_by_test_id("composer-config-save").click()
+
+    assert patch_bodies[-1] == {"model_override": "sonnet[1m]"}
+    expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text(
+        "Sonnet 5 (1M context)"
+    )
+
+
 def test_claude_native_picker_prefers_session_override_over_sticky_model(
     page: Page,
     seeded_session: tuple[str, str],

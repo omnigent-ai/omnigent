@@ -3515,12 +3515,18 @@ async def test_forwarder_does_not_mirror_when_hook_payload_lacks_session_id(
         # here means a TUI switch to claude-fable-5 never reaches the picker.
         ("claude-fable-5", "fable"),
         ("databricks-claude-fable-5", "fable"),
-        # Sonnet 5 routes to its own opt-in picker slot, not the generic
-        # "sonnet" row — both ids contain the substring "sonnet", so a miss
-        # here means a TUI switch to the newer Sonnet generation would
-        # wrongly light up the default-Sonnet row instead.
-        ("anthropic/claude-sonnet-5", "sonnet_5"),
-        ("databricks-claude-sonnet-5", "sonnet_5"),
+        # Without a custom-slot pin the generic "sonnet" row IS this model
+        # (the probe-union catalogs pin sonnet to the current Sonnet), so
+        # the family alias is the renderable row — mirroring the legacy
+        # "sonnet_5" here would stomp a just-saved override with an id the
+        # picker doesn't list.
+        ("anthropic/claude-sonnet-5", "sonnet"),
+        ("databricks-claude-sonnet-5", "sonnet"),
+        # 1M-context resolutions keep their marker: the bracket alias is
+        # its own picker row, and collapsing to the bare family would
+        # silently drop the context claim on the round-trip.
+        ("databricks-claude-sonnet-5[1m]", "sonnet[1m]"),
+        ("claude-fable-5[1m]", "fable[1m]"),
         # Unknown family or empty → None (don't surface an unrenderable id).
         ("gpt-5-4-mini", None),
         ("", None),
@@ -3533,10 +3539,26 @@ def test_model_alias_for_collapses_concrete_id_to_tier_alias(
     """
     ``_model_alias_for`` maps a concrete transcript model id to the
     picker's tier alias so a TUI ``/model`` switch lands on a picker
-    row. Covers Anthropic + Databricks-gateway id shapes and the
-    no-match / empty cases (caller skips the post on ``None``).
+    row. Covers Anthropic + Databricks-gateway id shapes, 1M-context
+    bracket variants, and the no-match / empty cases (caller skips the
+    post on ``None``).
     """
     assert forwarder._model_alias_for(model) == expected
+
+
+def test_model_alias_for_uses_the_custom_slot_row_only_where_it_exists() -> None:
+    """The legacy ``sonnet_5`` opt-in row is mirrored only on its config.
+
+    A config whose custom slot pins the newer Sonnet renders that model as
+    the ``sonnet_5`` picker row (its ``sonnet`` row is bound to the older
+    default), so the mirror must name it. Everywhere else the family alias
+    is the row; a bracket id keeps its marker even beside the pin.
+    """
+    pinned = {"ANTHROPIC_CUSTOM_MODEL_OPTION": "databricks-claude-sonnet-5"}
+    assert forwarder._model_alias_for("databricks-claude-sonnet-5", pinned) == "sonnet_5"
+    assert forwarder._model_alias_for("anthropic/claude-sonnet-5", pinned) == "sonnet_5"
+    assert forwarder._model_alias_for("databricks-claude-sonnet-5[1m]", pinned) == "sonnet[1m]"
+    assert forwarder._model_alias_for("databricks-claude-sonnet-4-6", pinned) == "sonnet"
 
 
 @pytest.mark.asyncio
@@ -3627,8 +3649,8 @@ async def test_forwarder_mirrors_tui_model_switch_after_baseline(tmp_path: Path)
 
     model_posts = [r for r in requests if r["type"] == "external_model_change"]
     assert len(model_posts) == 1
-    assert model_posts[0]["data"] == {"model": "sonnet_5"}
-    assert dedupe.posted_model == "sonnet_5"
+    assert model_posts[0]["data"] == {"model": "sonnet"}
+    assert dedupe.posted_model == "sonnet"
 
 
 @pytest.mark.asyncio
@@ -3711,16 +3733,16 @@ async def test_forwarder_retries_model_post_after_transient_failure(tmp_path: Pa
         with transcript_path.open("a", encoding="utf-8") as fh:
             fh.write(_assistant("a2", "claude-sonnet-5") + "\n")
         await _poll()
-        assert model_posts == [{"model": "sonnet_5"}]  # attempted once
+        assert model_posts == [{"model": "sonnet"}]  # attempted once
         assert dedupe.posted_model == "opus"  # NOT advanced — POST failed
-        assert dedupe.observed_model == "sonnet_5"  # but remembered
+        assert dedupe.observed_model == "sonnet"  # but remembered
 
         # Poll 3: a plain user turn (no message.model) still retries.
         with transcript_path.open("a", encoding="utf-8") as fh:
             fh.write(_user("u1") + "\n")
         await _poll()
-        assert model_posts == [{"model": "sonnet_5"}, {"model": "sonnet_5"}]  # retried
-        assert dedupe.posted_model == "sonnet_5"  # now committed
+        assert model_posts == [{"model": "sonnet"}, {"model": "sonnet"}]  # retried
+        assert dedupe.posted_model == "sonnet"  # now committed
 
 
 def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprint(

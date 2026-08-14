@@ -109,8 +109,7 @@ import type {
 import { uploadFile } from "@/lib/filesApi";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
-import { isClaudeNativeModel } from "@/lib/claudeNativeModels";
-import { isCodexNativeModel } from "@/lib/codexNativeModels";
+import { findNativeModelOption } from "@/lib/codexNativeModels";
 import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { getOmnigentHostConfig } from "@/lib/host";
@@ -2585,28 +2584,19 @@ function nativeModelFamilyForSession(session: Pick<Session, "labels">): NativeMo
 }
 
 /**
- * Whether a sticky model id can be applied to a native session family.
+ * Whether a sticky model id can be applied to a native session.
  *
- * :param family: Native model family from :func:`nativeModelFamilyForSession`.
+ * Catalog membership is the whole check, for every native family: the
+ * session's own catalog (probed from the harness) is the authority on
+ * what it accepts — a local alias list would only re-reject rows the
+ * catalog itself offers.
+ *
  * :param model: Sticky model id / alias.
- * :returns: True only when the model is compatible with that native family.
+ * :param session: Target session, whose catalog vouches (or doesn't).
+ * :returns: True only when the session's catalog lists the model.
  */
-function isNativeModelCompatible(
-  family: NativeModelFamily,
-  model: string,
-  session: Session,
-): boolean {
-  switch (family) {
-    case "claude": {
-      const options = session.codexModelOptions ?? [];
-      return (
-        isClaudeNativeModel(model) &&
-        options.some((option) => option.id === model || option.model === model)
-      );
-    }
-    case "codex":
-      return isCodexNativeModel(session.codexModelOptions ?? [], model);
-  }
+function isNativeModelCompatible(model: string, session: Session): boolean {
+  return findNativeModelOption(session.codexModelOptions ?? [], model) !== null;
 }
 
 /**
@@ -2629,9 +2619,7 @@ function deferredNativeStickyModel(session: Session): string | null {
   }
   const stickyModel =
     useChatStore.getState().selectedModel ?? loadPickerPref(PICKER_PREF_MODEL_KEY);
-  return stickyModel != null && isNativeModelCompatible(family, stickyModel, session)
-    ? stickyModel
-    : null;
+  return stickyModel != null && isNativeModelCompatible(stickyModel, session) ? stickyModel : null;
 }
 
 /**
@@ -3050,7 +3038,7 @@ async function bindStream(
     // navigating back to a native session restores it.
     const compatibleStickyModel =
       nativeModelFamily !== null && stickyModel != null
-        ? isNativeModelCompatible(nativeModelFamily, stickyModel, session)
+        ? isNativeModelCompatible(stickyModel, session)
           ? stickyModel
           : null
         : stickyModel;
@@ -3123,7 +3111,7 @@ async function bindStream(
         !catalogWonBindRace ||
         state.selectedModel == null ||
         nativeModelFamily === null ||
-        isNativeModelCompatible(nativeModelFamily, state.selectedModel, {
+        isNativeModelCompatible(state.selectedModel, {
           ...session,
           codexModelOptions: racedOptions!,
         });

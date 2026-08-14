@@ -170,6 +170,13 @@ from omnigent.tools.builtins.load_skill import (
 
 _logger = logging.getLogger(__name__)
 
+# Claude-native session model listing: how long one request waits inline for
+# the probe before answering 503-pending, and how long the probe may stay
+# pending before the configured rows are served instead. Module-level so
+# tests can patch the pacing.
+_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S = 2.5
+_CLAUDE_MODEL_OPTIONS_PROBE_GRACE_S = 25.0
+
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
     """
@@ -4188,7 +4195,9 @@ def create_runner_app(
         from omnigent.codex_native_app_server import (
             client_for_transport,
             list_codex_model_options,
+            mark_launch_default,
         )
+        from omnigent.codex_native_bridge import read_codex_home_config_model
 
         state = await _codex_native_bridge_state_for_session(
             conv_id,
@@ -4204,10 +4213,15 @@ def create_runner_app(
         )
         try:
             await codex_client.connect()
-            return await list_codex_model_options(codex_client)
+            rows = await list_codex_model_options(codex_client)
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
+        active_model = await asyncio.to_thread(
+            read_codex_home_config_model,
+            Path(state.codex_home),
+        )
+        return mark_launch_default(rows, active_model)
 
     async def _handle_pi_native_model_change(
         conv_id: str,
@@ -8526,10 +8540,25 @@ def create_runner_app(
         }
         return JSONResponse(status_code=200, content={"models": models})
 
+    # One probe per claude-native session: the merged listing (configured
+    # rows ∪ the harness's own probed answer) resolves once in the
+    # background and is cached for the session's lifetime — the launch
+    # config cannot change under it. A short inline wait lets a warm probe
+    # answer the first request; past that the endpoint answers 503 (the
+    # server's fetch retries those), and past the grace it serves the
+    # configured rows so the catalog is never empty.
+    _claude_model_options_rows: dict[str, list[dict[str, object]]] = {}
+    _claude_model_options_probes: dict[
+        str, tuple[asyncio.Task[list[dict[str, object]]], float]
+    ] = {}
+
     @app.get("/v1/sessions/{session_id}/claude-model-options")
     async def get_session_claude_model_options(session_id: str) -> JSONResponse:
         if _session_harness_name(session_id) != "claude-native":
             return JSONResponse(status_code=200, content={"models": []})
+        cached = _claude_model_options_rows.get(session_id)
+        if cached is not None:
+            return JSONResponse(status_code=200, content={"models": cached})
         try:
             claude_config = await _resolve_session_claude_launch_config(session_id)
         except click.ClickException as exc:
@@ -8561,12 +8590,61 @@ def create_runner_app(
                     ),
                 },
             )
-        from omnigent.claude_native import claude_native_model_options
-
-        return JSONResponse(
-            status_code=200,
-            content={"models": claude_native_model_options(claude_config)},
+        from omnigent.claude_native import (
+            claude_model_options_with_probe,
+            claude_native_model_options,
         )
+
+        entry = _claude_model_options_probes.get(session_id)
+        if entry is None:
+
+            async def _probed_rows() -> list[dict[str, object]]:
+                merged, _gateway_rows = await claude_model_options_with_probe(claude_config)
+                return merged
+
+            entry = (asyncio.create_task(_probed_rows()), time.monotonic())
+            _claude_model_options_probes[session_id] = entry
+        probe, started_at = entry
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(
+                asyncio.shield(probe), timeout=_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S
+            )
+        if probe.done():
+            try:
+                rows = probe.result()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — retryable; the next request restarts the probe
+                _claude_model_options_probes.pop(session_id, None)
+                _logger.warning(
+                    "Claude-native model probe failed for session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "claude_native_model_options_failed",
+                        "detail": "the harness model probe failed; retrying",
+                    },
+                )
+            _claude_model_options_rows[session_id] = rows
+            return JSONResponse(status_code=200, content={"models": rows})
+        if time.monotonic() - started_at < _CLAUDE_MODEL_OPTIONS_PROBE_GRACE_S:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_model_options_pending",
+                    "detail": "the harness model probe is still resolving",
+                },
+            )
+        # The probe outlived the grace: serve the configured rows as this
+        # session's listing rather than holding the picker empty.
+        probe.cancel()
+        _claude_model_options_probes.pop(session_id, None)
+        rows = await asyncio.to_thread(claude_native_model_options, claude_config)
+        _claude_model_options_rows[session_id] = rows
+        return JSONResponse(status_code=200, content={"models": rows})
 
     @app.post("/v1/sessions/{session_id}/skills/resolve")
     async def resolve_session_skill(session_id: str, request: Request) -> JSONResponse:

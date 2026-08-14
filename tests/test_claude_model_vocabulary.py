@@ -143,3 +143,34 @@ def test_catalog_prefixes_match_the_routing_defaults() -> None:
     from omnigent.server.smart_routing import MODEL_ID_PREFIXES
 
     assert _CATALOG_PREFIXES == MODEL_ID_PREFIXES
+
+
+@pytest.mark.parametrize(
+    ("candidate", "env"),
+    [
+        ("sonnet[1m]", {}),
+        ("sonnet[1m]", _PINNED_ENV),
+        ("opus[1m]", _PINNED_ENV),
+        ("Fable[1M]", {}),
+    ],
+)
+def test_bracket_family_aliases_are_their_own_model_arguments(
+    candidate: str,
+    env: dict[str, str],
+) -> None:
+    """``sonnet[1m]`` is a settable alias the harness enumerates itself.
+
+    It must pass through verbatim on pinned and bare envs alike: stepping
+    down to ``sonnet`` silently drops the context marker, and ``None``
+    blocks a switch the pane would accept.
+    """
+    assert claude_model_alias(candidate, env) == candidate.lower()
+    assert claude_model_command_arg(candidate, env) == candidate.lower()
+
+
+def test_bracket_marker_on_a_non_alias_is_not_an_argument() -> None:
+    """The bracket pass-through covers only Claude's own family aliases."""
+    assert claude_model_alias("gpt-5.5[1m]", {}) is None
+    # A dangling bracket is not a marker; on a pinned env nothing else
+    # claims it either (the bare-login segment fallback is separate).
+    assert claude_model_alias("sonnet[", _PINNED_ENV) is None

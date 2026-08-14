@@ -55,6 +55,8 @@ import {
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
   RoutingModelSelect,
+  defaultModelLabel,
+  nativeModelLabel,
 } from "@/components/HarnessConfigControls";
 import {
   DropdownMenu,
@@ -374,22 +376,6 @@ const CODEX_NATIVE_BYPASS_APPROVAL_OPTION = {
   description: "Runs Codex with no approval prompts and no command sandbox",
   args: [] as string[],
 };
-
-function displayModelId(option: Pick<NativeModelOption, "id">): string {
-  return option.id;
-}
-
-function displayModelName(option: Pick<NativeModelOption, "id" | "displayName">): string {
-  return option.displayName ?? option.id;
-}
-
-function defaultModelLabel(
-  options: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[],
-  display: (option: Pick<NativeModelOption, "id" | "displayName">) => string,
-): string {
-  const dflt = options.find((option) => option.isDefault);
-  return dflt ? `Default (${display(dflt)})` : "Default";
-}
 
 /** Use a local-friendly label only when the desktop shell proves the host id is this machine. */
 export function displayNameForHost(
@@ -1494,11 +1480,11 @@ function HarnessConfigModal({
   const configTitleName = autoNative ? SMART_ROUTING_LABEL : agent.display_name;
   const modelValue = smartRoutingOn ? MODEL_SELECT_SMART : draftModel || MODEL_SELECT_DEFAULT;
   const claudeModelSelectOptions = useMemo(
-    () => claudeModelOptions.map((m) => ({ id: m.id, label: displayModelName(m) })),
+    () => claudeModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
     [claudeModelOptions],
   );
   const codexModelSelectOptions = useMemo(
-    () => codexModelOptions.map((m) => ({ id: m.id, label: displayModelId(m) })),
+    () => codexModelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
     [codexModelOptions],
   );
   const onModelChange = (value: string) => {
@@ -1684,7 +1670,7 @@ function HarnessConfigModal({
                   offerSmartRouting={smartRoutingEligible}
                   testId="new-chat-landing-config-model"
                   models={codexModelSelectOptions}
-                  defaultLabel={defaultModelLabel(codexModelOptions, displayModelId)}
+                  defaultLabel={defaultModelLabel(codexModelOptions)}
                   contentClassName="[&_[data-slot=select-item]]:pl-2.5"
                 >
                   {modelsLoading && (
@@ -2745,15 +2731,16 @@ export function NewChatLandingScreen() {
           ? CODEX_NATIVE_BYPASS_APPROVAL_OPTION.label
           : (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ??
             approvalMode);
+      const pickedCodexRow = codexModelOptions.find((m) => m.id === pickedModel);
       const modelRows =
         routingOn || !isCodex
           ? routingRow
           : [
               {
                 label: "Model",
-                value:
-                  codexModelOptions.find((m) => m.id === pickedModel)?.id ??
-                  defaultModelLabel(codexModelOptions, displayModelId),
+                value: pickedCodexRow
+                  ? nativeModelLabel(pickedCodexRow)
+                  : defaultModelLabel(codexModelOptions),
               },
             ];
       return [...modelRows, { label: "Approval", value: approvalValue }];

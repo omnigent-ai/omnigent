@@ -570,9 +570,18 @@ async def test_codex_native_model_options_returns_503_until_bridge_state_exists(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config_model", "expected_default"),
+    [
+        pytest.param(None, "gpt-5.5", id="unset-keeps-codex-default"),
+        pytest.param("gpt-5.4-mini", "gpt-5.4-mini", id="launch-model-wins"),
+    ],
+)
 async def test_codex_native_model_options_query_model_list(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    config_model: str | None,
+    expected_default: str,
 ) -> None:
     """
     Runner model-options endpoint queries Codex ``model/list``.
@@ -580,7 +589,10 @@ async def test_codex_native_model_options_query_model_list(
     The Web UI must not carry its own Codex model / effort catalog. The
     runner is the process that can reach the session's Codex app-server, so
     this endpoint should ask Codex for models and return those model objects
-    unchanged for the AP snapshot.
+    for the AP snapshot, changing only which one is marked default. Codex's
+    own ``isDefault`` is its built-in preference and says nothing about this
+    session, so the model named by the session's ``config.toml`` — the one
+    the pane launched on — wins when the list offers it.
     """
     from omnigent import codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
@@ -588,13 +600,46 @@ async def test_codex_native_model_options_query_model_list(
     conv_id = "68ba0a62ebe928d26adf37c8974ce1eb"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    if config_model is not None:
+        (codex_home / "config.toml").write_text(f'model = "{config_model}"\n')
+
+    async def _fake_auto_create_codex(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        """Stand in for the codex launch, leaving the seeded bridge dir alone."""
+        del resource_registry, publish_event, kwargs
+        return SessionResourceView(
+            id="terminal_codex_main",
+            type="terminal",
+            session_id=session_id,
+            name="codex:main",
+            metadata={"terminal_name": "codex", "session_key": "main", "running": True},
+        )
+
+    # Session create launches Codex for real, and that launch owns the bridge
+    # dir: it calls clear_bridge_state, and its forwarder task rewrites both
+    # the state and CODEX_HOME/config.toml after the response is returned. On
+    # a machine where Codex and a Databricks profile resolve, that wipes the
+    # state seeded below no matter which side of create seeds it. The endpoint
+    # under test stays real: it still reads bridge state and CODEX_HOME off
+    # disk and still queries Codex through the fake app-server client.
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal",
+        _fake_auto_create_codex,
+    )
+
     codex_native_bridge.write_bridge_state(
         bridge_dir,
         codex_native_bridge.CodexNativeBridgeState(
             session_id=conv_id,
             socket_path="ws://127.0.0.1:43210",
             thread_id="thread_codex",
-            codex_home=str(tmp_path / "codex-home"),
+            codex_home=str(codex_home),
             active_turn_id=None,
         ),
     )
@@ -692,31 +737,31 @@ async def test_codex_native_model_options_query_model_list(
         resp = await client.get(f"/v1/sessions/{conv_id}/codex-model-options")
 
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {
-        "models": [
-            {
-                "id": "gpt-5.5",
-                "model": "databricks-gpt-5-5",
-                "displayName": "GPT-5.5",
-                "defaultReasoningEffort": "high",
-                "supportedReasoningEfforts": [
-                    {"reasoningEffort": "low", "description": "Low"},
-                    {"reasoningEffort": "medium", "description": "Medium"},
-                ],
-                "isDefault": True,
-            },
-            {
-                "id": "gpt-5.4-mini",
-                "model": "databricks-gpt-5-4-mini",
-                "displayName": "GPT-5.4 mini",
-                "defaultReasoningEffort": "medium",
-                "supportedReasoningEfforts": [
-                    {"reasoningEffort": "minimal", "description": "Minimal"}
-                ],
-                "isDefault": False,
-            },
-        ]
-    }
+    expected_models: list[dict[str, object]] = [
+        {
+            "id": "gpt-5.5",
+            "model": "databricks-gpt-5-5",
+            "displayName": "GPT-5.5",
+            "defaultReasoningEffort": "high",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": "low", "description": "Low"},
+                {"reasoningEffort": "medium", "description": "Medium"},
+            ],
+        },
+        {
+            "id": "gpt-5.4-mini",
+            "model": "databricks-gpt-5-4-mini",
+            "displayName": "GPT-5.4 mini",
+            "defaultReasoningEffort": "medium",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": "minimal", "description": "Minimal"}
+            ],
+        },
+    ]
+    for model_row in expected_models:
+        if model_row["id"] == expected_default:
+            model_row["isDefault"] = True
+    assert resp.json() == {"models": expected_models}
     assert fake_client.requests == [
         ("model/list", {"includeHidden": False}),
         ("model/list", {"includeHidden": False, "cursor": "next-page"}),
@@ -758,6 +803,12 @@ async def test_claude_native_model_options_use_session_launch_catalog(
         return config
 
     monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
+
+    async def _probe_unavailable(claude_config: object) -> None:
+        del claude_config
+        return
+
+    monkeypatch.setattr("omnigent.claude_native.probe_claude_model_options", _probe_unavailable)
 
     async def _fake_auto_create(
         session_id: str,
@@ -818,6 +869,103 @@ async def test_claude_native_model_options_use_session_launch_catalog(
     assert second.json() == expected
     # Auto-create and both UI reads shared one launch-time live query.
     assert resolved_specs == [claude_spec]
+
+
+@pytest.mark.asyncio
+async def test_claude_native_model_options_serves_probe_union_after_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow probe answers 503-pending, then the union rows, then the cache.
+
+    The server's fetch retries 503s, so an in-flight probe holds the
+    catalog back rather than serving a stale list; once the harness
+    answers, its rows join the configured ones and the session serves that
+    union for its lifetime.
+    """
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+    from omnigent.runner import app as runner_app_module
+
+    conv_id = "9c527915981fe729dd9a19a6dfcbca49"
+    claude_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return claude_spec
+
+    config = ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-10"},
+        api_key_helper="printf token",
+        model="system.ai.claude-opus-4-10",
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_native.resolve_native_claude_config",
+        lambda *, spec: config,
+    )
+    release = asyncio.Event()
+
+    async def _slow_probe(
+        claude_config: object,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        del claude_config
+        await release.wait()
+        return [{"id": "sonnet[1m]", "model": "claude-sonnet-5[1m]"}], []
+
+    monkeypatch.setattr("omnigent.claude_native.probe_claude_model_options", _slow_probe)
+    monkeypatch.setattr(runner_app_module, "_CLAUDE_MODEL_OPTIONS_INLINE_WAIT_S", 0.01)
+
+    async def _fake_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event
+        resolver = kwargs.get("resolve_launch_config")
+        recorder = kwargs.get("record_launch_config")
+        assert callable(resolver)
+        assert callable(recorder)
+        recorder(session_id, await resolver())
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        pending = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+        assert pending.status_code == 503
+        assert pending.json()["error"] == "claude_native_model_options_pending"
+        release.set()
+        resolved = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+        cached = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+
+    expected_ids = [row["id"] for row in resolved.json()["models"]]
+    assert resolved.status_code == 200
+    # Configured tier rows keep the rich spelling; the probe contributes
+    # the rows the config does not cover.
+    assert "opus" in expected_ids
+    assert "sonnet[1m]" in expected_ids
+    assert cached.json() == resolved.json()
 
 
 @pytest.mark.asyncio

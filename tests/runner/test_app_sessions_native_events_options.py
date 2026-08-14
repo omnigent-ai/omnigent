@@ -1937,6 +1937,127 @@ async def test_events_model_change_on_native_session_types_slash_command(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pins", "picked", "expected_command"),
+    [
+        # The reported bug: a gateway config pins the three families but not
+        # fable; picking the probed ``fable`` row injected ``/model opus`` —
+        # the resolver swapped the alias for the provider default and the
+        # vocabulary re-spelled that as its pinned alias.
+        pytest.param(
+            {
+                "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "databricks-claude-haiku-4-5",
+            },
+            "fable",
+            "/model fable",
+            id="gateway-unpinned-family-is-never-swapped-for-the-default",
+        ),
+        # Bracket aliases are the harness's own /model vocabulary. On a
+        # pinned env the old vocabulary had no spelling for them (503);
+        pytest.param(
+            {
+                "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5",
+            },
+            "sonnet[1m]",
+            "/model sonnet[1m]",
+            id="pinned-bracket-alias-passes-through",
+        ),
+        # on a bare login it stepped down to the family alias, silently
+        # dropping the 1M-context marker.
+        pytest.param(
+            {},
+            "sonnet[1m]",
+            "/model sonnet[1m]",
+            id="bare-login-bracket-alias-keeps-its-context-marker",
+        ),
+    ],
+)
+async def test_events_model_change_applies_the_picked_alias_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    pins: dict[str, str],
+    picked: str,
+    expected_command: str,
+) -> None:
+    """
+    A picker alias reaches the pane as itself, never as another model.
+
+    The harness enumerated these aliases itself (they are its ``/model``
+    vocabulary), so the injected command must carry the pick verbatim and
+    leave resolution to Claude — anything else switches the pane to a
+    model the user did not choose.
+    """
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+
+    captured: list[str] = []
+
+    def _fake_inject(
+        bridge_dir: Any,
+        *,
+        command: str,
+        timeout_s: float,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        """Record the injected command without touching tmux."""
+        del bridge_dir, timeout_s, auto_confirm, confirm_hint
+        captured.append(command)
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(claude_native_bridge, "read_model_env", lambda _bridge_dir: dict(pins))
+    monkeypatch.setattr("omnigent.claude_native._CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    config = (
+        ClaudeNativeUcodeConfig(env=dict(pins), model=pins.get("ANTHROPIC_DEFAULT_OPUS_MODEL"))
+        if pins
+        else None
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_native.resolve_native_claude_config", lambda *, spec: config
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the native spec for any agent_id."""
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    conv_id = uuid.uuid4().hex
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": picked},
+        )
+
+    assert resp.status_code == 204, (
+        f"model_change for {picked!r} must apply; got {resp.status_code}: {resp.text}"
+    )
+    assert captured == [expected_command], (
+        f"picking {picked!r} must inject {expected_command!r}; injecting anything else "
+        f"switches the pane to a model the user did not choose (got {captured!r})"
+    )
+
+
+@pytest.mark.asyncio
 async def test_events_model_change_rejects_a_model_the_picker_cannot_spell(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
