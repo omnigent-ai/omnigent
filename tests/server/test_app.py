@@ -70,6 +70,65 @@ def test_server_version_reads_version_constant() -> None:
     assert server_app._server_version() == VERSION
 
 
+@pytest.mark.asyncio
+async def test_well_known_manifest_shape(client: httpx.AsyncClient) -> None:
+    """GET /.well-known/omnigent.json returns the version manifest.
+
+    The desktop shell reads this BEFORE loading the SPA to decide how to open a
+    window, so the envelope keys are a contract: every one asserted here is a
+    key a shipped shell may branch on.
+    """
+    from omnigent.version import VERSION
+
+    resp = await client.get("/.well-known/omnigent.json")
+    assert resp.status_code == 200
+    # JSON, not the SPA's index.html — see the not-swallowed test below.
+    assert resp.headers["content-type"].startswith("application/json")
+    body = resp.json()
+
+    assert body["manifest_version"] == server_app.WELL_KNOWN_MANIFEST_VERSION
+    # An int, so clients can compare with >= rather than parsing a string.
+    assert isinstance(body["manifest_version"], int)
+    # Same source of truth as /api/version and /v1/info.server_version, so a
+    # client never sees three different answers for one server.
+    assert body["server_version"] == VERSION
+    # Present-but-null: clients rely on the key existing, and null is the
+    # "no floor" path every shipped shell must accept.
+    assert "min_desktop_version" in body
+    assert body["min_desktop_version"] is None
+    # Tells the shell where server-driven chrome lives, so it need not infer
+    # placement from the version number.
+    assert body["ui"]["server_picker"] == "sidebar"
+
+
+@pytest.mark.asyncio
+async def test_well_known_manifest_is_unauthed(client: httpx.AsyncClient) -> None:
+    """The manifest is readable without a session cookie.
+
+    The shell consults it before the app loads — i.e. before any login could
+    have happened — so an auth gate here would defeat its purpose entirely.
+    """
+    resp = await client.get("/.well-known/omnigent.json", headers={"Cookie": ""})
+    assert resp.status_code == 200
+    assert resp.json()["manifest_version"] >= 1
+
+
+def test_well_known_prefix_is_not_spa_fallback() -> None:
+    """An unmatched /.well-known/* path must 404, never fall back to the SPA.
+
+    The web UI is mounted at "/" and serves ``index.html`` for unmatched paths
+    so client routes survive a refresh. Without ``.well-known`` on the API
+    allowlist, a shell probing an OLDER server (which has no manifest route)
+    would receive ``200 text/html`` and could parse the SPA shell as a
+    manifest. The 404 is what makes "no manifest" detectable, and therefore
+    what makes the pre-manifest fallback path work at all.
+    """
+    assert server_app._is_web_ui_api_fallback_path(".well-known/omnigent.json")
+    assert server_app._is_web_ui_api_fallback_path(".well-known/anything-else")
+    # Sanity: a real client route still falls through to index.html.
+    assert not server_app._is_web_ui_api_fallback_path("c/conv_abc123")
+
+
 class _StubWebSocket:
     """
     Minimal real ``WebSocketLike`` for registering a runner tunnel.

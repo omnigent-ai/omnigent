@@ -26,7 +26,12 @@ _CLAUDE_SUBSCRIPTION_MODELS = (
     "claude-haiku-4-5",
 )
 
-_CODEX_MODELS = ("gpt-5-6-sol", "gpt-5-6-luna", "gpt-5-6-terra", "gpt-5-5")
+#: Codex's own model slugs, which spell the version with a DOT
+#: (``gpt-5.6-sol``). These reach codex's ChatGPT-account backend directly, so
+#: the Databricks serving spelling (``databricks-gpt-5-6-sol``, hyphens only)
+#: is rejected here with a 400 — unlike the gateway catalogs below, which are
+#: correctly hyphenated. Ordered cheapest-safe default first.
+_CODEX_MODELS = ("gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.5")
 
 _STATIC_MODEL_FALLBACKS = {
     (SUBSCRIPTION_KIND, "claude"): StaticModelFallback(
@@ -56,6 +61,12 @@ _STATIC_MODEL_FALLBACKS = {
 def static_model_fallback(provider_kind: str, cli: str) -> StaticModelFallback | None:
     """Return the owned fallback for a provider kind and CLI, if registered."""
     return _STATIC_MODEL_FALLBACKS.get((provider_kind, cli))
+
+
+#: Codex's launch default when nothing else names a model. The bundled OpenAI
+#: catalog's newest row is a bare family alias (``gpt-5.6``) that codex rejects,
+#: so a codex launch defaults to a concrete variant from its own catalog.
+CODEX_DEFAULT_MODEL = _STATIC_MODEL_FALLBACKS[(SUBSCRIPTION_KIND, "codex")].model_ids[0]
 
 
 # ── Smart Routing ───────────────────────────────────────────────────────────

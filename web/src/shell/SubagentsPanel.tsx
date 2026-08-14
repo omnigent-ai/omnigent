@@ -76,6 +76,7 @@ import { AddAgentDialog } from "./AddAgentDialog";
 const SESSION_SCOPED_PARAMS = ["file", "diff", "comment", "view"] as const;
 const CODEX_NATIVE_SUBAGENT_WRAPPER = "codex-native-ui-subagent";
 const OPENCODE_NATIVE_SUBAGENT_WRAPPER = "opencode-native-ui-subagent";
+const ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER = "antigravity-native-ui-subagent";
 // Pi children are scaffold (no wrapper label); the spawn title's agent-type head (``tool``) is the signal.
 const PI_AGENT_NAME = "pi";
 type AgentRowIcon = ComponentType<SVGProps<SVGSVGElement>>;
@@ -411,9 +412,14 @@ function childPrimaryLabel(child: ChildSessionInfo): string {
   // rejects "ui" as a sub-agent name.
   const isUserAdded = child.title?.startsWith("ui:") ?? false;
   const childWrapper = child.labels?.[WRAPPER_LABEL_KEY];
+  // agy joins these rather than taking the generic path below: its child title
+  // is ``"<role>:<cascade id>"``, so the first-colon split puts the ROLE in
+  // ``tool`` and the cascade UUID in the suffix — and the generic path returns
+  // ``session_name ?? suffix``, both of which are that UUID.
   const isNativeSubagent =
     childWrapper === CODEX_NATIVE_SUBAGENT_WRAPPER ||
-    childWrapper === OPENCODE_NATIVE_SUBAGENT_WRAPPER;
+    childWrapper === OPENCODE_NATIVE_SUBAGENT_WRAPPER ||
+    childWrapper === ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER;
   if (isNativeSubagent && !isUserAdded) {
     return child.tool ?? child.title ?? child.id;
   }

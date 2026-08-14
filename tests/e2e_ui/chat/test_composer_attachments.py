@@ -3,8 +3,14 @@
 The composer (``pages/ChatPage.tsx``) lets the user attach files via the
 paperclip button (which clicks a hidden ``<input type="file">``), paste, or
 drag-drop. Each attached file renders as a chip below the textarea with a
-per-file remove button; on send the files are embedded inline in the message
-(there is no separate upload endpoint), and ``removeFile`` drops a chip.
+per-file remove button; on send each file is POSTed to
+``/v1/sessions/{id}/resources/files`` and the message references the returned
+``file_id``, and ``removeFile`` drops a chip.
+
+The new-chat landing screen (``shell/NewChatDialog.tsx``) has its own composer
+with the same affordances, and it validates attachments the same way — that
+one matters most, because a file rejected only after the session is created
+strands the user's first message in a session they never wanted.
 
 This flow has no coverage below the browser: no web vitest test exercises
 the ChatPage composer's ``addFiles`` / ``removeFile`` path, and the attach
@@ -21,9 +27,10 @@ disappearing after the remove click.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
 
 _COMPOSER = "Ask the agent anything…"
 # Composer accepts image/*,application/pdf,text/*,application/json (the hidden
@@ -42,6 +49,16 @@ _PPTX_NAME = "deck.pptx"
 # for the OS picker (and the drag-drop ``matchesAccept`` validator) to admit it.
 _JSON_NAME = "attach_sample.json"
 _JSON_BODY = '{"composer": "attachment", "e2e": true}\n'
+
+# A zip is the case users actually hit (dragging an iCloud Photos export).
+_ZIP_NAME = "photos.zip"
+
+# The server's real 415 body for an unsupported upload, from
+# ``routes_resources.upload_session_file``. Used to drive the failed-send path.
+_SERVER_415_DETAIL = (
+    "Unsupported attachment type 'application/zip'. Only images, PDF, "
+    "and text/code files can be attached."
+)
 
 
 def test_attach_then_remove_file(
@@ -133,3 +150,99 @@ def test_reject_unsupported_type(
     expect(page.get_by_role("button", name=f"Remove {_PPTX_NAME}")).to_have_count(0)
     # And the inline rejection error is shown.
     expect(page.get_by_text("can't be attached", exact=False)).to_be_visible(timeout=10_000)
+
+
+def test_landing_rejects_unsupported_type_and_keeps_message(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """The new-chat landing composer rejects a zip without losing the typed message.
+
+    The landing screen is the case that actually bit users: it used to append
+    incoming files unchecked, so a zip only failed after the session had been
+    created and navigated into — and by then the typed message was gone (the
+    landing draft is cleared on create and the pending prompt is consumed
+    destructively), leaving an error and nothing to resend.
+
+    Three things are pinned here, none of which a component test can reach,
+    because they depend on the real hidden input and on no session being
+    created:
+
+    1. No chip appears — the zip never enters composer state.
+    2. The typed message survives the rejection.
+    3. The rejection notice clears on the next keystroke. A rejected file is
+       never attached, so there is no chip to remove and nothing else would
+       ever clear it; left sticky it reads as a hard blocker.
+    """
+    base_url, _session_id = seeded_session
+    sample = tmp_path / _ZIP_NAME
+    sample.write_bytes(b"PK\x03\x04 not a real zip, just an unsupported binary")
+
+    page.goto(base_url)
+    composer = page.get_by_test_id("new-chat-landing-input")
+    expect(composer).to_be_visible(timeout=30_000)
+
+    composer.fill("summarize these photos")
+    page.get_by_test_id("new-chat-landing-file-input").set_input_files(str(sample))
+
+    # Rejected: no chip, and the reason names the file.
+    expect(page.get_by_role("button", name=f"Remove {_ZIP_NAME}")).to_have_count(0)
+    error = page.get_by_test_id("new-chat-landing-attachment-error")
+    expect(error).to_be_visible(timeout=10_000)
+    expect(error).to_contain_text(_ZIP_NAME)
+
+    # The message the user typed is untouched, and no session was created —
+    # still on the landing screen, not redirected into /c/<id>.
+    expect(composer).to_have_value("summarize these photos")
+    assert "/c/" not in page.url, f"a session was created despite the rejection: {page.url}"
+
+    # Typing clears the notice so it can't read as a blocker.
+    composer.fill("summarize these photos please")
+    expect(error).to_have_count(0, timeout=10_000)
+
+
+def test_failed_upload_restores_the_message(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """A send whose upload fails hands the message back to the composer.
+
+    Before, a failed upload left the user with an error and an empty composer:
+    ``submit`` clears the text optimistically, the optimistic bubble rolls
+    back, and nothing else held the message. Now ``send`` stashes it in
+    ``failedSendDraft`` and the composer restores it.
+
+    The failure is injected at the network boundary (the upload route responds
+    415 with the server's real body) rather than by attaching an unsupported
+    file — client-side validation would reject that before any request, so it
+    would never exercise this path. The 415 body also pins the second half of
+    the fix: the banner must carry the server's reason, not a bare
+    ``upload failed: 415`` built from an empty HTTP/2 ``statusText``.
+    """
+    base_url, session_id = seeded_session
+    sample = tmp_path / _ATTACH_NAME
+    sample.write_text(_ATTACH_BODY)
+
+    def _reject_upload(route: Route) -> None:
+        route.fulfill(
+            status=415,
+            content_type="application/json",
+            body=json.dumps({"detail": _SERVER_415_DETAIL}),
+        )
+
+    page.route("**/resources/files", _reject_upload)
+
+    page.goto(f"{base_url}/c/{session_id}")
+    composer = page.get_by_placeholder(_COMPOSER)
+    expect(composer).to_be_visible(timeout=30_000)
+
+    page.locator('input[type="file"][accept*="image/"]').set_input_files(str(sample))
+    expect(page.get_by_role("button", name=f"Remove {_ATTACH_NAME}")).to_be_visible(timeout=10_000)
+
+    composer.fill("look at this file")
+    composer.press("Enter")
+
+    # The server's reason reaches the user instead of a bare status line.
+    expect(page.get_by_text("Unsupported attachment type", exact=False)).to_be_visible(
+        timeout=30_000
+    )
+    # And the message is back in the composer, ready to retry.
+    expect(composer).to_have_value("look at this file", timeout=10_000)

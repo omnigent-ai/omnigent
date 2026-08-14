@@ -189,6 +189,17 @@ jobs:
             --network-delay-ms "$NETWORK_DELAY_MS" \
             --output "benchmark-results-${{ matrix.backend }}.json"
 
+      - name: Render results matrix to job summary
+        # The JSON artifact feeds the trend dashboard; this makes the same
+        # numbers readable on the run page without downloading it.
+        if: always()
+        run: |
+          if [[ -f "benchmark-results-${{ matrix.backend }}.json" ]]; then
+            uv run --no-sync dev/benchmarks/omnigent/report_markdown.py \
+              --title "Benchmark results" \
+              "benchmark-results-${{ matrix.backend }}.json" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Upload benchmark results
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()

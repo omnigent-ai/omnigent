@@ -1097,6 +1097,18 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def list_daily_costs(self, user_id: str, since_day_utc: str) -> list[tuple[str, float]]:
+        """
+        Return per-day cost rows for a user from ``since_day_utc`` onward.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param since_day_utc: Inclusive lower-bound UTC day as ``"YYYY-MM-DD"``.
+        :returns: List of ``(day_utc, cost_usd)`` tuples, ascending by day.
+            Days with no spend are omitted.
+        """
+        ...
+
+    @abstractmethod
     def get_daily_cost_state(self, user_id: str, day_utc: str) -> dict[str, float]:
         """
         Return a user's daily cost rollup state for one UTC day.

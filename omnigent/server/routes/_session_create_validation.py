@@ -19,6 +19,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_READ
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
+from omnigent.stores.host_store import host_is_live
 
 _logger = logging.getLogger(__name__)
 
@@ -149,6 +150,21 @@ async def validate_existing_host_workspace(
             host_store=host_store,
         )
         host_name = host.name
+        # Wrong-replica classification, same as the /v1/hosts/* endpoints and
+        # RunnerRouter: validate_workspace below does a local host_registry miss
+        # → "host is offline" (invalid_input), which the client can't recover
+        # from. If the host is live per the store but its tunnel isn't on this
+        # replica, the create landed on the wrong replica — surface WRONG_REPLICA
+        # so the client re-addresses WITHOUT the key. A genuinely offline host
+        # falls through to the invalid_input case. Both are 400; the distinct
+        # code, not the status, is what tells the client to re-address rather
+        # than give up. Safe to raise here: workspace validation runs BEFORE
+        # create_conversation, so no orphan row is left.
+        if host_registry is not None and host_registry.get(host_id) is None and host_is_live(host):
+            raise OmnigentError(
+                f"host {host_name or host_id!r} is on another replica; retry",
+                code=ErrorCode.WRONG_REPLICA,
+            )
 
     # Read the agent's os_env.cwd — None when the spec has no os_env block
     # (headless agents). Headless agents have no filesystem access at all but

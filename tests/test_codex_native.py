@@ -64,6 +64,9 @@ def _point_codex_auth_check_at(
         launch = codex_native_app_server.NativeCodexLaunch(
             config_overrides=[], model=None, profile=None
         )
+    # Isolate the shared codex config.toml the config-default launch reads, so a
+    # defer-to-login test doesn't pick up the real machine's provider default.
+    monkeypatch.setenv("CODEX_HOME", str(auth_path.parent))
     monkeypatch.setattr(codex_native, "resolve_native_codex_launch", lambda model=None: launch)
     monkeypatch.setattr(
         codex_native,
@@ -202,6 +205,60 @@ def test_codex_auth_unavailable_reason_provider_override_available(
     _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True, launch=launch)
 
     assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_config_default_provider_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An empty-override launch routed by the config.toml provider default is ready.
+
+    omnigent pins no provider (empty overrides, profile None, meta "openai") but
+    defers to Codex's own config.toml top-level ``model_provider`` default — a
+    Databricks AIGW provider. auth.json is deliberately absent; availability must
+    come from the resolvable launch base URL.
+    """
+    codex_home = tmp_path / "codex-home"
+    auth_path = codex_home / "auth.json"  # never created
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+    from omnigent.onboarding import detected
+
+    monkeypatch.setattr(detected, "codex_config_provider_dismissed", lambda _config: False)
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "config.toml").write_text(
+        'model_provider = "Databricks"\n[model_providers.Databricks]\n'
+        'base_url = "https://example.cloud.databricks.com/ai-gateway/codex/v1"\n',
+        encoding="utf-8",
+    )
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_explicit_openai_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An explicit ``model_provider="openai"`` launch still gates on auth.json.
+
+    Even with a Databricks provider default in config.toml, an explicit openai
+    pin is Codex's built-in login — a logged-out openai user must report
+    needs-auth, never read the config default.
+    """
+    codex_home = tmp_path / "codex-home"
+    auth_path = codex_home / "auth.json"  # never created
+    launch = codex_native_app_server.NativeCodexLaunch(
+        config_overrides=['model_provider="openai"'], model=None, profile=None
+    )
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True, launch=launch)
+    from omnigent.onboarding import detected
+
+    monkeypatch.setattr(detected, "codex_config_provider_dismissed", lambda _config: False)
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "config.toml").write_text(
+        'model_provider = "Databricks"\n[model_providers.Databricks]\n'
+        'base_url = "https://example.cloud.databricks.com/ai-gateway/codex/v1"\n',
+        encoding="utf-8",
+    )
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
 
 
 def test_codex_auth_unavailable_reason_resolver_failure_falls_back_to_auth_json(

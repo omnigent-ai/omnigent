@@ -48,6 +48,17 @@ vi.mock("./ForkSessionDialog", () => ({
     </div>
   ),
 }));
+// The switch dialog owns its own host/filesystem queries; stub it so these
+// tests only pin whether this dialog offers it and with which session.
+vi.mock("./SwitchHostDialog", () => ({
+  SwitchHostDialog: (props: { sessionId: string; currentHostId: string | null }) => (
+    <div
+      data-testid="switch-host-dialog-stub"
+      data-session-id={props.sessionId}
+      data-current-host-id={props.currentHostId ?? ""}
+    />
+  ),
+}));
 
 afterEach(() => {
   cleanup();
@@ -165,6 +176,36 @@ describe("<ReconnectSessionDialog />", () => {
     // The clone form stays mounted (forceMount) but its panel is the
     // inactive one while the Reconnect tab is the default.
     expect(clonePanelState()).toBe("inactive");
+  });
+
+  it("offers the host switch to a host_offline owner and hands off to that dialog", () => {
+    // The composer badge no longer carries a switch link while offline, so
+    // this is the only way to escape a host that isn't coming back.
+    const { onOpenChange } = renderDialog({
+      state: "host_offline",
+      isOwner: true,
+      sourceHostId: "host_dead",
+    });
+    expect(screen.queryByTestId("switch-host-dialog-stub")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("reconnect-session-switch-host"));
+
+    // Handing off means this dialog closes as the switch one opens; the
+    // switch dialog is a sibling, so it survives that close.
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    const stub = screen.getByTestId("switch-host-dialog-stub");
+    expect(stub.getAttribute("data-session-id")).toBe("conv_abc123");
+    expect(stub.getAttribute("data-current-host-id")).toBe("host_dead");
+  });
+
+  it("withholds the host switch from a non-owner and from local_stranded", () => {
+    // Binding a runner on another machine isn't a viewer's call, and a
+    // local_stranded session has no host to move off of.
+    renderDialog({ state: "host_offline", isOwner: false });
+    expect(screen.queryByTestId("reconnect-session-switch-host")).toBeNull();
+    cleanup();
+    renderDialog({ state: "local_stranded", isOwner: true });
+    expect(screen.queryByTestId("reconnect-session-switch-host")).toBeNull();
   });
 
   it("defaults to the Clone tab for a host_offline non-owner", () => {

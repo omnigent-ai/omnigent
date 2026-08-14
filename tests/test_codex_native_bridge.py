@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from omnigent.codex_native_bridge import (
     clear_active_turn_id_if_matches,
     clear_bridge_state,
     codex_home_for_bridge_dir,
+    codex_mcp_config_overrides,
     mcp_startup_waiting_detail,
     pending_mcp_servers,
     prepare_bridge_dir,
@@ -27,6 +29,22 @@ from omnigent.codex_native_bridge import (
     write_codex_config_model,
     write_policy_hook_config,
 )
+
+
+def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Path) -> None:
+    """codex launches serve-mcp with ``-I`` so the workspace can't shadow omnigent.
+
+    The MCP server starts in the session workspace, and without ``-I`` python puts
+    that cwd on ``sys.path``, so a workspace that is an omnigent checkout supplies
+    the bridge's own package. Every other native bridge passes ``-I`` here.
+
+    :param tmp_path: Stands in for the per-session bridge dir.
+    """
+    overrides = codex_mcp_config_overrides(tmp_path)
+
+    prefix = "mcp_servers.omnigent.args="
+    raw = next(o[len(prefix) :] for o in overrides if o.startswith(prefix))
+    assert json.loads(raw)[:4] == ["-I", "-m", "omnigent.claude_native_bridge", "serve-mcp"]
 
 
 def _seed_active_turn(bridge_dir: Path, active_turn_id: str | None) -> None:

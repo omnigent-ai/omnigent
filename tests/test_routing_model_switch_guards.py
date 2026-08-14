@@ -28,6 +28,8 @@ _OMNIGENT = Path(__file__).resolve().parent.parent / "omnigent"
 _SWITCH_PATH_FUNCTIONS = (
     "inject_slash_command",
     "_confirm_tui_dialog",
+    # The confirm retry loop lives here, so it inherits the same rule.
+    "_confirm_and_verify_dialog_closed",
 )
 
 

@@ -39,6 +39,7 @@ from omnigent.repl._resume_picker import (
     _last_message_preview_from_entities,
     _Preview,
     pick_conversation,
+    pick_conversation_cross_agent_from_sdk,
     pick_conversation_from_store,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -842,6 +843,9 @@ class _BadgeRow:
     title: str | None = "test"
     created_at: int = 0
     labels: Mapping[str, str] | None = None
+    # The owner filter in the cross-agent picker reads ``owner``; the
+    # badge tests ignore it. Defaulted so existing rows are unaffected.
+    owner: str | None = None
 
 
 def test_runtime_badge_claude_native() -> None:
@@ -1282,3 +1286,79 @@ def test_workspace_metadata_omits_unrecorded_workspace_segment(
     assert selected == "eadade68b1f6e5f2f5e0c57a00d8d378"
     assert "Workspace" not in rendered
     assert "—" not in rendered
+
+
+# ── Cross-agent picker — owner filter ────────────────────
+#
+# ``omnigent resume`` (no id) lists the server's ACL-scoped sessions,
+# which include ones merely shared with the caller. Resume is
+# owner-only, so the picker drops rows the caller does not own. Reuses
+# the ``_FakeAPClient`` / ``_BadgeRow`` fakes above.
+
+
+def _owned_and_shared_rows() -> list[_BadgeRow]:
+    """A shared row (owned by someone else) then the caller's own row."""
+    return [
+        _BadgeRow(
+            id="5bcf1e3b9a1c4d2e8f0a1b2c3d4e5f60",
+            title="bob's shared chat",
+            owner="bob@example.com",
+            labels={},
+        ),
+        _BadgeRow(
+            id="a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+            title="my own chat",
+            owner="me@example.com",
+            labels={},
+        ),
+    ]
+
+
+async def test_cross_agent_picker_drops_sessions_not_owned_by_caller() -> None:
+    """
+    With ``owner_user_id`` set, sessions merely shared with the caller are
+    dropped — only their own sessions are listed and selectable. Resume is
+    owner-only, so a shared row would be a dead end.
+    """
+    client = _FakeAPClient(rows=_owned_and_shared_rows())
+    out = io.StringIO()
+
+    # After filtering to "me@example.com" only the owned row survives, so
+    # row 1 is that owned session.
+    selected = await pick_conversation_cross_agent_from_sdk(
+        client,
+        owner_user_id="me@example.com",
+        out=out,
+        in_=io.StringIO("1\n"),
+    )
+
+    assert selected == "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+    rendered = out.getvalue()
+    assert "my own chat" in rendered
+    # The shared row must not appear at all.
+    assert "bob's shared chat" not in rendered
+    assert "5bcf1e3b9a1c4d2e8f0a1b2c3d4e5f60" not in rendered
+
+
+async def test_cross_agent_picker_lists_everything_when_owner_unknown() -> None:
+    """
+    ``owner_user_id=None`` (identity unresolved, or a permissionless
+    single-user server) leaves the list unfiltered — the pre-existing
+    behavior. Both rows are listed, so resume never silently hides
+    sessions when it can't tell who the caller is.
+    """
+    client = _FakeAPClient(rows=_owned_and_shared_rows())
+    out = io.StringIO()
+
+    # No filter → row 1 is still the (shared) row the server returned first.
+    selected = await pick_conversation_cross_agent_from_sdk(
+        client,
+        owner_user_id=None,
+        out=out,
+        in_=io.StringIO("1\n"),
+    )
+
+    assert selected == "5bcf1e3b9a1c4d2e8f0a1b2c3d4e5f60"
+    rendered = out.getvalue()
+    assert "bob's shared chat" in rendered
+    assert "my own chat" in rendered

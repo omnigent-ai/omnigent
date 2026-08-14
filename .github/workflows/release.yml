@@ -666,6 +666,10 @@ jobs:
   # never re-freezes and doc-sync keeps deriving the right X.Y-docs branch.
   bump-main:
     needs: [authorize, plan, cut]
+    # The benchmark chain is skipped on most cuts, and a default `success()`
+    # gate inherits that skip through `cut`, so this job silently vanished on
+    # every cut but one. Depend on `cut` succeeding, not on the whole closure.
+    if: ${{ !cancelled() && needs.cut.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

@@ -2393,3 +2393,75 @@ def test_runner_reject_detail_tolerates_status_only_response_fake() -> None:
         status_code = 503
 
     assert _runner_reject_detail(_Fake()) == "runner returned status 503"  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_persist_and_project_structured_error_round_trip() -> None:
+    """Structured title/cause/remediation survive persist → project.
+
+    A classified failure stores its friendly fields as labels, and
+    ``_last_task_error_from_labels`` projects them back so a reload renders the
+    same clear card instead of just code + message.
+    """
+    from omnigent.server.routes.sessions import _last_task_error_from_labels
+    from omnigent.server.schemas import ErrorDetail
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _MockStore:
+        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
+            captured[session_id] = updates
+
+    error = ErrorDetail(
+        code="required_terminal_exited",
+        message="Claude Code can't run as root\n\n...diagnostics...",
+        title="Claude Code can't run as root",
+        cause="The agent terminal exited immediately because Claude Code refuses ...",
+        remediation="Run the host as a non-root user (uid != 0).",
+    )
+    await _persist_session_status_error_labels(
+        "aa11bb22cc33dd44ee55ff6677889900", error, _MockStore()
+    )  # type: ignore[arg-type]
+
+    labels = captured["aa11bb22cc33dd44ee55ff6677889900"]
+    projected = _last_task_error_from_labels(labels)
+    assert projected == {
+        "code": "required_terminal_exited",
+        "message": "Claude Code can't run as root\n\n...diagnostics...",
+        "title": "Claude Code can't run as root",
+        "cause": "The agent terminal exited immediately because Claude Code refuses ...",
+        "remediation": "Run the host as a non-root user (uid != 0).",
+    }
+
+
+@pytest.mark.asyncio
+async def test_persist_error_labels_clears_stale_structured_fields() -> None:
+    """An unclassified failure must not inherit a prior failure's title/cause.
+
+    The label store is upsert-only, so every persist writes all structured keys
+    (empty when absent). An error with no title/cause/remediation therefore
+    projects back to just code + message.
+    """
+    from omnigent.server.routes.sessions import _last_task_error_from_labels
+    from omnigent.server.schemas import ErrorDetail
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _MockStore:
+        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
+            captured[session_id] = updates
+
+    error = ErrorDetail(code="runner_error", message="turn setup failed")
+    await _persist_session_status_error_labels(
+        "bb22cc33dd44ee55ff66778899001122", error, _MockStore()
+    )  # type: ignore[arg-type]
+
+    labels = captured["bb22cc33dd44ee55ff66778899001122"]
+    # All structured keys are written empty so a stale value can't leak.
+    assert labels["omnigent.last_task_error_title"] == ""
+    assert labels["omnigent.last_task_error_cause"] == ""
+    assert labels["omnigent.last_task_error_remediation"] == ""
+    assert _last_task_error_from_labels(labels) == {
+        "code": "runner_error",
+        "message": "turn setup failed",
+    }

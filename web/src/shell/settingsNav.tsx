@@ -211,7 +211,11 @@ export function SettingsSidebarBody({
 
   return (
     <>
-      <div className="px-3 pt-3">
+      {/* settings-sidebar-header carries the same traffic-light clearance the
+      home sidebar's header row gets: with the sidebar now starting at the
+      window's top edge on the macOS shell, this Back row would otherwise sit
+      underneath the window controls (see index.css). Inert elsewhere. */}
+      <div className="settings-sidebar-header px-3 pt-3">
         <Button
           asChild
           variant="ghost"

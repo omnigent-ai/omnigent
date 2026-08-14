@@ -1,8 +1,80 @@
-// Vitest cases for `parseEvent` — the raw-SSE-JSON → typed-event mapping.
+// Vitest cases for `parseEvent` — the raw-SSE-JSON → typed-event mapping —
+// and `withStallGuard` — the byte-level silence watchdog.
 
-import { describe, expect, it } from "vitest";
-import { parseEvent } from "./sse";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { parseEvent, withStallGuard } from "./sse";
 import type { SessionStatusEvent, SessionSupersededEvent, TextDelta } from "./events";
+
+describe("withStallGuard", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** An upstream byte stream the test feeds, plus a cancel probe. */
+  function upstream(): {
+    stream: ReadableStream<Uint8Array>;
+    push: (s: string) => void;
+    cancelled: () => boolean;
+  } {
+    let ctrl: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        ctrl = c;
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    return {
+      stream,
+      push: (s) => ctrl!.enqueue(new TextEncoder().encode(s)),
+      cancelled: () => cancelled,
+    };
+  }
+
+  it("passes chunks through while bytes flow, then trips on silence", async () => {
+    const up = upstream();
+    let stalled = 0;
+    const reader = withStallGuard(up.stream, {
+      stallMs: 1_000,
+      onStall: () => (stalled += 1),
+    }).getReader();
+
+    // Bytes inside the window pass through and re-arm the timer.
+    up.push("a");
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe("a");
+    await vi.advanceTimersByTimeAsync(900);
+    up.push("b");
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe("b");
+    expect(stalled).toBe(0);
+
+    // Silence past the window: the upstream is cancelled and the guarded
+    // stream ends cleanly (done, not an error) — the same shape as a
+    // transport drop, which consumers answer with a reconnect.
+    const pending = reader.read();
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect((await pending).done).toBe(true);
+    expect(stalled).toBe(1);
+    expect(up.cancelled()).toBe(true);
+  });
+
+  it("propagates a consumer cancel upstream without tripping", async () => {
+    const up = upstream();
+    let stalled = 0;
+    const guarded = withStallGuard(up.stream, { stallMs: 1_000, onStall: () => (stalled += 1) });
+
+    await guarded.cancel();
+    expect(up.cancelled()).toBe(true);
+
+    // The armed timer was cleared: silence after cancel is not a stall.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(stalled).toBe(0);
+  });
+});
 
 describe("parseEvent — response.output_text.delta", () => {
   it("parses a plain delta with no streaming identifiers", () => {

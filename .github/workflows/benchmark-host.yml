@@ -1,0 +1,118 @@
+name: Benchmark (host sessions)
+
+# Profiles the host-bound session lifecycle — create → host.launch_runner →
+# runner boot → first token (`session_cold_start`), plus restart and the
+# common session actions around it — and renders the journey × metric matrix
+# into the job summary. Informational: no thresholds, so a noisy shared
+# runner can't block a PR; regression *gating* stays with benchmark-pr.yml
+# (store paths) and release.yml (release cuts). The seeded, backend-matrix
+# trend numbers stay with the nightly benchmark.yml; this workflow's value is
+# a fresh matrix on the PRs that actually move these numbers.
+#
+# Uses dev/benchmarks/omnigent (real server + real `omni host` daemon +
+# runner against a zero-latency mock LLM — no agent CLI or credentials).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "omnigent/host/**"
+      - "omnigent/runner/**"
+      - "omnigent/server/**"
+      - "dev/benchmarks/**"
+      - ".github/workflows/benchmark-host.yml"
+  workflow_dispatch:
+    inputs:
+      journeys:
+        description: "Comma-separated journeys (blank = the host-session set)"
+        required: false
+        default: ""
+      iterations:
+        description: "Requests per run (runner journeys stay capped at 5)"
+        required: false
+        default: "100"
+      runs:
+        description: "Timed runs per journey"
+        required: false
+        default: "3"
+
+permissions:
+  contents: read
+
+env:
+  # No web SPA build during `uv sync` (setup.py _build_web_ui): nothing here
+  # serves the bundle, and the build otherwise times out on public npm.
+  OMNIGENT_SKIP_WEB_UI: "true"
+  UV_INDEX_URL: https://pypi.org/simple
+  PIP_INDEX_URL: https://pypi.org/simple
+  # The host-session set: the host-bound lifecycle journeys first, then the
+  # common HTTP session actions a user drives around them. Matches the
+  # journey names in dev/benchmarks/omnigent/journeys.py (ALL_JOURNEYS).
+  DEFAULT_JOURNEYS: >-
+    session_cold_start,session_cold_restart,warm_turn,time_to_first_token,interrupt,create_session,fork_session,list_sessions,get_session,load_conversation_history
+  JOURNEYS: ${{ (github.event_name == 'workflow_dispatch' && inputs.journeys) || '' }}
+  ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || '100' }}
+  RUNS: ${{ github.event_name == 'workflow_dispatch' && inputs.runs || '3' }}
+
+concurrency:
+  # PR pushes cancel the previous run; manual dispatches never cancel each
+  # other (unique run_id).
+  group: benchmark-host-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  benchmark-host:
+    name: Host session benchmark (sqlite)
+    if: github.repository == 'omnigent-ai/omnigent' && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        # Same install as the other benchmark workflows so numbers stay
+        # comparable across them.
+        run: uv sync --extra dev --extra databricks
+
+      - name: Run host-session benchmark
+        # Throwaway empty SQLite DB (run.py default): these journeys measure
+        # process spin-up and turn latency, not query scale — corpus-scale
+        # numbers live in the nightly benchmark.yml.
+        run: |
+          uv run --no-sync dev/benchmarks/omnigent/run.py \
+            --journeys "${JOURNEYS:-$DEFAULT_JOURNEYS}" \
+            --iterations "$ITERATIONS" \
+            --runs "$RUNS" \
+            --output benchmark-results-host.json
+
+      - name: Render results matrix to job summary
+        if: always()
+        run: |
+          if [[ -f benchmark-results-host.json ]]; then
+            uv run --no-sync dev/benchmarks/omnigent/report_markdown.py \
+              --title "Host session benchmark" \
+              benchmark-results-host.json >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: benchmark-results-host-${{ github.run_id }}
+          path: benchmark-results-host.json
+          retention-days: 30
+          if-no-files-found: warn

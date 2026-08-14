@@ -27,6 +27,11 @@ the flip:
   ``_make_auth_token_factory`` returns for a managed sandbox on ``main``):
   ``GET /v1/sessions/{id}/agent/contents`` -> **401**.
 * WITH the fix: the same GET -> **200**, returning the agent bundle.
+
+The second test replays the OMNI-2529 deadlock over the same live stack: a
+managed runner whose re-mint gets 403 from the (simulated) Apps edge after its
+owner JWT fully expires must re-resolve a local credential instead of raising
+``httpx.RequestError`` on every callback forever.
 """
 
 from __future__ import annotations
@@ -35,16 +40,26 @@ import asyncio
 import os
 import signal
 import subprocess
+import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import pytest
 
-from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+from omnigent.runner._entry import (
+    _InitialAuthTokenFactory,
+    _make_auth_token_factory,
+    _ManagedMintTokenFactory,
+    _RunnerDatabricksAuth,
+)
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
+    RUNNER_DELEGATED_AUTH_ENV_VAR,
+    RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     token_bound_runner_id,
 )
@@ -158,6 +173,124 @@ def accounts_server(tmp_path: Path) -> Iterator[tuple[str, str]]:
         log_handle.close()
 
 
+def _seed_owned_session_with_managed_runner(base_url: str, db_uri: str) -> str:
+    """Create Alice's session and bind the managed runner id to it.
+
+    Alice's identity comes from a directly-minted accounts cookie signed with
+    the server's shared secret — the same JWT the password login flow issues;
+    only the password dance is skipped. The session-create, agent registration,
+    and owner grant are all real. The runner-id bind is what the managed-launch
+    path does at spawn time via ``replace_runner_id``; WAL journaling + a 20s
+    busy_timeout make this cross-process write safe against the running server,
+    which then resolves runner_id -> owner from this row.
+
+    :param base_url: Live server base URL.
+    :param db_uri: SQLite URI of the server's database.
+    :returns: The created session id.
+    """
+    owner_cookie = mint_session_cookie(_OWNER, bytes.fromhex(_COOKIE_SECRET_HEX), 8, "accounts")
+    bundle = build_agent_bundle(name="e2e-managed-runner-agent")
+    with httpx.Client(base_url=base_url, timeout=30.0) as http:
+        create = http.post(
+            "/v1/sessions",
+            headers={
+                "Authorization": f"Bearer {owner_cookie}",
+                "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+            },
+            data={"metadata": "{}"},
+            files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        )
+    assert create.status_code in (200, 201), (create.status_code, create.text)
+    session_id = create.json()["session_id"]
+
+    runner_id = token_bound_runner_id(_BINDING_TOKEN)
+    SqlAlchemyConversationStore(db_uri).replace_runner_id(session_id, runner_id)
+    return session_id
+
+
+def _start_apps_edge_proxy(
+    upstream: str,
+) -> tuple[str, threading.Event, Callable[[], None]]:
+    """Run a reverse proxy that can start 403ing the managed-mint endpoint.
+
+    Stands in for the Databricks Apps edge: every request is forwarded to
+    *upstream* over a real socket until ``forbid_mint`` is set, after which
+    ``POST /v1/runners/{id}/token`` is answered ``403 Invalid Token`` without
+    reaching the server — exactly what the edge does once the bearer presented
+    on the mint request has expired.
+
+    :param upstream: Base URL of the real server to forward to.
+    :returns: ``(proxy_base_url, forbid_mint, shutdown)``.
+    """
+    forbid_mint = threading.Event()
+    forward = httpx.Client(base_url=upstream, timeout=30.0)
+
+    class _EdgeHandler(BaseHTTPRequestHandler):
+        """Forwarding handler with a switchable mint-endpoint 403."""
+
+        def log_message(self, format: str, *args: object) -> None:
+            """Suppress default request logging."""
+            del format, args
+
+        def do_GET(self) -> None:
+            self._relay()
+
+        def do_POST(self) -> None:
+            self._relay()
+
+        def _relay(self) -> None:
+            """Forward one request upstream, or 403 a forbidden mint."""
+            # Constrain the request target to the API paths this test drives:
+            # an absolute-form target (scheme/netloc) would override the
+            # forward client's fixed base_url, so only origin-form ``/v1/...``
+            # targets are relayed; everything else is refused.
+            parts = urlsplit(self.path)
+            if parts.scheme or parts.netloc or not parts.path.startswith("/v1/"):
+                self.send_error(404)
+                return
+            target = urlunsplit(("", "", parts.path, parts.query, ""))
+            if (
+                forbid_mint.is_set()
+                and self.command == "POST"
+                and parts.path.startswith("/v1/runners/")
+                and parts.path.endswith("/token")
+            ):
+                body = b"Invalid Token"
+                self.send_response(403)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            content = self.rfile.read(length) if length else b""
+            headers = {
+                name: value
+                for name, value in self.headers.items()
+                if name.lower() not in ("host", "content-length", "connection", "accept-encoding")
+            }
+            upstream_resp = forward.request(self.command, target, content=content, headers=headers)
+            self.send_response(upstream_resp.status_code)
+            for name in ("Content-Type", "X-Agent-Name", "Location"):
+                value = upstream_resp.headers.get(name)
+                if value:
+                    self.send_header(name, value)
+            self.send_header("Content-Length", str(len(upstream_resp.content)))
+            self.end_headers()
+            self.wfile.write(upstream_resp.content)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _EdgeHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def _shutdown() -> None:
+        server.shutdown()
+        server.server_close()
+        forward.close()
+
+    return f"http://127.0.0.1:{server.server_port}", forbid_mint, _shutdown
+
+
 async def _get_agent_contents(
     base_url: str,
     path: str,
@@ -203,31 +336,8 @@ def test_managed_runner_callback_authenticates_end_to_end(
     """
     base_url, db_uri = accounts_server
 
-    # 1. Alice owns a real session. Her identity comes from a directly-minted
-    #    accounts cookie signed with the server's shared secret — the same JWT
-    #    the password login flow issues; only the password dance is skipped.
-    #    The session-create, agent registration, and owner grant are all real.
-    owner_cookie = mint_session_cookie(_OWNER, bytes.fromhex(_COOKIE_SECRET_HEX), 8, "accounts")
-    bundle = build_agent_bundle(name="e2e-managed-runner-agent")
-    with httpx.Client(base_url=base_url, timeout=30.0) as http:
-        create = http.post(
-            "/v1/sessions",
-            headers={
-                "Authorization": f"Bearer {owner_cookie}",
-                "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
-            },
-            data={"metadata": "{}"},
-            files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        )
-    assert create.status_code in (200, 201), (create.status_code, create.text)
-    session_id = create.json()["session_id"]
-
-    # 2. Bind a managed runner id to Alice's session — what the managed-launch
-    #    path does at spawn time via replace_runner_id. WAL journaling + a 20s
-    #    busy_timeout make this cross-process write safe against the running
-    #    server, which then resolves runner_id -> owner from this row.
-    runner_id = token_bound_runner_id(_BINDING_TOKEN)
-    SqlAlchemyConversationStore(db_uri).replace_runner_id(session_id, runner_id)
+    # 1-2. Alice owns a real session with a managed runner id bound to it.
+    session_id = _seed_owned_session_with_managed_runner(base_url, db_uri)
 
     # 3. Put this process in a managed-sandbox posture: the runner holds ONLY
     #    its binding token and the server URL — no omnigent-login token, no
@@ -272,3 +382,83 @@ def test_managed_runner_callback_authenticates_end_to_end(
     # real agent bundle comes back.
     assert authed.headers.get("X-Agent-Name")
     assert authed.content[:2] == b"\x1f\x8b", "expected a gzip agent bundle body"
+
+
+def test_managed_runner_survives_mint_403_after_token_expiry(
+    accounts_server: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mint 403 after the owner JWT expires must not brick the runner (OMNI-2529).
+
+    Replays the production deadlock end-to-end over real sockets: a
+    host-launched runner bootstraps on the injected bearer, falls back to
+    managed mint when that bearer is rejected (a real mint through the Apps
+    edge stand-in), then the session outlives the minted JWT while idle. The
+    re-mint presents the expired JWT as its own proxy bearer, so the edge
+    answers 403 without reaching the server. Before the fix neither
+    ``declined`` nor ``proxy_auth_failed`` latched in that state, and every
+    subsequent callback raised ``httpx.RequestError("Databricks token refresh
+    returned no token")`` for the remaining life of the process. With the fix
+    the chain re-resolves the machine's stored login credential in the same
+    call, so the callback that hits the 403 still authenticates.
+
+    :param accounts_server: ``(base_url, db_uri)`` from the live-server fixture.
+    :param monkeypatch: Puts this process into the host-launched-runner posture
+        (injected initial bearer, delegated-mint marker, binding token) with a
+        stored login credential available for recovery.
+    :returns: None.
+    """
+    base_url, db_uri = accounts_server
+    session_id = _seed_owned_session_with_managed_runner(base_url, db_uri)
+    proxy_url, forbid_mint, shutdown_proxy = _start_apps_edge_proxy(base_url)
+    try:
+        # Host-launched posture: the runner starts with an injected bearer and
+        # the delegated-mint marker, and everything it sends goes through the
+        # Apps edge. The machine also holds a stored `omnigent login` token —
+        # the recovery credential the pre-fix code never consulted.
+        owner_cookie = mint_session_cookie(
+            _OWNER, bytes.fromhex(_COOKIE_SECRET_HEX), 8, "accounts"
+        )
+        monkeypatch.setenv("RUNNER_SERVER_URL", proxy_url)
+        monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, _BINDING_TOKEN)
+        monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, owner_cookie)
+        monkeypatch.setenv(RUNNER_DELEGATED_AUTH_ENV_VAR, "1")
+        monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: owner_cookie)
+
+        factory = _make_auth_token_factory()
+        assert isinstance(factory, _InitialAuthTokenFactory)
+        contents_path = f"/v1/sessions/{session_id}/agent/contents"
+
+        # The injected host bearer authenticates the first callback.
+        first = asyncio.run(
+            _get_agent_contents(proxy_url, contents_path, _RunnerDatabricksAuth(factory))
+        )
+        assert first.status_code == 200, (first.status_code, first.text)
+
+        # The host bearer is rejected -> managed mint takes over: a real mint
+        # POST through the edge to the live server, then the callback runs on
+        # the minted owner JWT.
+        factory.invalidate()
+        minted = asyncio.run(
+            _get_agent_contents(proxy_url, contents_path, _RunnerDatabricksAuth(factory))
+        )
+        assert minted.status_code == 200, (minted.status_code, minted.text)
+        mint_factory = factory._fallback_factory
+        assert isinstance(mint_factory, _ManagedMintTokenFactory)
+        assert mint_factory._cached_token, "a real owner JWT should have been minted"
+
+        # The session outlives the JWT: the cache is fully expired and the
+        # edge now 403s every re-mint (the presented bearer is dead).
+        mint_factory._cached_expires_at = time.time() - 1.0
+        forbid_mint.set()
+
+        # Pre-fix this raised httpx.RequestError — and would forever. The
+        # chain must instead latch proxy_auth_failed and hand this same
+        # callback the stored login credential.
+        recovered = asyncio.run(
+            _get_agent_contents(proxy_url, contents_path, _RunnerDatabricksAuth(factory))
+        )
+        assert recovered.status_code == 200, (recovered.status_code, recovered.text)
+        assert mint_factory.proxy_auth_failed is True
+    finally:
+        shutdown_proxy()

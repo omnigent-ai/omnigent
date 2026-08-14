@@ -17,7 +17,8 @@ from __future__ import annotations
 import pytest
 
 from omnigent.errors import OmnigentError
-from omnigent.inner.datamodel import OSEnvSpec
+from omnigent.inner.datamodel import AgentDef, OSEnvSpec
+from omnigent.inner.datamodel import ExecutorSpec as OmniExecutorSpec
 from omnigent.inner.tools import AgentTool, FunctionTool
 from omnigent.spec import (
     AgentSpec,
@@ -610,3 +611,42 @@ def test_client_runtime_tool_round_trips_through_reverse_translation(
     # Parameters preserved — without these the validator rejects
     # the round-tripped spec ("client tool has no parameters").
     assert tool_info.parameters == parameters
+
+
+@pytest.mark.parametrize(
+    ("harness", "expected"),
+    [
+        # A generic-ACP id must keep its slug: it canonicalizes to the base
+        # ``acp`` harness for dispatch, but the slug is the only thing that says
+        # WHICH configured ACP agent to spawn.
+        ("acp:devin", "acp:devin"),
+        ("acp:kilocode", "acp:kilocode"),
+        # Bare ``acp`` has no slug to preserve.
+        ("acp", "acp"),
+        # Every other harness still canonicalizes, so aliases keep resolving.
+        ("claude", "claude-sdk"),
+    ],
+)
+def test_acp_slug_survives_reverse_translation(harness: str, expected: str) -> None:
+    """
+    ``acp:<slug>`` survives ``agent_def_to_agent_spec`` intact.
+
+    This is the path a harness launch actually takes: the omnigent loader parses
+    the YAML into an :class:`AgentDef`, the reverse translator turns it into an
+    ``AgentSpec``, and ``_build_acp_spawn_env`` then resolves which configured ACP
+    agent to launch by reading the slug back off ``executor.config["harness"]``.
+    The reverse translator used to canonicalize ``acp:<slug>`` down to ``acp``,
+    making the slug unrecoverable — so every ``acp:<slug>`` launch silently
+    spawned the *first* configured ACP agent instead of the requested one.
+
+    **What breaks if this fails**: ``omnigent run --harness acp:devin`` runs
+    somebody else's agent (whichever is first in the ``acp:`` config block)
+    while the UI still reports the one that was asked for.
+    """
+    agent_def = AgentDef(
+        name="hello-agent",
+        prompt="You are a helpful assistant.",
+        executor=OmniExecutorSpec(model="databricks-claude-sonnet-4-6", harness=harness),
+    )
+    spec = agent_def_to_agent_spec(agent_def)
+    assert spec.executor.config["harness"] == expected

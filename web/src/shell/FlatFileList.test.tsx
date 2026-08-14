@@ -1,10 +1,14 @@
-import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
+vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { FlatFileList } from "./FlatFileList";
 
 afterEach(cleanup);
+beforeEach(() => copyTextMock.mockClear());
 
 /** Render FlatFileList with sensible defaults, overriding only what a test needs. */
 function renderList(props: Partial<Parameters<typeof FlatFileList>[0]> = {}) {
@@ -190,5 +194,32 @@ describe("FlatFileList line-change counter", () => {
 
     expect(screen.queryByText(/^\+/)).not.toBeInTheDocument();
     expect(screen.queryByText(/^−/)).not.toBeInTheDocument();
+  });
+});
+
+describe("FlatFileList copy path", () => {
+  it("copies the full path even though the button is named for the file", () => {
+    // The accessible name carries only the basename (so a screen reader isn't
+    // read a whole path per row, and the name can't collide with the folder
+    // toggles that legitimately contain directory segments) -- but the
+    // CLIPBOARD must get the complete path, which is the whole point.
+    renderList({
+      files: [
+        {
+          path: "src/deep/app.ts",
+          name: "app.ts",
+          status: "modified",
+          bytes: 2048,
+          modified_at: null,
+          lines_added: null,
+          lines_removed: null,
+        },
+      ],
+    });
+
+    const button = screen.getByRole("button", { name: "Copy path: app.ts" });
+    fireEvent.click(button);
+
+    expect(copyTextMock).toHaveBeenCalledWith("src/deep/app.ts");
   });
 });

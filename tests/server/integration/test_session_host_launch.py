@@ -27,6 +27,7 @@ import pytest
 from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
 
+from omnigent.entities import Conversation
 from omnigent.host.frames import (
     HostHelloFrame,
     HostLaunchRunnerFrame,
@@ -1803,8 +1804,13 @@ async def test_offline_runner_serves_file_content_and_changes_from_host(
     # raise RUNNER_UNAVAILABLE (the host-fallback trigger). The test client
     # runs no lifespan, so install a router that reproduces that signal.
     class _OfflineRunnerRouter:
-        def client_for_session_resources(self, session_id: str) -> object:
-            del session_id
+        def client_for_session_resources(
+            self,
+            session_id: str,
+            *,
+            conversation: Conversation | None = None,
+        ) -> object:
+            del session_id, conversation
             raise OmnigentError("runner is offline", code=ErrorCode.RUNNER_UNAVAILABLE)
 
     prior_router = _globals._runner_router
@@ -1863,8 +1869,13 @@ async def test_offline_runner_no_host_still_returns_503(
     session_id = session["id"]
 
     class _OfflineRunnerRouter:
-        def client_for_session_resources(self, session_id: str) -> object:
-            del session_id
+        def client_for_session_resources(
+            self,
+            session_id: str,
+            *,
+            conversation: Conversation | None = None,
+        ) -> object:
+            del session_id, conversation
             raise OmnigentError("runner is offline", code=ErrorCode.RUNNER_UNAVAILABLE)
 
     prior_router = _globals._runner_router

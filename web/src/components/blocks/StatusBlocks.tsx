@@ -33,15 +33,64 @@ interface ErrorBannerProps {
   message: string;
   source: string;
   code: string;
+  /** Friendly headline for a classified failure, e.g. "Claude Code can't run as root". */
+  title?: string;
+  /** One/two-sentence explanation of why it failed. Paired with `title`. */
+  cause?: string;
+  /** Concrete next step to fix it, e.g. a command to run. */
+  remediation?: string;
 }
 
 /**
- * Loud destructive banner for `error` blocks. Falls back to `code` when
- * `message` is empty (matches the reducer's intent — never show a blank
- * panel even when the LLM error payload omits the message).
+ * One-line English descriptions for known failure `code`s, so an
+ * unclassified failure (no `title`/`cause` from the runner) still reads as a
+ * sentence instead of a raw enum. Mirrors the server-side
+ * `describe_failure_code` table (omnigent/runner/launch_failure.py); keep the
+ * two in sync.
  */
-export function ErrorBanner({ message, source, code }: ErrorBannerProps) {
-  const display = message || code || "Unknown error";
+const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
+  required_terminal_exited:
+    "The agent's terminal exited unexpectedly, so the session can't continue.",
+  terminal_launch_failed: "The agent's terminal couldn't be started on the host.",
+  runner_error: "Something went wrong setting up the turn on the host.",
+  runner_disconnected: "The connection to the host dropped unexpectedly.",
+  connection_error: "The connection to the agent dropped mid-turn.",
+  context_length_exceeded: "The conversation grew past the model's context window.",
+  executor_error: "The agent runtime hit an error while running the turn.",
+};
+
+/**
+ * Loud destructive banner for `error` blocks.
+ *
+ * When the runner classified the failure it passes `title` / `cause` /
+ * `remediation`, and the banner renders a clear card: headline, plain-English
+ * cause, a "Try this" remediation line, and the raw diagnostics folded into a
+ * collapsible. Otherwise it falls back to a code→sentence map (so even an
+ * unclassified failure reads as English) and finally to the raw message/code —
+ * never a blank panel.
+ */
+export function ErrorBanner({
+  message,
+  source,
+  code,
+  title,
+  cause,
+  remediation,
+}: ErrorBannerProps) {
+  // Headline: the friendly title, else a plain-English sentence for a known
+  // code, else a generic fallback. Never the raw enum.
+  const headline = title || FAILURE_CODE_DESCRIPTIONS[code] || "Something went wrong";
+  // Body under the headline: the classifier's cause, else the raw message.
+  // Suppressed when it would merely echo the headline (e.g. a known code with
+  // an empty message), so the panel never shows the same sentence twice or a
+  // bare code string.
+  const bodyText = cause || message || "";
+  const explanation = bodyText && bodyText !== headline ? bodyText : null;
+  // With a friendly title, the raw message is the detailed diagnostics blob —
+  // keep it available but folded away. Without one, the message is already the
+  // explanation, so there's nothing extra to fold.
+  const details = title && message && message !== explanation ? message : null;
+
   return (
     <Alert
       variant="destructive"
@@ -49,13 +98,33 @@ export function ErrorBanner({ message, source, code }: ErrorBannerProps) {
     >
       <AlertCircleIcon />
       <AlertTitle className="min-w-0 break-words [overflow-wrap:anywhere]">
-        Error{source ? ` · ${source}` : ""}
-        {code && message ? ` · ${code}` : ""}
+        {headline}
+        {source ? ` · ${source}` : ""}
       </AlertTitle>
-      <AlertDescription className="min-w-0 max-w-full overflow-hidden">
-        <span className="block max-w-full whitespace-pre-wrap break-words [overflow-wrap:anywhere] [text-wrap:wrap]">
-          {display}
-        </span>
+      <AlertDescription className="min-w-0 max-w-full space-y-2 overflow-hidden">
+        {explanation ? (
+          <span className="block max-w-full whitespace-pre-wrap break-words [overflow-wrap:anywhere] [text-wrap:wrap]">
+            {explanation}
+          </span>
+        ) : null}
+        {remediation ? (
+          <span className="block max-w-full break-words font-medium [overflow-wrap:anywhere]">
+            Try this: {remediation}
+          </span>
+        ) : null}
+        {details ? (
+          <Collapsible>
+            <CollapsibleTrigger className="group flex items-center gap-1 text-xs opacity-80 hover:opacity-100">
+              <ChevronRightIcon className="size-3 transition-transform group-data-[state=open]:rotate-90" />
+              Details{code ? ` · ${code}` : ""}
+            </CollapsibleTrigger>
+            <CollapsibleContent>
+              <span className="mt-1 block max-w-full whitespace-pre-wrap break-words font-mono text-xs opacity-80 [overflow-wrap:anywhere] [text-wrap:wrap]">
+                {details}
+              </span>
+            </CollapsibleContent>
+          </Collapsible>
+        ) : null}
       </AlertDescription>
     </Alert>
   );

@@ -1,0 +1,227 @@
+name: "Run UI compat tests (smoke or full suite)"
+description: >
+  Run tests/e2e_ui/ in one of two cross-version configurations:
+
+  Config A — new SPA + new runner, old server (server_version set):
+    The server subprocess is pinned to the released tag while the SPA is
+    built from HEAD. Tests the common deploy ordering where the server
+    lags behind the frontend.
+
+  Config B — old SPA, new server + new runner (ui_version set):
+    The SPA is built from the released tag's web/ source and the HEAD
+    server is pointed at it via OMNIGENT_WEB_UI_DIST. Tests cached-SPA
+    scenarios where a user's browser has an older bundle after a server
+    upgrade.
+
+  Exactly one of server_version / ui_version must be set.
+
+  Two run modes:
+  - full_suite=false (default): run only @pytest.mark.compat_smoke tests.
+  - full_suite=true: run the complete tests/e2e_ui/ suite, sharded.
+
+inputs:
+  server_version:
+    description: >
+      Release tag for the OLD server (e.g. v0.9.0). SPA and runner stay
+      on HEAD. Mutually exclusive with ui_version.
+    required: false
+    default: ""
+  ui_version:
+    description: >
+      Release tag whose web/ source is used to build the OLD SPA (e.g.
+      v0.9.0). Server and runner stay on HEAD; OMNIGENT_WEB_UI_DIST is
+      set to the old built bundle. Mutually exclusive with server_version.
+    required: false
+    default: ""
+  full_suite:
+    description: >
+      "true" = run the full tests/e2e_ui/ suite with sharding (overnight matrix).
+      "false" (default) = run only @pytest.mark.compat_smoke tests (PR gate).
+    required: false
+    default: "false"
+  shard_id:
+    description: "0-based shard index (only used when full_suite=true)."
+    required: false
+    default: "0"
+  num_shards:
+    description: "Total shard count (only used when full_suite=true)."
+    required: false
+    default: "1"
+  artifact_suffix:
+    description: >
+      Appended to uploaded-artifact names (e.g. "-ui-config"). Default empty.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Configure environment
+      shell: bash
+      run: |
+        {
+          echo "OMNIGENT_SKIP_WEB_UI=true"
+          echo "ANTHROPIC_API_KEY="
+          echo "OPENAI_API_KEY="
+          echo "CODEX="
+          echo "CLAUDE_CODE="
+        } >> "$GITHUB_ENV"
+
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+      with:
+        python-version-file: ".python-version"
+
+    - name: Set up pnpm + Node
+      uses: ./.github/actions/setup-pnpm
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+      with:
+        enable-cache: true
+
+    - name: Cache virtualenv
+      uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+      with:
+        path: .venv
+        key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+
+    - name: Install project and dev dependencies
+      shell: bash
+      run: uv sync --locked --extra all --extra dev
+
+    - name: Install bubblewrap and tmux
+      shell: bash
+      run: |
+        sudo apt-get install -y bubblewrap tmux
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+    - name: Cache Playwright browsers
+      uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+      with:
+        path: ~/.cache/ms-playwright
+        key: ${{ runner.os }}-playwright-${{ hashFiles('uv.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-playwright-
+
+    - name: Install Playwright Chromium
+      shell: bash
+      run: uv run playwright install --with-deps chromium
+
+    - name: Build HEAD SPA
+      # Always build the HEAD SPA so the built_spa fixture's tombstone assertion
+      # passes. In Config B OMNIGENT_WEB_UI_DIST is then set to the old bundle,
+      # so the server serves that instead — but the HEAD build must exist for the
+      # fixture's structural check.
+      shell: bash
+      env:
+        NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+      run: |
+        pnpm install --frozen-lockfile --filter web
+        pnpm --filter web run build
+
+    - name: "Build pinned old server (Config A)"
+      if: ${{ inputs.server_version != '' }}
+      shell: bash
+      env:
+        SERVER_VERSION_INPUT: ${{ inputs.server_version }}
+      run: |
+        tag="$SERVER_VERSION_INPUT"
+        if ! [[ "$tag" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([a-z0-9.]*)?$ ]]; then
+          echo "Invalid server_version: '$tag'" >&2; exit 1
+        fi
+        src="$RUNNER_TEMP/ui-server-src"
+        venv="$RUNNER_TEMP/ui-server-env"
+        git worktree add --detach "$src" "$tag"
+        uv venv --python 3.12 "$venv"
+        uv pip install --python "$venv/bin/python" \
+          -e "$src" -e "$src/sdks/python-client" -e "$src/sdks/ui"
+        "$venv/bin/omnigent" --version
+        echo "OMNIGENT_COMPAT_SERVER_PYTHON=$venv/bin/python" >> "$GITHUB_ENV"
+        echo "OMNIGENT_COMPAT_SERVER_VERSION=${tag#v}" >> "$GITHUB_ENV"
+
+    - name: "Build old SPA from release tag (Config B: old SPA / new server)"
+      # Check out the old tag's web/ source into a temp dir, build it there,
+      # then set OMNIGENT_WEB_UI_DIST so the HEAD server serves that bundle.
+      if: ${{ inputs.ui_version != '' }}
+      shell: bash
+      env:
+        UI_VERSION_INPUT: ${{ inputs.ui_version }}
+        NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+      run: |
+        tag="$UI_VERSION_INPUT"
+        if ! [[ "$tag" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([a-z0-9.]*)?$ ]]; then
+          echo "Invalid ui_version: '$tag'" >&2; exit 1
+        fi
+        src="$RUNNER_TEMP/ui-spa-src"
+        git worktree add --detach "$src" "$tag"
+        # Build the old SPA in its own directory. pnpm install uses the
+        # old lock file; the build output lands in web/dist/ inside src.
+        cd "$src"
+        pnpm install --frozen-lockfile --filter web
+        pnpm --filter web run build
+        # vite.config.ts writes to ../omnigent/server/static/web-ui relative
+        # to web/ — resolve to the absolute path inside the old checkout.
+        built=$(cd web && node -e "const p=require('./vite.config.ts')" 2>/dev/null \
+          || echo "$src/omnigent/server/static/web-ui")
+        # Fall back to checking both known locations.
+        if [ -d "$src/omnigent/server/static/web-ui" ]; then
+          built="$src/omnigent/server/static/web-ui"
+        elif [ -d "$src/web/dist" ]; then
+          built="$src/web/dist"
+        else
+          echo "Could not locate built SPA under $src" >&2; exit 1
+        fi
+        # Set OMNIGENT_WEB_UI_DIST so the HEAD server serves this old bundle.
+        # The HEAD SPA is still built above (built_spa fixture needs it for the
+        # tombstone assertion); the server uses OMNIGENT_WEB_UI_DIST to override
+        # which bundle it actually mounts.
+        echo "OMNIGENT_WEB_UI_DIST=$built" >> "$GITHUB_ENV"
+
+    - name: Run UI compat tests
+      shell: bash
+      env:
+        FULL_SUITE: ${{ inputs.full_suite }}
+        SHARD_ID: ${{ inputs.shard_id }}
+        NUM_SHARDS: ${{ inputs.num_shards }}
+        E2E_TMP_BASE: /tmp/omnigent-compat-ui-${{ github.run_id }}
+      run: |
+        mkdir -p "$E2E_TMP_BASE"
+        if [[ "$FULL_SUITE" == "true" ]]; then
+          uv run pytest tests/e2e_ui/ \
+            -m "not visual and not nightly" \
+            --ui-skip-build \
+            --splits="$NUM_SHARDS" \
+            --group="$((SHARD_ID + 1))" \
+            --tracing=retain-on-failure \
+            --screenshot=only-on-failure \
+            -v --tb=long --showlocals --log-level=INFO \
+            --timeout=180 \
+            --timeout-method=thread \
+            --basetemp="$E2E_TMP_BASE" \
+            --junitxml="$E2E_TMP_BASE/junit.xml" \
+            || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
+        else
+          uv run pytest tests/e2e_ui/ \
+            -m compat_smoke \
+            --ui-skip-build \
+            -v --tb=long --showlocals --log-level=INFO \
+            --timeout=120 \
+            --timeout-method=thread \
+            --basetemp="$E2E_TMP_BASE" \
+            --junitxml="$E2E_TMP_BASE/junit.xml"
+        fi
+
+    - name: Upload logs on failure
+      if: ${{ failure() || cancelled() }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      with:
+        name: compat-ui-smoke-logs-${{ github.run_id }}${{ inputs.artifact_suffix }}
+        path: |
+          /tmp/omnigent-compat-ui-${{ github.run_id }}/**/server.log
+          /tmp/omnigent-compat-ui-${{ github.run_id }}/**/runner.log
+          /tmp/omnigent-compat-ui-${{ github.run_id }}/**/.omnigent/logs/**/*.log
+          /tmp/omnigent-compat-ui-${{ github.run_id }}/junit.xml
+        retention-days: 7
+        if-no-files-found: warn
+        include-hidden-files: true

@@ -15,6 +15,7 @@ import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
+import { setSessionHost } from "./sessionHost";
 import type {
   ModelUsage,
   NativeModelOption,
@@ -164,7 +165,13 @@ interface SessionResponseWire {
    * `total_cost_usd`). Absent/`null` when no per-model usage was recorded.
    */
   usage_by_model?: Record<string, ModelUsageWire> | null;
-  last_task_error?: { code: string; message: string } | null;
+  last_task_error?: {
+    code: string;
+    message: string;
+    title?: string;
+    cause?: string;
+    remediation?: string;
+  } | null;
   /**
    * Outstanding `response.elicitation_request` event dicts at the
    * moment the snapshot was built. The live SSE stream has no
@@ -284,6 +291,9 @@ function usageByModelFromWire(
 }
 
 function sessionFromWire(wire: SessionResponseWire): Session {
+  // Record the session's host so slice-key routing (turn dispatch, terminal
+  // attach) can pin to the replica holding that host's runner tunnel.
+  setSessionHost(wire.id, wire.host_id);
   return {
     id: wire.id,
     agentId: wire.agent_id,
@@ -364,13 +374,25 @@ export class ApiError extends Error {
  * server's `error.message` / `error.code` over the bare status line.
  * Falls back to ``"<status> <statusText>"`` when the body is missing or
  * not the AP error shape.
+ *
+ * Routes that raise FastAPI's `HTTPException` directly (the upload route's
+ * 415/413, the 501 "not configured" guards) serialize as `{"detail": "…"}`
+ * instead, so that shape is read too — otherwise those failures reach the
+ * user as a bare status line ("415 ", with statusText empty over HTTP/2)
+ * rather than the reason the server actually gave.
  */
-async function apiErrorFromResponse(res: Response): Promise<ApiError> {
-  let message = `${res.status} ${res.statusText}`;
+export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
+  let message = `${res.status} ${res.statusText}`.trim();
   let code: string | null = null;
   try {
-    const body = (await res.json()) as { error?: { code?: string; message?: string } };
+    const body = (await res.json()) as {
+      error?: { code?: string; message?: string };
+      detail?: unknown;
+    };
+    // FastAPI's validation errors put a list in `detail`; only a plain
+    // string is a message meant for the user.
     if (body.error?.message) message = body.error.message;
+    else if (typeof body.detail === "string" && body.detail) message = body.detail;
     if (body.error?.code) code = body.error.code;
   } catch {
     // Non-JSON / empty body — keep the status-line fallback.

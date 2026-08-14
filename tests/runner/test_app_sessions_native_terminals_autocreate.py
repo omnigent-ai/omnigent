@@ -1053,6 +1053,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         **gateway_env,
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
+        "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     }
     assert spec.command == "claude"
     # The gateway default model is applied (no per-session override here).

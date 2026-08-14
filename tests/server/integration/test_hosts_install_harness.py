@@ -23,9 +23,11 @@ from typing import Any
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 
+from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
     HostHelloFrame,
     HostInstallHarnessFrame,
@@ -136,6 +138,18 @@ def install_app(
         create_hosts_router(registry, host_store, conv_store),
         prefix="/v1",
     )
+
+    @app.exception_handler(OmnigentError)
+    async def _handle_omnigent_error(
+        request: Request,
+        exc: OmnigentError,
+    ) -> JSONResponse:
+        """Convert application errors to structured JSON responses."""
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
     return app, registry, host_store, conv_store
 
 
@@ -557,18 +571,19 @@ async def test_install_harness_offline_host_returns_409(
     install_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
     """
-    Installing on a registered-but-offline host returns 409.
+    Installing on an offline host returns 409.
 
-    A host row can exist in the store while no live tunnel connection is
-    present; the install needs a live connection to forward the frame.
+    A host row can exist in the store while offline (no live tunnel connection
+    present); the install needs a live connection to forward the frame.
     """
     app, _reg, host_store, _cs = install_app
-    # Persist a host row without a live registry connection.
+    # Persist a host row as offline without a live registry connection.
     host_store.upsert_on_connect(
         host_id=_HOST_ID,
         name=_HOST_NAME,
         user_id="local",
     )
+    host_store.set_offline(_HOST_ID)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(f"/v1/hosts/{_HOST_ID}/harnesses/claude/install")
 

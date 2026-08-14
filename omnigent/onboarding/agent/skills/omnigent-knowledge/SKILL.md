@@ -19,14 +19,14 @@ my-agent/
 ├── config.yaml          # REQUIRED — agent spec
 ├── AGENTS.md            # Recommended — instructions/personality
 ├── skills/              # Optional — load-on-demand skills
-│   └── <skill-name>/
+│   └── <dir>/           # Free-form; skill name comes from SKILL.md
 │       └── SKILL.md
 ├── tools/               # Optional — packaged tools
 │   ├── python/          # Local Python tools (auto-discovered *.py)
 │   ├── typescript/      # Local TypeScript tools (auto-discovered *.ts)
 │   └── mcp/             # MCP server declarations (*.yaml)
 └── agents/              # Optional — sub-agent directories (recursive)
-    └── <agent-name>/
+    └── <dir>/           # Free-form; sub-agent name comes from config.yaml
         ├── config.yaml
         └── ...
 ```
@@ -97,7 +97,7 @@ interaction:
     output: [text]               # default: [text]
 
 tools:
-  # Sub-agents this agent can spawn (must match agents/ subdirectories)
+  # Sub-agents this agent can spawn (declared names of agents/ sub-agents)
   agents:
     - researcher
     - summarizer
@@ -152,7 +152,8 @@ at runtime. Best practices:
 
 ## Skills Format
 
-Each skill lives in `skills/<skill-name>/SKILL.md`:
+Each skill lives in `skills/<dir>/SKILL.md` (the directory name is free-form
+and need not match the skill's `name`):
 
 ```markdown
 ---
@@ -168,7 +169,8 @@ When researching a topic:
 
 Rules:
 - YAML frontmatter with `name` and `description` (both required)
-- `name` must match the directory name, be lowercase, use `[a-z0-9-]+`
+- `name` must be lowercase and use `[a-z0-9-]+`; it need not match the
+  directory name (the directory is where the skill's files load from)
 - Body is markdown instructions loaded on demand by the agent
 - Referenced in AGENTS.md or config.yaml
 
@@ -328,9 +330,9 @@ my-agent/
   AGENTS.md
   agents/
     researcher/
-      config.yaml        # sub-agent spec
-    fact-checker/
-      config.yaml        # another sub-agent
+      config.yaml        # sub-agent spec — declares name: researcher
+    fact-check-worker/
+      config.yaml        # declares name: fact-checker (dir may differ)
 ```
 
 ### Declaring sub-agents
@@ -346,7 +348,8 @@ tools:
     - web_search
 ```
 
-Each name must match a directory under `agents/`. The **parent** must use
+Each name must be the declared `name` of a sub-agent under `agents/`; the
+directory it lives in may differ. The **parent** must use
 `executor.type: omnigent` — that's what provides the spawn tools. Each
 sub-agent is a full agent and may use any executor (`claude_sdk`,
 `agents_sdk`, or `omnigent`).

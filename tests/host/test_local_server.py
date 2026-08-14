@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+import httpx
 import pytest
 
 from omnigent.host import local_server
@@ -1124,3 +1125,135 @@ def test_ensure_does_not_advertise_pidfile_before_ownership_confirmed(
     assert result.url == "http://127.0.0.1:6767"
     # Once confirmed, the record IS advertised for reuse/discovery.
     assert pid_file.read_text() == "9001\n6767\n"
+
+
+def test_wait_adopts_a_slow_boot_while_the_process_is_alive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A server that outlives the ready timeout but is still booting is adopted.
+
+    A first boot (cold imports + DB migrations) has taken ~40s in the
+    wild — past the ready timeout. While the child process is alive the
+    wait must extend to the boot ceiling instead of failing a server
+    that is seconds from healthy (and then leaking it).
+    """
+
+    class _Proc:
+        pid = 4321
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    class _Resp:
+        status_code = 200
+
+    calls = {"n": 0}
+
+    def _fake_get(url: str, *, timeout: float, trust_env: bool) -> _Resp:
+        del url, timeout, trust_env
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.ConnectError("not ready yet")
+        return _Resp()
+
+    monkeypatch.setattr("httpx.get", _fake_get)
+
+    local_server._wait_for_local_omnigent_server(
+        "http://127.0.0.1:8123",
+        _Proc(),
+        tmp_path / "server.log",
+        timeout=0.05,
+        boot_ceiling=30.0,
+    )
+
+    assert calls["n"] == 3
+
+
+def test_wait_stops_the_spawned_server_when_the_boot_ceiling_expires(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Exhausting the wait stops our own child before raising.
+
+    Raising while the spawned server keeps running leaves a healthy but
+    untracked orphan (the failure path clears the pidfile record) — the
+    exact leak behind background servers accumulating on a dev box.
+    """
+
+    class _Proc:
+        pid = 4321
+
+        def __init__(self) -> None:
+            self.terminated = False
+            self.killed = False
+            self._exited = False
+
+        def poll(self) -> int | None:
+            return 0 if self._exited else None
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self._exited = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+    def _fake_get(url: str, *, timeout: float, trust_env: bool) -> None:
+        del url, timeout, trust_env
+        raise httpx.ConnectError("never ready")
+
+    monkeypatch.setattr("httpx.get", _fake_get)
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_PID_PATH", tmp_path / "local_server.pid")
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", tmp_path / "local_server.sig")
+    proc = _Proc()
+
+    with pytest.raises(click.ClickException):
+        local_server._wait_for_local_omnigent_server(
+            "http://127.0.0.1:8123",
+            proc,
+            tmp_path / "server.log",
+            timeout=0.05,
+            boot_ceiling=0.3,
+        )
+
+    assert proc.terminated is True
+    assert proc.killed is False
+
+
+def test_wait_fails_fast_without_stopping_a_child_that_already_died(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A dead child fails immediately; there is nothing left to stop."""
+
+    class _Proc:
+        pid = 4321
+        terminated = False
+
+        @staticmethod
+        def poll() -> int:
+            return 1
+
+        def terminate(self) -> None:
+            type(self).terminated = True
+
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_PID_PATH", tmp_path / "local_server.pid")
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", tmp_path / "local_server.sig")
+    proc = _Proc()
+
+    with pytest.raises(click.ClickException):
+        local_server._wait_for_local_omnigent_server(
+            "http://127.0.0.1:8123",
+            proc,
+            tmp_path / "server.log",
+            timeout=5.0,
+            boot_ceiling=5.0,
+        )
+
+    assert proc.terminated is False

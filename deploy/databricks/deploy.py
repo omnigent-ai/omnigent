@@ -212,7 +212,7 @@ class _ClassifiedWheels:
     """Result of sorting built wheels by size for upload routing.
 
     :param main: The top-level ``omnigent`` wheel — always uploaded
-        with the ``[databricks]`` extra.
+        with the ``[databricks,tracing]`` extras.
     :param small: Wheels ≤ 10 MB. Uploaded into the bundle's
         ``source_code_path`` and referenced by relative path.
     :param oversize: Wheels > 10 MB. These cannot be used by the
@@ -369,7 +369,7 @@ def build_uv_pyproject(
     """
     source_lines = _uv_source_lines(main_wheel, small_wheels, oversize_wheels)
     dependencies = [
-        f'"omnigent[databricks]=={deploy_version}"',
+        f'"omnigent[databricks,tracing]=={deploy_version}"',
         f'"omnigent-client=={deploy_version}"',
         f'"omnigent-ui-sdk=={deploy_version}"',
     ]

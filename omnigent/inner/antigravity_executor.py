@@ -69,6 +69,7 @@ from .executor import (
     TurnCancelled,
     TurnComplete,
     classify_tool_result,
+    describe_exception,
 )
 
 logger = logging.getLogger(__name__)
@@ -498,7 +499,7 @@ class AntigravityExecutor(Executor):
                 tools=tools,
             )
         except ImportError as exc:
-            yield ExecutorError(message=str(exc), retryable=False)
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
         except Exception as exc:
             logger.exception("Antigravity agent construction failed")

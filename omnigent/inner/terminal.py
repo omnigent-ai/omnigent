@@ -1000,6 +1000,11 @@ class TerminalInstance:
     # not read as agent activity. ``-inf`` until the first interaction.
     _last_client_interaction_at: float = field(default=float("-inf"), repr=False)
     _last_pane_snapshot: str | None = field(default=None, repr=False)
+    # Exit status of the pane's inner process, captured from tmux
+    # ``#{pane_dead_status}`` the first time a dead pane is observed (only
+    # meaningful with ``keep_alive_after_exit`` / ``remain-on-exit``). ``None``
+    # until the process exits or when tmux reports no numeric status.
+    _last_exit_status: int | None = field(default=None, repr=False)
 
     @property
     def tmux_target(self) -> str:
@@ -1043,6 +1048,32 @@ class TerminalInstance:
     def _remember_pane_snapshot(self, snapshot: str) -> None:
         """Store a pane capture for later exit diagnostics."""
         self._last_pane_snapshot = snapshot
+
+    def last_exit_status(self) -> int | None:
+        """Return the inner process's exit code, if the pane has died.
+
+        Captured from tmux ``#{pane_dead_status}`` when a dead pane is first
+        observed (see :meth:`_pane_is_dead` / :meth:`_pane_is_dead_async`).
+        Only meaningful for terminals launched with ``keep_alive_after_exit``
+        (``remain-on-exit``); ``None`` otherwise or before exit.
+        """
+        return self._last_exit_status
+
+    def _remember_exit_status(self, fields: str) -> None:
+        """Record the exit code from a ``#{pane_dead} #{pane_dead_status}`` row.
+
+        A managed terminal is single-pane by construction (:attr:`tmux_target`
+        is always ``"main"``), so ``list-panes`` returns exactly one row and its
+        two fields describe that pane: ``pane_dead`` (``1`` once the inner
+        process exits) and ``pane_dead_status`` (the wait-status, empty while
+        alive). Reading only the first two whitespace tokens is therefore
+        unambiguous. Parsed best-effort — a missing or non-numeric status just
+        leaves the code unset.
+        """
+        parts = fields.split()
+        if len(parts) >= 2 and parts[0] == "1":
+            with contextlib.suppress(ValueError):
+                self._last_exit_status = int(parts[1])
 
     def _tmux_base_cmd(self) -> list[str]:
         """
@@ -1728,11 +1759,12 @@ class TerminalInstance:
         """
         try:
             out = self._tmux_output_sync(
-                "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead}"
+                "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead} #{pane_dead_status}"
             )
         except RuntimeError:
             return False
-        return "1" in out.split()
+        self._remember_exit_status(out)
+        return out.split()[:1] == ["1"]
 
     def pane_pid_sync(self) -> int | None:
         """Return the pid of the pane's foreground process, or ``None``.
@@ -1862,11 +1894,12 @@ class TerminalInstance:
         """
         try:
             out = await self._tmux_output(
-                "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead}"
+                "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead} #{pane_dead_status}"
             )
         except RuntimeError:
             return False
-        return "1" in out.split()
+        self._remember_exit_status(out)
+        return out.split()[:1] == ["1"]
 
     async def _tmux(self, *args: str) -> None:
         """Run a tmux command against this instance's server."""

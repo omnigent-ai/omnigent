@@ -63,6 +63,20 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
+
+class WrongReplicaWSError(RuntimeError):
+    """Raised by the tunnel factory on a wrong-replica routing miss.
+
+    Carries the ``WRONG_REPLICA`` signal (the runner tunnel is bound but
+    lives on a different replica) out to the terminal-attach route, which
+    maps it to WS close code ``4400`` so the client re-dials WITHOUT the key.
+    A plain :class:`RuntimeError` would collapse to the generic ``4500``
+    internal-error close, which the client treats as a dead-end. Subclasses
+    ``RuntimeError`` so existing ``except Exception`` fallbacks that close
+    ``4500`` still catch it.
+    """
+
+
 # Match the runner-side WS attach path that
 # ``attach_terminal_by_resource_id`` constructs:
 #   ``/v1/sessions/{conv}/resources/terminals/{terminal_id}/attach``

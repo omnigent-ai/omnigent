@@ -1,26 +1,27 @@
 """Tests for the pure RPC step→item mapper.
 
 These exercise :func:`omnigent.antigravity_native_steps.map_step_to_events`
-using the real recorded fixtures captured from live agy sessions (Task 1).
-No I/O, no live agy: the mapper is driven with fixture dicts and event shapes
-are asserted exactly.
+using the real recorded fixtures captured from live agy sessions — from BOTH
+RPC shapes, since they differ (``stream_*`` fixtures are verbatim
+``StreamAgentStateUpdates`` frames, the rest are ``GetCascadeTrajectorySteps``
+snapshots). No I/O, no live agy: the mapper is driven with fixture dicts and
+event shapes are asserted exactly.
 
 Key assertions:
 - PLANNER_RESPONSE with text → exactly one ``external_conversation_item``
   ``message`` (role assistant, ``output_text`` content). NO
   ``external_output_text_delta`` / ``output_text_delta`` event.
 - USER_INPUT → ``[]`` (skipped — fixes user-dup).
-- PLANNER_RESPONSE with tool_calls → ``function_call`` item(s) via allocator.
-- RUN_COMMAND DONE → ``function_call_output`` carrying
-  ``runCommand.combinedOutput.full``.
-- RUN_COMMAND WAITING → ``function_call`` only (no output yet).
-- ASK_QUESTION WAITING → ``function_call`` only (no output yet).
-- ASK_QUESTION DONE → ``function_call_output`` carrying the formatted answer.
+- PLANNER_RESPONSE with tool_calls → ``[]``; the tool step owns the pair.
+- A tool step at terminal status → its ``function_call`` AND the matching
+  ``function_call_output``, sharing a step-derived call id, on either shape.
+- RUN_COMMAND / ASK_QUESTION WAITING → ``[]`` (no result yet).
 - CHECKPOINT / CONVERSATION_HISTORY → ``[]``.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Any, cast
@@ -28,7 +29,6 @@ from typing import Any, cast
 from omnigent.antigravity_native_steps import (
     OutboundEvent,
     _execution_discriminator,
-    _ToolCallIdAllocator,
     map_step_to_events,
     output_reasoning_delta_event,
     pending_interaction,
@@ -41,16 +41,27 @@ from omnigent.antigravity_native_steps import (
 _FIXTURES = Path(__file__).parent / "fixtures" / "antigravity" / "steps"
 _CID = "test-conversation-id"
 
+# Every recorded fixture belongs to this trajectory; tool-call ids are derived
+# from ``(trajectory, step index)`` so they are predictable per fixture.
+_TRAJ = "efb134b2-d69f-43de-bb54-c9ece346d8a3"
+
+
+def _call_id(step_index: int) -> str:
+    """The call id the mapper derives for a fixture step in this trajectory."""
+    return f"agy_call_{_TRAJ}_{step_index}"
+
+
+def _item(event: OutboundEvent) -> dict[str, Any]:
+    """Return one event's ``item_data``, asserting it is a dict."""
+    data = event.data["item_data"]
+    assert isinstance(data, dict)
+    return data
+
 
 def _load(name: str) -> dict[str, Any]:
     """Load one step fixture by filename (without extension)."""
     path = _FIXTURES / f"{name}.json"
     return cast(dict[str, Any], json.loads(path.read_text()))
-
-
-def _allocator() -> _ToolCallIdAllocator:
-    """Fresh allocator for each test."""
-    return _ToolCallIdAllocator(conversation_id=_CID)
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +101,7 @@ class TestUserInputCommitted:
     def test_user_input_commits_user_message(self) -> None:
         """USER_INPUT step → exactly one committed user ``message`` item."""
         step = _load("user_input")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert len(events) == 1
         ev = events[0]
         assert ev.event_type == "external_conversation_item"
@@ -105,13 +116,13 @@ class TestUserInputCommitted:
     def test_user_input_no_delta(self) -> None:
         """USER_INPUT commits a message but emits no streaming delta events."""
         step = _load("user_input")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         _assert_no_delta(events)
 
     def test_user_input_without_text_is_skipped(self) -> None:
         """A USER_INPUT step with no recoverable text emits nothing (no empty bubble)."""
         step = {"type": "CORTEX_STEP_TYPE_USER_INPUT", "userInput": {}}
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert events == []
 
 
@@ -131,25 +142,25 @@ class TestPlannerResponseText:
         message); the new mapper emits 1.
         """
         step = _load("planner_response_text")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert len(events) == 1
 
     def test_event_type_is_conversation_item(self) -> None:
         """The single event has type ``external_conversation_item``."""
         step = _load("planner_response_text")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert events[0].event_type == "external_conversation_item"
 
     def test_item_type_is_message(self) -> None:
         """The event's ``item_type`` is ``"message"``."""
         step = _load("planner_response_text")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert events[0].data["item_type"] == "message"
 
     def test_message_role_is_assistant(self) -> None:
         """The ``message`` item has role ``"assistant"``."""
         step = _load("planner_response_text")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
         assert item_data["role"] == "assistant"
@@ -160,7 +171,7 @@ class TestPlannerResponseText:
         fixture's ``plannerResponse.response`` text.
         """
         step = _load("planner_response_text")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
         content = item_data["content"]
@@ -180,20 +191,20 @@ class TestPlannerResponseText:
         event before the message; the new mapper drops it entirely.
         """
         step = _load("planner_response_text")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         _assert_no_delta(events)
 
     def test_step_index_from_fixture(self) -> None:
         """step_index on the event matches the fixture's sourceTrajectoryStepInfo.stepIndex."""
         step = _load("planner_response_text")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         # planner_response_text.json has stepIndex=2
         assert events[0].step_index == 2
 
     def test_response_id_stable(self) -> None:
         """response_id is deterministic: ``agy_<conversation_id>_<stepIndex>``."""
         step = _load("planner_response_text")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert events[0].data["response_id"] == f"agy_{_CID}_2"
 
 
@@ -210,7 +221,7 @@ class TestPlannerResponseError:
         step = _load("planner_response_text")
         step["status"] = "CORTEX_STEP_STATUS_ERROR"
         step["plannerResponse"] = {}  # no text/error detail -> generic marker
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert len(events) == 1
         ev = events[0]
         assert ev.event_type == "external_conversation_item"
@@ -226,7 +237,7 @@ class TestPlannerResponseError:
         step = _load("planner_response_text")
         step["status"] = "CORTEX_STEP_STATUS_ERROR"
         step["plannerResponse"] = {"error": "model overloaded (503)"}
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert "model overloaded (503)" in events[0].data["item_data"]["content"][0]["text"]
 
 
@@ -235,102 +246,23 @@ class TestPlannerResponseError:
 # ---------------------------------------------------------------------------
 
 
-class TestPlannerResponseToolCallRunCommand:
-    """PLANNER_RESPONSE with run_command tool call → function_call event(s)."""
+class TestPlannerToolCallsNotMirrored:
+    """
+    A planner's ``toolCalls`` is never mirrored — the tool step owns the pair.
 
-    def test_returns_one_function_call(self) -> None:
-        """One tool call → one ``function_call`` event."""
-        step = _load("planner_response_tool_call_run_command")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        assert len(events) == 1
-        assert events[0].data["item_type"] == "function_call"
+    The live stream strips ``plannerResponse.toolCalls`` altogether, so mirroring
+    from there produced nothing at all for streamed turns. Mapping it on the poll
+    shape only would post a SECOND, differently-keyed invocation for every tool
+    the moment the reader fell back to polling.
+    """
 
-    def test_function_call_name(self) -> None:
-        """The function_call name matches the fixture's toolCall name."""
-        step = _load("planner_response_tool_call_run_command")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        item_data = events[0].data["item_data"]
-        assert isinstance(item_data, dict)
-        assert item_data["name"] == "run_command"
-
-    def test_function_call_id_is_real_agy_id(self) -> None:
-        """
-        call_id is the real agy-assigned id from plannerResponse.toolCalls[].id.
-
-        The fixture carries id="cbawg2v8"; the mapper must use that directly,
-        NOT synthesize a positional id from the allocator.
-        """
-        alloc = _allocator()
-        step = _load("planner_response_tool_call_run_command")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=alloc)
-        item_data = events[0].data["item_data"]
-        assert isinstance(item_data, dict)
-        # Real agy id from the fixture
-        assert item_data["call_id"] == "cbawg2v8"
-        # Allocator must NOT have been advanced (real id was used instead)
-        assert alloc.invocation_count == 0
-
-    def test_function_call_arguments_strip_display_keys(self) -> None:
-        """
-        ``toolAction`` and ``toolSummary`` are stripped from the function
-        arguments; the real command args remain.
-        """
-        step = _load("planner_response_tool_call_run_command")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        item_data = events[0].data["item_data"]
-        assert isinstance(item_data, dict)
-        args_text = item_data["arguments"]
-        assert isinstance(args_text, str)
-        args = json.loads(args_text)
-        assert "toolAction" not in args
-        assert "toolSummary" not in args
-        # Real args remain
-        assert "CommandLine" in args
-
-    def test_no_delta_event(self) -> None:
-        """No delta event is emitted for a tool-call-only PLANNER_RESPONSE."""
-        step = _load("planner_response_tool_call_run_command")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        _assert_no_delta(events)
-
-    def test_step_index(self) -> None:
-        """step_index matches fixture stepIndex=5."""
-        step = _load("planner_response_tool_call_run_command")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        assert events[0].step_index == 5
-
-
-class TestPlannerResponseToolCallAskQuestion:
-    """PLANNER_RESPONSE with ask_question tool call → function_call event."""
-
-    def test_returns_one_function_call(self) -> None:
-        """One ask_question tool call → one ``function_call`` event."""
-        step = _load("planner_response_tool_call_ask_question")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        assert len(events) == 1
-        assert events[0].data["item_type"] == "function_call"
-
-    def test_function_call_name(self) -> None:
-        """The function_call name is ``ask_question``."""
-        step = _load("planner_response_tool_call_ask_question")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        item_data = events[0].data["item_data"]
-        assert isinstance(item_data, dict)
-        assert item_data["name"] == "ask_question"
-
-    def test_function_call_id_is_real_agy_id(self) -> None:
-        """
-        call_id is the real agy-assigned id from plannerResponse.toolCalls[].id.
-
-        The fixture carries id="jfizoalt"; the allocator must NOT advance.
-        """
-        alloc = _allocator()
-        step = _load("planner_response_tool_call_ask_question")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=alloc)
-        item_data = events[0].data["item_data"]
-        assert isinstance(item_data, dict)
-        assert item_data["call_id"] == "jfizoalt"
-        assert alloc.invocation_count == 0
+    def test_tool_call_only_planner_emits_nothing(self) -> None:
+        """A DONE planner with tool calls but no text maps to no items."""
+        for name in (
+            "planner_response_tool_call_run_command",
+            "planner_response_tool_call_ask_question",
+        ):
+            assert map_step_to_events(_load(name), conversation_id=_CID) == []
 
 
 # ---------------------------------------------------------------------------
@@ -339,25 +271,22 @@ class TestPlannerResponseToolCallAskQuestion:
 
 
 class TestRunCommandDone:
-    """RUN_COMMAND DONE step → ``function_call_output`` with combinedOutput."""
+    """RUN_COMMAND DONE step → the invocation plus its combinedOutput."""
 
-    def test_returns_one_event(self) -> None:
-        """One DONE run_command → one event."""
+    def test_returns_the_pair(self) -> None:
+        """One DONE run_command → its ``function_call`` and its output."""
         step = _load("run_command_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        assert len(events) == 1
+        events = map_step_to_events(step, conversation_id=_CID)
+        assert [event.data["item_type"] for event in events] == [
+            "function_call",
+            "function_call_output",
+        ]
 
     def test_event_type_is_conversation_item(self) -> None:
         """event_type is ``external_conversation_item``."""
         step = _load("run_command_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        assert events[0].event_type == "external_conversation_item"
-
-    def test_item_type_is_function_call_output(self) -> None:
-        """item_type is ``function_call_output``."""
-        step = _load("run_command_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        assert events[0].data["item_type"] == "function_call_output"
+        events = map_step_to_events(step, conversation_id=_CID)
+        assert {event.event_type for event in events} == {"external_conversation_item"}
 
     def test_output_from_combined_output_full(self) -> None:
         """
@@ -366,32 +295,25 @@ class TestRunCommandDone:
         The fixture has ``combinedOutput.full = '/Users/bryanli/...scratch\\n'``.
         """
         step = _load("run_command_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        item_data = events[0].data["item_data"]
-        assert isinstance(item_data, dict)
-        assert item_data["output"] == "/Users/bryanli/.gemini/antigravity-cli/scratch\n"
+        events = map_step_to_events(step, conversation_id=_CID)
+        assert _item(events[1])["output"] == "/Users/bryanli/.gemini/antigravity-cli/scratch\n"
 
-    def test_call_id_is_real_agy_id(self) -> None:
+    def test_pair_shares_the_step_derived_call_id(self) -> None:
         """
-        call_id is the real agy-assigned id from metadata.toolCall.id.
+        Both items are keyed on the step's own ``(trajectory, index)`` identity.
 
-        The fixture carries toolCall.id="cbawg2v8", matching the invocation
-        step's plannerResponse.toolCalls[0].id.  The allocator must NOT be
-        consulted (no pending ids needed).
+        agy's ``metadata.toolCall.id`` ("cbawg2v8" here) is deliberately not
+        used: streamed steps carry no such id, so keying on it would make the
+        id depend on which RPC delivered the step.
         """
         step = _load("run_command_done")
-        alloc = _allocator()
-        events = map_step_to_events(step, conversation_id=_CID, allocator=alloc)
-        item_data = events[0].data["item_data"]
-        assert isinstance(item_data, dict)
-        assert item_data["call_id"] == "cbawg2v8"
-        # Allocator was not used (no orphan id minted)
-        assert alloc.orphan_output_count == 0
+        events = map_step_to_events(step, conversation_id=_CID)
+        assert {_item(event)["call_id"] for event in events} == {_call_id(6)}
 
     def test_step_index(self) -> None:
         """step_index matches fixture stepIndex=6."""
         step = _load("run_command_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert events[0].step_index == 6
 
 
@@ -412,13 +334,13 @@ class TestRunCommandWaiting:
     def test_waiting_emits_no_output_event(self) -> None:
         """WAITING run_command → empty list (no function_call_output)."""
         step = _load("run_command_waiting")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert events == []
 
     def test_waiting_no_delta(self) -> None:
         """No delta event from a WAITING run_command."""
         step = _load("run_command_waiting")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         _assert_no_delta(events)
 
 
@@ -430,41 +352,38 @@ class TestRunCommandWaiting:
 class TestRunCommandError:
     """A terminal-ERROR tool step must still close its ``function_call``.
 
-    The invocation side emits a ``function_call`` for the tool unconditionally,
-    so an ERROR result (e.g. an ignored/timed-out interactive prompt that flips
-    WAITING→ERROR) must emit a paired ``function_call_output`` keyed on the same
-    id, or the web UI strands a perpetual in-progress tool card.
+    An ERROR result (e.g. an ignored/timed-out interactive prompt that flips
+    WAITING→ERROR) carries no result text, but the pair must still be emitted
+    with a marker, or the web UI strands a perpetual in-progress tool card.
     """
 
-    def test_error_emits_one_output_event(self) -> None:
-        """A failed (ERROR-status) run_command emits one function_call_output."""
+    def test_error_emits_the_pair(self) -> None:
+        """A failed (ERROR-status) run_command still emits both items."""
         step = _load("run_command_error")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        assert len(events) == 1
-        assert events[0].data["item_type"] == "function_call_output"
+        events = map_step_to_events(step, conversation_id=_CID)
+        assert [event.data["item_type"] for event in events] == [
+            "function_call",
+            "function_call_output",
+        ]
 
-    def test_error_output_keyed_on_real_id(self) -> None:
-        """The error output pairs by the real agy id (matches the invocation)."""
+    def test_error_output_shares_the_invocation_id(self) -> None:
+        """The error output pairs with the invocation emitted beside it."""
         step = _load("run_command_error")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        item_data = cast(dict[str, Any], events[0].data["item_data"])
-        # Fixture carries toolCall.id="cbawg2v8" — the same id the planner
-        # invocation emits, so the pair correlates.
-        assert item_data["call_id"] == "cbawg2v8"
+        events = map_step_to_events(step, conversation_id=_CID)
+        assert {_item(event)["call_id"] for event in events} == {_call_id(6)}
 
     def test_error_output_text_is_nonempty_marker(self) -> None:
         """The output is a non-empty error marker mentioning the ERROR status."""
         step = _load("run_command_error")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        item_data = cast(dict[str, Any], events[0].data["item_data"])
-        output = item_data["output"]
+        events = map_step_to_events(step, conversation_id=_CID)
+        output = _item(events[1])["output"]
         assert isinstance(output, str) and output
         assert "ERROR" in output
 
     def test_error_step_index(self) -> None:
         """step_index matches fixture stepIndex=6."""
         step = _load("run_command_error")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert events[0].step_index == 6
 
 
@@ -476,45 +395,45 @@ class TestRunCommandError:
 class TestToolResultClosure:
     """Every tool call is closed, even with empty or unmapped results.
 
-    Regression coverage for dangling ``function_call``s: a successful command
-    whose output proto3-omits empty ``combinedOutput.full``, and a result step
-    of a type the mapper has no extractor for (e.g. VIEW_FILE / CODE_ACTION),
-    must each still emit a ``function_call_output`` keyed on the real
-    ``metadata.toolCall.id`` so the web UI's tool card resolves.
+    Regression coverage for half-rendered tool cards: a successful command whose
+    output proto3-omits empty ``combinedOutput.full``, and a step of a type the
+    mapper has no extractor for, must each still emit the full pair so the web
+    UI's tool card resolves.
     """
 
     def test_done_run_command_empty_output_still_closes(self) -> None:
-        """DONE run_command with no combinedOutput → one event, empty output."""
+        """DONE run_command with no combinedOutput → the pair, empty output."""
         step = _load("run_command_done")
         # Proto3 omits empty scalars: drop combinedOutput to simulate a
         # ``cd`` / ``mkdir`` / redirect that produced no captured output.
         step["runCommand"].pop("combinedOutput", None)
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        assert len(events) == 1
-        assert events[0].data["item_type"] == "function_call_output"
-        item_data = cast(dict[str, Any], events[0].data["item_data"])
-        assert item_data["call_id"] == "cbawg2v8"
-        assert item_data["output"] == ""
+        events = map_step_to_events(step, conversation_id=_CID)
+        assert [event.data["item_type"] for event in events] == [
+            "function_call",
+            "function_call_output",
+        ]
+        assert {_item(event)["call_id"] for event in events} == {_call_id(6)}
+        assert _item(events[1])["output"] == ""
 
-    def test_unmapped_tool_result_type_with_id_closes(self) -> None:
-        """A result type with no extractor but a toolCall.id still closes the call."""
+    def test_tool_step_with_no_typed_body_still_closes(self) -> None:
+        """A tool step whose body the mapper cannot read still emits the pair."""
         step = _load("run_command_done")
-        # Re-label as a result type the mapper has no extractor for; keep the
-        # real toolCall.id so the pair still correlates.
-        step["type"] = "CORTEX_STEP_TYPE_VIEW_FILE"
+        # Re-label as a type with no matching body, and drop the body itself:
+        # nothing is extractable, but the card must not be left half-open.
+        step["type"] = "CORTEX_STEP_TYPE_CODE_ACTION"
         step.pop("runCommand", None)
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        assert len(events) == 1
-        assert events[0].data["item_type"] == "function_call_output"
-        item_data = cast(dict[str, Any], events[0].data["item_data"])
-        assert item_data["call_id"] == "cbawg2v8"
-        assert item_data["output"] == ""
+        events = map_step_to_events(step, conversation_id=_CID)
+        assert [event.data["item_type"] for event in events] == [
+            "function_call",
+            "function_call_output",
+        ]
+        assert {_item(event)["call_id"] for event in events} == {_call_id(6)}
+        assert _item(events[1])["output"] == ""
 
-    def test_system_step_without_tool_id_is_skipped(self) -> None:
-        """A non-tool step with no toolCall.id is NOT treated as a tool result."""
-        step = _load("checkpoint")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        assert events == []
+    def test_system_step_is_skipped(self) -> None:
+        """A step agy never marked as a tool action is not a tool result."""
+        for name in ("checkpoint", "conversation_history"):
+            assert map_step_to_events(_load(name), conversation_id=_CID) == []
 
 
 # ---------------------------------------------------------------------------
@@ -523,28 +442,27 @@ class TestToolResultClosure:
 
 
 class TestListDirectoryDone:
-    """LIST_DIRECTORY DONE step → ``function_call_output``."""
+    """LIST_DIRECTORY DONE step → the invocation plus its listing."""
 
-    def test_returns_one_function_call_output(self) -> None:
-        """DONE list_directory → one function_call_output event."""
+    def test_returns_the_pair(self) -> None:
+        """DONE list_directory → its invocation and its output."""
         step = _load("list_directory_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        assert len(events) == 1
-        assert events[0].data["item_type"] == "function_call_output"
+        events = map_step_to_events(step, conversation_id=_CID)
+        assert [event.data["item_type"] for event in events] == [
+            "function_call",
+            "function_call_output",
+        ]
 
-    def test_call_id_is_real_agy_id(self) -> None:
-        """call_id is the real agy-assigned id from metadata.toolCall.id."""
+    def test_pair_shares_the_step_derived_call_id(self) -> None:
+        """Both items key on the step's own identity, not agy's toolCall.id."""
         step = _load("list_directory_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        item_data = events[0].data["item_data"]
-        assert isinstance(item_data, dict)
-        # Fixture carries toolCall.id="h510vxi0"
-        assert item_data["call_id"] == "h510vxi0"
+        events = map_step_to_events(step, conversation_id=_CID)
+        assert {_item(event)["call_id"] for event in events} == {_call_id(10)}
 
     def test_step_index(self) -> None:
         """step_index matches fixture stepIndex=10."""
         step = _load("list_directory_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert events[0].step_index == 10
 
 
@@ -564,7 +482,7 @@ class TestAskQuestionWaiting:
     def test_waiting_emits_no_event(self) -> None:
         """WAITING ask_question → empty list."""
         step = _load("ask_question_waiting")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert events == []
 
 
@@ -574,28 +492,27 @@ class TestAskQuestionWaiting:
 
 
 class TestAskQuestionDone:
-    """ASK_QUESTION DONE step → function_call_output."""
+    """ASK_QUESTION DONE step → the invocation plus the answer."""
 
-    def test_returns_function_call_output(self) -> None:
-        """DONE ask_question → one function_call_output event."""
+    def test_returns_the_pair(self) -> None:
+        """DONE ask_question → its invocation and its output."""
         step = _load("ask_question_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        assert len(events) == 1
-        assert events[0].data["item_type"] == "function_call_output"
+        events = map_step_to_events(step, conversation_id=_CID)
+        assert [event.data["item_type"] for event in events] == [
+            "function_call",
+            "function_call_output",
+        ]
 
-    def test_call_id_is_real_agy_id(self) -> None:
-        """call_id is the real agy-assigned id from metadata.toolCall.id."""
+    def test_pair_shares_the_step_derived_call_id(self) -> None:
+        """Both items key on the step's own identity, not agy's toolCall.id."""
         step = _load("ask_question_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
-        item_data = events[0].data["item_data"]
-        assert isinstance(item_data, dict)
-        # Fixture carries toolCall.id="jfizoalt", matching the planner invocation
-        assert item_data["call_id"] == "jfizoalt"
+        events = map_step_to_events(step, conversation_id=_CID)
+        assert {_item(event)["call_id"] for event in events} == {_call_id(12)}
 
     def test_step_index(self) -> None:
         """step_index matches fixture stepIndex=12."""
         step = _load("ask_question_done")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert events[0].step_index == 12
 
 
@@ -610,13 +527,13 @@ class TestSystemStepsSkipped:
     def test_checkpoint_returns_empty(self) -> None:
         """CHECKPOINT step → ``[]``."""
         step = _load("checkpoint")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert events == []
 
     def test_conversation_history_returns_empty(self) -> None:
         """CONVERSATION_HISTORY step → ``[]``."""
         step = _load("conversation_history")
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert events == []
 
 
@@ -643,7 +560,7 @@ class TestSlotZeroStepIndex:
         assert isinstance(traj_info, dict)
         traj_info.pop("stepIndex", None)
 
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert len(events) == 1
         assert events[0].step_index == 0
 
@@ -657,7 +574,7 @@ class TestSlotZeroStepIndex:
         assert isinstance(traj_info, dict)
         traj_info["stepIndex"] = "2"  # String form
 
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert len(events) == 1
         assert events[0].step_index == 2
 
@@ -691,7 +608,7 @@ class TestModifiedResponsePrecedence:
         planner["response"] = "Original text."
         planner["modifiedResponse"] = "Post-moderation text."
 
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert len(events) == 1
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
@@ -711,7 +628,7 @@ class TestModifiedResponsePrecedence:
         planner.pop("modifiedResponse", None)
         planner["response"] = "Fallback text."
 
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert len(events) == 1
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
@@ -730,7 +647,7 @@ class TestModifiedResponsePrecedence:
         planner["modifiedResponse"] = ""
         planner["response"] = "Non-empty response."
 
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
         assert len(events) == 1
         item_data = events[0].data["item_data"]
         assert isinstance(item_data, dict)
@@ -744,94 +661,36 @@ class TestModifiedResponsePrecedence:
 # ---------------------------------------------------------------------------
 
 
-class TestRealIdPairing:
+class TestPairingIsOrderIndependent:
     """
-    Verify that real agy tool-call ids are used for invocation↔output pairing.
+    Each tool step carries its own pair, so arrival order cannot mis-pair.
 
-    The RPC carries the same id on both the invocation
-    (``plannerResponse.toolCalls[].id``) and the result
-    (``metadata.toolCall.id``).  The mapper uses those ids directly —
-    no FIFO position, no allocator — so pairing is order-independent.
+    The mapper once correlated invocations to results positionally (FIFO): a
+    result arriving before an earlier tool finished took the wrong invocation's
+    id. Deriving both items from one step makes mis-pairing unrepresentable —
+    there is no cross-step state left to get out of step.
     """
 
-    def test_planner_then_run_command_done_share_real_id(self) -> None:
+    def test_results_delivered_out_of_order_keep_their_own_ids(self) -> None:
+        """Two tool steps mapped in reverse order still key on themselves."""
+        ask_question = map_step_to_events(_load("ask_question_done"), conversation_id=_CID)
+        run_command = map_step_to_events(_load("run_command_done"), conversation_id=_CID)
+
+        assert {_item(event)["call_id"] for event in ask_question} == {_call_id(12)}
+        assert {_item(event)["call_id"] for event in run_command} == {_call_id(6)}
+
+    def test_mapping_a_step_twice_is_stable(self) -> None:
         """
-        PLANNER_RESPONSE and RUN_COMMAND DONE → both carry the same real agy id.
+        Re-mapping the same step re-derives identical items.
 
-        The invocation call_id and the output call_id must equal the fixture's
-        agy-assigned id ("cbawg2v8"), not a positional allocator id.
+        The reader replays the on-connect snapshot and re-reads steps across a
+        stream→poll fallback; ids that drifted between passes would double the
+        tool card instead of deduping it.
         """
-        alloc = _allocator()
-        planner_step = _load("planner_response_tool_call_run_command")
-        planner_events = map_step_to_events(planner_step, conversation_id=_CID, allocator=alloc)
-        assert len(planner_events) == 1
-        planner_item_data = planner_events[0].data["item_data"]
-        assert isinstance(planner_item_data, dict)
-        invocation_call_id = planner_item_data["call_id"]
-        assert invocation_call_id == "cbawg2v8"
-
-        result_step = _load("run_command_done")
-        result_events = map_step_to_events(result_step, conversation_id=_CID, allocator=alloc)
-        assert len(result_events) == 1
-        result_item = result_events[0].data["item_data"]
-        assert isinstance(result_item, dict)
-        # Same real id — not a FIFO-synthesized orphan id
-        assert result_item["call_id"] == invocation_call_id
-
-    def test_two_results_out_of_order_pair_by_real_id(self) -> None:
-        """
-        REGRESSION: two tool-result steps with DIFFERENT real ids delivered
-        out of order each pair to the correct invocation by real id.
-
-        FIFO would mis-pair: if result-B arrives before result-A, FIFO gives
-        result-B the call_id of invocation-A and result-A gets invocation-B's
-        id.  Real-id pairing is immune to arrival order.
-
-        We simulate two consecutive PLANNER_RESPONSE steps each invoking a
-        different tool (run_command id="cbawg2v8", ask_question id="jfizoalt")
-        then deliver their result steps OUT OF ORDER (ask_question result first,
-        run_command result second).
-        """
-
-        alloc = _allocator()
-
-        # Emit PLANNER_RESPONSE for run_command (id="cbawg2v8")
-        rc_planner = _load("planner_response_tool_call_run_command")
-        rc_planner_events = map_step_to_events(rc_planner, conversation_id=_CID, allocator=alloc)
-        assert len(rc_planner_events) == 1
-        rc_item = rc_planner_events[0].data["item_data"]
-        assert isinstance(rc_item, dict)
-        assert rc_item["call_id"] == "cbawg2v8"
-
-        # Emit PLANNER_RESPONSE for ask_question (id="jfizoalt")
-        aq_planner = _load("planner_response_tool_call_ask_question")
-        aq_planner_events = map_step_to_events(aq_planner, conversation_id=_CID, allocator=alloc)
-        assert len(aq_planner_events) == 1
-        aq_item = aq_planner_events[0].data["item_data"]
-        assert isinstance(aq_item, dict)
-        assert aq_item["call_id"] == "jfizoalt"
-
-        # Now deliver ask_question DONE result FIRST (out of order vs run_command)
-        aq_done = _load("ask_question_done")
-        aq_result_events = map_step_to_events(aq_done, conversation_id=_CID, allocator=alloc)
-        assert len(aq_result_events) == 1
-        aq_result_item = aq_result_events[0].data["item_data"]
-        assert isinstance(aq_result_item, dict)
-        # Must pair with ask_question id, NOT run_command id
-        assert aq_result_item["call_id"] == "jfizoalt"
-
-        # Then deliver run_command DONE result
-        rc_done = _load("run_command_done")
-        rc_result_events = map_step_to_events(rc_done, conversation_id=_CID, allocator=alloc)
-        assert len(rc_result_events) == 1
-        rc_result_item = rc_result_events[0].data["item_data"]
-        assert isinstance(rc_result_item, dict)
-        # Must pair with run_command id, NOT ask_question id
-        assert rc_result_item["call_id"] == "cbawg2v8"
-
-        # Allocator must not have been used at all (all ids were real)
-        assert alloc.invocation_count == 0
-        assert alloc.orphan_output_count == 0
+        step = _load("run_command_done")
+        assert map_step_to_events(step, conversation_id=_CID) == map_step_to_events(
+            step, conversation_id=_CID
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1207,7 +1066,7 @@ class TestMapStepEmitsNoReasoning:
         """
         step = _load("planner_response_text")
         cast(dict[str, Any], step["plannerResponse"])["thinking"] = "internal chain of thought"
-        events = map_step_to_events(step, conversation_id=_CID, allocator=_allocator())
+        events = map_step_to_events(step, conversation_id=_CID)
 
         for event in events:
             assert event.event_type != "external_output_reasoning_delta"
@@ -1257,3 +1116,150 @@ class TestExecutionDiscriminator:
         step = _load("user_input")
         # Confirms the live wire shape this fix relies on (per-turn executionId).
         assert _execution_discriminator(step) == "1df76a5f-0318-4c71-b31d-7e3b51a3d981"
+
+
+# ---------------------------------------------------------------------------
+# Stream projection: agy omits toolCall / toolCalls from streamed steps
+# ---------------------------------------------------------------------------
+
+
+class TestStreamProjection:
+    """
+    Map tool steps as delivered by ``StreamAgentStateUpdates``.
+
+    agy serves the same step at two fidelities. ``GetCascadeTrajectorySteps``
+    (poll) carries ``metadata.toolCall`` and ``plannerResponse.toolCalls``;
+    the live stream strips both — they embed ``thinkingSignature`` blobs, and
+    the typed body (``runCommand`` / ``viewFile`` / …) already describes the
+    call. Every fixture below is a verbatim live stream frame.
+
+    The mapper therefore derives the whole pair from the RESULT step: its
+    ``sourceTrajectoryStepInfo`` is the call id, its typed body the arguments
+    and the output. The planner's ``toolCalls`` is never the source, so both
+    RPC shapes produce identical items.
+    """
+
+    def _pair(self, name: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Map a stream fixture and return its (function_call, output) item data."""
+        return self._pair_step(_load(name), label=name)
+
+    def _pair_step(
+        self, step: dict[str, Any], *, label: str = "step"
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Map one step dict and return its (function_call, output) item data."""
+        events = map_step_to_events(step, conversation_id=_CID)
+        kinds = [event.data.get("item_type") for event in events]
+        assert kinds == ["function_call", "function_call_output"], (
+            f"{label} mapped to {kinds}, expected an invocation followed by its output"
+        )
+        call = events[0].data["item_data"]
+        output = events[1].data["item_data"]
+        assert isinstance(call, dict) and isinstance(output, dict)
+        return call, output
+
+    def test_run_command_emits_a_paired_call_and_output(self) -> None:
+        """A streamed RUN_COMMAND yields an invocation AND its output, paired."""
+        call, output = self._pair("stream_run_command_done")
+        assert call["name"] == "run_command"
+        assert call["call_id"] == output["call_id"]
+        assert "git status" in str(call["arguments"])
+        assert "On branch main" in str(output["output"])
+
+    def test_view_file_is_mirrored_rather_than_dropped(self) -> None:
+        """
+        REGRESSION: a streamed VIEW_FILE reached the web UI as nothing at all.
+
+        VIEW_FILE is not one of the mapper's known result types, and the stream
+        strips the ``metadata.toolCall.id`` that would otherwise classify it —
+        so the step was read as system noise and silently dropped. Six of them
+        vanished from one live conversation.
+        """
+        call, output = self._pair("stream_view_file_done")
+        assert call["name"] == "view_file"
+        assert call["call_id"] == output["call_id"]
+
+    def test_a_suffixed_sibling_does_not_shadow_the_exact_argument(self) -> None:
+        """
+        An argument whose name matches a body key EXACTLY wins over a prefix hit.
+
+        Streamed steps carry no ``argumentsJson``, so arguments are recovered by
+        matching ``metadata.argumentsOrder`` against the typed body — by prefix,
+        because agy suffixes some of them (``AbsolutePath`` → ``absolutePathUri``).
+        A prefix scan alone returns whichever sibling comes first in the body, so
+        a body carrying both spellings could surface the wrong value.
+        """
+        step = copy.deepcopy(_load("stream_view_file_done"))
+        step["metadata"]["argumentsOrder"] = ["AbsolutePath"]
+        # The suffixed sibling is FIRST, so a prefix-only scan reaches it first.
+        step["viewFile"] = {
+            "absolutePathUriPreview": "file:///wrong.json",
+            "absolutePath": "file:///right.json",
+        }
+
+        call, _ = self._pair_step(step)
+        assert "right.json" in str(call["arguments"]), (
+            f"the exact argument must win over a suffixed sibling; got {call['arguments']}"
+        )
+        assert "wrong.json" not in str(call["arguments"])
+
+    def test_generic_step_uses_the_agy_tool_name(self) -> None:
+        """GENERIC steps keep ``toolCall`` in the stream; prefer that real name."""
+        call, _ = self._pair("stream_generic_done")
+        assert call["name"] == "manage_subagents"
+
+    def test_list_directory_uses_the_agy_tool_name(self) -> None:
+        """agy calls this tool ``list_dir``, not the type-derived ``list_directory``."""
+        call, _ = self._pair("stream_list_directory_done")
+        assert call["name"] == "list_dir"
+
+    def test_call_id_is_identical_across_both_rpc_shapes(self) -> None:
+        """
+        The same step mapped from the stream and from the poll snapshot pairs
+        under ONE call id.
+
+        Both fixtures are trajectory ``efb134b2…`` step 6. A reader that falls
+        back from the stream to the poll mid-conversation must not re-key the
+        pair, or the tool card splits in two.
+        """
+        stream_call, stream_output = self._pair("stream_run_command_done")
+        snapshot_events = map_step_to_events(_load("run_command_done"), conversation_id=_CID)
+        snapshot_ids = {
+            item["call_id"]
+            for event in snapshot_events
+            if isinstance(item := event.data["item_data"], dict) and "call_id" in item
+        }
+        assert snapshot_ids == {stream_call["call_id"]} == {stream_output["call_id"]}
+
+    def test_planner_never_emits_a_function_call(self) -> None:
+        """
+        The result step is the SOLE source of the pair — on both shapes.
+
+        The poll snapshot's planner still carries ``toolCalls``; emitting from
+        there too would post a second, differently-keyed invocation for every
+        tool whenever the reader falls back to polling.
+        """
+        for name in ("stream_planner_tool_call", "planner_response_tool_call_run_command"):
+            events = map_step_to_events(_load(name), conversation_id=_CID)
+            kinds = [event.data.get("item_type") for event in events]
+            assert "function_call" not in kinds, f"{name} emitted an invocation: {kinds}"
+
+    def test_planner_text_still_commits(self) -> None:
+        """Stripping toolCalls must not disturb the committed assistant message."""
+        events = map_step_to_events(_load("stream_planner_text_done"), conversation_id=_CID)
+        assert [event.data.get("item_type") for event in events] == ["message"]
+
+    def test_no_fixture_produces_an_orphan_call_id(self) -> None:
+        """
+        REGRESSION: streamed results were keyed to invented ``_orphan_N`` ids.
+
+        With no ``toolCall.id`` on the step and no pending invocation to pair
+        with (the planner never registered one), every streamed result minted a
+        standalone id. 611 such outputs were recorded across 10 live
+        conversations, against 0 invocations.
+        """
+        for path in sorted(_FIXTURES.glob("*.json")):
+            events = map_step_to_events(_load(path.stem), conversation_id=_CID)
+            for event in events:
+                item = event.data.get("item_data")
+                call_id = item.get("call_id", "") if isinstance(item, dict) else ""
+                assert "orphan" not in str(call_id), f"{path.stem} minted {call_id}"

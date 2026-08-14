@@ -12,6 +12,7 @@ Databricks credential mint is stubbed with the real
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ import pytest
 from cachetools import TTLCache
 
 import omnigent.model_catalog as model_catalog
+from omnigent.codex_model_vocabulary import codex_spawn_model
 from omnigent.model_catalog import (
     ModelEntry,
     ModelListing,
@@ -32,7 +34,7 @@ from omnigent.model_catalog import (
     resolve_model_provider,
     spec_harness,
 )
-from omnigent.model_fallbacks import static_model_fallback
+from omnigent.model_fallbacks import CODEX_DEFAULT_MODEL, static_model_fallback
 from omnigent.model_metadata import (
     ModelCapability,
     ModelCostTier,
@@ -953,10 +955,10 @@ def test_cli_config_listing_is_static_and_unverified(
     assert listing.source == "static"
     assert listing.verified is False
     assert [m.id for m in listing.models] == [
-        "gpt-5-6-sol",
-        "gpt-5-6-luna",
-        "gpt-5-6-terra",
-        "gpt-5-5",
+        "gpt-5.6-sol",
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.5",
     ]
     # The note must say the CLI resolves the credential itself — this row
     # is a working worker, not a credentials preflight failure.
@@ -986,6 +988,39 @@ def test_static_model_fallbacks_document_ownership(
     assert fallback.owner
     assert fallback.provenance
     assert fallback.discovery_gap
+
+
+@pytest.mark.parametrize("provider_kind", ["subscription", "cli-config"])
+def test_codex_catalog_ids_are_spelled_the_way_codex_accepts(provider_kind: str) -> None:
+    """Codex's catalogs carry its dotted slugs, not the hyphenated serving ids.
+
+    Codex's own backend 400s on ``gpt-5-6-sol``; only ``gpt-5.6-sol`` reaches a
+    ChatGPT-account login. The two spellings still compare equal, so a routed
+    arm keeps matching either way.
+
+    :param provider_kind: The registered provider kind under test.
+    """
+    fallback = static_model_fallback(provider_kind, "codex")
+    assert fallback is not None
+    for model_id in fallback.model_ids:
+        assert not model_id.startswith("databricks-"), model_id
+        assert codex_spawn_model(model_id) == model_id, (
+            f"{model_id!r} is not codex's own spelling for itself"
+        )
+
+
+def test_codex_default_model_names_a_concrete_variant() -> None:
+    """The codex launch default is a tiered model, not a bare family alias.
+
+    The bundled OpenAI catalog's newest row is ``gpt-5.6``, which codex rejects
+    as a family name; a default must name a variant its backend serves.
+    """
+    fallback = static_model_fallback("subscription", "codex")
+    assert fallback is not None
+    assert CODEX_DEFAULT_MODEL in fallback.model_ids
+    assert codex_spawn_model(CODEX_DEFAULT_MODEL) == CODEX_DEFAULT_MODEL
+    # A bare family alias has no tier segment after the dotted version.
+    assert re.fullmatch(r"gpt-\d+\.\d+", CODEX_DEFAULT_MODEL) is None
 
 
 def test_cursor_listing_uses_live_cli_base_models(

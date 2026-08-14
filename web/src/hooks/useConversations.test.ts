@@ -28,6 +28,7 @@ import {
   useStopSession,
   useTogglePinnedConversation,
   fetchPinnedConversations,
+  unmarkSessionsDeleting,
   PINNED_CONVERSATIONS_KEY,
   type Conversation,
   type PinnedConversationsResult,
@@ -56,6 +57,10 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  // Optimistic delete hides ids from every list fetch until the delete
+  // settles, in module-level state that would otherwise leak into the next
+  // test (which reuses the same ids against a fresh cache).
+  unmarkSessionsDeleting();
 });
 
 describe("renameConversation", () => {
@@ -221,6 +226,64 @@ describe("useConversations project filter", () => {
 
     const url = fetchMock.mock.calls[0][0] as string;
     expect(url).toContain("project=__all__");
+  });
+});
+
+describe("useConversations search timeout", () => {
+  function renderSearch(searchQuery: string) {
+    fetchMock.mockResolvedValue(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useConversations(searchQuery, true), { wrapper });
+    return queryClient;
+  }
+
+  it("bounds a search fetch with an AbortSignal", async () => {
+    renderSearch("linear");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    // A search request can hang if its server-side index is missing, so it
+    // carries a timeout signal; the URL still requests the search.
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain("search_query=linear");
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("does not bound an ordinary (non-search) list fetch", async () => {
+    renderSearch("");
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    // Plain pagination is indexed/fast; adding a deadline could abort a
+    // legitimately larger page, so no signal is attached.
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).not.toContain("search_query=");
+    expect(init.signal).toBeUndefined();
+  });
+
+  it("does not retry a client-side search timeout, but retries other errors", () => {
+    const queryClient = renderSearch("linear");
+    const query = queryClient.getQueryCache().find({
+      queryKey: ["conversations", "linear", true],
+    });
+    const retry = (query?.options as { retry?: unknown } | undefined)?.retry as (
+      failureCount: number,
+      error: unknown,
+    ) => boolean;
+    expect(typeof retry).toBe("function");
+
+    // A fired AbortSignal.timeout rejects with a TimeoutError DOMException —
+    // terminal, so retrying would only re-arm the same slow request.
+    const timeoutError = new DOMException("timeout", "TimeoutError");
+    expect(retry(0, timeoutError)).toBe(false);
+
+    // A genuine server/network error still retries (up to the default cap).
+    expect(retry(0, new Error("500 Internal Server Error"))).toBe(true);
+    expect(retry(3, new Error("500 Internal Server Error"))).toBe(false);
   });
 });
 
@@ -410,10 +473,19 @@ function infinitePage(rows: Conversation[]): ConversationsInfiniteData {
 }
 
 describe("useStopAndDeleteConversation cache eviction", () => {
-  function seedAndDelete() {
-    // Call 1: stop_session → {queued:false}. Call 2: DELETE → {deleted:true}.
+  /**
+   * Seed the caches a delete touches and render the hook.
+   *
+   * @param deleteResult - What the DELETE resolves to. Pass a pending
+   *   promise to hold the mutation in flight, or a non-ok response to
+   *   exercise the rollback.
+   */
+  function seedAndDelete(
+    deleteResult: Response | Promise<Response> = mockResponse({ deleted: true }),
+  ) {
+    // Call 1: stop_session → {queued:false}. Call 2: the DELETE.
     fetchMock.mockResolvedValueOnce(mockResponse({ queued: false }));
-    fetchMock.mockResolvedValueOnce(mockResponse({ deleted: true }));
+    fetchMock.mockImplementationOnce(() => Promise.resolve(deleteResult));
     const queryClient = new QueryClient({
       defaultOptions: { mutations: { retry: false } },
     });
@@ -517,6 +589,106 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     expect(pinned!.conversations.map((c) => c.id)).toEqual(["conv_pinned_other"]);
     // The patch preserves the query's filterHonored flag.
     expect(pinned!.filterHonored).toBe(true);
+  });
+
+  it("drops the row before the DELETE resolves (optimistic)", async () => {
+    // Hold the DELETE open so the assertions land while it's still in
+    // flight. This is the whole point of the optimistic path: the sidebar
+    // repaints now, not after seconds of server-side teardown (stop,
+    // runner resources, worktree, managed sandbox).
+    let settleDelete = (_res: Response) => {};
+    const pendingDelete = new Promise<Response>((resolve) => {
+      settleDelete = resolve;
+    });
+    const { queryClient, rendered } = seedAndDelete(pendingDelete);
+
+    rendered.result.current.mutate({ id: "conv_x" });
+    await waitFor(() => {
+      const data = queryClient.getQueryData<ConversationsInfiniteData>([
+        "conversations",
+        "",
+        false,
+      ]);
+      expect(data!.pages[0].data.map((c) => c.id)).toEqual(["conv_other"]);
+    });
+    // Still un-settled: the row left the list on the strength of the
+    // request alone.
+    expect(rendered.result.current.isPending).toBe(true);
+
+    settleDelete(mockResponse({ deleted: true }));
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+  });
+
+  it("keeps the row out of a list refetch that lands mid-delete", async () => {
+    let settleDelete = (_res: Response) => {};
+    const pendingDelete = new Promise<Response>((resolve) => {
+      settleDelete = resolve;
+    });
+    const { queryClient, rendered } = seedAndDelete(pendingDelete);
+
+    rendered.result.current.mutate({ id: "conv_x" });
+    await waitFor(() => expect(rendered.result.current.isPending).toBe(true));
+
+    // The server still lists the session — the DELETE hasn't landed, and
+    // the search-indexed deployment lags further still. Any list fetch in
+    // this window (the reconcile poll, a WS-triggered refetch, a search)
+    // must not repaint the row the user just deleted.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        object: "list",
+        data: [
+          { id: "conv_x", object: "conversation", title: "Doomed", created_at: 0, updated_at: 5 },
+          { id: "conv_other", object: "conversation", title: "Kept", created_at: 0, updated_at: 4 },
+        ],
+        first_id: "conv_x",
+        last_id: "conv_other",
+        has_more: false,
+      }),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    // An unseeded query variant, so this really hits the network rather
+    // than reading the already-spliced cache.
+    const list = renderHook(() => useConversations("doomed"), { wrapper });
+    await waitFor(() => expect(list.result.current.data).toBeDefined());
+    expect(fetchMock.mock.calls.at(-1)![0]).toContain("search_query=doomed");
+    expect(list.result.current.data!.pages[0].data.map((c) => c.id)).toEqual(["conv_other"]);
+
+    settleDelete(mockResponse({ deleted: true }));
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+  });
+
+  it("puts the row back when the delete fails", async () => {
+    const { queryClient, rendered } = seedAndDelete(mockResponse({}, { ok: false, status: 500 }));
+    // The restored row carries no failure state of its own (it unmounted
+    // when it was spliced out), so the toast is the only signal the user
+    // gets that the delete didn't land.
+    const toasts: string[] = [];
+    window.addEventListener("omnigent:toast", (e) => {
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    });
+
+    rendered.result.current.mutate({ id: "conv_x" });
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    // Named, so a user who deleted several sessions knows which came back.
+    expect(toasts).toEqual(["Couldn't delete Old name — it's back in the sidebar."]);
+
+    // The session still exists, so every list it was optimistically
+    // removed from must show it again — including the project folder and
+    // the sibling Pinned cache.
+    const base = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    expect(base!.pages[0].data.map((c) => c.id)).toEqual(["conv_x", "conv_other"]);
+    const folder = queryClient.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "Sprint 42",
+    ]);
+    expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_x", "conv_sibling"]);
+    const pinned = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
+    expect(pinned!.conversations.map((c) => c.id)).toEqual(["conv_x", "conv_pinned_other"]);
+    // The per-session caches survive a failed delete — the session is still
+    // there to open.
+    expect(queryClient.getQueryData(["session", "conv_x"])).toBeDefined();
   });
 
   it("does not refetch the conversations list, but does refresh the project list", async () => {
