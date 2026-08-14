@@ -20,7 +20,6 @@ Tool categories:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import dataclasses
 import json
 import logging
@@ -1996,7 +1995,6 @@ async def _execute_subagent_tool(
                     child_session_id,
                     exc_info=True,
                 )
-
 
     # Publish session.created on the parent's SSE stream so the
     # REPL debug panel and any client subscribers discover the
