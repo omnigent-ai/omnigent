@@ -35,6 +35,7 @@ import {
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
 import { showToast } from "@/components/ui/toast";
+import { revokePermission } from "@/lib/permissionsApi";
 import { conversationDisplayLabel, setLegacyPinnedConversationId } from "@/shell/sidebarNav";
 import { stopSession } from "@/lib/sessionsApi";
 import { setSessionHost } from "@/lib/sessionHost";
@@ -47,7 +48,7 @@ import {
   renameProject as apiRenameProject,
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
-import { useChatStore } from "@/store/chatStore";
+import { releaseConversation, useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
@@ -494,6 +495,8 @@ export async function deleteConversation(id: string, deleteBranch = false): Prom
   // Drop any client-side queued messages for the now-deleted session; bound to
   // a dead conversation, they could never flush.
   useChatStore.getState().clearQueuedMessages(id);
+  // A deleted conversation must stop pumping and let go of its stream.
+  releaseConversation(id);
 }
 
 /**
@@ -845,6 +848,49 @@ export function useStopAndDeleteConversation() {
 }
 
 /**
+ * Leave a session shared with you — revoking your OWN grant via
+ * `DELETE /v1/sessions/{id}/permissions/{viewerId}` — so it drops out of the
+ * sidebar. The server allows a self-revoke with only read access; `viewerId`
+ * must be the caller's own id (the sidebar reads it from the resolved identity
+ * it already uses to decide the row isn't owned).
+ *
+ * The row is spliced out of the cached list pages in place rather than
+ * invalidated, for the same reason delete does it (see
+ * `useStopAndDeleteConversation`): `GET /v1/sessions` may be served from a
+ * search index that catches up asynchronously, so an immediate refetch can
+ * resurrect the row the user just dismissed. Nothing is deleted server-side —
+ * only the caller's grant — so the owner re-sharing brings it back.
+ *
+ * Callers are responsible for navigating away from `/c/{id}` when leaving the
+ * session currently being viewed; it 404s for them afterwards.
+ */
+export function useLeaveSession() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, viewerId }: { id: string; viewerId: string }) =>
+      revokePermission(id, viewerId),
+    onSuccess: (_data, { id }) => {
+      const ids = new Set([id]);
+      for (const queryKey of [["conversations"], ["project-sessions"]]) {
+        for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+          queryKey,
+        })) {
+          const { data: next, removed } = removeIdsFromPages(data, ids);
+          if (removed) queryClient.setQueryData(key, next);
+        }
+      }
+      // Drop the per-session caches too, so the row can't re-enter the sidebar
+      // from a still-fresh backfill entry once it leaves the paginated pages.
+      queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
+      queryClient.removeQueries({ queryKey: ["session", id] });
+      queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+        old ? { ...old, conversations: old.conversations.filter((c) => !ids.has(c.id)) } : old,
+      );
+    },
+  });
+}
+
+/**
  * Stop a live session via `POST /v1/sessions/{id}/events` with a
  * `stop_session` event. Unlike delete, the conversation row and its
  * transcript are kept — only the running process is terminated (for
@@ -915,11 +961,22 @@ export function useBulkArchiveConversations() {
  * the cached lists in `onMutate` so the sidebar repaints immediately,
  * and only the ones whose delete failed are restored. Returns the
  * succeeded / failed session IDs.
+ *
+ * `deleteBranchIds` opts individual worktree sessions into git cleanup:
+ * a session whose id is in the set is deleted with `?delete_branch=true`
+ * (the server removes its worktree and branch). Ids absent from the set
+ * — or all ids when it's omitted — delete without touching any branch.
  */
 export function useBulkDeleteConversations() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (ids: string[]) => {
+    mutationFn: async ({
+      ids,
+      deleteBranchIds,
+    }: {
+      ids: string[];
+      deleteBranchIds?: ReadonlySet<string>;
+    }) => {
       const results = await Promise.allSettled(
         ids.map(async (id) => {
           try {
@@ -927,7 +984,7 @@ export function useBulkDeleteConversations() {
           } catch {
             // Best-effort stop
           }
-          await deleteConversation(id);
+          await deleteConversation(id, deleteBranchIds?.has(id) ?? false);
         }),
       );
       const succeeded: string[] = [];
@@ -945,11 +1002,11 @@ export function useBulkDeleteConversations() {
       }
       return { succeeded, failed };
     },
-    onMutate: (ids) => paintConversationsDeleted(queryClient, ids),
-    onSuccess: (_data, ids) => {
+    onMutate: ({ ids }) => paintConversationsDeleted(queryClient, ids),
+    onSuccess: (_data, { ids }) => {
       finalizeDeletedConversations(queryClient, ids);
     },
-    onError: (error, ids, snapshot) => {
+    onError: (error, { ids }, snapshot) => {
       // Partial failure: the sessions that did delete stay gone; the rest
       // come back. A non-bulk error (nothing reported) restores everything.
       const bulk = error instanceof BulkConversationMutationError ? error : null;

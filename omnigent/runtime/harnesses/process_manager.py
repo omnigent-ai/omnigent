@@ -31,6 +31,7 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -600,6 +601,25 @@ class HarnessProcessManager:
         # first failure so we fall back to a direct exec for the process's life.
         self._harness_zygote = HarnessZygoteClient.from_env()
         self._harness_zygote_disabled = False
+        # Hook called when a mid-response entry is respawned (model/harness switch).
+        # Only fires when the replaced process had an in-flight response; invoked
+        # outside the spawn lock so the callback can re-enter get_client without deadlock.
+        self._on_harness_respawn: Callable[[str, str, str], Awaitable[None]] | None = None
+
+    def set_respawn_hook(self, hook: Callable[[str, str, str], Awaitable[None]] | None) -> None:
+        """Register the runner-side respawn→resync hook.
+
+        Called once by ``create_runner_app`` to wire
+        ``_resync_turn_state``. The hook fires from :meth:`get_client`
+        whenever an existing entry that HAD AN IN-FLIGHT RESPONSE is
+        respawned for a model or harness switch — see
+        :attr:`_on_harness_respawn`.
+
+        :param hook: Async ``(conversation_id, reason, replaced_response_id)
+            -> None`` callback, or ``None`` to clear (the default when no
+            runner is wired).
+        """
+        self._on_harness_respawn = hook
 
     @property
     def instance_dir(self) -> Path:
@@ -719,6 +739,15 @@ class HarnessProcessManager:
         # bumped generation and is allowed to respawn.
         async with self._registry_lock:
             start_generation = self._release_generations.get(conversation_id, 0)
+        # Non-None only for a model/harness-switch respawn of an in-flight entry
+        # (not crash respawns — those are already covered by the orphan watchdog).
+        respawn_reason: str | None = None
+        # The replaced entry's in-flight response id, captured at the respawn
+        # decision (before ``_close_entry``). ``None`` means the replaced process
+        # was NOT mid-response — a between-turns switch that strands no turn, so
+        # the hook must not fire. Carried into the hook so the runner can
+        # identity-match the turn it is about to cancel.
+        replaced_response_id: str | None = None
         spawn_lock = await self._get_spawn_lock(conversation_id)
         async with spawn_lock:
             # ``release`` / ``shutdown`` take this same lock, so a teardown
@@ -767,8 +796,10 @@ class HarnessProcessManager:
                     entry.harness,
                     harness,
                 )
+                replaced_response_id = self._in_flight_response_ids.get(conversation_id)
                 await self._close_entry(entry)
                 entry = None
+                respawn_reason = "harness_respawn_agent_switch"
             if entry is not None:
                 # The model is baked into the subprocess env at spawn time;
                 # a later turn requesting a different model (e.g. after the
@@ -785,8 +816,10 @@ class HarnessProcessManager:
                         entry.model,
                         requested_model,
                     )
+                    replaced_response_id = self._in_flight_response_ids.get(conversation_id)
                     await self._close_entry(entry)
                     entry = None
+                    respawn_reason = "harness_respawn_model_switch"
             if entry is None:
                 if harness == "any":
                     raise NoLiveHarnessError(
@@ -819,7 +852,40 @@ class HarnessProcessManager:
             # ``time.monotonic()`` is a single process-wide source
             # both code paths agree on.
             entry.last_used_at = time.monotonic()
-            return entry.client
+            client = entry.client
+        # Signal the runner OUTSIDE the spawn lock (the hook re-enters
+        # ``get_client(conv, "any")`` to forward the interrupt). Fire ONLY when
+        # the replaced process was actually mid-response — a respawn with no
+        # in-flight response strands no turn (the common between-turns ``/model``
+        # case, and the new-turn's-own-setup case where the caller has not marked
+        # in-flight yet), so firing there would cancel the very turn being
+        # started. The replaced response id is carried so the runner can
+        # identity-match the turn it cancels.
+        if (
+            respawn_reason is not None
+            and replaced_response_id is not None
+            and self._on_harness_respawn is not None
+        ):
+            # Best-effort: the respawn→resync signal is a recovery hint, not part
+            # of the client-handoff contract. A hook that raises (e.g. the
+            # runner's ``_resync_turn_state`` adapter throwing) must NOT fail the
+            # acquisition — a turn would then lose its client purely because a
+            # recovery signal errored. Catch broadly, log, and still return the
+            # freshly-spawned client. Logged (not swallowed silently) so the
+            # backstop watchdog path stays observable.
+            try:
+                await self._on_harness_respawn(
+                    conversation_id, respawn_reason, replaced_response_id
+                )
+            except Exception:  # best-effort recovery signal — never fail handoff
+                _logger.error(
+                    "respawn resync hook failed for conversation %s (reason %s); "
+                    "harness acquisition proceeds, orphan backstop remains",
+                    conversation_id,
+                    respawn_reason,
+                    exc_info=True,
+                )
+        return client
 
     async def forward_cancel(
         self,

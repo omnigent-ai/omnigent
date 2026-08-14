@@ -516,9 +516,9 @@ async def forward_kiro_session_to_omnigent(
     mirrored_external_session_id: str | None = None
     last_posted_cost: float | None = None
     last_posted_model: str | None = None
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
-    ) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
                 if state.session_id is None or jsonl_path is None or not jsonl_path.exists():

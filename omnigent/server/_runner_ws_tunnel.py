@@ -39,6 +39,7 @@ import logging
 import re
 import secrets
 from collections.abc import Callable
+from dataclasses import dataclass
 from types import TracebackType
 from typing import TYPE_CHECKING
 
@@ -85,6 +86,57 @@ class WrongReplicaWSError(RuntimeError):
 # construction, so the captured value feeds
 # ``router.client_for_existing_conversation()``.
 _RUNNER_PATH_RE = re.compile(r"^/v1/sessions/(?P<conv>[^/?]+)/resources/terminals/[^/?]+/attach")
+
+
+@dataclass(frozen=True)
+class DirectAttachEndpoint:
+    """A runner's advertised loopback terminal-attach listener.
+
+    :param port: Loopback TCP port on the runner's machine,
+        e.g. ``52341``.
+    :param token: Per-runner-process bearer token the listener
+        requires on every handshake.
+    """
+
+    port: int
+    token: str
+
+
+def make_direct_attach_resolver(
+    router: RunnerRouter,
+    registry: TunnelRegistry,
+) -> Callable[[str], DirectAttachEndpoint | None]:
+    """Build a resolver from conversation id to its runner's direct-attach advert.
+
+    Mirrors :func:`make_tunnel_ws_factory`'s routing (pinned runner →
+    live tunnel session) but only reads the hello advert; installed via
+    :func:`omnigent.runtime.set_runner_direct_attach_resolver` so the
+    terminals API can hand same-machine browsers a relay-free attach URL.
+
+    :param router: Routes conversation ids to pinned runner ids.
+    :param registry: Tunnel registry that owns the live runner sessions.
+    :returns: Callable returning the advert, or ``None`` when the
+        conversation has no pinned runner, the runner is offline, or it
+        advertised no listener.
+    """
+
+    def resolver(conversation_id: str) -> DirectAttachEndpoint | None:
+        try:
+            routed = router.client_for_existing_conversation(conversation_id)
+        except OmnigentError:
+            return None
+        if routed is None:
+            return None
+        session = registry.get(routed.runner_id)
+        if session is None:
+            return None
+        port = session.hello.direct_attach_port
+        token = session.hello.direct_attach_token
+        if port is None or not token:
+            return None
+        return DirectAttachEndpoint(port=port, token=token)
+
+    return resolver
 
 
 def make_tunnel_ws_factory(

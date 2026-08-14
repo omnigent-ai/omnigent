@@ -113,7 +113,7 @@ def _pick_conversation_for_resume(
     from omnigent.repl._resume_picker import pick_conversation_cross_agent_from_sdk
 
     base_url = server.rstrip("/")
-    headers = _remote_headers(server_url=base_url)
+    headers = _remote_headers(server_url=base_url, host_id=None)
     # Resume is owner-only, so the picker lists only the caller's own
     # sessions — never ones merely shared with them. Resolve who the
     # caller is here so the picker can drop shared rows; best-effort, so
@@ -339,7 +339,7 @@ def _read_wrapper_label_remote(
     from omnigent.chat import _remote_headers
 
     base_url = server.rstrip("/")
-    headers = _remote_headers(server_url=base_url)
+    headers = _remote_headers(server_url=base_url, host_id=None)
     try:
         resp = httpx.get(
             f"{base_url}/v1/sessions/{conv_id}",

@@ -2529,8 +2529,8 @@ def _parse_inline_mcp_servers(
         in config.yaml. ``None`` or a non-dict value returns an empty
         list without raising.
     :param expand_env: Whether to expand ``${VAR}`` references in
-        ``headers`` and ``env`` values. ``True`` (default) for
-        deploy/runtime; ``False`` for scaffolding/validation.
+        ``url``, ``headers`` and ``env`` values. ``True`` (default)
+        for deploy/runtime; ``False`` for scaffolding/validation.
     :returns: A list of :class:`MCPServerConfig` objects, one per
         inline MCP entry, in YAML key order.
     """
@@ -2564,6 +2564,8 @@ def _parse_inline_mcp_servers(
                 code=ErrorCode.INVALID_INPUT,
             )
         headers = expand_env_vars(raw_headers) if expand_env and raw_headers else raw_headers
+        if url is not None:
+            url = expand_env_vars({"url": str(url)})["url"] if expand_env else str(url)
         raw_env = val.get("env", {})
         if raw_env and not isinstance(raw_env, dict):
             raise OmnigentError(
@@ -2603,7 +2605,7 @@ def _parse_inline_mcp_servers(
                 description=str(raw_desc)
                 if (raw_desc := val.get("description")) is not None
                 else None,
-                url=str(url) if url is not None else None,
+                url=url if url is not None else None,
                 command=str(command) if command is not None else None,
                 args=args,
                 headers=headers,
@@ -2695,7 +2697,7 @@ def _parse_http_mcp_server(
         ``{"name": "github", "transport": "http", "url": "..."}``.
     :param yaml_file: Path to the source file — used in error messages.
     :param expand_env: Whether to expand ``${VAR}`` references in
-        ``headers``.
+        ``url`` and ``headers``.
     :returns: A fully populated :class:`MCPServerConfig` with
         ``transport == "http"``.
     :raises OmnigentError: If ``url`` is missing or a stdio-only
@@ -2714,6 +2716,9 @@ def _parse_http_mcp_server(
             f"MCP server {name!r} missing required field 'url': {yaml_file}",
             code=ErrorCode.INVALID_INPUT,
         )
+    url_str = str(url)
+    if expand_env:
+        url_str = expand_env_vars({"url": url_str})["url"]
     raw_headers = raw.get("headers", {})
     if not isinstance(raw_headers, dict):
         raise OmnigentError(
@@ -2725,7 +2730,7 @@ def _parse_http_mcp_server(
     return MCPServerConfig(
         name=str(name),
         transport="http",
-        url=str(url),
+        url=url_str,
         headers=expand_env_vars(headers) if expand_env else headers,
         description=str(raw_description) if raw_description is not None else None,
         timeout=(

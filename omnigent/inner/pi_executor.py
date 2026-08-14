@@ -55,9 +55,16 @@ from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.json_types import JsonValue
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.model_metadata import ModelMetadata, ModelWireAPI
+from omnigent.model_metadata import ModelWireAPI
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
-from omnigent.pi_model_compatibility import SYSTEM_AI_RESPONSES_KEYWORDS, unsupported_in_pi
+from omnigent.pi_model_compatibility import (
+    SYSTEM_AI_RESPONSES_KEYWORDS,
+    databricks_model_aliases,
+    enrich_databricks_model_catalog,
+    pi_model_is_reasoning,
+    pi_model_json_entry,
+    unsupported_in_pi,
+)
 from omnigent.pi_native_credentials import (
     _databricks_workspace_url_for_gateway,
     _is_databricks_ai_gateway_url,
@@ -750,9 +757,12 @@ def _build_models_json(
         wire_apis = wire_catalog.get(model_id.lower(), catalog_model.metadata.wire_apis)
         provider_name = _pi_provider_for_model(model_id, wire_apis)
         registered_model = catalog_model
-        if model is not None and model.lower() in _databricks_model_aliases(model_id):
+        if model is not None and model.lower() in databricks_model_aliases(model_id):
             registered_model = replace(catalog_model, id=model)
-        provider_models[provider_name].append(_pi_model_json_entry(registered_model))
+        # ``JsonObject`` is the open bag this builder assembles; a TypedDict is
+        # not assignable to it (dict value types are invariant), so copy.
+        entry: _JsonObject = dict(pi_model_json_entry(registered_model))
+        provider_models[provider_name].append(entry)
     config: _PiModelsConfig = {
         "providers": {
             # Models advertising Responses support use the AI Gateway's Codex
@@ -844,7 +854,7 @@ def _build_models_json(
             # over silent loss), since most current gateway models are
             # multimodal and text-only turns are unaffected.
             entry: _JsonObject = {"id": model, "input": ["text", "image"]}
-            if _pi_model_is_reasoning(model):
+            if pi_model_is_reasoning(model):
                 entry["reasoning"] = True
             provider["models"] = [*provider["models"], entry]
     return config
@@ -857,27 +867,6 @@ def _build_models_json(
 # turn dies with "Stream ended without finish_reason".
 # Note: GLM, kimi, and inkling now route via Responses API (system.ai.* ids)
 # so they no longer need this flag.
-_PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek",)
-
-
-def _pi_model_is_reasoning(model: str) -> bool:
-    """Return whether *model* needs Pi's ``reasoning: true`` model flag."""
-    lower = model.lower()
-    return any(fragment in lower for fragment in _PI_REASONING_MODEL_FRAGMENTS)
-
-
-def _pi_model_json_entry(model: model_catalog.ModelEntry) -> _JsonObject:
-    """Translate normalized catalog metadata into Pi's model schema."""
-    entry: _JsonObject = {"id": model.id, "input": ["text", "image"]}
-    if model.metadata.context_window is not None:
-        entry["contextWindow"] = model.metadata.context_window
-    if model.metadata.max_output_tokens is not None:
-        entry["maxTokens"] = model.metadata.max_output_tokens
-    if _pi_model_is_reasoning(model.id):
-        entry["reasoning"] = True
-    return entry
-
-
 def _pi_needs_responses_api(
     model: str,
     wire_apis: frozenset[ModelWireAPI] | None = None,
@@ -930,78 +919,9 @@ def _databricks_model_wire_catalog(
     """Index UC wire metadata by both system and serving-endpoint aliases."""
     catalog: dict[str, frozenset[ModelWireAPI]] = {}
     for model in models:
-        for alias in _databricks_model_aliases(model.id):
+        for alias in databricks_model_aliases(model.id):
             catalog[alias] = model.metadata.wire_apis
     return catalog
-
-
-def _databricks_model_aliases(model_id: str) -> frozenset[str]:
-    """Return equivalent Unity Catalog and serving-endpoint model ids."""
-    normalized = model_id.lower()
-    aliases = {normalized}
-    if normalized.startswith("system.ai."):
-        aliases.add(f"databricks-{normalized.removeprefix('system.ai.')}")
-    elif normalized.startswith("databricks-"):
-        aliases.add(f"system.ai.{normalized.removeprefix('databricks-')}")
-    return frozenset(aliases)
-
-
-def _enrich_databricks_model_catalog(
-    discovered: Sequence[model_catalog.ModelEntry],
-    metadata_models: Sequence[model_catalog.ModelEntry],
-) -> tuple[model_catalog.ModelEntry, ...]:
-    """Add MLflow limits and capabilities to live workspace models."""
-    metadata_by_alias = {
-        alias: model.metadata
-        for model in metadata_models
-        for alias in _databricks_model_aliases(model.id)
-    }
-    enriched: list[model_catalog.ModelEntry] = []
-    for model in discovered:
-        metadata = next(
-            (
-                metadata_by_alias[alias]
-                for alias in _databricks_model_aliases(model.id)
-                if alias in metadata_by_alias
-            ),
-            None,
-        )
-        if metadata is None:
-            enriched.append(model)
-            continue
-        discovered_metadata = model.metadata
-        enriched.append(
-            replace(
-                model,
-                metadata=ModelMetadata(
-                    supported_capabilities=(
-                        discovered_metadata.supported_capabilities
-                        or metadata.supported_capabilities
-                    ),
-                    unsupported_capabilities=(
-                        discovered_metadata.unsupported_capabilities
-                        or metadata.unsupported_capabilities
-                    ),
-                    context_window=(
-                        discovered_metadata.context_window
-                        if discovered_metadata.context_window is not None
-                        else metadata.context_window
-                    ),
-                    max_output_tokens=(
-                        discovered_metadata.max_output_tokens
-                        if discovered_metadata.max_output_tokens is not None
-                        else metadata.max_output_tokens
-                    ),
-                    cost_tier=(
-                        discovered_metadata.cost_tier
-                        if discovered_metadata.cost_tier is not None
-                        else metadata.cost_tier
-                    ),
-                    wire_apis=discovered_metadata.wire_apis or metadata.wire_apis,
-                ),
-            )
-        )
-    return tuple(enriched)
 
 
 async def _create_subprocess_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:  # type: ignore[explicit-any]
@@ -2063,7 +1983,7 @@ class PiExecutor(Executor):
                 exc_info=True,
             )
         else:
-            models = _enrich_databricks_model_catalog(models, metadata_models)
+            models = enrich_databricks_model_catalog(models, metadata_models)
         self._gateway_model_entries = tuple(models)
         self._gateway_model_wire_apis = _databricks_model_wire_catalog(models)
         return self._gateway_model_wire_apis

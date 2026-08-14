@@ -39,6 +39,7 @@ vi.mock("@/hooks/useConversations", () => ({
   // Rename/archive are wired on the row but not exercised here; minimal
   // stubs keep the row from crashing on mount.
   useRenameConversation: () => ({ mutate: vi.fn() }),
+  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),

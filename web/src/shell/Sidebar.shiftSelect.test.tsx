@@ -57,6 +57,7 @@ const { projectsMock, conversationsRef, projectSessionsMock, bulkArchiveMock } =
 
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
+  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({
     mutate: bulkArchiveMock.mutate,

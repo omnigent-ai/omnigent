@@ -224,6 +224,7 @@ describe("authenticatedFetch", () => {
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
         hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
       }));
 
       fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
@@ -234,6 +235,37 @@ describe("authenticatedFetch", () => {
       const init = fetchMock.mock.calls[0][1] as RequestInit;
       const headers = new Headers(init.headers);
       expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_123");
+    });
+
+    it("stamps the slice-key header in standalone dev against a workspace", async () => {
+      // `npm run dev` pointed at a workspace URL installs no fetcher, but it's
+      // still a Databricks workspace (sharded) — the VITE_DATABRICKS_WORKSPACE
+      // build flag drives the key so dev traffic reaches the right replica (no
+      // manual step).
+      vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
+      vi.doMock("./sessionHost", () => ({
+        getSessionHost: vi.fn(() => null),
+        setSessionHost: vi.fn(),
+        isHostKeyless: vi.fn(() => false),
+        markHostKeyless: vi.fn(),
+        clearHostKeyless: vi.fn(),
+        modalHostId: vi.fn(() => null),
+        resolveModalHost: vi.fn(),
+        isModalHostResolved: vi.fn(() => true),
+      }));
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({})),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+      }));
+
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+      const { authenticatedFetch } = await import("./identity");
+
+      await authenticatedFetch("/v1/hosts/host_abc/runners", { method: "POST" });
+
+      const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_abc");
     });
 
     it("retries keyless on wrong_replica 400 response", async () => {
@@ -250,6 +282,7 @@ describe("authenticatedFetch", () => {
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
         hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
       }));
 
       const wrongReplicaResponse = {
