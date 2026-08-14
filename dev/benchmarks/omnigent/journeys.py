@@ -102,6 +102,9 @@ class Journey:
         per op, so 100+ iterations would blow the CI time budget; they cap at a
         few samples per run and lean on ``--runs`` for repeats. ``None`` (HTTP
         journeys) means no cap.
+    :param skip_warmup: When ``True``, the warmup phase is skipped regardless
+        of ``--warmup``. Useful for expensive journeys where even a single
+        warmup iteration would waste significant time.
     :param description: Human-readable one-liner for ``--list``.
     """
 
@@ -115,6 +118,7 @@ class Journey:
     needs_runner: bool = False
     needs_host: bool = False
     max_iterations: int | None = None
+    skip_warmup: bool = False
     description: str = ""
 
     async def run_setup(self, env: BenchEnvironment) -> JourneyContext:
@@ -240,7 +244,8 @@ async def run_latency(
     except Exception as exc:  # noqa: BLE001 — a setup failure is a recorded data point
         return _setup_failed_result(exc)
     try:
-        for _ in range(warmup):
+        effective_warmup = 0 if journey.skip_warmup else warmup
+        for _ in range(effective_warmup):
             with contextlib.suppress(Exception):  # warmup errors are non-fatal
                 await journey.run_prepare(env, ctx)
                 await journey.measure(env, ctx)
@@ -786,8 +791,9 @@ async def _measure_policy_evaluate(env: BenchEnvironment, ctx: JourneyContext) -
 # polly (omnigent run) emits this just before the agent REPL appears.
 _CLI_STARTUP_READY_SIGNAL = "Launching your agent"
 
-# Per-attempt timeout. polly boots in ~3-5s locally; 30s is generous headroom.
-_CLI_STARTUP_TIMEOUT_S = 30
+# Per-attempt timeout. With the bench host daemon pre-running (needs_host=True),
+# polly reuses it; remaining work is session + runner connect ~5-20s on CI.
+_CLI_STARTUP_TIMEOUT_S = 60
 
 # ~5s per attempt; cap so a large --iterations stays in budget.
 _CLI_STARTUP_MAX_ITERATIONS = 3
@@ -1054,45 +1060,35 @@ ALL_JOURNEYS: dict[str, Journey] = {
             teardown=_teardown_hook_spawn,
             description="Spawn the per-chunk MessageDisplay hook exactly as Claude Code does.",
         ),
-    )
-}
-
-# Journeys excluded from the default ALL_JOURNEYS set because they require
-# special environment setup and must be run explicitly via --journeys.
-OPT_IN_JOURNEYS: dict[str, Journey] = {
-    j.name: j
-    for j in (
         Journey(
             name="cli_startup",
             kind="latency",
             measure=_measure_cli_startup,
             max_iterations=_CLI_STARTUP_MAX_ITERATIONS,
+            skip_warmup=True,
             description=(
                 "Spawn `omnigent polly --server` and time invocation → REPL ready "
-                "(daemon + session + runner connect). Opt-in only — run explicitly via "
-                "--journeys cli_startup. Requires pexpect."
+                "(daemon + session + runner connect). No LLM call needed. "
+                "Requires pexpect."
             ),
         ),
     )
 }
 
+# Registry alias — kept for callers that enumerate opt-in journeys explicitly.
+OPT_IN_JOURNEYS: dict[str, Journey] = {}
+
 
 def resolve_journeys(names: list[str] | None) -> list[Journey]:
-    """Resolve requested journey *names* (or all default journeys when ``None``/empty).
+    """Resolve requested journey *names* (or all when ``None``/empty).
 
-    Looks up *names* in both :data:`ALL_JOURNEYS` (run by default) and
-    :data:`OPT_IN_JOURNEYS` (excluded from the default set; must be named
-    explicitly). When *names* is empty or ``None``, returns only the default
-    journeys — opt-in journeys are never included automatically.
-
-    :raises KeyError: If a requested name isn't in either registry.
+    :raises KeyError: If a requested name isn't registered.
     """
-    _all = {**ALL_JOURNEYS, **OPT_IN_JOURNEYS}
     if not names:
         return list(ALL_JOURNEYS.values())
     resolved = []
     for name in names:
-        if name not in _all:
-            raise KeyError(f"unknown journey {name!r}; known: {', '.join(_all)}")
-        resolved.append(_all[name])
+        if name not in ALL_JOURNEYS:
+            raise KeyError(f"unknown journey {name!r}; known: {', '.join(ALL_JOURNEYS)}")
+        resolved.append(ALL_JOURNEYS[name])
     return resolved
