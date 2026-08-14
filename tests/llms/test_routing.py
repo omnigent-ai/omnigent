@@ -37,6 +37,13 @@ from omnigent.llms.routing import RoutedModel, infer_harness_from_model, parse_m
             ),
         ),
         (
+            "orcarouter/anthropic/claude-sonnet-4.6",
+            RoutedModel(
+                provider="orcarouter",
+                model="anthropic/claude-sonnet-4.6",
+            ),
+        ),
+        (
             "ollama/llama3",
             RoutedModel(provider="ollama", model="llama3"),
         ),

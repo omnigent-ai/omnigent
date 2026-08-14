@@ -305,6 +305,28 @@ def test_resolve_base_url_raises_when_both_none() -> None:
         _resolve_base_url(None, None)
 
 
+@pytest.mark.parametrize(
+    ("provider", "expected_base_url"),
+    [
+        ("openrouter", "https://openrouter.ai/api/v1"),
+        ("orcarouter", "https://api.orcarouter.ai/v1"),
+    ],
+)
+def test_openai_compatible_gateways_get_their_default_base_url(
+    provider: str, expected_base_url: str
+) -> None:
+    """A gateway provider id resolves to its own endpoint, not api.openai.com.
+
+    Failure means the gateway's key is sent to OpenAI, which 401s.
+    """
+    from omnigent.llms.adapters import _create_adapter
+
+    adapter = _create_adapter(provider)
+
+    assert type(adapter).__name__ == "OpenAICompatibleAdapter"
+    assert adapter._base_url == expected_base_url
+
+
 # ── Responses API tool conversion ───────────────────────
 
 

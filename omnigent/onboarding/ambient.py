@@ -76,7 +76,7 @@ _OLLAMA_PROBE_TIMEOUT = 0.25
 # Providers absent here (or mapped to ``None``) are reported with
 # ``family=None`` — their key is detected but no harness surface is
 # implied. Anthropic serves the ``anthropic`` surface; OpenAI and
-# OpenAI-compatible gateways (OpenRouter) serve the ``openai`` surface;
+# OpenAI-compatible gateways (OpenRouter, OrcaRouter) serve the ``openai`` surface;
 # Gemini serves the ``gemini`` surface (the antigravity-sdk harness drives
 # the Gemini SDK directly with a GEMINI_API_KEY), so a detected
 # GEMINI_API_KEY is adopted as a ``gemini``-family ``key`` provider.
@@ -84,6 +84,7 @@ _ENV_KEY_FAMILY: dict[str, str | None] = {
     "anthropic": ANTHROPIC_FAMILY,
     "openai": OPENAI_FAMILY,
     "openrouter": OPENAI_FAMILY,
+    "orcarouter": OPENAI_FAMILY,
     "gemini": GEMINI_FAMILY,
 }
 

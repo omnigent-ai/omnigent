@@ -99,6 +99,23 @@ def test_synthesize_env_key_openrouter_uses_vendor_endpoint_and_chat_wire() -> N
     assert openai_block["api_key_ref"] == "env:OPENROUTER_API_KEY"
 
 
+def test_synthesize_env_key_orcarouter_uses_vendor_endpoint_and_chat_wire() -> None:
+    """A detected OrcaRouter key gets OrcaRouter's base_url + chat wire.
+
+    Same rule as OpenRouter: an OpenAI-compatible gateway key is scoped to
+    that gateway, so defaulting to api.openai.com (or the Responses wire)
+    would 401 / 404 every request.
+    """
+    det = DetectedProvider(
+        name="orcarouter", kind="key", family=OPENAI_FAMILY, source="$ORCAROUTER_API_KEY"
+    )
+    entries = synthesize_detected_entries([det])
+    openai_block = entries["orcarouter"]["openai"]
+    assert openai_block["base_url"] == "https://api.orcarouter.ai/v1"
+    assert openai_block["wire_api"] == "chat"
+    assert openai_block["api_key_ref"] == "env:ORCAROUTER_API_KEY"
+
+
 def test_synthesize_env_key_openai_honors_openai_base_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
