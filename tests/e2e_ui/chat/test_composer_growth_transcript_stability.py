@@ -338,6 +338,31 @@ def test_composer_growth_reflows_transcript_without_covering_output(
 
     assert_clearance(baseline, "baseline")
 
+    # The public near-bottom alias includes readers within 70px, but a reader
+    # who deliberately stopped 50px above bottom is not library-locked. The
+    # bottom bridge must leave native browser anchoring in control.
+    page.locator('[role="log"] > div').first.hover()
+    page.mouse.wheel(0, -50)
+    near_bottom_escaped = _settled_geometry(page)
+    assert abs(near_bottom_escaped["distanceFromBottom"] - 50) <= 1, near_bottom_escaped
+
+    for _ in range(3):
+        composer.press("Shift+Enter")
+    near_bottom_grown = _settled_geometry(page)
+    assert_reader_anchor(
+        near_bottom_escaped,
+        near_bottom_grown,
+        "near-bottom escaped composer growth",
+    )
+    assert abs(near_bottom_grown["overlap"]) <= 1, near_bottom_grown
+    expect(composer).to_be_focused()
+
+    for _ in range(3):
+        composer.press("Backspace")
+    _settled_geometry(page)
+    _scroll_to_distance_from_bottom(page, 0)
+    assert_clearance(_settled_geometry(page), "after near-bottom reset")
+
     # Grow: three Shift+Enter newlines, one line taller each.
     for _ in range(3):
         composer.press("Shift+Enter")

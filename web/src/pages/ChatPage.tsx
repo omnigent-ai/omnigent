@@ -2366,19 +2366,24 @@ export function KeepBottomOnViewportResize() {
     scrollRef?: React.RefObject<HTMLElement>;
   };
   const scrollRef = ctx.scrollRef;
-  const isAtBottom = ctx.isAtBottom;
+  const state = ctx.state;
   const scrollToBottom = ctx.scrollToBottom;
 
   useEffect(() => {
     const el = scrollRef?.current;
     if (!el || typeof ResizeObserver === "undefined") return;
+    const isPhysicallyAtBottom = () => el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
+    let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isPhysicallyAtBottom();
     let clientHeight = el.clientHeight;
     let frame: number | null = null;
+    const onScroll = () => {
+      wasBottomLocked = isPhysicallyAtBottom();
+    };
     const observer = new ResizeObserver(() => {
       const nextHeight = el.clientHeight;
       if (nextHeight === clientHeight) return;
       clientHeight = nextHeight;
-      if (!isAtBottom) return;
+      if (!wasBottomLocked) return;
       scrollToBottom("instant");
       if (frame !== null) cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
@@ -2386,12 +2391,14 @@ export function KeepBottomOnViewportResize() {
         scrollToBottom("instant");
       });
     });
+    el.addEventListener("scroll", onScroll, { passive: true });
     observer.observe(el);
     return () => {
+      el.removeEventListener("scroll", onScroll);
       observer.disconnect();
       if (frame !== null) cancelAnimationFrame(frame);
     };
-  }, [isAtBottom, scrollRef, scrollToBottom]);
+  }, [scrollRef, scrollToBottom, state]);
 
   return null;
 }

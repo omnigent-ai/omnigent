@@ -83,6 +83,8 @@ describe("KeepBottomOnViewportResize", () => {
     stickContext.scrollRef.current = null;
     stickContext.contentRef.current = null;
     stickContext.isAtBottom = false;
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
     stickContext.scrollToBottom.mockReset();
 
     class StubResizeObserver {
@@ -117,6 +119,8 @@ describe("KeepBottomOnViewportResize", () => {
     stickContext.scrollRef.current = null;
     stickContext.contentRef.current = null;
     stickContext.isAtBottom = false;
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
   });
 
   function flushFrames() {
@@ -127,8 +131,8 @@ describe("KeepBottomOnViewportResize", () => {
     });
   }
 
-  function makeScrollRoot() {
-    const metrics = { scrollTop: 800, scrollHeight: 2000, clientHeight: 700 };
+  function makeScrollRoot(scrollTop = 1300) {
+    const metrics = { scrollTop, scrollHeight: 2000, clientHeight: 700 };
     const scrollRoot = document.createElement("div");
     setScrollMetrics(scrollRoot, metrics);
     stickContext.scrollRef.current = scrollRoot;
@@ -138,6 +142,8 @@ describe("KeepBottomOnViewportResize", () => {
   it("keeps a bottom-locked transcript pinned after its viewport shrinks", () => {
     const { metrics } = makeScrollRoot();
     stickContext.isAtBottom = true;
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
     render(<KeepBottomOnViewportResize />);
 
     metrics.clientHeight = 650;
@@ -152,7 +158,7 @@ describe("KeepBottomOnViewportResize", () => {
   });
 
   it("leaves an escaped reader anchored by the browser", () => {
-    const { metrics } = makeScrollRoot();
+    const { metrics } = makeScrollRoot(800);
     render(<KeepBottomOnViewportResize />);
 
     metrics.clientHeight = 650;
@@ -161,6 +167,43 @@ describe("KeepBottomOnViewportResize", () => {
     expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
     expect(frames.size).toBe(0);
     expect(metrics.scrollTop).toBe(800);
+  });
+
+  it("ignores the public near-bottom alias when the live lock is escaped", () => {
+    const { metrics } = makeScrollRoot(1250);
+    stickContext.isAtBottom = true;
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.clientHeight = 650;
+    act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+    expect(metrics.scrollTop).toBe(1250);
+  });
+
+  it("keeps a user escape after a same-resize library reclassification", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    stickContext.isAtBottom = true;
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    render(<KeepBottomOnViewportResize />);
+
+    metrics.scrollTop = 1250;
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
+    fireEvent.scroll(scrollRoot);
+
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
+    metrics.clientHeight = 650;
+    act(() => resize?.());
+
+    expect(stickContext.scrollToBottom).not.toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+    expect(metrics.scrollTop).toBe(1250);
   });
 
   it("ignores content-only resize notifications", () => {
@@ -178,6 +221,8 @@ describe("KeepBottomOnViewportResize", () => {
   it("disconnects the observer and cancels a queued follow-up frame", () => {
     const { metrics } = makeScrollRoot();
     stickContext.isAtBottom = true;
+    stickContext.state.isAtBottom = true;
+    stickContext.state.escapedFromLock = false;
     const { unmount } = render(<KeepBottomOnViewportResize />);
 
     metrics.clientHeight = 650;
