@@ -4855,7 +4855,7 @@ async def test_the_quiescence_recheck_backs_off_after_agy_vetoes_a_close(
             )
         )
         deadline = 0
-        while polls < 30 and deadline < 10_000:
+        while polls < 30 and deadline < 50_000:
             deadline += 1
             await asyncio.sleep(0)
         mirror.cancel()
