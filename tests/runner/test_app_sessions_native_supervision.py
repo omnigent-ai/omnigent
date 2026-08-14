@@ -1832,6 +1832,174 @@ async def test_parent_idle_with_stuck_wake_flag_and_drained_inbox_clears_flag() 
 
 
 @pytest.mark.asyncio
+async def test_repeat_identical_recovery_wake_is_suppressed() -> None:
+    """
+    A recovery wake identical to the previous one is skipped, not re-posted.
+
+    The stranded-inbox recovery wake (``_rewake_parent_if_inbox_stranded``)
+    re-nudges a parent that idled without draining. In a steady-state
+    homogeneous fan-out — many same-named children, the parent draining at
+    roughly the completion rate so the inbox count plateaus — the latest
+    child's label and the pending count don't change between turn boundaries,
+    so the recovery wake would repeat the *same* ``[System: ...]`` line every
+    round. That verbatim repeat is pure spam: the parent already holds that
+    exact instruction. The fix records the last delivered re-wake per parent
+    and skips a follow-up re-wake that matches it.
+
+    The critical companion guarantee — the FIRST recovery wake still fires
+    even when it matches an earlier *completion* wake — is pinned by
+    ``test_parent_idle_with_stuck_wake_flag_posts_recovery_wake``; only
+    repeat *re-wakes* are deduped, never completion notices.
+
+    Sequence (wake counts bracketed): children share the ``gp/fanout`` label so
+    the notices can match. (1) child A completes idle → wake [1]; parent turn
+    T1 starts (clears flag); (2) child B completes mid-T1 → completion wake [2],
+    re-arms flag; (3) T1 ends → recovery wake [3] ``gp/fanout … 2 results``
+    (recorded as the last re-wake); (4) parent turn T2 starts (clears flag),
+    the test drains one inbox item then child C completes mid-T2, bringing the
+    count back to 2 → completion wake [4] (a fresh completion always posts);
+    (5) T2 ends → the recovery wake would again be ``gp/fanout … 2 results`` —
+    identical to step 3 — so it is SKIPPED (count stays [4]). Without the fix
+    step 5 posts a 5th, duplicate wake — the discriminator.
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id = "b3d5c9f1a26e4708b1f0c4d29e7a6f13"
+    child_a = "5f2a1c8b90d34e6fa7c1b2d3e4f50617"
+    child_b = "6a3b2d9c81e45f70b8d2c3e4f5061728"
+    child_c = "7b4c3e0d92f560810c9e4d5a6b172839"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    server_client = _WakeRecordingServerClient(parent_id)
+    gate = asyncio.Event()
+    harness_client = _BlockingHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_dedupe"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_dedupe"}}),
+        ],
+        gate,
+    )
+    pm = _FakeProcessManager(harness_client)  # type: ignore[arg-type]
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    runner_app._session_inboxes_ref[parent_id] = session_inbox
+    for child in (child_a, child_b, child_c):
+        runner_app.register_subagent_work(
+            parent_session_id=parent_id,
+            child_session_id=child,
+            agent="gp",
+            title="fanout",
+        )
+
+    async def _start_blocking_parent_turn() -> None:
+        """Post a parent message and wait for the (blocking) turn to start.
+
+        ``post_seen`` resolves only after ``_run_turn_bg`` clears the wake
+        flag, so callers know the flag is clear before completing a child.
+        """
+        harness_client.post_seen.clear()
+        parent_resp = await client.post(
+            f"/v1/sessions/{parent_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "c1d2e3f4a5b60718293a4b5c6d7e8f90",
+                "model": "test-agent",
+                "harness": "openai-agents",
+                "content": [{"type": "input_text", "text": "wake notice"}],
+            },
+        )
+        assert parent_resp.status_code == 202, parent_resp.text
+        await asyncio.wait_for(harness_client.post_seen.wait(), timeout=5.0)
+
+    async def _complete_child(child_id: str, output: str) -> None:
+        resp = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={"type": "external_session_status", "data": {"status": "idle", "output": output}},
+        )
+        assert resp.status_code == 204, resp.text
+
+    async def _wait_turn_idle() -> None:
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while app.state.has_active_work():
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("parent turn did not end within 5s")
+            await asyncio.sleep(0.01)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    try:
+        async with _runner_client(app) as client:
+            # 1. Child A completes idle → first wake.
+            await _complete_child(child_a, "A_DONE")
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+
+            # 2. Start T1, then child B completes mid-turn → completion wake,
+            #    re-arms the flag with no later turn to clear it.
+            await _start_blocking_parent_turn()
+            await _complete_child(child_b, "B_DONE")
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+            assert len(server_client.wake_posts) == 2, (
+                f"Expected A + B wakes before T1 ends, got {len(server_client.wake_posts)}."
+            )
+
+            # 3. End T1 → recovery wake (the first re-wake). It matches child
+            #    B's completion wake verbatim yet must still fire — that
+            #    contract is guarded elsewhere; here it seeds the last-re-wake
+            #    record used to dedupe step 5.
+            gate.set()
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+            assert len(server_client.wake_posts) == 3, (
+                f"Expected the recovery wake to bring the count to 3, got "
+                f"{len(server_client.wake_posts)}."
+            )
+            recovery_text = server_client.wake_posts[2]["data"]["content"][0]["text"]
+            assert "sub-agent gp/fanout finished (completed)" in recovery_text
+            assert "2 results waiting in inbox" in recovery_text
+            await _wait_turn_idle()
+
+            # 4. Start T2 (clears the flag). Drain one inbox item, then child C
+            #    completes mid-T2 — the count returns to 2, so C's completion
+            #    wake is identical text to the step-3 recovery wake. A fresh
+            #    completion always posts (never deduped), so this is wake [4].
+            gate.clear()
+            await _start_blocking_parent_turn()
+            assert not session_inbox.empty()
+            session_inbox.get_nowait()
+            await _complete_child(child_c, "C_DONE")
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+            assert len(server_client.wake_posts) == 4, (
+                f"Expected child C's completion wake as the 4th, got "
+                f"{len(server_client.wake_posts)}."
+            )
+
+            # 5. End T2 → the recovery wake would repeat "gp/fanout … 2 results"
+            #    verbatim (identical to step 3), so it must be SUPPRESSED. Give a
+            #    wrongly-scheduled 5th wake room to land before asserting.
+            gate.set()
+            await _wait_turn_idle()
+    finally:
+        gate.set()
+        for child in (child_a, child_b, child_c):
+            runner_app.unregister_subagent_work(child)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    # Exactly 4 wakes: A + B + recovery + C's completion. A 5th would be the
+    # duplicate recovery wake this fix suppresses; 3 would mean C's genuine
+    # completion notice was wrongly swallowed.
+    assert len(server_client.wake_posts) == 4, (
+        f"Expected the repeat recovery wake to be suppressed (4 wakes total), "
+        f"got {len(server_client.wake_posts)}."
+    )
+
+
+@pytest.mark.asyncio
 async def test_replayed_idle_status_after_inbox_drain_is_acknowledged() -> None:
     """
     Replayed terminal status after parent drain is a benign duplicate.

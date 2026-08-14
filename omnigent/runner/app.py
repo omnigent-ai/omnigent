@@ -2115,6 +2115,12 @@ def create_runner_app(
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
     _subagent_wake_pending: set[str] = set()
+    # parent_session_id -> the last stranded-inbox RE-WAKE notice delivered to
+    # that parent. A completion wake always fires; only a repeat re-wake that
+    # matches the previous re-wake verbatim (parent idled again without
+    # draining anything) is skipped, so the parent isn't re-notified with the
+    # same line at every turn boundary.
+    _last_rewake_notice: dict[str, str] = {}
 
     _session_histories = _session_histories_ref
     _last_server_item_id: dict[str, str] = {}
@@ -3524,6 +3530,7 @@ def create_runner_app(
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
         _subagent_wake_pending.discard(session_id)
+        _last_rewake_notice.pop(session_id, None)
         _session_sub_agent_names.pop(session_id, None)
         unregister_child_session(session_id)
         unregister_subagent_work_for_session(session_id)
@@ -5626,12 +5633,20 @@ def create_runner_app(
                 _cond.notify_all()
 
     async def _post_subagent_wake_notice(
-        parent_id: str, notice: str, child_id: str, created_by: str | None
+        parent_id: str,
+        notice: str,
+        child_id: str,
+        created_by: str | None,
+        *,
+        is_rewake: bool = False,
     ) -> None:
         delivered = await _deliver_subagent_wake_post(
             server_client, parent_id, notice, created_by=created_by
         )
-        if not delivered:
+        if delivered:
+            if is_rewake:
+                _last_rewake_notice[parent_id] = notice
+        else:
             _subagent_wake_pending.discard(parent_id)
             _logger.warning(
                 "Sub-agent wake POST failed for parent=%s child=%s after %d attempt(s); "
@@ -5641,7 +5656,7 @@ def create_runner_app(
                 _WAKE_POST_MAX_ATTEMPTS,
             )
 
-    def _schedule_subagent_wake(entry: _SubagentWorkEntry) -> None:
+    def _schedule_subagent_wake(entry: _SubagentWorkEntry, *, is_rewake: bool = False) -> None:
         if entry.parent_session_id == entry.child_session_id:
             return
         inbox = _session_inboxes.get(entry.parent_session_id)
@@ -5653,19 +5668,26 @@ def create_runner_app(
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        _subagent_wake_pending.add(entry.parent_session_id)
         notice = _format_subagent_wake_notice(
             agent=entry.agent,
             title=entry.title,
             status=entry.status,
             pending=inbox.qsize(),
         )
+        # The first stranded-inbox re-wake still fires (it's the recovery nudge
+        # for a parent that idled without draining). Only a follow-up re-wake
+        # identical to the previous one is skipped — the parent idled again
+        # without draining, so repeating the same line just spams it.
+        if is_rewake and notice == _last_rewake_notice.get(entry.parent_session_id):
+            return
+        _subagent_wake_pending.add(entry.parent_session_id)
         _wake_task = loop.create_task(
             _post_subagent_wake_notice(
                 entry.parent_session_id,
                 notice,
                 entry.child_session_id,
                 entry.created_by,
+                is_rewake=is_rewake,
             )
         )
         _wake_task.add_done_callback(_background_tasks.discard)
@@ -5685,7 +5707,7 @@ def create_runner_app(
             entries,
             key=lambda entry: entry.completed_at if entry.completed_at is not None else 0.0,
         )
-        _schedule_subagent_wake(latest)
+        _schedule_subagent_wake(latest, is_rewake=True)
 
     def _mark_subagent_terminal_and_wake(
         child_session_id: str, *, status: str, output: str | None
