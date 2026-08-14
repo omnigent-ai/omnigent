@@ -75,7 +75,7 @@ Firing is fire-and-forget: the guard steps run synchronously so a dead fire cost
 
 ## Lifecycle
 
-A task is `active`, `paused`, or `deleted`. `PATCH /v1/scheduled-tasks/{id}` changes any stored field and can move a task between `active` and `paused`; it cannot set `deleted` (use `DELETE`), and it cannot null a `workspace` or `host_id` that is already set. Unset fields in a PATCH are left unchanged.
+A task is `active`, `paused`, or `deleted`. `PATCH /v1/scheduled-tasks/{id}` changes any stored field and can move a task between `active` and `paused`; it cannot set `deleted` (use `DELETE`), and it never accepts an explicit `null` for `workspace` or `host_id` -- the rejection is on the presence of the key, so it applies even to a task where that field is currently unset. Omitting a field leaves it unchanged; there is no way to clear one.
 
 `POST /v1/scheduled-tasks/{id}/run` fires a task immediately and returns 202. It does not disturb the recurring schedule, which makes it the way to test a new automation without waiting for its next occurrence.
 
