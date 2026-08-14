@@ -85,7 +85,8 @@ interface ParsedErrorMessage {
 
 const DIAGNOSTICS_HEADING = /^(?:terminal|lifecycle) diagnostics:\s*$/i;
 const LAST_OUTPUT_HEADING = /^last captured (?:terminal )?output:\s*(.*)$/i;
-const UNAVAILABLE_OUTPUT = /^unavailable[.!]?$/i;
+const UNAVAILABLE_OUTPUT =
+  /^unavailable(?:[.!]|\. The process exited before Omnigent captured a pane snapshot\.)?$/i;
 
 function trimBlankBoundaryLines(lines: string[]): string | null {
   let start = 0;

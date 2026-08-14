@@ -207,7 +207,7 @@ describe("ErrorBanner", () => {
     },
   );
 
-  it("suppresses an explicitly unavailable last-output diagnostics tab", () => {
+  it("suppresses the runner's unavailable last-output diagnostics tab", () => {
     render(
       <ErrorBanner
         message={[
@@ -216,7 +216,7 @@ describe("ErrorBanner", () => {
           "Terminal diagnostics:",
           "pid: 42",
           "",
-          "Last captured output: unavailable",
+          "Last captured output: unavailable. The process exited before Omnigent captured a pane snapshot.",
         ].join("\n")}
         source="execution"
         code="required_terminal_exited"

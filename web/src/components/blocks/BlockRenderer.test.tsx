@@ -160,6 +160,31 @@ describe("BlockRenderer dispatch", () => {
     );
   });
 
+  it("suppresses the runner's unavailable last-output diagnostics tab", () => {
+    const items: RenderItem[] = [
+      {
+        kind: "error",
+        itemId: null,
+        source: "execution",
+        code: "required_terminal_exited",
+        message: [
+          "Required terminal exited unexpectedly; the session runtime is no longer available.",
+          "Terminal diagnostics:",
+          "terminal: required-runtime:main",
+          "Last captured terminal output: unavailable. The process exited before Omnigent captured a pane snapshot.",
+        ].join("\n"),
+      },
+    ];
+
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.queryByRole("tab", { name: "Last captured output" })).toBeNull();
+    expect(screen.getByTestId("error-diagnostics-content")).toHaveTextContent(
+      "terminal: required-runtime:main",
+    );
+  });
+
   it("renders a friendly failure card when the error is classified", () => {
     const items: RenderItem[] = [
       {

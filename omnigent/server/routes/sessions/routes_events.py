@@ -225,6 +225,17 @@ def _retry_recovery_lock(session_id: str) -> asyncio.Lock:
     return lock
 
 
+def _evict_retry_recovery_task(
+    session_id: str,
+    completed_task: asyncio.Task[dict[str, bool | str]],
+) -> None:
+    """Evict a settled retry task without disturbing a newer attempt."""
+    if _retry_recovery_tasks.get(session_id) is completed_task:
+        _retry_recovery_tasks.pop(session_id, None)
+    if not completed_task.cancelled():
+        completed_task.exception()
+
+
 async def _recover_retry_session(
     *,
     request: Request,
@@ -324,13 +335,10 @@ async def _retry_session_single_flight(
                 )
             )
             _retry_recovery_tasks[session_id] = task
-    try:
-        return await asyncio.shield(task)
-    finally:
-        if task.done():
-            async with lock:
-                if _retry_recovery_tasks.get(session_id) is task:
-                    _retry_recovery_tasks.pop(session_id, None)
+            task.add_done_callback(
+                lambda completed_task: _evict_retry_recovery_task(session_id, completed_task)
+            )
+    return await asyncio.shield(task)
 
 
 def register_events_routes(

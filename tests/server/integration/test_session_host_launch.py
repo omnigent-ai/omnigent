@@ -2095,6 +2095,67 @@ async def test_retry_session_single_flight_launches_and_rotates_once(
     assert conv.runner_id != original_runner_id
 
 
+async def test_retry_session_single_flight_evicts_after_only_waiter_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settled recovery is not reused after its only waiter is cancelled."""
+    from omnigent.server.routes.sessions import routes_events
+
+    session_id = "cancelled-retry-waiter"
+    first_started = asyncio.Event()
+    finish_first = asyncio.Event()
+    first_settled = asyncio.Event()
+    attempts = 0
+    first_result = {"queued": False, "recovered": True, "recovery": "first"}
+    second_result = {"queued": False, "recovered": True, "recovery": "second"}
+
+    async def _recover(**kwargs: Any) -> dict[str, bool | str]:
+        nonlocal attempts
+        del kwargs
+        attempts += 1
+        if attempts == 1:
+            first_started.set()
+            await finish_first.wait()
+            first_settled.set()
+            return first_result
+        return second_result
+
+    monkeypatch.setattr(routes_events, "_recover_retry_session", _recover)
+    routes_events._retry_recovery_tasks.pop(session_id, None)
+
+    waiter = asyncio.create_task(
+        routes_events._retry_session_single_flight(
+            request=None,
+            session_id=session_id,
+            conversation_store=None,
+            runner_router=None,
+        )
+    )
+    await first_started.wait()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    finish_first.set()
+    await first_settled.wait()
+    for _ in range(10):
+        if session_id not in routes_events._retry_recovery_tasks:
+            break
+        await asyncio.sleep(0)
+
+    assert session_id not in routes_events._retry_recovery_tasks
+    assert (
+        await routes_events._retry_session_single_flight(
+            request=None,
+            session_id=session_id,
+            conversation_store=None,
+            runner_router=None,
+        )
+        == second_result
+    )
+    assert attempts == 2
+
+
 @pytest.mark.parametrize(
     ("error_code", "error_message", "expected_status"),
     [
