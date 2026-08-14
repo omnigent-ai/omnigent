@@ -9095,6 +9095,36 @@ def _stop_daemon_sessions(
     return stopped
 
 
+def _signal_daemon(record: _HostDaemonRecord, sig: int) -> bool:
+    """
+    Deliver ``sig`` to a daemon, healing over PIDs that cannot be signalled.
+
+    A ``PermissionError`` (``EPERM``) means the recorded PID was recycled to a
+    process owned by another user, so our daemon is already gone — the record
+    is stale. Drop it and tell the caller to stop rather than crashing.
+
+    :param record: Daemon record whose process should receive the signal.
+    :param sig: Signal number to deliver, e.g. ``signal.SIGTERM``.
+    :returns: ``True`` to keep going (signal sent, or the process had already
+        exited); ``False`` if the PID was stale and its record was cleared.
+    """
+    try:
+        os.kill(record.pid, sig)
+    except ProcessLookupError:
+        # Exited between the liveness check and the signal — the poll loop
+        # below will notice and delete the record.
+        return True
+    except PermissionError:
+        click.echo(
+            f"{record.target}: daemon pid={record.pid} is no longer ours "
+            "(cannot signal it); clearing the stale record.",
+            err=True,
+        )
+        _delete_daemon_record(record)
+        return False
+    return True
+
+
 def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
     """
     Terminate one local daemon process.
@@ -9106,8 +9136,8 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
     if not _pid_alive(record.pid):
         _delete_daemon_record(record)
         return
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(record.pid, signal.SIGTERM)
+    if not _signal_daemon(record, signal.SIGTERM):
+        return
     deadline = time.monotonic() + _HOST_DAEMON_STOP_GRACE_S
     while time.monotonic() < deadline:
         if not _pid_alive(record.pid):
@@ -9115,8 +9145,8 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
             return
         time.sleep(0.1)
     if force:
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(record.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        if not _signal_daemon(record, getattr(signal, "SIGKILL", signal.SIGTERM)):
+            return
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             if not _pid_alive(record.pid):

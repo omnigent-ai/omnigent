@@ -377,6 +377,33 @@ def test_stop_surfaces_failures_and_suggests_force(monkeypatch: pytest.MonkeyPat
     assert "retry with --force" in result.output
 
 
+def test_terminate_daemon_heals_stale_pid_owned_by_another_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recycled PID owned by another user is healed, not crashed on.
+
+    ``_pid_alive`` reports an ``AccessDenied`` process as alive, so
+    ``os.kill`` raises ``PermissionError`` (EPERM). ``_terminate_daemon``
+    must clear the stale record and return instead of letting the
+    ``PermissionError`` escape and crash the CLI.
+    """
+    from omnigent.cli import _terminate_daemon
+
+    record = _record("https://example.com", mode="server", pid=4242)
+    monkeypatch.setattr("omnigent.cli._pid_alive", lambda pid: True)
+
+    def _kill(pid: int, sig: int) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr("omnigent.cli.os.kill", _kill)
+    deleted: list[_HostDaemonRecord] = []
+    monkeypatch.setattr("omnigent.cli._delete_daemon_record", lambda rec: deleted.append(rec))
+
+    _terminate_daemon(record, force=False)  # must not raise
+
+    assert deleted == [record]  # stale record cleared so it stops reappearing
+
+
 def test_stop_clears_stale_legacy_host_pid(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
