@@ -124,25 +124,78 @@ def _append_streamed_output(page: Page, height: int) -> dict:
             ).closest('form');
             const scroller = form.parentElement.querySelector('[role="log"] > div');
             const content = scroller.firstElementChild;
-            const before = {
+            const spacer = content.lastElementChild;
+            const geometry = () => ({
                 scrollHeight: scroller.scrollHeight,
                 scrollTop: scroller.scrollTop,
-            };
+            });
+            const before = geometry();
             const streamed = document.createElement('div');
             streamed.dataset.testid = 'streamed-output-probe';
             streamed.style.flex = '0 0 auto';
             streamed.style.height = `${height}px`;
             streamed.textContent = 'Additional streamed output below the reader.';
-            content.append(streamed);
+            content.insertBefore(streamed, spacer);
             return {
                 before,
-                after: {
-                    scrollHeight: scroller.scrollHeight,
-                    scrollTop: scroller.scrollTop,
-                },
+                after: geometry(),
             };
         }""",
         height,
+    )
+
+
+def _append_output_while_growing_composer(
+    page: Page,
+    initial_height: int,
+    restoring_height: int,
+) -> dict:
+    """Grow output and composer together, then append again during restore."""
+    return page.evaluate(
+        """async ({ initialHeight, restoringHeight }) => {
+            const textarea = document.querySelector(
+                'textarea[aria-label="Message the agent"]'
+            );
+            const form = textarea.closest('form');
+            const scroller = form.parentElement.querySelector('[role="log"] > div');
+            const content = scroller.firstElementChild;
+            const spacer = content.lastElementChild;
+            const appendProbe = (height, testid) => {
+                const streamed = document.createElement('div');
+                streamed.dataset.testid = testid;
+                streamed.style.flex = '0 0 auto';
+                streamed.style.height = `${height}px`;
+                streamed.textContent = 'Additional streamed output below the reader.';
+                content.insertBefore(streamed, spacer);
+            };
+            const geometry = () => ({
+                clientHeight: scroller.clientHeight,
+                scrollHeight: scroller.scrollHeight,
+                scrollTop: scroller.scrollTop,
+            });
+            const before = geometry();
+
+            appendProbe(initialHeight, 'same-frame-output-probe');
+            const valueSetter = Object.getOwnPropertyDescriptor(
+                HTMLTextAreaElement.prototype,
+                'value'
+            ).set;
+            valueSetter.call(textarea, `${textarea.value}\n\n\n`);
+            textarea.dispatchEvent(new InputEvent('input', { bubbles: true }));
+
+            // The first frame delivers the combined content/container resize
+            // and schedules restoration. The second runs while that restore is
+            // active, before its clear frame has completed.
+            await new Promise((resolve) => requestAnimationFrame(resolve));
+            await new Promise((resolve) => requestAnimationFrame(resolve));
+            appendProbe(restoringHeight, 'during-restore-output-probe');
+
+            return { before, afterDuringRestore: geometry() };
+        }""",
+        {
+            "initialHeight": initial_height,
+            "restoringHeight": restoring_height,
+        },
     )
 
 
@@ -247,7 +300,7 @@ def test_composer_growth_reflows_transcript_without_covering_output(
 
     appended = _append_streamed_output(page, 240)
     streamed = _settled_geometry(page)
-    added_height = appended["after"]["scrollHeight"] - appended["before"]["scrollHeight"]
+    added_height = streamed["viewport"][1] - appended["before"]["scrollHeight"]
     assert added_height > 0, appended
     assert appended["after"]["scrollTop"] == appended["before"]["scrollTop"], appended
     expected_streamed_distance = escaped["distanceFromBottom"] + added_height
@@ -297,3 +350,33 @@ def test_composer_growth_reflows_transcript_without_covering_output(
         )
         <= 1
     ), (after_user_scroll, after_user_scroll_grown)
+
+    # Output and composer growth may land in one ResizeObserver delivery while
+    # a follow-up stream chunk arrives before restoration clears. Preserve the
+    # real distance across both deltas instead of consuming either as resize
+    # bookkeeping.
+    for _ in range(3):
+        composer.press("Backspace")
+    _settled_geometry(page)
+    _scroll_to_distance_from_bottom(page, 180)
+    same_frame_escaped = _settled_geometry(page)
+    assert abs(same_frame_escaped["distanceFromBottom"] - 180) <= 1, same_frame_escaped
+
+    combined = _append_output_while_growing_composer(page, 240, 90)
+    same_frame_grown = _settled_geometry(page)
+    total_added_height = same_frame_grown["viewport"][1] - combined["before"]["scrollHeight"]
+    assert total_added_height > 0, (combined, same_frame_grown)
+    assert same_frame_grown["viewport"][0] < combined["before"]["clientHeight"], (
+        combined,
+        same_frame_grown,
+    )
+    assert page.locator('[data-testid="same-frame-output-probe"]').count() == 1
+    assert page.locator('[data-testid="during-restore-output-probe"]').count() == 1
+    expected_same_frame_distance = same_frame_escaped["distanceFromBottom"] + total_added_height
+    assert abs(same_frame_grown["distanceFromBottom"] - expected_same_frame_distance) <= 1, (
+        same_frame_escaped,
+        combined,
+        same_frame_grown,
+    )
+    assert abs(same_frame_grown["overlap"]) <= 1, same_frame_grown
+    expect(composer).to_be_focused()

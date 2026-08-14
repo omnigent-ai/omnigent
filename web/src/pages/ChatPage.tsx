@@ -2375,111 +2375,208 @@ function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
  * `scrollTop = scrollHeight - clientHeight - distance`. We also observe the
  * transcript content: output can keep growing while an escaped reader's
  * `scrollTop` stays still, so that growth must increase the stored distance
- * before a later composer resize restores it. An explicit restore target
- * distinguishes our own scroll from the next genuine user scroll.
+ * before a later composer resize restores it. The boundary before the trailing
+ * spacer distinguishes output growth from viewport-only layout changes, while
+ * explicit input intent distinguishes genuine reader scrolling from synthetic
+ * clamp and restore events.
  */
 function PreserveScrollDistanceOnResize() {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     contentRef?: React.RefObject<HTMLElement>;
     scrollRef?: React.RefObject<HTMLElement>;
+    stopScroll?: () => void;
   };
   const contentRef = ctx.contentRef;
   const scrollRef = ctx.scrollRef;
   const state = ctx.state;
+  const stopScroll = ctx.stopScroll;
 
   useEffect(() => {
     const el = scrollRef?.current;
     if (!el) return;
+    const content = (contentRef?.current ?? el.firstElementChild) as HTMLElement | null;
+    const spacer = content?.lastElementChild as HTMLElement | null;
 
     const measure = () => el.scrollHeight - el.clientHeight - el.scrollTop;
-    let distance = state.escapedFromLock ? Math.max(0, measure()) : 1;
+    const measureContentExtent = () =>
+      content && spacer
+        ? spacer.getBoundingClientRect().top - content.getBoundingClientRect().top
+        : el.scrollHeight;
+    let escaped = state.escapedFromLock;
+    let distance = escaped ? Math.max(0, measure()) : 1;
     let prevSH = el.scrollHeight;
     let prevCH = el.clientHeight;
+    let prevContentExtent = measureContentExtent();
     let restoring = false;
     let restoreFrame: number | null = null;
     let clearRestoreFrame: number | null = null;
+    let clearRestoreTimer: number | null = null;
     let restorePasses = 0;
     let scrollTimer: number | null = null;
+    let userIntentTimer: number | null = null;
+    let userScrollIntent = false;
+    let pointerScrolling = false;
 
-    const reconcileContentHeight = (scrollHeight: number) => {
+    const reconcileContentHeight = (scrollHeight: number, clientHeight: number) => {
       const delta = scrollHeight - prevSH;
-      if (delta === 0) return;
-      distance = state.escapedFromLock ? Math.max(0, distance + delta) : 1;
+      const contentExtent = measureContentExtent();
+      const contentChanged = Math.abs(contentExtent - prevContentExtent) >= 1;
+      const viewportResizeActive = restoring || clientHeight !== prevCH;
+      if (delta !== 0 && (!viewportResizeActive || contentChanged)) {
+        distance = escaped ? Math.max(0, distance + delta) : 1;
+      }
       prevSH = scrollHeight;
+      prevContentExtent = contentExtent;
+    };
+
+    const preserveEscapedState = () => {
+      if (!escaped) return;
+      stopScroll?.();
+      state.escapedFromLock = true;
+      state.isAtBottom = false;
     };
 
     const applyRestore = () => {
       restoreFrame = null;
       const scrollHeight = el.scrollHeight;
       const clientHeight = el.clientHeight;
+      reconcileContentHeight(scrollHeight, clientHeight);
+      preserveEscapedState();
       const maxScrollTop = Math.max(0, scrollHeight - clientHeight);
       el.scrollTop = Math.max(0, Math.min(maxScrollTop, maxScrollTop - distance));
-      prevSH = el.scrollHeight;
       prevCH = el.clientHeight;
       clearRestoreFrame = requestAnimationFrame(() => {
         clearRestoreFrame = null;
-        if (Math.abs(Math.max(0, measure()) - distance) > 1 && restorePasses < 3) {
-          restorePasses += 1;
-          restoreFrame = requestAnimationFrame(applyRestore);
-          return;
-        }
-        restoring = false;
-        restorePasses = 0;
+        clearRestoreTimer = window.setTimeout(() => {
+          clearRestoreTimer = null;
+          if (Math.abs(Math.max(0, measure()) - distance) > 1 && restorePasses < 3) {
+            restorePasses += 1;
+            restoreFrame = requestAnimationFrame(applyRestore);
+            return;
+          }
+          restoring = false;
+          restorePasses = 0;
+        }, 2);
       });
     };
 
     const scheduleRestore = () => {
-      if (!restoring) restorePasses = 0;
-      restoring = true;
-      if (restoreFrame !== null) cancelAnimationFrame(restoreFrame);
-      if (clearRestoreFrame !== null) cancelAnimationFrame(clearRestoreFrame);
+      preserveEscapedState();
+      if (!restoring) {
+        restorePasses = 0;
+        restoring = true;
+      }
+      if (clearRestoreFrame !== null) {
+        cancelAnimationFrame(clearRestoreFrame);
+        clearRestoreFrame = null;
+      }
+      if (clearRestoreTimer !== null) {
+        window.clearTimeout(clearRestoreTimer);
+        clearRestoreTimer = null;
+      }
+      if (restoreFrame !== null) return;
       restoreFrame = requestAnimationFrame(applyRestore);
+    };
+
+    const cancelRestore = () => {
+      if (restoreFrame !== null) {
+        cancelAnimationFrame(restoreFrame);
+        restoreFrame = null;
+      }
+      if (clearRestoreFrame !== null) {
+        cancelAnimationFrame(clearRestoreFrame);
+        clearRestoreFrame = null;
+      }
+      if (clearRestoreTimer !== null) {
+        window.clearTimeout(clearRestoreTimer);
+        clearRestoreTimer = null;
+      }
+      restoring = false;
+      restorePasses = 0;
+    };
+
+    const markUserScrollIntent = () => {
+      userScrollIntent = true;
+      if (userIntentTimer !== null) window.clearTimeout(userIntentTimer);
+      userIntentTimer = window.setTimeout(() => {
+        userIntentTimer = null;
+        userScrollIntent = false;
+      }, 150);
+    };
+
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
+        markUserScrollIntent();
+      }
+    };
+
+    const onPointerDown = () => {
+      pointerScrolling = true;
+    };
+
+    const onPointerUp = () => {
+      pointerScrolling = false;
     };
 
     const onScroll = () => {
       if (scrollTimer !== null) window.clearTimeout(scrollTimer);
-      // The library updates `escapedFromLock` one millisecond after its scroll
-      // listener runs. Read its stable mutable state after that classification
-      // so scrollbar drags and the first post-stream user scroll are genuine,
-      // while its own bottom-lock scrolls remain synthetic here.
+      // Explicit wheel/key/pointer intent distinguishes genuine reader movement
+      // from the library's own clamp and bottom-lock scrolls.
       scrollTimer = window.setTimeout(() => {
         scrollTimer = null;
-        if (restoring) return;
+        const userInitiated = userScrollIntent || pointerScrolling;
+        userScrollIntent = false;
+        if (userIntentTimer !== null) {
+          window.clearTimeout(userIntentTimer);
+          userIntentTimer = null;
+        }
         const sh = el.scrollHeight;
         const ch = el.clientHeight;
-        if (ch !== prevCH) {
-          scheduleRestore();
+        reconcileContentHeight(sh, ch);
+        if (!userInitiated) {
+          if (ch !== prevCH) scheduleRestore();
           return;
         }
-        distance = state.escapedFromLock ? Math.max(0, measure()) : 1;
-        prevSH = sh;
+        if (restoring) cancelRestore();
+        const measuredDistance = Math.max(0, measure());
+        escaped = measuredDistance > 1;
+        distance = escaped ? measuredDistance : 1;
+        if (escaped) stopScroll?.();
+        state.escapedFromLock = escaped;
+        state.isAtBottom = !escaped;
         prevCH = ch;
       }, 2);
     };
 
     const observer = new ResizeObserver(() => {
-      const sh = el.scrollHeight;
       const ch = el.clientHeight;
-      if (restoring) {
-        scheduleRestore();
-        return;
-      }
+      reconcileContentHeight(el.scrollHeight, ch);
       if (ch !== prevCH) scheduleRestore();
-      else reconcileContentHeight(sh);
     });
 
     el.addEventListener("scroll", onScroll, { passive: true });
+    el.addEventListener("wheel", markUserScrollIntent, { passive: true });
+    el.addEventListener("keydown", onKeyDown);
+    el.addEventListener("pointerdown", onPointerDown, { passive: true });
+    window.addEventListener("pointerup", onPointerUp, { passive: true });
+    window.addEventListener("pointercancel", onPointerUp, { passive: true });
     observer.observe(el);
-    const content = contentRef?.current ?? el.firstElementChild;
     if (content) observer.observe(content);
     return () => {
       el.removeEventListener("scroll", onScroll);
+      el.removeEventListener("wheel", markUserScrollIntent);
+      el.removeEventListener("keydown", onKeyDown);
+      el.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
       observer.disconnect();
       if (scrollTimer !== null) window.clearTimeout(scrollTimer);
+      if (userIntentTimer !== null) window.clearTimeout(userIntentTimer);
       if (restoreFrame !== null) cancelAnimationFrame(restoreFrame);
       if (clearRestoreFrame !== null) cancelAnimationFrame(clearRestoreFrame);
+      if (clearRestoreTimer !== null) window.clearTimeout(clearRestoreTimer);
     };
-  }, [contentRef, scrollRef, state]);
+  }, [contentRef, scrollRef, state, stopScroll]);
 
   return null;
 }
