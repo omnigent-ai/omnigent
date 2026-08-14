@@ -2380,7 +2380,7 @@ function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
  * explicit input intent distinguishes genuine reader scrolling from synthetic
  * clamp and restore events.
  */
-function PreserveScrollDistanceOnResize() {
+export function PreserveScrollDistanceOnResize() {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     contentRef?: React.RefObject<HTMLElement>;
     scrollRef?: React.RefObject<HTMLElement>;

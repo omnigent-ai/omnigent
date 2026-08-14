@@ -3,10 +3,18 @@ import { Profiler, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UserMessageBlock } from "@/lib/blocks";
 import { useChatStore } from "@/store/chatStore";
-import { HistoryAutoLoader, JumpToTopButton, LatestTurnSpacer } from "./ChatPage";
+import {
+  HistoryAutoLoader,
+  JumpToTopButton,
+  LatestTurnSpacer,
+  PreserveScrollDistanceOnResize,
+} from "./ChatPage";
 
 const stickContext = vi.hoisted(() => ({
   scrollRef: { current: null as HTMLElement | null },
+  contentRef: { current: null as HTMLElement | null },
+  state: { isAtBottom: false, escapedFromLock: true },
+  stopScroll: undefined as (() => void) | undefined,
 }));
 
 vi.mock("use-stick-to-bottom", () => ({
@@ -58,6 +66,153 @@ function setScrollMetrics(
     get: () => metrics.clientHeight ?? 0,
   });
 }
+
+describe("PreserveScrollDistanceOnResize", () => {
+  let resize: (() => void) | null;
+  let disconnectSpy = vi.fn<() => void>();
+  let nextFrameId: number;
+  let frames: Map<number, FrameRequestCallback>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resize = null;
+    disconnectSpy.mockClear();
+    nextFrameId = 1;
+    frames = new Map();
+    stickContext.scrollRef.current = null;
+    stickContext.contentRef.current = null;
+    stickContext.state.isAtBottom = false;
+    stickContext.state.escapedFromLock = true;
+    stickContext.stopScroll = vi.fn();
+
+    class StubResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resize = () => callback([], this as unknown as ResizeObserver);
+      }
+      observe() {}
+      disconnect() {
+        disconnectSpy();
+      }
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    vi.stubGlobal(
+      "requestAnimationFrame",
+      vi.fn((callback: FrameRequestCallback) => {
+        const id = nextFrameId++;
+        frames.set(id, callback);
+        return id;
+      }),
+    );
+    vi.stubGlobal(
+      "cancelAnimationFrame",
+      vi.fn((id: number) => {
+        frames.delete(id);
+      }),
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.clearAllTimers();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    stickContext.scrollRef.current = null;
+    stickContext.contentRef.current = null;
+    stickContext.stopScroll = undefined;
+  });
+
+  function flushRestore() {
+    act(() => {
+      for (let pass = 0; pass < 5 && frames.size > 0; pass += 1) {
+        const callbacks = [...frames.values()];
+        frames.clear();
+        for (const callback of callbacks) callback(performance.now());
+        vi.advanceTimersByTime(3);
+      }
+    });
+  }
+
+  function makeScrollRoot() {
+    const metrics = { scrollTop: 800, scrollHeight: 2000, clientHeight: 700 };
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, metrics);
+    stickContext.scrollRef.current = scrollRoot;
+    return { metrics, scrollRoot };
+  }
+
+  it("preserves post-release momentum through scrollend and cancels an active restore", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    render(<PreserveScrollDistanceOnResize />);
+
+    fireEvent.pointerDown(scrollRoot);
+    fireEvent.scroll(scrollRoot);
+    act(() => vi.advanceTimersByTime(2));
+    fireEvent.pointerUp(window);
+
+    metrics.clientHeight = 650;
+    act(() => resize?.());
+    expect(frames.size).toBe(1);
+
+    metrics.scrollTop = 700;
+    fireEvent.scroll(scrollRoot);
+    act(() => vi.advanceTimersByTime(2));
+    expect(cancelAnimationFrame).toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+
+    fireEvent(scrollRoot, new Event("scrollend"));
+    act(() => vi.advanceTimersByTime(22));
+
+    metrics.clientHeight = 600;
+    act(() => resize?.());
+    flushRestore();
+
+    expect(metrics.scrollHeight - metrics.clientHeight - metrics.scrollTop).toBe(650);
+    expect(stickContext.state.escapedFromLock).toBe(true);
+    expect(stickContext.state.isAtBottom).toBe(false);
+  });
+
+  it("keeps momentum active until the last-scroll debounce when scrollend is unavailable", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    render(<PreserveScrollDistanceOnResize />);
+
+    fireEvent.pointerDown(scrollRoot);
+    fireEvent.scroll(scrollRoot);
+    act(() => vi.advanceTimersByTime(2));
+    fireEvent.pointerUp(window);
+
+    metrics.scrollTop = 700;
+    fireEvent.scroll(scrollRoot);
+    act(() => vi.advanceTimersByTime(142));
+
+    metrics.scrollTop = 650;
+    fireEvent.scroll(scrollRoot);
+    act(() => vi.advanceTimersByTime(152));
+
+    metrics.clientHeight = 600;
+    act(() => resize?.());
+    flushRestore();
+
+    expect(metrics.scrollHeight - metrics.clientHeight - metrics.scrollTop).toBe(650);
+  });
+
+  it("cleans up observer, pointer intent, timers, and queued restore frames", () => {
+    const { metrics, scrollRoot } = makeScrollRoot();
+    const { unmount } = render(<PreserveScrollDistanceOnResize />);
+
+    fireEvent.pointerDown(scrollRoot);
+    fireEvent.pointerUp(window);
+    metrics.clientHeight = 650;
+    act(() => resize?.());
+    expect(frames.size).toBe(1);
+
+    unmount();
+
+    expect(disconnectSpy).toHaveBeenCalledOnce();
+    expect(cancelAnimationFrame).toHaveBeenCalled();
+    expect(frames.size).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
 
 describe("HistoryAutoLoader", () => {
   beforeEach(() => {
