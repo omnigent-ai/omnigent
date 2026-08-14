@@ -326,6 +326,7 @@ def test_sanitize_real_sys_session_send_args_collapses_to_object() -> None:
         "input",
         "purpose",
         "model",
+        "reasoning_effort",
         "file_ids",
         "cost_budget",
     }
