@@ -17,6 +17,7 @@ import json
 import uuid
 from dataclasses import dataclass
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -7310,6 +7311,53 @@ async def test_stop_session_no_runner_lifts_stop_fence(
     finally:
         if session_id is not None:
             _interrupt_fenced_sessions.discard(session_id)
+
+
+async def test_retry_session_reconnects_without_persisting_or_forwarding_input(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry reconnects the existing runner without replaying user input."""
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], initial_message="Keep this once")
+    before = await client.get(f"/v1/sessions/{session['id']}")
+    before_items = before.json()["items"]
+    runner_client = object()
+    get_runner = AsyncMock(return_value=runner_client)
+    relay_ready = AsyncMock(return_value=None)
+    monkeypatch.setattr(routes_events, "_get_runner_client", get_runner)
+    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", relay_ready)
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"queued": False}
+    get_runner.assert_awaited()
+    relay_ready.assert_awaited_once()
+    after = await client.get(f"/v1/sessions/{session['id']}")
+    assert after.json()["items"] == before_items
+
+
+async def test_retry_session_keeps_error_actionable_when_runner_is_unavailable(
+    client: httpx.AsyncClient,
+) -> None:
+    """Retry fails loud when no runner can reconnect, without adding history."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+
+    assert response.status_code == 503, response.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["items"] == []
 
 
 @pytest.mark.parametrize(

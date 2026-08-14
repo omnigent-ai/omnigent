@@ -1,8 +1,195 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
-import { RoutingDecisionCard } from "./StatusBlocks";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { copyText } from "@/lib/clipboard";
+import { ErrorBanner, RoutingDecisionCard } from "./StatusBlocks";
+
+vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
 
 afterEach(cleanup);
+
+const TERMINAL_ERROR = [
+  "Required terminal exited unexpectedly; the session runtime is no longer available.",
+  "",
+  "Terminal diagnostics:",
+  "terminal: claude:main",
+  "command: claude (8 args; argv omitted because terminal args may contain secrets)",
+  "cwd: /Users/corey.zumar",
+  "shell: /bin/zsh",
+  "pid: 48291",
+  "runtime: claude-code 1.0.83",
+  "session_id: sess_8f4a2c19",
+  "started_at: Tue Aug 11 16:42:18 2026",
+  "last_heartbeat: Tue Aug 11 17:00:44 2026",
+  "exit_code: 0",
+  "signal: none",
+  "pty_status: detached",
+  "reconnect_attempts: 3",
+  "termination_reason: terminal pane no longer available",
+  "",
+  "Last captured terminal output:",
+  "Pane is dead (status 0, Tue Aug 11 17:00:46 2026)",
+].join("\n");
+
+describe("ErrorBanner", () => {
+  beforeEach(() => vi.mocked(copyText).mockClear());
+
+  it("renders compact by default and expands labeled message content", () => {
+    render(
+      <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
+    );
+
+    const messageToggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
+    expect(messageToggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("Message")).toBeNull();
+    fireEvent.click(messageToggle);
+    expect(messageToggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("Message")).toBeInTheDocument();
+    const message = screen.getByTestId("error-message-content");
+    expect(message).toHaveClass("whitespace-pre-wrap");
+    expect(message).toHaveClass("break-words");
+    expect(message).toHaveTextContent(/Required terminal exited unexpectedly/);
+    expect(message).not.toHaveTextContent("terminal: claude:main");
+  });
+
+  it("preserves classified title, cause, and remediation semantics", () => {
+    render(
+      <ErrorBanner
+        message={TERMINAL_ERROR}
+        source="execution"
+        code="required_terminal_exited"
+        title="Claude Code can't run as root"
+        cause="Claude Code refuses this launch mode when the host runs as root."
+        remediation="Run the host as a non-root user (uid != 0)."
+      />,
+    );
+    expect(screen.getByText("Claude Code can't run as root")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Claude Code can't run as root/i }));
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent(
+      "Claude Code refuses this launch mode when the host runs as root.",
+    );
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent(
+      "Try this: Run the host as a non-root user (uid != 0).",
+    );
+  });
+
+  it("separates terminal diagnostics and last output into tabs", () => {
+    render(
+      <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
+    const terminal = screen.getByTestId("error-diagnostics-content");
+    expect(terminal).toHaveTextContent("terminal: claude:main");
+    expect(terminal).toHaveTextContent("termination_reason: terminal pane no longer available");
+    expect(terminal).not.toHaveTextContent("Pane is dead");
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Last captured output" }));
+    expect(screen.getByRole("tab", { name: "Last captured output" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getAllByTestId("error-diagnostics-content").at(-1)).toHaveTextContent(
+      "Pane is dead",
+    );
+  });
+
+  it("copies message and active diagnostics with accessible confirmation", async () => {
+    render(
+      <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy message" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Message copied" })).toBeTruthy(),
+    );
+    expect(copyText).toHaveBeenCalledWith(
+      "Required terminal exited unexpectedly; the session runtime is no longer available.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Last captured output" }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy last captured output" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Last captured output copied" })).toBeTruthy(),
+    );
+    expect(copyText).toHaveBeenLastCalledWith("Pane is dead (status 0, Tue Aug 11 17:00:46 2026)");
+  });
+
+  it("falls back to a non-empty message without diagnostics controls", () => {
+    render(<ErrorBanner message="" source="" code="mystery_failure" />);
+    fireEvent.click(screen.getByRole("button", { name: "Something went wrong" }));
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent("mystery_failure");
+    expect(screen.queryByRole("button", { name: "View diagnostics" })).toBeNull();
+  });
+
+  it("dismisses only the visible banner", () => {
+    render(
+      <div>
+        <span>Unrelated transcript content</span>
+        <ErrorBanner message="boom" source="execution" code="executor_error" />
+      </div>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss error" }));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByText("Unrelated transcript content")).toBeInTheDocument();
+  });
+
+  it("prevents duplicate retries and resolves the banner on success", async () => {
+    let resolveRetry: (() => void) | undefined;
+    const onRetry = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRetry = resolve;
+        }),
+    );
+    render(
+      <ErrorBanner
+        message={TERMINAL_ERROR}
+        source="execution"
+        code="required_terminal_exited"
+        onRetry={onRetry}
+      />,
+    );
+    const retry = screen.getByRole("button", { name: "Retry" });
+    act(() => {
+      retry.click();
+      retry.click();
+    });
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
+    expect(retry).toBeDisabled();
+    resolveRetry?.();
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  });
+
+  it("restores the actionable error and diagnostics when retry fails", async () => {
+    const onRetry = vi.fn().mockRejectedValue(new Error("Host is still offline"));
+    render(
+      <ErrorBanner
+        message={TERMINAL_ERROR}
+        source="execution"
+        code="required_terminal_exited"
+        onRetry={onRetry}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("Retry failed: Host is still offline")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    expect(screen.getByRole("button", { name: "View diagnostics" })).toBeInTheDocument();
+  });
+
+  it("does not invent retry for non-retryable variants", () => {
+    render(
+      <ErrorBanner
+        message="The conversation is too long."
+        source="llm"
+        code="context_length_exceeded"
+        onRetry={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+});
 
 describe("RoutingDecisionCard — session-level auto-routing", () => {
   it("applied verdict: shows model pill with tier and rationale", () => {

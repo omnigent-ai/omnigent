@@ -965,6 +965,11 @@ export function stopSession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "stop_session", data: {} });
 }
 
+/** Reconnect or relaunch the existing runner without replaying user input. */
+export function retrySession(sessionId: string): Promise<PostEventResponse> {
+  return postEvent(sessionId, { type: "retry_session", data: {} });
+}
+
 /**
  * Resolve an outstanding elicitation via its dedicated URL endpoint
  * (URL-based elicitation): `POST /v1/sessions/{id}/elicitations/{eid}/resolve`

@@ -102,6 +102,7 @@ from omnigent.server.routes._sessions.common import (
     _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
     _INTERRUPT_TYPE,
     _MCP_ELICITATION_TYPE,
+    _RETRY_SESSION_TYPE,
     _SLASH_COMMAND_TYPE,
     _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_SESSION_TYPE,
@@ -309,6 +310,8 @@ def register_events_routes(
           it writes no persistent marker, so the next message
           auto-relaunches the session on its (still-online) host via
           the normal message-dispatch relaunch path.
+        - ``"retry_session"`` reconnects or relaunches the existing
+          session runner without persisting or replaying user input.
         - ``"message"`` on an ``omnigent claude`` terminal session
           is forwarded to the bound runner for tmux injection only;
           the accepted prompt is persisted later when Claude records
@@ -383,6 +386,7 @@ def register_events_routes(
             _COMPACT_TYPE,
             _SLASH_COMMAND_TYPE,
             _STOP_SESSION_TYPE,
+            _RETRY_SESSION_TYPE,
             _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             _EXTERNAL_CONVERSATION_ITEM_TYPE,
             _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
@@ -1476,6 +1480,8 @@ def register_events_routes(
             runner_client,
             conversation_store,
         )
+        if body.type == _RETRY_SESSION_TYPE:
+            return {"queued": False}
         _agent = agent_store.get(conv.agent_id) if conv.agent_id else None
         # Determine whether the agent has MCP servers so the runner's
         # proxy_stream handler knows to initialise ProxyMcpManager.

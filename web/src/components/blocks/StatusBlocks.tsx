@@ -10,17 +10,24 @@
 import {
   AlertCircleIcon,
   BrainCircuitIcon,
+  CheckIcon,
   ChevronRightIcon,
+  CopyIcon,
+  LoaderCircleIcon,
   RotateCcwIcon,
   ShieldXIcon,
   ShrinkIcon,
+  XIcon,
 } from "lucide-react";
-import { useMemo } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
 import { DatabricksIcon } from "@/components/icons/DatabricksIcon";
+import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { shortModelName } from "@/components/CostRoutingControl";
+import { copyText } from "@/lib/clipboard";
 import {
   type RoutingDecisionExtras,
   harnessDisplayLabel,
@@ -39,6 +46,8 @@ interface ErrorBannerProps {
   cause?: string;
   /** Concrete next step to fix it, e.g. a command to run. */
   remediation?: string;
+  /** Reconnect the existing session without replaying or duplicating user input. */
+  onRetry?: () => Promise<void>;
 }
 
 /**
@@ -59,6 +68,64 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   executor_error: "The agent runtime hit an error while running the turn.",
 };
 
+const RETRYABLE_ERROR_CODES = new Set([
+  "required_terminal_exited",
+  "terminal_launch_failed",
+  "runner_error",
+  "runner_disconnected",
+  "runner_failed_to_start",
+  "runner_unavailable",
+  "connection_error",
+  "executor_error",
+  "wrong_replica",
+]);
+
+interface ParsedErrorMessage {
+  message: string;
+  terminal: string | null;
+  lastOutput: string | null;
+}
+
+const DIAGNOSTICS_HEADING = /^(?:terminal|lifecycle) diagnostics:\s*$/i;
+const LAST_OUTPUT_HEADING = /^last captured (?:terminal )?output:\s*(.*)$/i;
+
+function trimBlankBoundaryLines(lines: string[]): string | null {
+  let start = 0;
+  let end = lines.length;
+  while (start < end && lines[start]!.trim() === "") start += 1;
+  while (end > start && lines[end - 1]!.trim() === "") end -= 1;
+  return start < end ? lines.slice(start, end).join("\n") : null;
+}
+
+function parseErrorMessage(rawMessage: string): ParsedErrorMessage {
+  const lines = rawMessage.replace(/\r\n?/g, "\n").split("\n");
+  const diagnosticsIndex = lines.findIndex((line) => DIAGNOSTICS_HEADING.test(line.trim()));
+  const searchStart = diagnosticsIndex >= 0 ? diagnosticsIndex + 1 : 0;
+  const lastOutputIndex = lines.findIndex(
+    (line, index) => index >= searchStart && LAST_OUTPUT_HEADING.test(line.trim()),
+  );
+
+  if (diagnosticsIndex < 0 && lastOutputIndex < 0) {
+    return { message: rawMessage.trim(), terminal: null, lastOutput: null };
+  }
+
+  const messageEnd = diagnosticsIndex >= 0 ? diagnosticsIndex : lastOutputIndex;
+  const message = lines.slice(0, messageEnd).join("\n").trim();
+  const terminal =
+    diagnosticsIndex >= 0
+      ? trimBlankBoundaryLines(
+          lines.slice(diagnosticsIndex + 1, lastOutputIndex >= 0 ? lastOutputIndex : undefined),
+        )
+      : null;
+  let lastOutput: string | null = null;
+  if (lastOutputIndex >= 0) {
+    const headingMatch = lines[lastOutputIndex]!.trim().match(LAST_OUTPUT_HEADING);
+    const headingValue = headingMatch?.[1]?.trim() ?? "";
+    lastOutput = trimBlankBoundaryLines([headingValue, ...lines.slice(lastOutputIndex + 1)]);
+  }
+  return { message, terminal, lastOutput };
+}
+
 /**
  * Loud destructive banner for `error` blocks.
  *
@@ -76,56 +143,232 @@ export function ErrorBanner({
   title,
   cause,
   remediation,
+  onRetry,
 }: ErrorBannerProps) {
-  // Headline: the friendly title, else a plain-English sentence for a known
-  // code, else a generic fallback. Never the raw enum.
   const headline = title || FAILURE_CODE_DESCRIPTIONS[code] || "Something went wrong";
-  // Body under the headline: the classifier's cause, else the raw message.
-  // Suppressed when it would merely echo the headline (e.g. a known code with
-  // an empty message), so the panel never shows the same sentence twice or a
-  // bare code string.
-  const bodyText = cause || message || "";
-  const explanation = bodyText && bodyText !== headline ? bodyText : null;
-  // With a friendly title, the raw message is the detailed diagnostics blob —
-  // keep it available but folded away. Without one, the message is already the
-  // explanation, so there's nothing extra to fold.
-  const details = title && message && message !== explanation ? message : null;
+  const parsed = useMemo(() => parseErrorMessage(message), [message]);
+  const messageText = useMemo(() => {
+    const parts: string[] = [];
+    if (cause) parts.push(cause);
+    if (remediation) parts.push(`Try this: ${remediation}`);
+    if (!cause && parsed.message && parsed.message !== headline) parts.push(parsed.message);
+    if (parts.length === 0) parts.push(parsed.message || code || headline);
+    return parts.join("\n\n");
+  }, [cause, code, headline, parsed.message, remediation]);
+  const diagnostics = useMemo(
+    () =>
+      [
+        parsed.terminal ? { id: "terminal", label: "Terminal", content: parsed.terminal } : null,
+        parsed.lastOutput
+          ? { id: "output", label: "Last captured output", content: parsed.lastOutput }
+          : null,
+      ].filter((item): item is { id: string; label: string; content: string } => item !== null),
+    [parsed.lastOutput, parsed.terminal],
+  );
+  const [expanded, setExpanded] = useState(false);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [activeDiagnostics, setActiveDiagnostics] = useState(diagnostics[0]?.id ?? "terminal");
+  const [copiedTarget, setCopiedTarget] = useState<string | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState<string | null>(null);
+  const [dismissed, setDismissed] = useState(false);
+  const copyResetRef = useRef<number>(0);
+  const retryInFlightRef = useRef(false);
+  const messageId = useId();
+  const diagnosticsId = useId();
+  const retryable = onRetry !== undefined && RETRYABLE_ERROR_CODES.has(code);
+
+  useEffect(() => () => window.clearTimeout(copyResetRef.current), []);
+
+  if (dismissed) return null;
+
+  const copy = async (target: string, value: string) => {
+    await copyText(value);
+    setCopiedTarget(target);
+    window.clearTimeout(copyResetRef.current);
+    copyResetRef.current = window.setTimeout(() => setCopiedTarget(null), 2000);
+  };
+
+  const retry = async () => {
+    if (!onRetry || retryInFlightRef.current) return;
+    retryInFlightRef.current = true;
+    setRetrying(true);
+    setRetryError(null);
+    try {
+      await onRetry();
+      setDismissed(true);
+    } catch (error) {
+      retryInFlightRef.current = false;
+      setRetryError(`Retry failed: ${error instanceof Error ? error.message : String(error)}`);
+      setRetrying(false);
+    }
+  };
 
   return (
     <Alert
       variant="destructive"
-      className="min-w-0 max-w-full overflow-hidden has-[>svg]:grid-cols-[auto_minmax(0,1fr)]"
+      className="w-[min(35rem,100%)] min-w-0 max-w-full overflow-hidden border-destructive/35 bg-destructive/[0.04] has-[>svg]:grid-cols-[auto_minmax(0,1fr)]"
     >
-      <AlertCircleIcon />
-      <AlertTitle className="min-w-0 break-words [overflow-wrap:anywhere]">
-        {headline}
-        {source ? ` · ${source}` : ""}
-      </AlertTitle>
-      <AlertDescription className="min-w-0 max-w-full space-y-2 overflow-hidden">
-        {explanation ? (
-          <span className="block max-w-full whitespace-pre-wrap break-words [overflow-wrap:anywhere] [text-wrap:wrap]">
-            {explanation}
-          </span>
-        ) : null}
-        {remediation ? (
-          <span className="block max-w-full break-words font-medium [overflow-wrap:anywhere]">
-            Try this: {remediation}
-          </span>
-        ) : null}
-        {details ? (
-          <Collapsible>
-            <CollapsibleTrigger className="group flex items-center gap-1 text-xs opacity-80 hover:opacity-100">
-              <ChevronRightIcon className="size-3 transition-transform group-data-[state=open]:rotate-90" />
-              Details{code ? ` · ${code}` : ""}
-            </CollapsibleTrigger>
-            <CollapsibleContent>
-              <span className="mt-1 block max-w-full whitespace-pre-wrap break-words font-mono text-xs opacity-80 [overflow-wrap:anywhere] [text-wrap:wrap]">
-                {details}
+      <AlertCircleIcon className="mt-0.5 size-4" />
+      <div className="min-w-0 max-w-full">
+        <div className="flex min-w-0 items-start gap-1">
+          <button
+            type="button"
+            aria-expanded={expanded}
+            aria-controls={messageId}
+            onClick={() => setExpanded((value) => !value)}
+            className="group min-w-0 flex-1 cursor-pointer rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          >
+            <AlertTitle className="flex min-w-0 items-start gap-1.5 pr-1">
+              <ChevronRightIcon
+                className={cn(
+                  "mt-0.5 size-3.5 shrink-0 transition-transform",
+                  expanded && "rotate-90",
+                )}
+                aria-hidden="true"
+              />
+              <span className="min-w-0 break-words [overflow-wrap:anywhere]">
+                {headline}
+                {source ? (
+                  <span className="font-normal text-destructive/75"> · {source}</span>
+                ) : null}
               </span>
-            </CollapsibleContent>
-          </Collapsible>
+            </AlertTitle>
+          </button>
+          {retryable ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              onClick={() => void retry()}
+              disabled={retrying}
+              className="shrink-0 text-muted-foreground hover:text-foreground"
+            >
+              {retrying ? (
+                <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+              ) : (
+                <RotateCcwIcon aria-hidden="true" />
+              )}
+              Retry
+            </Button>
+          ) : null}
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Dismiss error"
+            onClick={() => setDismissed(true)}
+            className="shrink-0 text-muted-foreground hover:text-foreground"
+          >
+            <XIcon aria-hidden="true" />
+          </Button>
+        </div>
+        {retrying ? (
+          <div role="status" aria-live="polite" className="mt-1 text-xs text-muted-foreground">
+            Reconnecting…
+          </div>
         ) : null}
-      </AlertDescription>
+        {retryError ? (
+          <div className="mt-1 break-words text-xs text-destructive [overflow-wrap:anywhere]">
+            {retryError}
+          </div>
+        ) : null}
+        {expanded ? (
+          <AlertDescription
+            id={messageId}
+            className="mt-2 min-w-0 max-w-full space-y-3 overflow-hidden text-foreground"
+          >
+            <section aria-labelledby={`${messageId}-label`} className="min-w-0 space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <h4 id={`${messageId}-label`} className="text-xs font-medium text-muted-foreground">
+                  Message
+                </h4>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={copiedTarget === "message" ? "Message copied" : "Copy message"}
+                  onClick={() => void copy("message", messageText)}
+                >
+                  {copiedTarget === "message" ? (
+                    <CheckIcon aria-hidden="true" />
+                  ) : (
+                    <CopyIcon aria-hidden="true" />
+                  )}
+                </Button>
+              </div>
+              <div
+                data-testid="error-message-content"
+                className="max-w-full whitespace-pre-wrap break-words font-mono text-xs text-foreground [overflow-wrap:anywhere] [text-wrap:wrap]"
+              >
+                {messageText}
+              </div>
+            </section>
+            {diagnostics.length > 0 ? (
+              <Collapsible open={diagnosticsOpen} onOpenChange={setDiagnosticsOpen}>
+                <CollapsibleTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    aria-controls={diagnosticsId}
+                    className="px-0 text-muted-foreground hover:bg-transparent hover:text-foreground"
+                  >
+                    <ChevronRightIcon
+                      className={cn("transition-transform", diagnosticsOpen && "rotate-90")}
+                      aria-hidden="true"
+                    />
+                    View diagnostics
+                  </Button>
+                </CollapsibleTrigger>
+                <CollapsibleContent id={diagnosticsId} className="min-w-0 pt-1">
+                  <Tabs value={activeDiagnostics} onValueChange={setActiveDiagnostics}>
+                    {diagnostics.length > 1 ? (
+                      <TabsList variant="pill" aria-label="Diagnostic sections">
+                        {diagnostics.map((item) => (
+                          <TabsTrigger key={item.id} value={item.id}>
+                            {item.label}
+                          </TabsTrigger>
+                        ))}
+                      </TabsList>
+                    ) : null}
+                    {diagnostics.map((item) => (
+                      <TabsContent key={item.id} value={item.id} className="min-w-0">
+                        <div className="mt-1 flex min-w-0 items-start gap-1 rounded-md border border-border/70 bg-muted/35 p-2">
+                          <pre
+                            data-testid="error-diagnostics-content"
+                            className="max-h-56 min-w-0 flex-1 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-foreground [overflow-wrap:anywhere]"
+                          >
+                            {item.content}
+                          </pre>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-xs"
+                            className="shrink-0"
+                            aria-label={
+                              copiedTarget === item.id
+                                ? `${item.label} copied`
+                                : `Copy ${item.label.toLowerCase()}`
+                            }
+                            onClick={() => void copy(item.id, item.content)}
+                          >
+                            {copiedTarget === item.id ? (
+                              <CheckIcon aria-hidden="true" />
+                            ) : (
+                              <CopyIcon aria-hidden="true" />
+                            )}
+                          </Button>
+                        </div>
+                      </TabsContent>
+                    ))}
+                  </Tabs>
+                </CollapsibleContent>
+              </Collapsible>
+            ) : null}
+          </AlertDescription>
+        ) : null}
+      </div>
     </Alert>
   );
 }

@@ -106,6 +106,7 @@ import {
   liveCandidateAssistantIndex,
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { retrySession } from "@/lib/sessionsApi";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import {
@@ -3822,6 +3823,7 @@ function AssistantBubble({
   // common case. The "Working…" shimmer for the empty-items / streaming
   // gap is rendered at the page level, not inside this component.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const conversationId = useChatStore((s) => s.conversationId);
   // A pending elicitation means the turn is parked awaiting the user —
   // still in flight even when its lifecycle or the session status reads
   // settled (e.g. a reload while parked). Feeds the fold suppression.
@@ -3834,6 +3836,10 @@ function AssistantBubble({
   const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
+  const handleRetryError = useCallback(async () => {
+    if (!conversationId) throw new Error("Session is not available");
+    await retrySession(conversationId);
+  }, [conversationId]);
 
   if (bubble.items.length === 0) return null;
 
@@ -3882,6 +3888,7 @@ function AssistantBubble({
             hasPendingElicitation={hasPendingElicitation}
             lastActivityAtS={bubble.lastActivityAtS}
             showsWorking={showsWorking}
+            onRetryError={handleRetryError}
           />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (

@@ -138,18 +138,24 @@ describe("BlockRenderer dispatch", () => {
     expect(alert).toHaveClass("min-w-0");
     expect(alert).toHaveClass("overflow-hidden");
 
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
     const description = container.querySelector('[data-slot="alert-description"]');
     expect(description).not.toBeNull();
     expect(description).toHaveClass("min-w-0");
     expect(description).toHaveClass("overflow-hidden");
 
-    const messageNode = screen.getByText(/Required terminal exited unexpectedly/);
+    const messageNode = screen.getByTestId("error-message-content");
     expect(messageNode).toHaveClass("whitespace-pre-wrap");
     expect(messageNode).toHaveClass("break-words");
-    expect(messageNode.textContent).toContain(
-      "Lifecycle diagnostics:\nterminal: required-runtime:main",
+    expect(messageNode.textContent).toContain("Required terminal exited unexpectedly");
+    expect(messageNode.textContent).not.toContain("terminal: required-runtime:main");
+
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.getByTestId("error-diagnostics-content").textContent).toContain(
+      "terminal: required-runtime:main",
     );
-    expect(messageNode.textContent).toContain(
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Last captured output" }));
+    expect(screen.getAllByTestId("error-diagnostics-content").at(-1)?.textContent).toContain(
       "  - first diagnostic line\n  - second diagnostic line",
     );
   });
@@ -173,14 +179,46 @@ describe("BlockRenderer dispatch", () => {
 
     // Headline is the friendly title, not the raw code.
     expect(screen.getByText("Claude Code can't run as root")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: /Claude Code can't run as root/i }));
     // Cause is shown in plain English.
     expect(screen.getByText(/refuses the flag as root/)).toBeDefined();
     // Remediation is surfaced.
     expect(screen.getByText(/Run the host as a non-root user/)).toBeDefined();
-    // Raw diagnostics are folded away behind a Details toggle (collapsed).
-    expect(screen.getByText(/Details/)).toBeDefined();
+    // Raw diagnostics are folded away behind a nested disclosure.
+    expect(screen.getByRole("button", { name: "View diagnostics" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
     // The raw enum is NOT the visible headline.
     expect(screen.queryByText(/Error · required_terminal_exited/)).toBeNull();
+  });
+
+  it("forwards retryable errors once without inventing input replay", async () => {
+    let resolveRetry: (() => void) | undefined;
+    const onRetryError = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRetry = resolve;
+        }),
+    );
+    const item: Extract<RenderItem, { kind: "error" }> = {
+      kind: "error",
+      itemId: null,
+      source: "execution",
+      code: "required_terminal_exited",
+      message: "Terminal stopped",
+    };
+
+    render(<BlockRenderer items={[item]} sessionStatus="idle" onRetryError={onRetryError} />);
+    const retry = screen.getByRole("button", { name: "Retry" });
+    fireEvent.click(retry);
+    fireEvent.click(retry);
+
+    expect(onRetryError).toHaveBeenCalledTimes(1);
+    expect(onRetryError).toHaveBeenCalledWith(item);
+    expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
+    resolveRetry?.();
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
   });
 
   it("falls back to a code→sentence description for an unclassified failure", () => {
