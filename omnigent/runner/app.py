@@ -1139,6 +1139,40 @@ _subagent_work_by_child: dict[str, _SubagentWorkEntry] = {}
 _subagent_work_by_parent: dict[str, set[str]] = {}
 _drained_delivered_subagent_children: set[str] = set()
 
+# Per-(parent, agent_type) monotonic ordinal counter for structured
+# sub-agent names (e.g. "researcher-1", "researcher-2").
+_subagent_ordinal_counters: dict[tuple[str, str], int] = {}
+
+
+def next_subagent_ordinal(parent_session_id: str, agent_type: str) -> int:
+    """Return the next ordinal for a (parent, agent_type) pair and bump the counter."""
+    key = (parent_session_id, agent_type)
+    ordinal = _subagent_ordinal_counters.get(key, 0) + 1
+    _subagent_ordinal_counters[key] = ordinal
+    return ordinal
+
+
+def recover_subagent_ordinals(
+    parent_session_id: str,
+    agent_type: str,
+    existing_children: list[dict[str, object]],
+) -> None:
+    """Set the ordinal high-water mark from existing children after a runner restart."""
+    import re
+
+    key = (parent_session_id, agent_type)
+    if key in _subagent_ordinal_counters:
+        return
+    pattern = re.compile(rf"^{re.escape(agent_type)}-(\d+)$")
+    max_ordinal = 0
+    for child in existing_children:
+        session_name = child.get("session_name")
+        if isinstance(session_name, str):
+            m = pattern.match(session_name)
+            if m:
+                max_ordinal = max(max_ordinal, int(m.group(1)))
+    _subagent_ordinal_counters[key] = max_ordinal
+
 
 def register_subagent_work(
     *,
@@ -3118,6 +3152,27 @@ def create_runner_app(
             # Only claude reported terminal_ready in the create-session response.
             if harness_name == "claude-native":
                 terminal_ready = _launch_result
+
+                # Start the loopback relay now instead of at the first
+                # web-dispatched turn: a prompt typed directly in the TUI
+                # fires policy hooks immediately, and without the relay every
+                # hook falls back to a Python spawn + WAN round trip. In the
+                # background so session create doesn't wait on it — hooks
+                # that beat it use that same fallback.
+                async def _start_claude_relay_early() -> None:
+                    try:
+                        await _ensure_comment_relay_started(
+                            session_id, session_labels=init_context.labels
+                        )
+                    except Exception:
+                        _logger.exception("Failed to pre-start comment relay for %s", session_id)
+
+                _relay_task = asyncio.create_task(
+                    _start_claude_relay_early(),
+                    name=f"claude-comment-relay:{session_id}",
+                )
+                _relay_task.add_done_callback(_background_tasks.discard)
+                _background_tasks.add(_relay_task)
 
         if (
             spec is not None
@@ -7769,6 +7824,12 @@ def create_runner_app(
             read_only=read_only,
             on_client_interaction=entry.instance.note_client_interaction,
         )
+
+    # Reused by the loopback direct-attach listener (see
+    # ``omnigent.runner.direct_attach``): same attach handler served on a
+    # token-gated 127.0.0.1 port so a same-machine browser can skip the
+    # server relay.
+    app.state.terminal_attach_handler = terminal_resource_attach_ws
 
     async def _require_os_env(session_id: str) -> AgentSpec | None:
         spec = await _resolve_session_agent_spec(session_id)

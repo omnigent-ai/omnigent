@@ -102,6 +102,45 @@ def _delete_sessions(base_url: str, session_ids: list[str]) -> None:
             httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
 
 
+def test_session_header_action_visibility(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Filter stays visible while Select reveals on hover or keyboard focus."""
+    base_url, session_id = seeded_session
+    title = f"e2e-header-actions-{uuid.uuid4().hex[:8]}"
+    _set_title(base_url, session_id, title)
+
+    page.set_viewport_size({"width": 1280, "height": 800})
+    page.goto(f"{base_url}/c/{session_id}")
+
+    expect(_row_link(page, title)).to_be_visible()
+    sessions_header = page.get_by_role("button", name="Sessions", exact=True)
+    filter_sessions = page.get_by_role("button", name="Filter sessions")
+    select_sessions = page.get_by_test_id("toggle-selection-mode")
+    select_wrapper = select_sessions.locator("..")
+
+    expect(filter_sessions).to_be_visible()
+    expect(filter_sessions).to_have_css("opacity", "1")
+    expect(select_wrapper).to_have_css("opacity", "0")
+
+    sessions_header.hover()
+    expect(select_wrapper).to_have_css("opacity", "1")
+
+    page.mouse.move(800, 700)
+    expect(select_wrapper).to_have_css("opacity", "0")
+    sessions_header.focus()
+    page.keyboard.press("Tab")
+    expect(select_sessions).to_be_focused()
+    expect(select_wrapper).to_have_css("opacity", "1")
+
+    select_sessions.click()
+    expect(page.get_by_role("button", name="Exit selection mode")).to_be_visible()
+    expect(filter_sessions).to_be_visible()
+    filter_sessions.click()
+    expect(page.get_by_test_id("session-filter-all")).to_be_visible()
+
+
 def test_selection_mode_toggle(
     page: Page,
     seeded_session: tuple[str, str],

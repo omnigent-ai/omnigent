@@ -44,6 +44,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import shutil
+import sys
+import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -759,6 +763,59 @@ async def _measure_policy_evaluate(env: BenchEnvironment, ctx: JourneyContext) -
     resp.raise_for_status()
 
 
+# ── native hook spawn (no server involved) ───────────────────
+
+# Claude Code blocks its TUI on command hooks, so one hook subprocess's whole
+# lifetime is user-visible latency: the MessageDisplay hook runs once per
+# streamed text chunk, and the same interpreter+import cost fronts every
+# statusline refresh and per-tool-call policy hook. Spawn the per-chunk hook
+# exactly as Claude Code does — isolated interpreter, module entrypoint, JSON
+# payload on stdin — and time the full process lifetime. The import-graph side
+# of this guarantee is pinned by tests/test_claude_native_message_display_hook.
+_HOOK_SPAWN_PAYLOAD = json.dumps(
+    {
+        "hook_event_name": "MessageDisplay",
+        "message_id": "bench-message",
+        "index": 0,
+        "final": False,
+        "delta": "benchmark chunk",
+    }
+).encode()
+
+
+async def _setup_hook_spawn(env: BenchEnvironment) -> JourneyContext:
+    """A throwaway bridge dir for the hook's appended deltas file."""
+    del env
+    return tempfile.mkdtemp(prefix="omnigent-bench-hook-")
+
+
+async def _measure_hook_spawn(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Spawn the MessageDisplay hook once, as Claude Code does, and wait."""
+    del env
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-I",
+        "-m",
+        "omnigent.claude_native_message_display_hook",
+        "--bridge-dir",
+        str(ctx),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate(_HOOK_SPAWN_PAYLOAD)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"hook exited {proc.returncode}: {stderr.decode('utf-8', 'replace')[:200]}"
+        )
+
+
+async def _teardown_hook_spawn(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Remove the throwaway bridge dir."""
+    del env
+    shutil.rmtree(str(ctx), ignore_errors=True)
+
+
 # ── registry ─────────────────────────────────────────────────
 
 ALL_JOURNEYS: dict[str, Journey] = {
@@ -903,6 +960,14 @@ ALL_JOURNEYS: dict[str, Journey] = {
             needs_runner=True,
             max_iterations=_RUNNER_FS_MAX_ITERATIONS,
             description="GET .../environments/default/filesystem/{path} — runner file read proxy.",
+        ),
+        Journey(
+            name="native_hook_spawn",
+            kind="latency",
+            measure=_measure_hook_spawn,
+            setup=_setup_hook_spawn,
+            teardown=_teardown_hook_spawn,
+            description="Spawn the per-chunk MessageDisplay hook exactly as Claude Code does.",
         ),
     )
 }

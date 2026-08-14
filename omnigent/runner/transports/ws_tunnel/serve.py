@@ -277,6 +277,8 @@ async def serve_tunnel(
     on_activity: Callable[[], None] | None = None,
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
+    direct_attach_port: int | None = None,
+    direct_attach_token: str | None = None,
 ) -> None:
     """Keep a runner WebSocket tunnel connected to a server.
 
@@ -374,6 +376,8 @@ async def serve_tunnel(
                 shutdown_event=shutdown_event,
                 on_graceful_shutdown=on_graceful_shutdown,
                 on_connected=_mark_connected,
+                direct_attach_port=direct_attach_port,
+                direct_attach_token=direct_attach_token,
                 **activity_kwargs,
             )
             # A graceful shutdown drains and closes the connection cleanly,
@@ -630,6 +634,8 @@ async def _serve_tunnel_once(
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
     on_connected: Callable[[], None] | None = None,
+    direct_attach_port: int | None = None,
+    direct_attach_token: str | None = None,
 ) -> None:
     """Serve one WebSocket connection until it closes.
 
@@ -711,7 +717,12 @@ async def _serve_tunnel_once(
     ) as ws:
         if on_connected is not None:
             on_connected()
-        await _send_hello(ws.send, runner_version)
+        await _send_hello(
+            ws.send,
+            runner_version,
+            direct_attach_port=direct_attach_port,
+            direct_attach_token=direct_attach_token,
+        )
         _logger.info("runner %s connected to %s", runner_id, tunnel_url)
         try:
             if shutdown_event is None:
@@ -849,12 +860,21 @@ async def _graceful_drain(
 async def _send_hello(
     send_text: Callable[[str], Awaitable[None]],
     runner_version: str,
+    *,
+    direct_attach_port: int | None = None,
+    direct_attach_token: str | None = None,
 ) -> None:
     """Send the runner's opening hello frame.
 
     :param send_text: Async WebSocket text sender.
     :param runner_version: Runner version string for the hello
         frame, e.g. ``"0.1.0"``.
+    :param direct_attach_port: Loopback port of the runner's direct
+        terminal-attach listener, advertised to the server so it can
+        hand browsers a same-machine attach URL. ``None`` when the
+        listener is not running.
+    :param direct_attach_token: Bearer token guarding that listener;
+        travels only alongside *direct_attach_port*.
     :returns: None.
     """
     # Signal host-side telemetry opt-out to the server so it can honour
@@ -873,6 +893,8 @@ async def _send_hello(
                 runner_version=runner_version,
                 frame_protocol_version=1,
                 telemetry_opt_out=_tel_opt_out,
+                direct_attach_port=direct_attach_port,
+                direct_attach_token=direct_attach_token,
                 harnesses=[
                     "claude-native",
                     "claude-sdk",

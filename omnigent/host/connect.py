@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, SupportsIndex, SupportsInt, cast
 
 import websockets.asyncio.client
-from websockets.exceptions import InvalidStatus, InvalidURI
+from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
 from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
@@ -110,6 +110,7 @@ from omnigent.runner.identity import (
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_LAUNCH_HARNESS_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
@@ -614,6 +615,7 @@ def _build_runner_env(
     parent_pid: int,
     initial_auth_token: str | None = None,
     host_id: str | None = None,
+    harness: str | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -640,6 +642,9 @@ def _build_runner_env(
     :param initial_auth_token: Current host bearer for the runner's initial
         server connection. The runner consumes and removes it before spawning
         any children. ``None`` leaves the legacy auth path unchanged.
+    :param harness: Canonical harness of the launching session, e.g.
+        ``"claude-native"``; lets the runner start harness-specific prewarms
+        at boot. ``None`` (unknown / older server) omits the stamp.
     :returns: The runner subprocess environment.
     """
     extra_names = {
@@ -691,6 +696,8 @@ def _build_runner_env(
         # there). The runner forwards this to databricks_request_headers, which
         # emits the routing header only on a host-sharded deployment.
         env[RUNNER_SLICE_KEY_ENV_VAR] = host_id
+    if harness:
+        env[RUNNER_LAUNCH_HARNESS_ENV_VAR] = harness
     return env
 
 
@@ -856,6 +863,19 @@ class HostProcess:
         )
         self._zygote: ZygoteManager | None = ZygoteManager() if self._zygote_enabled else None
         self._zygote_disabled = False
+        # Warms the zygote at daemon start so the first launch doesn't pay
+        # its one-time import; see run().
+        self._zygote_prestart_task: asyncio.Task[ZygoteManager | None] | None = None
+        # Inbound frames are handled on their own tasks (see
+        # _start_frame_task) so one slow handler — a model-options CLI exec,
+        # an npm install — can't head-of-line block a launch or a stat behind
+        # it. Launch/stop keep their arrival order relative to each other via
+        # this lock: a session DELETE racing a slow create must not have its
+        # stop overtake the launch it targets.
+        self._runner_lifecycle_lock = asyncio.Lock()
+        # Strong refs to in-flight frame tasks (create_task results are
+        # otherwise GC-able); each discards itself on completion.
+        self._frame_tasks: set[asyncio.Task[None]] = set()
 
     def _tracked_runner_pids(self) -> set[int]:
         """PIDs of runners this host spawned and still tracks directly.
@@ -1309,6 +1329,7 @@ class HostProcess:
             parent_pid=os.getpid(),
             initial_auth_token=initial_auth_token,
             host_id=self._identity.host_id,
+            harness=frame.harness,
         )
 
         # Embed the session id so operators can find all logs for a session
@@ -1379,6 +1400,36 @@ class HostProcess:
             runner_id=runner_id,
         )
 
+    def _ensure_zygote_started(self) -> ZygoteManager | None:
+        """Start (or reuse) the runner zygote, latching the fallback on failure.
+
+        Blocking — the first call pays the zygote's one-time import of the
+        runner graph — so call it from a worker thread.
+        ``ZygoteManager.start`` is idempotent under its own lock, so the
+        boot-time prewarm (see :meth:`run`) and a concurrent launch can both
+        call this safely.
+
+        :returns: The started zygote, or ``None`` when the zygote is disabled
+            (opt-out, non-POSIX, or a prior failure) or failed to start now.
+        """
+        zygote = self._zygote
+        if zygote is None or self._zygote_disabled:
+            return None
+        try:
+            zygote.start()
+        except ZygoteUnavailable as exc:
+            # Spawning the zygote itself is broken; retrying on every
+            # launch would only add a doomed spawn to each, so disable
+            # it for the daemon's life and fall back to direct Popen.
+            _logger.warning(
+                "Runner zygote failed to start (%s); disabling it and "
+                "falling back to direct spawn",
+                exc,
+            )
+            self._zygote_disabled = True
+            return None
+        return zygote
+
     def _spawn_runner_proc(
         self,
         env: dict[str, str],
@@ -1407,62 +1458,49 @@ class HostProcess:
         try:
             env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
 
-            zygote = self._zygote
-            if zygote is not None and not self._zygote_disabled:
+            zygote = self._ensure_zygote_started()
+            if zygote is not None:
                 try:
-                    zygote.start()
-                except ZygoteUnavailable as exc:
-                    # Spawning the zygote itself is broken; retrying on every
-                    # launch would only add a doomed spawn to each, so disable
-                    # it for the daemon's life and fall back.
-                    _logger.warning(
-                        "Runner zygote failed to start (%s); disabling it and "
-                        "falling back to direct spawn",
-                        exc,
+                    # The runner's OS parent will be the zygote, so its
+                    # getppid()-based orphan check must watch the zygote pid.
+                    zygote_env = dict(env)
+                    zygote_env[RUNNER_PARENT_PID_ENV_VAR] = str(zygote.pid)
+                    proc = zygote.fork_runner(zygote_env, str(log_path), str(workspace))
+                    _logger.info(
+                        "Forked runner via zygote (zygote pid=%s, runner pid=%s)",
+                        zygote.pid,
+                        proc.pid,
                     )
-                    self._zygote_disabled = True
-                else:
-                    try:
-                        # The runner's OS parent will be the zygote, so its
-                        # getppid()-based orphan check must watch the zygote pid.
-                        zygote_env = dict(env)
-                        zygote_env[RUNNER_PARENT_PID_ENV_VAR] = str(zygote.pid)
-                        proc = zygote.fork_runner(zygote_env, str(log_path), str(workspace))
-                        _logger.info(
-                            "Forked runner via zygote (zygote pid=%s, runner pid=%s)",
-                            zygote.pid,
-                            proc.pid,
+                    return proc, log_path
+                except ZygoteUnavailable as exc:
+                    if zygote.is_running():
+                        # Alive but its control channel failed. Do NOT stop
+                        # it: healthy runners already forked from it would
+                        # see their parent die and self-terminate via the
+                        # orphan watchdog. Disable for future launches; the
+                        # still-running zygote is reaped on daemon shutdown
+                        # (see run()'s finally).
+                        _logger.warning(
+                            "Runner zygote unavailable (%s); disabling it "
+                            "and falling back to direct spawn",
+                            exc,
                         )
-                        return proc, log_path
-                    except ZygoteUnavailable as exc:
-                        if zygote.is_running():
-                            # Alive but its control channel failed. Do NOT stop
-                            # it: healthy runners already forked from it would
-                            # see their parent die and self-terminate via the
-                            # orphan watchdog. Disable for future launches; the
-                            # still-running zygote is reaped on daemon shutdown
-                            # (see run()'s finally).
-                            _logger.warning(
-                                "Runner zygote unavailable (%s); disabling it "
-                                "and falling back to direct spawn",
-                                exc,
-                            )
-                            self._zygote_disabled = True
-                        else:
-                            # The zygote process died — its forked runners are
-                            # already self-terminating via their own orphan
-                            # watchdogs, so nothing depends on this instance.
-                            # Reap it and let the next launch's start() respawn
-                            # a fresh one instead of losing copy-on-write
-                            # forking for the rest of the daemon's life.
-                            _logger.warning(
-                                "Runner zygote died (%s); falling back to "
-                                "direct spawn and respawning the zygote on "
-                                "the next launch",
-                                exc,
-                            )
-                            with contextlib.suppress(Exception):
-                                zygote.stop()
+                        self._zygote_disabled = True
+                    else:
+                        # The zygote process died — its forked runners are
+                        # already self-terminating via their own orphan
+                        # watchdogs, so nothing depends on this instance.
+                        # Reap it and let the next launch's start() respawn
+                        # a fresh one instead of losing copy-on-write
+                        # forking for the rest of the daemon's life.
+                        _logger.warning(
+                            "Runner zygote died (%s); falling back to "
+                            "direct spawn and respawning the zygote on "
+                            "the next launch",
+                            exc,
+                        )
+                        with contextlib.suppress(Exception):
+                            zygote.stop()
 
             with child_logging_popen_kwargs(env) as logging_kwargs:
                 proc = subprocess.Popen(
@@ -2494,6 +2532,15 @@ class HostProcess:
         self._reaper_task = asyncio.create_task(
             self._orphan_reaper_loop(), name="host-orphan-reaper"
         )
+        # Warm the runner zygote now: start() blocks on its one-time import
+        # of the runner graph (~1-2s), which otherwise lands inside the first
+        # session launch of the daemon's life. Best-effort — a failure
+        # latches the same direct-Popen fallback the launch path uses.
+        if self._zygote is not None and not self._zygote_disabled:
+            self._zygote_prestart_task = asyncio.create_task(
+                asyncio.to_thread(self._ensure_zygote_started),
+                name="host-zygote-prestart",
+            )
         backoff = _RECONNECT_BASE_S
         try:
             while True:
@@ -2626,6 +2673,11 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._reaper_task
                 self._reaper_task = None
+            if self._zygote_prestart_task is not None:
+                self._zygote_prestart_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._zygote_prestart_task
+                self._zygote_prestart_task = None
             for watcher in list(self._watcher_tasks):
                 watcher.cancel()
             for watcher in list(self._watcher_tasks):
@@ -2876,7 +2928,15 @@ class HostProcess:
                 # reconnect loop's silent-connect streak keys off this.
                 self._conn_frame_received = True
                 if isinstance(raw, str):
-                    await self._handle_raw_message(ws, raw)
+                    # Each frame is handled on its own task so a slow handler
+                    # (a model-options CLI exec, a long git walk) can't
+                    # head-of-line block the frames behind it — measured
+                    # 0.3-1.3s of added session-create latency when a launch
+                    # or stat queued behind one. Responses correlate by
+                    # request_id, so completion order doesn't matter; the one
+                    # ordering that does (launch vs stop) is preserved by
+                    # _runner_lifecycle_lock in _dispatch_host_frame.
+                    self._start_frame_task(ws, raw)
         finally:
             readiness_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -2938,6 +2998,39 @@ class HostProcess:
                 configured = latest
                 gateway = latest_gateway
 
+    def _start_frame_task(self, ws: websockets.asyncio.client.ClientConnection, raw: str) -> None:
+        """Handle one inbound frame on its own task, off the receive loop.
+
+        :param ws: The open tunnel connection, passed through to the handler.
+        :param raw: The raw text frame received off the socket.
+        :returns: None.
+        """
+        task = asyncio.create_task(self._run_frame_handler(ws, raw), name="host-frame")
+        self._frame_tasks.add(task)
+        task.add_done_callback(self._frame_tasks.discard)
+
+    async def _run_frame_handler(
+        self, ws: websockets.asyncio.client.ClientConnection, raw: str
+    ) -> None:
+        """Run one frame handler, containing its failures.
+
+        A handler failure must not tear down the tunnel — every queued frame
+        (and the reconnect churn) would pay for one bad request. The server
+        side times out or retries its unanswered request.
+
+        :param ws: The open tunnel connection the handler replies on.
+        :param raw: The raw text frame received off the socket.
+        :returns: None.
+        """
+        try:
+            await self._handle_raw_message(ws, raw)
+        except ConnectionClosed:
+            # The tunnel died while this frame was in flight; the reconnect
+            # loop owns recovery.
+            _logger.debug("dropped frame result: tunnel closed mid-handling")
+        except Exception:
+            _logger.exception("host frame handler failed")
+
     async def _handle_raw_message(
         self, ws: websockets.asyncio.client.ClientConnection, raw: str
     ) -> None:
@@ -2995,9 +3088,18 @@ class HostProcess:
         :returns: None.
         """
         if isinstance(frame, HostLaunchRunnerFrame):
-            await ws.send(encode_host_frame(await self._handle_launch(frame)))
+            # Frames run on concurrent tasks, but launch/stop must keep their
+            # arrival order relative to each other (a stop for a session must
+            # not overtake the launch it targets). The lock is this task's
+            # first await, and tasks start in frame-arrival order, so waiters
+            # queue FIFO in that same order — keep it first.
+            async with self._runner_lifecycle_lock:
+                launch_result = await self._handle_launch(frame)
+            await ws.send(encode_host_frame(launch_result))
         elif isinstance(frame, HostStopRunnerFrame):
-            await ws.send(encode_host_frame(await self._handle_stop(frame)))
+            async with self._runner_lifecycle_lock:
+                stop_result = await self._handle_stop(frame)
+            await ws.send(encode_host_frame(stop_result))
         elif isinstance(frame, HostRunnerStatusFrame):
             await ws.send(encode_host_frame(await self._handle_runner_status(frame)))
         elif isinstance(frame, HostStatFrame):

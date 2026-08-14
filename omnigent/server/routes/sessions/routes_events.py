@@ -52,7 +52,9 @@ from omnigent.server.auth import (
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
+    background_title_prompt,
     prepare_background_session_title,
+    schedule_background_child_task_summary,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
@@ -1502,6 +1504,23 @@ def register_events_routes(
             conversation=conv,
             event=body,
         )
+        # Schedule display-name generation for child sessions (the
+        # title coordinator skips children because their title is
+        # the stable spawn-or-continue key).
+        if (
+            conv.parent_conversation_id is not None
+            and conv.task_summary is None
+            and background_title_coordinator is not None
+        ):
+            _prompt_for_display = background_title_prompt(body)
+            if _prompt_for_display:
+                schedule_background_child_task_summary(
+                    coordinator=background_title_coordinator,
+                    session_id=session_id,
+                    prompt=_prompt_for_display,
+                    agent_id=conv.agent_id,
+                    sub_agent_name=conv.sub_agent_name,
+                )
         if body.type == _SLASH_COMMAND_TYPE:
             if _agent is None:
                 raise OmnigentError(

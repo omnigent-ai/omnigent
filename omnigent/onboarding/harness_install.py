@@ -41,6 +41,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import NamedTuple
 
@@ -744,6 +746,36 @@ def _parse_harness_cli_version(text: str) -> str | None:
 _DEFAULT_CLI_PROBE_TIMEOUT_S = 30.0
 READINESS_CLI_PROBE_TIMEOUT_S = 10.0
 
+# Probe caches damping the ambient readiness storm: every readiness refresh
+# on every host daemon execs vendor CLIs (``--version`` / ``auth status``)
+# whose answers change only when the binary is swapped or a login flips —
+# with a few dozen idle hosts that compounds into a constant machine-wide
+# subprocess churn. ``--version`` output is a pure function of the binary
+# bytes, so successful parses are cached against the binary's
+# ``(path, mtime_ns, size)`` signature; login state can flip without the
+# binary changing, so only positive verdicts are cached and they expire
+# after a short TTL — a cached "not logged in" would blind the setup
+# wizard's confirmation right after a successful login.
+_VERSION_PROBE_CACHE: dict[tuple[str, int, int], str] = {}
+_LOGIN_PROBE_CACHE: dict[tuple[str, str], float] = {}
+_PROBE_CACHE_LOCK = threading.Lock()
+_LOGIN_PROBE_CACHE_TTL_S = 120.0
+_PROBE_CACHE_MAX_ENTRIES = 64
+
+
+def _binary_signature(binary: str) -> tuple[str, int, int] | None:
+    """Return *binary*'s identity signature for the version cache.
+
+    :param binary: Absolute path of the CLI binary, e.g. ``"/usr/bin/claude"``.
+    :returns: ``(path, mtime_ns, size)``, or ``None`` when it cannot be
+        stat'ed (caller probes uncached).
+    """
+    try:
+        stat = os.stat(binary)
+    except OSError:
+        return None
+    return (binary, stat.st_mtime_ns, stat.st_size)
+
 
 def _harness_cli_version_satisfies(
     spec: HarnessInstallSpec,
@@ -888,9 +920,20 @@ def _harness_cli_version_string(
 ) -> str | None:
     """Return the parsed, normalized version string from *binary* ``--version``.
 
+    Successful parses are cached against the binary's ``(path, mtime_ns,
+    size)`` signature — the output cannot change until the binary does.
+    Failed probes (missing/hung binary, unparseable output) are never
+    cached, so a flaky state keeps re-probing like before.
+
     :param timeout: Seconds to wait for the ``--version`` subprocess, e.g.
         :data:`READINESS_CLI_PROBE_TIMEOUT_S` on the readiness path.
     """
+    sig = _binary_signature(binary)
+    if sig is not None:
+        with _PROBE_CACHE_LOCK:
+            cached = _VERSION_PROBE_CACHE.get(sig)
+        if cached is not None:
+            return cached
     try:
         completed = subprocess.run(
             [binary, "--version"],
@@ -901,7 +944,15 @@ def _harness_cli_version_string(
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return _parse_harness_cli_version((completed.stdout or "") + "\n" + (completed.stderr or ""))
+    version = _parse_harness_cli_version(
+        (completed.stdout or "") + "\n" + (completed.stderr or "")
+    )
+    if version is not None and sig is not None:
+        with _PROBE_CACHE_LOCK:
+            if len(_VERSION_PROBE_CACHE) >= _PROBE_CACHE_MAX_ENTRIES:
+                _VERSION_PROBE_CACHE.clear()
+            _VERSION_PROBE_CACHE[sig] = version
+    return version
 
 
 def harness_install_command(key: str) -> list[str]:
@@ -1053,6 +1104,11 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     (Codex's human line, ``agy models``' model list), so the exit code decides
     (``0`` only when logged in) and stdout is never parsed.
 
+    Positive verdicts are cached for :data:`_LOGIN_PROBE_CACHE_TTL_S`
+    seconds per ``(key, binary)`` so readiness refreshes don't exec the
+    vendor CLI on every pass; negative verdicts are never cached, and
+    :func:`harness_logout` invalidates the key's entries.
+
     :param key: A harness family, e.g. ``"anthropic"`` (Claude),
         ``"openai"`` (Codex), or ``"gemini"`` (Antigravity, via ``agy models``).
     :param timeout: Seconds to wait for the status subprocess, e.g. ``10.0`` on
@@ -1067,6 +1123,14 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
     if binary is None:
         return False
+    # Positive verdicts are TTL-cached (see the cache block above): logins
+    # are sticky, and the readiness loop re-probing a logged-in CLI every
+    # refresh is the ambient storm. Negatives always re-probe so a login
+    # made a moment ago is seen immediately.
+    cache_key = (key, binary)
+    with _PROBE_CACHE_LOCK:
+        if time.monotonic() < _LOGIN_PROBE_CACHE.get(cache_key, 0.0):
+            return True
     argv_binary = binary if key == GEMINI_FAMILY else spec.binary
     try:
         result = subprocess.run(
@@ -1085,14 +1149,20 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     # exit code is authoritative and stdout is never parsed — output that merely
     # happens to be JSON can't flip the verdict.
     status_key = spec.login_status_key
+    logged_in = result.returncode == 0
     if status_key is not None:
         try:
             payload = json.loads(result.stdout)
         except (json.JSONDecodeError, ValueError):
-            return result.returncode == 0
+            payload = None
         if isinstance(payload, dict) and status_key in payload:
-            return bool(payload[status_key])
-    return result.returncode == 0
+            logged_in = bool(payload[status_key])
+    if logged_in:
+        with _PROBE_CACHE_LOCK:
+            if len(_LOGIN_PROBE_CACHE) >= _PROBE_CACHE_MAX_ENTRIES:
+                _LOGIN_PROBE_CACHE.clear()
+            _LOGIN_PROBE_CACHE[cache_key] = time.monotonic() + _LOGIN_PROBE_CACHE_TTL_S
+    return logged_in
 
 
 def harness_login(key: str) -> bool:
@@ -1176,4 +1246,9 @@ def harness_logout(key: str) -> bool:
         subprocess.run([spec.binary, *spec.logout_args], check=False, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return False
+    # Drop cached logged-in verdicts so the confirmation below re-probes —
+    # a cached positive would report this successful logout as failed.
+    with _PROBE_CACHE_LOCK:
+        for cache_key in [k for k in _LOGIN_PROBE_CACHE if k[0] == key]:
+            del _LOGIN_PROBE_CACHE[cache_key]
     return not harness_cli_logged_in(key)

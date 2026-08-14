@@ -961,11 +961,22 @@ export function useBulkArchiveConversations() {
  * the cached lists in `onMutate` so the sidebar repaints immediately,
  * and only the ones whose delete failed are restored. Returns the
  * succeeded / failed session IDs.
+ *
+ * `deleteBranchIds` opts individual worktree sessions into git cleanup:
+ * a session whose id is in the set is deleted with `?delete_branch=true`
+ * (the server removes its worktree and branch). Ids absent from the set
+ * — or all ids when it's omitted — delete without touching any branch.
  */
 export function useBulkDeleteConversations() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (ids: string[]) => {
+    mutationFn: async ({
+      ids,
+      deleteBranchIds,
+    }: {
+      ids: string[];
+      deleteBranchIds?: ReadonlySet<string>;
+    }) => {
       const results = await Promise.allSettled(
         ids.map(async (id) => {
           try {
@@ -973,7 +984,7 @@ export function useBulkDeleteConversations() {
           } catch {
             // Best-effort stop
           }
-          await deleteConversation(id);
+          await deleteConversation(id, deleteBranchIds?.has(id) ?? false);
         }),
       );
       const succeeded: string[] = [];
@@ -991,11 +1002,11 @@ export function useBulkDeleteConversations() {
       }
       return { succeeded, failed };
     },
-    onMutate: (ids) => paintConversationsDeleted(queryClient, ids),
-    onSuccess: (_data, ids) => {
+    onMutate: ({ ids }) => paintConversationsDeleted(queryClient, ids),
+    onSuccess: (_data, { ids }) => {
       finalizeDeletedConversations(queryClient, ids);
     },
-    onError: (error, ids, snapshot) => {
+    onError: (error, { ids }, snapshot) => {
       // Partial failure: the sessions that did delete stay gone; the rest
       // come back. A non-bulk error (nothing reported) restores everything.
       const bulk = error instanceof BulkConversationMutationError ? error : null;
