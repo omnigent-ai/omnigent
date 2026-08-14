@@ -50,6 +50,7 @@ class ScheduledTaskStore(ABC):
         *,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
+        max_cost_usd: float | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
         state: str = "active",
@@ -68,6 +69,7 @@ class ScheduledTaskStore(ABC):
         :param timezone: IANA timezone the trigger is evaluated in.
         :param model_override: Optional LLM model override.
         :param reasoning_effort: Optional reasoning-effort hint.
+        :param max_cost_usd: Optional per-firing cost budget in USD.
         :param workspace: Runner start path (source repo / working dir).
         :param host_id: The connected host to pin the run to.
         :param state: Lifecycle state — ``active``/``paused``/``deleted``.
@@ -131,6 +133,7 @@ class ScheduledTaskStore(ABC):
         timezone: str | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
+        max_cost_usd: float | None = _UNSET,
         workspace: str | None = None,
         host_id: str | None = _UNSET,
         state: str | None = None,
