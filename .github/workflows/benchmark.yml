@@ -180,6 +180,13 @@ jobs:
             --database-uri "${{ steps.db.outputs.uri }}" \
             --sessions "$SESSIONS" --items-per-session "$ITEMS"
 
+      # pexpect and claude are needed by the cli_startup journey, which is part
+      # of the default ALL_JOURNEYS run below.
+      - name: Install CLI startup dependencies
+        run: |
+          uv pip install pexpect
+          npm install -g @anthropic-ai/claude-code
+
       - name: Run benchmark
         run: |
           uv run --no-sync dev/benchmarks/omnigent/run.py \
@@ -206,26 +213,5 @@ jobs:
         with:
           name: benchmark-results-${{ matrix.backend }}-${{ github.run_id }}
           path: benchmark-results-${{ matrix.backend }}.json
-          retention-days: 90
-          if-no-files-found: warn
-
-      - name: Install CLI startup dependencies
-        run: |
-          uv pip install pexpect
-          npm install -g @anthropic-ai/claude-code
-
-      - name: Run CLI startup benchmark
-        run: |
-          uv run --no-sync dev/benchmarks/omnigent/run.py \
-            --journeys cli_startup \
-            --runs "$RUNS" \
-            --output benchmark-results-cli-startup.json
-
-      - name: Upload CLI startup results
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: benchmark-results-cli-startup-${{ matrix.backend }}-${{ github.run_id }}
-          path: benchmark-results-cli-startup.json
           retention-days: 90
           if-no-files-found: warn
