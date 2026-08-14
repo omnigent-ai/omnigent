@@ -32,4 +32,5 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Remove max_cost_usd from scheduled_tasks."""
-    op.drop_column("scheduled_tasks", "max_cost_usd")
+    with op.batch_alter_table("scheduled_tasks") as batch_op:
+        batch_op.drop_column("max_cost_usd")
