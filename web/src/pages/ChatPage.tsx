@@ -1825,15 +1825,6 @@ function MainAgentSurface({
     conversationRef.current = el;
     setContainerEl(el);
   }, []);
-  // How far the composer has grown past its resting height. The composer keeps
-  // that growth out of the flex column, so the wrapper's box never moves —
-  // this only lifts the overlays pinned to its bottom edge (the scroll-to-
-  // bottom button, the Working… tab, the message nav) clear of the taller
-  // card. Written straight to the DOM: a re-render per line of typing would
-  // re-render the whole transcript for a purely visual offset.
-  const publishComposerGrowth = useCallback((px: number) => {
-    conversationRef.current?.style.setProperty("--composer-growth", `${px}px`);
-  }, []);
   const [terminalSurfaceEl, setTerminalSurfaceEl] = useState<HTMLElement | null>(null);
   // True only while the chat/terminal surface is the frontmost thing on screen.
   // Drives both native overlays so neither floats over an opened drawer.
@@ -2031,7 +2022,7 @@ function MainAgentSurface({
               >
                 {/* Scroll helpers — must live inside StickToBottom to access context. */}
                 <ScrollToBottomOnSend nonce={sendScrollNonce} />
-                <PreserveScrollDistanceOnResize />
+                <KeepBottomOnViewportResize />
                 <ConversationScrollRefBridge onScroller={setScroller} />
                 <HistoryAutoLoader scrollElement={scroller?.el ?? null} />
                 {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
@@ -2210,7 +2201,6 @@ function MainAgentSurface({
             subagentRoutingEligible={subagentRoutingEligible}
             subAgentLabel={subAgentLabel}
             wrapperLabel={wrapperLabel}
-            onGrowthChange={publishComposerGrowth}
           />
 
           {/* Chat/Terminal toggle for terminal-first sessions, reconnect-or-
@@ -2315,9 +2305,7 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
       aria-live="polite"
       data-testid="working-indicator-pin"
       className={cn(
-        // bottom tracks --composer-growth so the tab keeps meeting the card's
-        // top edge while the composer is grown (it overlaps this wrapper).
-        "pointer-events-none absolute inset-x-0 bottom-[var(--composer-growth,0px)] z-20 transition-opacity duration-200",
+        "pointer-events-none absolute inset-x-0 bottom-0 z-20 transition-opacity duration-200",
         visible ? "opacity-100" : "opacity-0",
       )}
     >
@@ -2372,72 +2360,45 @@ function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
   return null;
 }
 
-/**
- * Preserves the transcript's distance-from-bottom whenever its scroll container
- * resizes on the iOS shell — so the content you're looking at stays put while
- * the soft keyboard opens/closes (and while the composer grows on focus).
- *
- * Two things resize the container, and neither is handled by `use-stick-to-
- * bottom` (which only re-anchors on *content* resize): the keyboard, via
- * `useIOSViewportLock` shrinking the app-shell; and the composer growing taller
- * when focused (its send row / status line), which steals flex height from the
- * transcript a couple of lines at a time — *without* firing a visualViewport
- * resize. Watching only visualViewport missed the composer growth, which is why
- * the transcript crept up ~2 lines on focus.
- *
- * So we watch the scroll container itself with a `ResizeObserver` and, on any
- * size change, hold the scroll position relative to the bottom constant:
- * `scrollTop = scrollHeight - clientHeight - distance`. `distance` is tracked
- * from genuine user scrolls only — scrolls that coincide with a dimension change
- * (the resize's own clamp, or our restore) are ignored so they can't corrupt it.
- * At the bottom (distance 0) you stay at the bottom; scrolled up reading
- * history, you keep seeing the same messages. New messages still go through the
- * library (content resize doesn't change the container's box). Stateless across
- * any number of keyboard cycles.
- */
-function PreserveScrollDistanceOnResize() {
+/** Keep bottom-locked readers pinned when the composer changes viewport height. */
+export function KeepBottomOnViewportResize() {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef?: React.RefObject<HTMLElement>;
   };
   const scrollRef = ctx.scrollRef;
+  const state = ctx.state;
+  const scrollToBottom = ctx.scrollToBottom;
 
   useEffect(() => {
-    if (!isIOSShell()) return;
     const el = scrollRef?.current;
-    if (!el) return;
-
-    const measure = () => el.scrollHeight - el.clientHeight - el.scrollTop;
-    let distance = Math.max(0, measure());
-    let prevSH = el.scrollHeight;
-    let prevCH = el.clientHeight;
-
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const isPhysicallyAtBottom = () => el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
+    let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isPhysicallyAtBottom();
+    let clientHeight = el.clientHeight;
+    let frame: number | null = null;
     const onScroll = () => {
-      const sh = el.scrollHeight;
-      const ch = el.clientHeight;
-      // A scroll that lands on the same frame as a size change is resize-induced
-      // (the browser's clamp, or our own restore below) — not the user. Skip it
-      // so it can't overwrite the distance we're trying to preserve.
-      if (sh !== prevSH || ch !== prevCH) {
-        prevSH = sh;
-        prevCH = ch;
-        return;
-      }
-      distance = Math.max(0, measure());
+      wasBottomLocked = isPhysicallyAtBottom();
     };
-
     const observer = new ResizeObserver(() => {
-      el.scrollTop = el.scrollHeight - el.clientHeight - distance;
-      prevSH = el.scrollHeight;
-      prevCH = el.clientHeight;
+      const nextHeight = el.clientHeight;
+      if (nextHeight === clientHeight) return;
+      clientHeight = nextHeight;
+      if (!wasBottomLocked) return;
+      scrollToBottom("instant");
+      if (frame !== null) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        frame = null;
+        scrollToBottom("instant");
+      });
     });
-
     el.addEventListener("scroll", onScroll, { passive: true });
     observer.observe(el);
     return () => {
       el.removeEventListener("scroll", onScroll);
       observer.disconnect();
+      if (frame !== null) cancelAnimationFrame(frame);
     };
-  }, [scrollRef]);
+  }, [scrollRef, scrollToBottom, state]);
 
   return null;
 }
@@ -4062,13 +4023,6 @@ interface ComposerProps {
    * keep using ``modelPickerKind`` / ``isNativeWrapper``.
    */
   wrapperLabel?: string | null;
-  /**
-   * Reports how many pixels taller than its resting height the composer has
-   * grown. The composer keeps that growth out of the column's flex layout
-   * (see the negative top margin below); the transcript uses the number to
-   * lift its bottom-anchored overlays clear of the taller card.
-   */
-  onGrowthChange?: (px: number) => void;
 }
 
 /**
@@ -4475,7 +4429,6 @@ export function Composer({
   subagentRoutingEligible = false,
   subAgentLabel = null,
   wrapperLabel = null,
-  onGrowthChange,
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -4511,7 +4464,6 @@ export function Composer({
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const formRef = useRef<HTMLFormElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
@@ -5004,20 +4956,9 @@ export function Composer({
   };
 
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
-  // The extra rows float over the transcript instead of shrinking it: a
-  // negative top margin holds the form's margin box at its resting height, so
-  // the transcript's scroll viewport — and with it the scrollbar's travel and
-  // the turn rail's centering — stays exactly where it was. Only the taller
-  // card overlaps, and it's opaque across the message column.
-  const applyGrowth = useCallback(
-    (px: number) => {
-      const form = formRef.current;
-      if (form) form.style.marginTop = px > 0 ? `${-px}px` : "";
-      onGrowthChange?.(px);
-    },
-    [onGrowthChange],
-  );
-  useAutoGrowTextarea(textareaRef, value, 10, applyGrowth);
+  // Growth stays in the flex column so the transcript viewport ends where the
+  // composer begins instead of letting the card cover visible output.
+  useAutoGrowTextarea(textareaRef, value, 10);
 
   // Scope recall to the active conversation so ArrowUp surfaces only this
   // chat's prompts, not the last thing typed in any other chat.
@@ -5307,12 +5248,9 @@ export function Composer({
 
   return (
     <form
-      ref={formRef}
       onSubmit={handleSubmit}
       className={cn(
-        // relative: the grown card overlaps the transcript above it, and a
-        // positioned box paints over that in-flow sibling.
-        "chat-composer-form relative px-4 md:px-6",
+        "chat-composer-form px-4 md:px-6",
         isTerminalFirst ? "terminal-first-composer-form pb-1.5" : "pb-3",
       )}
     >
