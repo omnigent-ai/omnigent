@@ -4,10 +4,11 @@ import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
+import { requestComposerFocus } from "@/lib/composerFocus";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -2539,5 +2540,56 @@ describe("shouldQueueSend", () => {
 
   it("ignores queued messages belonging to a different conversation", () => {
     expect(shouldQueueSend("conv_a", "idle", "idle", [q("conv_b")])).toBe(false);
+  });
+});
+
+// Switching sessions from the command palette re-binds the composer, which
+// focuses it — but the palette's focus trap outlives the navigation and undoes
+// that. The palette hands focus back once it is gone, and the composer takes it
+// so the user can keep typing without reaching for the mouse.
+describe("Composer overlay focus hand-off", () => {
+  beforeEach(() => {
+    useChatStore.setState({ conversationId: "conv_test", skills: [] });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("focuses the textarea when a closing overlay hands focus back", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    ta.blur();
+    expect(document.activeElement).not.toBe(ta);
+
+    act(() => requestComposerFocus());
+
+    expect(document.activeElement).toBe(ta);
+  });
+
+  it("leaves focus alone on mobile, where it would summon the keyboard", () => {
+    // Same gate as the bind-time focus above: programmatic focus on a phone
+    // pops the software keyboard over the transcript.
+    vi.spyOn(window, "matchMedia").mockImplementation(
+      (query: string) =>
+        ({
+          matches: true,
+          media: query,
+          onchange: null,
+          addListener: () => {},
+          removeListener: () => {},
+          addEventListener: () => {},
+          removeEventListener: () => {},
+          dispatchEvent: () => false,
+        }) as unknown as MediaQueryList,
+    );
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    ta.blur();
+
+    act(() => requestComposerFocus());
+
+    expect(document.activeElement).not.toBe(ta);
   });
 });
