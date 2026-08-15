@@ -534,6 +534,8 @@ class _FakeCore:
         self.read_queue: list[object] = []
         self.read_default: object = _pod(phase="Pending")
         self.create_secret_error: Exception | None = None
+        self.list_pod_error: Exception | None = None
+        self.last_label_selector: str | None = None
         self.pod_list_items: list[object] = []
 
     def create_namespaced_secret(self, namespace, body, _request_timeout=None):
@@ -544,6 +546,9 @@ class _FakeCore:
 
     def list_namespaced_pod(self, namespace, label_selector=None, _request_timeout=None):
         self.calls.append("list_pod")
+        self.last_label_selector = label_selector
+        if self.list_pod_error is not None:
+            raise self.list_pod_error
         return SimpleNamespace(items=self.pod_list_items)
 
     def read_namespaced_pod(self, name, namespace, _request_timeout=None):
@@ -581,6 +586,7 @@ class _FakeBatch:
         self.calls: list[str] = []
         self.created_jobs: list[dict[str, object]] = []
         self.deleted_jobs: list[str] = []
+        self.last_delete_body: object = None
         self.create_job_error: Exception | None = None
         self.delete_job_errors: list[Exception | None] = []
 
@@ -592,6 +598,7 @@ class _FakeBatch:
 
     def delete_namespaced_job(self, name, namespace, body=None, _request_timeout=None):
         self.calls.append("delete_job")
+        self.last_delete_body = body
         if self.delete_job_errors:
             err = self.delete_job_errors.pop(0)
             if err is not None:
@@ -856,10 +863,11 @@ def test_launch_host_invalid_config_home_fails_before_creating_secret(
 def test_launch_host_fast_fails_on_clone_failure_with_log_tail(
     fake_clients: tuple[_FakeCore, _FakeBatch],
 ) -> None:
-    """A non-zero init container (clone failed) fails fast with the git error log tail."""
+    """Once backoffLimit is exhausted (phase Failed), fast-fail with the log tail."""
     core, batch = fake_clients
+    # Phase "Failed" means the Job exhausted its backoffLimit — terminal.
     failed_pod = _pod(
-        phase="Pending",
+        phase="Failed",
         init_statuses=[_terminated(128, name="workspace-prep")],
     )
     core.pod_list_items = [failed_pod]
@@ -919,6 +927,7 @@ def test_terminate_deletes_job_and_secret(
     core, batch = fake_clients
     _launcher().terminate("omnigent-job-6")
     assert batch.deleted_jobs == ["omnigent-job-6"]
+    assert batch.last_delete_body.propagation_policy == "Foreground"
     assert core.deleted_pods == ["omnigent-job-6"]
     assert core.deleted_secrets == ["omnigent-job-6-token"]
 
@@ -941,11 +950,151 @@ def test_terminate_retries_transient_then_gives_up_best_effort(
     from urllib3.exceptions import HTTPError
 
     core, batch = fake_clients
-    batch.delete_job_errors = [HTTPError("timeout")] * k8s._POD_DELETE_MAX_ATTEMPTS
+    batch.delete_job_errors = [HTTPError("timeout")] * k8s._DELETE_MAX_ATTEMPTS
     _launcher().terminate("omnigent-job-8")  # best-effort: must not raise
     assert "could not delete Kubernetes job 'omnigent-job-8'" in capsys.readouterr().err
     # The Secret delete still runs after the Job gives up.
     assert core.deleted_secrets == ["omnigent-job-8-token"]
+
+
+def test_terminate_still_deletes_secret_on_job_403(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+) -> None:
+    """A 403 on Job delete still cleans up the Secret (no leak)."""
+    core, batch = fake_clients
+    batch.delete_job_errors = [_FakeApiException(status=403, reason="Forbidden")]
+    with pytest.raises(click.ClickException, match="Forbidden"):
+        _launcher().terminate("omnigent-job-9")
+    # Secret must still be deleted even though Job delete raised.
+    assert core.deleted_secrets == ["omnigent-job-9-token"]
+
+
+def test_find_job_pod_raises_on_403(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 403 on pods:list surfaces immediately, not as a misleading 90s timeout."""
+    core, _batch = fake_clients
+    monkeypatch.setattr(k8s, "_POD_READY_TIMEOUT_S", 0.01)
+    core.list_pod_error = _FakeApiException(status=403, reason="Forbidden")
+    core.read_default = _pod(phase="Running")
+    with pytest.raises(click.ClickException, match="list sandbox pods"):
+        _launcher().start_host(
+            "omnigent-job-rbac",
+            token=_TOKEN,
+            host_id="host_rbac",
+            host_name="managed-rbac",
+            server_url="http://srv.example.com",
+        )
+
+
+def test_find_job_pod_sends_correct_label_selector(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+) -> None:
+    """The launcher queries for the child Pod using the correct job-name label."""
+    core, _batch = fake_clients
+    _setup_pod_discovery(core)
+    _launcher().start_host(
+        "omnigent-job-sel",
+        token=_TOKEN,
+        host_id="host_sel",
+        host_name="managed-sel",
+        server_url="http://srv.example.com",
+    )
+    assert core.last_label_selector == "job-name=omnigent-job-sel"
+
+
+def test_wait_rediscovers_pod_on_404(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+) -> None:
+    """A 404 on read (Pod replaced) triggers re-discovery, not a terminal failure."""
+    core, _batch = fake_clients
+    replacement_pod = _pod(phase="Running")
+    replacement_pod.metadata = SimpleNamespace(
+        name="omnigent-job-repl-abc", deletion_timestamp=None
+    )
+    # First discovery returns original, which 404s on read.
+    # Second discovery returns the replacement, which is Running.
+    original_pod = _pod(phase="Pending")
+    original_pod.metadata = SimpleNamespace(name="omnigent-job-repl-xyz", deletion_timestamp=None)
+    core.pod_list_items = [original_pod]
+    core.read_queue = [
+        _FakeApiException(status=404, reason="Not Found"),
+    ]
+
+    # After the 404, re-discovery should find the replacement.
+    def list_pod_side_effect(namespace, label_selector=None, _request_timeout=None):
+        core.calls.append("list_pod")
+        core.last_label_selector = label_selector
+        # Second call returns the replacement.
+        core.pod_list_items = [replacement_pod]
+        return SimpleNamespace(items=core.pod_list_items)
+
+    core.list_namespaced_pod = list_pod_side_effect
+    core.read_default = replacement_pod
+    workspace = _launcher().start_host(
+        "omnigent-job-repl",
+        token=_TOKEN,
+        host_id="host_repl",
+        host_name="managed-repl",
+        server_url="http://srv.example.com",
+    )
+    assert workspace is not None
+
+
+def test_crashloopbackoff_is_terminal(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+) -> None:
+    """A host in CrashLoopBackOff is detected even though the Pod is Running."""
+    core, _batch = fake_clients
+    crashloop_pod = _pod(
+        phase="Running",
+        container_statuses=[
+            SimpleNamespace(
+                name="host",
+                restart_count=3,
+                state=SimpleNamespace(
+                    waiting=SimpleNamespace(reason="CrashLoopBackOff", message="back-off"),
+                    terminated=None,
+                ),
+            )
+        ],
+    )
+    core.pod_list_items = [crashloop_pod]
+    core.read_queue = [crashloop_pod]
+    with pytest.raises(click.ClickException, match="crash-looping"):
+        _launcher().start_host(
+            "omnigent-job-crash",
+            token=_TOKEN,
+            host_id="host_crash",
+            host_name="managed-crash",
+            server_url="http://srv.example.com",
+        )
+
+
+def test_init_failure_pending_is_not_terminal(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under OnFailure, a Pending init failure is NOT terminal (kubelet retries)."""
+    core, _batch = fake_clients
+    monkeypatch.setattr(k8s, "_POD_READY_TIMEOUT_S", 0.01)
+    # Init container failed but Pod is still Pending — kubelet will retry.
+    pending_pod = _pod(
+        phase="Pending",
+        init_statuses=[_terminated(128, name="workspace-prep")],
+    )
+    core.pod_list_items = [pending_pod]
+    core.read_default = pending_pod
+    # Should time out, NOT fast-fail with "workspace prep failed".
+    with pytest.raises(click.ClickException, match="did not start within"):
+        _launcher().start_host(
+            "omnigent-job-retry",
+            token=_TOKEN,
+            host_id="host_retry",
+            host_name="managed-retry",
+            server_url="http://srv.example.com",
+        )
 
 
 def test_provision_reserves_pod_name_and_no_exec_transport() -> None:
