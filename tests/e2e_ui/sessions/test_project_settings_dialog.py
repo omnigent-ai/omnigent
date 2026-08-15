@@ -1,6 +1,6 @@
 """Browser e2e for the Project settings dialog (project ``config`` defaults).
 
-A project carries owner-private session defaults in its ``config`` JSON
+A project carries a name and owner-private session defaults in its ``config`` JSON
 (``{ host_id?, workspace?, agent_id?, use_worktree?, base_branch? }``). The "Project settings"
 dialog (``web/src/shell/ProjectSettingsDialog.tsx``, reached from the
 project-folder kebab) reads and writes that config via ``GET /v1/projects/{id}``
@@ -20,7 +20,9 @@ host-free path (the worktree toggle is a plain Switch, no host needed).
 
 from __future__ import annotations
 
+import os
 import uuid
+from pathlib import Path
 
 import httpx
 from playwright.sync_api import Page, expect
@@ -57,6 +59,39 @@ def _open_project_settings(page: Page, project: str) -> None:
     # The dialog's Save button confirms the editor mounted + the config fetch
     # settled (Save is disabled while loading).
     expect(page.get_by_test_id("project-settings-save")).to_be_enabled()
+
+
+def _screenshot(page: Page, name: str) -> None:
+    """Save optional local demo evidence without affecting CI runs."""
+    if shot_dir := os.environ.get("E2E_SCREENSHOT_DIR"):
+        output = Path(shot_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=output / f"{name}.png")
+
+
+def test_project_settings_renames_project(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Editing the settings name updates the project row in the sidebar."""
+    base_url, session_id = seeded_session
+    old_name = f"Before {uuid.uuid4().hex[:6]}"
+    new_name = f"After {uuid.uuid4().hex[:6]}"
+    _create_project(base_url, old_name)
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_project_settings(page, old_name)
+
+    name_input = page.get_by_test_id("project-settings-name")
+    expect(name_input).to_have_value(old_name)
+    name_input.fill(new_name)
+    _screenshot(page, "project-settings-name-edited")
+    page.get_by_test_id("project-settings-save").click()
+
+    expect(page.get_by_test_id("project-settings-save")).to_have_count(0)
+    expect(page.get_by_role("button", name=new_name, exact=True)).to_be_visible()
+    expect(page.get_by_role("button", name=old_name, exact=True)).to_have_count(0)
+    _screenshot(page, "project-renamed-in-sidebar")
 
 
 def test_project_settings_worktree_toggle_persists(

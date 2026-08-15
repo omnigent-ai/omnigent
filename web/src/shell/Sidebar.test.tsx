@@ -1704,6 +1704,22 @@ describe("Sidebar project sections", () => {
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
   });
 
+  it("offers project settings with the name field and no standalone rename action", async () => {
+    projectsMock.push("Customer X");
+    mockConversations([]);
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+
+    expect(screen.queryByText("Rename project")).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByTestId("project-settings"));
+    expect(await screen.findByRole("dialog", { name: "Project settings" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Name" })).toHaveValue("Customer X");
+  });
+
   it("deletes a project (and all its sessions) from the folder kebab after confirming", async () => {
     projectsMock.push("Customer X");
     mockConversations([

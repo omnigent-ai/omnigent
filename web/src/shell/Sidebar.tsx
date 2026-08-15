@@ -4205,10 +4205,6 @@ function ProjectFolderMenuItems({
           New session
         </Link>
       </C.Item>
-      <C.Item data-testid="rename-project" onSelect={actions.openRename}>
-        <PencilIcon className="size-3.5" />
-        Rename project
-      </C.Item>
       <C.Item data-testid="project-settings" onSelect={actions.openSettings}>
         <Settings2Icon className="size-3.5" />
         Project settings
