@@ -1359,14 +1359,24 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("opens the connect-host instructions from the host dropdown", () => {
-    renderLanding();
+  it("quotes server URLs in host and Lakebox connect commands", () => {
+    setOmnigentHostConfig({ cliServerUrlSuffix: "/api?profile=dev&glob=*" });
+    renderLanding({ databricks_features: true });
     // Radix dropdowns open on pointerdown (a bare click doesn't in jsdom).
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-connect-host"));
-    // The modal mounts the connect instructions with the runnable command.
+
     expect(screen.getByTestId("connect-host-dialog")).toBeTruthy();
-    expect(screen.getByTestId("connect-host-command")).toBeTruthy();
+    expect(screen.getByTestId("connect-host-command")).toHaveTextContent(
+      `omni host --server '${window.location.origin}/api?profile=dev&glob=*'`,
+    );
+
+    const lakeboxTab = screen.getByRole("tab", { name: "Databricks Lakebox" });
+    fireEvent.mouseDown(lakeboxTab);
+    fireEvent.click(lakeboxTab);
+    expect(screen.getByTestId("connect-lakebox-connect-command")).toHaveTextContent(
+      `omni sandbox connect --provider lakebox --sandbox-id <id> --server '${window.location.origin}/api?profile=dev&glob=*'`,
+    );
   });
 
   it("offers connect-host even when no hosts are online (no dead end)", () => {

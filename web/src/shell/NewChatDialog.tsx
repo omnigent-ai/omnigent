@@ -102,6 +102,7 @@ import {
   type ProjectPrefillState,
 } from "./projectPrefill";
 import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
+import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import {
   readLastHostChoice,
@@ -468,6 +469,7 @@ export function ConnectHostInstructions({
   // "loading" before the boot probe resolves → treat as OSS (no Databricks
   // hints) until known, so the clean UI shows first and lakebox never flashes.
   const databricksFeatures = info !== "loading" && info.databricks_features;
+  const quotedServerUrl = quoteShellArgument(serverUrl);
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
       {label && <p className="text-sm text-muted-foreground">{label}</p>}
@@ -483,7 +485,7 @@ export function ConnectHostInstructions({
           </TabsList>
           <TabsContent value="local">
             <CliCommandBlock
-              command={`omni host --server ${serverUrl}`}
+              command={`omni host --server ${quotedServerUrl}`}
               testIdPrefix="connect-host"
             />
           </TabsContent>
@@ -493,13 +495,16 @@ export function ConnectHostInstructions({
               testIdPrefix="connect-lakebox-create"
             />
             <CliCommandBlock
-              command={`omni sandbox connect --provider lakebox --sandbox-id <id> --server ${serverUrl}`}
+              command={`omni sandbox connect --provider lakebox --sandbox-id <id> --server ${quotedServerUrl}`}
               testIdPrefix="connect-lakebox-connect"
             />
           </TabsContent>
         </Tabs>
       ) : (
-        <CliCommandBlock command={`omni host --server ${serverUrl}`} testIdPrefix="connect-host" />
+        <CliCommandBlock
+          command={`omni host --server ${quotedServerUrl}`}
+          testIdPrefix="connect-host"
+        />
       )}
     </div>
   );
