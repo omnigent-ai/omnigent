@@ -678,6 +678,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 "terminal": "claude",
                 "session_key": "main",
                 "ensure_native_terminal": True,
+                "persist_resource_event": True,
             },
         ),
         (
@@ -3221,6 +3222,36 @@ async def test_relay_persists_terminal_resource_created_from_runner() -> None:
     assert events[0].data.resource["id"] == "terminal_zsh_s1"
     # Resource events thread on the session id (matches the REST path).
     assert events[0].response_id == "79b22ebd2309e48fdeb450c65611d51b"
+
+
+@pytest.mark.asyncio
+async def test_relay_does_not_persist_transient_terminal_resource_created() -> None:
+    """Retry recovery publishes terminal readiness without changing history."""
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    store = _ConversationStore()
+    client = _FakeStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "session.resource.created",
+                    "persist_resource_event": False,
+                    "resource": {
+                        "id": "terminal_claude_main",
+                        "type": "terminal",
+                        "name": "claude:main",
+                        "metadata": {"terminal_name": "claude", "session_key": "main"},
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
+
+    events = [item for item in store.appended_items if item.type == "resource_event"]
+    assert events == []
 
 
 @pytest.mark.asyncio

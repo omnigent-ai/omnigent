@@ -9,7 +9,7 @@ import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
-import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
+import { FALLBACK_SERVER_INFO, resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
@@ -86,27 +86,7 @@ applyThemePalette(readThemePalette());
 const bootProbe: Promise<ServerInfo> = Promise.race([
   resolveServerInfo(),
   new Promise<ServerInfo>((resolve) => {
-    setTimeout(
-      () =>
-        resolve({
-          accounts_enabled: false,
-          single_user: false,
-          login_url: null,
-          needs_setup: false,
-          databricks_features: false,
-          managed_sandboxes_enabled: false,
-          sandbox_provider: null,
-          sharing_mode: "on",
-          public_sharing_enabled: true,
-          server_version: null,
-          smart_routing_enabled: false,
-          smart_routing_sources: { external: false, oss: false },
-          harness_install_enabled: false,
-          installable_harnesses: [],
-          dictation_available: false,
-        }),
-      1500,
-    );
+    setTimeout(() => resolve(FALLBACK_SERVER_INFO), 1500);
   }),
 ]);
 

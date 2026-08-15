@@ -26,6 +26,7 @@ function info(overrides: Partial<ServerInfo>): ServerInfo {
     server_version: null,
     smart_routing_enabled: false,
     smart_routing_sources: { external: false, oss: false },
+    features: {},
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -116,6 +117,36 @@ describe("resolveServerInfo sandbox_providers", () => {
       sandbox_providers: ["modal", 7, null, "e2b"],
     });
     expect(resolved.sandbox_providers).toEqual(["modal", "e2b"]);
+  });
+});
+
+describe("resolveServerInfo release features", () => {
+  it("keeps boolean feature values and drops malformed entries", async () => {
+    const parsed = await probe({
+      features: { usage_page: true, harness_install: false, malformed: "yes" },
+    });
+    expect(parsed.features).toEqual({ usage_page: true, harness_install: false });
+  });
+
+  it("defaults missing features off", async () => {
+    const { isFeatureEnabled } = await import("./capabilities");
+    const parsed = await probe({});
+    expect(isFeatureEnabled(parsed, "usage_page")).toBe(false);
+    expect(isFeatureEnabled(parsed, "harness_install")).toBe(false);
+  });
+
+  it("falls back to the legacy harness field from an older server", async () => {
+    const { isFeatureEnabled } = await import("./capabilities");
+    const parsed = await probe({ harness_install_enabled: true });
+    expect(isFeatureEnabled(parsed, "harness_install")).toBe(true);
+  });
+
+  it("fails all release features closed when the probe fails", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("offline"));
+    const { isFeatureEnabled, resolveServerInfo } = await import("./capabilities");
+    const parsed = await resolveServerInfo();
+    expect(isFeatureEnabled(parsed, "usage_page")).toBe(false);
+    expect(isFeatureEnabled(parsed, "harness_install")).toBe(false);
   });
 });
 

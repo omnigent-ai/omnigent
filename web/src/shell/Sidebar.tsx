@@ -127,7 +127,7 @@ import {
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
+import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
@@ -473,6 +473,8 @@ export function Sidebar({
   onOpenSearch,
   peek,
 }: SidebarProps) {
+  const serverInfo = useServerInfo();
+  const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
@@ -923,29 +925,31 @@ export function Sidebar({
                 )}
               </Link>
             </Button>
-            <Button
-              asChild
-              variant="ghost"
-              className={cn(
-                SIDEBAR_ROW,
-                "w-full justify-start border-0 font-normal",
-                SIDEBAR_HOVER_HIGHLIGHT,
-                isUsagePage && SIDEBAR_ACTIVE_HIGHLIGHT,
-              )}
-              data-testid="usage-nav"
-            >
-              <Link to="/usage" onClick={onNavClick}>
-                <WalletIcon
-                  className={cn(
-                    "ui-icon",
-                    isUsagePage
-                      ? "text-[var(--sidebar-active-foreground)]"
-                      : "text-muted-foreground",
-                  )}
-                />
-                Usage
-              </Link>
-            </Button>
+            {usagePageEnabled && (
+              <Button
+                asChild
+                variant="ghost"
+                className={cn(
+                  SIDEBAR_ROW,
+                  "w-full justify-start border-0 font-normal",
+                  SIDEBAR_HOVER_HIGHLIGHT,
+                  isUsagePage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                )}
+                data-testid="usage-nav"
+              >
+                <Link to="/usage" onClick={onNavClick}>
+                  <WalletIcon
+                    className={cn(
+                      "ui-icon",
+                      isUsagePage
+                        ? "text-[var(--sidebar-active-foreground)]"
+                        : "text-muted-foreground",
+                    )}
+                  />
+                  Usage
+                </Link>
+              </Button>
+            )}
           </div>
 
           <nav

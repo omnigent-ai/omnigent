@@ -91,6 +91,22 @@ Apply your chosen issuer with `kubectl apply -f <file>`. Without it, cert-manage
 logs `IssuerNotFound` and no certificate is issued (the server still runs — only
 TLS is affected).
 
+## Release features
+
+Release features are deployment-wide and off by default. Set the
+comma-separated `OMNIGENT_FEATURES` value in `base/configmap.yaml`, apply your
+Kustomize target, and restart the Deployment so every pod receives one fresh
+startup snapshot:
+
+```bash
+kubectl kustomize deploy/kubernetes/base/ | kubectl apply -f -
+kubectl rollout restart deployment/omnigent
+kubectl rollout status deployment/omnigent
+```
+
+Use the same restart after removing a feature for rollback. See
+[`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for known keys.
+
 ## Deploy with an external database
 
 Use this path when you have a managed Postgres (RDS, Cloud SQL, Neon, etc.).

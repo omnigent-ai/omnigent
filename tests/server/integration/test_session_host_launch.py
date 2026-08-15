@@ -21,6 +21,7 @@ import contextlib
 import json
 import time
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -1974,7 +1975,7 @@ async def test_message_relaunch_workspace_missing_persists_error_turn(
     assert len(error_items) == 1, (
         f"expected exactly one error item for the workspace-missing refusal, got {error_items!r}"
     )
-    assert error_items[0]["code"] == "runner_failed_to_start"
+    assert error_items[0]["code"] == "workspace_missing"
     assert "does not exist" in error_items[0]["message"], (
         f"error message should mention workspace does not exist, got {error_items[0]['message']!r}"
     )
@@ -1982,3 +1983,220 @@ async def test_message_relaunch_workspace_missing_persists_error_turn(
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert conv.host_id == _HOST_ID
+
+
+async def test_retry_session_relaunches_dead_runner_without_mutating_history(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry relaunches one dead runner and confirms its recovered lifecycle."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    original_runner_id = session["runner_id"]
+    before = await client.get(f"/v1/sessions/{session_id}/items")
+    runner_client = object()
+    wait_for_runner_client = AsyncMock(return_value=runner_client)
+    initialize = AsyncMock(return_value=False)
+    relay_ready = AsyncMock(return_value=None)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", wait_for_runner_client)
+    monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
+    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", relay_ready)
+
+    set_runner_client(None)
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+    await responder
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {
+        "queued": False,
+        "recovered": True,
+        "recovery": "runner_relaunched",
+    }
+    initialize.assert_awaited_once()
+    assert initialize.await_args.kwargs["suppress_recovery_turn"] is False
+    relay_ready.assert_awaited_once()
+    after = await client.get(f"/v1/sessions/{session_id}/items")
+    assert after.json() == before.json()
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id != original_runner_id
+
+
+async def test_retry_session_single_flight_launches_and_rotates_once(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent retries share one host launch and one binding rotation."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    original_runner_id = session["runner_id"]
+    runner_client = object()
+
+    async def _runner_connects_after_launch(*args: Any, **kwargs: Any) -> object:
+        del args, kwargs
+        await asyncio.sleep(0.05)
+        return runner_client
+
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _runner_connects_after_launch)
+    monkeypatch.setattr(
+        routes_events,
+        "_ensure_runner_session_initialized",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        routes_events,
+        "_ensure_runner_relay_ready",
+        AsyncMock(return_value=None),
+    )
+    set_runner_client(None)
+
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    responses = await asyncio.gather(
+        client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "retry_session", "data": {}},
+        ),
+        client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "retry_session", "data": {}},
+        ),
+    )
+    await responder
+
+    expected = {
+        "queued": False,
+        "recovered": True,
+        "recovery": "runner_relaunched",
+    }
+    assert [response.json() for response in responses] == [expected, expected]
+    assert not await _expect_no_launch(comm, budget_s=0.2)
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id != original_runner_id
+
+
+async def test_retry_session_single_flight_evicts_after_only_waiter_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settled recovery is not reused after its only waiter is cancelled."""
+    from omnigent.server.routes.sessions import routes_events
+
+    session_id = "cancelled-retry-waiter"
+    first_started = asyncio.Event()
+    finish_first = asyncio.Event()
+    first_settled = asyncio.Event()
+    attempts = 0
+    first_result = {"queued": False, "recovered": True, "recovery": "first"}
+    second_result = {"queued": False, "recovered": True, "recovery": "second"}
+
+    async def _recover(**kwargs: Any) -> dict[str, bool | str]:
+        nonlocal attempts
+        del kwargs
+        attempts += 1
+        if attempts == 1:
+            first_started.set()
+            await finish_first.wait()
+            first_settled.set()
+            return first_result
+        return second_result
+
+    monkeypatch.setattr(routes_events, "_recover_retry_session", _recover)
+    routes_events._retry_recovery_tasks.pop(session_id, None)
+
+    waiter = asyncio.create_task(
+        routes_events._retry_session_single_flight(
+            request=None,
+            session_id=session_id,
+            conversation_store=None,
+            runner_router=None,
+        )
+    )
+    await first_started.wait()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    finish_first.set()
+    await first_settled.wait()
+    for _ in range(10):
+        if session_id not in routes_events._retry_recovery_tasks:
+            break
+        await asyncio.sleep(0)
+
+    assert session_id not in routes_events._retry_recovery_tasks
+    assert (
+        await routes_events._retry_session_single_flight(
+            request=None,
+            session_id=session_id,
+            conversation_store=None,
+            runner_router=None,
+        )
+        == second_result
+    )
+    assert attempts == 2
+
+
+@pytest.mark.parametrize(
+    ("error_code", "error_message", "expected_status"),
+    [
+        ("workspace_missing", _WORKSPACE_MISSING_ERROR, 410),
+        ("harness_not_configured", _HARNESS_REFUSAL, 412),
+    ],
+)
+async def test_retry_session_host_refusal_is_typed_and_does_not_persist(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    error_message: str,
+    expected_status: int,
+) -> None:
+    """Retry host refusals stay typed and never enter message persistence."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    before = await client.get(f"/v1/sessions/{session_id}/items")
+    set_runner_client(None)
+
+    responder = asyncio.create_task(
+        _serve_one_launch(
+            comm,
+            launch_status="failed",
+            launch_error=error_message,
+            launch_error_code=error_code,
+        )
+    )
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+    await responder
+
+    assert response.status_code == expected_status, response.text
+    assert response.json()["error"]["code"] == error_code
+    after = await client.get(f"/v1/sessions/{session_id}/items")
+    assert after.json() == before.json()
