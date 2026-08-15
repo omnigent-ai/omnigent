@@ -42,6 +42,11 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();
     expect(screen.getByText("Previous session")).toBeTruthy();
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
+    const viewToggle = screen.getByText("Toggle chat / terminal view").closest("li");
+    expect(viewToggle).toBeTruthy();
+    expect(within(viewToggle!).getByText("Ctrl")).toBeTruthy();
+    expect(within(viewToggle!).getByText("Alt")).toBeTruthy();
+    expect(within(viewToggle!).getByText("T")).toBeTruthy();
     expect(screen.getByText("Navigate suggestions")).toBeTruthy();
   });
 

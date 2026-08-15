@@ -1,6 +1,7 @@
 import { Loader2Icon, MessagesSquareIcon, TerminalIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { VIEW_MODE_TOGGLE_SHORTCUT } from "@/hooks/useViewModeToggleHotkey";
 import { isIOSShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { useTerminalFirst } from "./TerminalFirstContext";
@@ -110,7 +111,9 @@ function ViewModeSegment({
       </TooltipTrigger>
       {/* Bottom placement: the header sits at top-0, so a top-side tooltip
           would render above the viewport edge and get clipped. */}
-      <TooltipContent side="bottom">{label}</TooltipContent>
+      <TooltipContent side="bottom">
+        {label} · {VIEW_MODE_TOGGLE_SHORTCUT}
+      </TooltipContent>
     </Tooltip>
   );
 }
