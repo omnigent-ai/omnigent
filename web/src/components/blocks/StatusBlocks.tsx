@@ -13,7 +13,6 @@ import {
   CheckIcon,
   ChevronRightIcon,
   CopyIcon,
-  LoaderCircleIcon,
   RotateCcwIcon,
   ShieldXIcon,
   ShrinkIcon,
@@ -22,6 +21,7 @@ import {
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
 import { DatabricksIcon } from "@/components/icons/DatabricksIcon";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -189,8 +189,37 @@ export function ErrorBanner({
       setActiveDiagnostics(diagnostics[0]?.id ?? "terminal");
     }
   }, [activeDiagnostics, diagnostics]);
+  useEffect(() => {
+    if (retryError && !retrying) dismissButtonRef.current?.focus();
+  }, [retryError, retrying]);
 
   if (dismissed) return null;
+
+  if (retrying) {
+    return (
+      <div
+        data-testid="error-reconnecting"
+        className={cn(
+          TOOL_SURFACE_WIDTH_CLASS,
+          "relative flex min-h-14 items-center justify-center py-2",
+        )}
+      >
+        <span
+          aria-hidden="true"
+          className="absolute inset-x-0 top-1/2 border-border border-t border-dashed"
+        />
+        <Badge
+          variant="outline"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          className="relative z-10 h-auto rounded-xl border-border bg-background px-4 py-2 text-sm font-normal text-muted-foreground shadow-xs"
+        >
+          Reconnecting
+        </Badge>
+      </div>
+    );
+  }
 
   const copy = async (target: string, value: string) => {
     await copyText(value);
@@ -211,7 +240,6 @@ export function ErrorBanner({
       retryInFlightRef.current = false;
       setRetryError(`Retry failed: ${error instanceof Error ? error.message : String(error)}`);
       setRetrying(false);
-      dismissButtonRef.current?.focus();
     }
   };
 
@@ -298,14 +326,9 @@ export function ErrorBanner({
               variant="ghost"
               size="xs"
               onClick={() => void retry()}
-              disabled={retrying}
               className="mt-0.5 shrink-0 text-muted-foreground hover:text-foreground"
             >
-              {retrying ? (
-                <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
-              ) : (
-                <RotateCcwIcon aria-hidden="true" />
-              )}
+              <RotateCcwIcon aria-hidden="true" />
               Retry
             </Button>
           ) : null}
@@ -321,11 +344,6 @@ export function ErrorBanner({
             <XIcon aria-hidden="true" />
           </Button>
         </div>
-        {retrying ? (
-          <div role="status" aria-live="polite" className="mt-2 pl-8 text-sm text-muted-foreground">
-            Reconnecting…
-          </div>
-        ) : null}
         {retryError ? (
           <div
             role="status"

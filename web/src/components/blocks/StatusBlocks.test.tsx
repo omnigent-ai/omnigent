@@ -142,7 +142,7 @@ describe("ErrorBanner", () => {
     },
   );
 
-  it("keeps retry progress and failure aligned without changing the compact icon rule", async () => {
+  it("replaces the full banner during recovery and restores it after failure", async () => {
     let rejectRetry: ((error: Error) => void) | undefined;
     const onRetry = vi.fn(
       () =>
@@ -159,13 +159,26 @@ describe("ErrorBanner", () => {
       />,
     );
 
-    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    expect(screen.getByRole("status")).toHaveClass("pl-8");
-    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
+    const reconnecting = screen.getByTestId("error-reconnecting");
+    const status = screen.getByRole("status");
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(reconnecting).toHaveClass("justify-center", "min-h-14");
+    expect(status).toHaveTextContent(/^Reconnecting$/);
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(status).toHaveAttribute("aria-atomic", "true");
+    expect(status).toHaveClass("rounded-xl", "border-border", "bg-background");
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Dismiss error" })).toBeNull();
+    expect(screen.queryByText("Message")).toBeNull();
+    expect(screen.queryByRole("button", { name: "View diagnostics" })).toBeNull();
+    expect(screen.queryByTestId("error-status-icon")).toBeNull();
+    expect(screen.queryByTestId("error-headline")).toBeNull();
 
     await act(async () => rejectRetry?.(new Error("Host is still offline")));
-    expect(screen.getByRole("status")).toHaveClass("pl-8");
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(screen.queryByTestId("error-reconnecting")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("Retry failed: Host is still offline");
     expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
   });
 
@@ -284,7 +297,7 @@ describe("ErrorBanner", () => {
     expect(screen.getByText("Unrelated transcript content")).toBeInTheDocument();
   });
 
-  it("prevents duplicate retries and resolves the banner on success", async () => {
+  it("prevents duplicate retries and removes the replacement pill on success", async () => {
     let resolveRetry: (() => void) | undefined;
     const onRetry = vi.fn(
       () =>
@@ -300,16 +313,22 @@ describe("ErrorBanner", () => {
         onRetry={onRetry}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    expect(screen.getByText("Message")).toBeInTheDocument();
     const retry = screen.getByRole("button", { name: "Retry" });
     act(() => {
       retry.click();
       retry.click();
     });
     expect(onRetry).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
-    expect(retry).toBeDisabled();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(/^Reconnecting$/);
+    expect(screen.queryByText("Message")).toBeNull();
     resolveRetry?.();
-    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    await waitFor(() => {
+      expect(screen.queryByRole("status")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
   });
 
   it("restores the actionable error and diagnostics when retry fails", async () => {

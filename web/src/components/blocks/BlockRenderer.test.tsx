@@ -241,9 +241,14 @@ describe("BlockRenderer dispatch", () => {
 
     expect(onRetryError).toHaveBeenCalledTimes(1);
     expect(onRetryError).toHaveBeenCalledWith(item);
-    expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(/^Reconnecting$/);
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
     resolveRetry?.();
-    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    await waitFor(() => {
+      expect(screen.queryByRole("status")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
   });
 
   it("falls back to a code→sentence description for an unclassified failure", () => {
