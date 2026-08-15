@@ -80,4 +80,15 @@ describe("KeyboardShortcutsDialog", () => {
     expect(within(row!).queryByText("Alt")).toBeNull();
     expect(within(row!).getByText("1…0")).toBeTruthy();
   });
+
+  it("lists Ctrl+B as the workspace sidebar shortcut on non-macOS platforms", () => {
+    render(<KeyboardShortcutsDialog />);
+    toggleViaHotkey();
+    const row = screen.getByText("Toggle workspace sidebar").closest("li");
+    expect(row).toBeTruthy();
+    expect(within(row!).getByText("Ctrl")).toBeTruthy();
+    expect(within(row!).getByText("B")).toBeTruthy();
+    expect(within(row!).queryByText("Alt")).toBeNull();
+    expect(within(row!).queryByText("]")).toBeNull();
+  });
 });

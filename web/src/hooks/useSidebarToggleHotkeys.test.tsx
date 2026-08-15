@@ -1,7 +1,6 @@
-// ⌘⌥[ toggles the left sidebar, ⌘⌥] the right; matches the physical bracket
-// keys (not the glyph ⌥ produces), ignores the bare keys / missing-Alt / Shift
-// variants / auto-repeat / AltGraph, fully claims the event, and unbinds on
-// unmount.
+// ⌘⌥[ toggles the left sidebar; ⌘B and ⌘⌥] toggle the right. Matches physical
+// keys, ignores modifier variants / auto-repeat / AltGraph, fully claims the
+// event from editable surfaces, and unbinds on unmount.
 
 import { renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -15,10 +14,16 @@ function press(
     altKey: true,
   },
   code = "BracketLeft",
-): void {
-  document.body.dispatchEvent(
-    new KeyboardEvent("keydown", { code, bubbles: true, cancelable: true, ...mods }),
-  );
+  target: HTMLElement = document.body,
+): KeyboardEvent {
+  const event = new KeyboardEvent("keydown", {
+    code,
+    bubbles: true,
+    cancelable: true,
+    ...mods,
+  });
+  target.dispatchEvent(event);
+  return event;
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -45,7 +50,15 @@ describe("useSidebarToggleHotkeys", () => {
     expect(onToggleLeft).not.toHaveBeenCalled();
   });
 
-  it("Cmd variants also fire (macOS)", () => {
+  it("Cmd/Ctrl+B toggles only the right sidebar", () => {
+    const { onToggleLeft, onToggleRight } = setup();
+    press({ metaKey: true }, "KeyB");
+    press({ ctrlKey: true }, "KeyB");
+    expect(onToggleRight).toHaveBeenCalledTimes(2);
+    expect(onToggleLeft).not.toHaveBeenCalled();
+  });
+
+  it("Cmd variants of the legacy bracket chords still fire (macOS)", () => {
     const { onToggleLeft, onToggleRight } = setup();
     press({ metaKey: true, altKey: true }, "BracketLeft");
     press({ metaKey: true, altKey: true }, "BracketRight");
@@ -53,7 +66,16 @@ describe("useSidebarToggleHotkeys", () => {
     expect(onToggleRight).toHaveBeenCalledTimes(1);
   });
 
-  it("ignores the bare keys, missing-Alt, and Shift variants", () => {
+  it("leaves bare B and its Shift/Alt variants available", () => {
+    const { onToggleLeft, onToggleRight } = setup();
+    press({}, "KeyB");
+    press({ ctrlKey: true, shiftKey: true }, "KeyB");
+    press({ metaKey: true, altKey: true }, "KeyB");
+    expect(onToggleLeft).not.toHaveBeenCalled();
+    expect(onToggleRight).not.toHaveBeenCalled();
+  });
+
+  it("ignores the bare brackets, missing-Alt, and Shift bracket variants", () => {
     const { onToggleLeft, onToggleRight } = setup();
     press({}, "BracketLeft"); // bare [
     press({ ctrlKey: true }, "BracketLeft"); // ⌘[ alone = browser Back, not ours
@@ -71,9 +93,11 @@ describe("useSidebarToggleHotkeys", () => {
   });
 
   it("ignores auto-repeat (holding the chord doesn't flap the panel)", () => {
-    const { onToggleLeft } = setup();
+    const { onToggleLeft, onToggleRight } = setup();
     press({ ctrlKey: true, altKey: true, repeat: true }, "BracketLeft");
+    press({ ctrlKey: true, repeat: true }, "KeyB");
     expect(onToggleLeft).not.toHaveBeenCalled();
+    expect(onToggleRight).not.toHaveBeenCalled();
   });
 
   it("ignores AltGraph chords (Ctrl+Alt produced by intl layouts)", () => {
@@ -117,6 +141,27 @@ describe("useSidebarToggleHotkeys", () => {
     document.body.dispatchEvent(ev);
     expect(ev.defaultPrevented).toBe(true);
     expect(stopSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["composer", "textarea", ""],
+    ["terminal", "textarea", "xterm-helper-textarea"],
+    ["file editor", "textarea", "inputarea"],
+  ])("claims Cmd+B before the focused %s handles it", (_name, tag, className) => {
+    const { onToggleRight } = setup();
+    const target = document.createElement(tag);
+    target.className = className;
+    document.body.appendChild(target);
+    target.focus();
+    const targetHandler = vi.fn();
+    target.addEventListener("keydown", targetHandler);
+
+    const event = press({ metaKey: true }, "KeyB", target);
+
+    expect(onToggleRight).toHaveBeenCalledTimes(1);
+    expect(event.defaultPrevented).toBe(true);
+    expect(targetHandler).not.toHaveBeenCalled();
+    target.remove();
   });
 
   it("unbinds on unmount", () => {
