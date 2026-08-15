@@ -55,6 +55,91 @@ describe("ErrorBanner", () => {
     expect(message).not.toHaveTextContent("terminal: claude:main");
   });
 
+  it("uses one stable leading slot across rest, hover, focus, and expanded states", () => {
+    render(
+      <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
+    );
+
+    const messageToggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
+    expect(screen.getByTestId("error-leading-slot")).toHaveClass("size-5");
+    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
+    expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
+
+    fireEvent.mouseEnter(messageToggle);
+    expect(screen.queryByTestId("error-status-icon")).toBeNull();
+    expect(screen.getByTestId("error-disclosure-icon")).toHaveClass("text-foreground");
+    expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
+
+    fireEvent.mouseLeave(messageToggle);
+    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
+    expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
+
+    fireEvent.focus(messageToggle);
+    expect(screen.queryByTestId("error-status-icon")).toBeNull();
+    expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
+
+    fireEvent.blur(messageToggle);
+    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
+    fireEvent.click(messageToggle);
+    expect(screen.queryByTestId("error-status-icon")).toBeNull();
+    expect(screen.getByTestId("error-disclosure-icon")).toHaveClass("rotate-90");
+  });
+
+  it("keeps retry progress and failure aligned without changing the compact icon rule", async () => {
+    let rejectRetry: ((error: Error) => void) | undefined;
+    const onRetry = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectRetry = reject;
+        }),
+    );
+    render(
+      <ErrorBanner
+        message={TERMINAL_ERROR}
+        source="execution"
+        code="required_terminal_exited"
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(screen.getByRole("status")).toHaveClass("pl-8");
+    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
+
+    await act(async () => rejectRetry?.(new Error("Host is still offline")));
+    expect(screen.getByRole("status")).toHaveClass("pl-8");
+    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
+  });
+
+  it("matches the reference diagnostics hierarchy and surface treatment", () => {
+    render(
+      <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    expect(screen.getByRole("alert")).toHaveClass("rounded-2xl", "p-4");
+    expect(screen.getByTestId("error-message-content")).toHaveClass("font-mono", "text-sm");
+
+    const diagnosticsToggle = screen.getByRole("button", { name: "View diagnostics" });
+    expect(diagnosticsToggle).toHaveClass("justify-between");
+    expect(diagnosticsToggle.closest('[data-slot="collapsible"]')).toHaveClass("border-t", "pt-4");
+    fireEvent.click(diagnosticsToggle);
+
+    expect(screen.getByRole("tablist", { name: "Diagnostic sections" })).toHaveAttribute(
+      "data-variant",
+      "line",
+    );
+    const diagnostics = screen.getByTestId("error-diagnostics-content");
+    expect(diagnostics).toHaveClass("max-h-64", "text-zinc-100");
+    expect(diagnostics.parentElement).toHaveClass("rounded-xl", "bg-zinc-950");
+    expect(screen.getByRole("button", { name: "Copy terminal" })).toHaveClass(
+      "absolute",
+      "top-3",
+      "right-3",
+    );
+  });
+
   it("preserves classified title, cause, and remediation semantics", () => {
     render(
       <ErrorBanner
