@@ -15,6 +15,7 @@ import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
+import { setSessionHost } from "./sessionHost";
 import type {
   ModelUsage,
   NativeModelOption,
@@ -72,6 +73,10 @@ export interface PostEventResponse {
    * events.
    */
   pendingId?: string;
+  /** True only when retry performed a usable runner or terminal recovery. */
+  recovered?: boolean;
+  /** Machine-readable recovery outcome for retry_session control events. */
+  recovery?: "already_connected" | "native_terminal_ready" | "runner_relaunched";
 }
 
 /**
@@ -284,6 +289,9 @@ function usageByModelFromWire(
 }
 
 function sessionFromWire(wire: SessionResponseWire): Session {
+  // Record the session's host so slice-key routing (turn dispatch, terminal
+  // attach) can pin to the replica holding that host's runner tunnel.
+  setSessionHost(wire.id, wire.host_id);
   return {
     id: wire.id,
     agentId: wire.agent_id,
@@ -394,12 +402,16 @@ function postEventResponseFromWire(wire: {
   item_id?: string;
   denied?: boolean;
   pending_id?: string;
+  recovered?: boolean;
+  recovery?: PostEventResponse["recovery"];
 }): PostEventResponse {
   return {
     queued: wire.queued,
     itemId: wire.item_id,
     denied: wire.denied,
     pendingId: wire.pending_id,
+    recovered: wire.recovered,
+    recovery: wire.recovery,
   };
 }
 
@@ -909,6 +921,8 @@ export async function postEvent(
       item_id?: string;
       denied?: boolean;
       pending_id?: string;
+      recovered?: boolean;
+      recovery?: PostEventResponse["recovery"];
     },
   );
 }
@@ -959,6 +973,11 @@ export function interrupt(sessionId: string): Promise<PostEventResponse> {
  */
 export function stopSession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "stop_session", data: {} });
+}
+
+/** Reconnect or relaunch the existing runner without replaying user input. */
+export function retrySession(sessionId: string): Promise<PostEventResponse> {
+  return postEvent(sessionId, { type: "retry_session", data: {} });
 }
 
 /**

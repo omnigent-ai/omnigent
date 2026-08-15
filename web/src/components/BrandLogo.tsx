@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { OttoEyes } from "@/components/OttoEyes";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { useAppName, useLogoUrl } from "@/lib/branding";
-import { getOmnigentHostConfig, getOmnigentHostGeneration, hostFetch } from "@/lib/host";
+import { authenticatedFetch } from "@/lib/identity";
+import { getOmnigentHostConfig, getOmnigentHostGeneration } from "@/lib/host";
 
 interface BlobUrlEntry {
   refs: number;
@@ -47,7 +48,7 @@ function acquireLogo(path: string, generation: number): BlobUrlHandle {
   if (!entry) {
     entry = { refs: 0, url: null, discarded: false, promise: Promise.resolve("") };
     const current = entry;
-    current.promise = hostFetch(path)
+    current.promise = authenticatedFetch(path)
       .then((response) =>
         response.ok ? response.blob() : Promise.reject(new Error(`HTTP ${response.status}`)),
       )

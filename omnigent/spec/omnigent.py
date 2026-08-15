@@ -166,7 +166,7 @@ def agent_spec_to_agent_def(spec: AgentSpec) -> AgentDef:
     # ``"inherit"`` sentinel at translation time so it never
     # reaches the forward path as a string.
     # Bundle root: derived from any bundled skill's ``skill_dir``
-    # (each lives at ``<bundle>/skills/<name>/`` per AGENTSPEC.md).
+    # (each lives at ``<bundle>/skills/<dir>/`` per AGENTSPEC.md).
     # Without it the Claude SDK harness can't expose bundled skills
     # via ``--plugin-dir``. ``None`` when the spec has no skills —
     # nothing to expose, nothing to set.
@@ -1697,7 +1697,16 @@ def _translate_executor_from_def(
     harness = oa_executor.harness if oa_executor is not None else None
     if harness is None:
         harness = ""
-    harness = canonicalize_harness(harness) or ""
+    # A namespaced generic-ACP id (``acp:<slug>``) canonicalizes to the base
+    # ``acp`` harness, but the slug is what selects which user-configured ACP
+    # agent to spawn — ``_build_acp_spawn_env`` reads it back off
+    # ``config["harness"]`` at spawn time (see the dispatch note in
+    # ``runner/app.py``). Canonicalizing it away here silently spawned the first
+    # configured agent instead of the requested one, so keep the full id for
+    # ``acp:`` and canonicalize everything else (so aliases still resolve).
+    # Mirrors ``_materialize_harness_launcher_file`` in ``omnigent/cli.py``.
+    _canonical_harness = canonicalize_harness(harness) or ""
+    harness = harness if _canonical_harness == "acp" and ":" in harness else _canonical_harness
     profile = oa_executor.profile if oa_executor is not None else None
     if profile is None:
         profile = ""

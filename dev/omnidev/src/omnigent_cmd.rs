@@ -143,6 +143,16 @@ mod tests {
             .find(|(k, _)| k == "OMNIGENT_DATABASE_URI")
             .map(|(_, v)| v.clone());
         assert_eq!(db, Some(pod.db_uri()));
+
+        let config_home = cmd
+            .env
+            .iter()
+            .find(|(k, _)| k == "OMNIGENT_CONFIG_HOME")
+            .map(|(_, v)| v.clone());
+        assert_eq!(config_home, Some(pod.config_dir().display().to_string()));
+
+        assert!(cmd.env.iter().all(|(k, _)| k != "HOME"));
+        assert!(cmd.env.iter().all(|(k, _)| !k.starts_with("XDG_")));
     }
 
     #[test]

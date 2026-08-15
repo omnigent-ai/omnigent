@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import re
 
+import pytest
 from playwright.sync_api import Page, expect
 
 
+@pytest.mark.compat_smoke
 def test_send_message_renders_assistant_response(
     page: Page,
     seeded_session: tuple[str, str],

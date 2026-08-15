@@ -10,17 +10,17 @@ from the default ``pytest`` run via ``--ignore=tests/e2e_ui`` in
 Local usage::
 
     # one-time setup
-    uv sync --extra e2e-ui
-    uv run playwright install --with-deps chromium
+    uv sync --extra all --group test
+    uv run --no-sync playwright install --with-deps chromium
 
     # run against a freshly built SPA + spawned server
-    uv run pytest tests/e2e_ui -v
+    uv run --no-sync pytest tests/e2e_ui -v
 
     # iterate against an already-running server (dev hosts/ports need opt-in)
     cd web && npm run dev &
     omnigent server --agent examples/hello_world.yaml &
     OMNIGENT_E2E_ALLOW_DEV_BASE_URL=1 \
-      uv run pytest tests/e2e_ui --ui-base-url http://127.0.0.1:5173
+      uv run --no-sync pytest tests/e2e_ui --ui-base-url http://127.0.0.1:5173
 
 ``omnigent server`` is documented at ``omnigent/cli.py:server``:
 it spins up uvicorn with the Omnigent app and spawns an out-of-process
@@ -55,6 +55,7 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
+from tests._helpers.compat import apply_server_env, compat_server_cwd, server_executable
 from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
 from tests.codex_parity.sidecar_harness import (
     CodexResponsesSidecar,
@@ -570,6 +571,36 @@ def reset_mock_llm(mock_url: str) -> None:
     resp.raise_for_status()
 
 
+def seed_committed_items(session_id: str, items: list[Any]) -> None:
+    """Append committed ``NewConversationItem``s straight into the store.
+
+    For tests that need a settled transcript to act on but not the model's
+    behaviour. Skips the runner and the LLM entirely, so the test neither
+    waits on a turn nor inherits the mock-LLM harness's flakiness. Seed
+    BEFORE navigating — the chat hydrates its history on load.
+
+    Items go through the same store the server writes with, so they are
+    indistinguishable from a real turn's (same shape, ids, FTS rows).
+
+    :param session_id: Session to append to, e.g. ``"conv_abc123"``.
+    :param items: ``omnigent.entities.NewConversationItem`` values, in
+        transcript order.
+    :raises RuntimeError: If the server under test isn't one we spawned
+        (``--ui-base-url``), so its database isn't reachable from here.
+    """
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    database_uri = _server_state.get("database_uri")
+    if not database_uri:
+        raise RuntimeError(
+            "seeding needs the spawned server's database; it is "
+            "unavailable when running against --ui-base-url."
+        )
+    SqlAlchemyConversationStore(str(database_uri)).append(session_id, items)
+
+
 def seed_committed_turn(
     session_id: str,
     *,
@@ -579,35 +610,19 @@ def seed_committed_turn(
 ) -> None:
     """Write one committed user+assistant exchange straight into the store.
 
-    For tests that need a settled transcript to act on (per-message actions
-    anchor on a committed assistant response) but not the model's behaviour.
-    Skips the runner and the LLM entirely, so the test neither waits on a turn
-    nor inherits the mock-LLM harness's flakiness. Seed BEFORE navigating —
-    the chat hydrates its history on load.
-
-    Items are appended through the same store the server writes with, so they
-    are indistinguishable from a real turn's (same shape, ids, FTS rows).
+    Thin wrapper over :func:`seed_committed_items` for the common case: a
+    settled exchange per-message actions can anchor on (a fork's truncation
+    point, say).
 
     :param session_id: Session to append to, e.g. ``"conv_abc123"``.
     :param prompt: User message text, e.g. ``"ping"``.
     :param reply: Assistant message text, e.g. ``"pong"``.
     :param response_id: Response id shared by both items — per-message
         actions pass it as the turn anchor (e.g. a fork's truncation point).
-    :raises RuntimeError: If the server under test isn't one we spawned
-        (``--ui-base-url``), so its database isn't reachable from here.
     """
     from omnigent.entities import MessageData, NewConversationItem
-    from omnigent.stores.conversation_store.sqlalchemy_store import (
-        SqlAlchemyConversationStore,
-    )
 
-    database_uri = _server_state.get("database_uri")
-    if not database_uri:
-        raise RuntimeError(
-            "seed_committed_turn needs the spawned server's database; it is "
-            "unavailable when running against --ui-base-url."
-        )
-    SqlAlchemyConversationStore(str(database_uri)).append(
+    seed_committed_items(
         session_id,
         [
             NewConversationItem(
@@ -626,6 +641,32 @@ def seed_committed_turn(
             ),
         ],
     )
+
+
+def set_session_task_summary(session_id: str, task_summary: str) -> None:
+    """Write a session's ``task_summary`` straight into the store.
+
+    The background title coordinator is the only writer of this column —
+    there is no REST path for it — so a UI test that needs a settled label
+    seeds it here rather than waiting on LLM-backed generation. Seed BEFORE
+    navigating; the sub-agents rail reads the label when it hydrates.
+
+    :param session_id: Session to label, e.g. ``"conv_abc123"``.
+    :param task_summary: Human-readable label, e.g. ``"Investigate auth flow"``.
+    :raises RuntimeError: If the server under test isn't one we spawned
+        (``--ui-base-url``), so its database isn't reachable from here.
+    """
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    database_uri = _server_state.get("database_uri")
+    if not database_uri:
+        raise RuntimeError(
+            "set_session_task_summary needs the spawned server's database; it "
+            "is unavailable when running against --ui-base-url."
+        )
+    SqlAlchemyConversationStore(str(database_uri)).set_task_summary(session_id, task_summary)
 
 
 def set_fallback_mock_llm(
@@ -951,9 +992,8 @@ def live_server(
     # OMNIGENT_RUNNER_TUNNEL_TOKEN lets the server accept
     # exactly the sibling runner's WebSocket tunnel.
     mock_url = mock_llm_server_url
-    env = {
+    env: dict[str, str] = {
         **os.environ,
-        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
         "OMNIGENT_BUILTIN_AGENT_DIRS": os.pathsep.join(builtin_dirs),
         # Point the openai-agents harness at the mock LLM server so no
@@ -966,11 +1006,21 @@ def live_server(
         # WS /v1/dictation/stream transcribes any audio into FAKE_SCRIPT,
         # so chat/test_dictation.py needs no sherpa models or real ASR.
         "OMNIGENT_DICTATION_ENGINE": os.environ.get("OMNIGENT_DICTATION_ENGINE", "fake"),
+        # In compat mode the server binary runs from the pinned old venv, but
+        # the SPA was built from HEAD into _BUILD_OUTPUT. Point the old server
+        # at that directory so it serves the HEAD bundle instead of whatever
+        # stale (or absent) bundle ships in its own site-packages.
+        "OMNIGENT_WEB_UI_DIST": str(_BUILD_OUTPUT),
     }
+    # In normal runs, prepend the worktree so the server imports from the
+    # checked-out source. In compat mode (OMNIGENT_COMPAT_SERVER_PYTHON set),
+    # drop PYTHONPATH so the pinned old build in the compat venv resolves
+    # instead of being shadowed by the worktree.
+    apply_server_env(env, _REPO_ROOT)
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime; closed in finally
     proc = subprocess.Popen(
         [
-            sys.executable,
+            server_executable(),
             # Equivalent of the unit tests' ``monkeypatch.setattr(presence,
             # "_LEAVE_GRACE_S", ...)``, but applied INSIDE this spawned
             # interpreter — a monkeypatch in the test process can't reach a
@@ -996,6 +1046,9 @@ def live_server(
             str(agent_yaml_path),
         ],
         env=env,
+        # Compat mode: neutral CWD so the worktree doesn't shadow the pinned
+        # old server install via sys.path[0]. None (inherit) in normal runs.
+        cwd=compat_server_cwd(),
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )
@@ -2043,6 +2096,77 @@ def tool_fold_session(
     try:
         yield (live_server, session_id)
     finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            respawned.wait(timeout=5)
+
+
+@pytest.fixture
+def paused_mid_turn_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str, str]]:
+    """A runner-bound session whose turn PAUSES between two tool calls.
+
+    Same agent and bind contract as :func:`tool_fold_session`, except the
+    second LLM call blocks on the mock server's gate. That holds the turn
+    open — running, with its first tool already rendered — for as long as
+    the test needs, so a test can inject a mid-turn event (an elicitation,
+    say), act on it, then release the gate and let the same turn finish
+    with a second tool call and its wrap-up text. Without the gate the
+    ordering is a race against a turn that takes well under a second.
+
+    :param live_server: Spawned server fixture.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id, mock_llm_url)``. Send any turn, wait
+        for ``GET {mock_llm_url}/gate/pending``, then ``POST
+        {mock_llm_url}/gate/release`` to resume it.
+    """
+    import json as _json
+    import uuid as _uuid
+
+    model = f"paused-turn-probe-{_uuid.uuid4().hex[:8]}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_ls",
+                        "name": "sys_os_shell",
+                        "arguments": _json.dumps({"command": "ls"}),
+                    }
+                ]
+            },
+            {
+                "block": True,
+                "tool_calls": [
+                    {
+                        "call_id": "call_read",
+                        "name": "sys_os_read",
+                        "arguments": _json.dumps({"path": "README.md"}),
+                    }
+                ],
+            },
+        ],
+        key=model,
+    )
+    set_fallback_mock_llm(mock_llm_server_url, model, "Workspace inspected.")
+
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    yaml_text = _TOOL_FOLD_AGENT_YAML.format(name=_TOOL_FOLD_AGENT_NAME, model=model)
+    session_id = _create_bundled_session(live_server, runner_id, yaml_text)
+    try:
+        yield (live_server, session_id, mock_llm_server_url)
+    finally:
+        # Never leave a runner blocked on the gate — a stuck turn outlives
+        # the test and wedges the shared runner for the next one.
+        with contextlib.suppress(httpx.HTTPError):
+            httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0)
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
         if respawned is not None:
             respawned.terminate()

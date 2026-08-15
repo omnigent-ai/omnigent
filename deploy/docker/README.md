@@ -39,6 +39,27 @@ Reset everything (drops the DB and the artifact store):
 docker compose down -v
 ```
 
+## Release features
+
+Release features are deployment-wide and off by default. Enable one or more
+with the comma-separated `OMNIGENT_FEATURES` variable in `.env`, then recreate
+the server container:
+
+```dotenv
+OMNIGENT_FEATURES=usage_page
+```
+
+```bash
+docker compose up -d
+curl -s http://localhost:8000/v1/info | jq '.features'
+```
+
+Known keys and their lifecycle are documented in
+[`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md). Unknown keys fail
+server startup so a typo cannot silently produce the wrong rollout. To roll
+back, remove the key (or empty the variable), run `docker compose up -d` again,
+and reload the web app.
+
 ## Multi-user mode (accounts — default)
 
 Built-in accounts auth: no IdP to register, no proxy to host.

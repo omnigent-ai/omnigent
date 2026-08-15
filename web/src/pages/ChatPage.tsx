@@ -62,6 +62,7 @@ import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { useAppName } from "@/lib/branding";
+import { StreamBudgetBanner } from "@/components/StreamBudgetBanner";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
@@ -90,6 +91,7 @@ import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useIOSNativeKeyboardVisible } from "@/hooks/useIOSNativeKeyboardInset";
 import type { MessageContentBlock } from "@/lib/blocks";
+import { ELICITATION_RESPONSE_PREFIX } from "@/lib/blocks";
 import {
   derivePermissionLevel,
   isOwnerLevel,
@@ -105,6 +107,7 @@ import {
   liveCandidateAssistantIndex,
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { retrySession } from "@/lib/sessionsApi";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import {
@@ -406,6 +409,9 @@ export function buildPendingBubbles(
       itemId: p.tempId,
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
+      // Stamped once at send time; absent for snapshot-replayed entries,
+      // which show no timestamp rather than a re-stamped render time.
+      ...(p.createdAtS !== undefined ? { createdAtS: p.createdAtS } : {}),
     };
   });
 }
@@ -424,13 +430,15 @@ function isStandaloneElicitationBubble(bubble: Bubble): boolean {
   // turn to anchor to, so it must sit BELOW the user message it gated:
   //   • REQUEST-phase policy ASKs (gate the prompt before any turn), and
   //   • terminal-driven harness gates such as cursor-native `pre_tool_use`,
-  //     which never emit `response_created` (blockStream stamps these with
-  //     their own `elicit_*` id, so they land as standalone bubbles).
-  // A `tool_call` card inside an active SDK turn renders inline — it is grouped
-  // WITH the turn, so it is never an all-elicitation standalone bubble — and is
-  // intentionally excluded here.
+  //     which never emit `response_created`.
+  // The `elicit_*` response id blockStream stamps on exactly those cards IS the
+  // "no turn to anchor to" signal. A card carrying a real turn id belongs to
+  // that turn — an inline approval, or a question/plan card the walker split
+  // into its own bubble — and a user message after it is a NEW prompt, not the
+  // one the card gated, so it must not be lifted above the card.
   return (
     bubble.kind === "assistant" &&
+    bubble.responseId.startsWith(ELICITATION_RESPONSE_PREFIX) &&
     bubble.items.length > 0 &&
     bubble.items.every(
       (it) => it.kind === "elicitation" && (it.phase === "request" || it.phase === "pre_tool_use"),
@@ -1820,15 +1828,6 @@ function MainAgentSurface({
     conversationRef.current = el;
     setContainerEl(el);
   }, []);
-  // How far the composer has grown past its resting height. The composer keeps
-  // that growth out of the flex column, so the wrapper's box never moves —
-  // this only lifts the overlays pinned to its bottom edge (the scroll-to-
-  // bottom button, the Working… tab, the message nav) clear of the taller
-  // card. Written straight to the DOM: a re-render per line of typing would
-  // re-render the whole transcript for a purely visual offset.
-  const publishComposerGrowth = useCallback((px: number) => {
-    conversationRef.current?.style.setProperty("--composer-growth", `${px}px`);
-  }, []);
   const [terminalSurfaceEl, setTerminalSurfaceEl] = useState<HTMLElement | null>(null);
   // True only while the chat/terminal surface is the frontmost thing on screen.
   // Drives both native overlays so neither floats over an opened drawer.
@@ -2026,7 +2025,7 @@ function MainAgentSurface({
               >
                 {/* Scroll helpers — must live inside StickToBottom to access context. */}
                 <ScrollToBottomOnSend nonce={sendScrollNonce} />
-                <PreserveScrollDistanceOnResize />
+                <KeepBottomOnViewportResize />
                 <ConversationScrollRefBridge onScroller={setScroller} />
                 <HistoryAutoLoader scrollElement={scroller?.el ?? null} />
                 {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
@@ -2141,6 +2140,10 @@ function MainAgentSurface({
               scroller={scroller}
               hasMoreHistory={hasMoreHistory}
             />
+            {/* Too-many-tabs warning: floats as a rounded card just below the
+            header, a sibling of Conversation for the same reason as
+            JumpToTopButton — outside the chat-scroll-fade mask. */}
+            <StreamBudgetBanner />
             {/* Left-edge minimap: one tick per turn, scrolls independently, pages
             in older history on scroll-up. Sibling of Conversation for the same
             reason as JumpToTopButton — it escapes the chat-scroll-fade mask.
@@ -2201,7 +2204,6 @@ function MainAgentSurface({
             subagentRoutingEligible={subagentRoutingEligible}
             subAgentLabel={subAgentLabel}
             wrapperLabel={wrapperLabel}
-            onGrowthChange={publishComposerGrowth}
           />
 
           {/* Chat/Terminal toggle for terminal-first sessions, reconnect-or-
@@ -2306,9 +2308,7 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
       aria-live="polite"
       data-testid="working-indicator-pin"
       className={cn(
-        // bottom tracks --composer-growth so the tab keeps meeting the card's
-        // top edge while the composer is grown (it overlaps this wrapper).
-        "pointer-events-none absolute inset-x-0 bottom-[var(--composer-growth,0px)] z-20 transition-opacity duration-200",
+        "pointer-events-none absolute inset-x-0 bottom-0 z-20 transition-opacity duration-200",
         visible ? "opacity-100" : "opacity-0",
       )}
     >
@@ -2363,72 +2363,45 @@ function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
   return null;
 }
 
-/**
- * Preserves the transcript's distance-from-bottom whenever its scroll container
- * resizes on the iOS shell — so the content you're looking at stays put while
- * the soft keyboard opens/closes (and while the composer grows on focus).
- *
- * Two things resize the container, and neither is handled by `use-stick-to-
- * bottom` (which only re-anchors on *content* resize): the keyboard, via
- * `useIOSViewportLock` shrinking the app-shell; and the composer growing taller
- * when focused (its send row / status line), which steals flex height from the
- * transcript a couple of lines at a time — *without* firing a visualViewport
- * resize. Watching only visualViewport missed the composer growth, which is why
- * the transcript crept up ~2 lines on focus.
- *
- * So we watch the scroll container itself with a `ResizeObserver` and, on any
- * size change, hold the scroll position relative to the bottom constant:
- * `scrollTop = scrollHeight - clientHeight - distance`. `distance` is tracked
- * from genuine user scrolls only — scrolls that coincide with a dimension change
- * (the resize's own clamp, or our restore) are ignored so they can't corrupt it.
- * At the bottom (distance 0) you stay at the bottom; scrolled up reading
- * history, you keep seeing the same messages. New messages still go through the
- * library (content resize doesn't change the container's box). Stateless across
- * any number of keyboard cycles.
- */
-function PreserveScrollDistanceOnResize() {
+/** Keep bottom-locked readers pinned when the composer changes viewport height. */
+export function KeepBottomOnViewportResize() {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef?: React.RefObject<HTMLElement>;
   };
   const scrollRef = ctx.scrollRef;
+  const state = ctx.state;
+  const scrollToBottom = ctx.scrollToBottom;
 
   useEffect(() => {
-    if (!isIOSShell()) return;
     const el = scrollRef?.current;
-    if (!el) return;
-
-    const measure = () => el.scrollHeight - el.clientHeight - el.scrollTop;
-    let distance = Math.max(0, measure());
-    let prevSH = el.scrollHeight;
-    let prevCH = el.clientHeight;
-
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const isPhysicallyAtBottom = () => el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
+    let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isPhysicallyAtBottom();
+    let clientHeight = el.clientHeight;
+    let frame: number | null = null;
     const onScroll = () => {
-      const sh = el.scrollHeight;
-      const ch = el.clientHeight;
-      // A scroll that lands on the same frame as a size change is resize-induced
-      // (the browser's clamp, or our own restore below) — not the user. Skip it
-      // so it can't overwrite the distance we're trying to preserve.
-      if (sh !== prevSH || ch !== prevCH) {
-        prevSH = sh;
-        prevCH = ch;
-        return;
-      }
-      distance = Math.max(0, measure());
+      wasBottomLocked = isPhysicallyAtBottom();
     };
-
     const observer = new ResizeObserver(() => {
-      el.scrollTop = el.scrollHeight - el.clientHeight - distance;
-      prevSH = el.scrollHeight;
-      prevCH = el.clientHeight;
+      const nextHeight = el.clientHeight;
+      if (nextHeight === clientHeight) return;
+      clientHeight = nextHeight;
+      if (!wasBottomLocked) return;
+      scrollToBottom("instant");
+      if (frame !== null) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        frame = null;
+        scrollToBottom("instant");
+      });
     });
-
     el.addEventListener("scroll", onScroll, { passive: true });
     observer.observe(el);
     return () => {
       el.removeEventListener("scroll", onScroll);
       observer.disconnect();
+      if (frame !== null) cancelAnimationFrame(frame);
     };
-  }, [scrollRef]);
+  }, [scrollRef, scrollToBottom, state]);
 
   return null;
 }
@@ -3501,6 +3474,25 @@ function CompactionLoadingIndicator() {
 // re-renders the bubble that actually changed, not every prior message's
 // markdown/syntax-highlighting subtree. See `bubblesEqual`. Exported for
 // the user-bubble markdown render tests.
+function formatBubbleTimestamp(epochSeconds: number | undefined): string | null {
+  if (epochSeconds === undefined || epochSeconds === 0) return null;
+  const d = new Date(epochSeconds * 1000);
+  const now = new Date();
+  const time = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  if (
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate()
+  ) {
+    return time;
+  }
+  const date = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  if (d.getFullYear() !== now.getFullYear()) {
+    return `${d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}, ${time}`;
+  }
+  return `${date}, ${time}`;
+}
+
 export const BubbleView = memo(
   function BubbleView({
     bubble,
@@ -3611,6 +3603,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
+  const ts = formatBubbleTimestamp(bubble.createdAtS);
   // Runtime-injected `[System: ...]` notifications (task completion,
   // timer firings, terminal idle) ride in on role=user. When the content
   // is a pure system marker — no attached images or files — swap the
@@ -3632,129 +3625,149 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-user-message-id={bubble.itemId}
       className="max-w-[640px]"
     >
-      {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
-          immediately left of the right-aligned bubble (the bubble's own
-          ml-auto has no free space to absorb inside a fit-width row). */}
-      <div className="ml-auto flex w-fit max-w-full items-center gap-1.5">
-        {showAuthorBadge && author && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Avatar
-                size="sm"
-                data-testid="message-author"
-                aria-label={author}
-                className="shrink-0"
-              >
-                <AvatarFallback
-                  className="font-medium text-white"
-                  style={{ backgroundColor: userColor(author) }}
+      <div className="ml-auto flex w-fit max-w-full flex-col items-end">
+        {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
+            immediately left of the right-aligned bubble (the bubble's own
+            ml-auto has no free space to absorb inside a fit-width row). */}
+        <div className="flex w-fit max-w-full items-center gap-1.5">
+          {showAuthorBadge && author && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Avatar
+                  size="sm"
+                  data-testid="message-author"
+                  aria-label={author}
+                  className="shrink-0"
                 >
-                  {userInitials(author)}
-                </AvatarFallback>
-              </Avatar>
-            </TooltipTrigger>
-            <TooltipContent>{author}</TooltipContent>
-          </Tooltip>
-        )}
-        <MessageContent
-          className={cn(flashing && "animate-user-msg-flash")}
-          // Another contributor's bubble takes their avatar color at low
-          // alpha instead of the default bg-muted, so authorship reads at
-          // a glance without any email text.
-          style={showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined}
-        >
-          {/* Inline image previews — one non-wrapping strip. Wrapping would
-              re-flow the row as each image's width resolves on load, changing
-              the bubble's height and shoving the transcript; scrolling keeps
-              the row exactly one preview tall no matter what lands. */}
-          {images.length > 0 && (
-            <div className="mb-1.5 flex gap-2 overflow-x-auto">
-              {images.map((img) =>
-                img.file_id.startsWith("pending:") ? (
-                  // Upload in-flight — show a chip placeholder
+                  <AvatarFallback
+                    className="font-medium text-white"
+                    style={{ backgroundColor: userColor(author) }}
+                  >
+                    {userInitials(author)}
+                  </AvatarFallback>
+                </Avatar>
+              </TooltipTrigger>
+              <TooltipContent>{author}</TooltipContent>
+            </Tooltip>
+          )}
+          <MessageContent
+            className={cn(flashing && "animate-user-msg-flash")}
+            // Another contributor's bubble takes their avatar color at low
+            // alpha instead of the default bg-muted, so authorship reads at
+            // a glance without any email text.
+            style={
+              showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined
+            }
+          >
+            {/* Inline image previews — one non-wrapping strip. Wrapping would
+                re-flow the row as each image's width resolves on load, changing
+                the bubble's height and shoving the transcript; scrolling keeps
+                the row exactly one preview tall no matter what lands. */}
+            {images.length > 0 && (
+              <div className="mb-1.5 flex gap-2 overflow-x-auto">
+                {images.map((img) =>
+                  img.file_id.startsWith("pending:") ? (
+                    // Upload in-flight — show a chip placeholder
+                    <span
+                      key={img.file_id}
+                      className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
+                    >
+                      <ImageIcon className="size-3 shrink-0" />
+                      <span className="max-w-[180px] truncate">
+                        {img.filename ?? img.file_id.replace("pending:", "")}
+                      </span>
+                    </span>
+                  ) : (
+                    // Uploaded — render the actual image
+                    <SessionImage
+                      key={img.file_id}
+                      path={
+                        sessionId
+                          ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(img.file_id)}/content`
+                          : undefined
+                      }
+                      alt={img.filename ?? img.file_id}
+                      // Sizing lives in SessionImage, which reserves a matching
+                      // box so the bubble's height is settled before bytes land.
+                      className="rounded-md object-contain"
+                    />
+                  ),
+                )}
+              </div>
+            )}
+            {/* Non-image file chips */}
+            {fileChips.length > 0 && (
+              <div className="mb-1.5 flex flex-wrap gap-1.5">
+                {fileChips.map((att) => (
                   <span
-                    key={img.file_id}
+                    key={att.file_id}
                     className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
                   >
-                    <ImageIcon className="size-3 shrink-0" />
-                    <span className="max-w-[180px] truncate">
-                      {img.filename ?? img.file_id.replace("pending:", "")}
-                    </span>
-                  </span>
-                ) : (
-                  // Uploaded — render the actual image
-                  <SessionImage
-                    key={img.file_id}
-                    path={
-                      sessionId
-                        ? `/v1/sessions/${encodeURIComponent(sessionId)}/resources/files/${encodeURIComponent(img.file_id)}/content`
-                        : undefined
-                    }
-                    alt={img.filename ?? img.file_id}
-                    // Sizing lives in SessionImage, which reserves a matching
-                    // box so the bubble's height is settled before bytes land.
-                    className="rounded-md object-contain"
-                  />
-                ),
-              )}
-            </div>
-          )}
-          {/* Non-image file chips */}
-          {fileChips.length > 0 && (
-            <div className="mb-1.5 flex flex-wrap gap-1.5">
-              {fileChips.map((att) => (
-                <span
-                  key={att.file_id}
-                  className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                >
-                  <FileTextIcon className="size-3 shrink-0" />
-                  <span className="max-w-[180px] truncate">{att.filename ?? att.file_id}</span>
-                </span>
-              ))}
-            </div>
-          )}
-          {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
-          {mentionedChips.length > 0 && (
-            <div className="mb-1.5 flex flex-wrap gap-1.5">
-              {mentionedChips.map((item) => (
-                <span
-                  key={mentionItemPath(item)}
-                  className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                >
-                  {item.isDir ? (
-                    <FolderIcon className="size-3 shrink-0" />
-                  ) : (
                     <FileTextIcon className="size-3 shrink-0" />
-                  )}
-                  <span className="max-w-[180px] truncate" title={mentionItemPath(item)}>
-                    @{item.path}
-                    {item.isDir ? "/" : ""}
+                    <span className="max-w-[180px] truncate">{att.filename ?? att.file_id}</span>
                   </span>
-                  {item.lineRange && (
-                    <span className="shrink-0">
-                      :{item.lineRange.start}-{item.lineRange.end}
+                ))}
+              </div>
+            )}
+            {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
+            {mentionedChips.length > 0 && (
+              <div className="mb-1.5 flex flex-wrap gap-1.5">
+                {mentionedChips.map((item) => (
+                  <span
+                    key={mentionItemPath(item)}
+                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
+                  >
+                    {item.isDir ? (
+                      <FolderIcon className="size-3 shrink-0" />
+                    ) : (
+                      <FileTextIcon className="size-3 shrink-0" />
+                    )}
+                    <span className="max-w-[180px] truncate" title={mentionItemPath(item)}>
+                      @{item.path}
+                      {item.isDir ? "/" : ""}
                     </span>
-                  )}
-                </span>
-              ))}
-            </div>
-          )}
-          {/* Render user text as markdown, matching the assistant bubble
-            (headings, lists, code fences, file-path links). `breaks` keeps
-            single newlines as line breaks — users type multi-line messages
-            without blank-line paragraph separators and expect their line
-            breaks preserved. Empty text — e.g. an attachments-only message —
-            renders nothing rather than an empty markdown block. */}
-          {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
-        </MessageContent>
+                    {item.lineRange && (
+                      <span className="shrink-0">
+                        :{item.lineRange.start}-{item.lineRange.end}
+                      </span>
+                    )}
+                  </span>
+                ))}
+              </div>
+            )}
+            {/* Render user text as markdown, matching the assistant bubble
+              (headings, lists, code fences, file-path links). `breaks` keeps
+              single newlines as line breaks — users type multi-line messages
+              without blank-line paragraph separators and expect their line
+              breaks preserved. Empty text — e.g. an attachments-only message —
+              renders nothing rather than an empty markdown block. */}
+            {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
+          </MessageContent>
+        </div>
+        {/* Skip an empty row when there is neither a timestamp nor a copy
+            action. 40%-visible on touch (no hover), hover/focus-reveal on
+            desktop. py-1 matches the design prototype's 24px action row;
+            the timestamp rides inside it instead of adding a new row. */}
+        {(ts || text) && (
+          <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+            {ts && (
+              <span
+                className="select-none text-[11px] leading-4 text-foreground/56"
+                data-testid="message-timestamp"
+              >
+                {ts}
+              </span>
+            )}
+            {text && (
+              <MessageActions>
+                <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                  {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+                </MessageAction>
+              </MessageActions>
+            )}
+          </div>
+        )}
       </div>
-      {text && (
-        <MessageActions className="ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-          <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
-            {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-          </MessageAction>
-        </MessageActions>
-      )}
     </Message>
   );
 }
@@ -3773,6 +3786,7 @@ function AssistantBubble({
   // common case. The "Working…" shimmer for the empty-items / streaming
   // gap is rendered at the page level, not inside this component.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const conversationId = useChatStore((s) => s.conversationId);
   // A pending elicitation means the turn is parked awaiting the user —
   // still in flight even when its lifecycle or the session status reads
   // settled (e.g. a reload while parked). Feeds the fold suppression.
@@ -3785,10 +3799,18 @@ function AssistantBubble({
   const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
+  const handleRetryError = useCallback(async () => {
+    if (!conversationId) throw new Error("Session is not available");
+    const result = await retrySession(conversationId);
+    if (!result.recovered) {
+      throw new Error("The session is already connected; no recovery was performed");
+    }
+  }, [conversationId]);
 
   if (bubble.items.length === 0) return null;
 
   const markdownText = collectBubbleMarkdown(bubble.items);
+  const ts = formatBubbleTimestamp(bubble.createdAtS);
 
   // The bubble collapses to nothing but the "Worked for" row — its text
   // all sits inside the fold, and its answer lands in a later bubble.
@@ -3832,6 +3854,7 @@ function AssistantBubble({
             hasPendingElicitation={hasPendingElicitation}
             lastActivityAtS={bubble.lastActivityAtS}
             showsWorking={showsWorking}
+            onRetryError={handleRetryError}
           />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
@@ -3845,27 +3868,42 @@ function AssistantBubble({
         )}
         {/* Skipped on a fold-only bubble: the actions belong to content
             the user can see, and hanging them off a collapsed row spaced
-            consecutive rows unevenly depending on hidden narration. */}
-        {markdownText && !foldOnly && (
-          <MessageActions className="opacity-40 transition-opacity md:opacity-0 group-hover:opacity-100 group-focus-within:opacity-100">
-            <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
-              {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-            </MessageAction>
-            {/* Fork from this response: clone the session with history
-                truncated after this turn. Hidden while the response is
-                still streaming (its items aren't committed yet) and when
-                the session can't be forked (sub-agent / isolated mount). */}
-            {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
-              <MessageAction
-                tooltip="Fork from here"
-                size="icon-xxs"
-                data-testid="fork-from-response"
-                onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
-              >
-                <GitForkIcon size={14} />
-              </MessageAction>
+            consecutive rows unevenly depending on hidden narration. Also
+            skipped when there is neither a timestamp nor actions to show.
+            40%-visible on touch (no hover), hover/focus-reveal on desktop.
+            Order matches the design target: actions, then timestamp. */}
+        {!foldOnly && (ts || markdownText) && (
+          <div className="flex items-center gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+            {markdownText && (
+              <MessageActions>
+                <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                  {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+                </MessageAction>
+                {/* Fork from this response: clone the session with history
+                    truncated after this turn. Hidden while the response is
+                    still streaming (its items aren't committed yet) and when
+                    the session can't be forked (sub-agent / isolated mount). */}
+                {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
+                  <MessageAction
+                    tooltip="Fork from here"
+                    size="icon-xxs"
+                    data-testid="fork-from-response"
+                    onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
+                  >
+                    <GitForkIcon size={14} />
+                  </MessageAction>
+                )}
+              </MessageActions>
             )}
-          </MessageActions>
+            {ts && (
+              <span
+                className="select-none text-[11px] leading-4 text-foreground/56"
+                data-testid="message-timestamp"
+              >
+                {ts}
+              </span>
+            )}
+          </div>
         )}
       </Message>
 
@@ -3997,13 +4035,6 @@ interface ComposerProps {
    * keep using ``modelPickerKind`` / ``isNativeWrapper``.
    */
   wrapperLabel?: string | null;
-  /**
-   * Reports how many pixels taller than its resting height the composer has
-   * grown. The composer keeps that growth out of the column's flex layout
-   * (see the negative top margin below); the transcript uses the number to
-   * lift its bottom-anchored overlays clear of the taller card.
-   */
-  onGrowthChange?: (px: number) => void;
 }
 
 /**
@@ -4410,7 +4441,6 @@ export function Composer({
   subagentRoutingEligible = false,
   subAgentLabel = null,
   wrapperLabel = null,
-  onGrowthChange,
 }: ComposerProps) {
   const [value, setValue] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -4446,7 +4476,6 @@ export function Composer({
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const formRef = useRef<HTMLFormElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
@@ -4939,20 +4968,9 @@ export function Composer({
   };
 
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
-  // The extra rows float over the transcript instead of shrinking it: a
-  // negative top margin holds the form's margin box at its resting height, so
-  // the transcript's scroll viewport — and with it the scrollbar's travel and
-  // the turn rail's centering — stays exactly where it was. Only the taller
-  // card overlaps, and it's opaque across the message column.
-  const applyGrowth = useCallback(
-    (px: number) => {
-      const form = formRef.current;
-      if (form) form.style.marginTop = px > 0 ? `${-px}px` : "";
-      onGrowthChange?.(px);
-    },
-    [onGrowthChange],
-  );
-  useAutoGrowTextarea(textareaRef, value, 10, applyGrowth);
+  // Growth stays in the flex column so the transcript viewport ends where the
+  // composer begins instead of letting the card cover visible output.
+  useAutoGrowTextarea(textareaRef, value, 10);
 
   // Scope recall to the active conversation so ArrowUp surfaces only this
   // chat's prompts, not the last thing typed in any other chat.
@@ -5242,12 +5260,9 @@ export function Composer({
 
   return (
     <form
-      ref={formRef}
       onSubmit={handleSubmit}
       className={cn(
-        // relative: the grown card overlaps the transcript above it, and a
-        // positioned box paints over that in-flow sibling.
-        "chat-composer-form relative px-4 md:px-6",
+        "chat-composer-form px-4 md:px-6",
         isTerminalFirst ? "terminal-first-composer-form pb-1.5" : "pb-3",
       )}
     >
@@ -6110,7 +6125,7 @@ function SessionConfigModal({
   costRoutingEligible: boolean;
   subagentRoutingEligible: boolean;
 }) {
-  const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const conversationId = useChatStore((s) => s.conversationId);
@@ -6517,7 +6532,7 @@ function useSessionConfigSummary({
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
 }): { label: string; value: string }[] {
-  const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
@@ -6537,6 +6552,21 @@ function useSessionConfigSummary({
     rows.push({ label: "Effort", value: effortValue ?? "Default" });
   }
   return rows;
+}
+
+/**
+ * The effort this conversation is actually at.
+ *
+ * `sessionReasoningEffort` is conversation-scoped, so two live conversations at
+ * different efforts each read their own; `selectedEffort` is the single
+ * app-global sticky pick, used only as the pre-hydration fallback. Reading the
+ * sticky pick alone would show a warm-switched conversation the last effort
+ * picked anywhere.
+ */
+function useSessionEffort(): string | null {
+  const sessionReasoningEffort = useChatStore((s) => s.sessionReasoningEffort);
+  const stickyEffort = useChatStore((s) => s.selectedEffort);
+  return sessionReasoningEffort ?? stickyEffort;
 }
 
 /**
@@ -6677,7 +6707,7 @@ function ComposerModelEffortLabel({
   costRoutingEligible: boolean;
   harnessLabel: string | null;
 }) {
-  const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";

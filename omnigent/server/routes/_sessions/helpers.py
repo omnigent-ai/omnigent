@@ -105,7 +105,7 @@ from omnigent.server.managed_hosts import (
     ManagedHostLaunch,
     ManagedLaunch,
     ManagedLaunchTracker,
-    ManagedSandboxConfig,
+    ManagedSandboxDeployment,
     RepoWorkspace,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -4189,6 +4189,8 @@ async def _get_runner_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient | N
 async def _get_runner_client_impl(
     session_id: str,
     runner_router: RunnerRouter | None,
+    *,
+    conversation: Conversation | None = None,
 ) -> httpx.AsyncClient | None:
     """
     Get an HTTP client for the runner bound to a session.
@@ -4200,6 +4202,7 @@ async def _get_runner_client_impl(
         e.g. ``"conv_abc123"``.
     :param runner_router: The ``RunnerRouter`` instance, or
         ``None`` for in-process setups.
+    :param conversation: An already-loaded conversation to reuse for routing.
     :returns: An ``httpx.AsyncClient`` pointed at the runner,
         or ``None`` if no runner is available.
     """
@@ -4207,9 +4210,13 @@ async def _get_runner_client_impl(
 
     if runner_router is not None:
         try:
-            routed = runner_router.client_for_session_resources(
-                session_id,
-            )
+            if conversation is None:
+                routed = runner_router.client_for_session_resources(session_id)
+            else:
+                routed = runner_router.client_for_session_resources(
+                    session_id,
+                    conversation=conversation,
+                )
             return routed.client
         except (LookupError, httpx.HTTPError, OmnigentError):
             _logger.debug(
@@ -4563,11 +4570,12 @@ async def _provision_managed_sandbox(
     *,
     session_id: str,
     owner: str,
-    sandbox_config: ManagedSandboxConfig,
+    sandbox_config: ManagedSandboxDeployment,
     repo: RepoWorkspace | None,
     tracker: ManagedLaunchTracker,
     host_store: HostStore,
     relaunch_host: Host | None,
+    provider: str | None = None,
     agent_name: str | None = None,
 ) -> ManagedHostLaunch | None:
     """
@@ -4586,6 +4594,9 @@ async def _provision_managed_sandbox(
     :param host_store: Persistent host registrations.
     :param relaunch_host: Existing host row for a relaunch, or
         ``None`` for a first launch.
+    :param provider: Requested sandbox provider for a first launch, or
+        ``None`` for the default. Ignored on a relaunch, which stays on
+        the host row's recorded provider.
     :param agent_name: Server-resolved built-in agent name the session
         runs, stamped as the runner Pod's ``omnigent.ai/agent`` classifier
         (Kubernetes only), or ``None`` to leave it unstamped.
@@ -4621,6 +4632,7 @@ async def _provision_managed_sandbox(
             owner=owner,
             host_store=host_store,
             repo=repo,
+            provider=provider,
             agent_name=agent_name,
             on_stage=_on_stage,
         )
@@ -4723,19 +4735,28 @@ async def _get_runner_client_for_resource_access(
 
 async def _get_runner_client_for_resource_access_impl(
     session_id: str,
+    *,
+    conversation: Conversation | None = None,
 ) -> httpx.AsyncClient | None:
     """Return the authoritative runner client for session resources.
 
     Requires the session to be bound to a runner via
     ``PATCH /v1/sessions/{id}``; raises ``conflict`` otherwise. If no
     runner router is configured (unit-test/in-process setups), callers
-    may fall back to local registries.
+    may fall back to local registries. ``conversation`` reuses the row
+    already loaded during authorization.
     """
     from omnigent.runtime import get_runner_client, get_runner_router
 
     runner_router = get_runner_router()
     if runner_router is not None:
-        routed_runner = runner_router.client_for_session_resources(session_id)
+        if conversation is None:
+            routed_runner = runner_router.client_for_session_resources(session_id)
+        else:
+            routed_runner = runner_router.client_for_session_resources(
+                session_id,
+                conversation=conversation,
+            )
         return routed_runner.client
     return cast("httpx.AsyncClient | None", get_runner_client())
 
@@ -8658,6 +8679,7 @@ def _child_session_summary_from_conversation(
         id=conv.id,
         parent_session_id=parent_session_id,
         title=display_title,
+        task_summary=conv.task_summary,
         tool=tool,
         session_name=session_name,
         created_at=conv.created_at,

@@ -56,6 +56,12 @@ export interface Branding {
   powered_by: boolean;
 }
 
+/** Release features understood by this frontend build. */
+export type FeatureKey = "usage_page" | "harness_install";
+
+/** Deployment-wide release-feature values advertised by the server. */
+export type FeatureValues = Record<string, boolean>;
+
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
   accounts_enabled: boolean;
@@ -103,6 +109,12 @@ export interface ServerInfo {
    */
   sandbox_provider: string | null;
   /**
+   * Every launch-capable sandbox provider, in configured order — one
+   * new-session picker row each. Empty or absent falls back to the single
+   * ``sandbox_provider`` row. Read via :func:`sandboxProviderOptions`.
+   */
+  sandbox_providers?: string[];
+  /**
    * Server session-sharing policy. Drives whether the SPA shows the
    * Share control (``"on"``), restricts it to read-only invites
    * (``"read_only"``), or hides it entirely (``"off"``), in lockstep
@@ -137,8 +149,16 @@ export interface ServerInfo {
    */
   smart_routing_sources: SmartRoutingSources;
   /**
+   * Deployment-wide release features. Missing keys are disabled. The map is
+   * the canonical gate for new frontend surfaces.
+   */
+  features: FeatureValues;
+  /**
+   * Compatibility field for servers/frontends predating ``features``.
+   * New consumers should use :func:`isFeatureEnabled`.
+   *
    * True when the server accepts UI-driven harness installs
-   * (``OMNIGENT_HARNESS_INSTALL_ENABLED=1``). Gates the New Chat dialog's
+   * (``harness_install`` in ``OMNIGENT_FEATURES``). Gates the New Chat dialog's
    * one-click "Install" action for a missing harness. Fails to ``false`` so a
    * failed probe never offers an install the server would reject.
    */
@@ -193,8 +213,8 @@ function parseBranding(raw: unknown): Branding | null {
   return isEmpty ? null : branding;
 }
 
-/** Sentinel used when the probe fails — accounts is off, no login URL. */
-const FALLBACK_SERVER_INFO: ServerInfo = {
+/** Sentinel used when the probe fails — accounts and release features are off. */
+export const FALLBACK_SERVER_INFO: ServerInfo = {
   accounts_enabled: false,
   // Fail to multi-user: a failed probe must not hide account/sharing chrome.
   single_user: false,
@@ -203,6 +223,7 @@ const FALLBACK_SERVER_INFO: ServerInfo = {
   databricks_features: false,
   managed_sandboxes_enabled: false,
   sandbox_provider: null,
+  sandbox_providers: [],
   // Sharing fails OPEN (opposite of the other caps): a failed probe must
   // not silently disable sharing, so the sentinel is the permissive "on".
   sharing_mode: "on",
@@ -210,6 +231,7 @@ const FALLBACK_SERVER_INFO: ServerInfo = {
   server_version: null,
   smart_routing_enabled: false,
   smart_routing_sources: { external: false, oss: false },
+  features: {},
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
@@ -229,6 +251,25 @@ function parseSmartRoutingSources(raw: unknown, routingEnabled: boolean): SmartR
   }
   const sources = raw as Partial<Record<keyof SmartRoutingSources, unknown>>;
   return { external: sources.external === true, oss: sources.oss === true };
+}
+
+function parseFeatures(raw: unknown, harnessInstallEnabled: boolean): FeatureValues {
+  const parsed: FeatureValues = {};
+  if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+    for (const [key, value] of Object.entries(raw)) {
+      if (typeof value === "boolean") parsed[key] = value;
+    }
+  }
+  // A server predating the feature map exposed this one release gate as a
+  // top-level field. Preserve mixed-version behavior without making it a
+  // second source for new features.
+  if (!("harness_install" in parsed)) parsed.harness_install = harnessInstallEnabled;
+  return parsed;
+}
+
+/** Return whether a known release feature is enabled; missing/loading is off. */
+export function isFeatureEnabled(info: ServerInfo | "loading", feature: FeatureKey): boolean {
+  return info !== "loading" && info.features?.[feature] === true;
 }
 
 let cachedServerInfo: ServerInfo | null = null;
@@ -254,6 +295,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
       if (res.ok) {
         const data = (await res.json()) as Partial<ServerInfo>;
         const smartRoutingEnabled = data.smart_routing_enabled === true;
+        const harnessInstallEnabled = data.harness_install_enabled === true;
         cachedServerInfo = {
           accounts_enabled: data.accounts_enabled === true,
           single_user: data.single_user === true,
@@ -263,6 +305,9 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           managed_sandboxes_enabled: data.managed_sandboxes_enabled === true,
           sandbox_provider:
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
+          sandbox_providers: Array.isArray(data.sandbox_providers)
+            ? data.sandbox_providers.filter((p): p is string => typeof p === "string")
+            : [],
           sharing_mode: SHARING_MODES.includes(data.sharing_mode as SharingMode)
             ? (data.sharing_mode as SharingMode)
             : "on",
@@ -274,7 +319,8 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             data.smart_routing_sources,
             smartRoutingEnabled,
           ),
-          harness_install_enabled: data.harness_install_enabled === true,
+          features: parseFeatures(data.features, harnessInstallEnabled),
+          harness_install_enabled: harnessInstallEnabled,
           installable_harnesses: Array.isArray(data.installable_harnesses)
             ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
             : [],
@@ -343,4 +389,17 @@ export function sandboxOptionLabel(provider: string | null): string {
   const name =
     SANDBOX_PROVIDER_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
   return `${name} Sandbox`;
+}
+
+/**
+ * Provider ids to offer as new-session sandbox rows.
+ *
+ * Falls back to the single ``sandbox_provider`` when the server reports
+ * no list; ``[null]`` yields one row with the generic label. Tolerates a
+ * missing list (a hand-built ServerInfo) rather than throwing on render.
+ */
+export function sandboxProviderOptions(info: ServerInfo): (string | null)[] {
+  const offered = info.sandbox_providers;
+  if (Array.isArray(offered) && offered.length > 0) return offered;
+  return [info.sandbox_provider];
 }

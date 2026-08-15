@@ -43,6 +43,23 @@ class _HostRun:
     server_url: str
 
 
+def test_host_pid_path_honors_data_dir_at_import(tmp_path: Path) -> None:
+    env = {**os.environ, "OMNIGENT_DATA_DIR": str(tmp_path / "data")}
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from omnigent.cli import _HOST_PID_PATH; print(_HOST_PID_PATH)",
+        ],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == str(tmp_path / "data" / "host.pid")
+
+
 def test_host_command_registered() -> None:
     """
     Verify that ``host`` is a registered subcommand.

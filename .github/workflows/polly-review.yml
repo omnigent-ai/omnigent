@@ -164,7 +164,8 @@ jobs:
 
       - name: Install dependencies
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        run: uv sync --extra all --extra dev
+        # Reviews a prefetched diff against trusted main; it does not run PR checks.
+        run: uv sync --extra all
 
       - name: Install Claude Code CLI
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'

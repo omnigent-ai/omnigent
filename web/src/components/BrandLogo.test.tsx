@@ -4,13 +4,15 @@ import type { ServerInfo } from "@/lib/capabilities";
 import type { CapabilitiesContext as CapabilitiesContextType } from "@/lib/CapabilitiesContext";
 
 const getOmnigentHostConfig = vi.fn();
-const hostFetch = vi.fn();
+const authenticatedFetch = vi.fn();
 let hostGeneration = 0;
 
 vi.mock("@/lib/host", () => ({
   getOmnigentHostConfig: () => getOmnigentHostConfig(),
   getOmnigentHostGeneration: () => hostGeneration,
-  hostFetch: (path: string) => hostFetch(path),
+}));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: (path: string) => authenticatedFetch(path),
 }));
 vi.mock("@/components/OttoEyes", () => ({
   OttoEyes: () => <span data-testid="otto-eyes" />,
@@ -79,7 +81,7 @@ describe("BrandLogo", () => {
       "src",
       "/v1/branding/logo/standalone",
     );
-    expect(hostFetch).not.toHaveBeenCalled();
+    expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 
   it("falls back to Otto when a standalone image fails to load", () => {
@@ -91,10 +93,10 @@ describe("BrandLogo", () => {
     expect(screen.getByTestId("otto-eyes")).toBeInTheDocument();
   });
 
-  it("uses hostFetch and an object URL in embedded deployments", async () => {
+  it("uses the host transport and an object URL in embedded deployments", async () => {
     getOmnigentHostConfig.mockReturnValue({ fetcher: () => {} });
     const blob = new Blob(["logo"]);
-    hostFetch.mockResolvedValue({ ok: true, blob: () => Promise.resolve(blob) });
+    authenticatedFetch.mockResolvedValue({ ok: true, blob: () => Promise.resolve(blob) });
 
     render(logoTree(serverInfo("/v1/branding/logo/embed")));
 
@@ -103,24 +105,24 @@ describe("BrandLogo", () => {
       "src",
       "blob:brand-logo",
     );
-    expect(hostFetch).toHaveBeenCalledWith("/v1/branding/logo/embed");
+    expect(authenticatedFetch).toHaveBeenCalledWith("/v1/branding/logo/embed");
     expect(createObjectURL).toHaveBeenCalledWith(blob);
   });
 
   it("keeps the mascot fallback when the embedded fetch fails", async () => {
     getOmnigentHostConfig.mockReturnValue({ fetcher: () => {} });
-    hostFetch.mockResolvedValue({ ok: false, status: 404 });
+    authenticatedFetch.mockResolvedValue({ ok: false, status: 404 });
 
     render(logoTree(serverInfo("/v1/branding/logo/missing")));
 
-    await waitFor(() => expect(hostFetch).toHaveBeenCalledOnce());
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
     expect(screen.getByTestId("otto-eyes")).toBeInTheDocument();
     expect(screen.queryByRole("img", { name: "Acme Agent" })).not.toBeInTheDocument();
   });
 
   it("falls back and releases the URL when embedded image decoding fails", async () => {
     getOmnigentHostConfig.mockReturnValue({ fetcher: () => {} });
-    hostFetch.mockResolvedValue({
+    authenticatedFetch.mockResolvedValue({
       ok: true,
       blob: () => Promise.resolve(new Blob(["not an image"])),
     });
@@ -135,7 +137,7 @@ describe("BrandLogo", () => {
 
   it("deduplicates concurrent consumers and revokes after the last release", async () => {
     getOmnigentHostConfig.mockReturnValue({ fetcher: () => {} });
-    hostFetch.mockResolvedValue({
+    authenticatedFetch.mockResolvedValue({
       ok: true,
       blob: () => Promise.resolve(new Blob(["logo"])),
     });
@@ -143,7 +145,7 @@ describe("BrandLogo", () => {
     const second = render(logoTree(serverInfo("/v1/branding/logo/shared")));
     await waitFor(() => expect(screen.getAllByRole("img", { name: "Acme Agent" })).toHaveLength(2));
 
-    expect(hostFetch).toHaveBeenCalledTimes(1);
+    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
     expect(createObjectURL).toHaveBeenCalledTimes(1);
     first.unmount();
     expect(revokeObjectURL).not.toHaveBeenCalled();
@@ -154,9 +156,9 @@ describe("BrandLogo", () => {
   it("revokes a URL that resolves after its consumer unmounts", async () => {
     getOmnigentHostConfig.mockReturnValue({ fetcher: () => {} });
     const blobResult = deferred<Blob>();
-    hostFetch.mockResolvedValue({ ok: true, blob: () => blobResult.promise });
+    authenticatedFetch.mockResolvedValue({ ok: true, blob: () => blobResult.promise });
     const view = render(logoTree(serverInfo("/v1/branding/logo/slow")));
-    await waitFor(() => expect(hostFetch).toHaveBeenCalledOnce());
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
 
     view.unmount();
     blobResult.resolve(new Blob(["late"]));
@@ -167,7 +169,7 @@ describe("BrandLogo", () => {
   it("releases the old URL and fetches again when the path changes", async () => {
     getOmnigentHostConfig.mockReturnValue({ fetcher: () => {} });
     createObjectURL.mockReturnValueOnce("blob:first").mockReturnValueOnce("blob:second");
-    hostFetch.mockResolvedValue({
+    authenticatedFetch.mockResolvedValue({
       ok: true,
       blob: () => Promise.resolve(new Blob(["logo"])),
     });
@@ -180,13 +182,13 @@ describe("BrandLogo", () => {
       expect(screen.getByRole("img", { name: "Acme Agent" })).toHaveAttribute("src", "blob:second"),
     );
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:first");
-    expect(hostFetch).toHaveBeenCalledTimes(2);
+    expect(authenticatedFetch).toHaveBeenCalledTimes(2);
   });
 
   it("isolates identical paths across host generations", async () => {
     getOmnigentHostConfig.mockReturnValue({ fetcher: () => {} });
     createObjectURL.mockReturnValueOnce("blob:host-a").mockReturnValueOnce("blob:host-b");
-    hostFetch.mockResolvedValue({
+    authenticatedFetch.mockResolvedValue({
       ok: true,
       blob: () => Promise.resolve(new Blob(["logo"])),
     });
@@ -201,6 +203,6 @@ describe("BrandLogo", () => {
       expect(screen.getByRole("img", { name: "Acme Agent" })).toHaveAttribute("src", "blob:host-b"),
     );
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:host-a");
-    expect(hostFetch).toHaveBeenCalledTimes(2);
+    expect(authenticatedFetch).toHaveBeenCalledTimes(2);
   });
 });

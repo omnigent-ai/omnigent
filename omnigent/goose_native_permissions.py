@@ -170,9 +170,9 @@ async def supervise_goose_approval_mirror(
     active: _PendingApproval | None = None
     episode = 0
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
-    async with httpx.AsyncClient(
-        base_url=base_url, headers=headers, auth=auth, timeout=timeout
-    ) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
                 pane = await asyncio.to_thread(capture_goose_pane, bridge_dir)

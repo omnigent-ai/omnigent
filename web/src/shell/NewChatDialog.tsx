@@ -83,7 +83,7 @@ import {
 
 // Re-exported for tests that import the readiness helpers from this module.
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
-import { sandboxOptionLabel } from "@/lib/capabilities";
+import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { useHeading, usePoweredBy } from "@/lib/branding";
 import {
   isSlashCommandText,
@@ -103,10 +103,13 @@ import {
   type ProjectPrefillState,
 } from "./projectPrefill";
 import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
+import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import {
   readLastHostChoice,
   writeLastHostChoice,
+  readLastSandboxProvider,
+  writeLastSandboxProvider,
   SANDBOX_HOST_CHOICE,
 } from "@/lib/hostPreferences";
 import { readLastHarness, writeLastHarness } from "@/lib/harnessPreferences";
@@ -468,6 +471,7 @@ export function ConnectHostInstructions({
   // "loading" before the boot probe resolves → treat as OSS (no Databricks
   // hints) until known, so the clean UI shows first and lakebox never flashes.
   const databricksFeatures = info !== "loading" && info.databricks_features;
+  const quotedServerUrl = quoteShellArgument(serverUrl);
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
       {label && <p className="text-sm text-muted-foreground">{label}</p>}
@@ -483,7 +487,7 @@ export function ConnectHostInstructions({
           </TabsList>
           <TabsContent value="local">
             <CliCommandBlock
-              command={`omni host --server ${serverUrl}`}
+              command={`omni host --server ${quotedServerUrl}`}
               testIdPrefix="connect-host"
             />
           </TabsContent>
@@ -493,13 +497,16 @@ export function ConnectHostInstructions({
               testIdPrefix="connect-lakebox-create"
             />
             <CliCommandBlock
-              command={`omni sandbox connect --provider lakebox --sandbox-id <id> --server ${serverUrl}`}
+              command={`omni sandbox connect --provider lakebox --sandbox-id <id> --server ${quotedServerUrl}`}
               testIdPrefix="connect-lakebox-connect"
             />
           </TabsContent>
         </Tabs>
       ) : (
-        <CliCommandBlock command={`omni host --server ${serverUrl}`} testIdPrefix="connect-host" />
+        <CliCommandBlock
+          command={`omni host --server ${quotedServerUrl}`}
+          testIdPrefix="connect-host"
+        />
       )}
     </div>
   );
@@ -1006,7 +1013,7 @@ export function AgentHarnessPicker({
   const queryClient = useQueryClient();
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
-  const collapsedBadge = info !== "loading" && info.harness_install_enabled;
+  const collapsedBadge = isFeatureEnabled(info, "harness_install");
   const triggerRef = useRef<HTMLButtonElement>(null);
 
   // Touch devices can't hover, so the desktop submenu flyouts ("More",
@@ -1436,7 +1443,7 @@ function HarnessConfigModal({
 }) {
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
-  const collapsedBadge = info !== "loading" && info.harness_install_enabled;
+  const collapsedBadge = isFeatureEnabled(info, "harness_install");
   const entryHarness = nativeCodingAgentForAvailableAgent(agent)?.harness ?? null;
   const hasPermission = nativeAgentHasCapability(agent, "permissionMode");
   const hasApproval = nativeAgentHasCapability(agent, "approvalMode");
@@ -1866,6 +1873,7 @@ interface LandingDraft {
   pickedAgentId: string | null;
   selectedHostId: string | null;
   sandboxSelected: boolean;
+  sandboxProvider: string | null;
   sandboxRepoUrl: string;
   sandboxRepoBranch: string;
   workspace: string;
@@ -2016,7 +2024,7 @@ export function NewChatLandingScreen() {
   // Gates the whole UI-driven setup experience (Set up affordance + dialog +
   // collapsed badge). OFF → the composer/picker fall back to the original
   // "run omni setup" guidance, so a disabled flag is a no-op on the UI.
-  const harnessInstallEnabled = info !== "loading" && info.harness_install_enabled;
+  const harnessInstallEnabled = isFeatureEnabled(info, "harness_install");
   // Unfiltered brain-harness labels: safe for membership checks and for
   // labelling an existing pick, but the OPTIONS offered in the gear modal use
   // the gated `brainHarnessLabels` below, which drops the fully-auto row when
@@ -2026,6 +2034,22 @@ export function NewChatLandingScreen() {
   // falling back to the generic "New Sandbox" when the server names no
   // provider.
   const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
+  // One picker row per configured provider; a single-provider server
+  // yields exactly one.
+  const sandboxProviderRows = useMemo(
+    () => (info !== "loading" ? sandboxProviderOptions(info) : []),
+    [info],
+  );
+  // The provider a sandbox pick defaults to: the sticky last pick when the
+  // server still offers it, else the first offered row. Mirrors the sticky
+  // host choice — the composer reopens on the provider used last. Null until
+  // the rows load (info still resolving) so callers hold off seeding.
+  const defaultSandboxProvider = useCallback((): string | null => {
+    if (sandboxProviderRows.length === 0) return null;
+    const stored = readLastSandboxProvider();
+    if (stored !== null && sandboxProviderRows.includes(stored)) return stored;
+    return sandboxProviderRows[0];
+  }, [sandboxProviderRows]);
   // Embed-only docs seam: when the host passes additional docs and managed
   // sandboxes are unavailable, keep the sandbox row visible but disabled and
   // attach a help tooltip with a clickable link.
@@ -2058,6 +2082,12 @@ export function NewChatLandingScreen() {
   // (host_type: "managed"), so no host_id or workspace is sent.
   const [sandboxSelected, setSandboxSelected] = useState(
     () => landingDraft?.sandboxSelected ?? false,
+  );
+  // Provider the sandbox pick launches on. Seeded to the sticky last pick (or
+  // the first offered row) once the picker rows load; null both before that
+  // seed and for a single-provider server that names no provider.
+  const [sandboxProvider, setSandboxProvider] = useState<string | null>(
+    () => landingDraft?.sandboxProvider ?? null,
   );
   const { data: hostClaudeModelOptions, isLoading: hostClaudeModelsLoading } = useHostModelOptions(
     selectedHostId,
@@ -2231,6 +2261,7 @@ export function NewChatLandingScreen() {
     pickedAgentId,
     selectedHostId,
     sandboxSelected,
+    sandboxProvider,
     sandboxRepoUrl,
     sandboxRepoBranch,
     workspace,
@@ -2423,6 +2454,7 @@ export function NewChatLandingScreen() {
       if (info === "loading") return;
       if (managedSandboxesEnabled) {
         setSandboxSelected(true);
+        setSandboxProvider(defaultSandboxProvider());
         return;
       }
       // Sandbox no longer offered (e.g. an OSS server) — fall through.
@@ -2442,6 +2474,7 @@ export function NewChatLandingScreen() {
 
     if (managedSandboxesEnabled) {
       setSandboxSelected(true);
+      setSandboxProvider(defaultSandboxProvider());
       return;
     }
     const firstOnline = (hosts ?? []).find((h) => h.status === "online");
@@ -2454,6 +2487,7 @@ export function NewChatLandingScreen() {
     managedSandboxesEnabled,
     info,
     prefillSettled,
+    defaultSandboxProvider,
   ]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
@@ -3136,7 +3170,10 @@ export function NewChatLandingScreen() {
     });
     if (step === null) return;
     const { writes } = step;
-    if (writes.selectSandbox) setSandboxSelected(true);
+    if (writes.selectSandbox) {
+      setSandboxSelected(true);
+      setSandboxProvider(defaultSandboxProvider());
+    }
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.agentId !== undefined) {
       setPickedAgentId((cur) => cur ?? writes.agentId!);
@@ -3157,6 +3194,7 @@ export function NewChatLandingScreen() {
     selectedHostId,
     pickedAgentId,
     prefillConfig,
+    defaultSandboxProvider,
   ]);
 
   // Opt-in worktree from the project's stored config. The inference machine
@@ -3362,13 +3400,16 @@ export function NewChatLandingScreen() {
   const workspaceLabel = workspaceTrimmed
     ? (workspaceTrimmed.split("/").filter(Boolean).pop() ?? workspaceTrimmed)
     : "Working directory";
+  // Names the picked provider, else the server's default label.
+  const selectedSandboxLabel =
+    sandboxProvider !== null ? sandboxOptionLabel(sandboxProvider) : sandboxLabel;
   const selectedHostDisplayName = selectedHost
     ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
     : null;
   const hostLabel = connectingThisMachine
     ? "Connecting…"
     : sandboxSelected
-      ? sandboxLabel
+      ? selectedSandboxLabel
       : (selectedHostDisplayName ?? (onlineHosts.length === 0 ? "No hosts" : "Choose host"));
   // The chip shows just the branch (the "(existing)" distinction lives in the
   // popover's warning; appending it here only gets clipped by the chip's cap).
@@ -3477,11 +3518,15 @@ export function NewChatLandingScreen() {
     seededHostRef.current = null;
   }
 
-  function selectSandbox() {
+  function selectSandbox(provider: string | null = null) {
     // Persist the explicit sandbox pick (as the reserved sentinel) even when
     // it's already selected, mirroring selectHost — so the sandbox becomes the
-    // sticky default for the next visit.
+    // sticky default for the next visit, on the provider just picked.
     writeLastHostChoice(SANDBOX_HOST_CHOICE);
+    writeLastSandboxProvider(provider);
+    // Recorded even when already selected, so re-picking a different
+    // provider still switches which one launches.
+    setSandboxProvider(provider);
     if (sandboxSelected) return;
     // Mirror selectHost: a managed session's host and workspace are both
     // server-chosen, so clear any prior host pick and its workspace.
@@ -3675,6 +3720,8 @@ export function NewChatLandingScreen() {
               ? {
                   host_type: "managed",
                   workspace: composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch),
+                  // Omitted when null so a default create is unchanged.
+                  ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
                 }
               : {
                   host_id: selectedHostId,
@@ -4379,17 +4426,28 @@ export function NewChatLandingScreen() {
                   {(managedSandboxesEnabled || showDisabledSandboxWithDocs) && (
                     <>
                       {managedSandboxesEnabled ? (
-                        <DropdownMenuItem
-                          onSelect={selectSandbox}
-                          data-testid="new-chat-landing-sandbox-option"
-                          data-active={sandboxSelected ? "true" : undefined}
-                          className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
-                        >
-                          <span className="flex items-center gap-2">
-                            <MonitorCloudIcon className="size-4 text-muted-foreground" />
-                            <span className="text-sm">{sandboxLabel}</span>
-                          </span>
-                        </DropdownMenuItem>
+                        sandboxProviderRows.map((provider, index) => (
+                          <DropdownMenuItem
+                            key={provider ?? "default"}
+                            onSelect={() => selectSandbox(provider)}
+                            // First row keeps the original testid; later
+                            // rows get a scoped one.
+                            data-testid={
+                              index === 0
+                                ? "new-chat-landing-sandbox-option"
+                                : `new-chat-landing-sandbox-option-${provider}`
+                            }
+                            data-active={
+                              sandboxSelected && sandboxProvider === provider ? "true" : undefined
+                            }
+                            className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                          >
+                            <span className="flex items-center gap-2">
+                              <MonitorCloudIcon className="size-4 text-muted-foreground" />
+                              <span className="text-sm">{sandboxOptionLabel(provider)}</span>
+                            </span>
+                          </DropdownMenuItem>
+                        ))
                       ) : (
                         <DropdownMenuItem
                           aria-disabled="true"

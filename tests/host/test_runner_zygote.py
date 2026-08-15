@@ -341,6 +341,30 @@ def test_operator_malloc_override_wins_at_the_zygote_exec(monkeypatch, tmp_path)
     assert captured["MALLOC_ARENA_MAX"] == "16"
 
 
+def test_zygote_boots_from_inside_an_omnigent_checkout(monkeypatch, tmp_path) -> None:
+    """A daemon whose cwd holds an ``omnigent/`` package still starts a zygote.
+
+    The zygote inherits the daemon's cwd, which ``python -m`` would prepend to
+    ``sys.path``, so a daemon started inside an omnigent checkout would import
+    that checkout instead of the installed package. Booting against a poisoned
+    package proves the spawn keeps cwd off ``sys.path``.
+
+    :param monkeypatch: Fixture used to run from the poisoned directory.
+    :param tmp_path: Temp dir holding the poisoned package and the zygote log.
+    """
+    package = tmp_path / "omnigent"
+    package.mkdir()
+    (package / "__init__.py").write_text('raise ImportError("poisoned omnigent")\n')
+    monkeypatch.chdir(tmp_path)
+
+    mgr = ZygoteManager(log_path=tmp_path / "zygote.log")
+    mgr.start()
+    try:
+        assert mgr.is_running()
+    finally:
+        mgr.stop()
+
+
 # ── Harness-fork path (fork_harness) ──────────────────────────────
 #
 # The zygote also forks HARNESS children on request, sharing the harness import

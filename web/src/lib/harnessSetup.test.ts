@@ -25,6 +25,7 @@ const hostWith = (configured: Record<string, boolean | string> | null | undefine
 const info = (overrides: Partial<ServerInfo> = {}): ServerInfo =>
   ({
     harness_install_enabled: true,
+    features: { harness_install: overrides.harness_install_enabled ?? true },
     installable_harnesses: ["codex", "codex-native", "pi", "pi-native"],
     ...overrides,
   }) as ServerInfo;

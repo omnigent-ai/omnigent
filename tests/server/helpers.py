@@ -685,7 +685,7 @@ def build_agent_bundle(
 
     The bundle contains a single config.yaml with the given spec
     fields. When ``sub_agents`` is provided, each entry is added as
-    ``agents/<name>/config.yaml`` and the parent's
+    ``agents/<dir>/config.yaml`` and the parent's
     ``tools.agents`` list is populated.
 
     :param name: Agent name, e.g. ``"test-agent"``.
