@@ -7874,12 +7874,12 @@ def _require_declared_subagent(
     :param sub_agent_name: The requested sub-agent name to validate.
     :param agent_cache: Cache for loading the parsed parent bundle.
         ``None`` skips the check (cannot resolve the tree).
-    :raises OmnigentError: 404 ``NOT_FOUND`` when the bundle loads and
-        declares no sub-agent named ``sub_agent_name``.
+    :raises OmnigentError: 404 ``SUB_AGENT_UNRESOLVED`` when the bundle
+        loads and declares no sub-agent named ``sub_agent_name``.
     """
     if agent_cache is None:
         return
-    from omnigent.runtime.workflow import _find_spec_by_name
+    from omnigent.runtime.workflow import _find_spec_by_name, _sub_agent_unresolved_error
 
     try:
         parent_spec = agent_cache.load(
@@ -7891,10 +7891,7 @@ def _require_declared_subagent(
         # rejecting a create we cannot adjudicate.
         return
     if _find_spec_by_name(parent_spec, sub_agent_name) is None:
-        raise OmnigentError(
-            f"Sub-agent not declared in parent spec: {sub_agent_name!r}",
-            code=ErrorCode.NOT_FOUND,
-        )
+        raise _sub_agent_unresolved_error(parent_spec, sub_agent_name)
 
 
 def _spec_harness(spec: AgentSpec) -> str:

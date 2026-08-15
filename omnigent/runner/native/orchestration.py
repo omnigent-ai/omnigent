@@ -7835,7 +7835,7 @@ def _sub_agent_bundle_workdir(parent_entry: Any, parent_spec: Any, child_spec: A
     return workdir if workdir.is_dir() else None
 
 
-def _resolve_sub_agent_spec_entry(parent_entry: Any, sub_agent_name: str) -> ResolvedSpec | None:
+def _resolve_sub_agent_spec_entry(parent_entry: Any, sub_agent_name: str) -> ResolvedSpec:
     """Resolve a sub-agent by name into a spec entry rooted at its own bundle dir.
 
     The returned entry is always wrapped so downstream workdir lookups see
@@ -7845,23 +7845,15 @@ def _resolve_sub_agent_spec_entry(parent_entry: Any, sub_agent_name: str) -> Res
 
     :param parent_entry: Parent spec, bare or wrapped in ``ResolvedSpec``.
     :param sub_agent_name: Name of the sub-agent to resolve.
-    :returns: The wrapped child entry, or ``None`` when the name does not
-        resolve.
+    :returns: The wrapped child entry.
+    :raises OmnigentError: If the name is absent from the parent spec tree.
     """
-    from omnigent.runtime.workflow import _find_spec_by_name
+    from omnigent.runtime.workflow import _find_spec_by_name, _sub_agent_unresolved_error
 
     parent_spec = _unwrap_resolved_spec(parent_entry)
     child_spec = _find_spec_by_name(parent_spec, sub_agent_name)
     if child_spec is None:
-        # Callers in runtime/workflow.py keep the parent spec on a lookup
-        # miss, which boots the child as a clone of the parent. Unsafe, but
-        # pre-existing and out of scope here — tracked separately.
-        _logger.warning(
-            "Sub-agent %r not found under spec %r; no workdir resolved",
-            sub_agent_name,
-            getattr(parent_spec, "name", None),
-        )
-        return None
+        raise _sub_agent_unresolved_error(parent_spec, sub_agent_name)
     return ResolvedSpec(
         spec=child_spec,
         workdir=_sub_agent_bundle_workdir(parent_entry, parent_spec, child_spec),
