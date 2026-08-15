@@ -74,15 +74,41 @@ describe("ErrorBanner", () => {
     expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
     expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
 
-    fireEvent.focus(messageToggle);
+    fireEvent.keyDown(document, { key: "Tab" });
+    act(() => messageToggle.focus());
     expect(screen.queryByTestId("error-status-icon")).toBeNull();
     expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
 
-    fireEvent.blur(messageToggle);
+    act(() => messageToggle.blur());
     expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
     fireEvent.click(messageToggle);
     expect(screen.queryByTestId("error-status-icon")).toBeNull();
     expect(screen.getByTestId("error-disclosure-icon")).toHaveClass("rotate-90");
+  });
+
+  it("restores the status icon after pointer expand, collapse, and mouse leave", () => {
+    render(
+      <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
+    );
+
+    const messageToggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
+    fireEvent.mouseEnter(messageToggle);
+    fireEvent.pointerDown(messageToggle);
+    fireEvent.focus(messageToggle);
+    fireEvent.pointerUp(messageToggle);
+    fireEvent.click(messageToggle);
+    expect(screen.queryByTestId("error-status-icon")).toBeNull();
+    expect(screen.getByTestId("error-disclosure-icon")).toHaveClass("rotate-90");
+
+    fireEvent.pointerDown(messageToggle);
+    fireEvent.pointerUp(messageToggle);
+    fireEvent.click(messageToggle);
+    expect(screen.queryByTestId("error-status-icon")).toBeNull();
+    expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
+
+    fireEvent.mouseLeave(messageToggle);
+    expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
+    expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
   });
 
   it("keeps retry progress and failure aligned without changing the compact icon rule", async () => {
@@ -119,7 +145,12 @@ describe("ErrorBanner", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
     expect(screen.getByRole("alert")).toHaveClass("rounded-2xl", "p-4");
-    expect(screen.getByTestId("error-message-content")).toHaveClass("font-mono", "text-sm");
+    const message = screen.getByTestId("error-message-content");
+    const copyMessage = screen.getByRole("button", { name: "Copy message" });
+    expect(message).toHaveClass("font-mono", "text-sm", "pr-10");
+    expect(copyMessage.parentElement).toBe(message.parentElement);
+    expect(copyMessage).toHaveClass("absolute", "top-0", "right-0");
+    expect(screen.getByText("Message").nextElementSibling).toBe(message.parentElement);
 
     const diagnosticsToggle = screen.getByRole("button", { name: "View diagnostics" });
     expect(diagnosticsToggle).toHaveClass("justify-between");

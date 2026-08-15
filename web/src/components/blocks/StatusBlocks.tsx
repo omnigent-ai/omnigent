@@ -173,14 +173,15 @@ export function ErrorBanner({
   const [retryError, setRetryError] = useState<string | null>(null);
   const [dismissed, setDismissed] = useState(false);
   const [headerHovered, setHeaderHovered] = useState(false);
-  const [headerFocused, setHeaderFocused] = useState(false);
+  const [headerFocusVisible, setHeaderFocusVisible] = useState(false);
   const copyResetRef = useRef<number>(0);
   const retryInFlightRef = useRef(false);
+  const headerPointerDownRef = useRef(false);
   const dismissButtonRef = useRef<HTMLButtonElement>(null);
   const messageId = useId();
   const diagnosticsId = useId();
   const retryable = onRetry !== undefined && RETRYABLE_ERROR_CODES.has(code);
-  const showDisclosureIcon = expanded || headerHovered || headerFocused;
+  const showDisclosureIcon = expanded || headerHovered || headerFocusVisible;
 
   useEffect(() => () => window.clearTimeout(copyResetRef.current), []);
   useEffect(() => {
@@ -231,8 +232,25 @@ export function ErrorBanner({
             onClick={() => setExpanded((value) => !value)}
             onMouseEnter={() => setHeaderHovered(true)}
             onMouseLeave={() => setHeaderHovered(false)}
-            onFocus={() => setHeaderFocused(true)}
-            onBlur={() => setHeaderFocused(false)}
+            onPointerDown={() => {
+              headerPointerDownRef.current = true;
+              setHeaderFocusVisible(false);
+            }}
+            onPointerUp={() => {
+              headerPointerDownRef.current = false;
+            }}
+            onPointerCancel={() => {
+              headerPointerDownRef.current = false;
+            }}
+            onFocus={(event) => {
+              setHeaderFocusVisible(
+                !headerPointerDownRef.current && event.currentTarget.matches(":focus-visible"),
+              );
+            }}
+            onBlur={() => {
+              headerPointerDownRef.current = false;
+              setHeaderFocusVisible(false);
+            }}
             className="group/header -m-1 grid min-w-0 cursor-pointer grid-cols-[1.25rem_minmax(0,1fr)] items-start gap-x-3 rounded-lg p-1 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
           >
             <span
@@ -321,15 +339,21 @@ export function ErrorBanner({
             className="mt-6 min-w-0 max-w-full overflow-hidden text-foreground [text-wrap:wrap]"
           >
             <section aria-labelledby={`${messageId}-label`} className="min-w-0 space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <h4 id={`${messageId}-label`} className="text-sm font-medium text-muted-foreground">
-                  Message
-                </h4>
+              <h4 id={`${messageId}-label`} className="text-sm font-medium text-muted-foreground">
+                Message
+              </h4>
+              <div className="relative min-w-0">
+                <div
+                  data-testid="error-message-content"
+                  className="max-w-full min-w-0 whitespace-pre-wrap break-words pr-10 font-mono text-sm leading-6 text-foreground [overflow-wrap:anywhere] [text-wrap:wrap]"
+                >
+                  {messageText}
+                </div>
                 <Button
                   type="button"
                   variant="ghost"
                   size="icon-xs"
-                  className="text-muted-foreground hover:text-foreground"
+                  className="absolute top-0 right-0 text-muted-foreground hover:text-foreground"
                   aria-label={copiedTarget === "message" ? "Message copied" : "Copy message"}
                   onClick={() => void copy("message", messageText)}
                 >
@@ -339,12 +363,6 @@ export function ErrorBanner({
                     <CopyIcon aria-hidden="true" />
                   )}
                 </Button>
-              </div>
-              <div
-                data-testid="error-message-content"
-                className="max-w-full whitespace-pre-wrap break-words font-mono text-sm leading-6 text-foreground [overflow-wrap:anywhere] [text-wrap:wrap]"
-              >
-                {messageText}
               </div>
             </section>
             {diagnostics.length > 0 ? (
