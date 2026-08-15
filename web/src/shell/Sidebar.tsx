@@ -151,6 +151,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
+import { useArchiveSessionHotkey } from "@/hooks/useArchiveSessionHotkey";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
@@ -365,6 +366,69 @@ export function computeShiftSelectRange(
 /** Fire the post-archive toast. Hoisted so it isn't a render-scoped closure. */
 function showArchivedToast() {
   showToast(<ArchivedToast />);
+}
+
+/**
+ * Archive / unarchive one session — the single behavior behind the row menus'
+ * Archive item, its "A" shortcut, and the ⌘⌥A hotkey.
+ *
+ * Archiving sends only the PATCH: the server stops the session (and tears down
+ * a host-spawned runner) in the background once the flag is committed. Sending
+ * a client stop too would race that one against the same runner, and the loser
+ * gets a 503 from the already-killed pane.
+ */
+function useArchiveSessionAction(): (args: {
+  conversation: Conversation;
+  /** Whether the viewer is currently on this session's chat surface. */
+  isActive: boolean;
+  onArchiveStart?: () => void;
+  onArchiveError?: () => void;
+}) => void {
+  const archive = useArchiveConversation();
+  const navigate = useNavigate();
+  return ({ conversation, isActive, onArchiveStart, onArchiveError }) => {
+    // Unarchiving is a quick flag flip — no status row, no toast.
+    if (conversation.archived === true) {
+      archive.mutate({ id: conversation.id, archived: false });
+      return;
+    }
+    onArchiveStart?.();
+    archive.mutate(
+      { id: conversation.id, archived: true },
+      {
+        // Point the user at where the session went — it's no longer in the
+        // sidebar list, so surface its new home in Settings.
+        onSuccess: () => {
+          if (isActive) navigate("/", { replace: true });
+          showArchivedToast();
+        },
+        onError: () => onArchiveError?.(),
+      },
+    );
+  };
+}
+
+/**
+ * "A" archives the session whose row action menu is open — the one-letter
+ * shortcut the Archive item advertises, matching the kebab menus in Claude
+ * Code. Bound on the menu Content so it works under both the kebab dropdown
+ * and the right-click context menu.
+ *
+ * Clicking the item (rather than calling archive directly) is how Radix itself
+ * activates a highlighted item, so select, close, and the non-owner disabled
+ * state all keep working for free.
+ */
+function handleArchiveMenuKey(e: KeyboardEvent<HTMLElement>): void {
+  if (e.key !== "a" && e.key !== "A") return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const item = e.currentTarget.querySelector<HTMLElement>('[data-testid="archive-conversation"]');
+  // Non-owners get the item disabled; leave the key alone rather than firing
+  // a no-op (and let Radix's typeahead have it back).
+  if (item === null || item.hasAttribute("data-disabled")) return;
+  // Claim the key before Radix consumes it as typeahead.
+  e.preventDefault();
+  e.stopPropagation();
+  item.click();
 }
 
 /** Stable empty array for the pinned-conversations fallback (referential
@@ -1785,6 +1849,29 @@ function ConversationList({
   );
   usePinnedSessionHotkeys(pinnedSessionIds, activeId);
 
+  // ⌘⌥A archives the session currently open in the chat surface. Bound here
+  // (not on the row) because a row unmounts when its section is collapsed or
+  // its page hasn't loaded, while this list is always mounted. Sub-agent views
+  // resolve to their top-level session, matching what the row menu would act
+  // on. Null — and so inert — when nothing is open or the viewer isn't the
+  // owner, the same gate the menu's Archive item uses.
+  const activeRootId = useActiveRootSessionId(activeId ?? null);
+  const archiveSession = useArchiveSessionAction();
+  const activeConversation = useMemo(() => {
+    const id = activeRootId ?? activeId;
+    if (id === undefined || id === null) return null;
+    return (
+      allConversations.find((c) => c.id === id) ??
+      pinnedConversations.find((c) => c.id === id) ??
+      null
+    );
+  }, [allConversations, pinnedConversations, activeRootId, activeId]);
+  useArchiveSessionHotkey(
+    activeConversation !== null && isOwnedByViewer(activeConversation, viewerId)
+      ? () => archiveSession({ conversation: activeConversation, isActive: true })
+      : null,
+  );
+
   // Pinned membership is server-authoritative (the `omnigent.pinned` label),
   // so there's no client-side list to normalize against the loaded window —
   // the pinned query returns exactly the pinned sessions, unpinning removes the
@@ -2903,6 +2990,9 @@ function ConversationMenuItems({
             <ArchiveIcon className="size-3.5" />
           )}
           {isArchived ? "Unarchive" : "Archive"}
+          {/* The menu-scoped "A" shortcut (see handleArchiveMenuKey). Only the
+              enabled item advertises it — the disabled branch below can't act. */}
+          <span className="ml-auto pl-4 text-sm tracking-widest text-muted-foreground">A</span>
         </C.Item>
       ) : (
         <Tooltip>
@@ -3057,7 +3147,7 @@ function ConversationRow({
   }, [isActive]);
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
-  const archive = useArchiveConversation();
+  const archiveSession = useArchiveSessionAction();
   const leave = useLeaveSession();
   const moveToProject = useMoveToProject();
   // The kebab's user-facing "Stop session" action. Archiving does NOT go
@@ -3294,17 +3384,6 @@ function ConversationRow({
   }
 
   function runArchive() {
-    const nextArchived = !isArchived;
-    // Unarchiving is a quick flag flip — no status row.
-    if (!nextArchived) {
-      archive.mutate({ id: conversation.id, archived: false });
-      return;
-    }
-    // Archiving sends only the PATCH: the server stops the session (and
-    // tears down a host-spawned runner) in the background once the flag is
-    // committed. Sending a client stop too would race that one against the
-    // same runner, and the loser gets a 503 from the already-killed pane.
-    //
     // "Archiving…" must stay up until the row actually LEAVES the sidebar,
     // not merely until the PATCH resolves. The PATCH success only kicks off
     // an async `["conversations"]` refetch (see useArchiveConversation); the
@@ -3315,19 +3394,12 @@ function ConversationRow({
     // was still listed. So we DON'T clear it on success: this row unmounts
     // when the refetch removes it, which tears the spinner down with it.
     // Only an error clears the flag, restoring the interactive row for retry.
-    setIsArchiving(true);
-    archive.mutate(
-      { id: conversation.id, archived: true },
-      {
-        // Point the user at where the session went — it's no longer in
-        // the sidebar list, so surface its new home in Settings.
-        onSuccess: () => {
-          if (isActive) navigate("/", { replace: true });
-          showArchivedToast();
-        },
-        onError: () => setIsArchiving(false),
-      },
-    );
+    archiveSession({
+      conversation,
+      isActive,
+      onArchiveStart: () => setIsArchiving(true),
+      onArchiveError: () => setIsArchiving(false),
+    });
   }
 
   function confirmLeave() {
@@ -3499,7 +3571,7 @@ function ConversationRow({
             <ContextMenuTrigger asChild>
               <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
             </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44">
+            <ContextMenuContent className="min-w-44" onKeyDown={handleArchiveMenuKey}>
               <ConversationMenuItems
                 components={contextBundle}
                 setMenuOpen={() => {}}
@@ -3516,7 +3588,7 @@ function ConversationRow({
       ) : isMobile ? (
         <ContextMenu>
           <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
-          <ContextMenuContent className="min-w-44">
+          <ContextMenuContent className="min-w-44" onKeyDown={handleArchiveMenuKey}>
             <ConversationMenuItems
               components={contextBundle}
               setMenuOpen={() => {}}
@@ -3532,7 +3604,7 @@ function ConversationRow({
                 <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
               </div>
             </ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44">
+            <ContextMenuContent className="min-w-44" onKeyDown={handleArchiveMenuKey}>
               <ConversationMenuItems
                 components={contextBundle}
                 setMenuOpen={() => {}}
@@ -3632,7 +3704,7 @@ function ConversationRow({
                 <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
               </Button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="min-w-44">
+            <DropdownMenuContent align="end" className="min-w-44" onKeyDown={handleArchiveMenuKey}>
               <ConversationMenuItems
                 components={dropdownBundle}
                 setMenuOpen={setMenuOpen}

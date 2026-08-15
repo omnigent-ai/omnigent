@@ -79,6 +79,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Recall next prompt", keys: [DOWN] },
       { label: "Accept approval prompt", keys: [MOD_KEY, ENTER] },
       { label: "Toggle voice dictation", keys: [MOD_KEY, ALT, "V"] },
+      { label: "Archive session", keys: [MOD_KEY, ALT, "A"] },
       { label: "Stop response", keys: ["Esc"] },
     ],
   },
@@ -95,6 +96,11 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT, "["] },
       { label: "Toggle workspace sidebar", keys: [MOD_KEY, ALT, "]"] },
     ],
+  },
+  {
+    title: "Session menu",
+    note: "while a session's actions menu is open",
+    items: [{ label: "Archive session", keys: ["A"] }],
   },
   {
     title: "Slash commands",
@@ -144,9 +150,12 @@ export function KeyboardShortcutsList() {
   // Feature-based, stable per session; computed at render so tests can vary it.
   const groups = shortcutGroupsFor(isNativeShell());
   return (
-    <>
+    // Two balanced columns once there's room, so the reference reads as a wide
+    // card rather than one tall ribbon of rows. `break-inside-avoid` keeps a
+    // group's heading with its rows when the columns split.
+    <div className="sm:columns-2 sm:gap-8">
       {groups.map((group) => (
-        <section key={group.title} className="mb-4 last:mb-0">
+        <section key={group.title} className="mb-4 break-inside-avoid last:mb-0">
           <h3 className="mb-1 text-sm font-medium text-muted-foreground">
             {group.title}
             {group.note ? (
@@ -170,7 +179,7 @@ export function KeyboardShortcutsList() {
           </ul>
         </section>
       ))}
-    </>
+    </div>
   );
 }
 
@@ -197,7 +206,10 @@ export function KeyboardShortcutsDialog() {
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent className="sm:max-w-md">
+      {/* Scales with the viewport (the base `max-w-[calc(100%-2rem)]`) and
+          stops at a readable measure — the old `sm:max-w-md` left a narrow,
+          overly tall column of rows. */}
+      <DialogContent className="sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>Keyboard shortcuts</DialogTitle>
           <DialogDescription className="sr-only">
