@@ -19,6 +19,7 @@ import {
   listRunners,
   openSessionStream,
   postEvent,
+  resumeSession,
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
@@ -853,6 +854,35 @@ describe("postEvent", () => {
     });
     expect(out.pendingId).toBe("pending_abc123");
     expect(out.itemId).toBeUndefined();
+  });
+});
+
+describe("resumeSession", () => {
+  it("POSTs the no-message resume action", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse(undefined, { status: 204 }));
+
+    await resumeSession("conv with space");
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv%20with%20space/resume");
+    expect(init.method).toBe("POST");
+  });
+
+  it("surfaces the server reconnect guidance", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        {
+          error: {
+            code: "runner_unavailable",
+            message: "Reconnect the host and try again.",
+          },
+        },
+        { ok: false, status: 503 },
+      ),
+    );
+
+    await expect(resumeSession("conv_abc")).rejects.toThrow("Reconnect the host and try again.");
   });
 });
 

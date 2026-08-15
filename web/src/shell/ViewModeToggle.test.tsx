@@ -147,4 +147,20 @@ describe("ViewModeToggle", () => {
     fireEvent.click(chatSegment());
     expect(setView).toHaveBeenCalledWith("chat");
   });
+
+  it("keeps Terminal selectable when the paused session can be resumed", () => {
+    const setView = vi.fn();
+    renderToggle(
+      makeCtx({
+        setView,
+        terminalsAvailable: false,
+        terminalResumable: true,
+        terminalStartingUp: false,
+      }),
+    );
+    const terminal = terminalSegment();
+    expect(terminal).not.toBeDisabled();
+    fireEvent.click(terminal);
+    expect(setView).toHaveBeenCalledWith("terminal");
+  });
 });

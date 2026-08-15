@@ -804,6 +804,20 @@ export async function getSession(sessionId: string): Promise<Session> {
 }
 
 /**
+ * Wake a paused session without dispatching a chat event.
+ *
+ * The server reuses the session's existing host/workspace binding. The call is
+ * idempotent when the runner is already connected and creates no transcript
+ * item.
+ */
+export async function resumeSession(sessionId: string): Promise<void> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/resume`, {
+    method: "POST",
+  });
+  if (!res.ok) throw await apiErrorFromResponse(res);
+}
+
+/**
  * Snapshot a session WITHOUT its committed items or liveness fields.
  *
  * Use this (not `getSession`) when the caller hydrates the transcript

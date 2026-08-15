@@ -246,6 +246,32 @@ def register_resources_routes(
             raise _session_not_found()
         return conv
 
+    @router.post(
+        "/sessions/{session_id}/resume",
+        status_code=204,
+        response_class=Response,
+        dependencies=[Depends(require_trusted_origin)],
+    )
+    async def resume_session(
+        request: Request,
+        session_id: str,
+    ) -> Response:
+        """Wake a resumable session without dispatching a chat event."""
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        runner_client, _ = await ensure_runner_connected(
+            session_id=session_id,
+            conv=conv,
+            app_state=request.app.state,
+            conversation_store=conversation_store,
+            runner_router=runner_router or get_server_runner_router(),
+        )
+        if runner_client is None:
+            raise OmnigentError(
+                "Session cannot be resumed from this server. Reconnect its host and try again.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        return Response(status_code=204)
+
     async def _proxy_get_to_runner(
         session_id: str,
         path: str,
