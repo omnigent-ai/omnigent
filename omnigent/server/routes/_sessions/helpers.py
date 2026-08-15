@@ -1660,7 +1660,7 @@ def _resolve_llm_model(
         if agent is None:
             return None
         loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.expands_server_env
         )
         return loaded.spec.llm.model if loaded.spec.llm else None
     # UUID bind failures are wrapped by SQLAlchemy; do not hide broader DB errors.
@@ -1736,7 +1736,7 @@ def _resolve_harness_impl(
         if agent is None:
             return None
         loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.expands_server_env
         )
         executor = loaded.spec.executor
         # For a bundled-agent head sub-agent, report the HEAD's own harness,
@@ -1804,7 +1804,7 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
         )
     try:
         loaded = get_agent_cache().load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.expands_server_env
         )
     except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
         raise OmnigentError(
@@ -1838,7 +1838,7 @@ def _validated_harness_override_executor_type(agent: Agent) -> None:
 
     try:
         loaded = get_agent_cache().load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.expands_server_env
         )
     except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
         raise OmnigentError(
@@ -6587,7 +6587,7 @@ async def _run_compact_locked(
                 code=ErrorCode.NOT_FOUND,
             )
         loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.expands_server_env
         )
         spec = loaded.spec
         if spec.llm is not None:
@@ -6649,7 +6649,7 @@ def _agent_provider_family(agent: Agent) -> str | None:
     try:
         spec = (
             get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .load(agent.id, agent.bundle_location, expand_env=agent.expands_server_env)
             .spec
         )
     except Exception:  # noqa: BLE001
@@ -6705,7 +6705,7 @@ def _agent_is_native_impl(agent: Agent) -> bool:
     try:
         spec = (
             get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .load(agent.id, agent.bundle_location, expand_env=agent.expands_server_env)
             .spec
         )
     except Exception:  # noqa: BLE001
@@ -6741,7 +6741,7 @@ def _agent_carries_native_fork_history_impl(agent: Agent) -> bool:
     try:
         spec = (
             get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .load(agent.id, agent.bundle_location, expand_env=agent.expands_server_env)
             .spec
         )
     except Exception:  # noqa: BLE001
@@ -6767,7 +6767,7 @@ def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
     try:
         spec = (
             get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .load(agent.id, agent.bundle_location, expand_env=agent.expands_server_env)
             .spec
         )
     except Exception:  # noqa: BLE001
@@ -6785,7 +6785,7 @@ def _native_coding_agent_for_agent(agent: Agent) -> NativeCodingAgent | None:
     try:
         spec = (
             get_agent_cache()
-            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .load(agent.id, agent.bundle_location, expand_env=agent.expands_server_env)
             .spec
         )
     except Exception:  # noqa: BLE001
@@ -6842,7 +6842,7 @@ def _load_agent_spec_for_session_impl(
     return agent_cache.load(
         agent.id,
         agent.bundle_location,
-        expand_env=agent.session_id is None,
+        expand_env=agent.expands_server_env,
     ).spec
 
 
@@ -7829,7 +7829,7 @@ def _resolve_subagent_spec(
 
     try:
         parent_spec = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.expands_server_env
         ).spec
     except Exception:  # noqa: BLE001
         # A bundle that fails to load here must not break session
@@ -7883,7 +7883,7 @@ def _require_declared_subagent(
 
     try:
         parent_spec = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.expands_server_env
         ).spec
     except Exception:  # noqa: BLE001
         # Can't load the bundle -> can't prove the name is undeclared.
@@ -8138,7 +8138,7 @@ def _repl_terminal_ui_labels(
     else:
         try:
             spec = agent_cache.load(
-                agent.id, agent.bundle_location, expand_env=agent.session_id is None
+                agent.id, agent.bundle_location, expand_env=agent.expands_server_env
             ).spec
         except Exception:  # noqa: BLE001
             # Can't resolve the harness -> leave the label to the runner's
@@ -8782,7 +8782,7 @@ async def _handle_advise_models_mcp(
                     .load(
                         agent_obj.id,
                         agent_obj.bundle_location,
-                        expand_env=agent_obj.session_id is None,
+                        expand_env=agent_obj.expands_server_env,
                     )
                     .spec
                 )

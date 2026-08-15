@@ -43,6 +43,15 @@ export interface AvailableAgent {
   // session-discovered agents (custom uploads); absent on catalog agents
   // whose full data is already present from GET /v1/agents.
   sessionId?: string;
+  // Monotonic version counter, bumped on each refresh. Used in the git
+  // provenance line (`vN`). Absent on older servers / session-derived rows.
+  version?: number;
+  // Git-source provenance for agents imported from a git repo. All absent
+  // for non-git agents. git_url set ⇒ show provenance + Refresh in the picker.
+  git_url?: string | null;
+  git_ref?: string | null;
+  git_commit?: string | null;
+  git_host_id?: string | null;
 }
 
 const DISPLAY_NAMES: Record<string, string> = {
@@ -95,6 +104,11 @@ interface BuiltinAgentWire {
   // older servers, where every catalog row degrades to a protected entry.
   builtin?: boolean;
   created_at?: number | null;
+  version?: number;
+  git_url?: string | null;
+  git_ref?: string | null;
+  git_commit?: string | null;
+  git_host_id?: string | null;
 }
 
 interface BuiltinAgentsListWire {
@@ -144,6 +158,11 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
     // undefined as "protected" (same as true), so omission is safe.
     ...(a.builtin !== undefined ? { builtin: a.builtin } : {}),
     ...(a.created_at !== undefined ? { created_at: a.created_at } : {}),
+    ...(a.version !== undefined ? { version: a.version } : {}),
+    ...(a.git_url != null ? { git_url: a.git_url } : {}),
+    ...(a.git_ref != null ? { git_ref: a.git_ref } : {}),
+    ...(a.git_commit != null ? { git_commit: a.git_commit } : {}),
+    ...(a.git_host_id != null ? { git_host_id: a.git_host_id } : {}),
   }));
 }
 
@@ -198,6 +217,11 @@ interface AgentObjectWire {
   description?: string | null;
   harness?: string | null;
   skills?: { name: string; description: string }[];
+  version?: number;
+  git_url?: string | null;
+  git_ref?: string | null;
+  git_commit?: string | null;
+  git_host_id?: string | null;
 }
 
 /**
@@ -247,6 +271,11 @@ export async function prefetchAvailableAgentDetails(
               description: json.description ?? null,
               harness: json.harness ?? null,
               skills: json.skills ?? [],
+              ...(json.version !== undefined ? { version: json.version } : {}),
+              ...(json.git_url != null ? { git_url: json.git_url } : {}),
+              ...(json.git_ref != null ? { git_ref: json.git_ref } : {}),
+              ...(json.git_commit != null ? { git_commit: json.git_commit } : {}),
+              ...(json.git_host_id != null ? { git_host_id: json.git_host_id } : {}),
             },
       );
       // If enrichment reveals this agent is a native coding agent (e.g. a

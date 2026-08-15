@@ -36,6 +36,40 @@ class Agent:
     description: str | None = None
     updated_at: int | None = None
     session_id: str | None = None  # owning conversation id; None for template agents
+    # Git-source provenance (all None for non-git agents). git_url None ⇒ not
+    # git-backed. git_host_id is the host that cloned it, reused on refresh.
+    git_url: str | None = None
+    git_ref: str | None = None
+    git_subpath: str | None = None
+    git_commit: str | None = None
+    git_host_id: str | None = None
+
+    @property
+    def expands_server_env(self) -> bool:
+        """Whether this agent's ``${VAR}`` refs may expand against the server env.
+
+        The single source of truth for the ``expand_env`` decision at every
+        spec-load site. Expansion resolves ``${VAR}`` in a spec's MCP
+        ``env``/``headers`` and LLM/executor auth against the **server
+        process** environment (which holds provider keys, DB creds, etc.), so
+        it must be granted only to agent config the operator authored and
+        trusts.
+
+        Two provenance classes are therefore denied expansion (fail-safe):
+
+        * **Session-scoped agents** (``session_id`` set) — tenant-supplied
+          bundle uploads; expanding their ``${VAR}`` would leak server secrets
+          into a spec-controlled MCP/LLM connection.
+        * **Git-imported agents** (``git_url`` set) — third-party repo config
+          that merely happens to persist as a template (``session_id is
+          None``). It is *not* operator-authored, so it gets the same
+          no-expansion treatment as a session-scoped upload — matching the
+          trust level of ``omni run <cloned-repo>/config.yaml`` locally.
+
+        Only operator-authored template agents (``--agent`` / seeded
+        built-ins: ``session_id is None`` **and** ``git_url is None``) expand.
+        """
+        return self.session_id is None and self.git_url is None
 
 
 @dataclass

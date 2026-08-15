@@ -7237,7 +7237,7 @@ def _create_resolved_harness(
         return None
     try:
         loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.expands_server_env
         )
     except (KeyError, AttributeError, ValueError, ImportError, OSError):
         # An unloadable spec just means "harness unknown"; the create's own
@@ -7323,7 +7323,7 @@ def _spec_routes_its_own_harness(
         return False
     try:
         loaded = agent_cache.load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.expands_server_env
         )
     except (KeyError, AttributeError, ValueError, ImportError, OSError):
         # An unloadable spec just means "no opt-in"; the create's own
@@ -8185,7 +8185,7 @@ async def _create_session_from_existing_agent(
                 _tel_loaded = agent_cache.load(
                     agent.id,
                     agent.bundle_location,
-                    expand_env=agent.session_id is None,
+                    expand_env=agent.expands_server_env,
                 )
                 _tel_harness = _spec_harness(_tel_loaded.spec)
             else:
@@ -9123,7 +9123,7 @@ async def _get_session_snapshot(
                         agent_cache.load,
                         agent.id,
                         agent.bundle_location,
-                        expand_env=agent.session_id is None,
+                        expand_env=agent.expands_server_env,
                     )
                     spec = loaded.spec
                     if conv.sub_agent_name:

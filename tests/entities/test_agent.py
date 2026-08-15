@@ -55,3 +55,45 @@ def test_agent_defaults_independent() -> None:
     b = Agent(id="ag_b", created_at=1, name="b", bundle_location="b/h")
     a.description = "modified"
     assert b.description is None
+
+
+def _agent(**kwargs: object) -> Agent:
+    base: dict[str, object] = {
+        "id": "ag_x",
+        "created_at": 1,
+        "name": "a",
+        "bundle_location": "ag_x/h",
+    }
+    base.update(kwargs)
+    return Agent(**base)  # type: ignore[arg-type]
+
+
+def test_expands_server_env_operator_template() -> None:
+    """Operator-authored template (no session, no git) expands server env."""
+    agent = _agent(session_id=None, git_url=None)
+    assert agent.expands_server_env is True
+
+
+def test_expands_server_env_session_scoped_denied() -> None:
+    """A session-scoped (tenant-uploaded) agent must not expand server env."""
+    agent = _agent(session_id="conv_1", git_url=None)
+    assert agent.expands_server_env is False
+
+
+def test_expands_server_env_git_imported_denied() -> None:
+    """A git-imported template is untrusted repo config — no server-env expansion.
+
+    This is the core of the fix: git agents persist as templates
+    (``session_id is None``) but must NOT be granted the operator-template
+    privilege of expanding ``${VAR}`` against the server process env, which
+    would let a malicious repo's MCP ``env``/``headers`` exfiltrate server
+    secrets.
+    """
+    agent = _agent(session_id=None, git_url="https://github.com/org/repo")
+    assert agent.expands_server_env is False
+
+
+def test_expands_server_env_git_and_session_denied() -> None:
+    """Belt-and-suspenders: git provenance on a session-scoped row still denies."""
+    agent = _agent(session_id="conv_1", git_url="https://github.com/org/repo")
+    assert agent.expands_server_env is False

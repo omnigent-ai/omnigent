@@ -200,13 +200,16 @@ def register_agent_routes(
                 "X-Agent-Version": str(agent.version),
                 "X-Agent-Name": agent.name,
                 # Provenance for the runner's env-expansion decision:
-                # session-scoped agents are
-                # tenant-uploaded and must NOT have ${VAR} expanded
-                # against the runner process env; template agents
-                # (session_id is None) are operator-authored and may.
-                # The runner fails safe (treats a missing header as
-                # session-scoped → no expansion).
-                "X-Agent-Session-Scoped": "true" if agent.session_id is not None else "false",
+                # Tenant-supplied bundles must NOT have ${VAR} expanded
+                # against the runner process env; only operator-authored
+                # template agents may. ``expands_server_env`` denies both
+                # session-scoped uploads AND git-imported agents (untrusted
+                # third-party repo config that merely persists as a
+                # template). The runner fails safe (treats a missing header
+                # as no-expansion). Header name kept for wire-compat; it now
+                # means "not an env-expanding template", not literally
+                # "has a session_id".
+                "X-Agent-Session-Scoped": "false" if agent.expands_server_env else "true",
             },
         )
 
@@ -313,7 +316,7 @@ def register_agent_routes(
             # (session_id is None) may expand ${VAR} against the server
             # env; tenant session-scoped bundles must not.
             agent_cache.replace(
-                agent.id, new_loc, bundle_bytes, expand_env=agent.session_id is None
+                agent.id, new_loc, bundle_bytes, expand_env=agent.expands_server_env
             )
 
         return _to_agent_object(updated, agent_cache)

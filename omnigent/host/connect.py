@@ -9,6 +9,7 @@ the server.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import errno
 import functools
@@ -28,13 +29,17 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
 from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
+from omnigent.errors import OmnigentError
 from omnigent.gateway_inference import gateway_inference_map
+from omnigent.git_source import clone_and_bundle
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneAndBundleFrame,
+    HostCloneAndBundleResultFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
@@ -131,6 +136,11 @@ from omnigent.tls import client_ssl_context
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
+
+# Cap for host-side clone-and-bundle. base64 inflates raw bytes by ~33%, and
+# the server's Starlette WebSocket receive buffer defaults to ~16 MiB — so keep
+# the raw bundle well under that ceiling to leave room for the JSON envelope.
+_HOST_CLONE_MAX_BUNDLE_BYTES = 12 * 1024 * 1024  # 12 MiB raw
 
 
 class _WaitidInfo(Protocol):
@@ -2431,6 +2441,71 @@ class HostProcess:
             branch=created.branch,
         )
 
+    async def _handle_clone_and_bundle(
+        self,
+        frame: HostCloneAndBundleFrame,
+    ) -> HostCloneAndBundleResultFrame:
+        """Handle a ``host.clone_and_bundle`` request from the server.
+
+        Clones the remote git repo using the host's own ambient git
+        credentials, bundles the agent directory (or the repo root),
+        base64-encodes the result, and returns it to the server.
+
+        Runs the blocking work in a worker thread so the tunnel loop
+        keeps servicing pings; the orphan reaper is paused around the git
+        subprocess (same rationale as create_worktree, #1782).
+
+        :param frame: The clone-and-bundle request frame.
+        :returns: Result frame with base64-encoded bundle on success, or
+            ``status: "failed"`` with an error message.
+        """
+        try:
+            with self._host_subprocess_op():
+                bundle_bytes, commit_sha, resolved_ref = await asyncio.to_thread(
+                    clone_and_bundle,
+                    frame.git_url,
+                    frame.git_ref,
+                    frame.git_subpath,
+                )
+        except OmnigentError as exc:
+            return HostCloneAndBundleResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=str(exc),
+            )
+        except Exception as exc:
+            # A host bug must not hang the server's awaiting future — return a
+            # failed frame instead of propagating.
+            _logger.exception("Unexpected error in clone_and_bundle for %s", frame.git_url)
+            return HostCloneAndBundleResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"internal error during clone: {exc}",
+            )
+        if len(bundle_bytes) > _HOST_CLONE_MAX_BUNDLE_BYTES:
+            return HostCloneAndBundleResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=(
+                    f"agent bundle too large: {len(bundle_bytes)} bytes "
+                    f"(limit {_HOST_CLONE_MAX_BUNDLE_BYTES})"
+                ),
+            )
+        bundle_b64 = base64.b64encode(bundle_bytes).decode("ascii")
+        _logger.info(
+            "Cloned and bundled %s (ref %s, %d bytes raw)",
+            frame.git_url,
+            resolved_ref,
+            len(bundle_bytes),
+        )
+        return HostCloneAndBundleResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            bundle_b64=bundle_b64,
+            commit_sha=commit_sha,
+            resolved_ref=resolved_ref,
+        )
+
     async def _handle_remove_worktree(
         self,
         frame: HostRemoveWorktreeFrame,
@@ -3125,6 +3200,8 @@ class HostProcess:
             await ws.send(encode_host_frame(credentials_result))
         elif isinstance(frame, HostCreateWorktreeFrame):
             await ws.send(encode_host_frame(await self._handle_create_worktree(frame)))
+        elif isinstance(frame, HostCloneAndBundleFrame):
+            await ws.send(encode_host_frame(await self._handle_clone_and_bundle(frame)))
         elif isinstance(frame, HostRemoveWorktreeFrame):
             await ws.send(encode_host_frame(await self._handle_remove_worktree(frame)))
         elif isinstance(frame, HostListWorktreesFrame):

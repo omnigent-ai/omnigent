@@ -3202,15 +3202,55 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
         "This machine",
       ),
     );
-    // With no custom agents yet, the create item is a top-level row (no
-    // "Custom agents" submenu to hide it behind) and opens the dialog.
+    // With no custom agents yet, the "Create custom agent" submenu is a
+    // top-level row (no "Custom agents" submenu to hide it behind). Open it,
+    // then pick "Configure manually" to open the dialog.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    // No custom agents → no "Custom agents" submenu; create must be top-level.
+    // No custom agents → no "Custom agents" submenu; create group is top-level.
     expect(screen.queryByTestId("new-chat-landing-custom-agents")).toBeNull();
+    await openCreateAgentSubmenu();
     const createItem = screen.getByTestId("new-chat-landing-create-agent");
     fireEvent.click(createItem);
     await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
   });
+
+  it("groups 'Configure manually' + 'Import from Git' under Create custom agent", async () => {
+    renderLanding({ managed_sandboxes_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("Sandbox"),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    // The connected host resolves to the "This machine" label (via
+    // displayNameForHost) rather than its raw name, matching the sibling tests.
+    fireEvent.click(
+      screen.getAllByText("This machine").find((el) => el.closest('[role="menuitem"]') !== null)!,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "This machine",
+      ),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    await openCreateAgentSubmenu();
+    // Both creation paths live under the "Create custom agent" group.
+    expect(screen.getByTestId("new-chat-landing-create-agent")).toBeTruthy();
+    const importItem = screen.getByTestId("new-chat-landing-import-git");
+    expect(importItem).toBeTruthy();
+    // Choosing "Import from Git" opens the git import dialog.
+    fireEvent.click(importItem);
+    await waitFor(() => expect(screen.getByLabelText(/repository url/i)).toBeInTheDocument());
+  });
+
+  // "Create custom agent" is a submenu (Configure manually / Import from Git)
+  // on desktop. Open it so its items are in the DOM, then let the caller click
+  // the specific entry. The agent-picker dropdown must already be open.
+  async function openCreateAgentSubmenu(): Promise<void> {
+    const trigger = screen.getByTestId("new-chat-landing-create-agent-group");
+    fireEvent.pointerDown(trigger, { button: 0 });
+    fireEvent.pointerUp(trigger, { button: 0 });
+    fireEvent.click(trigger);
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-create-agent")).toBeTruthy());
+  }
 
   // Switch the target to the connected host, then create + submit a pending
   // custom agent from the dialog so it becomes the selected agent.
@@ -3229,6 +3269,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
       ),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    await openCreateAgentSubmenu();
     fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
     await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
     fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "my-agent" } });

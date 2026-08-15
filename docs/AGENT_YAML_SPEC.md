@@ -464,6 +464,43 @@ tools:
       required: [query]
 ```
 
+## Importing an agent from git
+
+Instead of running a local file, you can import an agent straight from a git
+repository through the web UI (New Chat → **Create custom agent** → **Import
+from Git**). You supply the repository URL and, optionally, a branch, a
+subpath, and an agent name; the clone runs **on a selected host** using that
+host's ambient git credentials (the same model as git worktrees), so private
+repos work without uploading any tokens to the server.
+
+Repository layout:
+
+- The imported directory must contain a `config.yaml` at its root — either the
+  repository root, or the directory named by the **subpath** if you set one.
+  Sibling files the agent references (e.g. `AGENTS.md`, a `skills/` directory)
+  are bundled alongside it.
+- The `.git` directory is stripped before bundling — only the working tree is
+  imported, never history.
+- The bundle is size-capped (12 MiB) to keep the transfer host-friendly; point
+  the subpath at just the agent directory rather than importing a large
+  monorepo root.
+
+Naming: agent names must be unique, so by default a repo can only be imported
+once — its `config.yaml` `name:` becomes the agent's name. Set **Agent name**
+in the dialog to override that, which lets you import the *same* repo several
+times under distinct names, e.g. one agent per branch:
+
+| Agent name | Repository | Branch |
+| --- | --- | --- |
+| `myagent-main` | `https://github.com/org/myagent` | `main` |
+| `myagent-dev` | `https://github.com/org/myagent` | `dev` |
+
+The name is chosen once, at import. **Refresh never renames an agent**: it
+re-clones the tracked branch on the same host and advances to its latest commit
+(bumping the agent's version only when the content actually changed), ignoring
+the repo's `name:` — so renaming the agent in `config.yaml` upstream won't break
+refresh or fork a second agent.
+
 ## Validation tips
 
 - Keep examples free of secrets, workspace URLs, customer data, and private

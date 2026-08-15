@@ -28,4 +28,9 @@ def sql_agent_to_entity(row: SqlAgent, session_id: str | None = None) -> Agent:
         description=row.description,
         updated_at=row.updated_at,
         session_id=None if row.kind == AGENT_KIND["template"] else session_id,
+        git_url=row.git_url,
+        git_ref=row.git_ref,
+        git_subpath=row.git_subpath,
+        git_commit=row.git_commit,
+        git_host_id=row.git_host_id,
     )

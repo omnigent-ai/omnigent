@@ -311,6 +311,10 @@ async def test_session_snapshot_uses_child_spec_metadata(
                     "name": "advisor-row",
                     "bundle_location": "bundle",
                     "session_id": None,
+                    # Snapshot loads specs via expand_env=agent.expands_server_env
+                    # (operator template ⇒ True). The stand-in Agent must expose
+                    # the same property the real entity does.
+                    "expands_server_env": True,
                 },
             )()
 

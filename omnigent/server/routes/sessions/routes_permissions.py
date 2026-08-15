@@ -399,7 +399,7 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
     if cache is not None:
         try:
             loaded = cache.load(
-                agent.id, agent.bundle_location, expand_env=agent.session_id is None
+                agent.id, agent.bundle_location, expand_env=agent.expands_server_env
             )
             harness = loaded.spec.executor.harness_kind
             if description is None:
@@ -460,4 +460,9 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
         policies=policies,
         skills=skills,
         terminals=terminals,
+        git_url=agent.git_url,
+        git_ref=agent.git_ref,
+        git_subpath=agent.git_subpath,
+        git_commit=agent.git_commit,
+        git_host_id=agent.git_host_id,
     )
