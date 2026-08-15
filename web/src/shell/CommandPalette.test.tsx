@@ -3,6 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ComponentProps } from "react";
 
 import { CommandPalette } from "./CommandPalette";
+import {
+  TerminalFirstContextProvider,
+  type TerminalFirstContextValue,
+} from "./TerminalFirstContext";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({
@@ -27,13 +31,33 @@ function setSessions(sessions: ReturnType<typeof conv>[], isFetching = false) {
   useConversations.mockReturnValue({ data: { pages: [{ data: sessions }] }, isFetching });
 }
 
+function terminalFirstCtx(
+  overrides: Partial<TerminalFirstContextValue> = {},
+): TerminalFirstContextValue {
+  return {
+    isClaudeNative: false,
+    isNativeWrapper: false,
+    isTerminalFirst: true,
+    isShellView: false,
+    view: "chat",
+    terminalViewKey: null,
+    setView: vi.fn(),
+    terminalsAvailable: true,
+    terminalStartingUp: false,
+    ...overrides,
+  };
+}
+
 /** Find a session row by its full label text even when the highlighter has
     split it around a <mark> (so the text lives across several nodes). */
 function labelRow(text: string) {
   return screen.getByText((_content, el) => el?.tagName === "SPAN" && el.textContent === text);
 }
 
-function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>> = {}) {
+function renderPalette(
+  overrides: Partial<ComponentProps<typeof CommandPalette>> = {},
+  terminalCtx: TerminalFirstContextValue | null = null,
+) {
   const props = {
     open: true,
     onOpenChange: vi.fn(),
@@ -41,7 +65,15 @@ function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>>
     onToggleRightSidebar: vi.fn(),
     ...overrides,
   };
-  render(<CommandPalette {...props} />);
+  render(
+    terminalCtx ? (
+      <TerminalFirstContextProvider value={terminalCtx}>
+        <CommandPalette {...props} />
+      </TerminalFirstContextProvider>
+    ) : (
+      <CommandPalette {...props} />
+    ),
+  );
   return props;
 }
 
@@ -248,6 +280,38 @@ describe("CommandPalette — actions", () => {
 
     fireEvent.click(screen.getByText("Toggle workspace sidebar"));
     expect(onToggleRightSidebar).toHaveBeenCalledTimes(1);
+  });
+
+  it("lists and runs the view toggle only when the active terminal-first view can switch", () => {
+    const ctx = terminalFirstCtx();
+    const onOpenChange = vi.fn();
+    renderPalette({ onOpenChange }, ctx);
+
+    fireEvent.click(screen.getByText("Toggle chat / terminal view"));
+
+    expect(ctx.setView).toHaveBeenCalledWith("terminal");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it.each([
+    ["outside a terminal-first session", terminalFirstCtx({ isTerminalFirst: false })],
+    ["while a user shell owns the view", terminalFirstCtx({ isShellView: true })],
+    [
+      "while the terminal destination is unavailable",
+      terminalFirstCtx({ terminalsAvailable: false }),
+    ],
+  ])("hides the view toggle %s", (_scenario, ctx) => {
+    renderPalette({}, ctx);
+    expect(screen.queryByText("Toggle chat / terminal view")).toBeNull();
+  });
+
+  it("keeps the action available to leave Terminal if the PTY disappears", () => {
+    const ctx = terminalFirstCtx({ view: "terminal", terminalsAvailable: false });
+    renderPalette({}, ctx);
+
+    fireEvent.click(screen.getByText("Toggle chat / terminal view"));
+
+    expect(ctx.setView).toHaveBeenCalledWith("chat");
   });
 
   it("filters actions client-side against the query", () => {
