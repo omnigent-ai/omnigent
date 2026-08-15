@@ -1822,6 +1822,83 @@ async def test_upload_and_list_session_files(
 
 
 @pytest.mark.asyncio
+async def test_upload_computer_use_frame_is_hidden_and_idempotent(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """Native frame uploads return stable references without file-list clutter."""
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\rIHDR"
+        + (4).to_bytes(4, "big")
+        + (3).to_bytes(4, "big")
+    )
+    url = (
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/"
+        "resources/computer-use-frames?source_id=codex%3Aturn_1%3Acall_1%3A0"
+    )
+
+    first = await file_client.post(
+        url,
+        files={"file": ("frame.png", png, "image/png")},
+    )
+    second = await file_client.post(
+        url,
+        files={"file": ("frame.png", png, "image/png")},
+    )
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    assert second.json() == first.json()
+    attachment = first.json()
+    assert attachment["kind"] == "computer_frame"
+    assert attachment["width"] == 4
+    assert attachment["height"] == 3
+
+    listed = await file_client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files")
+    assert attachment["file_id"] not in {item["id"] for item in listed.json()["data"]}
+
+    content = await file_client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files/"
+        f"{attachment['file_id']}/content"
+    )
+    assert content.status_code == 200
+    assert content.content == png
+
+
+@pytest.mark.asyncio
+async def test_hidden_frame_is_directly_readable_only_by_owning_session(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+) -> None:
+    """Frame references resolve for readers without entering normal lists."""
+    from omnigent.entities import FILE_PURPOSE_COMPUTER_USE_FRAME
+
+    frame = file_store.create(
+        "computer-use-frame.png",
+        13,
+        content_type="image/png",
+        session_id="79b22ebd2309e48fdeb450c65611d51b",
+        purpose=FILE_PURPOSE_COMPUTER_USE_FRAME,
+    )
+    artifact_store.put(frame.id, b"preview-bytes")
+
+    listed = await file_client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files")
+    assert frame.id not in {item["id"] for item in listed.json()["data"]}
+
+    content = await file_client.get(
+        f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files/{frame.id}/content"
+    )
+    assert content.status_code == 200
+    assert content.content == b"preview-bytes"
+
+    cross_session = await file_client.get(
+        f"/v1/sessions/5d29bee4350489d66feafecfebd94a97/resources/files/{frame.id}/content"
+    )
+    assert cross_session.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_get_session_file_validates_ownership(
     file_client: httpx.AsyncClient,
 ) -> None:
@@ -2053,6 +2130,37 @@ async def test_copy_files_from_direct_parent(
     )
     assert content.status_code == 200
     assert content.content == b"parent bytes"
+
+
+@pytest.mark.asyncio
+async def test_copy_files_hides_generated_computer_frames(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+) -> None:
+    """The attachment-copy API cannot turn a hidden preview into an upload."""
+    from omnigent.entities import FILE_PURPOSE_COMPUTER_USE_FRAME
+
+    frame = file_store.create(
+        "computer-use-frame.png",
+        24,
+        content_type="image/png",
+        session_id="b460374fc8e697b296708f52dc9d8179",
+        purpose=FILE_PURPOSE_COMPUTER_USE_FRAME,
+    )
+    artifact_store.put(frame.id, b"preview bytes")
+
+    resp = await file_client.post(
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={
+            "source_session_id": "b460374fc8e697b296708f52dc9d8179",
+            "file_ids": [frame.id],
+        },
+    )
+
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "not_found"
+    assert file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf").data == []
 
 
 @pytest.mark.asyncio

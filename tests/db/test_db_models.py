@@ -201,6 +201,7 @@ class TestSqlFile:
             assert loaded.filename == "report.pdf"
             assert loaded.bytes == 12345
             assert loaded.content_type == "application/pdf"
+            assert loaded.purpose == "user_upload"
 
     def test_nullable_content_type(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)

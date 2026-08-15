@@ -3,7 +3,7 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   MemoryRouter,
   Route,
@@ -74,6 +74,7 @@ vi.mock("./Sidebar", () => ({
       data-peek={peek ? "true" : "false"}
     />
   ),
+  isMobileViewport: () => !window.matchMedia("(min-width: 768px)").matches,
 }));
 vi.mock("./FilesPanel", () => ({
   // Scope-only stand-in matching the real FilesPanel after the open-file tabs
@@ -227,6 +228,58 @@ import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
 import { useChatStore } from "@/store/chatStore";
+import type { AnyBlock } from "@/lib/blocks";
+
+function computerUseBlocks(callId: string, terminal = false): AnyBlock[] {
+  const ctx = {
+    agent: "codex-native-ui",
+    depth: 0,
+    turn: 0,
+    timestamp: 1,
+    responseId: "resp_1",
+    itemId: `fc_${callId}`,
+  };
+  const presentation = {
+    kind: "computer_use" as const,
+    provider: "codex" as const,
+    appName: "TextEdit",
+    actionLabel: `Inspect ${callId}`,
+  };
+  const blocks: AnyBlock[] = [
+    {
+      type: "tool_group",
+      ctx,
+      executions: [
+        {
+          name: "mcp__node_repl__js",
+          arguments: {},
+          argsSummary: "",
+          callId,
+          agentName: "codex-native-ui",
+          executedBy: "server",
+          output: null,
+          presentation,
+        },
+      ],
+      iteration: 0,
+    },
+  ];
+  if (terminal) {
+    blocks.push({
+      type: "tool_result",
+      ctx: { ...ctx, itemId: `fco_${callId}` },
+      name: "mcp__node_repl__js",
+      callId,
+      agentName: "codex-native-ui",
+      output: "done",
+      attachments: [],
+      presentation,
+      presentationFinal: true,
+      status: "completed",
+    });
+  }
+  return blocks;
+}
 
 /**
  * Test-only consumer of the TerminalFirstContext provided by AppShell.
@@ -517,6 +570,8 @@ beforeEach(() => {
   // Reset terminal-first startup signals so one test's terminalPending /
   // failed status can't leak into another's terminalStartingUp.
   useChatStore.setState({
+    conversationId: null,
+    blocks: [],
     todos: [],
     terminalPending: false,
     sessionStatus: "idle",
@@ -524,7 +579,10 @@ beforeEach(() => {
   });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe("AppShell header", () => {
   it("renders the sidebar toggle on all pages", () => {
@@ -2834,6 +2892,61 @@ describe("Right-rail tab switching — file viewer close", () => {
   });
 });
 
+describe("Computer Use workspace", () => {
+  it("auto-opens the first running action once without stealing focus again", () => {
+    vi.spyOn(window, "matchMedia").mockImplementation(
+      (query) =>
+        ({
+          matches: query === "(min-width: 768px)",
+          media: query,
+          onchange: null,
+          addListener: () => {},
+          removeListener: () => {},
+          addEventListener: () => {},
+          removeEventListener: () => {},
+          dispatchEvent: () => false,
+        }) as MediaQueryList,
+    );
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_computer", permission_level: null }]);
+    useChatStore.setState({ blocks: computerUseBlocks("call_1") });
+
+    renderShell("/c/conv_computer");
+
+    expect(screen.getByRole("tab", { name: "Computer running" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByRole("status", { name: /codex computer use running/i })).toBeVisible();
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /^Files$/i }));
+    expect(screen.getByRole("tab", { name: /^Files$/i })).toHaveAttribute("aria-selected", "true");
+
+    act(() => {
+      useChatStore.setState({
+        blocks: [...computerUseBlocks("call_1", true), ...computerUseBlocks("call_2")],
+      });
+    });
+    expect(screen.getByRole("tab", { name: /^Files$/i })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("auto-opens the Computer drawer on a mobile viewport", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_mobile_computer", permission_level: null }]);
+    useChatStore.setState({ blocks: computerUseBlocks("call_mobile") });
+
+    renderShell("/c/conv_mobile_computer");
+
+    expect(screen.getByTestId("computer-panel-drawer")).toHaveAttribute("data-state", "open");
+  });
+});
+
 describe("Mobile session menu", () => {
   // The right-rail tabs have no room on a phone, so they're reached via the
   // top-right session-menu FAB, which opens each tab's content as a full-
@@ -2847,6 +2960,28 @@ describe("Mobile session menu", () => {
     fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
     return trigger;
   }
+
+  it("opens the Computer drawer for completed activity", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_computer", permission_level: null }]);
+    useChatStore.setState({ blocks: computerUseBlocks("call_1", true) });
+
+    renderShell("/c/conv_computer");
+    expect(screen.getByTestId("computer-panel-drawer")).toHaveAttribute("data-state", "closed");
+
+    openSessionMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: /^Computer$/i }));
+
+    expect(screen.getByTestId("computer-panel-drawer")).toHaveAttribute("data-state", "open");
+    expect(
+      within(screen.getByTestId("computer-panel-drawer")).getByRole("status", {
+        name: /codex computer use completed/i,
+      }),
+    ).toBeVisible();
+  });
 
   it("lists the native session's menu entries (Terminals folds into the pill)", () => {
     useEnvironmentMock.mockReturnValue({

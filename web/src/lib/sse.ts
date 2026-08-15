@@ -68,6 +68,11 @@ import type {
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
 import { routingExtrasFromWire } from "./routingDecision";
+import {
+  computerFramesFromWire,
+  computerUsePresentationFromWire,
+  computerUseStatusFromWire,
+} from "./computerUse";
 import type { ErrorInfo, ModelUsage, RememberScope, Response } from "./types";
 
 /**
@@ -1079,6 +1084,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       agentName: String(rec.model ?? ""),
       itemId,
       responseId,
+      presentation: computerUsePresentationFromWire(rec.presentation),
     } satisfies ToolCall;
   }
 
@@ -1089,6 +1095,10 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       output: String(rec.output ?? ""),
       itemId,
       responseId,
+      attachments: computerFramesFromWire(rec.attachments),
+      presentation: computerUsePresentationFromWire(rec.presentation),
+      presentationFinal: rec.presentation_final === true,
+      status: computerUseStatusFromWire(rec.status),
     } satisfies ToolResult;
   }
 

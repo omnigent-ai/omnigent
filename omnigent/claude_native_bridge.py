@@ -409,6 +409,10 @@ class ClaudeTranscriptItem:
     :param data: Item payload shaped like ``SessionEventInput.data``.
     :param response_id: Synthetic response id used to group the
         Claude turn in AP/web UI rendering.
+    :param pending_frames: ``(media_type, base64_data)`` pairs for Computer Use
+        result images. The bridge cannot upload (it is a synchronous parser),
+        so the forwarder stores each as a bounded hidden artifact and replaces
+        these with ``attachments`` references before posting. Never persisted.
     :param is_compact_summary: ``True`` when this item was parsed from a
         Claude ``isCompactSummary: true`` user record — the continuation
         summary Claude writes immediately after it compacts its own
@@ -424,6 +428,7 @@ class ClaudeTranscriptItem:
     data: _JsonObject
     response_id: str
     is_compact_summary: bool = False
+    pending_frames: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -5814,15 +5819,19 @@ def _user_transcript_items_from_entry(
         response_id = current_response_id or _response_id_from_source(
             _parent_or_record_source_key(entry, line_number, record_offset)
         )
+        output_data: _JsonObject = {
+            "call_id": call_id,
+            "output": _tool_result_output(entry, block),
+        }
+        if block.get("is_error") is True:
+            output_data["status"] = "failed"
         items.append(
             ClaudeTranscriptItem(
                 source_id=_source_id(source_key, item_index, "function_call_output"),
                 item_type="function_call_output",
-                data={
-                    "call_id": call_id,
-                    "output": _tool_result_output(entry, block),
-                },
+                data=output_data,
                 response_id=response_id,
+                pending_frames=_claude_computer_use_frames(block),
             )
         )
         item_index += 1
@@ -5932,16 +5941,20 @@ def _assistant_transcript_items_from_entry(
             arguments = block.get("input")
             if not isinstance(arguments, dict):
                 arguments = {}
+            call_data: _JsonObject = {
+                "agent": agent_name,
+                "name": name,
+                "arguments": json.dumps(arguments, separators=(",", ":")),
+                "call_id": tool_id,
+            }
+            presentation = _claude_computer_use_presentation(name, arguments)
+            if presentation is not None:
+                call_data["presentation"] = presentation
             items.append(
                 ClaudeTranscriptItem(
                     source_id=_source_id(source_key, item_index, "function_call"),
                     item_type="function_call",
-                    data={
-                        "agent": agent_name,
-                        "name": name,
-                        "arguments": json.dumps(arguments, separators=(",", ":")),
-                        "call_id": tool_id,
-                    },
+                    data=call_data,
                     response_id=response_id,
                 )
             )
@@ -6039,6 +6052,137 @@ def _stripped_image_placeholder(source: _JsonObject) -> str:
         f"[{label} omitted from history to save context — "
         "re-run the tool call above (e.g. Read the same path) to view it again]"
     )
+
+
+# Claude Code exposes its built-in desktop Computer Use runtime as an MCP
+# server, so every call arrives as ``mcp__computer-use__<method>``. The browser
+# surfaces (``mcp__Claude_Browser__``, ``mcp__claude-in-chrome__``) drive a page
+# rather than the desktop and deliberately do not match this prefix.
+_CLAUDE_COMPUTER_USE_TOOL_PREFIX = "mcp__computer-use__"
+
+# Observable method to provider-neutral action kind. Read-only methods map to
+# ``inspect``; a method absent here is summarized as ``interact`` so a new
+# vendor method degrades to a generic chip instead of being dropped.
+_CLAUDE_COMPUTER_USE_ACTION_KIND = {
+    "screenshot": "inspect",
+    "zoom": "inspect",
+    "cursor_position": "inspect",
+    "read_clipboard": "inspect",
+    "list_granted_applications": "inspect",
+    "left_click": "click",
+    "right_click": "click",
+    "middle_click": "click",
+    "double_click": "click",
+    "triple_click": "click",
+    "scroll": "scroll",
+    "type": "type",
+    "write_clipboard": "type",
+    "key": "key",
+    "hold_key": "key",
+    "left_click_drag": "drag",
+    "left_mouse_down": "drag",
+    "left_mouse_up": "drag",
+    "mouse_move": "drag",
+}
+
+_CLAUDE_COMPUTER_USE_DISPLAY_TEXT_MAX_CHARS = 256
+
+
+def _bounded_computer_use_text(value: object) -> str | None:
+    """Bound one untrusted vendor display string, or drop it."""
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    return stripped[:_CLAUDE_COMPUTER_USE_DISPLAY_TEXT_MAX_CHARS]
+
+
+def _claude_computer_use_method(name: str) -> str | None:
+    """Return the Computer Use method for *name*, or ``None`` for other tools."""
+    if not name.startswith(_CLAUDE_COMPUTER_USE_TOOL_PREFIX):
+        return None
+    return name[len(_CLAUDE_COMPUTER_USE_TOOL_PREFIX) :] or None
+
+
+def _claude_computer_use_action_kinds(method: str, arguments: _JsonObject) -> list[str]:
+    """Summarize the observable actions in one Computer Use call.
+
+    ``computer_batch`` carries its real actions in ``actions[].action``, so the
+    batch is summarized by its members. Routine screenshots are suppressed when
+    the same call also performed an interactive action, matching how the Codex
+    adapter drops the state refresh that surrounds every real interaction.
+    """
+    methods: list[str] = []
+    if method == "computer_batch":
+        actions = arguments.get("actions")
+        if isinstance(actions, list):
+            for entry in actions[:50]:
+                if isinstance(entry, dict) and isinstance(entry.get("action"), str):
+                    methods.append(entry["action"])
+    else:
+        methods.append(method)
+    action_kinds: list[str] = []
+    for candidate in methods:
+        if candidate == "wait":
+            continue
+        action_kind = _CLAUDE_COMPUTER_USE_ACTION_KIND.get(candidate, "interact")
+        if action_kind not in action_kinds:
+            action_kinds.append(action_kind)
+    if len(action_kinds) > 1 and "inspect" in action_kinds:
+        action_kinds.remove("inspect")
+    return action_kinds[:8]
+
+
+def _claude_computer_use_presentation(name: str, arguments: _JsonObject) -> _JsonObject | None:
+    """Classify a Claude tool call as Computer Use, or return ``None``.
+
+    Identity is the built-in Computer Use MCP server name, which is observable
+    on the call itself, so a text-only or failed result still renders as a
+    Computer Use card. Only ``open_application`` and ``request_access`` name an
+    app, so the app label is set solely from those rather than inferred.
+    """
+    method = _claude_computer_use_method(name)
+    if method is None:
+        return None
+    presentation: _JsonObject = {"kind": "computer_use", "provider": "claude"}
+    app = arguments.get("app")
+    if app is None:
+        apps = arguments.get("apps")
+        if isinstance(apps, list) and apps:
+            app = apps[0]
+    app_name = _bounded_computer_use_text(app)
+    if app_name is not None:
+        presentation["app_name"] = app_name
+    action_kinds = _claude_computer_use_action_kinds(method, arguments)
+    if action_kinds:
+        presentation["action_kinds"] = action_kinds
+    return presentation
+
+
+def _claude_computer_use_frames(block: _JsonObject) -> tuple[tuple[str, str], ...]:
+    """Return ``(media_type, base64_data)`` for image blocks in a tool result.
+
+    Extracted before :func:`_strip_inline_image_data` replaces the payload with
+    a placeholder, so the frame survives as a bounded artifact while the stored
+    output text stays small.
+    """
+    content = block.get("content")
+    if not isinstance(content, list):
+        return ()
+    frames: list[tuple[str, str]] = []
+    for entry in content[:100]:
+        if not isinstance(entry, dict) or entry.get("type") != "image":
+            continue
+        source = entry.get("source")
+        if not isinstance(source, dict) or source.get("type") != "base64":
+            continue
+        media_type = source.get("media_type")
+        data = source.get("data")
+        if not isinstance(media_type, str) or not isinstance(data, str) or not data:
+            continue
+        frames.append((media_type, data))
+    return tuple(frames)
 
 
 def _strip_inline_image_data(value: object) -> object:

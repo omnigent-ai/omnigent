@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 from collections.abc import Callable
@@ -6026,6 +6027,390 @@ def test_forwarder_drops_codex_image_generation_missing_status(
 
     assert posted == []
     assert "Codex imageGeneration missing status" in caplog.text
+
+
+def test_forwarder_posts_generic_mcp_tool_call() -> None:
+    """A non-Computer Use MCP result remains a generic tool card."""
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "mcpToolCall",
+                "id": "mcp_1",
+                "server": "docs",
+                "tool": "search",
+                "status": "completed",
+                "arguments": {"query": "public protocol"},
+                "appContext": None,
+                "pluginId": None,
+                "result": {
+                    "content": [{"type": "text", "text": "one result"}],
+                    "structuredContent": None,
+                    "_meta": {},
+                },
+                "error": None,
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    call = posted[0]["data"]["item_data"]
+    assert call == {
+        "agent": "codex-native-ui",
+        "name": "mcp__docs__search",
+        "arguments": '{"query": "public protocol"}',
+        "call_id": "mcp_1",
+    }
+    assert posted[1]["data"]["item_data"] == {
+        "call_id": "mcp_1",
+        "output": "one result",
+        "presentation_final": True,
+        "status": "completed",
+    }
+
+
+def test_forwarder_classifies_recorded_codex_computer_use_fixture() -> None:
+    """Recorded result metadata authoritatively classifies text-only use."""
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures/codex/computer_use/text_only.json").read_text()
+    )
+    posted: list[dict[str, Any]] = []
+    asyncio.run(_replay_completed_item(fixture["item"], _capture_handler(posted)))
+
+    presentation = {
+        "kind": "computer_use",
+        "provider": "codex",
+        "action_label": "Inspect TextEdit window title",
+        "action_kinds": ["inspect"],
+        "app_id": "com.apple.TextEdit",
+        "app_name": "TextEdit",
+    }
+    assert posted[0]["data"]["item_data"]["presentation"] == presentation
+    output = posted[1]["data"]["item_data"]
+    assert output["presentation"] == presentation
+    assert output["presentation_final"] is True
+    assert output["status"] == "completed"
+    assert "<accessibility tree omitted>" in output["output"]
+
+
+def test_computer_use_app_label_is_readable_on_both_lifecycle_edges() -> None:
+    """Neither a bundle path nor a bundle id reaches the panel as the app label.
+
+    Sky arguments name the app by bundle path while the authoritative tool
+    surface reports only a bundle id, so a call classified from arguments and
+    then refined from its result would otherwise show a raw filesystem path and
+    then a raw identifier.
+    """
+    arguments = {
+        "code": (
+            'const sky = require("@oai/sky");\n'
+            'await sky.press_key({app: "/Applications/Calculator.app", key: "7"});'
+        )
+    }
+    start = codex_native_forwarder._presentation_from_mcp_start(
+        {"server": "node_repl", "tool": "js", "arguments": arguments}
+    )
+    assert start is not None
+    assert start["app_name"] == "Calculator"
+    assert not str(start.get("app_name", "")).startswith("/")
+
+    completed = codex_native_forwarder._presentation_from_mcp_result(
+        {
+            "arguments": arguments,
+            "result": {
+                "_meta": {
+                    "codex/toolSurface": {
+                        "kind": "computerUse",
+                        "app": {"appId": "com.apple.Calculator", "kind": "appId"},
+                    }
+                }
+            },
+        }
+    )
+    assert completed is not None
+    # The bundle id stays authoritative for identity; only the label is derived.
+    assert completed["app_id"] == "com.apple.Calculator"
+    assert completed["app_name"] == "Calculator"
+
+
+def test_forwarder_streams_mcp_start_progress_and_completion(tmp_path: Path) -> None:
+    """MCP lifecycle edges preserve one call card and optional progress."""
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures/codex/computer_use/image_result.json").read_text()
+    )
+    started = fixture["events"][0]
+    completed = fixture["events"][1]
+    completed["params"]["item"]["result"]["content"] = [
+        {"type": "text", "text": "Window: Untitled, App: TextEdit."}
+    ]
+    posted: list[dict[str, Any]] = []
+    state = codex_native_forwarder._CodexForwarderState()
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_capture_handler(posted)),
+        ) as client:
+            for event in (
+                started,
+                {
+                    "method": "item/mcpToolCall/progress",
+                    "params": {
+                        "threadId": "thread_fixture",
+                        "turnId": "turn_image",
+                        "itemId": "exec_image",
+                        "message": "Reading TextEdit",
+                    },
+                },
+                completed,
+            ):
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=event,
+                    forwarder_state=state,
+                    expected_thread_id="thread_fixture",
+                )
+
+    asyncio.run(run())
+
+    assert [payload["type"] for payload in posted] == [
+        "external_conversation_item",
+        "external_tool_output_delta",
+        "external_conversation_item",
+    ]
+    call = posted[0]["data"]["item_data"]
+    assert call["presentation"]["app_name"] == "TextEdit"
+    assert call["presentation"]["action_kinds"] == ["inspect"]
+    assert posted[1]["data"] == {"call_id": "exec_image", "delta": "Reading TextEdit"}
+    output = posted[2]["data"]["item_data"]
+    assert output["presentation"]["app_id"] == "com.apple.TextEdit"
+    assert output["presentation"]["action_kinds"] == ["inspect"]
+    assert output["presentation_final"] is True
+
+
+def test_forwarder_summarizes_interactive_sky_methods_without_inspection_noise() -> None:
+    """Public Sky call source becomes a bounded, ordered action summary."""
+    presentation = codex_native_forwarder._presentation_from_mcp_start(
+        {
+            "server": "node_repl",
+            "tool": "js",
+            "arguments": {
+                "title": "Interact with TextEdit",
+                "code": "\n".join(
+                    (
+                        'await sky.get_app_state({ app: "TextEdit" });',
+                        'await sky.click({ app: "TextEdit", element_index: 1 });',
+                        "await sky.perform_secondary_action({",
+                        '  app: "TextEdit", element_index: 1, action: "Show Menu"',
+                        "});",
+                        'await sky.scroll({ app: "TextEdit", direction: "down" });',
+                        'await sky.type_text({ app: "TextEdit", text: "hello" });',
+                        'await sky.set_value({ app: "TextEdit", element_index: 2, value: "x" });',
+                        'await sky.select_text({ app: "TextEdit", text: "hello" });',
+                        (
+                            'await sky.drag({ app: "TextEdit", from_x: 1, from_y: 1, '
+                            "to_x: 2, to_y: 2 });"
+                        ),
+                        'await sky.press_key({ app: "TextEdit", key: "Return" });',
+                        'await sky.get_app_state({ app: "TextEdit" });',
+                    )
+                ),
+            },
+        }
+    )
+
+    assert presentation is not None
+    assert presentation["action_kinds"] == [
+        "click",
+        "interact",
+        "scroll",
+        "type",
+        "select",
+        "drag",
+        "key",
+    ]
+
+
+def test_forwarder_uploads_computer_frame_without_base64_event_payload() -> None:
+    """MCP image bytes use the hidden frame endpoint, not conversation JSON."""
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\rIHDR"
+        + (4).to_bytes(4, "big")
+        + (3).to_bytes(4, "big")
+    )
+    encoded = base64.b64encode(png).decode("ascii")
+    posted: list[dict[str, Any]] = []
+    upload_bodies: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/computer-use-frames"):
+            upload_bodies.append(request.content)
+            assert request.url.params["source_id"] == "codex:codex_turn_123:mcp_image:0"
+            return httpx.Response(
+                201,
+                json={
+                    "kind": "computer_frame",
+                    "file_id": "file_frame",
+                    "content_type": "image/png",
+                    "width": 4,
+                    "height": 3,
+                },
+            )
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": False})
+
+    item = {
+        "type": "mcpToolCall",
+        "id": "mcp_image",
+        "server": "node_repl",
+        "tool": "js",
+        "status": "completed",
+        "arguments": {"title": "Inspect TextEdit"},
+        "result": {
+            "content": [
+                {"type": "text", "text": "captured"},
+                {"type": "image", "data": encoded, "mimeType": "image/png"},
+            ],
+            "_meta": {
+                "codex/toolSurface": {
+                    "kind": "computerUse",
+                    "app": {"kind": "appId", "appId": "com.apple.TextEdit"},
+                }
+            },
+        },
+        "error": None,
+    }
+    asyncio.run(_replay_completed_item(item, handler))
+
+    assert len(upload_bodies) == 1
+    serialized_events = json.dumps(posted)
+    assert encoded not in serialized_events
+    output = posted[1]["data"]["item_data"]
+    assert output["attachments"] == [
+        {
+            "kind": "computer_frame",
+            "file_id": "file_frame",
+            "content_type": "image/png",
+            "width": 4,
+            "height": 3,
+        }
+    ]
+
+
+def test_forwarder_normalizes_mislabeled_computer_frame_mime() -> None:
+    """Sky JPEG bytes survive a Codex image block mislabeled as PNG."""
+    jpeg = b"\xff\xd8\xff\xc0\x00\x11\x08\x00\x03\x00\x04" + b"\x00" * 10
+    encoded = base64.b64encode(jpeg).decode("ascii")
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/computer-use-frames"):
+            assert b'filename="computer-use-frame.jpg"' in request.content
+            assert b"Content-Type: image/jpeg" in request.content
+            assert jpeg in request.content
+            return httpx.Response(
+                201,
+                json={
+                    "kind": "computer_frame",
+                    "file_id": "file_frame_jpeg",
+                    "content_type": "image/jpeg",
+                    "width": 4,
+                    "height": 3,
+                },
+            )
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": False})
+
+    item = {
+        "type": "mcpToolCall",
+        "id": "mcp_mislabeled_image",
+        "server": "node_repl",
+        "tool": "js",
+        "status": "completed",
+        "arguments": {"title": "Inspect TextEdit"},
+        "result": {
+            "content": [
+                {"type": "text", "text": "captured"},
+                {"type": "image", "data": encoded, "mimeType": "image/png"},
+            ],
+            "_meta": {
+                "codex/toolSurface": {
+                    "kind": "computerUse",
+                    "app": {"kind": "appId", "appId": "com.apple.TextEdit"},
+                }
+            },
+        },
+        "error": None,
+    }
+    asyncio.run(_replay_completed_item(item, handler))
+
+    output = posted[1]["data"]["item_data"]
+    assert output["attachments"] == [
+        {
+            "kind": "computer_frame",
+            "file_id": "file_frame_jpeg",
+            "content_type": "image/jpeg",
+            "width": 4,
+            "height": 3,
+        }
+    ]
+
+
+def test_forwarder_settles_interrupted_mcp_call_without_item_completion(tmp_path: Path) -> None:
+    """An interrupted turn cannot leave a persisted MCP card running forever."""
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures/codex/computer_use/interrupted.json").read_text()
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_fixture",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_interrupted",
+        ),
+    )
+    posted: list[dict[str, Any]] = []
+    state = codex_native_forwarder._CodexForwarderState()
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_capture_handler(posted)),
+        ) as client:
+            for event in fixture["events"]:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=event,
+                    forwarder_state=state,
+                    expected_thread_id="thread_fixture",
+                )
+
+    asyncio.run(run())
+
+    outputs = [
+        payload["data"]["item_data"]
+        for payload in posted
+        if payload["type"] == "external_conversation_item"
+        and payload["data"]["item_type"] == "function_call_output"
+    ]
+    assert outputs == [
+        {
+            "call_id": "exec_interrupted",
+            "output": "Interrupted before the MCP tool returned a result.",
+            "status": "interrupted",
+        }
+    ]
 
 
 def test_forwarder_posts_codex_entered_review_mode_marker() -> None:

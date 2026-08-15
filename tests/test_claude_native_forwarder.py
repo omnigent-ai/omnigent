@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -5658,6 +5659,141 @@ def test_transcript_forward_state_persists_settled_response_id(tmp_path: Path) -
     legacy = forwarder._read_forward_state(bridge_dir)
     assert legacy is not None
     assert legacy.settled_response_id is None
+
+
+def test_outstanding_computer_use_calls_are_bounded() -> None:
+    """Malformed or result-less transcripts cannot grow dedupe forever."""
+    dedupe = forwarder._ForwardDedupeState()
+    for index in range(forwarder._MAX_COMPUTER_USE_CALL_IDS + 5):
+        forwarder._remember_computer_use_call(dedupe, f"call-{index}")
+
+    assert len(dedupe.computer_use_call_ids) == forwarder._MAX_COMPUTER_USE_CALL_IDS
+    assert "call-0" not in dedupe.computer_use_call_ids
+    assert f"call-{forwarder._MAX_COMPUTER_USE_CALL_IDS + 4}" in dedupe.computer_use_call_ids
+
+
+@pytest.mark.asyncio
+async def test_computer_use_frame_survives_forwarder_restart_between_call_and_result(
+    tmp_path: Path,
+) -> None:
+    """Persisted call classification lets a restarted forwarder upload the frame."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    call_entry = {
+        "type": "assistant",
+        "uuid": "call-entry",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "computer-call",
+                    "name": "mcp__computer-use__screenshot",
+                    "input": {},
+                }
+            ],
+        },
+    }
+    transcript_path.write_text(json.dumps(call_entry) + "\n", encoding="utf-8")
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    posted: list[dict[str, Any]] = []
+    frame_uploads: list[httpx.Request] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/computer-use-frames"):
+            frame_uploads.append(request)
+            return httpx.Response(
+                201,
+                json={
+                    "kind": "computer_frame",
+                    "file_id": "frame-1",
+                    "content_type": "image/png",
+                    "width": 4,
+                    "height": 3,
+                },
+            )
+        posted.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+        )
+        assert state.computer_use_call_ids == ("computer-call",)
+
+        png = b"\x89PNG\r\n\x1a\nfixture"
+        result_entry = {
+            "type": "user",
+            "uuid": "result-entry",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "computer-call",
+                        "content": [
+                            {"type": "text", "text": "Screenshot captured."},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": base64.b64encode(png).decode("ascii"),
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+        }
+        with transcript_path.open("a", encoding="utf-8") as transcript:
+            transcript.write(json.dumps(result_entry) + "\n")
+
+        # Simulate a new process: reload only durable state and use fresh
+        # in-memory dedupe state before the result is observed.
+        restarted_state = forwarder._read_forward_state(bridge_dir)
+        assert restarted_state is not None
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=restarted_state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=forwarder._ForwardDedupeState(),
+        )
+
+    outputs = [
+        payload["data"]["item_data"]
+        for payload in posted
+        if payload["data"]["item_type"] == "function_call_output"
+    ]
+    assert len(frame_uploads) == 1
+    assert outputs[0]["attachments"] == [
+        {
+            "kind": "computer_frame",
+            "file_id": "frame-1",
+            "content_type": "image/png",
+            "width": 4,
+            "height": 3,
+        }
+    ]
+    assert state.computer_use_call_ids == ()
+    persisted = forwarder._read_forward_state(bridge_dir)
+    assert persisted is not None
+    assert persisted.computer_use_call_ids == ()
 
 
 def test_promote_pending_settle_waits_for_turn_quiescence() -> None:

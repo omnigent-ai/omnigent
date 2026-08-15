@@ -61,6 +61,11 @@ import {
 } from "./conversationItems";
 import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
 import { routingExtrasFromWire } from "./routingDecision";
+import {
+  computerFramesFromWire,
+  computerUsePresentationFromWire,
+  computerUseStatusFromWire,
+} from "./computerUse";
 
 // Claude built-ins whose call is a question TO the user rather than work
 // the agent did on its own. The elicitation that carried the card is
@@ -344,6 +349,7 @@ function functionCallToBlock(item: FunctionCallItem): ToolGroup {
     agentName: item.model ?? "",
     executedBy: "server",
     output: null,
+    presentation: computerUsePresentationFromWire(item.presentation),
   };
   return {
     type: "tool_group",
@@ -362,6 +368,10 @@ function functionCallOutputToBlock(item: FunctionCallOutputItem): ToolResultBloc
     callId: item.call_id,
     agentName: ctx.agent ?? "",
     output: item.output,
+    attachments: computerFramesFromWire(item.attachments),
+    presentation: computerUsePresentationFromWire(item.presentation),
+    presentationFinal: item.presentation_final === true,
+    status: computerUseStatusFromWire(item.status),
   };
 }
 

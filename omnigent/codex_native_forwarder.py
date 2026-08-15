@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import json
 import logging
+import re
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -236,6 +239,49 @@ _CODEX_ERROR_KIND_AUTH = "auth"
 _CODEX_ERROR_KIND_GENERIC = "generic"
 _CODEX_REAUTH_HINT = "Codex needs you to re-authenticate. Run `codex login` and retry."
 
+_CODEX_MCP_TOOL_ITEM_TYPE = "mcpToolCall"
+_CODEX_MCP_PROGRESS_METHOD = "item/mcpToolCall/progress"
+_MCP_ARGUMENT_SCAN_CHARS = 65_536
+_MCP_OUTPUT_MAX_CHARS = 65_536
+_MCP_IMAGE_MAX_ENCODED_CHARS = 8 * 1024 * 1024
+_MCP_DISPLAY_TEXT_MAX_CHARS = 256
+_COMPUTER_USE_PLUGIN_IDS = frozenset(
+    {
+        "computer-use",
+        "computer-use@openai-bundled",
+        "openai-bundled/computer-use",
+    }
+)
+_SKY_METHODS = (
+    "get_app_state",
+    "list_apps",
+    "click",
+    "drag",
+    "perform_secondary_action",
+    "press_key",
+    "scroll",
+    "select_text",
+    "set_value",
+    "type_text",
+)
+_SKY_METHOD_PATTERN = re.compile(
+    rf"\b(?:sky|[A-Za-z_$][\w$]*Sky)\.({'|'.join(_SKY_METHODS)})\s*\("
+)
+_SKY_APP_PATTERN = re.compile(r"\bapp\s*:\s*(['\"])(.{1,256}?)\1")
+_BUNDLE_ID_PATTERN = re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+_SKY_METHOD_ACTION_KIND = {
+    "get_app_state": "inspect",
+    "list_apps": "inspect",
+    "click": "click",
+    "drag": "drag",
+    "perform_secondary_action": "interact",
+    "press_key": "key",
+    "scroll": "scroll",
+    "select_text": "select",
+    "set_value": "type",
+    "type_text": "type",
+}
+
 
 @dataclass
 class _ForwarderTarget:
@@ -277,6 +323,26 @@ class _CodexToolCall:
     name: str
     arguments: _JsonObject
     output: str
+    presentation: _JsonObject | None = None
+    presentation_final: bool = False
+    status: str | None = None
+    images: tuple[_McpImage, ...] = ()
+
+
+@dataclass(frozen=True)
+class _McpImage:
+    """One bounded MCP image block awaiting hidden artifact storage."""
+
+    data: str
+    content_type: str
+
+
+@dataclass(frozen=True)
+class _PendingMcpToolCall:
+    """A live MCP call that may need interruption settlement."""
+
+    call_id: str
+    response_id: str
 
 
 @dataclass
@@ -408,6 +474,9 @@ class _CodexForwarderState:
     synced_item_keys: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
     posted_tool_calls: set[str] = field(default_factory=set)
+    pending_mcp_calls_by_turn: dict[str, dict[str, _PendingMcpToolCall]] = field(
+        default_factory=dict
+    )
     partial_text_by_turn: dict[str, list[_PartialTextBuffer]] = field(default_factory=dict)
     _anon_item_counters: dict[tuple[str, str], int] = field(default_factory=dict)
     completed_plan_text_by_turn: dict[str, str] = field(default_factory=dict)
@@ -646,6 +715,34 @@ class _CodexForwarderState:
             return False
         self.posted_tool_calls.remove(call_id)
         return True
+
+    def note_pending_mcp_call(
+        self,
+        *,
+        turn_id: str,
+        call_id: str,
+        response_id: str,
+    ) -> None:
+        """Record a live MCP call until a terminal item or turn edge arrives."""
+        self.pending_mcp_calls_by_turn.setdefault(turn_id, {})[call_id] = _PendingMcpToolCall(
+            call_id=call_id,
+            response_id=response_id,
+        )
+
+    def complete_pending_mcp_call(self, *, turn_id: str | None, call_id: str) -> None:
+        """Remove a completed MCP call from interruption tracking."""
+        if turn_id is None:
+            return
+        pending = self.pending_mcp_calls_by_turn.get(turn_id)
+        if pending is None:
+            return
+        pending.pop(call_id, None)
+        if not pending:
+            self.pending_mcp_calls_by_turn.pop(turn_id, None)
+
+    def consume_pending_mcp_calls(self, turn_id: str) -> list[_PendingMcpToolCall]:
+        """Return and clear MCP calls left open at a terminal turn edge."""
+        return list(self.pending_mcp_calls_by_turn.pop(turn_id, {}).values())
 
     def record_partial_text_delta(
         self,
@@ -2571,10 +2668,20 @@ async def _handle_event(
             # ``item/completed`` guard below remains the backstop for the
             # resume-backfill path, which replays only ``item/completed``.
             await _ensure_user_message_posted(client, route_session_id, params, forwarder_state)
-        elif isinstance(item, dict) and item.get("type") == "commandExecution":
+        elif isinstance(item, dict) and item.get("type") in {
+            "commandExecution",
+            _CODEX_MCP_TOOL_ITEM_TYPE,
+        }:
             call_id = await _post_tool_call_item(client, route_session_id, params, item)
             if call_id is not None:
                 forwarder_state.note_tool_call_posted(call_id)
+                turn_id = _turn_id_from_payload(params)
+                if item.get("type") == _CODEX_MCP_TOOL_ITEM_TYPE and turn_id is not None:
+                    forwarder_state.note_pending_mcp_call(
+                        turn_id=turn_id,
+                        call_id=call_id,
+                        response_id=_response_id(params),
+                    )
         return
     if method == _CODEX_SERVER_REQUEST_RESOLVED_METHOD:
         # Resolve on the session the elicitation was published on (a child
@@ -3095,6 +3202,17 @@ async def _maybe_handle_delta_event(
     :raises RuntimeError: If a delta event arrives without a text
         coalescer.
     """
+    if method == _CODEX_MCP_PROGRESS_METHOD:
+        item_id = params.get("itemId")
+        message = params.get("message")
+        if isinstance(item_id, str) and item_id and isinstance(message, str) and message:
+            await _post_tool_output_delta(
+                client,
+                session_id,
+                _bounded_text(message, _MCP_OUTPUT_MAX_CHARS),
+                call_id=item_id,
+            )
+        return True
     if method == "item/agentMessage/delta":
         if delta_coalescer is None:
             raise RuntimeError("Codex assistant delta handling requires a text-delta coalescer")
@@ -3224,6 +3342,13 @@ async def _handle_terminal_turn_boundary(
         params=params,
         forwarder_state=forwarder_state,
     )
+    await _settle_pending_mcp_calls_at_turn_boundary(
+        client,
+        session_id=session_id,
+        method=method,
+        params=params,
+        forwarder_state=forwarder_state,
+    )
     await _flush_turn_diff(
         client,
         session_id=session_id,
@@ -3253,6 +3378,47 @@ async def _handle_terminal_turn_boundary(
         )
     if handled:
         await usage_coalescer.flush()
+
+
+async def _settle_pending_mcp_calls_at_turn_boundary(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    method: str,
+    params: _JsonObject,
+    forwarder_state: _CodexForwarderState | None,
+) -> None:
+    """Persist terminal outputs for MCP calls missing ``item/completed``."""
+    if forwarder_state is None:
+        return
+    turn_id = _terminal_turn_id_from_params(params)
+    if turn_id is None:
+        return
+    pending = forwarder_state.consume_pending_mcp_calls(turn_id)
+    if not pending:
+        return
+    interrupted = method == "turn/completed" and _turn_status_is_interrupted(
+        _turn_status_from_params(params)
+    )
+    status = "interrupted" if interrupted else "failed"
+    output = (
+        "Interrupted before the MCP tool returned a result."
+        if interrupted
+        else "The turn ended before the MCP tool returned a result."
+    )
+    for call in pending:
+        await _post_external_item(
+            client,
+            session_id,
+            item_type="function_call_output",
+            item_data={
+                "call_id": call.call_id,
+                "output": output,
+                "status": status,
+            },
+            response_id=call.response_id,
+        )
+        forwarder_state.take_posted_tool_call(call.call_id)
 
 
 def _handle_usage_update(
@@ -5399,19 +5565,122 @@ async def _post_tool_call_item(
             tool_call.name,
         )
         return None
+    item_data: _JsonObject = {
+        "agent": _AGENT_NAME,
+        "name": tool_call.name,
+        "arguments": arguments_text,
+        "call_id": tool_call.call_id,
+    }
+    if tool_call.presentation is not None:
+        item_data["presentation"] = tool_call.presentation
     await _post_external_item(
         client,
         session_id,
         item_type="function_call",
-        item_data={
-            "agent": _AGENT_NAME,
-            "name": tool_call.name,
-            "arguments": arguments_text,
-            "call_id": tool_call.call_id,
-        },
+        item_data=item_data,
         response_id=_response_id(params),
     )
     return tool_call.call_id
+
+
+async def _upload_mcp_images(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    response_id: str,
+    call_id: str,
+    images: tuple[_McpImage, ...],
+) -> list[_JsonObject]:
+    """Upload decoded MCP images without placing base64 in event payloads."""
+    attachments: list[_JsonObject] = []
+    extensions = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+    }
+    for index, image in enumerate(images):
+        try:
+            decoded = base64.b64decode(image.data, validate=True)
+        except (binascii.Error, ValueError):
+            _logger.warning(
+                "Codex MCP image block has invalid base64: call_id=%s index=%s",
+                call_id,
+                index,
+            )
+            continue
+        content_type = _detected_mcp_image_content_type(decoded)
+        if content_type is None:
+            _logger.warning(
+                "Codex MCP image block has unsupported image bytes: call_id=%s index=%s",
+                call_id,
+                index,
+            )
+            continue
+        if content_type != image.content_type:
+            _logger.warning(
+                "Codex MCP image MIME disagrees with image bytes; using detected type: "
+                "call_id=%s index=%s declared=%s detected=%s",
+                call_id,
+                index,
+                image.content_type,
+                content_type,
+            )
+        source_id = f"codex:{response_id}:{call_id}:{index}"
+        try:
+            response = await client.post(
+                f"/v1/sessions/{url_component(session_id)}/resources/computer-use-frames",
+                params={"source_id": source_id},
+                files={
+                    "file": (
+                        f"computer-use-frame{extensions[content_type]}",
+                        decoded,
+                        content_type,
+                    )
+                },
+            )
+        except httpx.HTTPError:
+            _logger.warning(
+                "Codex MCP frame upload failed: call_id=%s index=%s",
+                call_id,
+                index,
+                exc_info=True,
+            )
+            continue
+        if response.status_code >= 400:
+            _logger.warning(
+                "Codex MCP frame upload rejected: call_id=%s index=%s status=%s",
+                call_id,
+                index,
+                response.status_code,
+            )
+            continue
+        try:
+            payload = response.json()
+        except ValueError:
+            _logger.warning(
+                "Codex MCP frame upload returned invalid JSON: call_id=%s index=%s",
+                call_id,
+                index,
+            )
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("kind") == "computer_frame"
+            and isinstance(payload.get("file_id"), str)
+        ):
+            attachments.append(payload)
+    return attachments
+
+
+def _detected_mcp_image_content_type(data: bytes) -> str | None:
+    """Identify supported MCP image bytes independently of untrusted metadata."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 async def _post_tool_item(
@@ -5447,12 +5716,38 @@ async def _post_tool_item(
     if forwarder_state is None or not forwarder_state.take_posted_tool_call(tool_call.call_id):
         if await _post_tool_call_item(client, session_id, params, item) is None:
             return
+    turn_id = _turn_id_from_payload(params)
+    if forwarder_state is not None and item.get("type") == _CODEX_MCP_TOOL_ITEM_TYPE:
+        forwarder_state.complete_pending_mcp_call(
+            turn_id=turn_id,
+            call_id=tool_call.call_id,
+        )
+    response_id = _response_id(params)
+    attachments = await _upload_mcp_images(
+        client,
+        session_id=session_id,
+        response_id=response_id,
+        call_id=tool_call.call_id,
+        images=tool_call.images,
+    )
+    item_data: _JsonObject = {
+        "call_id": tool_call.call_id,
+        "output": tool_call.output,
+    }
+    if attachments:
+        item_data["attachments"] = attachments
+    if tool_call.presentation is not None:
+        item_data["presentation"] = tool_call.presentation
+    if tool_call.presentation_final:
+        item_data["presentation_final"] = True
+    if tool_call.status is not None:
+        item_data["status"] = tool_call.status
     await _post_external_item(
         client,
         session_id,
         item_type="function_call_output",
-        item_data={"call_id": tool_call.call_id, "output": tool_call.output},
-        response_id=_response_id(params),
+        item_data=item_data,
+        response_id=response_id,
     )
 
 
@@ -5751,16 +6046,304 @@ def _image_generation_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCa
     )
 
 
-# Codex built-in tool item types this forwarder mirrors into Omnigent history.
-# ``mcpToolCall`` is intentionally absent: its event shape has not been
-# verified, so it is logged-but-skipped rather than mirrored with guessed
-# fields. Add it here once its real shape is captured.
+def _bounded_text(value: str, limit: int) -> str:
+    """Return display text bounded without splitting the truncation marker."""
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 1)] + "…"
+
+
+def _bounded_display_text(value: object) -> str | None:
+    """Normalize untrusted optional MCP display text."""
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    return _bounded_text(stripped, _MCP_DISPLAY_TEXT_MAX_CHARS)
+
+
+def _mcp_arguments_scan(arguments: _JsonObject) -> str:
+    """Serialize only a bounded argument prefix for provisional classification."""
+    serialized = _json_string(arguments)
+    raw_strings = "\n".join(value for value in arguments.values() if isinstance(value, str))
+    combined = f"{serialized or ''}\n{raw_strings}"
+    return combined[:_MCP_ARGUMENT_SCAN_CHARS]
+
+
+def _sky_action_kinds(scan: str) -> list[str]:
+    """Summarize observable Sky methods without pretending to know timing.
+
+    ``get_app_state`` is present after most interactive actions because the
+    Computer Use skill refreshes state before deciding what to do next. It is
+    therefore shown as ``inspect`` only for read-only calls; otherwise the
+    genuinely interactive actions remain the useful summary.
+    """
+    action_kinds: list[str] = []
+    for match in _SKY_METHOD_PATTERN.finditer(scan):
+        action_kind = _SKY_METHOD_ACTION_KIND[match.group(1)]
+        if action_kind not in action_kinds:
+            action_kinds.append(action_kind)
+    if len(action_kinds) > 1 and "inspect" in action_kinds:
+        action_kinds.remove("inspect")
+    return action_kinds
+
+
+def _app_display_name(value: str | None) -> str | None:
+    """Derive a readable app label from how Sky actually names an app.
+
+    Sky call arguments identify an app by bundle path
+    (``/Applications/Google Chrome.app``) while the authoritative tool surface
+    reports a bundle id (``com.google.Chrome``). Showing either verbatim makes
+    the panel label a raw path or identifier, and a call that starts from
+    arguments and completes from the tool surface would visibly swap between
+    the two, so both collapse to the app's own name.
+    """
+    if value is None:
+        return None
+    candidate = value.strip().rstrip("/")
+    if not candidate:
+        return None
+    basename = candidate.rsplit("/", 1)[-1]
+    if basename.lower().endswith(".app"):
+        return _bounded_display_text(basename[: -len(".app")])
+    if "/" not in candidate and _BUNDLE_ID_PATTERN.fullmatch(candidate):
+        return _bounded_display_text(candidate.rsplit(".", 1)[-1])
+    return _bounded_display_text(candidate)
+
+
+def _presentation_from_mcp_start(item: _JsonObject) -> _JsonObject | None:
+    """Classify a live MCP call using explicit identity or a strict Sky rule."""
+    arguments = item.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = {}
+    plugin_id = item.get("pluginId")
+    app_context = item.get("appContext")
+    explicit_identity = (
+        isinstance(plugin_id, str) and plugin_id.lower() in _COMPUTER_USE_PLUGIN_IDS
+    ) or (
+        isinstance(app_context, dict)
+        and app_context.get("kind") in {"computerUse", "computer_use"}
+    )
+    scan = _mcp_arguments_scan(arguments)
+    sky_identity = (
+        item.get("server") == "node_repl"
+        and item.get("tool") == "js"
+        and ("@oai/sky" in scan or _SKY_METHOD_PATTERN.search(scan) is not None)
+    )
+    if not explicit_identity and not sky_identity:
+        return None
+    presentation: _JsonObject = {
+        "kind": "computer_use",
+        "provider": "codex",
+    }
+    action_label = _bounded_display_text(arguments.get("title"))
+    if action_label is not None:
+        presentation["action_label"] = action_label
+    action_kinds = _sky_action_kinds(scan)
+    if action_kinds:
+        presentation["action_kinds"] = action_kinds
+    app_context_app = app_context.get("app") if isinstance(app_context, dict) else None
+    app_id = (
+        _bounded_display_text(app_context_app.get("appId"))
+        if isinstance(app_context_app, dict)
+        else None
+    )
+    app_name = (
+        _bounded_display_text(app_context_app.get("name"))
+        if isinstance(app_context_app, dict)
+        else None
+    )
+    if app_id is None and app_name is None:
+        app_match = _SKY_APP_PATTERN.search(scan)
+        if app_match is not None:
+            candidate = _bounded_display_text(app_match.group(2))
+            if candidate is not None:
+                if _BUNDLE_ID_PATTERN.fullmatch(candidate):
+                    app_id = candidate
+                else:
+                    app_name = candidate
+    app_name = _app_display_name(app_name) or _app_display_name(app_id)
+    if app_id is not None:
+        presentation["app_id"] = app_id
+    if app_name is not None:
+        presentation["app_name"] = app_name
+    return presentation
+
+
+def _presentation_from_mcp_result(item: _JsonObject) -> _JsonObject | None:
+    """Read the authoritative Computer Use identity from MCP result metadata."""
+    result = item.get("result")
+    if not isinstance(result, dict):
+        return None
+    metadata = result.get("_meta")
+    tool_surface = metadata.get("codex/toolSurface") if isinstance(metadata, dict) else None
+    if not isinstance(tool_surface, dict) or tool_surface.get("kind") != "computerUse":
+        return None
+    presentation: _JsonObject = {
+        "kind": "computer_use",
+        "provider": "codex",
+    }
+    arguments = item.get("arguments")
+    if isinstance(arguments, dict):
+        action_label = _bounded_display_text(arguments.get("title"))
+        if action_label is not None:
+            presentation["action_label"] = action_label
+        action_kinds = _sky_action_kinds(_mcp_arguments_scan(arguments))
+        if action_kinds:
+            presentation["action_kinds"] = action_kinds
+    app = tool_surface.get("app")
+    if isinstance(app, dict):
+        app_id = _bounded_display_text(app.get("appId"))
+        # The tool surface reports identity only, so the readable label is
+        # derived from the bundle id rather than a name field it never sends.
+        app_name = _app_display_name(
+            _bounded_display_text(app.get("name") or app.get("displayName"))
+        ) or _app_display_name(app_id)
+        if app_id is not None:
+            presentation["app_id"] = app_id
+        if app_name is not None:
+            presentation["app_name"] = app_name
+    return presentation
+
+
+def _safe_mcp_json(value: object) -> object:
+    """Remove opaque binary fields before serializing unknown MCP content."""
+    if isinstance(value, list):
+        return [_safe_mcp_json(entry) for entry in value[:100]]
+    if isinstance(value, dict):
+        safe: dict[str, object] = {}
+        for key, entry in list(value.items())[:100]:
+            safe[str(key)] = (
+                "<binary omitted>" if key in {"data", "blob"} else _safe_mcp_json(entry)
+            )
+        return safe
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _mcp_result_output(item: _JsonObject, *, computer_use: bool) -> str:
+    """Serialize standard MCP result content without retaining binary payloads."""
+    result = item.get("result")
+    parts: list[str] = []
+    if isinstance(result, dict):
+        content = result.get("content")
+        if isinstance(content, list):
+            for block in content[:100]:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if block_type == "text" and isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+                elif block_type == "image":
+                    parts.append(
+                        "[Image result stored as a Computer Use frame.]"
+                        if computer_use
+                        else "[Image result omitted.]"
+                    )
+                elif block_type == "audio":
+                    parts.append("[Audio result omitted.]")
+                elif block_type == "resource":
+                    resource = block.get("resource")
+                    if isinstance(resource, dict) and isinstance(resource.get("text"), str):
+                        parts.append(resource["text"])
+                    elif isinstance(resource, dict):
+                        uri = _bounded_display_text(resource.get("uri"))
+                        parts.append(f"[Embedded resource: {uri or 'binary content omitted'}]")
+                elif block_type == "resource_link":
+                    label = _bounded_display_text(block.get("title") or block.get("name"))
+                    uri = _bounded_display_text(block.get("uri"))
+                    parts.append(
+                        f"[Resource link: {label or 'resource'}{f' — {uri}' if uri else ''}]"
+                    )
+                else:
+                    serialized = json.dumps(
+                        _safe_mcp_json(block),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    parts.append(serialized)
+        if not parts and result.get("structuredContent") is not None:
+            parts.append(
+                json.dumps(
+                    _safe_mcp_json(result["structuredContent"]),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+    error = item.get("error")
+    error_message = error.get("message") if isinstance(error, dict) else None
+    if isinstance(error_message, str) and error_message:
+        parts.append(f"Error: {error_message}")
+    status = item.get("status")
+    if status == "failed" and not parts:
+        parts.append("MCP tool call failed.")
+    return _bounded_text("\n".join(part for part in parts if part), _MCP_OUTPUT_MAX_CHARS)
+
+
+def _mcp_result_images(item: _JsonObject, *, computer_use: bool) -> tuple[_McpImage, ...]:
+    """Extract supported bounded image blocks from an authoritative result."""
+    if not computer_use:
+        return ()
+    result = item.get("result")
+    content = result.get("content") if isinstance(result, dict) else None
+    if not isinstance(content, list):
+        return ()
+    images: list[_McpImage] = []
+    for block in content[:16]:
+        if not isinstance(block, dict) or block.get("type") != "image":
+            continue
+        data = block.get("data")
+        content_type = block.get("mimeType")
+        if (
+            isinstance(data, str)
+            and len(data) <= _MCP_IMAGE_MAX_ENCODED_CHARS
+            and content_type in {"image/jpeg", "image/png", "image/webp"}
+        ):
+            images.append(_McpImage(data=data, content_type=content_type))
+    return tuple(images)
+
+
+def _mcp_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | None:
+    """Build a generic MCP call with optional Computer Use presentation."""
+    server = _bounded_display_text(item.get("server"))
+    tool = _bounded_display_text(item.get("tool"))
+    if server is None or tool is None:
+        _logger.warning("Codex mcpToolCall missing server/tool: call_id=%s", call_id)
+        return None
+    arguments = item.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = {}
+    status = item.get("status")
+    terminal = status in {"completed", "failed"}
+    presentation = (
+        _presentation_from_mcp_result(item) if terminal else _presentation_from_mcp_start(item)
+    )
+    computer_use = presentation is not None
+    normalized_status = status if status in {"completed", "failed"} else None
+    safe_server = re.sub(r"[^A-Za-z0-9_-]+", "_", server)
+    safe_tool = re.sub(r"[^A-Za-z0-9_-]+", "_", tool)
+    return _CodexToolCall(
+        call_id=call_id,
+        name=f"mcp__{safe_server}__{safe_tool}",
+        arguments=arguments,
+        output=_mcp_result_output(item, computer_use=computer_use) if terminal else "",
+        presentation=presentation,
+        presentation_final=terminal,
+        status=normalized_status,
+        images=_mcp_result_images(item, computer_use=computer_use),
+    )
+
+
+# Codex tool item types this forwarder mirrors into Omnigent history.
 _TOOL_ITEM_BUILDERS: dict[str, _ToolItemBuilder] = {
     "commandExecution": _command_execution_tool_call,
     "fileChange": _file_change_tool_call,
     "webSearch": _web_search_tool_call,
     "imageView": _image_view_tool_call,
     "imageGeneration": _image_generation_tool_call,
+    _CODEX_MCP_TOOL_ITEM_TYPE: _mcp_tool_call,
 }
 _TOOL_ITEM_TYPES = frozenset(_TOOL_ITEM_BUILDERS)
 

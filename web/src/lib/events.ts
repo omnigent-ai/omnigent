@@ -10,6 +10,11 @@
 
 import type { RoutingDecisionExtras } from "./routingDecision";
 import type { ErrorInfo, ModelUsage, RememberScope, Response, SandboxLaunchStage } from "./types";
+import type {
+  ComputerFrameAttachment,
+  ComputerUsePresentation,
+  ComputerUseTerminalStatus,
+} from "./computerUse";
 
 /** Provider-native tool item types. */
 export const NATIVE_TOOL_TYPES = new Set<string>([
@@ -131,6 +136,7 @@ export interface ToolCall {
   itemId: string;
   /** Server-assigned response id (`event.item.response_id`). */
   responseId: string;
+  presentation?: ComputerUsePresentation;
 }
 
 /** A tool result from `output_item.done` (type `function_call_output`). */
@@ -140,6 +146,10 @@ export interface ToolResult {
   output: string;
   itemId: string;
   responseId: string;
+  attachments?: ComputerFrameAttachment[];
+  presentation?: ComputerUsePresentation;
+  presentationFinal?: boolean;
+  status?: ComputerUseTerminalStatus;
 }
 
 /** `response.function_call_output.delta` — live output from a running tool. */

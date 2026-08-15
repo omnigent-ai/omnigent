@@ -13,6 +13,7 @@
 // translator can skip them without crashing.
 
 import type { MessageContentBlock } from "./blocks";
+import type { ComputerFrameAttachmentWire, ComputerUsePresentationWire } from "./computerUse";
 
 export interface BaseItem {
   id: string;
@@ -45,12 +46,16 @@ export interface FunctionCallItem extends BaseItem {
   arguments: string;
   call_id: string;
   model?: string;
+  presentation?: ComputerUsePresentationWire;
 }
 
 export interface FunctionCallOutputItem extends BaseItem {
   type: "function_call_output";
   call_id: string;
   output: string;
+  attachments?: ComputerFrameAttachmentWire[];
+  presentation?: ComputerUsePresentationWire;
+  presentation_final?: boolean;
 }
 
 /**

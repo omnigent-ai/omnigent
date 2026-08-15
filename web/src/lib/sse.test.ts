@@ -133,6 +133,60 @@ describe("parseEvent — response.output_text.delta", () => {
   });
 });
 
+describe("parseEvent — computer-use output items", () => {
+  it("preserves presentation, frame references, finality, and status", () => {
+    const ev = parseEvent("response.output_item.done", {
+      item: {
+        id: "fco_1",
+        type: "function_call_output",
+        response_id: "resp_1",
+        call_id: "call_1",
+        output: "captured",
+        presentation: {
+          kind: "computer_use",
+          provider: "codex",
+          app_name: "TextEdit",
+        },
+        attachments: [
+          {
+            kind: "computer_frame",
+            file_id: "file_frame",
+            content_type: "image/png",
+            width: 640,
+            height: 480,
+          },
+        ],
+        presentation_final: true,
+        status: "completed",
+      },
+    });
+
+    expect(ev).toEqual({
+      type: "tool_result",
+      callId: "call_1",
+      output: "captured",
+      itemId: "fco_1",
+      responseId: "resp_1",
+      attachments: [
+        {
+          kind: "computer_frame",
+          fileId: "file_frame",
+          contentType: "image/png",
+          width: 640,
+          height: 480,
+        },
+      ],
+      presentation: {
+        kind: "computer_use",
+        provider: "codex",
+        appName: "TextEdit",
+      },
+      presentationFinal: true,
+      status: "completed",
+    });
+  });
+});
+
 describe("parseEvent — session.superseded", () => {
   it("parses the carrier + redirect target", () => {
     const ev = parseEvent("session.superseded", {

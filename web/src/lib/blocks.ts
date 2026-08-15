@@ -10,6 +10,11 @@
 
 import type { RoutingDecisionExtras } from "./routingDecision";
 import type { RememberScope, Response } from "./types";
+import type {
+  ComputerFrameAttachment,
+  ComputerUsePresentation,
+  ComputerUseTerminalStatus,
+} from "./computerUse";
 
 /**
  * Metadata attached to every stream block.
@@ -71,6 +76,8 @@ export interface ToolExecution {
   executedBy: "server" | "client";
   /** Tool output text, or `null` if not yet available. */
   output: string | null;
+  /** Optional display-only computer-use metadata. */
+  presentation?: ComputerUsePresentation;
 }
 
 // ── Response lifecycle ───────────────────────────────────
@@ -147,6 +154,10 @@ export interface ToolResultBlock {
   callId: string;
   agentName: string;
   output: string;
+  attachments?: ComputerFrameAttachment[];
+  presentation?: ComputerUsePresentation;
+  presentationFinal?: boolean;
+  status?: ComputerUseTerminalStatus;
 }
 
 /** A provider-native tool output (web_search, mcp, etc.). */

@@ -14,6 +14,13 @@ export interface SessionImageProps {
   path?: string;
   alt: string;
   className?: string;
+  /**
+   * Load as soon as the element exists instead of waiting for it to be
+   * scrolled to. Set it where the image is the surface's primary content, so
+   * it can't sit unresolved behind a lazy heuristic that never fires because
+   * the element has no reserved box until its bytes arrive.
+   */
+  eager?: boolean;
 }
 
 /**
@@ -46,25 +53,63 @@ const PREVIEW_PLACEHOLDER_BOX = "flex h-64 w-40 shrink-0 items-center justify-ce
  * bytes through the host fetcher — which handles both — and render an object
  * URL, with explicit loading and error states.
  */
-export function SessionImage({ path, alt, className }: SessionImageProps) {
+export function SessionImage({ path, alt, className, eager }: SessionImageProps) {
   // Host config is installed once at embed startup and never changes, so it's
   // safe to branch on it before any hooks. Hooks live in the embedded child.
   if (!getOmnigentHostConfig().fetcher) {
-    return (
-      <div className={PREVIEW_BOX}>
-        <ZoomableImage
-          src={path}
-          alt={alt}
-          className={cn(PREVIEW_IMAGE, className)}
-          // Offscreen history images cost nothing until scrolled to, and
-          // decoding off the main thread keeps the swap from blocking paint.
-          loading="lazy"
-          decoding="async"
-        />
-      </div>
-    );
+    return <StandaloneSessionImage path={path} alt={alt} className={className} eager={eager} />;
   }
   return <EmbeddedSessionImage path={path} alt={alt} className={className} />;
+}
+
+function ImageErrorFallback({ alt, className }: { alt: string; className?: string }) {
+  return (
+    <div
+      role="img"
+      aria-label={alt}
+      className={cn(
+        "flex h-64 min-w-0 items-center justify-center gap-1.5 rounded-md border border-border bg-muted px-3 text-sm text-muted-foreground",
+        className,
+      )}
+    >
+      <ImageIcon className="size-4 shrink-0" />
+      <span className="truncate">{alt}</span>
+    </div>
+  );
+}
+
+function StandaloneSessionImage({ path, alt, className, eager }: SessionImageProps) {
+  const [state, setState] = useState<LoadState>(path === undefined ? "error" : "loading");
+
+  useEffect(() => setState(path === undefined ? "error" : "loading"), [path]);
+  if (state === "error") return <ImageErrorFallback alt={alt} className={className} />;
+
+  return (
+    <div className={cn(PREVIEW_BOX, "relative")}>
+      <ZoomableImage
+        src={path}
+        alt={alt}
+        className={cn(PREVIEW_IMAGE, className)}
+        // Offscreen history images cost nothing until scrolled to, and
+        // decoding off the main thread keeps the swap from blocking paint. A
+        // caller that owns the whole surface opts out, since nothing there will
+        // scroll the image into view to release it.
+        loading={eager ? "eager" : "lazy"}
+        decoding="async"
+        onLoad={() => setState("loaded")}
+        onError={() => setState("error")}
+      />
+      {state === "loading" && (
+        <div
+          role="status"
+          aria-label="Loading image"
+          className="pointer-events-none absolute inset-0 flex items-center justify-center bg-muted/40 text-muted-foreground"
+        >
+          <Spinner />
+        </div>
+      )}
+    </div>
+  );
 }
 
 type LoadState = "loading" | "loaded" | "error";
@@ -163,19 +208,7 @@ function EmbeddedSessionImage({ path, alt, className }: SessionImageProps) {
   }, [path]);
 
   if (state === "error") {
-    return (
-      <div
-        role="img"
-        aria-label={alt}
-        className={cn(
-          "flex items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1.5 text-sm text-muted-foreground",
-          className,
-        )}
-      >
-        <ImageIcon className="size-3.5 shrink-0" />
-        <span className="truncate">{alt}</span>
-      </div>
-    );
+    return <ImageErrorFallback alt={alt} className={className} />;
   }
 
   if (state === "loading" || !blobUrl) {

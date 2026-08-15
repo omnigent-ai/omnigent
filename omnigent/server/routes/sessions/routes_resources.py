@@ -23,7 +23,12 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
+from omnigent.computer_use_frames import (
+    configured_computer_use_frame_limits,
+    store_computer_use_frame,
+)
 from omnigent.entities import (
+    FILE_PURPOSE_USER_UPLOAD,
     Conversation,
     StoredFile,
 )
@@ -1304,6 +1309,49 @@ def register_resources_routes(
         )
         return resource
 
+    @router.post(
+        "/sessions/{session_id}/resources/computer-use-frames",
+        status_code=201,
+        response_model=None,
+        include_in_schema=False,
+        dependencies=[Depends(require_trusted_origin)],
+    )
+    async def upload_computer_use_frame(
+        request: Request,
+        session_id: str,
+        file: Annotated[UploadFile, File(...)],
+        source_id: str = Query(min_length=1, max_length=512),
+    ) -> dict[str, Any]:
+        """Store one hidden, bounded frame emitted by a native harness."""
+        await _validate_session(session_id, request, LEVEL_EDIT)
+        if file_store is None or artifact_store is None:
+            raise HTTPException(
+                status_code=501,
+                detail="file store not configured",
+            )
+        content_type = (file.content_type or "").split(";", 1)[0].strip().lower()
+        if content_type not in {"image/jpeg", "image/png", "image/webp"}:
+            raise HTTPException(
+                status_code=415,
+                detail="Computer Use frames must be PNG, JPEG, or WebP images.",
+            )
+        limits = configured_computer_use_frame_limits()
+        content = await _read_upload_capped(file, limits.max_frame_bytes)
+        try:
+            attachment = await asyncio.to_thread(
+                store_computer_use_frame,
+                file_store=file_store,
+                artifact_store=artifact_store,
+                session_id=session_id,
+                data=content,
+                content_type=content_type,
+                limits=limits,
+                dedup_key=source_id,
+            )
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        return attachment.model_dump(exclude_none=True)
+
     @router.get(
         "/sessions/{session_id}/resources/files/{file_id}",
         response_model=None,
@@ -1523,7 +1571,11 @@ def register_resources_routes(
         total_bytes = 0
         for file_id in body.file_ids:
             stored = file_store.get(file_id, session_id=body.source_session_id)
-            if stored is None or not artifact_store.exists(stored.id):
+            if (
+                stored is None
+                or stored.purpose != FILE_PURPOSE_USER_UPLOAD
+                or not artifact_store.exists(stored.id)
+            ):
                 raise OmnigentError(
                     f"File '{file_id}' not found in source session",
                     code=ErrorCode.NOT_FOUND,

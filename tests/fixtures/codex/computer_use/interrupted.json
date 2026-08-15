@@ -1,0 +1,64 @@
+{
+  "source": "live subscription plus thread/read",
+  "events": [
+    {
+      "method": "item/started",
+      "params": {
+        "item": {
+          "type": "mcpToolCall",
+          "id": "exec_interrupted",
+          "server": "node_repl",
+          "tool": "js",
+          "status": "inProgress",
+          "arguments": {
+            "code": "globalThis.interruptionFixtureSky = (await import(\"@oai/sky\")).sky;\nawait globalThis.interruptionFixtureSky.get_app_state({ app: \"TextEdit\" });\nawait new Promise(resolve => setTimeout(resolve, 90000));\nnodeRepl.write(\"Wait completed.\");",
+            "timeout_ms": 120000,
+            "title": "Run interruption fixture"
+          },
+          "appContext": null,
+          "pluginId": null,
+          "result": null,
+          "error": null,
+          "durationMs": null
+        },
+        "threadId": "thread_fixture",
+        "turnId": "turn_interrupted",
+        "startedAtMs": 1700000002000
+      }
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "thread_fixture",
+        "turn": {
+          "id": "turn_interrupted",
+          "items": [],
+          "status": "interrupted",
+          "error": null,
+          "startedAt": 1700000002,
+          "completedAt": 1700000032,
+          "durationMs": 30233,
+          "itemsView": "notLoaded"
+        }
+      }
+    }
+  ],
+  "itemCompletedObserved": false,
+  "threadReadItemAfterInterruption": {
+    "type": "mcpToolCall",
+    "id": "exec_interrupted",
+    "server": "node_repl",
+    "tool": "js",
+    "status": "inProgress",
+    "arguments": {
+      "code": "globalThis.interruptionFixtureSky = (await import(\"@oai/sky\")).sky;\nawait globalThis.interruptionFixtureSky.get_app_state({ app: \"TextEdit\" });\nawait new Promise(resolve => setTimeout(resolve, 90000));\nnodeRepl.write(\"Wait completed.\");",
+      "timeout_ms": 120000,
+      "title": "Run interruption fixture"
+    },
+    "appContext": null,
+    "pluginId": null,
+    "result": null,
+    "error": null,
+    "durationMs": null
+  }
+}

@@ -9,6 +9,7 @@ import {
   Loader2Icon,
   MaximizeIcon,
   MinimizeIcon,
+  MonitorIcon,
   PlusIcon,
   SquareTerminalIcon,
   TerminalIcon,
@@ -31,6 +32,8 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { TerminalView } from "@/components/blocks/TerminalView";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
+import { ComputerUsePanel } from "@/components/ComputerUsePanel/ComputerUsePanel";
+import type { ComputerUseViewModel } from "@/lib/computerUse";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
@@ -525,6 +528,8 @@ interface WorkspacePanelProps {
   /** Whether the Browser tab is available — Electron shell only (hidden in a
    *  plain web build, which has no embedded WebContentsView). */
   showBrowserTab: boolean;
+  /** Latest classified computer-use activity; null hides the Computer tab. */
+  computerUse: ComputerUseViewModel | null;
   /** Count of changed files, shown as the Changes tab badge. */
   changedCount: number;
   /**
@@ -602,7 +607,7 @@ interface WorkspacePanelProps {
  * WorkspacePanel — the desktop right "Workspace" rail, rendered as a
  * floating card (bg-card, rounded, bordered, shadowed) sitting below the
  * full-width chat header band. Internally tabbed between Files, Changes,
- * Terminals, Agents and Tasks so each can claim the full rail height
+ * Terminals, Agents, Tasks, Computer and Browser so each can claim the full rail height
  * instead of competing for a vertically-split slot.
  *
  * Desktop-only (``hidden md:flex``): on mobile the rail's contents are
@@ -622,6 +627,7 @@ export function WorkspacePanel({
   onRightRailTabChange,
   showFilesPanel,
   showBrowserTab,
+  computerUse,
   changedCount,
   showShellsTab,
   terminalsLength,
@@ -701,7 +707,7 @@ export function WorkspacePanel({
           className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
         />
       )}
-      {/* Tab strip, in display order Files · Changes · Agents · Shells · Tasks.
+      {/* Tab strip, in display order Files · Changes · Agents · Shells · Tasks · Computer · Browser.
           Files (full folder tree) and Changes (changed-files-only list) are
           two peer tabs — same gate (an on-disk workspace), same FilesPanel,
           each pinned to one scope. Agents is always present (the Agents panel
@@ -807,6 +813,20 @@ export function WorkspacePanel({
                   <span className="sr-only">
                     {todosCompleted}/{todosTotal}
                   </span>
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
+            )}
+            {computerUse && (
+              <WorkspaceTabTooltip label="Computer">
+                <TabsTrigger
+                  value="computer"
+                  aria-label={computerUse.status === "running" ? "Computer running" : "Computer"}
+                  className="size-8 shrink-0 rounded-md p-0 hover:bg-muted"
+                >
+                  <MonitorIcon
+                    className={cn("size-4", computerUse.status === "running" && "animate-pulse")}
+                  />
+                  <span className="sr-only">Computer</span>
                 </TabsTrigger>
               </WorkspaceTabTooltip>
             )}
@@ -924,6 +944,8 @@ export function WorkspacePanel({
             onCommentsOpenChange={onCommentsOpenChange}
             sort={filesPanelSort}
           />
+        ) : rightRailTab === "computer" && computerUse ? (
+          <ComputerUsePanel conversationId={conversationId} viewModel={computerUse} />
         ) : rightRailTab === "browser" && showBrowserTab ? (
           // Embedded browser (Electron only) — BrowserPane self-gates and
           // measures this rail slot to position the native view over it.

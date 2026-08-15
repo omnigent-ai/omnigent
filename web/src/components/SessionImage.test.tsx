@@ -9,7 +9,7 @@
 // and what authenticatedFetch resolves to; URL.createObjectURL/revokeObjectURL are
 // stubbed because jsdom lacks them.
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const getOmnigentHostConfig = vi.fn();
@@ -70,6 +70,18 @@ describe("SessionImage (standalone, no host fetcher)", () => {
     expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 
+  it("defers offscreen previews but loads an eager one immediately", () => {
+    // WHY: a lazy <img> that has no reserved box until its bytes arrive can sit
+    // unresolved forever on a surface whose layout never trips the trigger, so
+    // an image that IS the surface's content has to opt out of the deferral.
+    render(<SessionImage path="/v1/sessions/a/files/x/content" alt="history" />);
+    expect(screen.getByRole("img", { name: "history" })).toHaveAttribute("loading", "lazy");
+
+    cleanup();
+    render(<SessionImage path="/v1/sessions/a/files/x/content" alt="frame" eager />);
+    expect(screen.getByRole("img", { name: "frame" })).toHaveAttribute("loading", "eager");
+  });
+
   it("reserves the preview box height before the image loads", () => {
     // WHY: the chat scroller runs with overflow-anchor:none, so an image that
     // sized itself only on decode would push the transcript down under the
@@ -77,6 +89,15 @@ describe("SessionImage (standalone, no host fetcher)", () => {
     render(<SessionImage path="/v1/sessions/a/files/x/content" alt="diagram" />);
     const box = screen.getByRole("img", { name: "diagram" }).closest("div");
     expect(box).toHaveClass("h-64");
+  });
+
+  it("replaces an expired or missing image with a bounded fallback", () => {
+    render(<SessionImage path="/expired" alt="expired frame" />);
+    fireEvent.error(screen.getByRole("img", { name: "expired frame" }));
+
+    const fallback = screen.getByRole("img", { name: "expired frame" });
+    expect(fallback).not.toHaveAttribute("src");
+    expect(fallback).toHaveClass("h-64");
   });
 });
 

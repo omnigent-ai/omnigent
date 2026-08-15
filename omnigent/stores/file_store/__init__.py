@@ -5,7 +5,7 @@ from __future__ import annotations
 import builtins
 from abc import ABC, abstractmethod
 
-from omnigent.entities import PagedList, StoredFile
+from omnigent.entities import FILE_PURPOSE_USER_UPLOAD, PagedList, StoredFile
 
 
 class FileStore(ABC):
@@ -39,6 +39,7 @@ class FileStore(ABC):
         bytes: int,
         content_type: str | None = None,
         session_id: str | None = None,
+        purpose: str = FILE_PURPOSE_USER_UPLOAD,
     ) -> StoredFile:
         """
         Record a new file. Generates a unique file_id.
@@ -50,6 +51,7 @@ class FileStore(ABC):
             e.g. ``"application/pdf"``.
         :param session_id: Owning session/conversation id. When
             set, the file is session-scoped; ``None`` for global.
+        :param purpose: Visibility/use class. Defaults to a normal user upload.
         :returns: The newly created :class:`StoredFile`.
         """
         ...
@@ -84,6 +86,7 @@ class FileStore(ABC):
         before: str | None = None,
         order: str = "desc",
         include_unscoped: bool = False,
+        purpose: str = FILE_PURPOSE_USER_UPLOAD,
     ) -> PagedList[StoredFile]:
         """
         List a session's files with cursor-based pagination.
@@ -98,6 +101,8 @@ class FileStore(ABC):
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param include_unscoped: When ``True``, also return files
             with ``session_id IS NULL`` (global/unscoped files).
+        :param purpose: File purpose to list. Normal callers use the default,
+            which hides generated preview frames.
         :returns: A :class:`PagedList` of :class:`StoredFile`.
         """
         ...

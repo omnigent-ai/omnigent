@@ -7,6 +7,7 @@ import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
+import type { ComputerUseViewModel } from "@/lib/computerUse";
 import { WorkspacePanel } from "./WorkspacePanel";
 
 // The rail's content children are exercised by their own suites; stub them so
@@ -37,6 +38,11 @@ vi.mock("./TodoPanel", () => ({
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
   BrowserPane: ({ conversationId }: { conversationId: string }) => (
     <div data-testid="browser-pane-stub">{conversationId}</div>
+  ),
+}));
+vi.mock("@/components/ComputerUsePanel/ComputerUsePanel", () => ({
+  ComputerUsePanel: ({ viewModel }: { viewModel: ComputerUseViewModel }) => (
+    <div data-testid="computer-use-panel-stub">{viewModel.status}</div>
   ),
 }));
 // The rail terminal view mounts a real xterm/WebSocket; stub it to a marker
@@ -87,6 +93,7 @@ function renderWorkspace(
     openFiles?: string[];
     changedCount?: number;
     showBrowserTab?: boolean;
+    computerUse?: ComputerUseViewModel | null;
     showShellsTab?: boolean;
     openTerminals?: string[];
     selectedTerminalKey?: string | null;
@@ -111,6 +118,7 @@ function renderWorkspace(
         showFilesPanel
         showBrowserTab={overrides.showBrowserTab ?? false}
         changedCount={overrides.changedCount ?? 0}
+        computerUse={overrides.computerUse ?? null}
         showShellsTab={overrides.showShellsTab ?? false}
         terminalsLength={0}
         subagentsWorking={0}
@@ -667,5 +675,34 @@ describe("WorkspacePanel browser tab", () => {
     expect(screen.getByTestId("browser-pane-stub")).toBeInTheDocument();
     // And the file scope views are not mounted in that branch.
     expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+  });
+});
+
+describe("WorkspacePanel computer tab", () => {
+  const computerUse: ComputerUseViewModel = {
+    callId: "call_1",
+    presentation: {
+      kind: "computer_use",
+      provider: "codex",
+      appName: "TextEdit",
+      actionLabel: "Inspect document",
+    },
+    status: "running",
+    frame: null,
+    error: null,
+  };
+
+  it("appears only after classified activity and mounts the shared panel", () => {
+    renderWorkspace({ computerUse });
+    expect(screen.getByRole("tab", { name: "Computer running" })).toBeInTheDocument();
+    cleanup();
+
+    renderWorkspace({ rightRailTab: "computer", computerUse });
+    expect(screen.getByTestId("computer-use-panel-stub")).toHaveTextContent("running");
+  });
+
+  it("is omitted when no classified computer activity remains", () => {
+    renderWorkspace({ computerUse: null });
+    expect(screen.queryByRole("tab", { name: /computer/i })).toBeNull();
   });
 });

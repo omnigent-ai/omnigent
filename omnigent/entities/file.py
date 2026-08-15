@@ -2,6 +2,15 @@
 
 from dataclasses import dataclass
 
+FILE_PURPOSE_USER_UPLOAD = "user_upload"
+FILE_PURPOSE_COMPUTER_USE_FRAME = "computer_use_frame"
+FILE_PURPOSES = frozenset(
+    {
+        FILE_PURPOSE_USER_UPLOAD,
+        FILE_PURPOSE_COMPUTER_USE_FRAME,
+    }
+)
+
 
 @dataclass
 class StoredFile:
@@ -17,6 +26,9 @@ class StoredFile:
         is session-scoped, e.g. ``"conv_abc123"``. ``None`` for
         historical unscoped records created before session-scoped
         file resources were introduced.
+    :param purpose: Artifact visibility/use class. ``"user_upload"`` files
+        appear in normal file lists. ``"computer_use_frame"`` files are
+        generated previews hidden from those lists.
     """
 
     id: str
@@ -25,3 +37,4 @@ class StoredFile:
     bytes: int
     content_type: str | None = None
     session_id: str | None = None
+    purpose: str = FILE_PURPOSE_USER_UPLOAD
