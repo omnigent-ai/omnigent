@@ -110,6 +110,9 @@ describe("useViewModeToggleHotkey", () => {
     xterm.append(textarea);
     document.body.append(xterm);
     textarea.focus();
+    // xterm may stop bubbling after handling a key. The app-level escape
+    // chord must be captured before the PTY surface can consume it.
+    textarea.addEventListener("keydown", (event) => event.stopPropagation());
 
     press(textarea);
 
