@@ -47,6 +47,7 @@ import contextlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -828,6 +829,16 @@ async def _measure_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> N
     omnigent_bin = os.environ.get("OMNIGENT_BIN") or shutil.which("omnigent")
     if omnigent_bin is None:
         raise RuntimeError("omnigent binary not found. Set OMNIGENT_BIN or add omnigent to PATH.")
+
+    # Stop any stale daemons from a previous iteration — a leftover host daemon
+    # registered to the bench server causes the next `omnigent polly` to fail
+    # with "runner tunnel rejection (HTTP 401)" or "host is on another replica".
+    subprocess.run(
+        [omnigent_bin, "stop"],
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
 
     child = pexpect.spawn(
         omnigent_bin,
