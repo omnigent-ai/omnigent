@@ -6328,7 +6328,7 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
 _HARNESS_CHOICES_HELP = (
     "'claude' (alias for 'claude-sdk'), 'claude-sdk', 'codex', "
     "'cursor', 'kimi', "
-    "'openai-agents', 'open-responses', 'pi', 'antigravity', 'qwen', 'goose', or 'copilot'"
+    "'openai-agents', 'open-responses', 'pi', 'antigravity', 'qwen', 'goose', 'rovo', or 'copilot'"
 )
 _HARNESS_HELP = f"Harness to use for a local agent: {_HARNESS_CHOICES_HELP}."
 _RUN_HARNESS_HELP = (

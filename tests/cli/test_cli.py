@@ -969,6 +969,14 @@ def test_help_groups_harnesses_and_other_commands() -> None:
     assert commands_at < result.output.index("server")
 
 
+def test_run_help_lists_rovo_harness() -> None:
+    """The standalone Rovo CLI is discoverable through the built-in launcher."""
+    result = CliRunner().invoke(cli, ["run", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "'rovo'" in result.output
+
+
 def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
     """The ``update`` alias is omitted from --help but stays registered."""
     result = CliRunner().invoke(cli, ["--help"])
