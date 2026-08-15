@@ -890,6 +890,17 @@ async def test_create_session_repl_terminal_dispatch(
         spec_version=1,
         name="dispatch-agent",
         executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+        sub_agents=(
+            [
+                AgentSpec(
+                    spec_version=1,
+                    name=sub_agent_name,
+                    executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+                )
+            ]
+            if sub_agent_name is not None
+            else []
+        ),
     )
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
 
