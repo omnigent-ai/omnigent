@@ -41,6 +41,7 @@ import {
 } from "@/lib/workspacePanelPreferences";
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
 import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
+import { readDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
 import {
   Dialog,
   DialogContent,
@@ -217,7 +218,9 @@ export function AppShell() {
   const { conversationId } = useParams<{ conversationId: string }>();
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
   const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() =>
-    conversationId ? (readSessionWorkspaceState(conversationId).rightRailTab ?? "files") : "files",
+    conversationId
+      ? (readSessionWorkspaceState(conversationId).rightRailTab ?? readDefaultWorkspaceTab())
+      : "files",
   );
   // The comments panel only contributes to the min width when the rail is
   // actually showing the file viewer — on any other tab the FileViewer
@@ -753,19 +756,6 @@ export function AppShell() {
   // no-filesystem agent with no terminals/sub-agents would otherwise
   // render an empty white card with no way to dismiss it.
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
-  // Keep the selected tab valid. When the current tab disappears — e.g. the
-  // files panel turns off — fall back to the first still-visible tab in
-  // display order (Files · Changes · Agents · Browser). Picking
-  // the first available (rather than ping-ponging between two effects) keeps
-  // this convergent even when several tabs vanish at once.
-  useEffect(() => {
-    if (railTabsAvailable[rightRailTab]) return;
-    const next = (["files", "changes", "subagents", "browser"] as const).find(
-      (t) => railTabsAvailable[t],
-    );
-    if (next) setRightRailTab(next);
-  }, [railTabsAvailable, rightRailTab]);
-
   // Mount the relay at the always-present shell level (not BrowserPane, which
   // only mounts while its tab is selected) so it's listening before the first
   // browser_navigate. No-op outside Electron / with no conversation.
@@ -967,11 +957,10 @@ export function AppShell() {
             : (stored ?? (defaultToTerminal ? terminalKey : null)),
     );
 
-    // Restore the selected rail tab (the Files vs Changes scope is now the tab
-    // itself). ``nextTab`` stays null when there's no persisted tab and no file
-    // to surface, so the tab-fallback effect can still land on the first
-    // *available* tab — forcing "files" here would shadow it.
-    let nextTab: RightRailTab | null = persisted.rightRailTab ?? null;
+    // A remembered per-session tab wins; otherwise use the Appearance default.
+    // The availability effect below replaces an unavailable choice with Files
+    // or, when Files is unavailable too, the first visible tab.
+    let nextTab: RightRailTab = persisted.rightRailTab ?? readDefaultWorkspaceTab();
 
     // Restore the open file tabs from the per-session store, then merge the
     // URL ?file= param: a deep-link selects (and, if absent, opens) that file
@@ -1003,7 +992,7 @@ export function AppShell() {
     if (nextSelected && nextTab !== "files" && nextTab !== "changes") {
       nextTab = "files";
     }
-    if (nextTab !== null) setRightRailTab(nextTab);
+    setRightRailTab(nextTab);
 
     // Restore the rail open-state for this session. A deep link / reload that
     // carries a workspace signal — a file to open (?file=) or a comment to
@@ -1040,6 +1029,16 @@ export function AppShell() {
       setPanelInitialKeyState(terminalKey);
     }
   }, [agentTerminal, conversationId, searchParams, terminalFirst]);
+
+  // Keep the restored/default tab valid. This runs after session restoration
+  // so an unavailable restored choice cannot overwrite its own fallback.
+  useEffect(() => {
+    if (railTabsAvailable[rightRailTab]) return;
+    const next = (["files", "changes", "subagents", "terminals", "todos", "browser"] as const).find(
+      (tab) => railTabsAvailable[tab],
+    );
+    if (next) setRightRailTab(next);
+  }, [railTabsAvailable, rightRailTab]);
 
   // Persist the per-session rail tab + open file tabs whenever they change.
   // Keyed on the state (not conversationId) and targeted at the conversation
