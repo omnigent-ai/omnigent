@@ -803,6 +803,26 @@ _CLI_STARTUP_TIMEOUT_S = 60
 _CLI_STARTUP_MAX_ITERATIONS = 3
 
 
+async def _prepare_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> None:
+    """Stop stale daemons before each timed cli_startup iteration.
+
+    A leftover host daemon from the previous iteration causes the next
+    ``omnigent polly`` to fail with "runner tunnel rejection (HTTP 401)"
+    or "host is on another replica". Runs outside the latency timer.
+    """
+    del env
+    omnigent_bin = os.environ.get("OMNIGENT_BIN") or shutil.which("omnigent")
+    if omnigent_bin is None:
+        return
+    await asyncio.to_thread(
+        subprocess.run,
+        [omnigent_bin, "stop"],
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+
+
 async def _measure_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> None:
     """Time ``omnigent polly --server`` from invocation to REPL ready.
 
@@ -829,16 +849,6 @@ async def _measure_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> N
     omnigent_bin = os.environ.get("OMNIGENT_BIN") or shutil.which("omnigent")
     if omnigent_bin is None:
         raise RuntimeError("omnigent binary not found. Set OMNIGENT_BIN or add omnigent to PATH.")
-
-    # Stop any stale daemons from a previous iteration — a leftover host daemon
-    # registered to the bench server causes the next `omnigent polly` to fail
-    # with "runner tunnel rejection (HTTP 401)" or "host is on another replica".
-    subprocess.run(
-        [omnigent_bin, "stop"],
-        capture_output=True,
-        timeout=10,
-        check=False,
-    )
 
     child = pexpect.spawn(
         omnigent_bin,
@@ -1078,6 +1088,7 @@ ALL_JOURNEYS: dict[str, Journey] = {
             name="cli_startup",
             kind="latency",
             measure=_measure_cli_startup,
+            prepare=_prepare_cli_startup,
             max_iterations=_CLI_STARTUP_MAX_ITERATIONS,
             skip_warmup=True,
             description=(
