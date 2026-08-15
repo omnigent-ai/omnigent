@@ -89,4 +89,18 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
         args=("agent", "stdio"),
         aliases=("grok-build",),
     ),
+    # The current standalone Rovo CLI exposes an ACP server. Rovo's native
+    # permission behavior remains enabled; users may opt into YOLO themselves.
+    "rovo": AcpCliHarness(
+        install=HarnessInstallSpec(
+            "Rovo Dev",
+            "rovo",
+            None,
+            login_args=("auth", "login"),
+            install_hint="Install Rovo CLI and ensure `rovo` is on PATH",
+            auth_hint="run `rovo auth login`",
+        ),
+        args=("acp",),
+        aliases=("rovodev",),
+    ),
 }
