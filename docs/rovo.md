@@ -12,10 +12,8 @@ executor:
   harness: rovo
 ```
 
-The builtin harness launches `rovo acp` and does not force YOLO mode. You can
-choose Rovo's permission behavior in its own configuration or invoke the CLI
-with YOLO when running it outside Omnigent. The `rovodev` alias is also
-accepted.
+The builtin harness launches `rovo acp` and leaves Rovo's permission behavior
+under the control of the Rovo CLI. The `rovodev` alias is also accepted.
 
 Rovo owns its authentication, model selection, memory, skills, MCP
 configuration, and vendor tools. Omnigent supplies its MCP bridge, streams ACP
