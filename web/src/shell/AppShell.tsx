@@ -797,9 +797,13 @@ export function AppShell() {
     setPanelInitialKeyState(stored);
 
     // A remembered per-session tab wins; otherwise use the Appearance default.
-    // The availability effect below replaces an unavailable choice with Files
-    // or, when Files is unavailable too, the first visible tab.
-    let nextTab: RightRailTab = persisted.rightRailTab ?? readDefaultWorkspaceTab();
+    // Navigating within the visible Agents tree is one continuous rail action,
+    // so keep that tab while moving between its root and descendants.
+    const keepAgentsAcrossTreeNavigation =
+      rightRailTab === "subagents" && rootSessionId !== null && rootSessionId !== conversationId;
+    let nextTab: RightRailTab =
+      persisted.rightRailTab ??
+      (keepAgentsAcrossTreeNavigation ? "subagents" : readDefaultWorkspaceTab());
 
     // Restore the open file tabs from the per-session store, then merge the
     // URL ?file= param: a deep-link selects (and, if absent, opens) that file
