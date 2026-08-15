@@ -957,7 +957,7 @@ export function AppShell() {
   }, [setSearchParams]);
 
   // Toggle the right (Workspace) sidebar — shared by the header's collapse
-  // button and the ⌘⌥]/Ctrl+Alt+] hotkey so they can't drift. Beyond flipping the
+  // button and the Workspace hotkeys so they can't drift. Beyond flipping the
   // open-state it persists the choice and keeps the deep-link URL in sync:
   // re-add ?file= on reopen (the FileViewer diff-sync race makes an effect
   // unsafe here), and strip file/diff/comment on collapse so the URL never
@@ -1113,8 +1113,7 @@ export function AppShell() {
     setRightPanelMaximized((prev) => !prev);
   };
 
-  // ⌘⌥[ / ⌘⌥] (Ctrl+Alt on Win/Linux) toggle the left and right sidebars. Bound
-  // here where both panels' open-state lives.
+  // Global sidebar shortcuts are bound here where both panels' open-state lives.
   useSidebarToggleHotkeys({
     onToggleLeft: toggleLeftSidebar,
     onToggleRight: toggleRightPanel,
