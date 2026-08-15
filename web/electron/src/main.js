@@ -1781,11 +1781,14 @@ function buildMenu() {
   /** @type {Electron.MenuItemConstructorOptions[]} */
   const serverSubmenu = [
     {
+      id: "new_session",
+      label: "New Session",
+      accelerator: "CmdOrCtrl+N",
+      click: () => sendOpenPath(activeWindow(), "/"),
+    },
+    {
       id: "new_window",
       label: "New Window",
-      // Own the standard new-window accelerator here — there is no
-      // role-based File menu in this app.
-      accelerator: "CmdOrCtrl+N",
       click: () => newWindow(),
     },
     {
