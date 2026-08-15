@@ -247,6 +247,9 @@ export function ErrorBanner({
                 !headerPointerDownRef.current && event.currentTarget.matches(":focus-visible"),
               );
             }}
+            onKeyDown={(event) => {
+              setHeaderFocusVisible(event.currentTarget.matches(":focus-visible"));
+            }}
             onBlur={() => {
               headerPointerDownRef.current = false;
               setHeaderFocusVisible(false);

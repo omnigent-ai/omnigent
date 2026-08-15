@@ -111,6 +111,37 @@ describe("ErrorBanner", () => {
     expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
   });
 
+  it.each([" ", "Enter"])(
+    "refreshes keyboard focus visibility after pointer focus and %j activation",
+    (key) => {
+      render(
+        <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
+      );
+
+      const messageToggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
+      fireEvent.pointerDown(messageToggle);
+      act(() => messageToggle.focus());
+      fireEvent.pointerUp(messageToggle);
+      fireEvent.mouseLeave(messageToggle);
+      expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
+
+      fireEvent.keyDown(messageToggle, { key });
+      expect(screen.queryByTestId("error-status-icon")).toBeNull();
+      expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
+      fireEvent.click(messageToggle);
+      expect(screen.getByTestId("error-disclosure-icon")).toHaveClass("rotate-90");
+
+      fireEvent.keyDown(messageToggle, { key });
+      fireEvent.click(messageToggle);
+      expect(screen.queryByTestId("error-status-icon")).toBeNull();
+      expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
+
+      act(() => messageToggle.blur());
+      expect(screen.getByTestId("error-status-icon")).toBeInTheDocument();
+      expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
+    },
+  );
+
   it("keeps retry progress and failure aligned without changing the compact icon rule", async () => {
     let rejectRetry: ((error: Error) => void) | undefined;
     const onRetry = vi.fn(
