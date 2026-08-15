@@ -68,10 +68,8 @@ function measureTextarea(
  * covering the case where ``scrollHeight`` reads 0 on mount (e.g. mid
  * client-side route swap, before layout settles).
  *
- * ``onGrowth`` reports how much taller than its resting height the box now
- * is, so a caller can keep that growth out of the surrounding layout — see
- * the in-session composer, which floats the extra rows over the transcript
- * rather than shrinking it.
+ * ``onGrowth`` reports how much taller than its resting height the box now is
+ * for callers that need to coordinate nearby controls with the resized input.
  */
 export function useAutoGrowTextarea(
   ref: RefObject<HTMLTextAreaElement | null>,

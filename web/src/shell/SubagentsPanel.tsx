@@ -428,7 +428,9 @@ function childPrimaryLabel(child: ChildSessionInfo): string {
     const titleSuffix = child.title.split(":").slice(1).join(":");
     if (titleSuffix) titleTask = titleSuffix;
   }
-  return child.session_name ?? titleTask ?? child.title ?? child.tool ?? child.id;
+  return (
+    child.task_summary ?? child.session_name ?? titleTask ?? child.title ?? child.tool ?? child.id
+  );
 }
 
 /**

@@ -292,12 +292,14 @@ def test_effective_iterations_uncapped_journey_passthrough() -> None:
 
 
 def test_runner_journeys_are_capped() -> None:
-    """Every full-turn journey caps its iterations; HTTP journeys do not."""
+    """Every full-turn journey caps its iterations; HTTP journeys do not.
+
+    Non-runner journeys may also declare a cap when they are inherently slow
+    (e.g. cli_startup which takes ~10s per iteration).
+    """
     for journey in ALL_JOURNEYS.values():
         if journey.needs_runner:
             assert journey.max_iterations is not None, journey.name
-        else:
-            assert journey.max_iterations is None, journey.name
 
 
 @pytest.mark.asyncio

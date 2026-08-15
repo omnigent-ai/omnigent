@@ -84,9 +84,9 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        # Same install as the other benchmark workflows so numbers stay
+        # Same runtime install as the other benchmark workflows so numbers stay
         # comparable across them.
-        run: uv sync --extra dev --extra databricks
+        run: uv sync --extra databricks
 
       - name: Run host-session benchmark
         # Throwaway empty SQLite DB (run.py default): these journeys measure

@@ -5855,6 +5855,7 @@ function applyChildSessionUpdated(
   if (child.title !== undefined) patch.title = strOrNull(child.title);
   if (child.tool !== undefined) patch.tool = strOrNull(child.tool);
   if (child.session_name !== undefined) patch.session_name = strOrNull(child.session_name);
+  if (child.task_summary !== undefined) patch.task_summary = strOrNull(child.task_summary);
   if (child.labels !== undefined) patch.labels = strRecordOrEmpty(child.labels);
   if (child.current_task_status !== undefined)
     patch.current_task_status = strOrNull(child.current_task_status);
@@ -5874,6 +5875,7 @@ function applyChildSessionUpdated(
     const inserted: ChildSessionInfo = {
       id: childId,
       title: patch.title ?? null,
+      task_summary: patch.task_summary ?? null,
       tool: patch.tool ?? null,
       session_name: patch.session_name ?? null,
       labels: patch.labels ?? {},

@@ -4826,10 +4826,14 @@ async def test_the_quiescence_recheck_backs_off_after_agy_vetoes_a_close(
     """
     polls = 0
     idle_checks = 0
+    reached_target = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
     def _steps(_port: int, _cascade: str) -> list[dict[str, Any]]:
         nonlocal polls
         polls += 1
+        if polls == 30:
+            loop.call_soon_threadsafe(reached_target.set)
         return [_load("user_input")]  # turn open, never another step
 
     def _still_running(_port: int) -> dict[str, Any]:
@@ -4854,13 +4858,12 @@ async def test_the_quiescence_recheck_backs_off_after_agy_vetoes_a_close(
                 child_session_id="conv_child_a",
             )
         )
-        deadline = 0
-        while polls < 30 and deadline < 10_000:
-            deadline += 1
-            await asyncio.sleep(0)
-        mirror.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await mirror
+        try:
+            await asyncio.wait_for(reached_target.wait(), timeout=_MIRROR_HANG_GUARD_S)
+        finally:
+            mirror.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await mirror
 
     assert polls >= 30, f"the mirror should have kept polling a vetoed child; got {polls}"
     # Windows of 2, 4, 8, 16 reach poll 30 in four checks; a flat window would

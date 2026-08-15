@@ -31,7 +31,7 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { CapabilitiesContext } from "./lib/CapabilitiesContext";
-import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
+import { FALLBACK_SERVER_INFO, resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { EmbeddedProvider } from "./lib/embedded";
 import { type OmnigentHostConfig, setEmbedRoot, setOmnigentHostConfig } from "./lib/host";
 import { resolveIdentity } from "./lib/identity";
@@ -100,26 +100,6 @@ export interface OmnigentAppProps extends OmnigentHostConfig {
  * as the Radix portal root, so the host only renders this — no class/portal
  * wiring needed.
  */
-// Sentinel used when the `/v1/info` probe is slow or missing — matches
-// `main.tsx`'s fallback (accounts off, no login).
-const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
-  accounts_enabled: false,
-  single_user: false,
-  login_url: null,
-  needs_setup: false,
-  databricks_features: false,
-  managed_sandboxes_enabled: false,
-  sandbox_provider: null,
-  sharing_mode: "on",
-  public_sharing_enabled: true,
-  server_version: null,
-  smart_routing_enabled: false,
-  smart_routing_sources: { external: false, oss: false },
-  harness_install_enabled: false,
-  installable_harnesses: [],
-  dictation_available: false,
-};
-
 /**
  * Runs `main.tsx`'s boot-time `/v1/info` probe inside the embed tree.
  *
@@ -146,7 +126,7 @@ function EmbedCapabilitiesProvider({ children }: { children: ReactNode }) {
     // full re-navigation. resolveServerInfo never rejects (its failure path
     // resolves to the OFF sentinel), so the real value always arrives.
     const fallbackTimer = setTimeout(() => {
-      if (alive && !resolved) setInfo(SERVER_INFO_OFFLINE_FALLBACK);
+      if (alive && !resolved) setInfo(FALLBACK_SERVER_INFO);
     }, 1500);
     void resolveServerInfo().then((real) => {
       resolved = true;

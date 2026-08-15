@@ -568,6 +568,14 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--features",
+        default="",
+        help=(
+            "Comma-separated deployment-wide release features, e.g. "
+            "'usage_page'. Empty keeps every release feature off."
+        ),
+    )
+    parser.add_argument(
         "--target",
         default="prod",
         help=(
@@ -746,6 +754,8 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
         f"volume_name={args.volume_name}",
         "--var",
         f"otel_table_schema={args.otel_table_schema}",
+        "--var",
+        f"features={args.features}",
     ]
 
 

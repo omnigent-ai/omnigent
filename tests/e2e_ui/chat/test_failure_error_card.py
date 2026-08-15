@@ -14,7 +14,9 @@ independent of any live turn.
 
 from __future__ import annotations
 
-from playwright.sync_api import Page, expect
+import json
+
+from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.conftest import _server_state
 
@@ -78,3 +80,84 @@ def test_unclassified_failure_renders_english_headline_not_raw_code(
     expect(alert).to_contain_text("The agent's terminal exited unexpectedly", timeout=15_000)
     # ...and the raw enum is not surfaced as the headline.
     expect(alert).not_to_contain_text("Error · required_terminal_exited", timeout=15_000)
+
+
+def test_persisted_failure_expands_retries_and_dismisses_locally(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A persisted recoverable error exposes details and local controls.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _seed_error_item(
+        session_id,
+        code="required_terminal_exited",
+        message=(
+            "Required terminal exited unexpectedly; the runtime is no longer available.\n\n"
+            "Terminal diagnostics:\nexit_code: 1\nsignal: SIGTERM\n\n"
+            "Last captured output:\nfatal: runner unavailable"
+        ),
+    )
+    retry_payloads: list[dict[str, object]] = []
+
+    def _recover(route: Route) -> None:
+        payload = route.request.post_data_json
+        if payload.get("type") != "retry_session":
+            route.continue_()
+            return
+        retry_payloads.append(payload)
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "queued": False,
+                    "recovered": True,
+                    "recovery": "runner_relaunched",
+                }
+            ),
+        )
+
+    page.route(f"**/v1/sessions/{session_id}/events", _recover)
+    page.goto(f"{base_url}/c/{session_id}")
+
+    alert = page.get_by_role("alert")
+    expect(alert).to_be_visible(timeout=15_000)
+    headline = alert.get_by_role(
+        "button", name="The agent's terminal exited unexpectedly", exact=False
+    )
+    expect(headline).to_have_attribute("aria-expanded", "false")
+    expect(alert.get_by_test_id("error-message-content")).to_have_count(0)
+
+    headline.focus()
+    page.keyboard.press("Enter")
+    expect(headline).to_have_attribute("aria-expanded", "true")
+    expect(alert.get_by_role("heading", name="Message")).to_be_visible()
+    expect(alert.get_by_test_id("error-message-content")).to_contain_text(
+        "Required terminal exited unexpectedly"
+    )
+
+    alert.get_by_role("button", name="View diagnostics").click()
+    tabs = alert.get_by_role("tablist", name="Diagnostic sections")
+    expect(tabs).to_be_visible()
+    terminal_tab = tabs.get_by_role("tab", name="Terminal")
+    expect(terminal_tab).to_have_attribute("aria-selected", "true")
+    expect(alert.get_by_test_id("error-diagnostics-content")).to_contain_text("exit_code: 1")
+    tabs.get_by_role("tab", name="Last captured output").click()
+    expect(alert.get_by_test_id("error-diagnostics-content")).to_contain_text(
+        "fatal: runner unavailable"
+    )
+
+    alert.get_by_role("button", name="Retry").click()
+    expect(alert).to_have_count(0)
+    assert retry_payloads == [{"type": "retry_session", "data": {}}]
+
+    page.reload()
+    alert = page.get_by_role("alert")
+    expect(alert).to_be_visible(timeout=15_000)
+    alert.get_by_role("button", name="Dismiss error").click()
+    expect(alert).to_have_count(0)

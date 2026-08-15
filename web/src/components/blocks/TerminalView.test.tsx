@@ -23,6 +23,7 @@ import {
 const terminalSessionMock = vi.hoisted(() => ({
   instances: [] as {
     url: string;
+    container: HTMLDivElement;
     nativeSelection: boolean;
     onState: (state: ConnectionState) => void;
     dispose: ReturnType<typeof vi.fn>;
@@ -41,7 +42,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     focus = vi.fn();
 
     constructor(
-      _container: HTMLDivElement,
+      container: HTMLDivElement,
       url: string,
       onState: (state: ConnectionState) => void,
       _isDark?: boolean,
@@ -51,6 +52,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     ) {
       terminalSessionMock.instances.push({
         url,
+        container,
         nativeSelection,
         onState,
         dispose: this.dispose,
@@ -197,6 +199,43 @@ describe("hidden pre-warmed surface", () => {
     // No reveal edge — the session's own WS-open focus owns this case;
     // an extra explicit call would steal focus on every reconnect.
     expect(terminalSessionMock.instances[0].focus).not.toHaveBeenCalled();
+  });
+});
+
+describe("late direct-attach advert", () => {
+  it("retires the outgoing session when the advert lands on a live terminal", async () => {
+    // The runner's loopback advert reaches the client on a terminals
+    // refetch — after the terminal has already dialed. That prop change
+    // re-runs the attach ref for the SAME mount node (React 18 hands the
+    // node back rather than remounting, and skips the ref's cleanup), so
+    // the attach itself has to retire its predecessor. Without that,
+    // xterm stacks a second instance inside one node — two helper
+    // textareas, two renderers, two live bridges.
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />,
+    );
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    const relayed = terminalSessionMock.instances[0];
+
+    rerender(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        directAttachUrl={
+          "ws://127.0.0.1:54321/v1/sessions/conv_abc" +
+          "/resources/terminals/terminal_bash_s1/attach?token=t"
+        }
+      />,
+    );
+    await act(async () => {});
+
+    // Same node, so this is a re-attach rather than a remount — which is
+    // exactly why the predecessor cannot be left running.
+    const readvertised = terminalSessionMock.instances.at(-1)!;
+    expect(readvertised).not.toBe(relayed);
+    expect(readvertised.container).toBe(relayed.container);
+    expect(relayed.dispose).toHaveBeenCalled();
   });
 });
 

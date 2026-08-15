@@ -10,7 +10,7 @@
 
 import type { SetupStepWire } from "@/lib/agentLabels";
 import type { Host } from "@/hooks/useHosts";
-import type { ServerInfo } from "@/lib/capabilities";
+import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 
 /** Whether a step is satisfied, still needed, or not locally determinable. */
 export type SetupStepStatus = "done" | "todo" | "unknown";
@@ -124,7 +124,7 @@ export function harnessInstallableOnHost(
 ): boolean {
   return (
     info !== "loading" &&
-    info.harness_install_enabled &&
+    isFeatureEnabled(info, "harness_install") &&
     !!harness &&
     info.installable_harnesses.includes(harness) &&
     host?.status === "online"
@@ -182,7 +182,7 @@ export function harnessAuthableOnHost(
 ): boolean {
   return (
     info !== "loading" &&
-    info.harness_install_enabled &&
+    isFeatureEnabled(info, "harness_install") &&
     harnessCredentialFamily(harness) !== null &&
     host?.status === "online"
   );

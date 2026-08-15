@@ -34,6 +34,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
@@ -54,7 +55,7 @@ _HOST_NAME = "credential-test-laptop"
 @pytest.fixture(autouse=True)
 def _enable_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     """Enable the feature flag for every test except the flag-off case."""
-    monkeypatch.setenv("OMNIGENT_HARNESS_INSTALL_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_FEATURES", "harness_install")
 
 
 def _websocket_scope(path: str) -> dict[str, object]:
@@ -395,12 +396,20 @@ async def test_concurrent_writes_to_one_host_are_serialized(
 
 async def test_route_hidden_when_flag_off(
     cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With the flag off the route is 404 — the feature is invisible."""
-    monkeypatch.setenv("OMNIGENT_HARNESS_INSTALL_ENABLED", "0")
-    app, _reg, _hs, _cs = cred_app
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    _app, registry, host_store, conv_store = cred_app
+    off_app = FastAPI()
+    off_app.include_router(
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            feature_flags=FeatureFlags(),
+        ),
+        prefix="/v1",
+    )
+    async with AsyncClient(transport=ASGITransport(app=off_app), base_url="http://test") as client:
         resp = await client.post(
             f"/v1/hosts/{_HOST_ID}/harnesses/claude/credential",
             json={"kind": "key", "secret": "x"},
@@ -548,11 +557,19 @@ async def test_detect_credentials_returns_non_secret_descriptors(
 
 async def test_detect_credentials_hidden_when_flag_off(
     cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With the flag off the detect route is 404."""
-    monkeypatch.setenv("OMNIGENT_HARNESS_INSTALL_ENABLED", "0")
-    app, _reg, _hs, _cs = cred_app
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    _app, registry, host_store, conv_store = cred_app
+    off_app = FastAPI()
+    off_app.include_router(
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            feature_flags=FeatureFlags(),
+        ),
+        prefix="/v1",
+    )
+    async with AsyncClient(transport=ASGITransport(app=off_app), base_url="http://test") as client:
         resp = await client.get(f"/v1/hosts/{_HOST_ID}/credentials/detected")
     assert resp.status_code == 404

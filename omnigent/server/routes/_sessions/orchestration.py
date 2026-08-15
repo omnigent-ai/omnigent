@@ -3054,6 +3054,7 @@ async def ensure_runner_connected(
     app_state: Any,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    raise_host_refusal: bool = False,
 ) -> tuple[httpx.AsyncClient | None, Conversation]:
     """
     Bring a wakeable session's runner online for out-of-band resource access.
@@ -3088,6 +3089,10 @@ async def ensure_runner_connected(
         managed-launch tracker, host store, and sandbox config.
     :param conversation_store: Store holding the session row.
     :param runner_router: The ``RunnerRouter``, or ``None`` for in-process.
+    :param raise_host_refusal: Raise typed, non-persisting errors when the
+        host rejects launch because the harness is unavailable or the
+        workspace is gone. Resource callers keep the legacy ``False``
+        behavior; retry recovery opts in because it has no message to persist.
     :returns: ``(runner_client, conv)`` — the client is ``None`` when no
         runner is reachable and none is wakeable; ``conv`` is re-read after
         any wake/relaunch so the caller sees the rebound row.
@@ -3177,6 +3182,21 @@ async def ensure_runner_connected(
                 _HARNESS_NOT_CONFIGURED_ERROR_CODE,
                 _WORKSPACE_MISSING_ERROR_CODE,
             )
+            if _fatal_refusal and raise_host_refusal:
+                error_code = (
+                    ErrorCode.HARNESS_NOT_CONFIGURED
+                    if launch_attempt.error_code == _HARNESS_NOT_CONFIGURED_ERROR_CODE
+                    else ErrorCode.WORKSPACE_MISSING
+                )
+                raise OmnigentError(
+                    launch_attempt.error
+                    or (
+                        "The session harness is not configured on this host."
+                        if error_code == ErrorCode.HARNESS_NOT_CONFIGURED
+                        else "The session workspace no longer exists on the host."
+                    ),
+                    code=error_code,
+                )
             if _fatal_refusal and launch_attempt.error is not None:
                 _rer = getattr(app_state, "runner_exit_reports", None)
                 if _rer is not None:
@@ -3549,6 +3569,7 @@ async def _ensure_runner_session_initialized(
     initializer: RunnerSessionInitializer | None = None,
     *,
     suppress_recovery_turn: bool = False,
+    require_success: bool = False,
 ) -> bool:
     """
     Drive — and wait for — the runner's session-init handshake.
@@ -3597,6 +3618,8 @@ async def _ensure_runner_session_initialized(
         forward then arrives to an active turn, is buffered, and is
         processed a second time once the (redundant) recovery turn
         finishes.
+    :param require_success: Raise ``runner_unavailable`` when the handshake
+        fails instead of using the message path's best-effort fallback.
     :returns: ``True`` when a current runner explicitly confirmed its native
         terminal is ready; ``False`` for legacy or non-native responses.
     """
@@ -3635,13 +3658,18 @@ async def _ensure_runner_session_initialized(
             and payload.get("session_init_protocol_version") == 2
             and payload.get("terminal_ready") is True
         )
-    except (httpx.HTTPError, ConnectionError):
+    except (httpx.HTTPError, ConnectionError) as exc:
         _logger.warning(
             "Session-init handshake to runner failed for session %s; "
             "forwarding the message anyway",
             session_id,
             exc_info=True,
         )
+        if require_success:
+            raise OmnigentError(
+                "The recovered runner did not finish session initialization.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            ) from exc
         return False
 
 
@@ -3687,6 +3715,8 @@ async def _ensure_native_terminal_ready(
     runner_client: httpx.AsyncClient,
     session_id: str,
     conv: Conversation,
+    *,
+    persist_resource_event: bool = True,
 ) -> _NativeTerminalEnsureOutcome:
     """
     Ask the runner to create or return the native terminal for a message.
@@ -3701,6 +3731,9 @@ async def _ensure_native_terminal_ready(
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
     :param conv: Conversation row used to identify the native harness.
+    :param persist_resource_event: Whether a newly created terminal should be
+        appended to conversation history. Retry recovery disables persistence
+        while retaining the live resource event for connected clients.
     :returns: The probe outcome — a definitive ``error`` when the terminal
         could not start, else ``error=None``.
     """
@@ -3713,6 +3746,7 @@ async def _ensure_native_terminal_ready(
                 "terminal": terminal_name,
                 "session_key": "main",
                 "ensure_native_terminal": True,
+                "persist_resource_event": persist_resource_event,
             },
             timeout=10.0,
         )
@@ -5968,7 +6002,10 @@ async def _relay_runner_stream_once(
                     # The live publish below already updates connected
                     # clients.
                     resource_item = _resource_event_item_from_sse(session_id, event)
-                    if resource_item is not None:
+                    if (
+                        resource_item is not None
+                        and event.get("persist_resource_event") is not False
+                    ):
                         resource_data = resource_item.data
                         await _relay_persist(
                             conversation_store,

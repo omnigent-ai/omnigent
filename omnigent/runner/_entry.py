@@ -1508,6 +1508,35 @@ async def _run_tunnel_from_env() -> None:
     # drains its session streams and closes cleanly — the server then sees an
     # end-of-stream, not an abrupt drop that renders a scary error banner.
     tunnel_shutdown_event = asyncio.Event()
+    # Loopback direct-attach listener: lets a browser on this machine attach
+    # to terminals with zero relay legs. Best-effort — any failure keeps the
+    # runner relay-only. Windows never runs the web terminal bridges, so the
+    # listener is POSIX-only like the bridges themselves.
+    direct_attach_listener = None
+    direct_attach_token: str | None = None
+    if sys.platform != "win32":
+        try:
+            from omnigent.runner.direct_attach import (
+                allowed_origin_for_server,
+                create_direct_attach_app,
+                new_direct_attach_token,
+                start_direct_attach_listener,
+            )
+
+            attach_handler = getattr(app.state, "terminal_attach_handler", None)
+            allowed_origin = allowed_origin_for_server(server_url)
+            if attach_handler is not None and allowed_origin is not None:
+                direct_attach_token = new_direct_attach_token()
+                direct_attach_listener = await start_direct_attach_listener(
+                    create_direct_attach_app(
+                        attach_handler,
+                        token=direct_attach_token,
+                        allowed_origins=frozenset({allowed_origin}),
+                    )
+                )
+        except Exception:  # noqa: BLE001 — optimization only; never block the tunnel
+            _logger.warning("direct-attach listener setup failed", exc_info=True)
+            direct_attach_listener = None
     tunnel_task = asyncio.create_task(
         serve_tunnel(
             cast("_ASGIApp", app),  # FastAPI is ASGI-compatible; cast narrows for mypy
@@ -1521,6 +1550,12 @@ async def _run_tunnel_from_env() -> None:
             on_activity=_mark_activity,
             shutdown_event=tunnel_shutdown_event,
             on_graceful_shutdown=getattr(app.state, "drain_session_streams", None),
+            direct_attach_port=(
+                direct_attach_listener.port if direct_attach_listener is not None else None
+            ),
+            direct_attach_token=(
+                direct_attach_token if direct_attach_listener is not None else None
+            ),
         ),
         name=f"runner-ws-tunnel:{runner_id}",
     )
@@ -1613,6 +1648,9 @@ async def _run_tunnel_from_env() -> None:
         if idle_task is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await idle_task
+        if direct_attach_listener is not None:
+            with contextlib.suppress(Exception):
+                await direct_attach_listener.stop()
         await _lifespan_cm.__aexit__(None, None, None)
 
 

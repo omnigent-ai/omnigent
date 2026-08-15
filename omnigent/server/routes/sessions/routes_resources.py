@@ -826,12 +826,93 @@ def register_resources_routes(
             for key, value in request.query_params.items()
             if key in ("limit", "after", "before", "order")
         }
-        return await _proxy_get_to_runner(
+        page = await _proxy_get_to_runner(
             session_id,
             path,
             conv,
             params=forwarded or None,
         )
+        await _annotate_direct_attach(page, session_id, request)
+        return page
+
+    async def _caller_owns_session(session_id: str, request: Request) -> bool:
+        """Return whether the requester holds owner-level access.
+
+        Non-raising variant of the owner gate used for optional
+        enrichment: an interactive (write) attach requires owner level
+        (see ``terminal_attach._authorize_terminal_attach``), so the
+        direct-attach token — which grants write attach without a
+        server-side check — may only be disclosed to owners. Mirrors
+        the relay's permissions-disabled behavior: no permission store
+        means single-user mode, where the caller is the owner.
+
+        :param session_id: Session/conversation identifier.
+        :param request: The incoming request carrying auth context.
+        :returns: ``True`` when disclosure is allowed.
+        """
+        if permission_store is None:
+            return True
+        user_id = _get_user_id(request, auth_provider)
+        if user_id is None:
+            return False
+        try:
+            await _require_access_and_level(
+                user_id,
+                session_id,
+                LEVEL_OWNER,
+                permission_store,
+                conversation_store,
+            )
+        except OmnigentError:
+            return False
+        return True
+
+    async def _annotate_direct_attach(
+        page: dict[str, Any],
+        session_id: str,
+        request: Request,
+    ) -> None:
+        """Add ``metadata.direct_attach_url`` to each terminal item.
+
+        Best-effort enrichment for browsers running on the same machine
+        as the session's runner: when the runner advertised a loopback
+        attach listener over its tunnel and the caller is the session
+        owner, each terminal gains a ``ws://127.0.0.1:...`` URL the
+        client may *try* before the relay path. Any miss — no resolver
+        installed, runner offline, no advert, non-owner caller — leaves
+        the payload untouched, so the relay path is unaffected.
+
+        :param page: The runner's ``PaginatedList`` JSON, mutated in place.
+        :param session_id: Session/conversation identifier.
+        :param request: The incoming request carrying auth context.
+        """
+        from omnigent.runtime import get_runner_direct_attach_resolver
+
+        resolver = get_runner_direct_attach_resolver()
+        if resolver is None:
+            return
+        endpoint = resolver(session_id)
+        if endpoint is None:
+            return
+        if not await _caller_owns_session(session_id, request):
+            return
+        items = page.get("data")
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            terminal_id = item.get("id")
+            if not isinstance(terminal_id, str) or not terminal_id:
+                continue
+            metadata = item.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                item["metadata"] = metadata
+            metadata["direct_attach_url"] = (
+                f"ws://127.0.0.1:{endpoint.port}/v1/sessions/{session_id}"
+                f"/resources/terminals/{terminal_id}/attach?token={endpoint.token}"
+            )
 
     @router.post(
         "/sessions/{session_id}/resources/terminals",
