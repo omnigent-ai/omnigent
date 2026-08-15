@@ -1399,10 +1399,12 @@ export function AppShell() {
   // `terminals` is already runner-accurate (useTerminals empties it when the
   // runner is offline), so a non-empty list means an openable PTY.
   const terminalsAvailable = terminals.length > 0;
+  const terminalResumable = liveness.kind === "runner_asleep" || liveness.kind === "host_asleep";
   // Single pill-facing "loading" signal: not yet openable, but coming up —
   // either the runner is launching/relaunching (liveness `starting`, known the
   // instant a message is sent) or it's up and auto-creating the PTY
-  // (`terminalPending`). Idle stopped sessions are neither → greyed, not spinning.
+  // (`terminalPending`). Idle resumable sessions are neither: they stay
+  // selectable via `terminalResumable` and show the resume prompt, not a spinner.
   // Suppressed once the session has failed AND no send is in flight: a runner
   // that crashed before connecting (`runner_failed_to_start`), or a host that
   // refused the launch (`harness_not_configured`), sits in the `starting` grace
@@ -1461,6 +1463,7 @@ export function AppShell() {
       terminalViewKey: panelInitialKey,
       setView,
       terminalsAvailable,
+      terminalResumable,
       terminalStartingUp,
     }),
     [
@@ -1472,6 +1475,7 @@ export function AppShell() {
       panelInitialKey,
       setView,
       terminalsAvailable,
+      terminalResumable,
       terminalStartingUp,
     ],
   );

@@ -62,9 +62,16 @@ export interface TerminalFirstContextValue {
   /**
    * True when a terminal exists AND is reachable (the runner is online) —
    * i.e. there's a PTY the "Terminal" pill can open right now. False on a
-   * stopped/offline runner, which greys the button.
+   * stopped/offline runner; `terminalResumable` decides whether the button
+   * stays available with a resume prompt or is disabled.
    */
   terminalsAvailable: boolean;
+  /**
+   * True when no PTY is currently reachable but the session's existing host
+   * binding can resume it. Keeps Terminal selectable so the view can present
+   * its explicit resume prompt.
+   */
+  terminalResumable?: boolean;
   /**
    * True while the terminal is coming up but not yet openable — drives the
    * spinner on the "Terminal" pill so it reads as "loading" rather than a
