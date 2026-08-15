@@ -114,7 +114,6 @@ import {
   useLeaveSession,
   useMoveToProject,
   useDeleteProject,
-  useRenameProject,
   PROJECT_LABEL_KEY,
   PINNED_CONVERSATIONS_KEY,
   usePinnedConversations,
@@ -3927,10 +3926,8 @@ function ProjectFolderActions({
 // ── ProjectFolderMenu ─────────────────────────────────────────────────────────
 
 /**
- * The kebab on a project-folder header: "Rename project" (O(1) via
- * `PATCH /v1/projects/{id}` for a first-class project; promotes a label-only
- * folder on demand) and "Delete project" (archives + unfiles all members, then
- * removes the container). Delete is confirmed since it archives sessions.
+ * The kebab on a project-folder header. Settings edits the project name and
+ * defaults; Delete archives + unfiles all members, then removes the container.
  */
 function ProjectFolderMenu({
   projectName,
@@ -3945,11 +3942,8 @@ function ProjectFolderMenu({
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
-  const [renameOpen, setRenameOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [renameValue, setRenameValue] = useState(projectName);
   const deleteProject = useDeleteProject();
-  const renameProject = useRenameProject();
 
   return (
     <>
@@ -3983,16 +3977,6 @@ function ProjectFolderMenu({
               New session
             </Link>
           </DropdownMenuItem>
-          <DropdownMenuItem
-            data-testid="rename-project"
-            onSelect={() => {
-              setRenameValue(projectName);
-              setRenameOpen(true);
-            }}
-          >
-            <PencilIcon className="size-3.5" />
-            Rename project
-          </DropdownMenuItem>
           <DropdownMenuItem data-testid="project-settings" onSelect={() => setSettingsOpen(true)}>
             <Settings2Icon className="size-3.5" />
             Project settings
@@ -4007,66 +3991,6 @@ function ProjectFolderMenu({
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
-      <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
-        <DialogContent onClick={(e) => e.stopPropagation()}>
-          <DialogHeader>
-            <DialogTitle>Rename project</DialogTitle>
-          </DialogHeader>
-          {/* A <form> so Enter in the input submits natively (Radix Dialog
-              doesn't wrap children in one) instead of relying on a manual
-              key handler + button lookup. */}
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              const newName = renameValue.trim();
-              if (newName === "" || newName === projectName) {
-                setRenameOpen(false);
-                setMenuOpen(false);
-                return;
-              }
-              renameProject.mutate(
-                { id: projectId, oldName: projectName, newName },
-                {
-                  onSuccess: () => {
-                    setRenameOpen(false);
-                    setMenuOpen(false);
-                  },
-                },
-              );
-            }}
-          >
-            <input
-              autoFocus
-              className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none"
-              value={renameValue}
-              onChange={(e) => setRenameValue(e.target.value)}
-            />
-            {renameProject.isError && (
-              <p className="text-ui text-destructive" role="alert">
-                {(renameProject.error as Error).message}
-              </p>
-            )}
-            <DialogFooter className="border-t-0 bg-transparent">
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => setRenameOpen(false)}
-                disabled={renameProject.isPending}
-              >
-                Cancel
-              </Button>
-              <Button
-                type="submit"
-                data-testid="rename-project-confirm"
-                loading={renameProject.isPending}
-                disabled={renameValue.trim() === ""}
-              >
-                Rename
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
       <ProjectSettingsDialog
         open={settingsOpen}
         onOpenChange={(o) => {

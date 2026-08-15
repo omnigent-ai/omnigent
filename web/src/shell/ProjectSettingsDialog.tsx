@@ -112,6 +112,7 @@ export function ProjectSettingsDialog({
 
   // Draft fields. Seeded from the stored config each time the dialog opens (or
   // the fetched config arrives); local until saved.
+  const [name, setName] = useState(projectName);
   const [hostId, setHostId] = useState<string>(NONE);
   const [workspace, setWorkspace] = useState("");
   // Worktrees are opt-in: the toggle starts OFF and only an explicit ON is
@@ -159,6 +160,11 @@ export function ProjectSettingsDialog({
 
   useEffect(() => {
     if (!open) return;
+    setName(projectName);
+  }, [open, projectName]);
+
+  useEffect(() => {
+    if (!open) return;
     // Don't seed a blank draft from a failed load — Save is blocked anyway, and
     // clobbering the fields would risk sending `{}` if the guard ever regressed.
     if (loadFailed) return;
@@ -175,7 +181,8 @@ export function ProjectSettingsDialog({
     e.preventDefault();
     // Guard against submitting a blank draft seeded from a failed load, which
     // the server would read as "clear the stored defaults".
-    if (loadFailed) return;
+    const newName = name.trim();
+    if (loadFailed || newName === "") return;
     // Build the config from set fields only — an unset slot is an absent key,
     // so the whole object is `{}` when nothing is configured (the server treats
     // that as "clear the stored defaults").
@@ -198,7 +205,7 @@ export function ProjectSettingsDialog({
     if (base) config.base_branch = base;
 
     updateConfig.mutate(
-      { id: projectId, name: projectName, config },
+      { id: projectId, oldName: projectName, newName, config },
       { onSuccess: () => onOpenChange(false) },
     );
   };
@@ -243,11 +250,24 @@ export function ProjectSettingsDialog({
         <DialogHeader>
           <DialogTitle>Project settings</DialogTitle>
           <DialogDescription>
-            Defaults for new sessions in <span className="font-medium">{projectName}</span>. Each is
-            a starting point you can change per session; leave a field blank for no default.
+            Update this project and its defaults for new sessions. Each default is a starting point
+            you can change per session; leave a field blank for no default.
           </DialogDescription>
         </DialogHeader>
         <form onSubmit={onSubmit} className="flex flex-col gap-4">
+          <Field label="Name" htmlFor="project-settings-name">
+            <input
+              id="project-settings-name"
+              data-testid="project-settings-name"
+              className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              disabled={updateConfig.isPending}
+              maxLength={100}
+              required
+            />
+          </Field>
+
           <Field label="Host" hint="Where new sessions run by default">
             <Select
               value={hostId}
@@ -474,7 +494,7 @@ export function ProjectSettingsDialog({
               type="submit"
               data-testid="project-settings-save"
               loading={updateConfig.isPending}
-              disabled={isLoading || loadFailed}
+              disabled={isLoading || loadFailed || name.trim() === ""}
             >
               Save
             </Button>
