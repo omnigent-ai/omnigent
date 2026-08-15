@@ -106,7 +106,9 @@ async def validate_existing_host_workspace(
 ) -> str:
     """Validate a connected-host workspace against the agent's os_env boundary."""
     from omnigent.server.routes._workspace_validation import (
+        WORKSPACE_NOT_ABSOLUTE_MSG,
         WorkspaceValidationError,
+        is_absolute_host_path,
         validate_workspace,
     )
 
@@ -115,9 +117,9 @@ async def validate_existing_host_workspace(
             "workspace required when host_id is set",
             code=ErrorCode.INVALID_INPUT,
         )
-    if not workspace.startswith("/"):
+    if not is_absolute_host_path(workspace):
         raise OmnigentError(
-            "workspace must be an absolute path starting with /",
+            WORKSPACE_NOT_ABSOLUTE_MSG,
             code=ErrorCode.INVALID_INPUT,
         )
     if agent_cache is None:

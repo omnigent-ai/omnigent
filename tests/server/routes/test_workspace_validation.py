@@ -541,6 +541,28 @@ async def test_tilde_workspace_rejected(
     assert "absolute path" in exc_info.value.message
 
 
+async def test_windows_absolute_workspace_accepted(
+    host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
+) -> None:
+    """
+    Verify a Windows-style absolute workspace passes the input gate.
+
+    A POSIX server managing a Windows host receives ``C:\\project``;
+    the absolute-path guard must accept it (rather than rejecting it
+    the way ``startswith("/")`` did) and forward it to host.stat.
+    """
+    registry, _, _ = host_setup
+    _set_stat(registry, "C:\\project", canonical="C:\\project")
+
+    canonical = await validate_workspace(
+        host_registry=registry,
+        host_id=_HOST_ID,
+        workspace="C:\\project",
+        spec_cwd=".",
+    )
+    assert canonical == "C:\\project"
+
+
 # ── Host failure handling ────────────────────────────────
 
 
