@@ -1321,7 +1321,7 @@ class QwenExecutor(Executor):
             yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
 
-        requested_model = config.model if config is not None else self._model
+        requested_model = config.model if config is not None and config.model else self._model
         try:
             await self._apply_model_override(session_id, requested_model)
         except Exception as exc:  # noqa: BLE001

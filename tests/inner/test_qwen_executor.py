@@ -472,6 +472,38 @@ async def test_model_override_uses_standard_session_config() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_turn_applies_configured_model_without_per_turn_override() -> None:
+    """An empty per-turn config must not discard HARNESS_QWEN_MODEL."""
+    executor = QwenExecutor(model="qwen-plus")
+    executor._initialized = True
+    executor._session_id = "s1"
+    executor._system_prompt_sent = True
+    executor._proc = MagicMock(returncode=None)
+    executor._apply_model_override = AsyncMock()  # type: ignore[method-assign]
+
+    async def fake_send(msg: dict) -> None:
+        if msg.get("method") == "session/prompt":
+            executor._pending[msg["id"]].set_result(
+                {"id": msg["id"], "result": {"stopReason": "end_turn"}}
+            )
+
+    executor._send = fake_send  # type: ignore[method-assign]
+
+    events = [
+        event
+        async for event in executor.run_turn(
+            [{"role": "user", "content": "hello"}],
+            [],
+            "",
+            ExecutorConfig(model=None),
+        )
+    ]
+
+    executor._apply_model_override.assert_awaited_once_with("s1", "qwen-plus")
+    assert any(isinstance(event, TurnComplete) for event in events)
+
+
+@pytest.mark.asyncio
 async def test_ensure_session_cached_after_first_call() -> None:
     """_ensure_session does not make a second RPC call once session is set."""
     executor = QwenExecutor()
