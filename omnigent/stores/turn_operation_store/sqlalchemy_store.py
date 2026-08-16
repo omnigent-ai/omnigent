@@ -206,17 +206,49 @@ class SqlAlchemyTurnOperationStore(TurnOperationStore):
         item_id: str,
         dispatch_request: dict[str, Any],
     ) -> TurnOperation:
-        dispatch_request_json = _canonical_request(dispatch_request)
-        dispatch_request_hash = _digest("dispatch-request", dispatch_request_json)
+        prepared = self.prepare_input(operation_id, item_id, dispatch_request)
+        if prepared.state != "accepted":
+            return prepared
         with self._write_session("mark_input_persisted") as session:
             row = self._require_row(session, operation_id)
             state = decode_turn_operation_state(row.state)
             if state == "accepted":
                 row.state = encode_turn_operation_state("input_persisted")
-                row.item_id = item_id
-                row.dispatch_request_hash = dispatch_request_hash
-                row.dispatch_request_json = dispatch_request_json
                 row.updated_at = now_epoch()
+            return _to_entity(row)
+
+    def prepare_input(
+        self,
+        operation_id: str,
+        item_id: str,
+        dispatch_request: dict[str, Any],
+    ) -> TurnOperation:
+        """Freeze input identity and dispatch data before the item write.
+
+        Keeping the operation in ``accepted`` until the conversation item is
+        durably appended closes the cross-store crash gap: a replay can recover
+        the frozen payload and deterministic item id, append idempotently, and
+        only then advance to ``input_persisted``.
+        """
+        dispatch_request_json = _canonical_request(dispatch_request)
+        dispatch_request_hash = _digest("dispatch-request", dispatch_request_json)
+        with self._write_session("prepare_input") as session:
+            row = self._require_row(session, operation_id)
+            state = decode_turn_operation_state(row.state)
+            if state == "accepted":
+                if row.item_id is None:
+                    row.item_id = item_id
+                    row.dispatch_request_hash = dispatch_request_hash
+                    row.dispatch_request_json = dispatch_request_json
+                    row.updated_at = now_epoch()
+                elif (
+                    row.item_id != item_id
+                    or bytes(row.dispatch_request_hash or b"") != dispatch_request_hash
+                    or row.dispatch_request_json != dispatch_request_json
+                ):
+                    raise TurnOperationStateError(
+                        "operation is already prepared for another input item or dispatch request"
+                    )
             elif (
                 row.item_id != item_id
                 or bytes(row.dispatch_request_hash or b"") != dispatch_request_hash

@@ -1197,6 +1197,48 @@ class SessionEventInput(BaseModel):
     created_by: str | None = None
 
 
+class TurnOperationRequest(BaseModel):
+    """Versioned, replay-safe request for one user-message turn."""
+
+    version: Literal["v1alpha1"] = "v1alpha1"
+    event: SessionEventInput
+
+    @model_validator(mode="after")
+    def _user_message_only(self) -> TurnOperationRequest:
+        if self.event.type != "message" or self.event.data.get("role") != "user":
+            raise ValueError("turn operations require one user message event")
+        if self.event.created_by is not None:
+            raise ValueError("created_by is server-owned on turn operations")
+        return self
+
+
+class TurnOperationResponse(BaseModel):
+    """Public status projection of a durable server-to-runner turn."""
+
+    object: Literal["turn_operation"] = "turn_operation"
+    version: Literal["v1alpha1"] = "v1alpha1"
+    id: str
+    session_id: str
+    state: Literal[
+        "accepted",
+        "input_persisted",
+        "dispatched",
+        "dispatch_unknown",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "timed_out",
+    ]
+    item_id: str | None = None
+    dispatch_attempts: int = 0
+    created_at: int
+    updated_at: int | None = None
+    terminal_at: int | None = None
+    error_code: str | None = None
+    error: str | None = None
+    replayed: bool | None = None
+
+
 class SessionGitOptions(BaseModel):
     """
     Git worktree options for ``POST /v1/sessions``.

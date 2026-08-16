@@ -89,6 +89,47 @@ def test_create_and_exact_replay_return_one_operation(
     assert "workflow-principal" not in first.request_json
 
 
+def test_prepare_freezes_input_without_claiming_it_is_persisted(
+    store: SqlAlchemyTurnOperationStore,
+) -> None:
+    operation, _ = _create(store)
+    item_id = _uid("prepared-item")
+    dispatch = {"type": "message", "content": "build it"}
+
+    prepared = store.prepare_input(operation.id, item_id, dispatch)
+    replay = store.prepare_input(operation.id, item_id, dispatch)
+
+    assert prepared.state == "accepted"
+    assert prepared.item_id == item_id
+    assert prepared.dispatch_request_json is not None
+    assert replay == prepared
+
+    persisted = store.mark_input_persisted(operation.id, item_id, dispatch)
+    assert persisted.state == "input_persisted"
+    assert persisted.item_id == item_id
+
+
+def test_prepare_rejects_item_or_dispatch_drift(
+    store: SqlAlchemyTurnOperationStore,
+) -> None:
+    operation, _ = _create(store)
+    item_id = _uid("prepared-item")
+    store.prepare_input(operation.id, item_id, {"type": "message", "content": "build it"})
+
+    with pytest.raises(TurnOperationStateError, match="already prepared"):
+        store.prepare_input(
+            operation.id,
+            _uid("other-item"),
+            {"type": "message", "content": "build it"},
+        )
+    with pytest.raises(TurnOperationStateError, match="already prepared"):
+        store.prepare_input(
+            operation.id,
+            item_id,
+            {"type": "message", "content": "changed"},
+        )
+
+
 def test_same_key_changed_body_conflicts(store: SqlAlchemyTurnOperationStore) -> None:
     _create(store)
     with pytest.raises(TurnOperationConflict, match="another request"):

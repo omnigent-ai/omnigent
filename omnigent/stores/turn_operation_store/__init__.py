@@ -40,6 +40,16 @@ class TurnOperationStore(ABC):
         ...
 
     @abstractmethod
+    def prepare_input(
+        self,
+        operation_id: str,
+        item_id: str,
+        dispatch_request: dict[str, Any],
+    ) -> TurnOperation:
+        """Freeze the deterministic item identity and runner request."""
+        ...
+
+    @abstractmethod
     def mark_input_persisted(
         self,
         operation_id: str,

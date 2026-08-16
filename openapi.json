@@ -4112,6 +4112,67 @@
         "title": "SessionCreatedEvent",
         "type": "object"
       },
+      "SessionEventInput": {
+        "description": "A single client-submitted event/input item for a session.\n\nUsed both as an element of `initial_items` on session\ncreation and as the body of `POST /v1/sessions/{id}/events`.\nCarries a discriminator (`type`) and a free-form `data`\npayload whose shape is interpreted by the route layer based\non `type` (e.g. user message, function-call output,\napproval, interrupt).",
+        "properties": {
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional internal attribution actor for runner- originated events that are triggered by a prior human turn.",
+            "title": "Created By"
+          },
+          "data": {
+            "additionalProperties": true,
+            "description": "Type-specific payload. Shape varies by `type`; for `\"message\"` this looks like `{\"role\": \"user\", \"content\": [{\"type\": \"input_text\", \"text\": \"Hello\"}]}`. For `\"interrupt\"` this is typically `{}`.",
+            "title": "Data",
+            "type": "object"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional per-event LLM model override used when this event starts a fresh agent turn. Distinct from the session's bound agent; it substitutes for the agent spec's `llm.model` for that turn.",
+            "title": "Model Override"
+          },
+          "tools": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional OpenAI function-tool dicts registered when this event creates a new task. Mirrors `CreateResponseRequest.tools`, e.g. `[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"...\", \"parameters\": {...}}}]`. Ignored when the event steers into an active task: that task's tools are fixed at start time.",
+            "title": "Tools"
+          },
+          "type": {
+            "description": "Discriminator for the event/input kind, e.g. `\"message\"`, `\"function_call_output\"`, `\"interrupt\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "SessionEventInput",
+        "type": "object"
+      },
       "SessionForkRequest": {
         "additionalProperties": false,
         "description": "Request body for `POST /v1/sessions/{source_id}/fork`.\n\nCreates a deep copy of an existing session's items into a new\nsession. All fields are optional.",
@@ -6648,6 +6709,147 @@
           "session_id"
         ],
         "title": "TurnFailedEvent",
+        "type": "object"
+      },
+      "TurnOperationRequest": {
+        "description": "Versioned, replay-safe request for one user-message turn.",
+        "properties": {
+          "event": {
+            "$ref": "#/components/schemas/SessionEventInput"
+          },
+          "version": {
+            "const": "v1alpha1",
+            "default": "v1alpha1",
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event"
+        ],
+        "title": "TurnOperationRequest",
+        "type": "object"
+      },
+      "TurnOperationResponse": {
+        "description": "Public status projection of a durable server-to-runner turn.",
+        "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "integer"
+          },
+          "dispatch_attempts": {
+            "default": 0,
+            "title": "Dispatch Attempts",
+            "type": "integer"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "item_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Id"
+          },
+          "object": {
+            "const": "turn_operation",
+            "default": "turn_operation",
+            "title": "Object",
+            "type": "string"
+          },
+          "replayed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replayed"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "accepted",
+              "input_persisted",
+              "dispatched",
+              "dispatch_unknown",
+              "succeeded",
+              "failed",
+              "cancelled",
+              "timed_out"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "terminal_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminal At"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "version": {
+            "const": "v1alpha1",
+            "default": "v1alpha1",
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "session_id",
+          "state",
+          "created_at"
+        ],
+        "title": "TurnOperationResponse",
         "type": "object"
       },
       "TurnStartedEvent": {
@@ -12724,6 +12926,120 @@
           }
         },
         "summary": "Switch Session Agent",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/turn-operations": {
+      "post": {
+        "description": "Submit or exactly replay one durable user-message turn.",
+        "operationId": "post_turn_operation_v1_sessions__session_id__turn_operations_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TurnOperationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnOperationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Turn Operation",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/turn-operations/{operation_id}": {
+      "get": {
+        "description": "Return and, when possible, reconcile one durable turn.",
+        "operationId": "get_turn_operation_v1_sessions__session_id__turn_operations__operation_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "title": "Operation Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnOperationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Turn Operation",
         "tags": [
           "sessions"
         ]

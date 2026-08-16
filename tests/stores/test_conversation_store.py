@@ -607,6 +607,91 @@ def test_append_tool_output_with_nul_bytes(
     assert [r.id for r in results] == [item_id]
 
 
+def test_append_idempotent_replays_exact_item_and_rejects_drift(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    conv = conversation_store.create_conversation()
+    item_id = "a" * 32
+    item = NewConversationItem(
+        type="message",
+        response_id="turn_" + item_id,
+        data=MessageData(
+            role="user",
+            content=[{"type": "input_text", "text": "build it"}],
+        ),
+        created_by="alice@example.com",
+    )
+
+    first, created = conversation_store.append_idempotent(conv.id, item, item_id)
+    with get_or_create_engine(db_uri).begin() as connection:
+        connection.execute(
+            text("UPDATE conversations SET updated_at = 123 WHERE id = :id"),
+            {"id": bytes.fromhex(conv.id)},
+        )
+    replay, replay_created = conversation_store.append_idempotent(conv.id, item, item_id)
+
+    assert created is True
+    assert replay_created is False
+    assert replay == first
+    assert first.id == item_id
+    assert conversation_store.get_conversation(conv.id).updated_at == 123
+    assert len(conversation_store.list_items(conv.id).data) == 1
+
+    changed = item.model_copy(
+        update={
+            "data": MessageData(
+                role="user",
+                content=[{"type": "input_text", "text": "different"}],
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="different content"):
+        conversation_store.append_idempotent(conv.id, changed, item_id)
+
+
+def test_concurrent_idempotent_append_creates_one_item(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    import threading
+
+    conv = conversation_store.create_conversation()
+    item_id = "b" * 32
+    item = NewConversationItem(
+        type="message",
+        response_id="turn_" + item_id,
+        data=MessageData(
+            role="user",
+            content=[{"type": "input_text", "text": "build once"}],
+        ),
+    )
+    barrier = threading.Barrier(8, timeout=10.0)
+    results: list[tuple[str, bool]] = []
+    errors: list[Exception] = []
+    lock = threading.Lock()
+
+    def _append() -> None:
+        try:
+            barrier.wait()
+            persisted, created = conversation_store.append_idempotent(conv.id, item, item_id)
+            with lock:
+                results.append((persisted.id, created))
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=_append) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30.0)
+
+    assert errors == []
+    assert results.count((item_id, True)) == 1
+    assert results.count((item_id, False)) == 7
+    assert [stored.id for stored in conversation_store.list_items(conv.id).data] == [item_id]
+
+
 def test_append_reasoning_item(conversation_store: SqlAlchemyConversationStore) -> None:
     conv = conversation_store.create_conversation()
     items = conversation_store.append(
