@@ -3916,19 +3916,20 @@ export function NewChatLandingScreen() {
   );
 
   return (
-    // pb-12 lifts the content slightly above the geometric center, where
-    // the hero reads better optically.
+    // Phone: column fills the pane so the composer docks at the bottom
+    // (same place as the in-session chat box). Desktop: the block stays
+    // optically centered; pb-16 lifts it slightly above geometric center.
     <div
       ref={setLandingSurface}
-      className="relative flex flex-1 items-center justify-center"
+      className="relative flex min-h-0 flex-1 flex-col md:items-center md:justify-center"
       data-testid="new-chat-landing"
     >
       {/* Padding lives inside the 840px cap, so the composer renders at
           840 − 80 = 760px max on desktop. px-4 on phones (16px gutters)
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
-      <div className="flex w-full max-w-[840px] flex-col items-center gap-6 px-4 pt-8 pb-16 md:select-none md:px-10">
-        <div className="flex w-full flex-col items-center justify-center gap-3.5">
+      <div className="flex min-h-0 w-full max-w-[840px] flex-1 flex-col items-center px-4 pt-8 pb-[max(1rem,var(--omnigent-inset-bottom))] md:flex-none md:gap-6 md:select-none md:px-10 md:pb-16">
+        <div className="flex min-h-0 w-full flex-1 flex-col items-center justify-center gap-3.5 md:flex-none">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the same folder
             // icon the sidebar uses for a project, and name the project. Sized
@@ -4918,7 +4919,7 @@ export function NewChatLandingScreen() {
       </div>
 
       {poweredBy ? (
-        <footer className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center pb-4">
+        <footer className="pointer-events-none absolute inset-x-0 bottom-0 hidden justify-center pb-4 md:flex">
           <div className="pointer-events-auto">
             <PoweredByOmnigent />
           </div>

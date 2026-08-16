@@ -913,6 +913,18 @@ describe("NewChatLandingScreen", () => {
     expect(footer.parentElement).toHaveClass("gap-1");
   });
 
+  it("docks the composer to the bottom on phones and keeps it centered on desktop", () => {
+    renderLanding();
+
+    const landing = screen.getByTestId("new-chat-landing");
+    expect(landing).toHaveClass("flex-col", "md:items-center", "md:justify-center");
+    expect(landing.className.split(/\s+/)).not.toContain("items-center");
+    expect(landing.className.split(/\s+/)).not.toContain("justify-center");
+
+    const column = landing.firstElementChild;
+    expect(column).toHaveClass("flex-1", "md:flex-none");
+  });
+
   it("preserves the typed message and attachments when the landing screen unmounts and remounts", () => {
     // Navigating into an existing session and back unmounts the landing
     // screen; the draft is stashed at module scope so the half-composed
