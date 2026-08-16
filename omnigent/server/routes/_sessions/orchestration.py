@@ -573,6 +573,8 @@ async def _best_effort_stop(
     session_id: str,
     conversation_store: ConversationStore,
     runner_router: Any,
+    *,
+    force_own_stop: bool = False,
 ) -> None:
     """Stop a running session before a destructive lifecycle action.
 
@@ -592,6 +594,12 @@ async def _best_effort_stop(
     :param conversation_store: Store for descendant-id lookup.
     :param runner_router: The ``RunnerRouter`` for runner-client
         resolution, or ``None`` in tests / in-process setups.
+    :param force_own_stop: Stop ``session_id`` itself regardless of its
+        current status. Used by a deferred archive stop, where the
+        session was live at the moment the archive was requested but
+        may have already gone idle by the time this runs — the caller
+        captures that liveness once, upfront, rather than this function
+        re-deriving it from the (now stale) current status.
     """
     try:
         descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
@@ -611,7 +619,7 @@ async def _best_effort_stop(
     has_background_tasks = (
         own_status != "failed" and _session_background_task_count_cache.get(session_id, 0) > 0
     )
-    if status != "running" and not has_background_tasks:
+    if not force_own_stop and status != "running" and not has_background_tasks:
         return
 
     async def _stop(target_id: str) -> None:
@@ -624,7 +632,7 @@ async def _best_effort_stop(
                 exc_info=True,
             )
 
-    if own_status == "running" or has_background_tasks:
+    if force_own_stop or own_status == "running" or has_background_tasks:
         await _stop(session_id)
     for descendant_id in descendant_ids:
         if _session_status_cache.get(descendant_id) in ("running", "waiting"):
@@ -695,27 +703,27 @@ async def _archive_stop(
         running state (bounded by ``_ARCHIVE_IDLE_WAIT_TIMEOUT_S``). Set by
         a self-archive, which lands mid-turn.
     """
-    # Once the wait settles the session to idle, ``_best_effort_stop``'s own
-    # "is it currently running" gate would read that as nothing to do — but
-    # the wait's whole point was to let a mid-turn self-archive's turn end
-    # so the runner can still be stopped, so that gate must be bypassed here.
-    force_own_stop = False
+    # Capture liveness BEFORE the wait: that is the state the archive was
+    # requested against. By the time the wait resolves the session usually
+    # reads idle, and _best_effort_stop's own current-status gate would
+    # then see nothing to do — force_own_stop carries the pre-wait verdict
+    # through so a session that WAS live still gets stopped once, while a
+    # session that was already idle (nothing to stop) still stops nothing.
+    was_live = False
     if wait_for_idle:
+        own_status_before = _session_status_from_cache(session_id)
+        has_background_tasks_before = (
+            own_status_before != "failed"
+            and _session_background_task_count_cache.get(session_id, 0) > 0
+        )
+        was_live = own_status_before == "running" or has_background_tasks_before
         await _wait_for_session_idle(session_id)
-        force_own_stop = _session_status_from_cache(session_id) != "running"
     # Resolve through the facade so a test's monkeypatch is honored here.
     from omnigent.server.routes import sessions as _facade
 
-    await _facade._best_effort_stop(session_id, conversation_store, runner_router)
-    if force_own_stop:
-        try:
-            await _stop_session_via_runner(session_id, runner_router)
-        except Exception:  # noqa: BLE001
-            _logger.debug(
-                "Deferred archive stop failed for %s; proceeding anyway",
-                session_id,
-                exc_info=True,
-            )
+    await _facade._best_effort_stop(
+        session_id, conversation_store, runner_router, force_own_stop=was_live
+    )
     try:
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     except Exception:  # noqa: BLE001

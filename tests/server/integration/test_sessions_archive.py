@@ -163,7 +163,7 @@ async def test_archive_does_not_block_on_slow_stop(
     release = asyncio.Event()
     stopped: list[str] = []
 
-    async def _parked_stop(sid: str, *_args: object) -> None:
+    async def _parked_stop(sid: str, *_args: object, **_kwargs: object) -> None:
         stopped.append(sid)
         await release.wait()
 
@@ -353,13 +353,13 @@ async def test_archive_proceeds_when_child_lookup_fails(
         ):
             orig = _sessions_orchestration._best_effort_stop
 
-            async def _patched_stop(sid, cs, rr):
+            async def _patched_stop(sid, cs, rr, **kwargs):
                 with patch.object(
                     cs,
                     "list_child_conversation_ids_by_parent",
                     side_effect=RuntimeError("transient DB error"),
                 ):
-                    await orig(sid, cs, rr)
+                    await orig(sid, cs, rr, **kwargs)
 
             with patch.object(_sessions_facade, "_best_effort_stop", _patched_stop):
                 resp = await client.patch(
@@ -518,6 +518,63 @@ async def test_stop_when_idle_is_inert_without_archive(
         mock_stop.assert_not_awaited()
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_stop_when_idle_with_background_task_stops_exactly_once(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A background shell that outlives the turn still stops exactly once.
+
+    The deferred wait resolves once the session reads idle, at which
+    point ``_best_effort_stop``'s own background-task gate would *also*
+    decide to stop the same session — the own-session stop must not be
+    dispatched twice.
+    """
+    session = await create_test_session(client, name="archive-defer-background")
+    session_id = session["id"]
+
+    mock_stop = AsyncMock(return_value=True)
+    monkeypatch.setattr(_sessions_orchestration, "_ARCHIVE_IDLE_POLL_INTERVAL_S", 0.01)
+    _sessions_common._session_status_cache[session_id] = "running"
+    _sessions_common._session_background_task_count_cache[session_id] = 1
+    try:
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
+            resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True, "stop_when_idle": True},
+            )
+            assert resp.status_code == 200
+            # Turn ends, but the background shell is still counted as live.
+            _sessions_common._session_status_cache[session_id] = "idle"
+            await _drain_detached_stops()
+        mock_stop.assert_awaited_once()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+        _sessions_common._session_background_task_count_cache.pop(session_id, None)
+
+
+async def test_stop_when_idle_on_already_idle_session_stops_nothing(
+    client: httpx.AsyncClient,
+) -> None:
+    """A session already idle (no background work) when the PATCH lands has
+    nothing to stop, matching the immediate archive path."""
+    session = await create_test_session(client, name="archive-defer-already-idle")
+    session_id = session["id"]
+
+    mock_stop = AsyncMock(return_value=True)
+    try:
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
+            resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True, "stop_when_idle": True},
+            )
+            assert resp.status_code == 200
+            await _drain_detached_stops()
+        mock_stop.assert_not_awaited()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+        _sessions_common._session_background_task_count_cache.pop(session_id, None)
 
 
 # ── Agent contents download ──────────────────────────────
