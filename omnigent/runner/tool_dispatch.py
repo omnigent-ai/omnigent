@@ -82,6 +82,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
+from omnigent.tools.builtins.session_archive import SysSessionArchiveTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -294,7 +295,7 @@ _SESSION_QUERY_TOOLS = frozenset(
     }
 )
 
-_SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
+_SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name(), SysSessionArchiveTool.name()})
 
 # Grantee sentinel for an anonymous, public read-only share. Mirrors the
 # server's RESERVED_USER_PUBLIC; only specs with
@@ -548,6 +549,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysSessionGetHistoryTool,
             SysSessionGetInfoTool,
             SysSessionRenameTool,
+            SysSessionArchiveTool,
             SysAgentGetTool,
             SysAgentListTool,
             SysAgentDownloadTool,
@@ -4541,6 +4543,81 @@ async def _rename_current_session_via_rest(
     return json.dumps(payload)
 
 
+async def _archive_current_session_via_rest(
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """
+    Archive the calling session through ``PATCH /v1/sessions/{id}``.
+
+    The target is always the caller — the tool takes no arguments, so an
+    agent can archive itself and nothing else. ``stop_when_idle`` asks the
+    server to hold the teardown until this turn ends; without it the archive's
+    stop would kill the turn that made the call.
+
+    :param conversation_id: The calling session id, e.g. ``"conv_self"``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: JSON ``{"archived": true, "conversation_id": ...}``, or a JSON
+        error object (``session_not_found`` for 404,
+        ``session_archive_forbidden`` for 401/403).
+    """
+    if server_client is None:
+        return json.dumps({"error": "sys_session_archive requires server access"})
+    if conversation_id is None:
+        return json.dumps({"error": "sys_session_archive requires a session id"})
+    try:
+        resp = await server_client.patch(
+            f"/v1/sessions/{conversation_id}",
+            json={"archived": True, "stop_when_idle": True},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_archive failed: {exc}"})
+    if resp.status_code == 404:
+        return json.dumps({"error": "session_not_found", "conversation_id": conversation_id})
+    if resp.status_code in (401, 403):
+        return json.dumps(
+            {
+                "error": "session_archive_forbidden",
+                "conversation_id": conversation_id,
+                "message": "only the session owner can archive this session.",
+            }
+        )
+    if resp.status_code >= 400:
+        return json.dumps(
+            {
+                "error": f"sys_session_archive returned {resp.status_code}",
+                "detail": resp.text[:200],
+            }
+        )
+    return json.dumps({"archived": True, "conversation_id": conversation_id})
+
+
+async def _execute_session_self_write_tool(
+    tool_name: str,
+    args: _JsonObject,
+    *,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """
+    Runner-local handler for the self-targeted session writes.
+
+    Both tools act on the caller's own session and ignore any target id in
+    ``args``: ``sys_session_rename`` retitles it, ``sys_session_archive``
+    archives it.
+
+    :param tool_name: ``"sys_session_rename"`` or ``"sys_session_archive"``.
+    :param args: Parsed JSON arguments from the LLM.
+    :param conversation_id: The calling session id.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: Tool output JSON string.
+    """
+    if tool_name == SysSessionArchiveTool.name():
+        return await _archive_current_session_via_rest(conversation_id, server_client)
+    return await _rename_current_session_via_rest(args, conversation_id, server_client)
+
+
 async def _collect_sub_agents(
     conversation_id: str,
     server_client: httpx.AsyncClient,
@@ -5148,10 +5225,11 @@ async def execute_tool(
                 runner_workspace=runner_workspace,
             )
         elif tool_name in _SESSION_SELF_WRITE_TOOLS:
-            output = await _rename_current_session_via_rest(
+            output = await _execute_session_self_write_tool(
+                tool_name,
                 args,
-                conversation_id,
-                server_client,
+                conversation_id=conversation_id,
+                server_client=server_client,
             )
         elif tool_name in _SESSION_QUERY_TOOLS:
             output = await _execute_session_query_tool(

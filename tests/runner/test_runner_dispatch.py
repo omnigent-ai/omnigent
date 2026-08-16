@@ -7639,3 +7639,134 @@ async def test_spawn_async_tool_phase_tool_call_policy_allow(
     item = inbox.get_nowait()
     assert item["status"] == "completed"
     assert item["output"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_archive_patches_own_session_with_deferred_stop() -> None:
+    """
+    The tool archives the CALLER and asks the server to defer the stop
+    until this turn ends — the PATCH pairs ``archived: true`` with
+    ``stop_when_idle: true`` so a session archiving itself mid-turn still
+    finishes that turn before the runner is stopped.
+    """
+    from omnigent.runner.tool_dispatch import _archive_current_session_via_rest
+
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"id": "conv_self", "archived": True})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await _archive_current_session_via_rest("conv_self", server_client)
+
+    assert requests == [
+        ("PATCH", "/v1/sessions/conv_self", {"archived": True, "stop_when_idle": True})
+    ]
+    assert json.loads(output) == {"archived": True, "conversation_id": "conv_self"}
+
+
+@pytest.mark.asyncio
+async def test_sys_session_archive_ignores_any_supplied_target() -> None:
+    """
+    A model that invents a ``conversation_id`` argument still only archives
+    itself — the tool takes no arguments, so the URL is built from the
+    caller's own session id, never from ``args``.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_self_write_tool
+
+    requested_paths: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        return httpx.Response(200, json={"id": "conv_self", "archived": True})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await _execute_session_self_write_tool(
+            "sys_session_archive",
+            {"conversation_id": "conv_someone_else"},
+            conversation_id="conv_self",
+            server_client=server_client,
+        )
+
+    assert requested_paths == ["/v1/sessions/conv_self"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status_code,expected_error",
+    [
+        pytest.param(404, "session_not_found", id="not-found"),
+        pytest.param(403, "session_archive_forbidden", id="forbidden"),
+        pytest.param(401, "session_archive_forbidden", id="unauthorized"),
+    ],
+)
+async def test_sys_session_archive_maps_error_statuses(
+    status_code: int,
+    expected_error: str,
+) -> None:
+    """
+    HTTP failures become typed tool errors, never tracebacks: a 404 maps
+    to ``session_not_found``; 401/403 (not the session owner) map to
+    ``session_archive_forbidden``.
+    """
+    from omnigent.runner.tool_dispatch import _archive_current_session_via_rest
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"detail": "nope"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await _archive_current_session_via_rest("conv_self", server_client)
+
+    assert json.loads(output)["error"] == expected_error
+
+
+@pytest.mark.asyncio
+async def test_sys_session_archive_reports_unsupported_server() -> None:
+    """
+    An older server that rejects the unknown ``stop_when_idle`` field
+    (422, since ``UpdateSessionRequest`` is ``extra="forbid"``) reads as a
+    typed error instead of raising.
+    """
+    from omnigent.runner.tool_dispatch import _archive_current_session_via_rest
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"detail": "extra fields not permitted"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await _archive_current_session_via_rest("conv_self", server_client)
+
+    assert "422" in json.loads(output)["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_archive_requires_a_session_id() -> None:
+    """No caller session id → a clean error, not an f-string with ``None`` in the URL."""
+    from omnigent.runner.tool_dispatch import _archive_current_session_via_rest
+
+    output = await _archive_current_session_via_rest(None, object())  # type: ignore[arg-type]
+
+    assert "requires a session id" in json.loads(output)["error"]
+
+
+def test_sys_session_archive_dispatches_locally_and_relays_natively() -> None:
+    """The new tool rides the same local-dispatch and native-relay paths as sys_session_rename."""
+    from omnigent.runner.tool_dispatch import (
+        _NATIVE_RELAY_BUILTIN_TOOLS,
+        should_dispatch_locally,
+    )
+
+    assert should_dispatch_locally("sys_session_archive") is True
+    assert "sys_session_archive" in _NATIVE_RELAY_BUILTIN_TOOLS
