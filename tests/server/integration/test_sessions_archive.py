@@ -416,6 +416,109 @@ async def test_unarchive_skips_stop(
         _sessions_common._session_status_cache.pop(session_id, None)
 
 
+# ── stop_when_idle deferred archive stop ─────────────────
+
+
+async def test_stop_when_idle_defers_stop_until_turn_ends(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A self-archive mid-turn does not stop the runner until the turn ends."""
+    session = await create_test_session(client, name="archive-defer")
+    session_id = session["id"]
+
+    mock_stop = AsyncMock(return_value=True)
+    monkeypatch.setattr(_sessions_orchestration, "_ARCHIVE_IDLE_POLL_INTERVAL_S", 0.01)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
+            resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True, "stop_when_idle": True},
+            )
+            assert resp.status_code == 200
+            assert resp.json()["archived"] is True
+            # Still running: the stop must be parked, not issued.
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+            mock_stop.assert_not_awaited()
+            # Turn ends → the deferred stop proceeds.
+            _sessions_common._session_status_cache[session_id] = "idle"
+            await _drain_detached_stops()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_stop_when_idle_times_out_and_tears_down_anyway(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session that never reports idle still gets torn down, bounded."""
+    session = await create_test_session(client, name="archive-defer-timeout")
+    session_id = session["id"]
+
+    monkeypatch.setattr(_sessions_orchestration, "_ARCHIVE_IDLE_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(_sessions_orchestration, "_ARCHIVE_IDLE_WAIT_TIMEOUT_S", 0.05)
+    mock_stop = AsyncMock(return_value=True)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
+            resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True, "stop_when_idle": True},
+            )
+            assert resp.status_code == 200
+            await _drain_detached_stops()
+        mock_stop.assert_awaited_once()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_archive_without_stop_when_idle_stops_immediately(
+    client: httpx.AsyncClient,
+) -> None:
+    """The human-initiated archive keeps stopping a running session at once."""
+    session = await create_test_session(client, name="archive-no-defer")
+    session_id = session["id"]
+
+    mock_stop = AsyncMock(return_value=True)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
+            resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True},
+            )
+            await _drain_detached_stops()
+        assert resp.status_code == 200
+        mock_stop.assert_awaited_once()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_stop_when_idle_is_inert_without_archive(
+    client: httpx.AsyncClient,
+) -> None:
+    """``stop_when_idle`` alone neither archives nor stops anything."""
+    session = await create_test_session(client, name="archive-flag-only")
+    session_id = session["id"]
+
+    mock_stop = AsyncMock(return_value=True)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
+            resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"title": "still running", "stop_when_idle": True},
+            )
+            await _drain_detached_stops()
+        assert resp.status_code == 200
+        assert resp.json()["archived"] is False
+        mock_stop.assert_not_awaited()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
 # ── Agent contents download ──────────────────────────────
 
 

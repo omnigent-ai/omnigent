@@ -635,12 +635,42 @@ async def _best_effort_stop(
 # garbage-collected mid-stop (asyncio only holds weak refs to tasks).
 _detached_stop_tasks: set[asyncio.Task[None]] = set()
 
+# Bounds for a deferred archive stop (``stop_when_idle``). A self-archive
+# lands mid-turn, so the teardown waits for that turn to end — but a session
+# that never reports idle (wedged runner, harness that stops publishing) must
+# still be torn down, so the wait is capped.
+_ARCHIVE_IDLE_WAIT_TIMEOUT_S = 300.0
+_ARCHIVE_IDLE_POLL_INTERVAL_S = 0.5
+
+
+async def _wait_for_session_idle(session_id: str) -> None:
+    """
+    Wait for a session to leave the running state, bounded by a timeout.
+
+    Reads the relay-fed ``_session_status_cache``. An unknown status
+    (no cache entry) counts as not-running: a session with no live
+    relay has no turn to protect.
+
+    :param session_id: Session/conversation identifier.
+    """
+    deadline = time.monotonic() + _ARCHIVE_IDLE_WAIT_TIMEOUT_S
+    while _session_status_cache.get(session_id) in ("running", "waiting"):
+        if time.monotonic() >= deadline:
+            _logger.info(
+                "Deferred archive stop for %s timed out waiting for idle; tearing down anyway",
+                session_id,
+            )
+            return
+        await asyncio.sleep(_ARCHIVE_IDLE_POLL_INTERVAL_S)
+
 
 async def _archive_stop(
     session_id: str,
     conversation_store: ConversationStore,
     runner_router: Any,
     host_registry: Any,
+    *,
+    wait_for_idle: bool = False,
 ) -> None:
     """
     Stop an archived session and tear down its host-launched runner.
@@ -661,7 +691,12 @@ async def _archive_stop(
         resolution, or ``None`` in tests / in-process setups.
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
+    :param wait_for_idle: Defer the teardown until the session leaves the
+        running state (bounded by ``_ARCHIVE_IDLE_WAIT_TIMEOUT_S``). Set by
+        a self-archive, which lands mid-turn.
     """
+    if wait_for_idle:
+        await _wait_for_session_idle(session_id)
     # Resolve through the facade so a test's monkeypatch is honored here.
     from omnigent.server.routes import sessions as _facade
 
@@ -705,6 +740,8 @@ def _spawn_archive_stop(
     conversation_store: ConversationStore,
     runner_router: Any,
     host_registry: Any = None,
+    *,
+    wait_for_idle: bool = False,
 ) -> None:
     """
     Run :func:`_archive_stop` as a retained background task.
@@ -721,9 +758,17 @@ def _spawn_archive_stop(
         resolution, or ``None`` in tests / in-process setups.
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
+    :param wait_for_idle: Defer the teardown until the session leaves the
+        running state. Forwarded to :func:`_archive_stop`.
     """
     task = asyncio.create_task(
-        _archive_stop(session_id, conversation_store, runner_router, host_registry)
+        _archive_stop(
+            session_id,
+            conversation_store,
+            runner_router,
+            host_registry,
+            wait_for_idle=wait_for_idle,
+        )
     )
     _detached_stop_tasks.add(task)
     task.add_done_callback(_detached_stop_tasks.discard)

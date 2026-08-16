@@ -2006,6 +2006,14 @@ class UpdateSessionRequest(BaseModel):
         session from the default sidebar listing), ``False`` unarchives,
         ``None`` leaves unchanged. Owner-only (unlike ``title``, which
         needs only edit access).
+    :param stop_when_idle: Only meaningful alongside ``archived: true``.
+        When ``True``, the archive's teardown waits for the session to
+        leave the running state before stopping it, instead of stopping
+        it immediately. A session archiving ITSELF (``sys_session_archive``)
+        is mid-turn by definition, so an immediate stop would kill the
+        turn that asked to be archived. Bounded: the teardown proceeds
+        anyway once the wait times out. Default ``False`` keeps the
+        user-driven archive's stop-now behaviour.
     :param project_id: File this session into a first-class project (see
         ``designs/PROJECTS_PRD.md``). A non-empty id moves the session into
         that project; the empty string ``""`` unfiles it. **Omitting** the
@@ -2027,6 +2035,7 @@ class UpdateSessionRequest(BaseModel):
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
+    stop_when_idle: bool = False
     project_id: str | None = None
     silent: bool = False
 

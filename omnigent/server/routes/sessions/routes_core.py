@@ -1786,6 +1786,7 @@ def register_core_routes(
                 conversation_store,
                 runner_router,
                 getattr(request.app.state, "host_registry", None),
+                wait_for_idle=body.stop_when_idle,
             )
         # Notify the runner of effort / model changes so harnesses
         # that can't re-read these from store at turn boundaries

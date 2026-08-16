@@ -6686,6 +6686,12 @@
             "title": "Silent",
             "type": "boolean"
           },
+          "stop_when_idle": {
+            "default": false,
+            "description": "Only meaningful alongside `archived: true`. When `True`, the archive's teardown waits for the session to leave the running state before stopping it, instead of stopping it immediately. A session archiving ITSELF (`sys_session_archive`) is mid-turn by definition, so an immediate stop would kill the turn that asked to be archived. Bounded: the teardown proceeds anyway once the wait times out. Default `False` keeps the user-driven archive's stop-now behaviour.",
+            "title": "Stop When Idle",
+            "type": "boolean"
+          },
           "subagent_routing_override": {
             "anyOf": [
               {
