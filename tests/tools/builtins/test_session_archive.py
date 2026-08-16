@@ -1,4 +1,4 @@
-"""Unit tests for the ``sys_session_archive`` builtin schema."""
+"""Unit tests for :mod:`omnigent.tools.builtins.session_archive`."""
 
 from __future__ import annotations
 

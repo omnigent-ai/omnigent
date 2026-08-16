@@ -643,16 +643,12 @@ async def _best_effort_stop(
 # garbage-collected mid-stop (asyncio only holds weak refs to tasks).
 _detached_stop_tasks: set[asyncio.Task[None]] = set()
 
-# The in-flight deferred archive stop per session, if any. A retried
-# archive PATCH against a session that already has one pending must not
-# stack a second poller — each poller ends in its own own-session stop,
-# so N pollers would issue N stop RPCs for one archive.
+# The in-flight deferred archive stop per session, if any. Guards a
+# retried archive PATCH from stacking a second poller for one archive.
 _in_flight_archive_stops: dict[str, asyncio.Task[None]] = {}
 
-# Bounds for a deferred archive stop (``stop_when_idle``). A self-archive
-# lands mid-turn, so the teardown waits for that turn to end — but a session
-# that never reports idle (wedged runner, harness that stops publishing) must
-# still be torn down, so the wait is capped.
+# Bounds for a deferred archive stop (``stop_when_idle``): how long to
+# wait for the in-progress turn to end before tearing down anyway.
 _ARCHIVE_IDLE_WAIT_TIMEOUT_S = 300.0
 _ARCHIVE_IDLE_POLL_INTERVAL_S = 0.5
 
@@ -664,6 +660,10 @@ async def _wait_for_session_idle(session_id: str) -> None:
     Reads the relay-fed ``_session_status_cache``. An unknown status
     (no cache entry) counts as not-running: a session with no live
     relay has no turn to protect.
+
+    A session that never reports idle (wedged runner, harness that
+    stops publishing) must still be torn down, so the wait is capped
+    at ``_ARCHIVE_IDLE_WAIT_TIMEOUT_S``.
 
     :param session_id: Session/conversation identifier.
     """
@@ -699,6 +699,14 @@ async def _archive_stop(
     Every step is best-effort: a wedged, offline, or already-stopped
     runner must not leave the session un-archived.
 
+    When ``wait_for_idle`` is set, liveness is captured before the wait
+    runs: that is the state the archive was requested against, since by
+    the time the wait resolves the session usually reads idle already
+    and would otherwise look like nothing to stop. Archived status is
+    then re-checked right before stopping, because the wait gives a
+    user time to notice the session, unarchive it, and resume work —
+    and that unarchive must win over a stale stop.
+
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store for descendant and row lookups.
     :param runner_router: The ``RunnerRouter`` for runner-client
@@ -709,12 +717,9 @@ async def _archive_stop(
         running state (bounded by ``_ARCHIVE_IDLE_WAIT_TIMEOUT_S``). Set by
         a self-archive, which lands mid-turn.
     """
-    # Capture liveness BEFORE the wait: that is the state the archive was
-    # requested against. By the time the wait resolves the session usually
-    # reads idle, and _best_effort_stop's own current-status gate would
-    # then see nothing to do — force_own_stop carries the pre-wait verdict
-    # through so a session that WAS live still gets stopped once, while a
-    # session that was already idle (nothing to stop) still stops nothing.
+    # Capture liveness before the wait so force_own_stop carries the
+    # pre-wait verdict through to _best_effort_stop's current-status
+    # gate, which would otherwise see an already-idle session.
     was_live = False
     if wait_for_idle:
         own_status_before = _session_status_from_cache(session_id)
@@ -727,12 +732,9 @@ async def _archive_stop(
     # Resolve through the facade so a test's monkeypatch is honored here.
     from omnigent.server.routes import sessions as _facade
 
-    # Re-check archived status right before stopping: a wait of up to
-    # _ARCHIVE_IDLE_WAIT_TIMEOUT_S gives a user ample time to notice the
-    # session, unarchive it, and resume work, and that unarchive must win
-    # over a stale stop. A lookup failure falls back to the old
-    # unconditional behavior (stop proceeds) rather than raising out of
-    # this detached task.
+    # Re-check archived status right before stopping: an unarchive that
+    # happened during the wait must win over a stale stop. A lookup
+    # failure lets the stop proceed rather than raise out of this task.
     try:
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     except Exception:  # noqa: BLE001
@@ -794,6 +796,11 @@ def _spawn_archive_stop(
     stop's per-runner timeouts (seconds per running session against a
     wedged or asleep runner) even though the archive proceeds
     regardless of the stop's outcome.
+
+    Only one poller runs per session (see ``_in_flight_archive_stops``):
+    each ends in its own own-session stop, so a retried archive PATCH
+    that stacked a second poller would issue duplicate stop RPCs for
+    one archive.
 
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store for descendant and row lookups.

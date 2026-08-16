@@ -68,9 +68,6 @@ describe("formatToolTitle", () => {
       verb: "List tasks",
       body: "",
     });
-  });
-
-  it("formats sys_session_archive with no arguments", () => {
     expect(formatToolTitle("sys_session_archive", {})).toEqual({
       verb: "Archive session",
       body: "",
