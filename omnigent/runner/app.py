@@ -151,6 +151,13 @@ from omnigent.runner.subagent_routing import (
     routing_class_from_snapshot,
     session_routing_class,
 )
+from omnigent.runner.turn_operations import (
+    InvalidTurnOperation,
+    RunnerTurnOperationRegistry,
+    TurnOperationCapacityError,
+    TurnOperationConflict,
+    TurnOperationStateError,
+)
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
@@ -2069,6 +2076,12 @@ def create_runner_app(
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     app.state.active_turns = _active_turns
+    _runner_incarnation_id = uuid.uuid4().hex
+    _turn_operation_registry = RunnerTurnOperationRegistry()
+    _active_operation_ids: dict[str, str] = {}
+    app.state.runner_incarnation_id = _runner_incarnation_id
+    app.state.turn_operation_registry = _turn_operation_registry
+    app.state.active_operation_ids = _active_operation_ids
     _native_pane_status: dict[str, str] = {}
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
     app.state.session_message_buffers = _session_message_buffers
@@ -3422,6 +3435,9 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        if session_id in _active_turns:
+            _interrupted_sessions.add(session_id)
+        _terminalize_turn_operation(session_id, "cancelled")
         turn_task = _active_turns.pop(session_id, None)
         if turn_task is not None and isinstance(turn_task, asyncio.Task):
             turn_task.cancel()
@@ -4979,6 +4995,24 @@ def create_runner_app(
         if process_manager is not None:
             process_manager.clear_in_flight(conv_id)
 
+    def _terminalize_turn_operation(conv_id: str, terminal_state: str) -> None:
+        """Finalize and unbind the operation owned by one live turn, if any."""
+        operation_id = _active_operation_ids.pop(conv_id, None)
+        if operation_id is None:
+            return
+        try:
+            _turn_operation_registry.mark_terminal(operation_id, terminal_state)
+        except (KeyError, TurnOperationStateError, ValueError):
+            # Lifecycle disagreement must never wedge normal turn cleanup.
+            # The status endpoint remains fail-closed at its last runner-local
+            # state and the server coordinator will reconcile.
+            _logger.exception(
+                "turn operation terminal update failed: session=%s operation=%s target=%s",
+                conv_id,
+                operation_id,
+                terminal_state,
+            )
+
     def _sweep_dead_turn_slot(conv_id: str, occupant: asyncio.Task[None] | None) -> bool:
         """Remove a completed turn and all its per-turn tokens together (identity-guarded).
 
@@ -4986,6 +5020,21 @@ def create_runner_app(
         """
         if _active_turns.get(conv_id) is not occupant:
             return False
+        was_interrupted = conv_id in _interrupted_sessions
+        occupant_failed = False
+        if isinstance(occupant, asyncio.Task) and not occupant.cancelled():
+            occupant_failed = occupant.exception() is not None
+        terminal_state = (
+            "failed"
+            if conv_id in _desynced_sessions
+            else "cancelled"
+            if was_interrupted
+            else "failed"
+            if occupant_failed
+            else "succeeded"
+        )
+        _terminalize_turn_operation(conv_id, terminal_state)
+
         _active_turns.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
         _interrupted_sessions.discard(conv_id)
@@ -5008,13 +5057,24 @@ def create_runner_app(
             )
             return
 
+        was_interrupted = conv_id in _interrupted_sessions
+        terminal_state = (
+            "failed"
+            if conv_id in _desynced_sessions
+            else "cancelled"
+            if was_interrupted
+            else "failed"
+            if error is not None
+            else "succeeded"
+        )
+        _terminalize_turn_operation(conv_id, terminal_state)
+
         _active_turns.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
         # Transport-loss ending desyncs harness from runner; flag for clean rebind.
         if error is not None and error.get("code") == "connection_error":
             _desynced_sessions.add(conv_id)
         has_buffered = bool(_session_message_buffers.get(conv_id))
-        was_interrupted = conv_id in _interrupted_sessions
         # Suppress terminal only if desync recovery claimed the token for THIS generation's epoch.
         _suppress_status = _desync_terminalized.get(conv_id) == _turn_bind_epoch.get(conv_id, 0)
         if _suppress_status:
@@ -5224,6 +5284,7 @@ def create_runner_app(
         )
         if stream_sentinel:
             _active_turns.pop(conv_id, None)
+            _terminalize_turn_operation(conv_id, "failed")
             await _forward_harness_interrupt(conv_id)
         else:
             await _cancel_inprocess_turn(conv_id)
@@ -6609,6 +6670,33 @@ def create_runner_app(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    @app.get("/v1/turn-operations/{operation_id}")
+    async def get_turn_operation(operation_id: str) -> JSONResponse:
+        """Return runner-observed status for one operation in this incarnation."""
+        try:
+            operation = _turn_operation_registry.get(operation_id)
+        except InvalidTurnOperation as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_operation_id", "detail": str(exc)},
+            )
+        if operation is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "operation_not_found",
+                    "detail": (
+                        "Operation is not known to this runner incarnation; "
+                        "do not infer that it was never dispatched."
+                    ),
+                    "runner_incarnation_id": _runner_incarnation_id,
+                },
+            )
+        return JSONResponse(
+            status_code=200,
+            content=operation.public_dict(runner_incarnation_id=_runner_incarnation_id),
+        )
+
     @app.post("/v1/sessions/{conversation_id}/events")
     async def post_session_events(
         conversation_id: str,
@@ -6630,6 +6718,33 @@ def create_runner_app(
 
         body = await request.json()
         body_type = body.get("type") if isinstance(body, dict) else None
+        raw_operation_id = body.get("operation_id") if isinstance(body, dict) else None
+        operation_id: str | None = None
+        if raw_operation_id is not None:
+            if body_type not in ("message", None):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_operation_request",
+                        "detail": "operation_id is supported only for message turns",
+                    },
+                )
+            if not isinstance(raw_operation_id, str):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_operation_id",
+                        "detail": "operation_id must be a string",
+                    },
+                )
+            try:
+                _turn_operation_registry.validate_operation_id(raw_operation_id)
+            except InvalidTurnOperation as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_operation_id", "detail": str(exc)},
+                )
+            operation_id = raw_operation_id
         _logger.info(
             "post_session_events: conv=%s type=%s active=%s buffer_len=%d content_types=%s "
             "model_override=%s",
@@ -6653,8 +6768,9 @@ def create_runner_app(
                 )
             message_body = dict(body)
             message_body["conversation_id"] = conversation_id
+            operation_request = dict(message_body) if operation_id is not None else None
 
-            if _is_native_harness(conversation_id):
+            if operation_id is None and _is_native_harness(conversation_id):
                 resource_registry.note_session_turn_started(conversation_id)
 
             _seq = _ingest_next_seq.get(conversation_id, 0)
@@ -6667,6 +6783,48 @@ def create_runner_app(
                 while _ingest_now_serving.get(conversation_id, 0) != _seq:
                     await _cond.wait()
             try:
+                if operation_id is not None and operation_request is not None:
+                    existing_operation = _turn_operation_registry.get(operation_id)
+                    if existing_operation is not None:
+                        try:
+                            replay, _created = _turn_operation_registry.reserve(
+                                operation_id=operation_id,
+                                session_id=conversation_id,
+                                request=operation_request,
+                            )
+                        except InvalidTurnOperation as exc:
+                            return JSONResponse(
+                                status_code=400,
+                                content={
+                                    "error": "invalid_operation_request",
+                                    "detail": str(exc),
+                                },
+                            )
+                        except TurnOperationConflict as exc:
+                            return JSONResponse(
+                                status_code=409,
+                                content={"error": "operation_conflict", "detail": str(exc)},
+                            )
+                        return JSONResponse(
+                            status_code=202,
+                            content={
+                                **replay.public_dict(runner_incarnation_id=_runner_incarnation_id),
+                                "detail": "Idempotent operation replay; no new turn started.",
+                            },
+                        )
+                    if conversation_id in _active_turns:
+                        return JSONResponse(
+                            status_code=409,
+                            content={
+                                "error": "session_busy",
+                                "detail": (
+                                    "A durable operation turn is already active; retry after "
+                                    "its terminal status instead of buffering or merging turns."
+                                ),
+                                "runner_incarnation_id": _runner_incarnation_id,
+                            },
+                        )
+
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
                     message_body["content"] = await _resolve_forwarded_message_content(
@@ -6734,22 +6892,61 @@ def create_runner_app(
                         },
                     )
 
-                new_item = {
+                new_item: dict[str, Any] = {
                     "type": "message",
                     "role": message_body.get("role", "user"),
                     "content": message_body.get("content", []),
                 }
-                if conversation_id in _session_histories:
-                    _session_histories[conversation_id].append(new_item)
-                else:
+                loaded_history: list[dict[str, Any]] | None = None
+                if conversation_id not in _session_histories:
                     persisted_item_id = message_body.get("persisted_item_id")
-                    loaded = await _load_history_as_input(
+                    loaded_history = await _load_history_as_input(
                         conversation_id,
                         drop_item_id=persisted_item_id,
                     )
-                    loaded.append(new_item)
-                    _session_histories[conversation_id] = loaded
 
+                if operation_id is not None and operation_request is not None:
+                    try:
+                        operation, created = _turn_operation_registry.reserve(
+                            operation_id=operation_id,
+                            session_id=conversation_id,
+                            request=operation_request,
+                        )
+                    except InvalidTurnOperation as exc:
+                        return JSONResponse(
+                            status_code=400,
+                            content={"error": "invalid_operation_request", "detail": str(exc)},
+                        )
+                    except TurnOperationConflict as exc:
+                        return JSONResponse(
+                            status_code=409,
+                            content={"error": "operation_conflict", "detail": str(exc)},
+                        )
+                    except TurnOperationCapacityError as exc:
+                        return JSONResponse(
+                            status_code=503,
+                            content={"error": "operation_registry_full", "detail": str(exc)},
+                        )
+                    if not created:
+                        return JSONResponse(
+                            status_code=202,
+                            content={
+                                **operation.public_dict(
+                                    runner_incarnation_id=_runner_incarnation_id
+                                ),
+                                "detail": "Idempotent operation replay; no new turn started.",
+                            },
+                        )
+                    _turn_operation_registry.mark_running(operation_id)
+                    _active_operation_ids[conversation_id] = operation_id
+                    if _is_native_harness(conversation_id):
+                        resource_registry.note_session_turn_started(conversation_id)
+
+                if loaded_history is None:
+                    _session_histories[conversation_id].append(new_item)
+                else:
+                    loaded_history.append(new_item)
+                    _session_histories[conversation_id] = loaded_history
                 _begin_turn_slot(conversation_id)
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",
@@ -6777,13 +6974,17 @@ def create_runner_app(
                 )
                 _background_tasks.add(_turn_task)
 
-                return JSONResponse(
-                    status_code=202,
-                    content={
-                        "status": "accepted",
-                        "detail": "Turn started.",
-                    },
-                )
+                response_content: dict[str, Any] = {
+                    "status": "accepted",
+                    "detail": "Turn started.",
+                }
+                if operation_id is not None:
+                    operation = _turn_operation_registry.get(operation_id)
+                    if operation is not None:
+                        response_content.update(
+                            operation.public_dict(runner_incarnation_id=_runner_incarnation_id)
+                        )
+                return JSONResponse(status_code=202, content=response_content)
             finally:
                 async with _cond:
                     _ingest_now_serving[conversation_id] = _seq + 1
