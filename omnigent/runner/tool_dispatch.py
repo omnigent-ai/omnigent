@@ -4958,8 +4958,9 @@ async def _close_tree_scope_error(
                 "conversation_id": target_id,
                 "message": (
                     "target conversation is a top-level conversation, not a "
-                    "sub-agent session. To retire the session you are running "
-                    "in, call sys_session_archive (no arguments)."
+                    "sub-agent session. sys_session_archive retires the "
+                    "calling session itself — it takes no arguments and "
+                    "never targets another session."
                 ),
             }
         )

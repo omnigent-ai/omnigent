@@ -666,6 +666,44 @@ def test_close_top_level_conversation_in_tree_is_rejected(
     assert _CLOSED_TITLE_INFIX not in (parent_after.title or "")
 
 
+def test_close_top_level_target_named_by_a_different_caller_is_rejected(
+    session_fixture: _Fixture,
+) -> None:
+    """
+    A nested sub-agent naming the tree's top-level root (its ancestor,
+    not itself) hits the same refusal — and the message must not claim
+    the caller is running in the target, since here it isn't.
+
+    ``sys_session_archive`` ignores its arguments and always archives
+    the *calling* session, so a message phrased as "the session you are
+    running in" would be actively wrong advice for this caller.
+
+    :param session_fixture: Per-test fixture providing the tool ctx
+        and parent conversation id.
+    """
+    grandchild = session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title="nested:probe",
+        parent_conversation_id=session_fixture.child_conv_id,
+    )
+    nested_ctx = ToolContext(
+        task_id="task_placeholder",
+        agent_id="2759f8a97fd91216cb3e0d7a1f60c7f6",
+        conversation_id=grandchild.id,
+    )
+
+    tool = SysSessionCloseTool()
+    raw = tool.invoke(
+        json.dumps({"conversation_id": session_fixture.parent_conv_id}),
+        nested_ctx,
+    )
+    payload = json.loads(raw)
+    assert payload["error"] == "session_not_a_sub_agent"
+    assert payload["conversation_id"] == session_fixture.parent_conv_id
+    assert "sys_session_archive" in payload["message"]
+    assert "you are running in" not in payload["message"]
+
+
 # ── Close invoke tests ────────────────────────────────────
 
 

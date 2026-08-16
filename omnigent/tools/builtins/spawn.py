@@ -1251,8 +1251,9 @@ def _resolve_session_call(
                 "message": (
                     "target conversation is a top-level conversation, not a "
                     "sub-agent session; peek/close only operate on sub-agents. "
-                    "To retire the session you are running in, call "
-                    "sys_session_archive (no arguments)."
+                    "sys_session_archive retires the calling session itself "
+                    "— it takes no arguments and never targets another "
+                    "session."
                 ),
             }
         )

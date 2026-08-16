@@ -5518,6 +5518,65 @@ async def test_session_close_rejects_top_level_target() -> None:
     assert patched is False
 
 
+@pytest.mark.asyncio
+async def test_session_close_rejects_top_level_target_named_by_a_different_caller() -> None:
+    """
+    A nested sub-agent naming the tree's top-level root (its ancestor,
+    not itself) hits the same refusal — and the message must not claim
+    the caller is running in the target, since here it isn't.
+
+    ``sys_session_archive`` ignores its arguments and always archives
+    the *calling* session, so a message phrased as "the session you are
+    running in" would be actively wrong advice for this caller.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    patched = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal patched
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_root":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_root",
+                    "title": "some top-level title",
+                    "root_conversation_id": "conv_root",
+                    "parent_session_id": None,
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_nested":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_nested",
+                    "root_conversation_id": "conv_root",
+                    "parent_session_id": "conv_root",
+                },
+            )
+        if request.method == "PATCH":
+            patched = True
+            return httpx.Response(200, json={"id": "conv_root"})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_root"}),
+                # Caller is a nested sub-agent naming its own ancestor, NOT
+                # itself.
+                conversation_id="conv_nested",
+                server_client=client,
+            )
+        )
+    assert out["error"] == "session_not_a_sub_agent"
+    assert out["conversation_id"] == "conv_root"
+    assert "sys_session_archive" in out["message"]
+    assert "you are running in" not in out["message"]
+    assert patched is False
+
+
 def test_agent_tools_are_runner_local() -> None:
     """
     ``sys_agent_get`` / ``sys_agent_download`` dispatch locally in the
