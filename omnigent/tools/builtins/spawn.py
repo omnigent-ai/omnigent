@@ -499,7 +499,11 @@ class SysSessionListTool(Tool):
             "for orchestration (inspect via sys_agent_get / "
             "sys_session_get_info, or drive via sys_session_send by "
             "session_id). Pass agent_name to filter the global list to "
-            "sessions running that agent."
+            "sessions running that agent. Calls without pagination keep "
+            "the complete result while it fits the tool-output budget; "
+            "larger global session lists return a page with has_more "
+            "metadata. Pass limit and offset to continue; sub_agents stays "
+            "complete."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -507,7 +511,8 @@ class SysSessionListTool(Tool):
         Return the OpenAI-format tool schema.
 
         :returns: Dict with ``"type": "function"`` and a
-            ``"function"`` sub-dict; an optional ``agent_name`` filter.
+            ``"function"`` sub-dict; an optional ``agent_name`` filter
+            and pagination parameters.
         """
         return {
             "type": "function",
@@ -525,6 +530,21 @@ class SysSessionListTool(Tool):
                                 "this name, e.g. 'researcher'. Does not "
                                 "affect the 'sub_agents' view."
                             ),
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 100,
+                            "description": (
+                                "Optional maximum rows returned from 'sessions'. "
+                                "Omit it to keep the complete result while it fits."
+                            ),
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "default": 0,
+                            "description": "Zero-based offset into 'sessions'.",
                         },
                     },
                     "required": [],

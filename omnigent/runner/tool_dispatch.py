@@ -604,9 +604,110 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
 # sys_os_write, e.g. following the ``build-omnigent`` skill).
 _AGENT_CONFIG_SUBDIR = ".omnigent/agent-configs"
 
-# Broad page size for the sys_agent_list fan-out reads. Orchestrators want
-# the full launchable surface in one call, not a 20-row default page.
+# Broad internal page size for discovery fan-out reads.
 _AGENT_LIST_PAGE_LIMIT = 1000
+
+_DISCOVERY_LIST_MAX_LIMIT = 100
+# Match the existing default ceiling for ``sys_os_shell`` output. Discovery
+# tools stay below the same Omnigent-owned budget instead of guessing a
+# harness-specific limit.
+_DISCOVERY_LIST_OUTPUT_MAX_CHARS = 100_000
+
+
+def _discovery_list_window(args: _JsonObject, tool_name: str) -> tuple[int | None, int] | str:
+    """Validate the shared pagination window for discovery list tools."""
+    limit = args.get("limit")
+    offset = args.get("offset", 0)
+    if "limit" in args and (
+        not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or not 1 <= limit <= _DISCOVERY_LIST_MAX_LIMIT
+    ):
+        return json.dumps(
+            {
+                "error": (
+                    f"{tool_name}: 'limit' must be an integer between 1 and "
+                    f"{_DISCOVERY_LIST_MAX_LIMIT}"
+                )
+            }
+        )
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        return json.dumps({"error": f"{tool_name}: 'offset' must be a non-negative integer"})
+    return cast(int | None, limit), offset
+
+
+def _page_rows(rows: list[_JsonObject], limit: int, offset: int) -> tuple[list[_JsonObject], bool]:
+    """Return one page and whether another row exists in the fetched window."""
+    end = offset + limit
+    return rows[offset:end], len(rows) > end
+
+
+def _bounded_discovery_result(
+    sections: dict[str, list[_JsonObject]],
+    *,
+    limit: int | None,
+    offset: int,
+    page_sections: tuple[str, ...] | None = None,
+) -> str:
+    """Keep a small legacy result intact, otherwise return a fitting page."""
+    complete = json.dumps(sections)
+    if limit is None and offset == 0 and len(complete) <= _DISCOVERY_LIST_OUTPUT_MAX_CHARS:
+        return complete
+
+    requested_limit = limit or _DISCOVERY_LIST_MAX_LIMIT
+    paged = page_sections or tuple(sections)
+
+    def _candidate(candidate_limit: int) -> str:
+        page = dict(sections)
+        has_more: dict[str, bool] = {}
+        for name in paged:
+            rows = sections[name]
+            page[name], has_more[name] = _page_rows(rows, candidate_limit, offset)
+        return json.dumps(
+            {
+                **page,
+                "page": {
+                    "limit": candidate_limit,
+                    "offset": offset,
+                    "has_more": has_more,
+                },
+            }
+        )
+
+    low = 1
+    high = requested_limit
+    best: str | None = None
+    while low <= high:
+        candidate_limit = (low + high) // 2
+        candidate = _candidate(candidate_limit)
+        if len(candidate) <= _DISCOVERY_LIST_OUTPUT_MAX_CHARS:
+            best = candidate
+            low = candidate_limit + 1
+        else:
+            high = candidate_limit - 1
+    if best is not None:
+        return best
+
+    empty_page = _candidate(0)
+    if len(empty_page) > _DISCOVERY_LIST_OUTPUT_MAX_CHARS:
+        kind = "fixed_section"
+        oversized_sections = [
+            name for name, rows in sections.items() if name not in paged and rows
+        ]
+    else:
+        kind = "paginated_row"
+        oversized_sections = [name for name in paged if offset < len(sections[name])]
+    return json.dumps(
+        {
+            "error": (
+                f"Discovery result exceeds the {_DISCOVERY_LIST_OUTPUT_MAX_CHARS}-character "
+                "output limit even at the smallest page."
+            ),
+            "page": {"offset": offset},
+            "oversized": {"kind": kind, "sections": oversized_sections},
+        }
+    )
+
 
 # Union of all locally-dispatched tools.
 _ALL_LOCAL_TOOLS = (
@@ -3738,7 +3839,17 @@ async def _execute_session_query_tool(
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
 
     if tool_name == "sys_session_list":
-        return await _session_list_via_rest(conversation_id, server_client, args.get("agent_name"))
+        window = _discovery_list_window(args, tool_name)
+        if isinstance(window, str):
+            return window
+        limit, offset = window
+        return await _session_list_via_rest(
+            conversation_id,
+            server_client,
+            args.get("agent_name"),
+            limit=limit,
+            offset=offset,
+        )
     if tool_name == "sys_session_get_history":
         return await _session_get_history_via_rest(args, server_client)
     if tool_name == "sys_session_get_info":
@@ -4051,11 +4162,17 @@ async def _execute_agent_tool(
     if server_client is None:
         return json.dumps({"error": f"{tool_name} requires server access"})
     if tool_name == "sys_agent_list":
+        window = _discovery_list_window(args, tool_name)
+        if isinstance(window, str):
+            return window
+        limit, offset = window
         return await _agent_list_via_rest(
             server_client,
             agent_spec=agent_spec,
             conversation_id=conversation_id,
             runner_workspace=runner_workspace,
+            limit=limit,
+            offset=offset,
         )
     session_id = args.get("session_id")
     if not isinstance(session_id, str) or not session_id:
@@ -4419,6 +4536,8 @@ async def _agent_list_via_rest(
     agent_spec: AgentSpec | None,
     conversation_id: str | None,
     runner_workspace: Path | None,
+    limit: int | None,
+    offset: int,
 ) -> str:
     """
     List launchable agents across built-ins, session-bound, and local.
@@ -4448,7 +4567,11 @@ async def _agent_list_via_rest(
         resolution of the local-config scan.
     :param conversation_id: The caller's session id, for os_env cwd.
     :param runner_workspace: The runner workspace, authoritative cwd.
-    :returns: JSON ``{builtins, session_agents, local_configs}``.
+    :param limit: Optional maximum rows returned from each source. When
+        omitted, the complete legacy result is preserved while it fits.
+    :param offset: Zero-based offset applied to each source.
+    :returns: The legacy complete JSON result while it fits, otherwise a
+        bounded page with continuation metadata.
     """
     builtins_raw = await _agent_list_fetch("/v1/agents", server_client)
     sessions_raw = await _agent_list_fetch("/v1/sessions", server_client)
@@ -4460,7 +4583,7 @@ async def _agent_list_via_rest(
     listing["builtins"] = _in_spawn_family(
         listing["builtins"], await _spawn_family(server_client, conversation_id)
     )
-    return json.dumps(listing)
+    return _bounded_discovery_result(listing, limit=limit, offset=offset)
 
 
 def _project_agent_list(
@@ -4511,6 +4634,9 @@ async def _session_list_via_rest(
     conversation_id: str,
     server_client: httpx.AsyncClient,
     agent_name: object = None,
+    *,
+    limit: int | None,
+    offset: int,
 ) -> str:
     """
     Return the two-view session list: ``sub_agents`` + global ``sessions``.
@@ -4528,11 +4654,20 @@ async def _session_list_via_rest(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter for the global
         ``sessions`` view; ignored for ``sub_agents``.
-    :returns: JSON ``{"sub_agents": [...], "sessions": [...]}``.
+    :param limit: Optional maximum rows returned from the global sessions view. When
+        omitted, the complete legacy result is preserved while it fits.
+    :param offset: Zero-based offset into the global sessions view.
+    :returns: The legacy complete JSON result while it fits, otherwise a
+        bounded page with continuation metadata.
     """
     sub_agents = await _collect_sub_agents(conversation_id, server_client)
     sessions = await _collect_global_sessions(server_client, agent_name)
-    return json.dumps({"sub_agents": sub_agents, "sessions": sessions})
+    return _bounded_discovery_result(
+        {"sub_agents": cast(list[_JsonObject], sub_agents), "sessions": sessions},
+        limit=limit,
+        offset=offset,
+        page_sections=("sessions",),
+    )
 
 
 async def _rename_current_session_via_rest(

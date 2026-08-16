@@ -6115,7 +6115,11 @@ async def test_sys_agent_list_degrades_when_sources_fail(tmp_path: Path) -> None
         )
 
     info = json.loads(output)
-    assert info == {"builtins": [], "session_agents": [], "local_configs": []}
+    assert info == {
+        "builtins": [],
+        "session_agents": [],
+        "local_configs": [],
+    }
 
 
 @pytest.mark.asyncio
