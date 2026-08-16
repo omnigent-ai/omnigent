@@ -9153,8 +9153,28 @@
         ]
       },
       "post": {
-        "description": "Create a session.\n\n`application/json` preserves the existing contract: bind to\nan already-registered agent by `agent_id` and return the full\nsession snapshot. `multipart/form-data` is the Alpha\nrunner-state create path: the request carries a JSON\n`metadata` part and a `bundle` file part, then the server\nstores the bundle and creates the conversation row plus\nsession-scoped agent row in one database transaction.\n\n**Returns:** `SessionResponse` for JSON create, or `CreatedSessionResponse` for bundled create.\n\n**Raises**\n\n- `OmnigentError` \u2014 If metadata, bundle, or agent lookup validation fails, artifact storage is unavailable, or database creation fails.",
+        "description": "Create a session.\n\n`application/json` preserves the existing contract: bind to\nan already-registered agent by `agent_id` and return the full\nsession snapshot. `multipart/form-data` is the Alpha\nrunner-state create path: the request carries a JSON\n`metadata` part and a `bundle` file part, then the server\nstores the bundle and creates the conversation row plus\nsession-scoped agent row in one database transaction.\n\n**Parameters**\n\n- `idempotency_key` \u2014 Optional replay key for an empty top-level external JSON session shell. Multipart and side-effecting JSON creates fail closed when this header is present.\n\n**Returns:** `SessionResponse` for JSON create, or `CreatedSessionResponse` for bundled create.\n\n**Raises**\n\n- `OmnigentError` \u2014 If metadata, bundle, or agent lookup validation fails, artifact storage is unavailable, or database creation fails.",
         "operationId": "create_session_v1_sessions_post",
+        "parameters": [
+          {
+            "description": "Replay key for an empty top-level external session shell. Unsupported create shapes fail closed instead of silently weakening idempotency.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Replay key for an empty top-level external session shell. Unsupported create shapes fail closed instead of silently weakening idempotency.",
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
         "responses": {
           "201": {
             "content": {
@@ -9163,6 +9183,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "Create Session",

@@ -274,6 +274,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
+    SESSION_CREATE_IDEMPOTENCY_LABEL_PREFIX,
     ConversationNotFoundError,
     NameAlreadyExistsError,
 )
@@ -8186,6 +8187,16 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
+    idempotency_key = next(
+        (key for key in labels if key.startswith(SESSION_CREATE_IDEMPOTENCY_LABEL_PREFIX)),
+        None,
+    )
+    if idempotency_key is not None:
+        raise OmnigentError(
+            f"label {idempotency_key!r} is in the server-internal "
+            f"{SESSION_CREATE_IDEMPOTENCY_LABEL_PREFIX}* namespace and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
     if _TURN_ACTOR_LABEL in labels:
         raise OmnigentError(
             f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",

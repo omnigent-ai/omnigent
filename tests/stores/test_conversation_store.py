@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import event, text
+from sqlalchemy import delete, event, text
 
+from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
     ErrorData,
@@ -74,6 +75,24 @@ def test_fork_drops_per_user_pin_labels(
     assert pinned_label_key("bob") not in fork.labels
 
 
+def test_fork_drops_session_create_idempotency_binding(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A new fork must not inherit the source request's replay identity."""
+    source = conversation_store.create_conversation(
+        conversation_id="e" * 32,
+        initial_labels={
+            "omnigent.idempotency.create.key_hash": "key",
+            "omnigent.idempotency.create.owner_hash": "owner",
+            "omnigent.idempotency.create.request_hash": "request",
+        },
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert not any(key.startswith("omnigent.idempotency.create.") for key in fork.labels)
+
+
 def test_create_and_get(conversation_store: SqlAlchemyConversationStore) -> None:
     conv = conversation_store.create_conversation()
     assert len(conv.id) == 32
@@ -95,6 +114,47 @@ def test_create_with_existing_caller_supplied_id_raises(db_uri: str) -> None:
     assert created.id == conversation_id
     with pytest.raises(ConversationAlreadyExistsError):
         second_store.create_conversation(conversation_id=conversation_id)
+
+
+def test_create_with_initial_labels_binds_and_repairs_default_metadata(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The durable binding survives and repairs a cross-DB crash window."""
+    conversation_id = "b" * 32
+    labels = {"omnigent.idempotency.create.request_hash": "request-hash"}
+    created = conversation_store.create_conversation(
+        conversation_id=conversation_id,
+        initial_labels=labels,
+    )
+
+    assert created.labels == labels
+    with conversation_store._session("test_delete_metadata") as session:
+        session.execute(
+            delete(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+        )
+
+    repaired = conversation_store.ensure_conversation_metadata(conversation_id)
+
+    assert repaired is not None
+    assert repaired.id == conversation_id
+    assert repaired.labels == labels
+    assert repaired.kind == "default"
+    assert repaired.runner_id is None
+    assert repaired.host_id is None
+
+
+def test_initial_labels_reject_non_shell_store_shapes(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    with pytest.raises(ValueError, match="empty, top-level default session shell"):
+        conversation_store.create_conversation(
+            conversation_id="c" * 32,
+            initial_labels={"server-owned": "binding"},
+            runner_id="runner-1",
+        )
 
 
 def test_get_nonexistent(conversation_store: SqlAlchemyConversationStore) -> None:

@@ -584,6 +584,7 @@ bundle parsing fails, no database row is written.
 ```
 POST /v1/sessions
 Content-Type: application/json
+Idempotency-Key: agentfactory-attempt-42  # optional; see below
 
 {
   "agent_id": "ag_abc123",
@@ -600,6 +601,21 @@ Content-Type: application/json
 This preserves the existing sessions API contract for clients that
 already uploaded or registered an agent. The response is the full
 `SessionResponse` shape with `id` set to the new conversation id.
+
+  Idempotency-Key (header, optional)
+    Creates or replays one automation-safe session shell. The first
+    supported slice is intentionally limited to `agent_id` plus an optional
+    `title` on an empty, top-level, external session. The server binds the
+    key to the authenticated principal, workspace, and complete normalized
+    request. An exact replay returns the same session with `201`; reusing the
+    key with a changed request returns `409`. Keys must contain 1-255 visible
+    ASCII characters without whitespace. If the keyed request includes an
+    initial turn, labels, parent/sub-agent fields, host/sandbox/worktree
+    provisioning, model/routing/harness overrides, or multipart bundle
+    creation, the server returns `400` rather than silently weakening the
+    idempotency guarantee. The binding survives a process crash between the
+    durable conversation write and operational metadata creation; a replay
+    repairs missing default metadata without overwriting existing state.
 
   host_type (string, "external" | "managed", default "external")
     How the session's host is obtained. `"external"` (the default,
