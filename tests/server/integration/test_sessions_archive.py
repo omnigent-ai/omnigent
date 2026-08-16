@@ -577,6 +577,37 @@ async def test_stop_when_idle_on_already_idle_session_stops_nothing(
         _sessions_common._session_background_task_count_cache.pop(session_id, None)
 
 
+async def test_top_level_session_archives_itself_end_to_end(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The issue's scenario: a top-level run retires its own session."""
+    session = await create_test_session(client, name="scheduled-run")
+    session_id = session["id"]
+    assert session.get("parent_session_id") is None
+
+    monkeypatch.setattr(_sessions_orchestration, "_ARCHIVE_IDLE_POLL_INTERVAL_S", 0.01)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"archived": True, "stop_when_idle": True},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["archived"] is True
+
+        listing = await client.get("/v1/sessions")
+        assert session_id not in [s["id"] for s in listing.json()["data"]]
+
+        with_archived = await client.get("/v1/sessions", params={"include_archived": True})
+        assert session_id in [s["id"] for s in with_archived.json()["data"]]
+
+        _sessions_common._session_status_cache[session_id] = "idle"
+        await _drain_detached_stops()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
 # ── Agent contents download ──────────────────────────────
 
 
