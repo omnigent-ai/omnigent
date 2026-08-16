@@ -1857,6 +1857,46 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     )
 
 
+def test_server_explicit_config_overrides_omnigent_config_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An explicit ``-c`` is the single server and branding config source."""
+    import uvicorn.server
+
+    inherited = tmp_path / "inherited.yaml"
+    explicit = tmp_path / "explicit.yaml"
+    inherited.write_text("branding:\n  app_name: Inherited\n")
+    explicit.write_text("branding:\n  app_name: Explicit\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(inherited))
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    captured: dict[str, str] = {}
+
+    def _fake_server_run(self: object) -> None:
+        del self
+        captured["config"] = os.environ["OMNIGENT_CONFIG"]
+
+    monkeypatch.setattr(uvicorn.server.Server, "run", _fake_server_run)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "server",
+            "-c",
+            str(explicit),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "44771",
+            "--no-open",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"] == str(explicit.resolve())
+
+
 def test_server_with_explicit_db_does_not_reuse_canonical_server(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

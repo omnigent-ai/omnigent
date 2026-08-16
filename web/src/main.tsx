@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { StrictMode } from "react";
+import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import App from "./App.tsx";
@@ -9,8 +9,9 @@ import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
-import { FALLBACK_SERVER_INFO, resolveServerInfo, type ServerInfo } from "./lib/capabilities";
+import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
+import { createBootServerInfo } from "./lib/bootCapabilities";
 import { resolveIdentity } from "./lib/identity";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
@@ -83,48 +84,59 @@ applyThemePalette(readThemePalette());
 // missing server doesn't deadlock first paint. We add a small
 // safety timeout (1.5s) so users on a flaky network still get
 // something on screen.
-const bootProbe: Promise<ServerInfo> = Promise.race([
-  resolveServerInfo(),
-  new Promise<ServerInfo>((resolve) => {
-    setTimeout(() => resolve(FALLBACK_SERVER_INFO), 1500);
-  }),
-]);
+const bootServerInfo = createBootServerInfo(resolveServerInfo());
 
-const root = createRoot(document.getElementById("root")!);
-const renderApp = (info: ServerInfo) => {
-  root.render(
+function RootApp({ initialInfo }: { initialInfo: ServerInfo }) {
+  const [info, setInfo] = useState(initialInfo);
+  useEffect(() => {
+    let alive = true;
+    void bootServerInfo.settled.then((resolved) => {
+      if (alive) setInfo(resolved);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  useEffect(() => {
+    if (info.branding?.app_name) document.title = info.branding.app_name;
+    const faviconUrl = info.branding?.logos.favicon;
+    if (!faviconUrl) return;
+    let link = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
+    if (!link) {
+      link = document.createElement("link");
+      link.rel = "icon";
+      document.head.appendChild(link);
+    }
+    link.removeAttribute("type");
+    link.href = faviconUrl;
+  }, [info]);
+  return (
+    <CapabilitiesProvider info={info}>
+      <QueryClientProvider client={queryClient}>
+        <ThemeProvider>
+          <TooltipProvider>
+            <ImageLightboxProvider>
+              <BrowserRouter>
+                <SessionUpdatesProvider>
+                  <RunnerHealthProvider>
+                    <QueueFlushProvider>
+                      <App />
+                    </QueueFlushProvider>
+                  </RunnerHealthProvider>
+                </SessionUpdatesProvider>
+              </BrowserRouter>
+            </ImageLightboxProvider>
+          </TooltipProvider>
+        </ThemeProvider>
+      </QueryClientProvider>
+    </CapabilitiesProvider>
+  );
+}
+
+void bootServerInfo.initial.then((initialInfo) => {
+  createRoot(document.getElementById("root")!).render(
     <StrictMode>
-      <CapabilitiesProvider info={info}>
-        <QueryClientProvider client={queryClient}>
-          <ThemeProvider>
-            <TooltipProvider>
-              <ImageLightboxProvider>
-                <BrowserRouter>
-                  <SessionUpdatesProvider>
-                    <RunnerHealthProvider>
-                      <QueueFlushProvider>
-                        <App />
-                      </QueueFlushProvider>
-                    </RunnerHealthProvider>
-                  </SessionUpdatesProvider>
-                </BrowserRouter>
-              </ImageLightboxProvider>
-            </TooltipProvider>
-          </ThemeProvider>
-        </QueryClientProvider>
-      </CapabilitiesProvider>
+      <RootApp initialInfo={initialInfo} />
     </StrictMode>,
   );
-};
-
-// Paint as soon as the boot probe settles — the real value, or the 1.5s
-// fallback on a slow/missing probe.
-void bootProbe.then(renderApp);
-// Then settle on the real value once it lands. If the 1.5s fallback painted
-// first (slow-but-successful probe), this adopts the real /v1/info and
-// re-renders the same root — so capability-gated UI (e.g. the managed-sandbox
-// host option, accounts routes) isn't pinned off for the tab's lifetime.
-// resolveServerInfo caches, so this shares the boot probe's single fetch, and
-// the real value always resolves no earlier than the fallback, so it never
-// downgrades a real render back to the fallback.
-void resolveServerInfo().then(renderApp);
+});

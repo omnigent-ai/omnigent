@@ -251,6 +251,91 @@
         "title": "Body_upload_session_file_v1_sessions__session_id__resources_files_post",
         "type": "object"
       },
+      "BrandingInfo": {
+        "properties": {
+          "app_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "App Name"
+          },
+          "heading": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heading"
+          },
+          "logos": {
+            "$ref": "#/components/schemas/BrandingLogosInfo"
+          },
+          "powered_by": {
+            "title": "Powered By",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "app_name",
+          "heading",
+          "logos",
+          "powered_by"
+        ],
+        "title": "BrandingInfo",
+        "type": "object"
+      },
+      "BrandingLogosInfo": {
+        "properties": {
+          "favicon": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Favicon"
+          },
+          "loading": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Loading"
+          },
+          "main": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Main"
+          }
+        },
+        "required": [
+          "main",
+          "loading",
+          "favicon"
+        ],
+        "title": "BrandingLogosInfo",
+        "type": "object"
+      },
       "BrowserActionRequestEvent": {
         "description": "Request that the desktop renderer perform one browser action.\n\nEmitted by the server `POST /v1/sessions/{id}/browser/action_request`\nroute when a runner-side `browser_*` tool dispatch needs the\nOmnigent desktop app's embedded browser to act. The event fans out\non the session stream to every subscribed renderer; each renderer\nfirst POSTs `/browser/action_claim/{action_id}` and only the\nwinning claimant executes the action and POSTs the result back to\n`/browser/action_result/{action_id}`. The claim lease prevents\ndouble execution when more than one renderer is subscribed.",
         "properties": {
@@ -3446,6 +3531,131 @@
         "title": "SendCommentsRequest",
         "type": "object"
       },
+      "ServerInfoResponse": {
+        "properties": {
+          "accounts_enabled": {
+            "title": "Accounts Enabled",
+            "type": "boolean"
+          },
+          "branding": {
+            "$ref": "#/components/schemas/BrandingInfo"
+          },
+          "databricks_features": {
+            "title": "Databricks Features",
+            "type": "boolean"
+          },
+          "dictation_available": {
+            "title": "Dictation Available",
+            "type": "boolean"
+          },
+          "features": {
+            "additionalProperties": {
+              "type": "boolean"
+            },
+            "title": "Features",
+            "type": "object"
+          },
+          "harness_install_enabled": {
+            "title": "Harness Install Enabled",
+            "type": "boolean"
+          },
+          "installable_harnesses": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Installable Harnesses",
+            "type": "array"
+          },
+          "login_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Login Url"
+          },
+          "managed_sandboxes_enabled": {
+            "title": "Managed Sandboxes Enabled",
+            "type": "boolean"
+          },
+          "needs_setup": {
+            "title": "Needs Setup",
+            "type": "boolean"
+          },
+          "public_sharing_enabled": {
+            "title": "Public Sharing Enabled",
+            "type": "boolean"
+          },
+          "sandbox_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sandbox Provider"
+          },
+          "sandbox_providers": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Sandbox Providers",
+            "type": "array"
+          },
+          "server_version": {
+            "title": "Server Version",
+            "type": "string"
+          },
+          "sharing_mode": {
+            "enum": [
+              "on",
+              "read_only",
+              "restricted_read_only",
+              "off"
+            ],
+            "title": "Sharing Mode",
+            "type": "string"
+          },
+          "single_user": {
+            "title": "Single User",
+            "type": "boolean"
+          },
+          "smart_routing_enabled": {
+            "title": "Smart Routing Enabled",
+            "type": "boolean"
+          },
+          "smart_routing_sources": {
+            "$ref": "#/components/schemas/SmartRoutingSourcesInfo"
+          }
+        },
+        "required": [
+          "accounts_enabled",
+          "single_user",
+          "login_url",
+          "needs_setup",
+          "databricks_features",
+          "managed_sandboxes_enabled",
+          "sandbox_provider",
+          "sandbox_providers",
+          "sharing_mode",
+          "public_sharing_enabled",
+          "server_version",
+          "smart_routing_enabled",
+          "smart_routing_sources",
+          "features",
+          "harness_install_enabled",
+          "installable_harnesses",
+          "dictation_available",
+          "branding"
+        ],
+        "title": "ServerInfoResponse",
+        "type": "object"
+      },
       "ServerStreamEvent": {
         "discriminator": {
           "mapping": {
@@ -6144,6 +6354,24 @@
         "title": "SlashCommandData",
         "type": "object"
       },
+      "SmartRoutingSourcesInfo": {
+        "properties": {
+          "external": {
+            "title": "External",
+            "type": "boolean"
+          },
+          "oss": {
+            "title": "Oss",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "external",
+          "oss"
+        ],
+        "title": "SmartRoutingSourcesInfo",
+        "type": "object"
+      },
       "StoreHarnessCredentialRequest": {
         "description": "Request body for `POST /v1/hosts/{id}/harnesses/{harness}/credential`.\n\nCarries the credential in the body (never the URL). The secret field is\noptional so the `adopt` kind \u2014 which references an existing host env var\nby name rather than sending a value \u2014 can omit it.",
         "properties": {
@@ -7292,6 +7520,74 @@
         ]
       }
     },
+    "/v1/branding/logo/{variant}": {
+      "get": {
+        "description": "Serve a validated public branding asset, or 404 when unset.",
+        "operationId": "branding_logo_v1_branding_logo__variant__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "variant",
+            "required": true,
+            "schema": {
+              "title": "Variant",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "image/gif": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "image/png": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "image/webp": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "image/x-icon": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Validated raster branding image"
+          },
+          "404": {
+            "description": "Branding image not configured or invalid"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Branding Logo"
+      }
+    },
     "/v1/harnesses": {
       "get": {
         "operationId": "list_harnesses_v1_harnesses_get",
@@ -8034,33 +8330,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "anyOf": [
-                      {
-                        "type": "boolean"
-                      },
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "items": {
-                          "type": "string"
-                        },
-                        "type": "array"
-                      },
-                      {
-                        "additionalProperties": {
-                          "type": "boolean"
-                        },
-                        "type": "object"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ]
-                  },
-                  "title": "Response Info V1 Info Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/ServerInfoResponse"
                 }
               }
             },

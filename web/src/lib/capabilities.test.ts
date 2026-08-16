@@ -192,3 +192,32 @@ describe("resolveServerInfo smart_routing_sources", () => {
     expect(parsed.smart_routing_sources).toEqual({ external: false, oss: false });
   });
 });
+
+describe("resolveServerInfo branding", () => {
+  it("preserves an explicit empty heading and disabled attribution", async () => {
+    const brandingInfo = await probe({
+      branding: {
+        app_name: "Acme Agent",
+        heading: "",
+        logos: { main: "/logo/main", loading: "/logo/loading", favicon: "/logo/favicon" },
+        powered_by: false,
+      },
+    });
+
+    expect(brandingInfo.branding).toEqual({
+      app_name: "Acme Agent",
+      heading: "",
+      logos: { main: "/logo/main", loading: "/logo/loading", favicon: "/logo/favicon" },
+      powered_by: false,
+    });
+  });
+
+  it("normalizes an empty or malformed branding payload to null", async () => {
+    const empty = await probe({ branding: { logos: { main: 123 }, powered_by: true } });
+    expect(empty.branding).toBeNull();
+
+    vi.resetModules();
+    const malformed = await probe({ branding: "Acme" });
+    expect(malformed.branding).toBeNull();
+  });
+});
