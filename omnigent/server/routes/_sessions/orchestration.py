@@ -797,10 +797,10 @@ def _spawn_archive_stop(
     wedged or asleep runner) even though the archive proceeds
     regardless of the stop's outcome.
 
-    Only one poller runs per session (see ``_in_flight_archive_stops``):
-    each ends in its own own-session stop, so a retried archive PATCH
-    that stacked a second poller would issue duplicate stop RPCs for
-    one archive.
+    Only one *live* poller runs per session (see
+    ``_in_flight_archive_stops``): a retried archive PATCH must not stack
+    a second poller alongside one that is still parked or running, but a
+    finished poller's entry does not block a new one — it is replaced.
 
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store for descendant and row lookups.
@@ -811,7 +811,8 @@ def _spawn_archive_stop(
     :param wait_for_idle: Defer the teardown until the session leaves the
         running state. Forwarded to :func:`_archive_stop`.
     """
-    if session_id in _in_flight_archive_stops:
+    existing = _in_flight_archive_stops.get(session_id)
+    if existing is not None and not existing.done():
         # A poller is already parked (or running) for this session — a
         # retried archive PATCH must not stack a second one.
         return

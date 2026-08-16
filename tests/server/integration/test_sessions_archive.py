@@ -662,6 +662,43 @@ async def test_repeated_archive_patches_stop_the_session_exactly_once(
         _sessions_common._session_status_cache.pop(session_id, None)
 
 
+async def test_archive_after_finished_poller_still_dispatches_a_stop(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A finished poller's stale registry entry must not swallow the next stop.
+
+    The done-callback that clears ``_in_flight_archive_stops`` runs on a
+    later event-loop iteration than the task's own completion, so the
+    registry can momentarily hold a task that is done but not yet
+    cleared. Seed that exact state directly rather than racing for it,
+    then confirm a fresh archive PATCH still dispatches its own stop
+    instead of being swallowed by the stale entry.
+    """
+    session = await create_test_session(client, name="archive-stale-entry")
+    session_id = session["id"]
+
+    finished_task: asyncio.Task[None] = asyncio.create_task(asyncio.sleep(0))
+    await finished_task
+    assert finished_task.done()
+    _sessions_orchestration._in_flight_archive_stops[session_id] = finished_task
+
+    mock_stop = AsyncMock(return_value=True)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
+            resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True},
+            )
+            assert resp.status_code == 200
+            await _drain_detached_stops()
+        mock_stop.assert_awaited_once()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+        _sessions_orchestration._in_flight_archive_stops.pop(session_id, None)
+
+
 async def test_top_level_session_archives_itself_end_to_end(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
