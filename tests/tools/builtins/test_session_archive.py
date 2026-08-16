@@ -22,4 +22,10 @@ def test_description_scopes_the_tool_to_finished_unattended_runs() -> None:
     description = SysSessionArchiveTool.description()
 
     assert "current session" in description
+    # The load-bearing safety clause: without it, nothing in the schema
+    # stops the model from archiving a session a person is still using.
+    assert "person is still working" in description
+    # The unattended/finished-work framing that scopes when to call it.
+    assert "unattended" in description
+    # Reversibility is the claim that makes always-on registration defensible.
     assert "unarchive" in description
