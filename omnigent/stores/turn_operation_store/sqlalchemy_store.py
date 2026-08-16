@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from typing import Any, cast
 
@@ -22,6 +23,7 @@ from omnigent.stores.turn_operation_store import (
 )
 
 _DISPATCH_STATES = frozenset({"dispatched", "dispatch_unknown"})
+_RUNNER_INCARNATION_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 def _digest(domain: str, value: str) -> bytes:
@@ -67,10 +69,17 @@ def _to_entity(row: SqlTurnOperation) -> TurnOperation:
         idempotency_key_hash=_digest_hex(row.idempotency_key_hash),
         request_hash=_digest_hex(row.request_hash),
         request_json=row.request_json,
+        dispatch_request_hash=(
+            None if row.dispatch_request_hash is None else _digest_hex(row.dispatch_request_hash)
+        ),
+        dispatch_request_json=row.dispatch_request_json,
         state=decode_turn_operation_state(row.state),
         created_at=row.created_at,
         workspace_id=row.workspace_id or DEFAULT_WORKSPACE_ID,
         item_id=row.item_id,
+        runner_incarnation_id=row.runner_incarnation_id,
+        dispatch_attempts=row.dispatch_attempts,
+        last_dispatch_at=row.last_dispatch_at,
         updated_at=row.updated_at,
         terminal_at=row.terminal_at,
         error_code=row.error_code,
@@ -136,8 +145,13 @@ class SqlAlchemyTurnOperationStore(TurnOperationStore):
             idempotency_key_hash=key_hash,
             request_hash=request_hash,
             request_json=request_json,
+            dispatch_request_hash=None,
+            dispatch_request_json=None,
             state=encode_turn_operation_state("accepted"),
             item_id=None,
+            runner_incarnation_id=None,
+            dispatch_attempts=0,
+            last_dispatch_at=None,
             created_at=now_epoch(),
             updated_at=None,
             terminal_at=None,
@@ -186,16 +200,60 @@ class SqlAlchemyTurnOperationStore(TurnOperationStore):
             raise KeyError(operation_id)
         return row
 
-    def mark_input_persisted(self, operation_id: str, item_id: str) -> TurnOperation:
+    def mark_input_persisted(
+        self,
+        operation_id: str,
+        item_id: str,
+        dispatch_request: dict[str, Any],
+    ) -> TurnOperation:
+        dispatch_request_json = _canonical_request(dispatch_request)
+        dispatch_request_hash = _digest("dispatch-request", dispatch_request_json)
         with self._write_session("mark_input_persisted") as session:
             row = self._require_row(session, operation_id)
             state = decode_turn_operation_state(row.state)
             if state == "accepted":
                 row.state = encode_turn_operation_state("input_persisted")
                 row.item_id = item_id
+                row.dispatch_request_hash = dispatch_request_hash
+                row.dispatch_request_json = dispatch_request_json
                 row.updated_at = now_epoch()
-            elif row.item_id != item_id:
-                raise TurnOperationStateError("operation is already bound to another input item")
+            elif (
+                row.item_id != item_id
+                or bytes(row.dispatch_request_hash or b"") != dispatch_request_hash
+                or row.dispatch_request_json != dispatch_request_json
+            ):
+                raise TurnOperationStateError(
+                    "operation is already bound to another input item or dispatch request"
+                )
+            return _to_entity(row)
+
+    def record_dispatch_attempt(
+        self,
+        operation_id: str,
+        runner_incarnation_id: str,
+    ) -> TurnOperation:
+        if not _RUNNER_INCARNATION_RE.fullmatch(runner_incarnation_id):
+            raise ValueError("runner incarnation id must be 32 lowercase hexadecimal characters")
+        with self._write_session("record_dispatch_attempt") as session:
+            row = self._require_row(session, operation_id)
+            state = decode_turn_operation_state(row.state)
+            if state not in {"input_persisted", "dispatch_unknown"}:
+                raise TurnOperationStateError(f"cannot dispatch operation while it is {state}")
+            if (
+                row.runner_incarnation_id is not None
+                and row.runner_incarnation_id != runner_incarnation_id
+            ):
+                raise TurnOperationStateError(
+                    "operation is already bound to another runner incarnation"
+                )
+            now = now_epoch()
+            row.runner_incarnation_id = runner_incarnation_id
+            row.dispatch_attempts += 1
+            row.last_dispatch_at = now
+            row.updated_at = now
+            if state == "dispatch_unknown":
+                row.error_code = None
+                row.error = None
             return _to_entity(row)
 
     def mark_dispatch_result(
@@ -211,6 +269,12 @@ class SqlAlchemyTurnOperationStore(TurnOperationStore):
         with self._write_session("mark_dispatch_result") as session:
             row = self._require_row(session, operation_id)
             current = decode_turn_operation_state(row.state)
+            if current == "input_persisted" and (
+                row.runner_incarnation_id is None or row.dispatch_attempts < 1
+            ):
+                raise TurnOperationStateError(
+                    "dispatch result requires a recorded runner incarnation attempt"
+                )
             if current == "input_persisted" or (
                 current == "dispatch_unknown" and state == "dispatched"
             ):

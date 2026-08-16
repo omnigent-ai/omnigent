@@ -26,8 +26,13 @@ def test_turn_operations_upgrade_and_downgrade(tmp_path: Path) -> None:
         "idempotency_key_hash",
         "request_hash",
         "request_json",
+        "dispatch_request_hash",
+        "dispatch_request_json",
         "state",
         "item_id",
+        "runner_incarnation_id",
+        "dispatch_attempts",
+        "last_dispatch_at",
         "created_at",
         "updated_at",
         "terminal_at",
@@ -48,6 +53,16 @@ def test_turn_operations_upgrade_and_downgrade(tmp_path: Path) -> None:
     assert "ix_turn_operations_conversation_state" in indexes
 
     engine.dispose()
+    command.downgrade(config, "zb2c3d4e5f6a")
+    base = create_engine(uri)
+    base_columns = {column["name"] for column in inspect(base).get_columns("turn_operations")}
+    assert "dispatch_request_hash" not in base_columns
+    assert "dispatch_request_json" not in base_columns
+    assert "runner_incarnation_id" not in base_columns
+    assert "dispatch_attempts" not in base_columns
+    assert "last_dispatch_at" not in base_columns
+    base.dispose()
+
     command.downgrade(config, "za2b3c4d5e6f")
     downgraded = create_engine(uri)
     assert "turn_operations" not in inspect(downgraded).get_table_names()

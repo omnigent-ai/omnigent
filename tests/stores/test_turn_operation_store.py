@@ -43,6 +43,27 @@ def _create(
     )
 
 
+def _record_attempt(
+    store: SqlAlchemyTurnOperationStore,
+    operation_id: str,
+    incarnation: str | None = None,
+):
+    return store.record_dispatch_attempt(operation_id, incarnation or _uid("runner"))
+
+
+def _mark_input(
+    store: SqlAlchemyTurnOperationStore,
+    operation_id: str,
+    item_id: str | None = None,
+    dispatch_request: dict[str, object] | None = None,
+):
+    return store.mark_input_persisted(
+        operation_id,
+        item_id or _uid("input-item"),
+        dispatch_request or {"type": "message", "content": "build it"},
+    )
+
+
 def test_create_and_exact_replay_return_one_operation(
     store: SqlAlchemyTurnOperationStore,
 ) -> None:
@@ -113,9 +134,19 @@ def test_lifecycle_and_exact_replays_are_idempotent(
     operation, _ = _create(store)
     item_id = _uid("input-item")
 
-    persisted = store.mark_input_persisted(operation.id, item_id)
+    persisted = _mark_input(store, operation.id, item_id)
     assert persisted.state == "input_persisted"
-    assert store.mark_input_persisted(operation.id, item_id) == persisted
+    assert _mark_input(store, operation.id, item_id) == persisted
+    assert json.loads(persisted.dispatch_request_json or "") == {
+        "content": "build it",
+        "type": "message",
+    }
+    assert persisted.dispatch_request_hash is not None
+
+    attempted = _record_attempt(store, operation.id)
+    assert attempted.runner_incarnation_id == _uid("runner")
+    assert attempted.dispatch_attempts == 1
+    assert attempted.last_dispatch_at is not None
 
     dispatched = store.mark_dispatch_result(operation.id, state="dispatched")
     assert dispatched.state == "dispatched"
@@ -132,7 +163,8 @@ def test_transport_ambiguity_requires_explicit_reconciliation(
     store: SqlAlchemyTurnOperationStore,
 ) -> None:
     operation, _ = _create(store)
-    store.mark_input_persisted(operation.id, _uid("input-item"))
+    _mark_input(store, operation.id)
+    _record_attempt(store, operation.id)
     unknown = store.mark_dispatch_result(
         operation.id,
         state="dispatch_unknown",
@@ -149,11 +181,40 @@ def test_transport_ambiguity_requires_explicit_reconciliation(
     assert reconciled.error is None
 
 
+def test_dispatch_attempt_binding_is_strict_and_retry_audited(
+    store: SqlAlchemyTurnOperationStore,
+) -> None:
+    operation, _ = _create(store)
+    _mark_input(store, operation.id)
+    with pytest.raises(ValueError, match="32 lowercase"):
+        store.record_dispatch_attempt(operation.id, "BAD")
+
+    first = _record_attempt(store, operation.id, _uid("runner-a"))
+    assert first.dispatch_attempts == 1
+    store.mark_dispatch_result(
+        operation.id,
+        state="dispatch_unknown",
+        error_code="runner_timeout",
+        error="first attempt",
+    )
+    retry = _record_attempt(store, operation.id, _uid("runner-a"))
+    assert retry.dispatch_attempts == 2
+    assert retry.error_code is None
+    assert retry.error is None
+
+    with pytest.raises(TurnOperationStateError, match="another runner incarnation"):
+        _record_attempt(store, operation.id, _uid("runner-b"))
+    store.mark_dispatch_result(operation.id, state="dispatched")
+    with pytest.raises(TurnOperationStateError, match="while it is dispatched"):
+        _record_attempt(store, operation.id, _uid("runner-a"))
+
+
 def test_terminal_report_can_resolve_dispatch_unknown(
     store: SqlAlchemyTurnOperationStore,
 ) -> None:
     operation, _ = _create(store)
-    store.mark_input_persisted(operation.id, _uid("input-item"))
+    _mark_input(store, operation.id)
+    _record_attempt(store, operation.id)
     store.mark_dispatch_result(operation.id, state="dispatch_unknown")
     terminal = store.mark_terminal(
         operation.id,
@@ -175,14 +236,19 @@ def test_invalid_or_conflicting_transitions_fail_closed(
         store.mark_terminal(operation.id, state="succeeded")
 
     item_id = _uid("input-item")
-    store.mark_input_persisted(operation.id, item_id)
-    with pytest.raises(TurnOperationStateError, match="another input item"):
-        store.mark_input_persisted(operation.id, _uid("other-item"))
+    _mark_input(store, operation.id, item_id)
+    with pytest.raises(TurnOperationStateError, match="another input item or dispatch request"):
+        _mark_input(store, operation.id, _uid("other-item"))
+    with pytest.raises(TurnOperationStateError, match="another input item or dispatch request"):
+        _mark_input(store, operation.id, item_id, {"content": "changed"})
     with pytest.raises(ValueError, match="dispatch result"):
         store.mark_dispatch_result(operation.id, state="failed")
     with pytest.raises(ValueError, match="terminal state"):
         store.mark_terminal(operation.id, state="running")
 
+    with pytest.raises(TurnOperationStateError, match="recorded runner incarnation"):
+        store.mark_dispatch_result(operation.id, state="dispatched")
+    _record_attempt(store, operation.id)
     store.mark_dispatch_result(operation.id, state="dispatched")
     store.mark_terminal(operation.id, state="failed", error="first report")
     with pytest.raises(TurnOperationStateError, match="terminal replay changed"):
@@ -195,7 +261,7 @@ def test_unknown_operation_reads_none_and_mutations_raise_key_error(
     operation_id = _uid("unknown-operation")
     assert store.get(operation_id) is None
     with pytest.raises(KeyError, match=operation_id):
-        store.mark_input_persisted(operation_id, _uid("input-item"))
+        _mark_input(store, operation_id)
 
 
 def test_workspace_and_conversation_scope_are_independent(
@@ -230,7 +296,8 @@ def test_concurrent_conflicting_terminal_reports_have_one_winner(tmp_path: Path)
     uri = f"sqlite:///{tmp_path}/turn-terminal.db"
     store = SqlAlchemyTurnOperationStore(uri)
     operation, _ = _create(store)
-    store.mark_input_persisted(operation.id, _uid("input-item"))
+    _mark_input(store, operation.id)
+    _record_attempt(store, operation.id)
     store.mark_dispatch_result(operation.id, state="dispatched")
 
     def report(state: str) -> str:

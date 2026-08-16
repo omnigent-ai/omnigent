@@ -51,14 +51,25 @@ a conflict.
 
 1. Persist the operation before appending conversation input.
 2. Bind the operation to exactly one persisted input item before forwarding.
-3. Propagate the operation identifier through the server-runner boundary.
-4. A runner must deduplicate that identifier before this API can automate
+3. Persist the exact runner dispatch envelope with that item. Recovery reloads
+   this envelope; it never reconstructs routing, model, file, or item metadata.
+4. Propagate the operation identifier through the server-runner boundary.
+5. A runner must deduplicate that identifier before this API can automate
    redispatch.
-5. A transport timeout after forwarding records `dispatch_unknown`; it is not
+6. A transport timeout after forwarding records `dispatch_unknown`; it is not
    treated as proof that nothing ran.
-6. Runner status/reconciliation must resolve ambiguity before retry. A terminal
+7. Before each dispatch attempt, the coordinator records the runner's
+   `runner_incarnation_id`. An exact retry is permitted only against that same
+   incarnation, where the runner operation registry can deduplicate it.
+8. A missing operation on the same incarnation can be retried only while the
+   durable state is `input_persisted` or `dispatch_unknown`. A runner that loses
+   an already acknowledged `dispatched` operation is a protocol failure.
+9. A missing operation after the runner incarnation changes is terminal
+   ambiguity (`timed_out` with an explicit restart error), never evidence that
+   the prior request did not execute and never permission to redispatch.
+10. Runner status/reconciliation must resolve ambiguity before retry. A terminal
    observation may resolve `dispatch_unknown` directly.
-7. Durable cursor publication and terminal evidence are separate follow-up
+11. Durable cursor publication and terminal evidence are separate follow-up
    contracts. Live SSE remains an optimization, never the recovery source of
    truth.
 

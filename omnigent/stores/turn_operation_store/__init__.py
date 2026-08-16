@@ -40,8 +40,22 @@ class TurnOperationStore(ABC):
         ...
 
     @abstractmethod
-    def mark_input_persisted(self, operation_id: str, item_id: str) -> TurnOperation:
-        """Advance ``accepted`` to ``input_persisted`` idempotently."""
+    def mark_input_persisted(
+        self,
+        operation_id: str,
+        item_id: str,
+        dispatch_request: dict[str, Any],
+    ) -> TurnOperation:
+        """Bind one item and exact runner request, then mark input persisted."""
+        ...
+
+    @abstractmethod
+    def record_dispatch_attempt(
+        self,
+        operation_id: str,
+        runner_incarnation_id: str,
+    ) -> TurnOperation:
+        """Bind one preflighted runner incarnation and count an attempt."""
         ...
 
     @abstractmethod
