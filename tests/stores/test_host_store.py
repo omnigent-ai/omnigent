@@ -76,6 +76,32 @@ def test_upsert_creates_host_on_first_connect(
     assert fetched.status == "online"
 
 
+def test_list_all_hosts_returns_every_users_hosts(host_store: HostStore) -> None:
+    """
+    Verify that ``list_all_hosts`` spans every user (the admin view),
+    while ``list_hosts`` keeps filtering to a single owner.
+    """
+    host_store.upsert_on_connect(
+        host_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", name="alice-host", user_id="alice@example.com"
+    )
+    host_store.upsert_on_connect(
+        host_id="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", name="bob-host", user_id="bob@example.com"
+    )
+
+    all_hosts = host_store.list_all_hosts()
+    assert {h.host_id for h in all_hosts} == {
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    }
+    assert {h.user_id for h in all_hosts} == {"alice@example.com", "bob@example.com"}
+
+    # Per-user listing still filters to the owner only.
+    alice_hosts = host_store.list_hosts("alice@example.com")
+    assert [h.host_id for h in alice_hosts] == ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+    bob_hosts = host_store.list_hosts("bob@example.com")
+    assert [h.host_id for h in bob_hosts] == ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+
+
 def test_upsert_updates_existing_host_on_reconnect(
     host_store: HostStore,
 ) -> None:

@@ -52,6 +52,7 @@ def resolve_host_owner(
     user_id: str | None,
     host_id: str,
     host_store: HostStore,
+    is_admin: bool = False,
 ) -> Host:
     """
     Authorize that the caller owns a known host.
@@ -75,7 +76,7 @@ def resolve_host_owner(
     host = host_store.get_host(host_id)
     if host is None:
         raise HTTPException(status_code=404, detail="host not found")
-    if user_id is not None and host.user_id != user_id:
+    if user_id is not None and not is_admin and host.user_id != user_id:
         raise HTTPException(status_code=403, detail="not your host")
     return host
 
@@ -125,6 +126,11 @@ def resolve_host_launch(
         user_id=user_id,
         host_id=host_id,
         host_store=host_store,
+        is_admin=(
+            permission_store is not None
+            and user_id is not None
+            and permission_store.is_admin(user_id)
+        ),
     )
 
     conn = host_registry.get(host_id)

@@ -82,6 +82,23 @@ class TestResolveHostOwner:
         result = resolve_host_owner(user_id=None, host_id="host_1", host_store=store)
         assert result.host_id == "host_1"
 
+    def test_admin_bypasses_ownership(self) -> None:
+        # Bob owns the host; alice is an admin -> ownership waived.
+        host = _FakeHost(host_id="host_1", user_id="bob")
+        store = _FakeHostStore(hosts={"host_1": host})
+        result = resolve_host_owner(
+            user_id="alice", host_id="host_1", host_store=store, is_admin=True
+        )
+        assert result.host_id == "host_1"
+
+    def test_non_admin_still_403_on_others_host(self) -> None:
+        # is_admin default False: a plain user never bypasses ownership.
+        host = _FakeHost(host_id="host_1", user_id="bob")
+        store = _FakeHostStore(hosts={"host_1": host})
+        with pytest.raises(HTTPException) as exc_info:
+            resolve_host_owner(user_id="alice", host_id="host_1", host_store=store)
+        assert exc_info.value.status_code == 403
+
 
 # ── resolve_host_launch ──────────────────────────────────────────────
 
@@ -146,3 +163,63 @@ class TestResolveHostLaunch:
         )
         assert result.host.host_id == "host_1"
         assert result.conv.id == "s1"
+
+    def test_admin_can_launch_on_other_users_host(self, monkeypatch) -> None:
+        import omnigent.server.routes._host_launch as hl
+
+        # Isolation: this test targets HOST authorization, so the session
+        # owner check is neutralized.
+        monkeypatch.setattr(hl, "check_session_access", lambda *a, **k: True)
+
+        class _FakePermStore:
+            def is_admin(self, user_id: str) -> bool:
+                return user_id == "alice"
+
+        host = _FakeHost(host_id="host_1", user_id="bob")  # bob's host
+        conn = object()
+        conv = Conversation(
+            id="s1", created_at=1, updated_at=1, root_conversation_id="s1", agent_id="ag_1"
+        )
+        store = _FakeHostStore(hosts={"host_1": host})
+        registry = _FakeHostRegistry(conns={"host_1": conn})
+        conv_store = _FakeConversationStore(convs={"s1": conv})
+        result = resolve_host_launch(
+            user_id="alice",  # admin
+            host_id="host_1",
+            session_id="s1",
+            host_store=store,
+            host_registry=registry,
+            conversation_store=conv_store,
+            permission_store=_FakePermStore(),
+        )
+        assert result.host.host_id == "host_1"
+        assert result.conv.id == "s1"
+
+    def test_non_admin_cannot_launch_on_other_users_host(self, monkeypatch) -> None:
+        import omnigent.server.routes._host_launch as hl
+
+        monkeypatch.setattr(hl, "check_session_access", lambda *a, **k: True)
+
+        class _FakePermStore:
+            def is_admin(self, user_id: str) -> bool:
+                return False
+
+        host = _FakeHost(host_id="host_1", user_id="bob")
+        conn = object()
+        conv = Conversation(
+            id="s1", created_at=1, updated_at=1, root_conversation_id="s1", agent_id="ag_1"
+        )
+        store = _FakeHostStore(hosts={"host_1": host})
+        registry = _FakeHostRegistry(conns={"host_1": conn})
+        conv_store = _FakeConversationStore(convs={"s1": conv})
+        with pytest.raises(HTTPException) as exc_info:
+            resolve_host_launch(
+                user_id="alice",
+                host_id="host_1",
+                session_id="s1",
+                host_store=store,
+                host_registry=registry,
+                conversation_store=conv_store,
+                permission_store=_FakePermStore(),
+            )
+        assert exc_info.value.status_code == 403

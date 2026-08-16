@@ -577,6 +577,17 @@ def create_hosts_router(
     flags = feature_flags or resolve_feature_flags()
     router = APIRouter()
 
+    async def _is_admin(user_id: str | None) -> bool:
+        """True when the caller holds the admin role.
+
+        Admin users may use every host (ownership is bypassed), matching
+        the shared-host model where admin roles control all hosts. Returns
+        False when auth is disabled or the user lacks the admin flag.
+        """
+        if user_id is None or permission_store is None:
+            return False
+        return await asyncio.to_thread(permission_store.is_admin, user_id)
+
     @router.get("/hosts")
     async def list_hosts(request: Request) -> dict[str, list[dict[str, Any]]]:
         """List all hosts owned by the authenticated user.
@@ -594,7 +605,11 @@ def create_hosts_router(
         # only when auth is disabled entirely — there the single-user
         # server's hosts are owned by the reserved "local" user.
         user_id = require_user(request, auth_provider)
-        if user_id is None:
+        if await _is_admin(user_id):
+            # Admin role: shared-host model — admin users see and can
+            # control every host, not just their own.
+            hosts = await asyncio.to_thread(host_store.list_all_hosts)
+        elif user_id is None:
             hosts = await asyncio.to_thread(host_store.list_hosts, "local")
         else:
             hosts = await asyncio.to_thread(host_store.list_hosts, user_id)
@@ -655,7 +670,8 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
+        is_admin = await _is_admin(user_id)
+        if user_id is not None and host.user_id != user_id and not is_admin:
             raise HTTPException(status_code=403, detail="not your host")
 
         # Status comes from the DB so the answer is consistent across
@@ -692,7 +708,8 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
+        is_admin = await _is_admin(user_id)
+        if user_id is not None and host.user_id != user_id and not is_admin:
             raise HTTPException(status_code=403, detail="not your host")
         conn = host_registry.get(host.host_id)
         if conn is None:
@@ -1110,7 +1127,8 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
+        is_admin = await _is_admin(user_id)
+        if user_id is not None and host.user_id != user_id and not is_admin:
             raise HTTPException(status_code=403, detail="not your host")
 
         if "\x00" in path:
@@ -1191,7 +1209,8 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
+        is_admin = await _is_admin(user_id)
+        if user_id is not None and host.user_id != user_id and not is_admin:
             raise HTTPException(status_code=403, detail="not your host")
 
         path = body.path
@@ -1295,7 +1314,8 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
+        is_admin = await _is_admin(user_id)
+        if user_id is not None and host.user_id != user_id and not is_admin:
             raise HTTPException(status_code=403, detail="not your host")
 
         conn = host_registry.get(host.host_id)
@@ -1411,7 +1431,8 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
+        is_admin = await _is_admin(user_id)
+        if user_id is not None and host.user_id != user_id and not is_admin:
             raise HTTPException(status_code=403, detail="not your host")
 
         conn = host_registry.get(host.host_id)
@@ -1491,7 +1512,8 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
+        is_admin = await _is_admin(user_id)
+        if user_id is not None and host.user_id != user_id and not is_admin:
             raise HTTPException(status_code=403, detail="not your host")
 
         conn = host_registry.get(host.host_id)
@@ -1542,7 +1564,8 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
+        is_admin = await _is_admin(user_id)
+        if user_id is not None and host.user_id != user_id and not is_admin:
             raise HTTPException(status_code=403, detail="not your host")
 
         if not path.strip():

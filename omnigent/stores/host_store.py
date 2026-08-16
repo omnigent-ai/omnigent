@@ -635,6 +635,23 @@ class HostStore:
             )
             return [_row_to_host(row) for row in rows]
 
+    def list_all_hosts(self) -> list[Host]:
+        """List all hosts across every user (admin view).
+
+        Returns both online and offline hosts for all users, ordered
+        by ``updated_at`` descending (most recently active first).
+
+        :returns: List of :class:`Host` entities.
+        """
+        with self._session("list_all_hosts") as session:
+            rows = (
+                session.query(SqlHost)
+                .filter(SqlHost.workspace_id == current_workspace_id())
+                .order_by(SqlHost.updated_at.desc())
+                .all()
+            )
+            return [_row_to_host(row) for row in rows]
+
     def get_host(self, host_id: str) -> Host | None:
         """
         Fetch a single host by ID.

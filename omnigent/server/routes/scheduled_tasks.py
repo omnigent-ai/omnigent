@@ -267,6 +267,7 @@ def create_scheduled_tasks_router(
             workspace=workspace,
             agent=agent,
             agent_cache=agent_cache,
+            permission_store=permission_store,
             host_store=getattr(request.app.state, "host_store", None),
             host_registry=getattr(request.app.state, "host_registry", None),
         )

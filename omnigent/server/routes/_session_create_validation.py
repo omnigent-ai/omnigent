@@ -101,6 +101,7 @@ async def validate_existing_host_workspace(
     workspace: str | None,
     agent: Any,
     agent_cache: AgentCache | None,
+    permission_store: Any | None = None,
     host_store: Any | None,
     host_registry: Any | None,
 ) -> str:
@@ -143,11 +144,17 @@ async def validate_existing_host_workspace(
     # name for error messages.
     host_name: str | None = None
     if host_store is not None:
+        is_admin = (
+            permission_store is not None
+            and user_id is not None
+            and await asyncio.to_thread(permission_store.is_admin, user_id)
+        )
         host = await asyncio.to_thread(
             resolve_host_owner,
             user_id=user_id,
             host_id=host_id,
             host_store=host_store,
+            is_admin=is_admin,
         )
         host_name = host.name
         # Wrong-replica classification, same as the /v1/hosts/* endpoints and

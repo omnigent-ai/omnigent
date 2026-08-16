@@ -4413,6 +4413,7 @@ async def _validate_session_workspace(
         workspace=workspace,
         agent=agent,
         agent_cache=agent_cache,
+        permission_store=getattr(request.app.state, "permission_store", None),
         host_store=getattr(request.app.state, "host_store", None),
         host_registry=getattr(request.app.state, "host_registry", None),
     )
