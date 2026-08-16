@@ -50,8 +50,9 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Remove runner-binding metadata without altering journal entries."""
-    op.drop_column("turn_operations", "last_dispatch_at")
-    op.drop_column("turn_operations", "dispatch_attempts")
-    op.drop_column("turn_operations", "runner_incarnation_id")
-    op.drop_column("turn_operations", "dispatch_request_json")
-    op.drop_column("turn_operations", "dispatch_request_hash")
+    with op.batch_alter_table("turn_operations") as batch_op:
+        batch_op.drop_column("last_dispatch_at")
+        batch_op.drop_column("dispatch_attempts")
+        batch_op.drop_column("runner_incarnation_id")
+        batch_op.drop_column("dispatch_request_json")
+        batch_op.drop_column("dispatch_request_hash")
