@@ -13,6 +13,7 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.runner import create_runner_app
+from omnigent.runner.resource_registry import SessionResourceRegistry
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
 
@@ -25,7 +26,11 @@ def _sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event)}\n\n"
 
 
-def _app(*, frames: list[str] | None = None) -> tuple[FastAPI, _FakeProcessManager]:
+def _app(
+    *,
+    frames: list[str] | None = None,
+    resource_registry: SessionResourceRegistry | None = None,
+) -> tuple[FastAPI, _FakeProcessManager]:
     harness = _ScriptedHarnessClient(
         frames
         or [
@@ -37,6 +42,7 @@ def _app(*, frames: list[str] | None = None) -> tuple[FastAPI, _FakeProcessManag
     app = create_runner_app(
         process_manager=manager,  # type: ignore[arg-type]
         server_client=NullServerClient(),  # type: ignore[arg-type]
+        resource_registry=resource_registry,
     )
     return app, manager
 
@@ -161,6 +167,32 @@ async def test_failed_harness_stream_terminalizes_operation_as_failed() -> None:
         status = await client.get(f"/v1/turn-operations/{operation_id}")
         assert status.status_code == 200
         assert status.json()["state"] == "failed"
+
+
+async def test_failure_after_reservation_does_not_leave_operation_accepted() -> None:
+    class _FailingRegistry(SessionResourceRegistry):
+        def note_session_turn_started(self, session_id: str) -> None:
+            raise RuntimeError(f"turn-state write failed for {session_id}")
+
+    app, manager = _app(resource_registry=_FailingRegistry())
+    operation_id = _id("setup-failure-operation")
+    session_id = _id("setup-failure-session")
+    async with await _client(app) as client:
+        with pytest.raises(RuntimeError, match="turn-state write failed"):
+            await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "content": "fail after reservation",
+                    "harness_override": "codex-native",
+                    "operation_id": operation_id,
+                },
+            )
+        status = await client.get(f"/v1/turn-operations/{operation_id}")
+    assert status.status_code == 200
+    assert status.json()["state"] == "failed"
+    assert session_id not in app.state.active_operation_ids
+    assert session_id not in app.state.active_turns
+    assert manager.get_client_calls == []
 
 
 async def test_deleting_live_session_terminalizes_operation_as_cancelled() -> None:

@@ -6769,6 +6769,10 @@ def create_runner_app(
             message_body = dict(body)
             message_body["conversation_id"] = conversation_id
             operation_request = dict(message_body) if operation_id is not None else None
+            _note_session_harness_override(
+                conversation_id,
+                cast(str | None, message_body.get("harness_override")),
+            )
 
             if operation_id is None and _is_native_harness(conversation_id):
                 resource_registry.note_session_turn_started(conversation_id)
@@ -6939,15 +6943,20 @@ def create_runner_app(
                         )
                     _turn_operation_registry.mark_running(operation_id)
                     _active_operation_ids[conversation_id] = operation_id
-                    if _is_native_harness(conversation_id):
+                try:
+                    if operation_id is not None and _is_native_harness(conversation_id):
                         resource_registry.note_session_turn_started(conversation_id)
 
-                if loaded_history is None:
-                    _session_histories[conversation_id].append(new_item)
-                else:
-                    loaded_history.append(new_item)
-                    _session_histories[conversation_id] = loaded_history
-                _begin_turn_slot(conversation_id)
+                    if loaded_history is None:
+                        _session_histories[conversation_id].append(new_item)
+                    else:
+                        loaded_history.append(new_item)
+                        _session_histories[conversation_id] = loaded_history
+                    _begin_turn_slot(conversation_id)
+                except Exception:
+                    if operation_id is not None:
+                        _terminalize_turn_operation(conversation_id, "failed")
+                    raise
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",
                     conversation_id,
