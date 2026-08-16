@@ -34,6 +34,7 @@ from omnigent.tools.builtins import (
     SysScheduledTaskDeleteTool,
     SysScheduledTaskListTool,
     SysScheduledTaskUpdateTool,
+    SysSessionArchiveTool,
     SysSessionCloseTool,
     SysSessionCreateTool,
     SysSessionGetHistoryTool,
@@ -502,8 +503,17 @@ class ToolManager:
             self._tools[SysSessionCreateTool.name()] = SysSessionCreateTool()
 
     def _register_session_tools(self) -> None:
-        """Register framework-owned tools for the current session."""
+        """
+        Register framework-owned tools for the current session.
+
+        Both act on the CALLING session only and take no target id, so
+        neither grants reach the caller did not already have:
+        ``sys_session_rename`` retitles it, ``sys_session_archive``
+        archives it when its work is finished (the one cleanup path an
+        unattended top-level run can take for itself).
+        """
         self._tools[SysSessionRenameTool.name()] = SysSessionRenameTool()
+        self._tools[SysSessionArchiveTool.name()] = SysSessionArchiveTool()
 
     def _register_agent_mgmt_tools(self) -> None:
         """

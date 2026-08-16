@@ -64,6 +64,9 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_session_list",
         "sys_session_get_info",
         "sys_session_rename",
+        # Self-archive is framework-owned and always registered so an
+        # unattended run can tidy up its own session when it finishes.
+        "sys_session_archive",
         # Read-only agent discovery tools are likewise always available
         # (global, permission-bounded reads of any accessible session's
         # agent / bundle).
@@ -124,6 +127,12 @@ def test_session_rename_is_registered_for_every_agent() -> None:
     names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
 
     assert "sys_session_rename" in names
+
+
+def test_session_archive_is_registered_for_every_agent() -> None:
+    names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
+
+    assert "sys_session_archive" in names
 
 
 @pytest.fixture()
