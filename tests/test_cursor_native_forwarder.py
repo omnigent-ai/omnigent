@@ -229,6 +229,18 @@ class TestBlobToItem:
         blob = self._blob({"role": "user", "content": "just some unwrapped context"})
         assert fwd._blob_to_item(2, "bid", blob, "a") is None
 
+    def test_automated_notification_with_user_query_is_skipped(self) -> None:
+        content = (
+            "<timestamp>Sunday, Aug 16, 2026, 10:49 AM (UTC-4)</timestamp>\n"
+            "<system_notification>\n"
+            "The following task has finished.\n"
+            "</system_notification>\n"
+            "<user_query>Briefly inform the user about the task result and perform "
+            "any follow-up actions (if needed).</user_query>"
+        )
+        blob = self._blob({"role": "user", "content": content})
+        assert fwd._blob_to_item(2, "bid", blob, "a") is None
+
 
 class TestReadNewItems:
     def test_reads_live_wal_store(self, tmp_path: Path) -> None:
@@ -241,6 +253,17 @@ class TestReadNewItems:
             [
                 ("s", {"role": "system", "content": "x"}),
                 ("u", _user("<user_query>\nReply ALPHA\n</user_query>")),
+                (
+                    "notification",
+                    {
+                        "role": "user",
+                        "content": (
+                            "<system_notification>Task finished.</system_notification>"
+                            "<user_query>Briefly inform the user about the task result and "
+                            "perform any follow-up actions (if needed).</user_query>"
+                        ),
+                    },
+                ),
                 ("bin", b"\x00binary"),
                 ("a", _assistant([{"type": "text", "text": "ALPHA"}])),
             ],
@@ -256,8 +279,8 @@ class TestReadNewItems:
         assert [it.item_data["role"] for it in posted] == ["user", "assistant"]
         assert posted[0].item_data["content"][0]["text"] == "Reply ALPHA"
         assert posted[1].item_data["content"][0]["text"] == "ALPHA"
-        # Every row (incl. skipped system/binary) advances the cursor.
-        assert max(it.rowid for it in items) == 4
+        # Every row (incl. skipped system/notification/binary) advances the cursor.
+        assert max(it.rowid for it in items) == 5
 
     def test_rowid_dedup_skips_already_seen(self, tmp_path: Path) -> None:
         store = tmp_path / "store.db"
