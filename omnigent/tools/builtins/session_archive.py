@@ -21,8 +21,8 @@ class SysSessionArchiveTool(Tool):
         return (
             "Archive the current session: hide it from the default session list and "
             "shut its runner down once this turn ends. Call it as the last action of "
-            "an unattended run (a scheduled task or similar automation) that has "
-            "finished its work, so the run does not leave an open session behind. "
+            "a top-level unattended run (a scheduled task or similar automation) that "
+            "has finished its work, so the run does not leave an open session behind. "
             "Do not call it while a person is still working in this session. "
             "Nothing is deleted — the full transcript stays readable and the user can "
             "unarchive the session at any time. Takes no arguments; it always targets "

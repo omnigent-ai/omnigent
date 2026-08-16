@@ -4543,6 +4543,68 @@ async def _rename_current_session_via_rest(
     return json.dumps(payload)
 
 
+def _archive_status_error(status_code: int, detail: str) -> str:
+    """Typed error for a non-2xx/3xx snapshot GET or archive PATCH.
+
+    A 422 means an older server rejects ``stop_when_idle`` as an unknown
+    field (``UpdateSessionRequest`` is ``extra="forbid"``) — call that out
+    so the model asks the user to archive instead of retrying the tool,
+    which is what stacks repeated archive attempts.
+    """
+    message = f"sys_session_archive returned {status_code}"
+    if status_code == 422:
+        message += (
+            ": self-archive is not supported on this server version; "
+            "ask the user to archive the session instead."
+        )
+    return json.dumps({"error": message, "detail": detail[:200]})
+
+
+async def _fetch_archive_snapshot(
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+) -> _JsonObject | str:
+    """
+    Fetch + status-classify the archive caller's own session snapshot.
+
+    Mirrors :func:`_fetch_close_target`'s snapshot-then-act shape: archiving
+    a sub-agent session is unrecoverable (its ``(agent, title)`` slot has
+    no way back — see :func:`_archive_current_session_via_rest`), so any
+    snapshot problem fails closed and skips the PATCH entirely, the same
+    way a non-200 snapshot skips close.
+
+    :param conversation_id: The calling session id, e.g. ``"conv_self"``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: The parsed snapshot dict on HTTP 200; otherwise a JSON error
+        string (``session_not_found`` for 404, ``session_archive_forbidden``
+        for 401/403, a generic status error otherwise).
+    """
+    try:
+        snap = await server_client.get(f"/v1/sessions/{conversation_id}", timeout=30.0)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_archive failed: {exc}"})
+    if snap.status_code == 404:
+        return json.dumps({"error": "session_not_found", "conversation_id": conversation_id})
+    if snap.status_code in (401, 403):
+        return json.dumps(
+            {
+                "error": "session_archive_forbidden",
+                "conversation_id": conversation_id,
+                "message": "only the session owner can archive this session.",
+            }
+        )
+    if snap.status_code != 200:
+        return _archive_status_error(snap.status_code, snap.text)
+    try:
+        parsed = snap.json()
+    except ValueError:
+        return json.dumps({"error": "sys_session_archive returned malformed session data"})
+    body = _string_object_dict(parsed)
+    if body is None:
+        return json.dumps({"error": "sys_session_archive returned malformed session data"})
+    return body
+
+
 async def _archive_current_session_via_rest(
     conversation_id: str | None,
     server_client: httpx.AsyncClient | None,
@@ -4555,16 +4617,40 @@ async def _archive_current_session_via_rest(
     server to hold the teardown until this turn ends; without it the archive's
     stop would kill the turn that made the call.
 
+    A sub-agent caller is refused before the PATCH is issued (a GET
+    snapshot checks first): the find-or-create path that resumes a named
+    sub-agent (``_find_open_child_by_title`` / the runner's child-session
+    lookup) never lists archived rows, and the store's duplicate-title
+    guard does not exempt them either, so an archived sub-agent's
+    ``(agent, title)`` slot can neither be resumed nor recreated. Only its
+    parent retiring it via ``sys_session_close`` can do that safely.
+
     :param conversation_id: The calling session id, e.g. ``"conv_self"``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :returns: JSON ``{"archived": true, "conversation_id": ...}``, or a JSON
         error object (``session_not_found`` for 404,
-        ``session_archive_forbidden`` for 401/403).
+        ``session_archive_forbidden`` for 401/403, ``session_is_a_sub_agent``
+        if the caller is itself a sub-agent session).
     """
     if server_client is None:
         return json.dumps({"error": "sys_session_archive requires server access"})
     if conversation_id is None:
         return json.dumps({"error": "sys_session_archive requires a session id"})
+    snap = await _fetch_archive_snapshot(conversation_id, server_client)
+    if isinstance(snap, str):
+        return snap
+    if snap.get("parent_session_id") is not None:
+        return json.dumps(
+            {
+                "error": "session_is_a_sub_agent",
+                "conversation_id": conversation_id,
+                "message": (
+                    "sys_session_archive retires a top-level session; a "
+                    "sub-agent session is retired by its parent via "
+                    "sys_session_close."
+                ),
+            }
+        )
     try:
         resp = await server_client.patch(
             f"/v1/sessions/{conversation_id}",
@@ -4583,13 +4669,8 @@ async def _archive_current_session_via_rest(
                 "message": "only the session owner can archive this session.",
             }
         )
-    if resp.status_code >= 400:
-        return json.dumps(
-            {
-                "error": f"sys_session_archive returned {resp.status_code}",
-                "detail": resp.text[:200],
-            }
-        )
+    if resp.status_code >= 300:
+        return _archive_status_error(resp.status_code, resp.text)
     return json.dumps({"archived": True, "conversation_id": conversation_id})
 
 

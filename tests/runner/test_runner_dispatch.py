@@ -7715,7 +7715,12 @@ async def test_sys_session_archive_patches_own_session_with_deferred_stop() -> N
     requests: list[tuple[str, str, dict[str, Any]]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
-        requests.append((request.method, request.url.path, json.loads(request.content)))
+        body = json.loads(request.content) if request.content else {}
+        requests.append((request.method, request.url.path, body))
+        if request.method == "GET":
+            return httpx.Response(
+                200, json={"id": "conv_self", "parent_session_id": None, "archived": False}
+            )
         return httpx.Response(200, json={"id": "conv_self", "archived": True})
 
     async with httpx.AsyncClient(
@@ -7725,7 +7730,8 @@ async def test_sys_session_archive_patches_own_session_with_deferred_stop() -> N
         output = await _archive_current_session_via_rest("conv_self", server_client)
 
     assert requests == [
-        ("PATCH", "/v1/sessions/conv_self", {"archived": True, "stop_when_idle": True})
+        ("GET", "/v1/sessions/conv_self", {}),
+        ("PATCH", "/v1/sessions/conv_self", {"archived": True, "stop_when_idle": True}),
     ]
     assert json.loads(output) == {"archived": True, "conversation_id": "conv_self"}
 
@@ -7743,6 +7749,10 @@ async def test_sys_session_archive_ignores_any_supplied_target() -> None:
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         requested_paths.append(request.url.path)
+        if request.method == "GET":
+            return httpx.Response(
+                200, json={"id": "conv_self", "parent_session_id": None, "archived": False}
+            )
         return httpx.Response(200, json={"id": "conv_self", "archived": True})
 
     async with httpx.AsyncClient(
@@ -7756,7 +7766,7 @@ async def test_sys_session_archive_ignores_any_supplied_target() -> None:
             server_client=server_client,
         )
 
-    assert requested_paths == ["/v1/sessions/conv_self"]
+    assert requested_paths == ["/v1/sessions/conv_self", "/v1/sessions/conv_self"]
 
 
 @pytest.mark.asyncio
@@ -7801,6 +7811,10 @@ async def test_sys_session_archive_reports_unsupported_server() -> None:
     from omnigent.runner.tool_dispatch import _archive_current_session_via_rest
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200, json={"id": "conv_self", "parent_session_id": None, "archived": False}
+            )
         return httpx.Response(422, json={"detail": "extra fields not permitted"})
 
     async with httpx.AsyncClient(
@@ -7809,7 +7823,112 @@ async def test_sys_session_archive_reports_unsupported_server() -> None:
     ) as server_client:
         output = await _archive_current_session_via_rest("conv_self", server_client)
 
-    assert "422" in json.loads(output)["error"]
+    error = json.loads(output)["error"]
+    assert "422" in error
+    assert "ask the user to archive" in error
+
+
+@pytest.mark.asyncio
+async def test_sys_session_archive_refuses_a_sub_agent_caller() -> None:
+    """
+    A sub-agent that calls ``sys_session_archive`` on itself is refused
+    before the PATCH is issued.
+
+    Archiving a sub-agent is unrecoverable: the find-or-create path that
+    resumes a named sub-agent never lists archived rows, and the store's
+    duplicate-title guard doesn't exempt them either, so the
+    ``(agent, title)`` slot would be dead forever. Only the transport's GET
+    may be seen — the PATCH must never fire.
+    """
+    from omnigent.runner.tool_dispatch import _archive_current_session_via_rest
+
+    requests: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.method)
+        return httpx.Response(
+            200,
+            json={"id": "conv_child", "parent_session_id": "conv_parent", "archived": False},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await _archive_current_session_via_rest("conv_child", server_client)
+
+    assert requests == ["GET"]
+    payload = json.loads(output)
+    assert payload["error"] == "session_is_a_sub_agent"
+    assert payload["conversation_id"] == "conv_child"
+    assert "sys_session_close" in payload["message"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_archive_skips_patch_on_snapshot_fetch_failure() -> None:
+    """A snapshot GET that raises fails closed: no PATCH is issued."""
+    from omnigent.runner.tool_dispatch import _archive_current_session_via_rest
+
+    requests: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.method)
+        raise httpx.ConnectError("connection refused")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await _archive_current_session_via_rest("conv_self", server_client)
+
+    assert requests == ["GET"]
+    payload = json.loads(output)
+    assert "sys_session_archive failed" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_archive_skips_patch_on_malformed_snapshot() -> None:
+    """A 200 snapshot with a non-object body fails closed: no PATCH is issued."""
+    from omnigent.runner.tool_dispatch import _archive_current_session_via_rest
+
+    requests: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.method)
+        return httpx.Response(200, content=b"not json")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await _archive_current_session_via_rest("conv_self", server_client)
+
+    assert requests == ["GET"]
+    payload = json.loads(output)
+    assert "malformed session data" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_archive_redirect_is_not_treated_as_success() -> None:
+    """A 3xx PATCH response must not read back as ``{"archived": true}``."""
+    from omnigent.runner.tool_dispatch import _archive_current_session_via_rest
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200, json={"id": "conv_self", "parent_session_id": None, "archived": False}
+            )
+        return httpx.Response(307, text="redirected")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await _archive_current_session_via_rest("conv_self", server_client)
+
+    payload = json.loads(output)
+    assert "archived" not in payload
+    assert "307" in payload["error"]
 
 
 @pytest.mark.asyncio
