@@ -445,6 +445,7 @@ async def test_stop_when_idle_defers_stop_until_turn_ends(
             # Turn ends → the deferred stop proceeds.
             _sessions_common._session_status_cache[session_id] = "idle"
             await _drain_detached_stops()
+            mock_stop.assert_awaited_once()
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
 

@@ -695,12 +695,27 @@ async def _archive_stop(
         running state (bounded by ``_ARCHIVE_IDLE_WAIT_TIMEOUT_S``). Set by
         a self-archive, which lands mid-turn.
     """
+    # Once the wait settles the session to idle, ``_best_effort_stop``'s own
+    # "is it currently running" gate would read that as nothing to do — but
+    # the wait's whole point was to let a mid-turn self-archive's turn end
+    # so the runner can still be stopped, so that gate must be bypassed here.
+    force_own_stop = False
     if wait_for_idle:
         await _wait_for_session_idle(session_id)
+        force_own_stop = _session_status_from_cache(session_id) != "running"
     # Resolve through the facade so a test's monkeypatch is honored here.
     from omnigent.server.routes import sessions as _facade
 
     await _facade._best_effort_stop(session_id, conversation_store, runner_router)
+    if force_own_stop:
+        try:
+            await _stop_session_via_runner(session_id, runner_router)
+        except Exception:  # noqa: BLE001
+            _logger.debug(
+                "Deferred archive stop failed for %s; proceeding anyway",
+                session_id,
+                exc_info=True,
+            )
     try:
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     except Exception:  # noqa: BLE001
