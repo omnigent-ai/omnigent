@@ -1242,8 +1242,9 @@ def _resolve_session_call(
             }
         )
     if target.parent_conversation_id is None:
-        # Close frees a child's ``(agent, title)`` slot, which a top-level
-        # conversation does not have; archiving is its lifecycle action.
+        # _agent_title_from_conversation raises on a title with no colon,
+        # which every top-level conversation has; close also has no
+        # (agent, title) slot to free for one.
         return json.dumps(
             {
                 "error": "session_not_a_sub_agent",
