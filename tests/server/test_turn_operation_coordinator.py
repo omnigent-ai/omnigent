@@ -57,6 +57,8 @@ class _Runner:
             return httpx.Response(409, json={"error": "session_busy", "detail": "busy"})
         if self.post_mode == "malformed":
             return httpx.Response(202, json={"state": "running"})
+        if self.post_mode == "timeout_before_accept":
+            raise httpx.ReadTimeout("request outcome unknown before acceptance", request=request)
         existing = self.operations.get(body["operation_id"])
         if existing is not None:
             if self.operation_requests[body["operation_id"]] != body:
@@ -147,7 +149,7 @@ async def test_transport_unknown_retries_only_on_same_incarnation(
     store: SqlAlchemyTurnOperationStore,
 ) -> None:
     operation = _input_persisted(store)
-    runner = _Runner(post_mode="timeout")
+    runner = _Runner(post_mode="timeout_before_accept")
     coordinator, client = _coordinator(store, runner)
     async with client:
         with pytest.raises(RunnerOperationDispatchUnknown) as caught:
@@ -166,6 +168,28 @@ async def test_transport_unknown_retries_only_on_same_incarnation(
     assert dispatched.error is None
     assert len(runner.posts) == 2
     assert runner.executions == [operation.id]
+
+
+async def test_transport_unknown_reconciles_existing_operation_without_repost(
+    store: SqlAlchemyTurnOperationStore,
+) -> None:
+    operation = _input_persisted(store)
+    runner = _Runner(post_mode="timeout")
+    coordinator, client = _coordinator(store, runner)
+    async with client:
+        with pytest.raises(RunnerOperationDispatchUnknown):
+            await coordinator.dispatch(operation.id, operation.conversation_id)
+        runner.operations[operation.id] = {
+            "operation_id": operation.id,
+            "session_id": operation.conversation_id,
+            "state": "succeeded",
+            "runner_incarnation_id": runner.incarnation,
+        }
+        terminal = await coordinator.dispatch(operation.id, operation.conversation_id)
+
+    assert terminal.state == "succeeded"
+    assert terminal.dispatch_attempts == 1
+    assert len(runner.posts) == 1
 
 
 async def test_changed_incarnation_never_redispatches_unknown_operation(

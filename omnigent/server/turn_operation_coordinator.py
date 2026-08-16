@@ -96,10 +96,14 @@ class TurnOperationCoordinator:
         ):
             return await self._terminalize_restart_ambiguity(operation)
 
-        if operation.state == "dispatched":
-            if preflight.state == "not_found":
-                return await self._terminalize_missing_dispatched(operation)
+        if preflight.state != "not_found":
+            if operation.runner_incarnation_id is None:
+                raise RunnerOperationProtocolError(
+                    "runner reports an operation before any recorded dispatch attempt"
+                )
             return await self._apply_runner_status(operation, preflight)
+        if operation.state == "dispatched":
+            return await self._terminalize_missing_dispatched(operation)
 
         operation = await asyncio.to_thread(
             self._store.record_dispatch_attempt,
