@@ -643,6 +643,12 @@ async def _best_effort_stop(
 # garbage-collected mid-stop (asyncio only holds weak refs to tasks).
 _detached_stop_tasks: set[asyncio.Task[None]] = set()
 
+# The in-flight deferred archive stop per session, if any. A retried
+# archive PATCH against a session that already has one pending must not
+# stack a second poller — each poller ends in its own own-session stop,
+# so N pollers would issue N stop RPCs for one archive.
+_in_flight_archive_stops: dict[str, asyncio.Task[None]] = {}
+
 # Bounds for a deferred archive stop (``stop_when_idle``). A self-archive
 # lands mid-turn, so the teardown waits for that turn to end — but a session
 # that never reports idle (wedged runner, harness that stops publishing) must
@@ -721,18 +727,32 @@ async def _archive_stop(
     # Resolve through the facade so a test's monkeypatch is honored here.
     from omnigent.server.routes import sessions as _facade
 
-    await _facade._best_effort_stop(
-        session_id, conversation_store, runner_router, force_own_stop=was_live
-    )
+    # Re-check archived status right before stopping: a wait of up to
+    # _ARCHIVE_IDLE_WAIT_TIMEOUT_S gives a user ample time to notice the
+    # session, unarchive it, and resume work, and that unarchive must win
+    # over a stale stop. A lookup failure falls back to the old
+    # unconditional behavior (stop proceeds) rather than raising out of
+    # this detached task.
     try:
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     except Exception:  # noqa: BLE001
         _logger.debug(
-            "Archive host-runner teardown lookup failed for %s",
+            "Archive re-check lookup failed for %s; stopping anyway",
             session_id,
             exc_info=True,
         )
-        return
+        conv = None
+    else:
+        if conv is None or not conv.archived:
+            _logger.info(
+                "Session %s is no longer archived; skipping its deferred stop",
+                session_id,
+            )
+            return
+
+    await _facade._best_effort_stop(
+        session_id, conversation_store, runner_router, force_own_stop=was_live
+    )
     if conv is None or not conv.host_id or not conv.runner_id:
         return
     # Mark the tunnel drop intentional BEFORE tearing it down so the relay
@@ -784,6 +804,10 @@ def _spawn_archive_stop(
     :param wait_for_idle: Defer the teardown until the session leaves the
         running state. Forwarded to :func:`_archive_stop`.
     """
+    if session_id in _in_flight_archive_stops:
+        # A poller is already parked (or running) for this session — a
+        # retried archive PATCH must not stack a second one.
+        return
     task = asyncio.create_task(
         _archive_stop(
             session_id,
@@ -794,7 +818,14 @@ def _spawn_archive_stop(
         )
     )
     _detached_stop_tasks.add(task)
-    task.add_done_callback(_detached_stop_tasks.discard)
+    _in_flight_archive_stops[session_id] = task
+
+    def _clear(completed: asyncio.Task[None]) -> None:
+        _detached_stop_tasks.discard(completed)
+        if _in_flight_archive_stops.get(session_id) is completed:
+            del _in_flight_archive_stops[session_id]
+
+    task.add_done_callback(_clear)
 
 
 def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str, str]:
@@ -9236,6 +9267,7 @@ __all__ = [
     "_handle_mcp_tools_call",
     "_heal_subagent_runner_binding_via_parent",
     "_hold_native_ask_gate",
+    "_in_flight_archive_stops",
     "_is_native_terminal_session",
     "_kick_managed_relaunch",
     "_kick_managed_wake",

@@ -577,6 +577,91 @@ async def test_stop_when_idle_on_already_idle_session_stops_nothing(
         _sessions_common._session_background_task_count_cache.pop(session_id, None)
 
 
+async def test_unarchive_while_deferred_stop_is_parked_skips_the_stop(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A user who unarchives while the deferred stop is still parked keeps
+    their session running.
+
+    The wait can take up to 300s — wide enough for someone to notice the
+    session vanish, unarchive it from "Show archived", and resume work
+    before the deferred stop ever fires. The stop must re-check archived
+    status right before acting, not trust the state from when it was
+    scheduled.
+    """
+    session = await create_test_session(client, name="archive-unarchive-race")
+    session_id = session["id"]
+
+    mock_stop = AsyncMock(return_value=True)
+    monkeypatch.setattr(_sessions_orchestration, "_ARCHIVE_IDLE_POLL_INTERVAL_S", 0.01)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
+            resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True, "stop_when_idle": True},
+            )
+            assert resp.status_code == 200
+            # Still parked, waiting for idle.
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+            mock_stop.assert_not_awaited()
+
+            # The user notices, unarchives, and resumes work.
+            unarchive_resp = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": False},
+            )
+            assert unarchive_resp.status_code == 200
+
+            # Turn ends — the wait resolves, but the re-check sees the
+            # session is no longer archived and skips the stop.
+            _sessions_common._session_status_cache[session_id] = "idle"
+            await _drain_detached_stops()
+            mock_stop.assert_not_awaited()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
+async def test_repeated_archive_patches_stop_the_session_exactly_once(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A model that retries the archive tool call must not stack pollers.
+
+    Each deferred stop ends in its own own-session stop RPC, so two
+    archive PATCHes against the same session (a retried call) must still
+    only stop the session once.
+    """
+    session = await create_test_session(client, name="archive-retry")
+    session_id = session["id"]
+
+    mock_stop = AsyncMock(return_value=True)
+    monkeypatch.setattr(_sessions_orchestration, "_ARCHIVE_IDLE_POLL_INTERVAL_S", 0.01)
+    _sessions_common._session_status_cache[session_id] = "running"
+    try:
+        with patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop):
+            resp1 = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True, "stop_when_idle": True},
+            )
+            assert resp1.status_code == 200
+            resp2 = await client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"archived": True, "stop_when_idle": True},
+            )
+            assert resp2.status_code == 200
+
+            _sessions_common._session_status_cache[session_id] = "idle"
+            await _drain_detached_stops()
+            mock_stop.assert_awaited_once()
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+
+
 async def test_top_level_session_archives_itself_end_to_end(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
