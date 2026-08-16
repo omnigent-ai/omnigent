@@ -4952,7 +4952,17 @@ async def _close_tree_scope_error(
     if caller_root is None or target_root != caller_root:
         return json.dumps({"error": "session_out_of_tree", "conversation_id": target_id})
     if target_snap.get("parent_session_id") is None:
-        return json.dumps({"error": "session_not_a_sub_agent", "conversation_id": target_id})
+        return json.dumps(
+            {
+                "error": "session_not_a_sub_agent",
+                "conversation_id": target_id,
+                "message": (
+                    "target conversation is a top-level conversation, not a "
+                    "sub-agent session. To retire the session you are running "
+                    "in, call sys_session_archive (no arguments)."
+                ),
+            }
+        )
     return None
 
 

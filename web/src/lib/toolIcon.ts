@@ -7,6 +7,7 @@
 // (which arrive completed).
 
 import {
+  Archive,
   Ban,
   Bot,
   Code2,
@@ -41,6 +42,7 @@ export function iconForTool(name: string, nativeToolType?: string): LucideIcon {
   if (name === "sys_terminal_close") return Ban;
   if (name.startsWith("sys_terminal_")) return Terminal;
   if (name === "sys_session_close") return Ban;
+  if (name === "sys_session_archive") return Archive;
   if (name.startsWith("sys_session_")) return Bot;
   if (name === "sys_call_async") return Send;
   if (name === "sys_read_inbox") return Inbox;

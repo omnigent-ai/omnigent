@@ -1242,19 +1242,17 @@ def _resolve_session_call(
             }
         )
     if target.parent_conversation_id is None:
-        # Top-level conversations don't carry the
-        # ``<agent>:<title>`` invariant on ``title`` that
-        # downstream :func:`_agent_title_from_conversation`
-        # depends on. Refuse here with a typed error rather
-        # than letting the title parse blow up.
+        # Close frees a child's ``(agent, title)`` slot, which a top-level
+        # conversation does not have; archiving is its lifecycle action.
         return json.dumps(
             {
                 "error": "session_not_a_sub_agent",
                 "conversation_id": target_id,
                 "message": (
-                    "target conversation is a top-level "
-                    "conversation, not a sub-agent session; "
-                    "peek/close only operate on sub-agents."
+                    "target conversation is a top-level conversation, not a "
+                    "sub-agent session; peek/close only operate on sub-agents. "
+                    "To retire the session you are running in, call "
+                    "sys_session_archive (no arguments)."
                 ),
             }
         )
@@ -1497,7 +1495,8 @@ class SysSessionCloseTool(Tool):
             "continuing this one. Returns session_not_found if "
             "conversation_id is unknown, session_out_of_tree if it "
             "isn't part of the caller's tree, or sub_agent_busy if "
-            "the child has a non-terminal task in flight."
+            "the child has a non-terminal task in flight. To retire "
+            "your OWN session instead, use sys_session_archive."
         )
 
     def get_schema(self) -> dict[str, Any]:

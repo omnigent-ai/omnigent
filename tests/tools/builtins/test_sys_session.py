@@ -632,6 +632,7 @@ def test_peek_top_level_conversation_in_tree_is_rejected(
     payload = json.loads(raw)
     assert payload["error"] == "session_not_a_sub_agent"
     assert payload["conversation_id"] == session_fixture.parent_conv_id
+    assert "sys_session_archive" in payload["message"]
 
 
 def test_close_top_level_conversation_in_tree_is_rejected(
@@ -656,6 +657,7 @@ def test_close_top_level_conversation_in_tree_is_rejected(
     payload = json.loads(raw)
     assert payload["error"] == "session_not_a_sub_agent"
     assert payload["conversation_id"] == session_fixture.parent_conv_id
+    assert "sys_session_archive" in payload["message"]
 
     parent_after = session_fixture.conv_store.get_conversation(
         session_fixture.parent_conv_id,

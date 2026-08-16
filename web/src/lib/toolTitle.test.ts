@@ -70,6 +70,13 @@ describe("formatToolTitle", () => {
     });
   });
 
+  it("formats sys_session_archive with no arguments", () => {
+    expect(formatToolTitle("sys_session_archive", {})).toEqual({
+      verb: "Archive session",
+      body: "",
+    });
+  });
+
   it("formats sys_timer_set with seconds and repeat flag", () => {
     expect(formatToolTitle("sys_timer_set", { seconds: 30 })).toEqual({
       verb: "Set timer:",

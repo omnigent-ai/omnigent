@@ -68,6 +68,7 @@ const FORMATTERS: Record<string, ArgFormatter> = {
   },
 
   sys_session_close: (args) => sessionTitle("Close child session:", args),
+  sys_session_archive: () => verbOnly("Archive session"),
   sys_session_list: () => verbOnly("List child sessions"),
   sys_session_get_info: (args) => {
     const id = asString(args.session_id);

@@ -5512,7 +5512,9 @@ async def test_session_close_rejects_top_level_target() -> None:
                 server_client=client,
             )
         )
-    assert out == {"error": "session_not_a_sub_agent", "conversation_id": "conv_root"}
+    assert out["error"] == "session_not_a_sub_agent"
+    assert out["conversation_id"] == "conv_root"
+    assert "sys_session_archive" in out["message"]
     assert patched is False
 
 
