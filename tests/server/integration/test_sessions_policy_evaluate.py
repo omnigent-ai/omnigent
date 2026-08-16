@@ -768,18 +768,40 @@ async def test_tool_call_ask_holds_gate_and_returns_allow_on_accept(
     assert resp.json()["result"] == "POLICY_ACTION_ALLOW"
 
 
+@pytest.mark.parametrize(
+    ("harness", "expects_interrupt"),
+    [("hermes", False), ("claude-native", True)],
+)
 async def test_tool_call_ask_returns_deny_on_decline(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    expects_interrupt: bool,
 ) -> None:
     """
     A declined TOOL_CALL ASK collapses to ``POLICY_ACTION_DENY`` —
     fail-closed. If the human refuses at the approve URL, the native
     tool must not run.
+
+    A native harness also gets an ``interrupt`` so the vendor TUI stops.
+    Every other harness continues the turn from the deny response.
+
+    :param harness: Harness the agent under test runs.
+    :param expects_interrupt: Whether the runner must receive an
+        ``interrupt`` event alongside the deny.
     """
     _patch_default_policies(monkeypatch, f"{__name__}._ask_for_bash")
-    agent = await create_test_agent(client)
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": harness}},
+    )
     session_id = await _create_session(client, agent["id"])
+
+    # Installed after session creation, which itself touches the runner
+    # snapshot path; the forward falls back to the global runner client
+    # when no runner is bound for the session.
+    capturing = CapturingRunnerClient()
+    monkeypatch.setattr("omnigent.runtime._globals._runner_client", capturing)
 
     drain = asyncio.create_task(_drain_elicitation_id(session_id))
     await asyncio.sleep(0.05)
@@ -800,6 +822,56 @@ async def test_tool_call_ask_returns_deny_on_decline(
     resp = await evaluate
     assert resp.status_code == 200, resp.text
     assert resp.json()["result"] == "POLICY_ACTION_DENY"
+    event_types = [post["json"].get("type") for post in capturing.posted]
+    assert ("interrupt" in event_types) is expects_interrupt
+
+
+async def test_tool_call_ask_decline_interrupts_when_harness_unresolved(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A decline whose harness resolution fails keeps the interrupt.
+
+    ``_resolve_harness`` returns ``None`` for missing state and caught
+    resolution errors. The decline boundary fails closed on that
+    uncertainty: the interrupt is kept, sacrificing the turn rather than
+    risking a native TUI continuing refused work.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._ask_for_bash")
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "hermes"}},
+    )
+    session_id = await _create_session(client, agent["id"])
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_hooks._resolve_harness",
+        lambda *a, **kw: None,
+    )
+    capturing = CapturingRunnerClient()
+    monkeypatch.setattr("omnigent.runtime._globals._runner_client", capturing)
+
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    await asyncio.sleep(0.05)
+    evaluate = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_call_request("Bash"),
+        )
+    )
+    elicitation_id = await drain
+    verdict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "decline"},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await evaluate
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["result"] == "POLICY_ACTION_DENY"
+    event_types = [post["json"].get("type") for post in capturing.posted]
+    assert "interrupt" in event_types
 
 
 async def test_tool_call_ask_forwards_popup_event_to_runner(

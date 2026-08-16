@@ -7438,6 +7438,111 @@ async def test_approval_event_without_content_flattened() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "expected_event_types"),
+    [("hermes", ["approval"]), ("claude-native", ["interrupt", "approval"])],
+)
+async def test_approval_decline_interrupts_only_native_harness(
+    harness: str,
+    expected_event_types: list[str],
+) -> None:
+    """
+    A declined approval interrupts a native harness only.
+
+    A native harness runs a vendor TUI that has to be told to stop. Every
+    other harness reads the deny off its policy hook and keeps the turn,
+    so interrupting it discards work the user did not cancel.
+
+    :param harness: Harness the session's agent spec declares.
+    :param expected_event_types: Event types the harness must receive, in
+        order.
+    """
+    captured: list[dict[str, Any]] = []
+
+    class _CapturingHarnessClient:
+        async def post(
+            self, url: str, *, json: dict[str, Any], timeout: float | None = None
+        ) -> httpx.Response:
+            del url, timeout
+            captured.append(json)
+            return httpx.Response(204)
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Resolve a minimal spec on the parametrized harness.
+
+        :param agent_id: Agent id (unused).
+        :param session_id: Session id (unused).
+        :returns: A minimal spec whose harness is ``harness``.
+        """
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="approval-decline-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+        )
+
+    mgr = _FakeProcessManager(harness_client=cast(Any, _CapturingHarnessClient()))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, mgr),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        # POST /v1/sessions seeds _session_spec_cache, which is what the
+        # approval path reads the session's harness back from.
+        create = await http.post(
+            "/v1/sessions",
+            json={"session_id": "conv_decline", "agent_id": "agent_decline"},
+        )
+        assert create.status_code == 201, create.text
+        resp = await http.post(
+            "/v1/sessions/conv_decline/events",
+            json={"type": "approval", "data": {"elicitation_id": "e2", "action": "decline"}},
+        )
+
+    assert resp.status_code == 204
+    assert [event["type"] for event in captured] == expected_event_types
+
+
+@pytest.mark.asyncio
+async def test_approval_decline_unresolved_harness_keeps_interrupt() -> None:
+    """
+    A decline whose session harness cannot be resolved keeps the interrupt.
+
+    The spec cache has no entry for the session, so harness resolution
+    returns ``None``. At an approval boundary that uncertainty must fail
+    closed: sacrifice the turn rather than risk a native TUI continuing
+    work the user refused.
+    """
+    captured: list[dict[str, Any]] = []
+
+    class _CapturingHarnessClient:
+        async def post(
+            self, url: str, *, json: dict[str, Any], timeout: float | None = None
+        ) -> httpx.Response:
+            del url, timeout
+            captured.append(json)
+            return httpx.Response(204)
+
+    mgr = _FakeProcessManager(harness_client=cast(Any, _CapturingHarnessClient()))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, mgr),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        # Deliberately no POST /v1/sessions first: the spec cache stays
+        # empty, so _session_harness_name returns None for this id.
+        resp = await http.post(
+            "/v1/sessions/conv_unresolved/events",
+            json={"type": "approval", "data": {"elicitation_id": "e3", "action": "decline"}},
+        )
+
+    assert resp.status_code == 204
+    assert [event["type"] for event in captured] == ["interrupt", "approval"]
+
+
+@pytest.mark.asyncio
 async def test_spawn_handle_round_trips_to_sys_cancel_async(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

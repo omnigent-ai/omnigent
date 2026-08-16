@@ -17,6 +17,7 @@ from fastapi.responses import Response
 from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.entities import Conversation
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
+from omnigent.harness_aliases import is_native_harness
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     get_agent_cache,
@@ -76,6 +77,7 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client,
     _native_ask_gate_lock,
     _publish_policy_denied,
+    _resolve_harness,
     _structured_ask_user_question,
 )
 from omnigent.server.routes._sessions.orchestration import (
@@ -871,17 +873,16 @@ def register_hooks_routes(
                                 elicitation_id=hook_elicitation_id,
                             )
                         except ElicitationDeclinedError as exc:
-                            # Explicit user decline: interrupt the native
-                            # harness BEFORE returning the hook deny so the
-                            # Escape key reaches Claude Code's tmux pane first.
-                            # By the time the DENY response reaches the hook
-                            # subprocess, the abort signal is already queued.
-                            # Best-effort: forwarding failures are swallowed.
-                            await _forward_session_change_to_runner(
-                                session_id,
-                                get_server_runner_router(),
-                                {"type": "interrupt"},
-                            )
+                            # A native harness drives a vendor TUI that stops
+                            # only on an abort signal, sent before the deny.
+                            # Every other harness keeps the turn on the deny.
+                            _declined_harness = _resolve_harness(conv)
+                            if _declined_harness is None or is_native_harness(_declined_harness):
+                                await _forward_session_change_to_runner(
+                                    session_id,
+                                    get_server_runner_router(),
+                                    {"type": "interrupt"},
+                                )
                             decline_body = {
                                 "result": "POLICY_ACTION_DENY",
                                 "reason": exc.args[0] or "Approval was declined.",

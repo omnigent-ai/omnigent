@@ -7020,7 +7020,15 @@ def create_runner_app(
             pending_approvals.resolve(_data.get("elicitation_id", ""), _elicit_action == "accept")
             if _session_harness_name(conversation_id) == "claude-native":
                 await _apply_claude_native_plan_verdict(conversation_id, _data)
-            if _elicit_action == "decline":
+            _declined_harness = _session_harness_name(conversation_id)
+            if _elicit_action == "decline" and (
+                _declined_harness is None or is_native_harness(_declined_harness)
+            ):
+                # A native harness runs a vendor TUI that only stops on an
+                # abort signal. Every other harness reads the deny off its
+                # policy hook and keeps the turn. An UNRESOLVED harness keeps
+                # the abort too: at an approval boundary, uncertainty must
+                # cost the turn, never risk running work the user refused.
                 try:
                     _int_client = await process_manager.get_client(conversation_id, "any")
                     await _int_client.post(
