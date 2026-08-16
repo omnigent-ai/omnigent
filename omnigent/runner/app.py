@@ -7565,9 +7565,6 @@ def create_runner_app(
             # same dead instance we just probed.
             current = terminal_registry.get(conv_id, terminal_name, "main")
             if current is instance:
-                # is_alive() set instance.running=False as a side effect;
-                # restore it so close() issues tmux kill-server.
-                instance.running = True
                 try:
                     await terminal_registry.close(conv_id, terminal_name, "main")
                 except asyncio.CancelledError:

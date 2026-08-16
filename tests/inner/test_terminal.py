@@ -6,11 +6,14 @@ import asyncio
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import psutil
 import pytest
 
 import omnigent.inner.terminal as terminal_mod
@@ -26,6 +29,28 @@ from omnigent.inner.terminal import (
     resolve_terminal_transport,
 )
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
+
+
+def _process_is_gone_or_zombie(process: psutil.Process) -> bool:
+    """Return whether a non-child process has terminated."""
+    try:
+        return not process.is_running() or process.status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return True
+
+
+async def _wait_until_process_terminates(
+    process: psutil.Process,
+    *,
+    timeout: float = 1.0,
+) -> bool:
+    """Poll for process termination without waiting for its parent to reap it."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if _process_is_gone_or_zombie(process):
+            return True
+        await asyncio.sleep(0.02)
+    return _process_is_gone_or_zombie(process)
 
 
 def _write_transport_config(config_home: Path, value: str | None) -> None:
@@ -424,6 +449,130 @@ async def test_server_survives_inner_process_exit_real_tmux(tmp_path: Path) -> N
         )
     finally:
         await instance.close()
+
+
+@pytest.mark.asyncio
+async def test_close_stops_launched_server_after_inner_process_exit(
+    tmp_path: Path,
+) -> None:
+    """A launched terminal owns tmux teardown after its pane exits."""
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        launch_cwd=str(tmp_path),
+        running=False,
+    )
+    tmux = AsyncMock()
+    instance._tmux = tmux
+
+    await instance.close()
+
+    tmux.assert_awaited_once_with("kill-server")
+    assert instance.running is False
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
+@pytest.mark.asyncio
+async def test_close_stops_server_after_inner_process_exit_real_tmux() -> None:
+    """Closing a finished terminal stops its private tmux server."""
+    private_dir = Path(tempfile.mkdtemp(prefix="omnigent-tmux-", dir="/tmp"))
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=private_dir / "tmux.sock",
+        private_dir=private_dir,
+        command="sh",
+        args=["-c", "printf 'terminal-finished\\n'"],
+        keep_alive_after_exit=True,
+    )
+    server_process: psutil.Process | None = None
+    try:
+        await instance.launch(cwd=private_dir)
+
+        server_probe = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(instance.socket_path),
+                "display-message",
+                "-p",
+                "-t",
+                instance.tmux_target,
+                "#{pid}",
+            ],
+            capture_output=True,
+            check=True,
+            timeout=5,
+        )
+        server_process = psutil.Process(int(server_probe.stdout.decode().strip()))
+
+        for _ in range(250):
+            if not await instance.is_alive():
+                break
+            await asyncio.sleep(0.02)
+        else:  # pragma: no cover - only on a hang/regression
+            raise AssertionError("inner process never reported as exited")
+
+        server_probe = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(instance.socket_path),
+                "has-session",
+                "-t",
+                instance.tmux_target,
+            ],
+            capture_output=True,
+            timeout=5,
+        )
+        assert server_probe.returncode == 0
+        pane = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(instance.socket_path),
+                "capture-pane",
+                "-p",
+                "-S",
+                "-",
+                "-t",
+                instance.tmux_target,
+            ],
+            capture_output=True,
+            check=True,
+            timeout=5,
+        )
+        assert b"terminal-finished" in pane.stdout
+
+        await instance.close()
+
+        server_probe = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(instance.socket_path),
+                "has-session",
+                "-t",
+                instance.tmux_target,
+            ],
+            capture_output=True,
+            timeout=5,
+        )
+        assert server_probe.returncode != 0
+        assert not instance.socket_path.exists()
+        assert await _wait_until_process_terminates(server_process), (
+            "tmux server remained live after close() once the inner process exited: "
+            f"pid={server_process.pid}"
+        )
+    finally:
+        await instance.close()
+        if server_process is not None and not _process_is_gone_or_zombie(server_process):
+            server_process.terminate()
+            if not await _wait_until_process_terminates(server_process):
+                server_process.kill()
+        shutil.rmtree(private_dir, ignore_errors=True)
 
 
 async def _capture_launch_argv(
