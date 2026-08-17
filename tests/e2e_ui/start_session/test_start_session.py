@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sys
 from typing import Any
 
 import pytest
@@ -3424,16 +3425,32 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
             )
             await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_have_text("None")
 
-            # Open the worktree chip and name a branch + base branch.
+            # Typed spaces become dashes as soon as the input event lands.
             await page.get_by_test_id("new-chat-landing-branch-chip").click()
-            await page.get_by_test_id("new-chat-landing-branch-input").fill("feature/login")
+            branch_input = page.get_by_test_id("new-chat-landing-branch-input")
+            await branch_input.press_sequentially("feature login")
+            await expect(branch_input).to_have_value("feature-login")
+
+            # A clipboard paste exercises the same normalization path.
+            select_all = "Meta+A" if sys.platform == "darwin" else "Control+A"
+            paste = "Meta+V" if sys.platform == "darwin" else "Control+V"
+            await branch_input.press(select_all)
+            await page.context.grant_permissions(
+                ["clipboard-read", "clipboard-write"], origin=base_url
+            )
+            await page.evaluate(
+                "(text) => navigator.clipboard.writeText(text)", "release candidate"
+            )
+            await branch_input.press(paste)
+            await expect(branch_input).to_have_value("release-candidate")
+
             # The base-branch input only appears once a branch name is set.
             await expect(page.get_by_test_id("new-chat-landing-base-branch-input")).to_be_visible()
             await page.get_by_test_id("new-chat-landing-base-branch-input").fill("main")
 
             # The chip label follows the branch name.
             await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_contain_text(
-                "feature/login"
+                "release-candidate"
             )
 
             # Filling the message closes the popover, then send.
@@ -3444,7 +3461,10 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
-            assert body.get("git") == {"branch_name": "feature/login", "base_branch": "main"}, body
+            assert body.get("git") == {
+                "branch_name": "release-candidate",
+                "base_branch": "main",
+            }, body
         finally:
             await browser.close()
 
