@@ -77,8 +77,15 @@ export function partitionAgentsByKind<T extends AvailableAgent>(
   agents: readonly T[],
 ): { builtins: T[]; customs: T[] } {
   const sorted = sortAgentsForDisplay(agents);
+  // Prefer the server's ``builtin`` signal — GET /v1/agents now sets it
+  // (session-scope-NULL row with a deterministic name-derived id). This groups
+  // dynamically-seeded built-ins with the harnesses instead of under custom
+  // agents; the {@link BUILTIN_AGENTS} allowlist is only a fallback for older
+  // servers that don't send the field. Without this, seeded ACP agents (Devin,
+  // grok, …) — whose names aren't in the static allowlist — fall to "custom".
+  const isBuiltin = (a: T): boolean => a.builtin ?? BUILTIN_AGENTS.has(a.name);
   return {
-    builtins: sorted.filter((a) => BUILTIN_AGENTS.has(a.name)),
-    customs: sorted.filter((a) => !BUILTIN_AGENTS.has(a.name)),
+    builtins: sorted.filter(isBuiltin),
+    customs: sorted.filter((a) => !isBuiltin(a)),
   };
 }
