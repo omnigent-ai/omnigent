@@ -199,6 +199,7 @@ import type { CostControlMode } from "@/components/CostRoutingControl";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentRowTooltip } from "@/components/AgentHoverCard";
 import { CreateAgentDialog } from "./CreateAgentDialog";
+import { ImportChatDialog } from "./ImportChatDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
 
@@ -2244,6 +2245,7 @@ export function NewChatLandingScreen() {
   } | null>(null);
   // Harness-config modal, opened from the composer's gear icon.
   const [configOpen, setConfigOpen] = useState(false);
+  const [importChatOpen, setImportChatOpen] = useState(false);
 
   // Mirror the current draft fields into a ref every render so the unmount
   // cleanup below can snapshot the latest values without re-subscribing.
@@ -4312,6 +4314,17 @@ export function NewChatLandingScreen() {
                     </>
                   )}
                 </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 px-2 text-xs text-muted-foreground"
+                  onClick={() => setImportChatOpen(true)}
+                  disabled={creating}
+                  data-testid="new-chat-import-chat"
+                >
+                  Import chat
+                </Button>
                 {selectedAgent && selectedAgentHasKnobs && (
                   <HarnessConfigModal
                     open={configOpen}
@@ -4349,6 +4362,12 @@ export function NewChatLandingScreen() {
                     setCostControlMode={setCostControlMode}
                   />
                 )}
+                <ImportChatDialog
+                  open={importChatOpen}
+                  onOpenChange={setImportChatOpen}
+                  hosts={hosts ?? []}
+                  defaultHostId={selectedHostId}
+                />
                 {/* Routing is not a standalone composer toggle — it folds into
                   the gear modal's Model dropdown as an "Smart Routing"
                   option (see HarnessConfigModal). */}

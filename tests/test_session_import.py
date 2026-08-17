@@ -390,6 +390,76 @@ def test_load_claude_session_rejects_empty_history(tmp_path: Path) -> None:
         load_claude_session(session_id, claude_home=tmp_path)
 
 
+def test_load_claude_session_prefers_summary_and_skips_interrupt_title(tmp_path: Path) -> None:
+    """Claude's summary names the chat instead of its synthetic interrupt record."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345679"
+    transcript = tmp_path / "projects" / "-repo" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    records = [
+        {
+            "type": "summary",
+            "summary": "Repair authentication redirects",
+            "leafUuid": "assistant-2",
+        },
+        {
+            "type": "user",
+            "uuid": "interrupt-1",
+            "cwd": "/repo",
+            "message": {
+                "role": "user",
+                "content": "[Request interrupted by user for tool use]",
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "user-1",
+            "cwd": "/repo",
+            "message": {"role": "user", "content": "Fix the login callback"},
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records),
+        encoding="utf-8",
+    )
+
+    imported = load_claude_session(session_id, claude_home=tmp_path)
+
+    assert imported.title == "Repair authentication redirects"
+
+
+def test_load_claude_session_title_falls_through_interrupt_record(tmp_path: Path) -> None:
+    """Without a summary, the first real prompt follows Claude's interrupt marker."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345670"
+    transcript = tmp_path / "projects" / "-repo" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    prompt = (
+        "Fix the login callback and preserve the original redirect target "
+        "after authentication completes"
+    )
+    records = [
+        {
+            "type": "user",
+            "uuid": "interrupt-1",
+            "cwd": "/repo",
+            "message": {"role": "user", "content": "[Request interrupted by user]"},
+        },
+        {
+            "type": "user",
+            "uuid": "user-1",
+            "cwd": "/repo",
+            "message": {"role": "user", "content": prompt},
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records),
+        encoding="utf-8",
+    )
+
+    imported = load_claude_session(session_id, claude_home=tmp_path)
+
+    assert imported.title == prompt
+
+
 def test_list_recent_claude_sessions_orders_parents_and_applies_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

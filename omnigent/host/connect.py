@@ -35,6 +35,8 @@ from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostChatImportFrame,
+    HostChatImportResultFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
@@ -2205,6 +2207,65 @@ class HostProcess:
             payload=payload,
         )
 
+    def _handle_chat_import(self, frame: HostChatImportFrame) -> HostChatImportResultFrame:
+        """Discover or normalize a local Claude/Codex transcript."""
+        from omnigent.session_import.local import (
+            list_recent_local_session_ids,
+            load_local_session,
+        )
+
+        if frame.source not in {"claude", "codex"}:
+            return HostChatImportResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error="Only Claude and Codex chats can be imported here",
+            )
+        try:
+            payload: dict[str, Any]
+            if frame.session_id is None:
+                rows = []
+                for session_id in list_recent_local_session_ids(frame.source, limit=frame.limit):
+                    try:
+                        chat = load_local_session(frame.source, session_id)
+                    except (OSError, TypeError, ValueError):
+                        continue
+                    rows.append(
+                        {
+                            "session_id": session_id,
+                            "title": chat.title,
+                            "workspace": chat.workspace,
+                            "item_count": len(chat.items),
+                        }
+                    )
+                payload = {"sessions": rows}
+            else:
+                chat = load_local_session(frame.source, frame.session_id)
+                payload = {
+                    "source": chat.source,
+                    "external_session_id": chat.external_session_id,
+                    "workspace": chat.workspace,
+                    "title": chat.title,
+                    "items": [
+                        {
+                            "type": item.type,
+                            "response_id": item.response_id,
+                            "data": item.data.model_dump(mode="json", exclude_none=True),
+                        }
+                        for item in chat.items
+                    ],
+                }
+        except (OSError, TypeError, ValueError) as exc:
+            return HostChatImportResultFrame(
+                request_id=frame.request_id,
+                status="error",
+                error=str(exc),
+            )
+        return HostChatImportResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            payload=payload,
+        )
+
     async def _handle_model_options(
         self,
         frame: HostModelOptionsFrame,
@@ -3143,6 +3204,9 @@ class HostProcess:
             await ws.send(encode_host_frame(fs_result))
         elif isinstance(frame, HostModelOptionsFrame):
             await ws.send(encode_host_frame(await self._handle_model_options(frame)))
+        elif isinstance(frame, HostChatImportFrame):
+            result = await asyncio.to_thread(self._handle_chat_import, frame)
+            await ws.send(encode_host_frame(result))
 
 
 def run_host_process(

@@ -19,10 +19,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from omnigent.db.utils import now_epoch
 from omnigent.entities import Conversation
@@ -70,6 +70,7 @@ _LIST_DIR_MAX_LIMIT = 1000
 # for transient network slowness without making the picker feel hung.
 _CREATE_DIR_TIMEOUT_S = 5.0
 _MODEL_OPTIONS_TIMEOUT_S = 15.0
+_CHAT_IMPORT_TIMEOUT_S = 30.0
 # Per-call timeout for host.install_harness round-trips. The host runs
 # `npm install -g <pkg>` — install_harness_cli caps that subprocess at 300s —
 # then recomputes readiness and sends the result back over the tunnel. The
@@ -104,6 +105,13 @@ def _host_absent_error(host: Host) -> OmnigentError:
     if host_is_live(host):
         return OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
     return OmnigentError("host is offline", code=ErrorCode.CONFLICT)
+
+
+class LoadHostChatRequest(BaseModel):
+    """One native chat to normalize on a selected host."""
+
+    source: Literal["claude", "codex"]
+    session_id: str = Field(min_length=1, max_length=128)
 
 
 async def _proxy_model_options(
@@ -576,6 +584,72 @@ def create_hosts_router(
     """
     flags = feature_flags or resolve_feature_flags()
     router = APIRouter()
+
+    async def _chat_import_host(request: Request, host_id: str) -> HostConnection:
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+        return conn
+
+    async def _request_chat_import(
+        conn: HostConnection,
+        *,
+        source: Literal["claude", "codex"],
+        session_id: str | None,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        from omnigent.server.routes._host_chat_import import request_host_chat_import
+
+        try:
+            result = await request_host_chat_import(
+                host_registry=host_registry,
+                host_conn=conn,
+                source=source,
+                session_id=session_id,
+                limit=limit,
+                timeout_s=_CHAT_IMPORT_TIMEOUT_S,
+            )
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail="host connection was lost") from exc
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="host did not respond") from None
+        if result.get("status") != "ok":
+            raise HTTPException(
+                status_code=422,
+                detail=result.get("error") or "chat import failed",
+            )
+        payload = result.get("payload")
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=502, detail="host returned an invalid import response")
+        return payload
+
+    @router.get("/hosts/{host_id}/chat-imports")
+    async def recent_chat_imports(
+        request: Request,
+        host_id: str,
+        source: Literal["claude", "codex"] = Query(),
+        limit: int = Query(default=10, ge=1, le=50),
+    ) -> dict[str, Any]:
+        """List recent importable native chats on a selected host."""
+        conn = await _chat_import_host(request, host_id)
+        return await _request_chat_import(conn, source=source, session_id=None, limit=limit)
+
+    @router.post("/hosts/{host_id}/chat-imports/load")
+    async def load_chat_import(
+        request: Request, host_id: str, body: LoadHostChatRequest
+    ) -> dict[str, Any]:
+        """Normalize one native chat on a selected host for ``/v1/imports``."""
+        session_id = body.session_id.strip()
+        if not session_id:
+            raise HTTPException(status_code=400, detail="session_id must not be blank")
+        conn = await _chat_import_host(request, host_id)
+        return await _request_chat_import(conn, source=body.source, session_id=session_id)
 
     @router.get("/hosts")
     async def list_hosts(request: Request) -> dict[str, list[dict[str, Any]]]:

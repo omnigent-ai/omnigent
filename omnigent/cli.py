@@ -5745,6 +5745,7 @@ def import_session_command(
             "source": imported.source,
             "external_session_id": imported.external_session_id,
             "workspace": imported.workspace,
+            "title": imported.title,
             "force": force,
             "items": [
                 {

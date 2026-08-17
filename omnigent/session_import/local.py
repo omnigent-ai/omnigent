@@ -10,8 +10,10 @@ from hashlib import sha256
 from pathlib import Path
 
 from omnigent.claude_native_bridge import read_transcript_items_from_offset
+from omnigent.claude_transcript import is_claude_interrupt_text
 from omnigent.codex_native import _CODEX_THREAD_ID_RE, _find_codex_rollout
-from omnigent.entities import NewConversationItem, parse_item_data
+from omnigent.entities import MessageData, NewConversationItem, parse_item_data
+from omnigent.entities.conversation import synthesize_conversation_title
 from omnigent.kimi_native_credentials import resolve_user_kimi_home
 from omnigent.kimi_native_forwarder import (
     read_kimi_wire_items,
@@ -27,6 +29,7 @@ from omnigent.opencode_native_app_server import (
 )
 from omnigent.opencode_native_forwarder import opencode_tool_output_text
 from omnigent.session_import.models import (
+    SESSION_IMPORT_TITLE_LIMIT,
     ImportSource,
     LocalSessionImport,
     SessionImportNotFoundError,
@@ -276,6 +279,42 @@ def _claude_workspace(transcript_path: Path) -> str | None:
     return None
 
 
+def _claude_session_summary(transcript_path: Path) -> str | None:
+    """Read Claude Code's explicit human-readable session summary."""
+    with transcript_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict) or record.get("type") != "summary":
+                continue
+            summary = record.get("summary")
+            if isinstance(summary, str) and (value := summary.strip()):
+                return value
+    return None
+
+
+def _claude_import_title(
+    transcript_path: Path,
+    items: tuple[NewConversationItem, ...],
+) -> str | None:
+    """Prefer Claude's summary, then the first non-synthetic user prompt."""
+    summary = _claude_session_summary(transcript_path)
+    if summary is not None:
+        return summary
+    for item in items:
+        if not isinstance(item.data, MessageData) or item.data.role != "user":
+            continue
+        title = synthesize_conversation_title(
+            item.data.content,
+            limit=SESSION_IMPORT_TITLE_LIMIT,
+        )
+        if title is not None and not is_claude_interrupt_text(title):
+            return title
+    return None
+
+
 def load_claude_session(
     session_id: str,
     *,
@@ -312,6 +351,7 @@ def load_claude_session(
         external_session_id=session_id,
         workspace=_claude_workspace(transcript_path),
         items=items,
+        title_hint=_claude_import_title(transcript_path, items),
     )
 
 

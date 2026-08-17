@@ -259,6 +259,8 @@ class HostConnection:
         ``error_code``, and ``error``.
     :param pending_model_options: Per-``request_id`` futures for pre-launch
         model catalogs resolved by the selected host.
+    :param pending_chat_imports: Per-``request_id`` futures for local native
+        chat discovery and normalization on the selected host.
     """
 
     workspace_id: int
@@ -313,6 +315,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_chat_imports: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
 

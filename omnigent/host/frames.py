@@ -73,6 +73,8 @@ class HostFrameKind(str, Enum):
     FS_RESULT = "host.fs_result"
     MODEL_OPTIONS = "host.model_options"
     MODEL_OPTIONS_RESULT = "host.model_options_result"
+    CHAT_IMPORT = "host.chat_import"
+    CHAT_IMPORT_RESULT = "host.chat_import_result"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -849,6 +851,26 @@ class HostModelOptionsResultFrame:
     routable_models: list[str] = field(default_factory=list)
 
 
+@dataclass
+class HostChatImportFrame:
+    """Server → host: discover or load a local Claude/Codex chat."""
+
+    request_id: str
+    source: str
+    session_id: str | None = None
+    limit: int = 10
+
+
+@dataclass
+class HostChatImportResultFrame:
+    """Host → server: local chat discovery/load result."""
+
+    request_id: str
+    status: str
+    payload: _JsonObject | None = None
+    error: str | None = None
+
+
 HostFrame = (
     HostHelloFrame
     | HostHarnessReadinessFrame
@@ -881,6 +903,8 @@ HostFrame = (
     | HostFsResultFrame
     | HostModelOptionsFrame
     | HostModelOptionsResultFrame
+    | HostChatImportFrame
+    | HostChatImportResultFrame
 )
 
 
@@ -1233,6 +1257,26 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "routable_models": frame.routable_models,
             }
         )
+    if isinstance(frame, HostChatImportFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CHAT_IMPORT.value,
+                "request_id": frame.request_id,
+                "source": frame.source,
+                "session_id": frame.session_id,
+                "limit": frame.limit,
+            }
+        )
+    if isinstance(frame, HostChatImportResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CHAT_IMPORT_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "payload": frame.payload,
+                "error": frame.error,
+            }
+        )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
 
 
@@ -1355,6 +1399,23 @@ def _decode_known_host_frame(
             return _decode_model_options(msg)
         case HostFrameKind.MODEL_OPTIONS_RESULT:
             return _decode_model_options_result(msg)
+        case HostFrameKind.CHAT_IMPORT:
+            return HostChatImportFrame(
+                request_id=_required_str(msg, "request_id"),
+                source=_required_str(msg, "source"),
+                session_id=_optional_nullable_str(msg, "session_id"),
+                limit=_required_int(msg, "limit"),
+            )
+        case HostFrameKind.CHAT_IMPORT_RESULT:
+            payload = msg.get("payload")
+            if payload is not None and not isinstance(payload, dict):
+                raise ValueError("frame field must be a JSON object or null: 'payload'")
+            return HostChatImportResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                status=_required_str(msg, "status"),
+                payload=payload,
+                error=_optional_nullable_str(msg, "error"),
+            )
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 

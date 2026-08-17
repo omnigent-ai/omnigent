@@ -73,6 +73,7 @@ def test_import_command_loads_local_session_and_posts_normalized_items(tmp_path:
         "source": "claude",
         "external_session_id": session_id,
         "workspace": "/repo",
+        "title": "inspect TODO.md",
         "force": False,
         "items": [
             {

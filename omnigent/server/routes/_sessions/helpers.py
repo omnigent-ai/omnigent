@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import re
 import secrets
 import time
 import urllib.parse
@@ -38,6 +37,7 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 
+from omnigent.claude_transcript import is_claude_interrupt_text
 from omnigent.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
     reserved_cost_control_keys,
@@ -3416,9 +3416,6 @@ def _is_kiro_native_session(conv: Conversation) -> bool:
 # user's bracketed question such as "[Request interrupted by user?]" stays a
 # real message. Kept in sync with `INTERRUPT_RE` in web/src/lib/systemMessage.ts,
 # which re-classifies the mirrored record as a muted "Interrupted" marker.
-_CLAUDE_INTERRUPT_RECORD_RE = re.compile(r"^\[Request interrupted by user(?: for tool use)?\]$")
-
-
 def _is_native_interrupt_record(data: MessageData) -> bool:
     """
     Whether a mirrored user item is the vendor CLI's own interrupt record.
@@ -3453,8 +3450,7 @@ def _is_native_interrupt_record(data: MessageData) -> bool:
     text = _message_text(data.content)
     if text is None:
         return False
-    first_line = text.strip().split("\n", 1)[0]
-    return _CLAUDE_INTERRUPT_RECORD_RE.match(first_line) is not None
+    return is_claude_interrupt_text(text)
 
 
 def _merge_pending_file_blocks(

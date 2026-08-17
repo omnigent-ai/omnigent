@@ -8,6 +8,8 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostChatImportFrame,
+    HostChatImportResultFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
@@ -43,6 +45,33 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+
+
+def test_chat_import_frames_round_trip() -> None:
+    """Native chat discovery and load payloads survive the host tunnel."""
+    request = HostChatImportFrame(
+        request_id="req_import",
+        source="codex",
+        session_id="thread-123",
+        limit=10,
+    )
+    assert decode_host_frame(encode_host_frame(request)) == request
+
+    result = HostChatImportResultFrame(
+        request_id="req_import",
+        status="ok",
+        payload={
+            "sessions": [
+                {
+                    "session_id": "thread-123",
+                    "title": "Fix login",
+                    "workspace": "/repo",
+                    "item_count": 12,
+                }
+            ]
+        },
+    )
+    assert decode_host_frame(encode_host_frame(result)) == result
 
 
 def test_model_options_frames_round_trip() -> None:
