@@ -382,11 +382,29 @@ describe("WorkspacePicker live selection (onNavigate)", () => {
     const onNavigate = vi.fn();
     render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);
     // Mount seeds the value with the directory the picker opened at, so the
-    // common case (open → it's already what you want) needs zero clicks.
-    expect(onNavigate).toHaveBeenCalledWith("/x");
-    // Clicking a folder navigates into it AND reports it as the new value.
+    // common case (open → it's already what you want) needs zero clicks. The
+    // report is flagged as not user-initiated: nobody has picked anything yet,
+    // and a caller that treats a pick as an explicit choice must not count it.
+    expect(onNavigate).toHaveBeenCalledWith("/x", { userInitiated: false });
+    // Clicking a folder navigates into it AND reports it as the new value —
+    // that one IS the user choosing a directory.
     fireEvent.click(screen.getByTestId("workspace-picker-entry-src"));
-    expect(onNavigate).toHaveBeenLastCalledWith("/x/src");
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/src", { userInitiated: true });
+  });
+
+  it("reports a committed path and a home jump as user-initiated", () => {
+    const onNavigate = vi.fn();
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);
+    // Typing a path and committing it is a pick, same as clicking a folder.
+    fireEvent.change(screen.getByTestId("workspace-picker-path-input"), {
+      target: { value: "/y" },
+    });
+    fireEvent.keyDown(screen.getByTestId("workspace-picker-path-input"), { key: "Enter" });
+    expect(onNavigate).toHaveBeenLastCalledWith("/y", { userInitiated: true });
+    // Home resolves through the listing rather than the path, so its report
+    // arrives a render later — it still has to count as the user's navigation.
+    fireEvent.click(screen.getByTestId("workspace-picker-home"));
+    expect(onNavigate).toHaveBeenLastCalledWith("/x", { userInitiated: true });
   });
 
   it("hides the Select button when onSelect is not supplied", () => {

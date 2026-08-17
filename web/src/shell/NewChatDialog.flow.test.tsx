@@ -12,6 +12,8 @@ import type { Host } from "@/hooks/useHosts";
 import { useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import type { HostDirectoryListing } from "@/hooks/useHostFilesystem";
+import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 
@@ -91,15 +93,19 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
   prefetchAvailableAgentDetails: vi.fn(),
 }));
 // The home listing is only consulted when there's no recent; the recent is
-// always set here, so keep this inert (returns no listing).
+// always set here, so this is inert by default. Cases that open the file
+// browser set a listing so the picker resolves a directory to navigate.
+let hostListing: HostDirectoryListing | undefined;
 vi.mock("@/hooks/useHostFilesystem", () => ({
-  useHostFilesystem: () => ({ data: undefined }),
+  useHostFilesystem: () => ({ data: hostListing, isPlaceholderData: false }),
   // WorkspacePicker reads this on mount when the file browser opens;
   // an idle mutation keeps it inert for these tests.
   useCreateHostDirectory: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
+// No worktrees by default; cases exercising the worktree combobox set one.
+let hostWorktrees: HostWorktree[] | undefined;
 vi.mock("@/hooks/useHostWorktrees", () => ({
-  useHostWorktrees: () => ({ data: undefined }),
+  useHostWorktrees: () => ({ data: hostWorktrees }),
 }));
 // No other sessions in scope — keep the conflict hooks inert so they don't
 // issue their own /health fetch or surface a warning. The warning is covered
@@ -270,6 +276,8 @@ beforeEach(() => {
   localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [SEEDED_WORKSPACE] }));
   setHosts([host()]);
   setAgents([agent()]);
+  hostListing = undefined;
+  hostWorktrees = undefined;
 });
 
 afterEach(() => {
@@ -1579,6 +1587,215 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string).agent_id).toBe("ag_hello");
+  });
+});
+
+describe("NewChatLandingScreen agent cwd default workspace (#509)", () => {
+  // beforeEach always seeds host_1's recent workspace, so these tests prove
+  // the selected agent's os_env.cwd overrides that recent as the default.
+  function waitForWorkspaceValue(basename: string): Promise<void> {
+    return waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(basename),
+    );
+  }
+
+  it("defaults the workspace to the selected agent's cwd and carries it to the create call", async () => {
+    setAgents([agent({ id: "ag_custom", name: "custom_agent", default_workspace: "/opt/custom" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    // The chip shows the agent-cwd basename ("custom"), NOT the seeded
+    // recent ("foo") — the agent's os_env.cwd is the default workspace.
+    await waitForWorkspaceValue("custom");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.agent_id).toBe("ag_custom");
+    expect(body.workspace).toBe("/opt/custom");
+  });
+
+  it("updates the workspace when switching to an agent with a different cwd", async () => {
+    setAgents([
+      agent({
+        id: "ag_first",
+        name: "custom_agent",
+        display_name: "Custom",
+        default_workspace: "/opt/custom",
+      }),
+      agent({
+        id: "ag_second",
+        name: "another_custom_agent",
+        display_name: "Another",
+        default_workspace: "/home/path",
+      }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceValue("custom");
+    // Switch to the second agent — the workspace must follow its cwd.
+    // Both are custom agents, so they live in the "Custom agents" submenu.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_second"));
+    await waitForWorkspaceValue("path");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.agent_id).toBe("ag_second");
+    expect(body.workspace).toBe("/home/path");
+  });
+
+  /** Two custom agents with different configured cwds, first one selected. */
+  function setTwoCwdAgents(): void {
+    setAgents([
+      agent({
+        id: "ag_first",
+        name: "custom_agent",
+        display_name: "Custom",
+        default_workspace: "/opt/custom",
+      }),
+      agent({
+        id: "ag_second",
+        name: "another_custom_agent",
+        display_name: "Another",
+        default_workspace: "/home/path",
+      }),
+    ]);
+  }
+
+  /** Switch agents via the picker (both live in the "Custom agents" submenu). */
+  function switchToSecondAgent(): Promise<void> {
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_second"));
+    // The switch is what triggers the cwd default, so wait for it to land
+    // before asserting on the workspace field.
+    return waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Another"),
+    );
+  }
+
+  it("keeps a worktree bound from the branch combobox when the agent changes", async () => {
+    setTwoCwdAgents();
+    hostWorktrees = [
+      {
+        path: "/Users/corey/repo-worktrees/feature-x",
+        branch: "feature/x",
+        is_main: false,
+        detached: false,
+      },
+    ];
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceValue("custom");
+    // Bind to the existing worktree: that writes the workspace through the
+    // branch combobox, not the file browser.
+    openWorktree();
+    fireEvent.focus(screen.getByTestId("new-chat-landing-branch-input"));
+    fireEvent.mouseDown(screen.getByTestId("new-chat-landing-worktree-option"));
+    await waitForWorkspaceValue("feature-x");
+
+    await switchToSecondAgent();
+    // Failure: the new agent's cwd overwrites the worktree directory, silently
+    // dropping the bind (and the branch prefilled from it) the user chose.
+    expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+      "feature-x",
+    );
+
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.workspace).toBe("/Users/corey/repo-worktrees/feature-x");
+    expect(body.git?.existing_worktree).toBe(true);
+  });
+
+  it("still follows the agent cwd after the file browser was opened but nothing picked", async () => {
+    setTwoCwdAgents();
+    hostListing = {
+      entries: [
+        { name: "src", path: "/opt/custom/src", type: "directory", bytes: null, modified_at: 0 },
+      ],
+      truncated: false,
+    };
+
+    renderLanding();
+    await waitForWorkspaceValue("custom");
+    // Open the browser and close it again without navigating anywhere. The
+    // picker reports the directory it opened at, which is not a pick.
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    await screen.findByTestId("workspace-picker");
+    fireEvent.keyDown(document.body, { key: "Escape" });
+
+    await switchToSecondAgent();
+    // Failure: merely opening the browser pinned the field, so the workspace
+    // stays on the previous agent's cwd instead of following the new one.
+    await waitForWorkspaceValue("path");
+  });
+
+  it("keeps a directory picked in the file browser when the agent changes", async () => {
+    setTwoCwdAgents();
+    hostListing = {
+      entries: [
+        { name: "src", path: "/opt/custom/src", type: "directory", bytes: null, modified_at: 0 },
+      ],
+      truncated: false,
+    };
+
+    renderLanding();
+    await waitForWorkspaceValue("custom");
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    // Navigating into a folder IS a pick — it must survive an agent switch.
+    fireEvent.click(await screen.findByTestId("workspace-picker-entry-src"));
+    await waitForWorkspaceValue("src");
+    fireEvent.keyDown(document.body, { key: "Escape" });
+
+    await switchToSecondAgent();
+    expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("src");
+  });
+
+  it("keeps a browser-picked directory when the composer is left and reopened", async () => {
+    setTwoCwdAgents();
+    hostListing = {
+      entries: [
+        { name: "src", path: "/opt/custom/src", type: "directory", bytes: null, modified_at: 0 },
+      ],
+      truncated: false,
+    };
+
+    renderLanding();
+    await waitForWorkspaceValue("custom");
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    fireEvent.click(await screen.findByTestId("workspace-picker-entry-src"));
+    await waitForWorkspaceValue("src");
+
+    // Leaving the composer preserves the draft, so returning restores the
+    // fields — including the fact that the directory was the user's pick.
+    cleanup();
+    renderLanding();
+    // Flush the mount effects, the agent-cwd default among them.
+    await act(async () => {});
+    // Failure: the restored pick reads as a default and the agent's cwd
+    // overwrites it the moment the composer reopens.
+    expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("src");
   });
 });
 

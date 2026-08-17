@@ -265,8 +265,13 @@ interface WorkspacePickerProps {
    * caller can track the selection live without an explicit "Select" click.
    * Distinct from ``onSelect`` (which is a one-shot commit + the button):
    * pass ``onNavigate`` for a live-updating picker with no button.
+   *
+   * Also fires once for the directory the picker opens at (``initialPath``
+   * or the resolved home) so a caller starts in sync. ``userInitiated`` is
+   * false for that first report and true for every real navigation, so a
+   * caller that treats a pick as an explicit choice can tell them apart.
    */
-  onNavigate?: (path: string) => void;
+  onNavigate?: (path: string, info: { userInitiated: boolean }) => void;
   /**
    * Called when the user dismisses the picker via the ✕ button.
    * ``undefined`` hides the button (e.g. when the picker is always
@@ -433,10 +438,15 @@ export function WorkspacePicker({
   // it fires only when currentAbsolute actually changes.
   const onNavigateRef = useRef(onNavigate);
   onNavigateRef.current = onNavigate;
+  // Set by navigateTo so the report below can tell a real navigation from the
+  // picker simply resolving the directory it opened at — which happens with no
+  // user input at all and must not read as a deliberate pick.
+  const userNavigatedRef = useRef(false);
   useEffect(() => {
-    if (currentAbsolute.startsWith("/")) {
-      onNavigateRef.current?.(currentAbsolute);
-    }
+    if (!currentAbsolute.startsWith("/")) return;
+    const userInitiated = userNavigatedRef.current;
+    userNavigatedRef.current = false;
+    onNavigateRef.current?.(currentAbsolute, { userInitiated });
   }, [currentAbsolute]);
 
   const parent = parentOf(currentAbsolute);
@@ -466,6 +476,9 @@ export function WorkspacePicker({
     // A click/commit supersedes any in-progress typing; let the
     // mirror effect refill the bar from the new listing.
     userEditedRef.current = false;
+    // Stays set until the report actually goes out, so going home ("" until
+    // the listing resolves it) still reports as user-initiated.
+    userNavigatedRef.current = true;
     setPath(next);
   }
 
