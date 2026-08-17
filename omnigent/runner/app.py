@@ -4267,6 +4267,41 @@ def create_runner_app(
                 publish_event=_publish_event,
             )
 
+    async def _heal_claude_pane_before_injection(
+        conv_id: str,
+        bridge_dir: Path,
+    ) -> None:
+        """Recreate a dead-but-registered Claude pane before a slash-command injection.
+
+        The model/effort session-change handlers inject into the pane's tmux
+        socket directly, so a terminal record that outlived its tmux backend
+        (crash, external kill, an eviction that skipped ``close()``) fails with
+        ``error connecting to .../tmux.sock`` — the same stale-registry class
+        #2951 healed on the turn path. Reuse that self-heal here, then wait for
+        the resumed TUI to render its input box: the recreate relaunches Claude
+        with ``--resume``, and ``inject_slash_command``'s short advertisement
+        window is well under the TUI's boot time.
+
+        A registered-and-alive pane returns after one ``is_alive()`` probe with
+        no ready-wait, so the healthy path is unchanged — including a pane
+        mid-turn, which never enters the wait loop. The deadline expiring is
+        not an error: the injection proceeds and surfaces its own failure.
+        """
+        from omnigent.claude_native_bridge import claude_pane_ready
+
+        terminal_registry = resource_registry.terminal_registry if resource_registry else None
+        if terminal_registry is None:
+            return
+        instance = terminal_registry.get(conv_id, "claude", "main")
+        if instance is not None and await instance.is_alive():
+            return
+        await _ensure_native_terminal_for_turn(conv_id, "claude-native")
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if await asyncio.to_thread(claude_pane_ready, bridge_dir):
+                return
+            await asyncio.sleep(0.5)
+
     async def _handle_claude_native_effort_change(
         conv_id: str,
         effort: str | None,
@@ -4285,6 +4320,7 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await _heal_claude_pane_before_injection(conv_id, bridge_dir)
         command = f"/effort {effort}"
         try:
             # An effort switch invalidates the prompt cache on a session with
@@ -4332,6 +4368,10 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        # Heal before read_model_env below: a recreated pane republishes the
+        # bridge dir's model env, so reading it first could pin a stale picker
+        # vocabulary and 503 a model the resumed session actually accepts.
+        await _heal_claude_pane_before_injection(conv_id, bridge_dir)
         selected_model = model.strip()
         claude_config = await _resolve_session_claude_launch_config(conv_id)
         resolved_model = (
