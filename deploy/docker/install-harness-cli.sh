@@ -13,11 +13,11 @@
 #                --build-arg EXTRA_HARNESS_CLIS="goose jcode opencode" .
 #
 # Each entry is NAME[@VERSION]; VERSION pins the CLI the way the harness's own
-# installer expects (an npm dist-tag/semver, GOOSE_VERSION, JCODE_VERSION).
-# An entry of the form npm:<pkg-spec> installs an arbitrary npm package
-# directly — the escape hatch for a CLI this script has no row for yet (npm:
-# entries skip the post-install binary smoke check, since the binary name
-# isn't known here).
+# installer expects (an npm dist-tag/semver, GOOSE_VERSION, JCODE_VERSION, ...).
+# An entry of the form npm:<pkg-spec> installs an
+# arbitrary npm package directly — the escape hatch for a CLI this script has
+# no row for yet (npm: entries skip the post-install binary smoke check, since
+# the binary name isn't known here).
 #
 # Why names instead of raw npm specs: the row knows HOW the harness ships.
 # Several harness CLIs are not npm packages at all (goose and jcode ship
@@ -33,19 +33,27 @@
 # HOME, so a CLI that only works from the build user's home fails the build
 # here rather than the first managed-sandbox session.
 #
-# Supported rows:
-#   claude    → npm @anthropic-ai/claude-code   (already in the default set;
-#   codex     → npm @openai/codex                name it only to pin a version,
-#   pi        → npm @earendil-works/pi-coding-agent  e.g. claude@2.1.161)
+# Supported rows — the CLI-gated harnesses NOT in the default image set (the
+# canonical list is _HARNESS_INSTALL in omnigent/onboarding/harness_install.py):
 #   opencode  → npm opencode-ai (default pin ~1.18.0, as harness_install.py)
 #   qwen      → npm @qwen-code/qwen-code
 #   goose     → vendor installer (aaif-goose/goose download_cli.sh)
 #   jcode     → vendor installer (1jehuang/jcode install.sh) — jcode runs as a
 #               user-configured ACP agent (acp.agents in config.yaml), not a
 #               builtin harness, but the managed host still needs the binary
+#   cursor    → vendor installer (cursor.com/install) — always fetches the
+#               latest agent build, so VERSION pins are rejected
+#   kimi      → vendor installer (code.kimi.com/kimi-code/install.sh)
 #
-# kiro-cli and agy ship in the host image by default (version-pinned inline in
-# the Dockerfiles) and are deliberately not rows here.
+# hermes is deliberately NOT a row: it requires Node >= 26 at runtime (its
+# installer self-installs a managed Node into the installing user's
+# HERMES_HOME) while the host images ship Node 22 — it needs the image's
+# Node baseline raised first, not just a baked binary.
+#
+# Default-set CLIs are deliberately not rows: claude/codex/pi install unpinned
+# from npm in the Dockerfiles (override via the npm: escape hatch, e.g.
+# npm:@openai/codex@0.147.0), and kiro-cli/agy are version-pinned there via
+# build ARGs (KIRO_CLI_VERSION / AGY_VERSION).
 #
 # Also runnable by hand on any Linux host with bash, curl, and npm (for the
 # npm rows) — e.g. to test a row before rebuilding an image:
@@ -55,8 +63,10 @@ set -euo pipefail
 
 # System PATH dir shared by every sandbox user. Overridable for testing.
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
-# Shared, world-readable home for jcode's builds tree (see install_jcode).
+# Shared, world-readable homes for CLIs whose installers are HOME-bound
+# (see install_jcode / install_cursor).
 JCODE_HOME="${JCODE_HOME:-/opt/jcode}"
+CURSOR_HOME="${CURSOR_HOME:-/opt/cursor}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -125,6 +135,37 @@ install_jcode() { # <version|"">
     verify jcode
 }
 
+install_cursor() {
+    # cursor's installer hardcodes $HOME/.local/{share,bin} with no directory
+    # override, so it gets the jcode treatment: redirect HOME to a shared
+    # location, relax perms, then link onto the shared PATH. The installer
+    # also creates an `agent` symlink — too generic for a shared PATH, so
+    # only cursor-agent is linked.
+    mkdir -p "$CURSOR_HOME"
+    echo ">> installing cursor-agent <latest> via cursor.com installer"
+    curl -fsSL https://cursor.com/install | HOME="$CURSOR_HOME" bash
+    chmod -R a+rX "$CURSOR_HOME"
+    ln -sf "$CURSOR_HOME/.local/bin/cursor-agent" "$BIN_DIR/cursor-agent"
+    verify cursor-agent
+}
+
+install_kimi() { # <version|"">
+    local version="$1"
+    # kimi installs a single static binary at ${KIMI_INSTALL_DIR}/bin/kimi —
+    # point it at BIN_DIR's parent so it lands on the shared PATH.
+    [[ "$BIN_DIR" == */bin ]] \
+        || die "kimi needs BIN_DIR to end in /bin (got $BIN_DIR)"
+    local -a install_env=(
+        "KIMI_INSTALL_DIR=${BIN_DIR%/bin}"
+        "KIMI_NO_MODIFY_PATH=1"
+    )
+    [ -z "$version" ] || install_env+=("KIMI_VERSION=$version")
+    echo ">> installing kimi ${version:-<latest>} via code.kimi.com installer"
+    curl -fsSL https://code.kimi.com/kimi-code/install.sh \
+        | env "${install_env[@]}" bash
+    verify kimi
+}
+
 [ $# -gt 0 ] || die "usage: install-harness-cli.sh NAME[@VERSION]... | npm:<pkg-spec>..."
 
 for spec in "$@"; do
@@ -141,16 +182,24 @@ for spec in "$@"; do
         *)   name="$spec"; version="" ;;
     esac
     case "$name" in
-        claude)   install_npm "@anthropic-ai/claude-code${version:+@$version}" claude ;;
-        codex)    install_npm "@openai/codex${version:+@$version}" codex ;;
-        pi)       install_npm "@earendil-works/pi-coding-agent${version:+@$version}" pi ;;
         opencode) install_npm "opencode-ai@${version:-~1.18.0}" opencode ;;
         qwen)     install_npm "@qwen-code/qwen-code${version:+@$version}" qwen ;;
         goose)    install_goose "$version" ;;
         jcode)    install_jcode "$version" ;;
+        cursor)
+            [ -z "$version" ] \
+                || die "cursor's installer always fetches the latest build — cursor@VERSION pins are not supported"
+            install_cursor
+            ;;
+        kimi)     install_kimi "$version" ;;
+        hermes)
+            die "hermes needs Node >= 26 at runtime and the host image ships Node 22 — its installer's managed Node lands in the build user's home. Raise the image's Node baseline first; no EXTRA_HARNESS_CLIS row until then" ;;
+        claude)   die "claude ships in the host image by default (unpinned npm install) — pin a different version via the npm: escape hatch: npm:@anthropic-ai/claude-code@<version>" ;;
+        codex)    die "codex ships in the host image by default (unpinned npm install) — pin a different version via the npm: escape hatch: npm:@openai/codex@<version>" ;;
+        pi)       die "pi ships in the host image by default (unpinned npm install) — pin a different version via the npm: escape hatch: npm:@earendil-works/pi-coding-agent@<version>" ;;
         kiro | kiro-cli | agy | antigravity)
-            die "$name ships in the host image by default (version-pinned) — no EXTRA_HARNESS_CLIS entry needed" ;;
+            die "$name ships in the host image by default, version-pinned via Dockerfile build ARGs (KIRO_CLI_VERSION / AGY_VERSION) — override with --build-arg instead" ;;
         *)
-            die "unknown harness CLI '$name' — supported names: claude, codex, pi, opencode, qwen, goose, jcode (or npm:<pkg-spec> for a package with no row)" ;;
+            die "unknown harness CLI '$name' — supported names: opencode, qwen, goose, jcode, cursor, kimi (or npm:<pkg-spec> for a package with no row)" ;;
     esac
 done

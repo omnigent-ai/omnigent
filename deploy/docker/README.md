@@ -304,11 +304,10 @@ docker build -t omnigent-host:latest --target host \
              --build-arg EXTRA_HARNESS_CLIS="goose jcode opencode" .
 ```
 
-Supported names (`claude`, `codex`, `pi`, `opencode`, `qwen`, `goose`,
-`jcode`), the install method behind each, and the `npm:<pkg-spec>`
-escape hatch live in
-[`install-harness-cli.sh`](./install-harness-cli.sh). Empty by default —
-the shipped CLI set is unchanged.
+Supported names (`opencode`, `qwen`, `goose`, `jcode`, `cursor`, `kimi`),
+the install method behind each, and the `npm:<pkg-spec>` escape hatch
+live in [`install-harness-cli.sh`](./install-harness-cli.sh). Empty by
+default — the shipped CLI set is unchanged.
 
 ### Using it with the Modal sandbox provider
 
