@@ -5117,7 +5117,7 @@ export function NewChatLandingScreen() {
                           id="landing-branch-name"
                           type="text"
                           value={branchName}
-                          onChange={(e) => setBranchName(e.target.value)}
+                          onChange={(e) => setBranchName(e.target.value.replaceAll(" ", "-"))}
                           onFocus={() => setBranchInputFocused(true)}
                           // Delay so a click on a dropdown option registers
                           // before the list unmounts on blur.
