@@ -26,6 +26,29 @@ export const BUILTIN_AGENTS = new Set([
   "debby",
 ]);
 
+// Builtin ACP CLI harness ids (mirrors ACP_CLI_HARNESSES on the server). Like
+// the native harnesses, these are harness-backed picks — not composed agents —
+// so the picker groups them under "Harnesses ▸ More", beside OpenCode/Cursor.
+// User-configured ACP agents carry an `acp:<slug>` harness; a builtin ACP CLI
+// harness carries a bare id.
+export const ACP_CLI_HARNESS_IDS = new Set<string>(["grok"]);
+
+/**
+ * Whether an agent is backed by the generic ACP harness — a configured
+ * `acp:<slug>` agent (e.g. Devin, Kilocode) or a builtin ACP CLI harness
+ * (e.g. Grok). These belong in the picker's "Harnesses" group with the native
+ * CLIs: selecting one runs a harness, not a composed agent.
+ *
+ * @param agent - Agent to classify (only its `harness` is read).
+ */
+export function isAcpHarnessAgent(
+  agent: Pick<AvailableAgent, "harness"> | null | undefined,
+): boolean {
+  const harness = agent?.harness;
+  if (harness == null) return false;
+  return harness.startsWith("acp:") || ACP_CLI_HARNESS_IDS.has(harness);
+}
+
 // Preferred display order for the built-in group. The server returns
 // agents newest-registered first (agent_store.list sorts by created_at
 // desc), so pin the order users expect; any agent not listed here falls
@@ -77,8 +100,15 @@ export function partitionAgentsByKind<T extends AvailableAgent>(
   agents: readonly T[],
 ): { builtins: T[]; customs: T[] } {
   const sorted = sortAgentsForDisplay(agents);
+  // Prefer the server's ``builtin`` signal — GET /v1/agents now sets it
+  // (session-scope-NULL row with a deterministic name-derived id). This groups
+  // dynamically-seeded built-ins with the harnesses instead of under custom
+  // agents; the {@link BUILTIN_AGENTS} allowlist is only a fallback for older
+  // servers that don't send the field. Without this, seeded ACP agents (Devin,
+  // grok, …) — whose names aren't in the static allowlist — fall to "custom".
+  const isBuiltin = (a: T): boolean => a.builtin ?? BUILTIN_AGENTS.has(a.name);
   return {
-    builtins: sorted.filter((a) => BUILTIN_AGENTS.has(a.name)),
-    customs: sorted.filter((a) => !BUILTIN_AGENTS.has(a.name)),
+    builtins: sorted.filter(isBuiltin),
+    customs: sorted.filter((a) => !isBuiltin(a)),
   };
 }
