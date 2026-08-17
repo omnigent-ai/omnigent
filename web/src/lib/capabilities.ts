@@ -45,6 +45,17 @@ export interface SmartRoutingSources {
   oss: boolean;
 }
 
+export interface Branding {
+  app_name: string | null;
+  heading: string | null;
+  logos: {
+    main: string | null;
+    loading: string | null;
+    favicon: string | null;
+  };
+  powered_by: boolean;
+}
+
 /** Release features understood by this frontend build. */
 export type FeatureKey = "usage_page" | "harness_install";
 
@@ -168,6 +179,38 @@ export interface ServerInfo {
    * backend (Electron, Firefox/Chromium).
    */
   dictation_available: boolean;
+  /** Operator branding, or null when the built-in identity should be used. */
+  branding?: Branding | null;
+}
+
+function parseBranding(raw: unknown): Branding | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const value = raw as Record<string, unknown>;
+  const nonEmpty = (candidate: unknown): string | null =>
+    typeof candidate === "string" && candidate.trim() !== "" ? candidate : null;
+  const rawLogos =
+    value.logos !== null && typeof value.logos === "object"
+      ? (value.logos as Record<string, unknown>)
+      : {};
+  const logos = {
+    main: nonEmpty(rawLogos.main),
+    loading: nonEmpty(rawLogos.loading),
+    favicon: nonEmpty(rawLogos.favicon),
+  };
+  const branding = {
+    app_name: nonEmpty(value.app_name),
+    heading: typeof value.heading === "string" ? value.heading : null,
+    logos,
+    powered_by: value.powered_by !== false,
+  };
+  const isEmpty =
+    branding.app_name === null &&
+    branding.heading === null &&
+    logos.main === null &&
+    logos.loading === null &&
+    logos.favicon === null &&
+    branding.powered_by;
+  return isEmpty ? null : branding;
 }
 
 /** Sentinel used when the probe fails — accounts and release features are off. */
@@ -192,6 +235,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
+  branding: null,
 };
 
 /**
@@ -281,6 +325,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
             : [],
           dictation_available: data.dictation_available === true,
+          branding: parseBranding(data.branding),
         };
         return cachedServerInfo;
       }

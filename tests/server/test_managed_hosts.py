@@ -3602,7 +3602,9 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
         bundle_location="bundle/loc",
         session_id=None,
     )
-    dead_host = SimpleNamespace(sandbox_provider="modal", user_id=_OWNER)
+    dead_host = SimpleNamespace(
+        sandbox_provider="modal", user_id=_OWNER, status="offline", updated_at=0
+    )
     app_state = SimpleNamespace(
         host_store=SimpleNamespace(get_host=lambda _hid: dead_host, is_online=lambda _hid: False),
         sandbox_config=SimpleNamespace(),

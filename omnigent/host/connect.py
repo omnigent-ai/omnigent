@@ -367,6 +367,13 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "REQUESTS_CA_BUNDLE",
         "CURL_CA_BUNDLE",
         "NODE_EXTRA_CA_CERTS",
+        # Force UTF-8 I/O on Windows. Without this, Python on Windows defaults
+        # to the system ANSI code page (e.g. cp1252), causing UnicodeEncodeError
+        # when the host daemon / runner prints Unicode characters such as "✓" or
+        # "↑" in connection status messages — which kills the tunnel in an
+        # infinite reconnect loop. Safe to propagate: a non-secret interpreter
+        # flag. No-op on POSIX where UTF-8 is the default.
+        "PYTHONUTF8",
         # Environment descriptor baked into the sandbox host image
         # (deploy/docker/Dockerfile `host` target), never set on
         # laptops. Claude Code refuses --dangerously-skip-permissions

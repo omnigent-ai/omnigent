@@ -3789,6 +3789,10 @@ def server(
 
     cfg = _load_config(config_path)
 
+    # Let the server-config reader (branding) see the same ``-c`` file.
+    if config_path:
+        os.environ["OMNIGENT_CONFIG"] = str(Path(config_path).resolve())
+
     # CLI args take precedence over config file, which takes precedence
     # over defaults.
     db_uri = database_uri or cfg.get("database_uri", _default_db_uri())
