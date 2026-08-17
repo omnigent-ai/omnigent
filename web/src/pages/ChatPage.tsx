@@ -28,6 +28,7 @@ import {
   PaperclipIcon,
   SettingsIcon,
   SquareIcon,
+  SquareTerminalIcon,
   WifiOffIcon,
   XIcon,
 } from "lucide-react";
@@ -2299,7 +2300,10 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
   const blockedOn = useChatStore((s) => s.blockedOn);
   const tick = useWorkingLabelTick();
-  const visible = show && !isAtBottom && !suppress;
+  // BackgroundTaskPill owns the background-tasks-only case; the pinned tab and
+  // its announcement yield to it.
+  const showShimmer = show && !isBackgroundTasksOnly(bgCount, blockedOn);
+  const visible = showShimmer && !isAtBottom && !suppress;
   return (
     <div
       // Always mounted (the aria-live region announces on show); bottom-0 sits
@@ -2317,11 +2321,11 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
           the agent is working, so it announces whether the tab is painted
           (scrolled up) or collapsed (at the bottom, where the inline shimmer
           owns the visuals). */}
-      {show && <span className="sr-only">Working…</span>}
+      {showShimmer && <span className="sr-only">Working…</span>}
       {/* Mirror the conversation content column (mx-auto + px-4 + width) so the
           tab's left edge lines up with the inline shimmer's. */}
       <div className={cn("mx-auto w-full px-4", CHAT_COLUMN_WIDTH)}>
-        {show && (
+        {showShimmer && (
           // Tab shape (rounded top, no bottom border, composer-matching bg) so
           // its flat bottom edge merges into the chat box. aria-hidden: the
           // sr-only span above owns the announcement, so the rotating label
@@ -2977,6 +2981,15 @@ export const WORKING_MESSAGES = [
 ] as const;
 
 /**
+ * Busy only because background tasks outlive the turn (a dev server, a
+ * background shell) — the agent isn't thinking and nothing's blocked. The
+ * composer's `BackgroundTaskPill` owns this; the "Working…" shimmer yields.
+ */
+export function isBackgroundTasksOnly(bgCount: number, blockedOn: string | null): boolean {
+  return !blockedOn && bgCount > 0;
+}
+
+/**
  * The label shown next to the working spinner. When the agent is parked on a
  * dialog (`blockedOn`) it says so — that outranks everything else, because it
  * is the one case where the session needs the user rather than time, and the
@@ -3005,6 +3018,9 @@ function WorkingIndicator() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
   const blockedOn = useChatStore((s) => s.blockedOn);
   const tick = useWorkingLabelTick();
+  // BackgroundTaskPill owns this case; the shimmer would misread as the agent
+  // still thinking.
+  if (isBackgroundTasksOnly(bgCount, blockedOn)) return null;
   const label = workingIndicatorLabel(bgCount, tick, blockedOn);
   return (
     <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
@@ -4404,6 +4420,32 @@ function SubagentComposerTray({ label }: { label: string }) {
 }
 
 /**
+ * Pill above the composer tallying background tasks that outlive the turn (a
+ * dev server, a background shell), shown in place of the "Working…" shimmer —
+ * which would misread as the agent still thinking. Label-only: the count spans
+ * shells, sub-agents, and tools, so there's no single terminal to open.
+ */
+function BackgroundTaskPill() {
+  const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const blockedOn = useChatStore((s) => s.blockedOn);
+  if (!isBackgroundTasksOnly(bgCount, blockedOn)) return null;
+  return (
+    <div className={cn("mx-auto flex w-full px-1 pb-1.5", CHAT_COLUMN_WIDTH)}>
+      <div
+        role="status"
+        data-testid="background-task-pill"
+        className="flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-sm text-muted-foreground shadow-sm"
+      >
+        <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+        <span>
+          {bgCount} background task{bgCount === 1 ? "" : "s"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/**
  * The message-input composer: textarea, attachments, slash-command
  * suggestions menu, and the send/stop controls. Exported for direct
  * unit testing of the slash-command keyboard behavior.
@@ -5308,6 +5350,9 @@ export function Composer({
           Truthy (not just non-null) so an empty label never peeks a
           nameless tray. */}
       {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
+      {/* Background tasks that outlive the turn show as a pill here, not the
+          "Working…" shimmer. Self-gates to null otherwise. */}
+      <BackgroundTaskPill />
       {/* Single rounded container — textarea + action row. No focus-within
           ring; drag-over still lifts an inset ring. dark:bg-card-solid so
           upper trays (queued / sub-agent) don't ghost through glass --card. */}

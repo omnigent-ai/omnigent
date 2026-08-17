@@ -338,7 +338,7 @@ from omnigent.stores.conversation_store import (
     pinned_label_key,
 )
 from omnigent.stores.file_store import FileStore
-from omnigent.stores.host_store import Host, HostStore
+from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
@@ -2889,7 +2889,7 @@ async def _maybe_relaunch_managed_sandbox(
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or host.sandbox_provider is None:
         return False
-    if await asyncio.to_thread(host_store.is_online, conv.host_id):
+    if host_is_live(host):
         host_registry = getattr(app_state, "host_registry", None)
         host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
         if not (host_resume_supported(host, sandbox_config) and host_conn is None):
@@ -3012,7 +3012,7 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
             runner_idle_s is not None and runner_idle_s >= _MANAGED_RESUMABLE_TUNNEL_STALE_S
         )
 
-    host_row_online = await asyncio.to_thread(host_store.is_online, conv.host_id)
+    host_row_online = host_is_live(host)
     sandbox_running = await asyncio.to_thread(host_sandbox_is_running, host, sandbox_config)
     if (
         sandbox_running is not False
@@ -5252,7 +5252,8 @@ async def _record_create_route_prompt(
             exc_info=True,
         )
         return conv
-    return await asyncio.to_thread(conversation_store.get_conversation, conv.id) or conv
+    conv.labels[CREATE_ROUTE_PROMPT_LABEL_KEY] = fingerprint
+    return conv
 
 
 async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> Any:
@@ -8017,13 +8018,7 @@ async def _create_session_from_existing_agent(
         _native_labels = dict(body.labels) if body.labels else {}
         _native_labels.update(native_agent.presentation_labels)
         await asyncio.to_thread(conversation_store.set_labels, conv.id, _native_labels)
-        updated_conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
-        if updated_conv is None:
-            raise OmnigentError(
-                f"Session {conv.id!r} disappeared while setting native labels",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
-        conv = updated_conv
+        conv.labels.update(_native_labels)
     elif (
         body.sub_agent_name
         and sub_spec is not None
@@ -8039,13 +8034,7 @@ async def _create_session_from_existing_agent(
         _merged = dict(body.labels) if body.labels else {}
         _merged.update(_sa_labels)
         await asyncio.to_thread(conversation_store.set_labels, conv.id, _merged)
-        updated_conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
-        if updated_conv is None:
-            raise OmnigentError(
-                f"Session {conv.id!r} disappeared while setting sub-agent labels",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
-        conv = updated_conv
+        conv.labels.update(_merged)
     elif (
         body.sub_agent_name is None
         and body.host_id is not None
@@ -8064,13 +8053,7 @@ async def _create_session_from_existing_agent(
         _merged = dict(body.labels) if body.labels else {}
         _merged.update(_repl_labels)
         await asyncio.to_thread(conversation_store.set_labels, conv.id, _merged)
-        updated_conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
-        if updated_conv is None:
-            raise OmnigentError(
-                f"Session {conv.id!r} disappeared while setting terminal-view labels",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
-        conv = updated_conv
+        conv.labels.update(_merged)
     elif body.labels:
         await asyncio.to_thread(conversation_store.set_labels, conv.id, body.labels)
 
@@ -8086,13 +8069,7 @@ async def _create_session_from_existing_agent(
             conv.id,
             {AUTO_HARNESS_LABEL_KEY: "1"},
         )
-        updated_conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
-        if updated_conv is None:
-            raise OmnigentError(
-                f"Session {conv.id!r} disappeared while setting the auto-harness label",
-                code=ErrorCode.INTERNAL_ERROR,
-            )
-        conv = updated_conv
+        conv.labels[AUTO_HARNESS_LABEL_KEY] = "1"
 
     if _native_smart_routing:
         # Surface the create-time pick as a transcript card, so the user sees
@@ -8136,7 +8113,8 @@ async def _create_session_from_existing_agent(
                 harness=_fixed_native_harness,
             )
             await _stamp_routing_decision_label(conv.id, conversation_store, _fixed_decision_id)
-            conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id) or conv
+            if _fixed_decision_id is not None:
+                conv.labels[ROUTING_DECISION_LABEL_KEY] = _fixed_decision_id
         elif _fixed_routing_error is not None:
             await _emit_server_routing_decision(
                 conv.id,
