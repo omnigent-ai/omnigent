@@ -73,6 +73,23 @@ class AcpCliHarness:
 # Keyed by canonical harness id. Keep keys sorted; each row's registrations
 # derive from here (see the module docstring for the full list).
 ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
+    # Devin (Cognition's ``devin`` CLI) drives ``devin acp`` — its ACP stdio
+    # server. Ships via a curl installer (not npm) and authenticates through its
+    # own ``devin auth login`` (or a Devin API key); Omnigent stores no
+    # credential. The row runs Devin's account-default model; a builtin row can't
+    # carry a per-user model, so set ``DEVIN_MODEL`` to pin one (or use an
+    # ``acp:`` config entry with ``--model``).
+    "devin": AcpCliHarness(
+        install=HarnessInstallSpec(
+            "Devin",
+            "devin",
+            None,
+            login_args=("auth", "login"),
+            install_hint="curl -fsSL https://cli.devin.ai/install.sh | bash",
+            auth_hint="run `devin auth login` (or set a Devin API key)",
+        ),
+        args=("acp",),
+    ),
     # Grok Build (xAI's ``grok`` CLI) drives ``grok agent stdio``. Ships via a
     # curl installer (not npm) and authenticates through its own ``grok login``
     # (xAI OAuth, device-code capable) or ``XAI_API_KEY``; Omnigent stores no
