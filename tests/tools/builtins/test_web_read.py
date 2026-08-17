@@ -315,22 +315,49 @@ def test_nimble_rejects_unsupported_driver(tool_ctx: ToolContext) -> None:
     assert mock_post.call_count == 0, "Must not call the API for an invalid driver."
 
 
-def test_nimble_vx6_disables_render(tool_ctx: ToolContext) -> None:
-    """The plain-HTTP driver vx6 does not turn on the browser render."""
+@pytest.mark.parametrize("driver", ["vx6", "media-vx6", "fast-vx6"])
+def test_nimble_http_only_drivers_disable_render(tool_ctx: ToolContext, driver: str) -> None:
+    """The plain-HTTP tiers (vx6 / media-vx6 / fast-vx6) do not render JS."""
     fake_response = MagicMock()
-    fake_response.json.return_value = {"content": "body"}
-
     fake_response.json.return_value = {"data": {"markdown": "body"}}
-    tool = WebReadTool(config={"read_provider": "nimble", "api_key": "k", "driver": "vx6"})
+    tool = WebReadTool(config={"read_provider": "nimble", "api_key": "k", "driver": driver})
     with patch("omnigent.tools.builtins.web_read_nimble.httpx.post") as mock_post:
         mock_post.return_value = fake_response
         tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
 
     body = mock_post.call_args.kwargs["json"]
-    assert body["driver"] == "vx6"
+    assert body["driver"] == driver
     assert body["render"] is False
-    # vx6 is plain HTTP — no markdown_backend needed, but still markdown format.
     assert body["formats"] == ["markdown"]
+
+
+@pytest.mark.parametrize("driver", ["vx8", "vx8-pro", "vx10", "vx10-pro", "vx12", "vx12-pro"])
+def test_nimble_rendering_drivers_enable_render(tool_ctx: ToolContext, driver: str) -> None:
+    """Every browser tier renders JS (render True) and is accepted by the allowlist."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"data": {"markdown": "body"}}
+    tool = WebReadTool(config={"read_provider": "nimble", "api_key": "k", "driver": driver})
+    with patch("omnigent.tools.builtins.web_read_nimble.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
+
+    body = mock_post.call_args.kwargs["json"]
+    assert body["driver"] == driver
+    assert body["render"] is True
+
+
+def test_nimble_auto_driver_sends_render_auto(tool_ctx: ToolContext) -> None:
+    """The ``auto`` driver sends ``render: "auto"`` so Nimble picks and escalates."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {"data": {"markdown": "body"}}
+    tool = WebReadTool(config={"read_provider": "nimble", "api_key": "k", "driver": "auto"})
+    with patch("omnigent.tools.builtins.web_read_nimble.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        tool.invoke(json.dumps({"url": "https://example.com"}), tool_ctx)
+
+    body = mock_post.call_args.kwargs["json"]
+    assert body["driver"] == "auto"
+    assert body["render"] == "auto"
 
 
 def test_nimble_http_error_returns_error_string(tool_ctx: ToolContext) -> None:

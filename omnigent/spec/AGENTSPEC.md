@@ -187,7 +187,7 @@ tools:
     - name: web_read
       read_provider: nimble              # browser-rendered; keyed
       api_key: ${NIMBLE_API_KEY}
-      # optional: driver (vx6 | vx8 default | vx10); output_format (markdown | html)
+      # optional: driver (auto | vx8 default | vx10 | vx12, + -pro variants | vx6 plain HTTP); output_format (markdown | html)
     - name: web_read
       read_provider: firecrawl           # LLM-native markdown, self-hostable; keyed
       api_key: ${FIRECRAWL_API_KEY}
@@ -197,8 +197,10 @@ tools:
 - **`jina`** — Jina Reader. Keyless by default (an `api_key` only lifts the rate
   limit). Fast and cheap for public pages; lightest-weight of the three.
 - **`nimble`** — Nimble Web API. Browser-rendered for higher reliability on
-  JavaScript-heavy pages. Requires `api_key`. Drivers, lightest→most capable:
-  `vx6` (plain HTTP), `vx8` (default), `vx10` (max).
+  JavaScript-heavy pages. Requires `api_key`. Drivers (from Nimble's documented
+  set): `vx8` (default, renders JS), higher tiers `vx10` / `vx12` and their
+  `-pro` variants, `auto` (Nimble picks and escalates per domain), and the
+  plain-HTTP tiers `vx6` / `media-vx6` / `fast-vx6`.
 - **`firecrawl`** — Firecrawl. LLM-native markdown, self-hostable. Requires
   `api_key`. Escalating proxy tiers.
 

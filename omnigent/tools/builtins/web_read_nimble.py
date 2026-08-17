@@ -17,10 +17,10 @@ Configured in the agent spec::
           read_provider: nimble
           api_key: ${NIMBLE_API_KEY}
           # optional:
-          # driver: vx8            # vx6 (plain HTTP) | vx8 (JS render) | vx10 (max)
+          # driver: vx8            # auto | vx8 default | vx10 / vx12 (+ -pro) | vx6 (plain HTTP)
           # output_format: markdown  # markdown (default) | html
 
-See https://docs.nimbleway.com/api-reference/web-api/extract
+See https://docs.nimbleway.com/nimble-sdk/web-tools/extract/quickstart
 """
 
 from __future__ import annotations
@@ -38,13 +38,30 @@ _DEFAULT_BASE_URL = "https://sdk.nimbleway.com"
 # Nimble's own SDKs send (same convention as the other Nimble builtins).
 _CLIENT_SOURCE = "omnigent"
 
-# Collection driver / tier, lightest -> most capable. The plain HTTP tier (vx6)
-# is fast but does not render JavaScript, so client-rendered pages come back
-# empty; vx8 renders and is the right default. vx10 is the highest-reliability
-# tier for the most demanding pages. Validated against this allowlist so a typo
-# yields a clear error rather than an opaque API failure.
+# Collection driver / tier — the full documented enum from Nimble's Extract
+# ``ExtractPayload`` schema. Validated against this allowlist so a typo yields a
+# clear error rather than an opaque API failure. ``vx8`` is the default: it
+# renders JavaScript and suits most pages; higher tiers (``vx10``/``vx12`` and
+# their ``-pro`` variants) trade cost for reliability, and ``auto`` lets Nimble
+# pick and escalate per domain. The HTTP-only tiers below do not render JS.
 _DEFAULT_DRIVER = "vx8"
-_VALID_DRIVERS = frozenset({"vx6", "vx8", "vx10"})
+_VALID_DRIVERS = frozenset(
+    {
+        "auto",
+        "vx6",
+        "vx8",
+        "vx8-pro",
+        "vx10",
+        "vx10-pro",
+        "vx12",
+        "vx12-pro",
+        "media-vx6",
+        "fast-vx6",
+    }
+)
+# Drivers that do NOT execute JavaScript (plain HTTP). For these, ``render`` is
+# false; ``auto`` sends ``render: "auto"`` (Nimble decides); all others render.
+_HTTP_ONLY_DRIVERS = frozenset({"vx6", "media-vx6", "fast-vx6"})
 
 _DEFAULT_OUTPUT_FORMAT = "markdown"
 _VALID_OUTPUT_FORMATS = frozenset({"markdown", "html"})
@@ -83,6 +100,18 @@ def _resolve_driver(config: dict[str, str]) -> str | None:
     return driver if driver in _VALID_DRIVERS else None
 
 
+def _render_for(driver: str) -> bool | str:
+    """Map a driver to the matching ``render`` value for the request body.
+
+    :param driver: A validated driver name.
+    :returns: ``"auto"`` for the ``auto`` driver (Nimble decides and escalates),
+        ``False`` for the HTTP-only tiers (no JavaScript), ``True`` otherwise.
+    """
+    if driver == "auto":
+        return "auto"
+    return driver not in _HTTP_ONLY_DRIVERS
+
+
 def _read_nimble(url: str, config: dict[str, str]) -> str:
     """
     Fetch one URL as clean content via Nimble's Web API.
@@ -116,8 +145,9 @@ def _read_nimble(url: str, config: dict[str, str]) -> str:
     body: dict[str, Any] = {
         "url": url,
         "formats": [output_format],
-        # ``render`` turns on the browser (JS execution); vx6 is plain HTTP.
-        "render": driver != "vx6",
+        # ``render`` turns on the browser (JS execution). The HTTP-only tiers
+        # don't render; ``auto`` lets Nimble decide; every other tier renders.
+        "render": _render_for(driver),
         "driver": driver,
     }
     if output_format == "markdown":
@@ -192,15 +222,15 @@ def _format_read(payload: dict[str, Any], url: str, driver: str, output_format: 
     if not content:
         return (
             f"web_read: no content extracted from {url} (the page may be empty or "
-            f"blocked on driver {driver!r}; try a stronger driver such as vx10)."
+            f"blocked on driver {driver!r}; try a higher tier such as vx10 or vx12)."
         )
 
     lowered = content.lower()
     if len(content) < 500 and any(marker in lowered for marker in _BLOCK_MARKERS):
         return (
             f"web_read: {url} returned a challenge/denied response instead of the "
-            f"page on driver {driver!r}. Try a higher-reliability driver (vx10) or "
-            "a different read_provider."
+            f"page on driver {driver!r}. Try a higher tier (vx10 / vx12, or their "
+            "-pro variants) or a different read_provider."
         )
 
     return content

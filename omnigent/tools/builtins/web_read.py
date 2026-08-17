@@ -18,7 +18,7 @@ Usage in config.yaml::
         - name: web_read
           read_provider: nimble      # or firecrawl / jina
           api_key: ${NIMBLE_API_KEY}   # keyed backends need it; jina is keyless
-          # driver: vx8                # nimble only (vx6/vx8/vx10)
+          # driver: vx8                # nimble only (auto/vx8/vx10/vx12, + -pro; vx6 plain HTTP)
           # output_format: markdown    # nimble only (markdown/html)
           # proxy: auto                # firecrawl only (basic/enhanced/auto)
 
