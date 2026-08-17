@@ -68,6 +68,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "state",
         "last_run_at",
         "last_run_conversation_id",
+        "requires_hook_review",
         "created_at",
         "updated_at",
     }

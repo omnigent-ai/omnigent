@@ -467,6 +467,7 @@ class _CodexNativeLaunchConfig:
     auto_harness: bool = False
     routing_enabled: bool = False
     turn_routing: bool = False
+    scheduled_task_trigger: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1019,6 +1020,7 @@ async def _codex_native_launch_config(
     # conversation label ("1" to enable). Read here so the runner applies
     # it at launch; any other value (incl. absent) leaves the normal stance.
     bypass_sandbox = False
+    scheduled_task_trigger: str | None = None
     labels = snapshot.get("labels")
     if isinstance(labels, dict):
         _fsi = labels.get(FORK_SOURCE_LABEL_KEY)
@@ -1029,6 +1031,9 @@ async def _codex_native_launch_config(
             fork_source_external_id = _fse
         fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
         bypass_sandbox = labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
+        raw_trigger = labels.get("omnigent.scheduled_task.trigger")
+        if raw_trigger in {"manual", "scheduled"}:
+            scheduled_task_trigger = raw_trigger
     # One derivation of the session's Smart Routing class, shared with the SDK
     # codex path, so "pinned" and "auto-harness" mean the same on both.
     routing_class = routing_class_from_snapshot(
@@ -1049,6 +1054,7 @@ async def _codex_native_launch_config(
         auto_harness=routing_class.auto_harness,
         routing_enabled=routing_class.routing_enabled,
         turn_routing=routing_class.turn_routing,
+        scheduled_task_trigger=scheduled_task_trigger,
     )
 
 
@@ -3733,6 +3739,7 @@ async def _auto_create_codex_terminal(
         build_codex_remote_args,
         codex_session_meta_model_provider,
         codex_terminal_env,
+        codex_user_hooks_audit_status,
         preload_codex_thread_for_resume,
         resolve_native_codex_launch,
     )
@@ -4047,6 +4054,39 @@ async def _auto_create_codex_terminal(
     await app_server.start()
     _AUTO_CODEX_APP_SERVERS[session_id] = app_server
 
+    bypass_hook_trust = (
+        app_server.codex_cli_version is not None
+        and app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
+    )
+    if launch_config.scheduled_task_trigger == "scheduled":
+        audit_client = CodexAppServerClient(ws_url=codex_ws_url, client_name="omnigent-hook-audit")
+        await audit_client.connect()
+        try:
+            audit = await codex_user_hooks_audit_status(audit_client.request, cwd=workspace)
+        finally:
+            await audit_client.close()
+        if audit != "trusted":
+            code = (
+                "hook_audit_required" if audit == "review_required" else "hook_audit_unavailable"
+            )
+            publish_event(
+                session_id,
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "error": {
+                        "code": code,
+                        "message": "Run this automation manually to review its Codex hooks.",
+                    },
+                },
+            )
+            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+            await app_server.close()
+            raise RuntimeError(code)
+        bypass_hook_trust = True
+    elif launch_config.scheduled_task_trigger == "manual":
+        bypass_hook_trust = False
+
     event_client = CodexAppServerClient(
         ws_url=codex_ws_url,
         client_name="omnigent-codex-native-auto",
@@ -4126,23 +4166,9 @@ async def _auto_create_codex_terminal(
                     # OpenAI built-in (which would force the first-run
                     # login screen and block thread creation).
                     config_overrides=tuple(app_server.config_overrides),
-                    # Omnigent provisions the private CODEX_HOME and vets
-                    # hook sources itself; skip the interactive trust prompt
-                    # that headless sub-agents can never answer.
-                    #
-                    # Requires a *positively parsed* version, unlike the
-                    # hooks-file gate in ``codex_native_app_server``, which
-                    # treats an unknown version as supported. The two differ
-                    # because their failure modes do: an unsupported hooks
-                    # file is ignored by codex and caught downstream at the
-                    # trust check, whereas an unknown CLI flag aborts argv
-                    # parsing — so a transient ``codex --version`` hiccup on a
-                    # pre-0.131 codex would turn a recoverable trust prompt
-                    # into a dead terminal.
-                    bypass_hook_trust=(
-                        app_server.codex_cli_version is not None
-                        and app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
-                    ),
+                    # Scheduled runs only bypass after an audit; manual runs
+                    # keep new or changed hooks reviewable in terminal view.
+                    bypass_hook_trust=bypass_hook_trust,
                 ),
                 env=codex_terminal_env(app_server),
                 # Match the local ``omnigent codex`` terminal scrollback.
@@ -4184,8 +4210,11 @@ async def _auto_create_codex_terminal(
                 bridge_dir=bridge_dir,
                 codex_ws_url=codex_ws_url,
                 codex_home=codex_home,
+                require_user_hook_trust=launch_config.scheduled_task_trigger == "manual",
+                hook_audit_cwd=workspace,
                 event_client=event_client,
                 routing_summary=_codex_launch.summary,
+                publish_event=publish_event,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -4235,6 +4264,9 @@ async def _codex_discover_thread_and_forward(
     codex_home: Path,
     event_client: CodexAppServerClient,
     routing_summary: str,
+    require_user_hook_trust: bool = False,
+    hook_audit_cwd: str = "",
+    publish_event: Callable[[str, _JsonObject], None] | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -4261,6 +4293,11 @@ async def _codex_discover_thread_and_forward(
         routing (provider / profile / model, or the login-fallback state),
         threaded into the startup-timeout error so hosted users can diagnose
         without runner-log access (see #2745).
+    :param require_user_hook_trust: Verify manual automation hook approval
+        after Codex starts its thread.
+    :param hook_audit_cwd: Workspace used for manual automation hook audit.
+    :param publish_event: Optional session event publisher. Production launch
+        supplies it; tests that do not exercise hook review may omit it.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -4308,6 +4345,26 @@ async def _codex_discover_thread_and_forward(
             return
 
         app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
+        if require_user_hook_trust and app_server is not None:
+            from omnigent.codex_native_app_server import codex_user_hooks_audit_status
+
+            audit = await codex_user_hooks_audit_status(event_client.request, cwd=hook_audit_cwd)
+            if audit != "trusted":
+                code = (
+                    "hook_audit_required"
+                    if audit == "review_required"
+                    else "hook_audit_unavailable"
+                )
+                if publish_event is not None:
+                    publish_event(
+                        session_id,
+                        {
+                            "type": "session.status",
+                            "status": "failed",
+                            "error": {"code": code, "message": "Hooks were not approved."},
+                        },
+                    )
+                return
         persist_user_hook_trust = getattr(app_server, "persist_user_hook_trust", None)
         if callable(persist_user_hook_trust):
             try:

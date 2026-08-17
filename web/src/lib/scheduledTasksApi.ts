@@ -53,6 +53,7 @@ export interface ScheduledTask {
    */
   lastRunStatus: ScheduledTaskRunStatus | null;
   lastRunConversationId: string | null;
+  requiresHookReview?: boolean;
   /**
    * ISO-8601 timestamp of the next scheduled fire, computed by the SERVER's
    * live scheduler (its authoritative anchor), or `null` when the task is
@@ -126,6 +127,7 @@ interface ScheduledTaskWire {
   last_run_at: number | null;
   last_run_status: ScheduledTaskRunStatus | null;
   last_run_conversation_id: string | null;
+  requires_hook_review?: boolean;
   next_run_at: string | null;
 }
 
@@ -200,6 +202,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     lastRunAt: wire.last_run_at,
     lastRunStatus: wire.last_run_status,
     lastRunConversationId: wire.last_run_conversation_id,
+    requiresHookReview: wire.requires_hook_review,
     nextRunAt: wire.next_run_at,
   };
 }
@@ -305,9 +308,10 @@ export async function deleteScheduledTask(id: string): Promise<void> {
  * `void` — callers invalidate the list + runs queries to pick up the new run's
  * status. A `409` (already in flight) surfaces as a {@link ScheduledTaskApiError}.
  */
-export async function runScheduledTaskNow(id: string): Promise<void> {
+export async function runScheduledTaskNow(id: string): Promise<{ runId: string }> {
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}/run`, {
     method: "POST",
   });
-  if (!res.ok) throw await errorFromResponse(res);
+  const body = await readJsonOrThrow<{ run_id: string }>(res);
+  return { runId: body.run_id };
 }

@@ -31,6 +31,9 @@ import { useNow } from "@/hooks/useNow";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
+import { useNavigate } from "@/lib/routing";
+import { listScheduledTaskRuns } from "@/lib/scheduledTasksApi";
+import { showToast } from "@/components/ui/toast";
 
 type FilterTab = "all" | "active" | "paused";
 
@@ -49,6 +52,7 @@ export function TasksPage() {
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
   const runNowMutation = useRunScheduledTaskNow();
+  const navigate = useNavigate();
 
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<FilterTab>("all");
@@ -134,8 +138,30 @@ export function TasksPage() {
     deleteMutation.mutate(task.id);
   }
 
-  function handleRunNow(task: ScheduledTask) {
-    runNowMutation.mutate(task.id);
+  async function handleRunNow(task: ScheduledTask) {
+    try {
+      showToast(task.requiresHookReview ? "Opening hook review…" : "Starting automation…");
+      const { runId } = await runNowMutation.mutateAsync(task.id);
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        // Sequential polling is intentional: each request observes later server state.
+        // eslint-disable-next-line no-await-in-loop
+        const run = (await listScheduledTaskRuns(task.id)).find((item) => item.id === runId);
+        if (run?.conversationId) {
+          navigate(`/c/${run.conversationId}?view=terminal`);
+          return;
+        }
+        if (run && ["failed", "skipped", "incomplete"].includes(run.status)) {
+          throw new Error(`Automation could not start (${run.errorCode ?? run.status})`);
+        }
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise<void>((resolve) => {
+          window.setTimeout(resolve, 500);
+        });
+      }
+      throw new Error("Automation is taking too long to start");
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "Automation could not start");
+    }
   }
 
   function handleEdit(task: ScheduledTask) {

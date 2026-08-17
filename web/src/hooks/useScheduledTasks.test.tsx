@@ -60,7 +60,7 @@ beforeEach(() => {
   vi.mocked(api.createScheduledTask).mockResolvedValue(TASK);
   vi.mocked(api.updateScheduledTask).mockResolvedValue({ ...TASK, state: "paused" });
   vi.mocked(api.deleteScheduledTask).mockResolvedValue(undefined);
-  vi.mocked(api.runScheduledTaskNow).mockResolvedValue(undefined);
+  vi.mocked(api.runScheduledTaskNow).mockResolvedValue({ runId: "run_1" });
 });
 
 afterEach(() => {

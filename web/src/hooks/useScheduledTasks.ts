@@ -50,7 +50,7 @@ export function useScheduledTasks() {
     // page-scoped poll into app-wide 60s background traffic. If you need a
     // persistent scheduled-tasks indicator, add a SEPARATE lightweight query
     // (no short refetchInterval, or a much longer one) — don't reuse this one.
-    refetchInterval: 60_000,
+    refetchInterval: 5_000,
   });
 }
 

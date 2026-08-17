@@ -57,6 +57,7 @@ export function ScheduledTaskRow({
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const paused = task.state === "paused";
+  const needsReview = task.requiresHookReview;
   // Subtitle: the schedule summary, plus the SERVER's next-run time when armed
   // (active tasks only — a paused task has null nextRunAt). We only format the
   // delta from the server value against the ticking `now`; we never recompute
@@ -91,6 +92,11 @@ export function ScheduledTaskRow({
               className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
             >
               Paused
+            </span>
+          )}
+          {needsReview && (
+            <span className="shrink-0 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 dark:bg-amber-950 dark:text-amber-300">
+              Needs hook review
             </span>
           )}
         </span>
@@ -133,7 +139,7 @@ export function ScheduledTaskRow({
         <DropdownMenuContent align="end">
           <DropdownMenuItem onSelect={() => onRunNow(task)} data-testid="task-run-now">
             <ZapIcon className="size-4" />
-            Run now
+            {needsReview ? "Review hooks" : "Run now"}
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => onEdit(task)} data-testid="task-edit">
             <PencilIcon className="size-4" />

@@ -1075,26 +1075,27 @@ async def test_run_now_triggers_and_records_a_run(
 
     calls: list[tuple[int, str]] = []
     now = int(time.time())
+    run_id = uuid.uuid4().hex
 
-    async def _fake_run_now(workspace_id: int, scheduled_task_id: str) -> bool:
+    async def _fake_run_now(workspace_id: int, scheduled_task_id: str) -> str:
         calls.append((workspace_id, scheduled_task_id))
         # Use a current-time fire so the LIST endpoint's stale backstop (6h age
         # from fired_at) does NOT reap this fresh in-flight run to ``failed``.
         SqlAlchemyScheduledTaskStore(db_uri).create_run(
-            run_id=uuid.uuid4().hex,
+            run_id=run_id,
             scheduled_task_id=scheduled_task_id,
             status="running",
             scheduled_at=now,
             conversation_id=uuid.uuid4().hex,
             fired_at=now,
         )
-        return True
+        return run_id
 
     auth_app.state.scheduled_task_run_now = _fake_run_now
 
     resp = await auth_client.post(f"/v1/scheduled-tasks/{task_id}/run", headers=_headers())
     assert resp.status_code == 202, resp.text
-    assert resp.json() == {"triggered": True, "id": task_id}
+    assert resp.json() == {"triggered": True, "id": task_id, "run_id": run_id}
     # The trigger was invoked with the task's workspace + id.
     assert calls == [(0, task_id)]
 

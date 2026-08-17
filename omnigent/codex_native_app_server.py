@@ -1480,6 +1480,39 @@ def _our_policy_hooks_from_list(listed: _JsonObject, cwd: str) -> list[_JsonObje
     return _our_hooks_from_list(listed, cwd, _POLICY_HOOK_MODULE)
 
 
+async def codex_user_hooks_audit_status(request: CodexRequestFn, *, cwd: str) -> str:
+    """Return ``trusted``, ``review_required``, or ``unavailable`` for user hooks."""
+    listed = await request("hooks/list", {"cwds": [cwd]})
+    result = _string_object_dict(listed.get("result")) or listed
+    data = _object_list(result.get("data")) or []
+    entry = next(
+        (
+            item
+            for raw in data
+            if (item := _string_object_dict(raw)) is not None and item.get("cwd") == cwd
+        ),
+        None,
+    )
+    if entry is None:
+        return "unavailable"
+    hooks = [
+        hook
+        for raw in (_object_list(entry.get("hooks")) or [])
+        if (hook := _string_object_dict(raw)) is not None
+        and _POLICY_HOOK_MODULE not in str(hook.get("command", ""))
+        and _CODEX_ROUTER_HOOK_MODULE not in str(hook.get("command", ""))
+    ]
+    if not hooks:
+        return "trusted"
+    if any(hook.get("currentHash") is None or hook.get("trustStatus") is None for hook in hooks):
+        return "unavailable"
+    return (
+        "trusted"
+        if all(hook.get("trustStatus") in _TRUSTED_HOOK_STATUSES for hook in hooks)
+        else "review_required"
+    )
+
+
 def _hooks_list_diagnostics(listed: _JsonObject, cwd: str) -> str:
     """
     Summarize a ``hooks/list`` response for a discovery-failure error.

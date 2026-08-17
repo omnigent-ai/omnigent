@@ -127,6 +127,7 @@ def _to_response(
         "last_run_at": task.last_run_at,
         "last_run_status": last_run_status,
         "last_run_conversation_id": task.last_run_conversation_id,
+        "requires_hook_review": task.requires_hook_review,
         "next_run_at": next_run_at,
         "updated_at": task.updated_at,
     }
@@ -448,15 +449,15 @@ def create_scheduled_tasks_router(
                 "scheduled task scheduler is not running",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
-        started = await run_now(task.workspace_id, task.id)
-        if not started:
+        run_id = await run_now(task.workspace_id, task.id)
+        if not run_id:
             # The row exists (we just loaded it) and paused is allowed, so the
             # only skip reason is an already-in-flight fire for this task.
             raise OmnigentError(
                 "a run for this scheduled task is already in flight",
                 code=ErrorCode.CONFLICT,
             )
-        return {"triggered": True, "id": task.id}
+        return {"triggered": True, "id": task.id, "run_id": run_id}
 
     @router.patch("/scheduled-tasks/{scheduled_task_id}")
     async def update_scheduled_task(
