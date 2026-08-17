@@ -634,6 +634,67 @@ describe("AppShell header", () => {
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
   });
 
+  it("uses the terminal default for an eligible session with a usable terminal", () => {
+    localStorage.setItem("omnigent:default-session-view", "terminal");
+    mockConversations([
+      {
+        id: "conv_terminal",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+      },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        {
+          id: "terminal_claude_main",
+          name: "claude",
+          session: "main",
+          running: true,
+        },
+      ],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_terminal");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+  });
+
+  it("lets an explicit per-session Chat choice override the terminal default", () => {
+    localStorage.setItem("omnigent:default-session-view", "terminal");
+    mockConversations([
+      {
+        id: "conv_terminal",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+      },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        {
+          id: "terminal_claude_main",
+          name: "claude",
+          session: "main",
+          running: true,
+        },
+      ],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_terminal");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    expect(sessionStorage.getItem("omnigent.web.panel-key:conv_terminal")).toBe("chat");
+
+    cleanup();
+    renderShell("/c/conv_terminal");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
+  });
+
   it("shows the terminal-startup spinner while a terminal-first session is coming up", () => {
     // Baseline for the suppression test below: terminalPending (PTY being
     // created) with no terminals available drives terminalStartingUp true.
@@ -808,11 +869,12 @@ describe("TerminalFirstContext", () => {
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
   });
 
-  it("flips to an empty Terminal view when a terminal-first session has no terminal resource", () => {
-    // The terminal-first pill is still a useful navigation affordance when a
-    // stopped/killed session has no resource rows. `setView("terminal")`
-    // must persist an open-but-empty terminal view instead of refusing to
-    // switch because there is no first terminal key.
+  it("stays Chat-only when the terminal default has no usable terminal resource", () => {
+    localStorage.setItem("omnigent:default-session-view", "terminal");
+    sessionStorage.setItem(
+      "omnigent.web.panel-key:conv_native_empty",
+      "terminal:terminal_claude_main",
+    );
     mockConversations([
       {
         id: "conv_native_empty",
@@ -834,7 +896,7 @@ describe("TerminalFirstContext", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
 
-    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
     expect(screen.queryByTestId("terminals-panel")).toBeNull();
   });
 
