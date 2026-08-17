@@ -62,7 +62,7 @@ def test_server_picker_opens_and_copies_current_url(
     expect(copy_action).to_be_focused()
     copy_action.press("Enter")
 
-    expect(page.get_by_role("status")).to_contain_text("Server URL copied.")
+    expect(page.get_by_test_id("toast")).to_contain_text("Server URL copied.")
     assert page.evaluate("navigator.clipboard.readText()") == _CURRENT_ORIGIN
 
     expect(open_action).to_be_hidden()
