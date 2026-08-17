@@ -519,6 +519,7 @@ def _ensure_default_agents(
     :param agent_cache: Cache for loaded agent specs.
     """
     _ensure_default_native_agents(agent_store, artifact_store, agent_cache)
+    _ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
@@ -662,6 +663,120 @@ def _ensure_default_native_agents(
             agent_cache,
             name=agent.agent_name,
             bundle_bytes=_build_native_bundle(provider),
+        )
+
+
+# Light framing for a seeded ACP picker agent. ACP agents run their own tool
+# loop, so the vendor CLI supplies the real behavior; this is just enough to
+# name the role.
+_ACP_AGENT_PROMPT = (
+    "You are a coding agent running inside Omnigent through the Agent Client "
+    "Protocol. Help the user with software engineering tasks in their workspace: "
+    "read and edit files, run commands, investigate, and implement changes. Work "
+    "within the current repository, explain what you are doing, and when you finish "
+    "a task tell the user how to verify it."
+)
+
+
+def _build_acp_bundle(*, harness: str, name: str) -> bytes:
+    """
+    Materialize a one-file ACP picker agent and tar it.
+
+    ACP agents have no provider row (unlike :func:`_build_native_bundle`), so the
+    spec is a generated single YAML on the debby-style directory path: just the
+    ``acp:<slug>`` (or builtin ACP CLI) harness id. The launch command is resolved
+    from the host's own ``acp:`` config (user agents) or PATH (builtin CLI rows)
+    at spawn time, so nothing host-specific is baked into the bundle.
+
+    :param harness: The harness id, e.g. ``"acp:devin"`` or ``"grok"``.
+    :param name: The agent name / stable-id seed — a valid ``[a-zA-Z0-9_-]+``
+        slug (e.g. ``"devin"``, ``"grok"``), never a display label with spaces.
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    import yaml
+
+    from omnigent.spec import materialize_bundle
+
+    raw = {
+        "spec_version": 1,
+        "name": name,
+        "prompt": _ACP_AGENT_PROMPT,
+        "executor": {"type": "omnigent", "config": {"harness": harness}},
+        "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        source = Path(tmpdir) / "src"
+        source.mkdir()
+        (source / "config.yaml").write_text(yaml.safe_dump(raw, sort_keys=False))
+        bundle_dir = materialize_bundle(source, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_acp_agents(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Seed a picker agent for each ACP harness set up on THIS server's host.
+
+    Native harnesses seed a fixed ``<harness>-ui`` agent each
+    (:func:`_ensure_default_native_agents`). ACP agents are host config rather
+    than a fixed catalog, so seed one agent per user-configured ``acp:<slug>``
+    agent (``harness_is_configured("acp:...")`` treats "in config" as set up) and
+    per builtin ACP CLI harness whose binary is on PATH (its readiness gate). On a
+    host with no ACP setup — the common remote-server case, where the server holds
+    no ``acp:`` config — this seeds nothing.
+
+    Purely additive: it only adds picker rows and never touches native seeding.
+    A malformed ``acp:`` block is logged and skipped, never fatal to startup
+    (mirrors the dynamic ``acp:*`` catalog rows in ``harness_plugins``).
+
+    Note: a seeded row is keyed by the agent's display name, so renaming a
+    configured ACP agent leaves the old picker row behind until the store is
+    reseeded — acceptable since native names are fixed and never rename.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    from omnigent._platform import resolve_cli_binary
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+    # (1) User-configured acp:<slug> agents — "set up" == present in config.
+    try:
+        from omnigent.onboarding.acp_auth import acp_agents
+
+        configured = list(acp_agents())
+    except Exception:  # noqa: BLE001 — a malformed acp: block must never break startup
+        _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
+        configured = []
+    for agent in configured:
+        # Key the built-in by the slug, not the display label: agent names must be
+        # ``[a-zA-Z0-9_-]+`` (the spec validator rejects spaces/dots), and a label
+        # like "Gemini CLI" would fail to load. The web picker capitalizes the slug
+        # for display (e.g. ``devin`` -> "Devin").
+        _ensure_builtin_agent(
+            agent_store,
+            artifact_store,
+            agent_cache,
+            name=agent.slug,
+            bundle_bytes=_build_acp_bundle(harness=f"acp:{agent.slug}", name=agent.slug),
+        )
+
+    # (2) Builtin ACP CLI harnesses (e.g. grok) — "set up" == binary on PATH. Keyed
+    # by the catalog id (already a valid slug), not the display label.
+    for key, row in ACP_CLI_HARNESSES.items():
+        if resolve_cli_binary(row.binary) is None:
+            continue
+        _ensure_builtin_agent(
+            agent_store,
+            artifact_store,
+            agent_cache,
+            name=key,
+            bundle_bytes=_build_acp_bundle(harness=key, name=key),
         )
 
 
