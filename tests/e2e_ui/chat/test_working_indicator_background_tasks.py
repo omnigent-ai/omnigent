@@ -1,12 +1,16 @@
-"""Working indicator behavior when background shells outlive a turn.
+"""Working indicator behavior when background tasks run alongside a turn.
 
-A claude-native turn can settle to ``idle`` while background shells keep
-running. The forwarder reports that as ``external_session_status: idle``
-carrying a positive ``background_task_count``. The turn has ended, so the
-composer's ``background-task-pill`` names the shells instead of the
-"Working…" shimmer (which would misread as the agent still thinking).
+The "Working…" shimmer and the ``background-task-pill`` are independent
+surfaces:
 
-Both tests drive the real status edges through the Sessions events route
+* While the turn is still active (``running``/``waiting`` — the parent parked
+  on its async-work drain of sub-agents / background shells), BOTH show: the
+  shimmer reports the live turn and the pill counts the tasks.
+* Once the turn has genuinely ended (``idle``) but a background shell outlives
+  it, only the pill shows — a "Working…" shimmer there would misread as the
+  agent still thinking.
+
+All tests drive the real status edges through the Sessions events route
 (the same path the claude-native forwarder posts to), so they are
 deterministic — no live LLM turn, whose timing and the openai-agents
 executor's handling of a blocked mock would make the assertions flaky.
@@ -105,6 +109,33 @@ def test_background_task_indicator_label_lifecycle(
     #    Stop-hook `0` clears the tally, so the indicator goes out.
     _publish_status(base_url, session_id, "idle", background_task_count=0)
     expect(working).to_have_count(0, timeout=15_000)
+
+
+def test_working_shimmer_and_pill_coexist_while_waiting(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A ``waiting`` turn shows the working shimmer AND the pill together.
+
+    ``waiting`` is the parent turn parked on its async-work drain — sub-agents
+    or background shells it spawned are still running. The turn is live, so the
+    "Working…" shimmer stays lit; the shells are running, so the pill tallies
+    them. The two are independent surfaces and must show side by side.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server
+        fixture.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    working = page.locator(_WORKING)
+    pill = page.locator(_PILL)
+    page.goto(f"{base_url}/c/{session_id}")
+
+    _publish_status(base_url, session_id, "waiting", background_task_count=2)
+    # Both surfaces light: the shimmer for the live turn, the pill for the tally.
+    expect(pill).to_contain_text("2 background tasks", timeout=15_000)
+    expect(working).to_contain_text(_WORKING_LABEL_RE, timeout=15_000)
 
 
 def test_sidebar_spinner_ignores_background_tasks(

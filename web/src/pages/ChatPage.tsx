@@ -2299,10 +2299,12 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
   const { isAtBottom } = useStickToBottomContext();
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
   const blockedOn = useChatStore((s) => s.blockedOn);
+  const agentWorking = useAgentTurnActive();
   const tick = useWorkingLabelTick();
-  // BackgroundTaskPill owns the background-tasks-only case; the pinned tab and
-  // its announcement yield to it.
-  const showShimmer = show && !isBackgroundTasksOnly(bgCount, blockedOn);
+  // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
+  // the state; the pinned tab and its announcement yield. While the turn is
+  // active the tab still shows.
+  const showShimmer = show && !isBackgroundTasksOnly(bgCount, blockedOn, agentWorking);
   const visible = showShimmer && !isAtBottom && !suppress;
   return (
     <div
@@ -2346,7 +2348,7 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
           >
             <BrandLogo variant="icon" className="otto-working h-4 w-auto shrink-0" />
             <Shimmer className="text-sm font-mono" duration={1.5}>
-              {workingIndicatorLabel(bgCount, tick, blockedOn)}
+              {workingIndicatorLabel(tick, blockedOn)}
             </Shimmer>
           </div>
         )}
@@ -2987,35 +2989,44 @@ export const WORKING_MESSAGES = [
 ] as const;
 
 /**
- * Busy only because background tasks outlive the turn (a dev server, a
- * background shell) — the agent isn't thinking and nothing's blocked. The
- * composer's `BackgroundTaskPill` owns this; the "Working…" shimmer yields.
+ * Busy only because background tasks outlive a FINISHED turn (a dev server, a
+ * background shell) — the agent's own turn has ended and nothing's blocked. The
+ * composer's `BackgroundTaskPill` reports the count and the "Working…" shimmer
+ * stays off (it would misread as the agent still thinking). While the turn is
+ * still active (`agentWorking`) the shimmer wins, and the pill shows the count
+ * alongside it.
  */
-export function isBackgroundTasksOnly(bgCount: number, blockedOn: string | null): boolean {
-  return !blockedOn && bgCount > 0;
+export function isBackgroundTasksOnly(
+  bgCount: number,
+  blockedOn: string | null,
+  agentWorking: boolean,
+): boolean {
+  return !agentWorking && !blockedOn && bgCount > 0;
 }
 
 /**
- * The label shown next to the working spinner. When the agent is parked on a
- * dialog (`blockedOn`) it says so — that outranks everything else, because it
- * is the one case where the session needs the user rather than time, and the
- * dialog may live only in the terminal tab. Otherwise, when background shells
- * outlive the turn (`bgCount > 0`) it names how many are still running (the
- * tick is ignored — that count is information, not decoration). Failing both
- * it rotates through `WORKING_MESSAGES` by wall-clock `tick`.
+ * Whether the agent's own turn is in progress — server `running`/`waiting`, or
+ * a local send in flight — as opposed to being busy only because background
+ * tasks outlive a finished turn. Separates the shimmer's "working" state from
+ * the pill's "background-tasks-only" state.
  */
-export function workingIndicatorLabel(
-  bgCount: number,
-  tick = 0,
-  blockedOn: string | null = null,
-): string {
+function useAgentTurnActive(): boolean {
+  const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const localSending = useChatStore((s) => s.status === "streaming");
+  return computeIsWorking(sessionStatus) || localSending;
+}
+
+/**
+ * The label shown next to the working shimmer. When the agent is parked on a
+ * dialog (`blockedOn`) it says so — that outranks the rotation, because it is
+ * the one case where the session needs the user rather than time, and the
+ * dialog may live only in the terminal tab. Otherwise it rotates through
+ * `WORKING_MESSAGES` by wall-clock `tick`. Background-task counts belong to
+ * `BackgroundTaskPill`, not this shimmer.
+ */
+export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null): string {
   if (blockedOn) {
     return `Blocked on: ${blockedOn}`;
-  }
-  if (bgCount > 0) {
-    return bgCount === 1
-      ? "1 background task still running"
-      : `${bgCount} background tasks still running`;
   }
   return WORKING_MESSAGES[tick % WORKING_MESSAGES.length]!;
 }
@@ -3023,11 +3034,13 @@ export function workingIndicatorLabel(
 function WorkingIndicator() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
   const blockedOn = useChatStore((s) => s.blockedOn);
+  const agentWorking = useAgentTurnActive();
   const tick = useWorkingLabelTick();
-  // BackgroundTaskPill owns this case; the shimmer would misread as the agent
-  // still thinking.
-  if (isBackgroundTasksOnly(bgCount, blockedOn)) return null;
-  const label = workingIndicatorLabel(bgCount, tick, blockedOn);
+  // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
+  // the state and the shimmer stays off (it would misread as the agent still
+  // thinking). While the turn is active the shimmer shows, with the pill beside it.
+  if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
+  const label = workingIndicatorLabel(tick, blockedOn);
   return (
     <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
       <MessageContent>
@@ -4426,15 +4439,16 @@ function SubagentComposerTray({ label }: { label: string }) {
 }
 
 /**
- * Pill above the composer tallying background tasks that outlive the turn (a
- * dev server, a background shell), shown in place of the "Working…" shimmer —
- * which would misread as the agent still thinking. Label-only: the count spans
- * shells, sub-agents, and tools, so there's no single terminal to open.
+ * Pill above the composer tallying background tasks that are running (a dev
+ * server, a background shell, a sub-agent). Independent of the "Working…"
+ * shimmer: while the turn is active both show — the shimmer for the turn, the
+ * pill for the tally — and once the turn ends the pill carries on alone.
+ * Label-only: the count spans shells, sub-agents, and tools, so there's no
+ * single terminal to open.
  */
 function BackgroundTaskPill() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
-  const blockedOn = useChatStore((s) => s.blockedOn);
-  if (!isBackgroundTasksOnly(bgCount, blockedOn)) return null;
+  if (bgCount <= 0) return null;
   return (
     <div className={cn("mx-auto flex w-full px-1 pb-1.5", CHAT_COLUMN_WIDTH)}>
       <div
