@@ -157,10 +157,18 @@ the workspace.
 Responses API** (`POST /api/2.0/genie/agents/{space_id}/responses`) and streamed
 back over SSE as each step of the turn completes — whole items, not
 token-by-token deltas. Genie's planning arrives as reasoning and each SQL query
-it runs shows up as a tool call while the turn is still running; the report text
-lands when Genie finishes writing it, with result rows re-rendered as Markdown
-tables (capped at 50 rows). Follow-up turns continue the same Genie
-conversation.
+it runs surfaces as a tool card while the turn is still running — Genie executes
+that SQL itself and Omnigent only observes it, so it is not a tool call Omnigent
+serves: it is not subject to `TOOL_CALL` policy gating and emits no usage toward
+cost budgets. The report text lands when Genie finishes writing it, with result
+rows re-rendered as Markdown tables (capped at 50 rows).
+
+Follow-up turns continue the same Genie conversation. That continuity is
+server-side, keyed by a `conversation_id` the running harness process holds in
+memory: it is never persisted, and the harness declares resume `NONE`. A restart
+— or resuming a saved session — therefore starts a fresh, contextless Genie
+conversation, since only the latest user message is forwarded and earlier turns
+are not replayed.
 
 Genie Agent mode is a Databricks **Beta** API gated on a workspace preview
 toggle. Until a workspace admin turns it on, the endpoint answers 404
@@ -201,7 +209,13 @@ the credentials the Databricks SDK resolves from your profile — every request
 carries a freshly minted bearer token, so a long turn survives OAuth token
 expiry — not through the Databricks AI gateway. It also dispatches no Omnigent
 tools: the space runs its own SQL, so those calls are surfaced as observations.
-See [`examples/genie`](../examples/genie).
+
+That makes **tools attached to a `databricks-genie` agent inert**. A `tools:`
+block — or an MCP server wired to the agent — parses and connects without
+complaint, but the harness reports no tool-calling support and forwards only the
+latest user message to Genie, so the tools are silently discarded. If you need
+tool composition, point a tool-calling harness at the Genie MCP server instead
+of using this harness. See [`examples/genie`](../examples/genie).
 
 CLI flags such as `--harness` and `--model` can override or supply missing
 executor values for a run. Databricks credentials come from the spec's
