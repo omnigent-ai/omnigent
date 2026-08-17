@@ -12,11 +12,12 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from sqlalchemy.exc import StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
@@ -100,6 +101,45 @@ from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
+
+
+class SmartRoutingSourcesInfo(BaseModel):
+    external: bool
+    oss: bool
+
+
+class BrandingLogosInfo(BaseModel):
+    main: str | None
+    loading: str | None
+    favicon: str | None
+
+
+class BrandingInfo(BaseModel):
+    app_name: str | None
+    heading: str | None
+    logos: BrandingLogosInfo
+    powered_by: bool
+
+
+class ServerInfoResponse(BaseModel):
+    accounts_enabled: bool
+    single_user: bool
+    login_url: str | None
+    needs_setup: bool
+    databricks_features: bool
+    managed_sandboxes_enabled: bool
+    sandbox_provider: str | None
+    sandbox_providers: list[str]
+    sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
+    public_sharing_enabled: bool
+    server_version: str
+    smart_routing_enabled: bool
+    smart_routing_sources: SmartRoutingSourcesInfo
+    features: dict[str, bool]
+    harness_install_enabled: bool
+    installable_harnesses: list[str]
+    dictation_available: bool
+    branding: BrandingInfo
 
 
 def _server_version() -> str:
@@ -877,6 +917,9 @@ def create_app(
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
 
+    from omnigent.server.server_config import load_branding_snapshot
+
+    branding_snapshot = load_branding_snapshot(server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
 
     # First-boot admin bootstrap for the accounts auth provider.
@@ -1192,6 +1235,7 @@ def create_app(
     app.state.host_store = host_store
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
+    app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
@@ -1784,8 +1828,8 @@ def create_app(
             "ui": {"server_picker": "sidebar"},
         }
 
-    @app.get("/v1/info")
-    async def info() -> dict[str, bool | str | list[str] | dict[str, bool] | None]:
+    @app.get("/v1/info", response_model=ServerInfoResponse)
+    async def info() -> ServerInfoResponse:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -1917,26 +1961,59 @@ def create_app(
         from omnigent.server.dictation import engine_availability
 
         dictation_available, _ = engine_availability()
-        return {
-            "accounts_enabled": accounts_enabled,
-            "single_user": single_user,
-            "login_url": login_url,
-            "needs_setup": needs_setup,
-            "databricks_features": databricks_features,
-            "managed_sandboxes_enabled": managed_sandboxes_enabled,
-            "sandbox_provider": sandbox_provider,
-            "sandbox_providers": sandbox_providers,
-            "sharing_mode": sharing_mode.value,
-            "public_sharing_enabled": public_sharing_enabled,
-            "server_version": _server_version(),
-            "smart_routing_enabled": smart_routing_enabled,
-            "smart_routing_sources": smart_routing_sources,
-            "features": app.state.feature_flags.frontend_dict(),
-            # Compatibility fields for frontends predating the feature map.
-            "harness_install_enabled": harness_install_enabled,
-            "installable_harnesses": installable_harnesses,
-            "dictation_available": dictation_available,
-        }
+        return ServerInfoResponse.model_validate(
+            {
+                "accounts_enabled": accounts_enabled,
+                "single_user": single_user,
+                "login_url": login_url,
+                "needs_setup": needs_setup,
+                "databricks_features": databricks_features,
+                "managed_sandboxes_enabled": managed_sandboxes_enabled,
+                "sandbox_provider": sandbox_provider,
+                "sandbox_providers": sandbox_providers,
+                "sharing_mode": sharing_mode.value,
+                "public_sharing_enabled": public_sharing_enabled,
+                "server_version": _server_version(),
+                "smart_routing_enabled": smart_routing_enabled,
+                "smart_routing_sources": smart_routing_sources,
+                "features": app.state.feature_flags.frontend_dict(),
+                "harness_install_enabled": harness_install_enabled,
+                "installable_harnesses": installable_harnesses,
+                "dictation_available": dictation_available,
+                "branding": branding_snapshot.config(),
+            }
+        )
+
+    @app.get(
+        "/v1/branding/logo/{variant}",
+        response_class=Response,
+        responses={
+            200: {
+                "description": "Validated raster branding image",
+                "content": {
+                    media_type: {"schema": {"type": "string", "format": "binary"}}
+                    for media_type in (
+                        "image/gif",
+                        "image/jpeg",
+                        "image/png",
+                        "image/webp",
+                        "image/x-icon",
+                    )
+                },
+            },
+            404: {"description": "Branding image not configured or invalid"},
+        },
+    )
+    async def branding_logo(variant: str) -> Response:
+        """Serve a validated public branding asset, or 404 when unset."""
+        asset = branding_snapshot.logo_asset(variant)
+        if asset is None:
+            raise StarletteHTTPException(status_code=404, detail="Branding logo not found")
+        return Response(
+            content=asset.content,
+            media_type=asset.media_type,
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
     async def me(request: Request) -> dict[str, str | bool | None] | JSONResponse:
