@@ -4942,6 +4942,7 @@ def _seed_subagent_on_disk(
     description: str,
     tool_use_id: str,
     transcript_records: list[dict[str, Any]] | None = None,
+    spawn_transcript_path: Path | None = None,
 ) -> Path:
     """
     Create the ``.meta.json`` + ``.jsonl`` pair Claude Code would
@@ -4962,9 +4963,34 @@ def _seed_subagent_on_disk(
         rows to seed into the sub-agent's ``.jsonl``. ``None`` /
         empty leaves the transcript empty (the common case when a
         sub-agent has just been spawned).
+    :param spawn_transcript_path: Transcript containing the spawning
+        tool call. Defaults to the top-level transcript.
     :returns: Path to the sub-agent's ``.jsonl`` (handy for tests
         that append rows after the fact).
     """
+    spawn_path = spawn_transcript_path or transcript_path
+    with spawn_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "isSidechain": spawn_path != transcript_path,
+                    "type": "assistant",
+                    "uuid": f"spawn-{subagent_id}",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": tool_use_id,
+                                "name": "Agent",
+                                "input": {"description": description},
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
     subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
     subagents_dir.mkdir(parents=True, exist_ok=True)
     meta_path = subagents_dir / f"agent-{subagent_id}.meta.json"
@@ -5072,6 +5098,122 @@ async def test_subagent_watcher_posts_external_subagent_start_for_new_meta(
             await task
         server.shutdown()
         server.server_close()
+
+
+async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
+    tmp_path: Path,
+) -> None:
+    """Nested Claude agents register under their immediate Omnigent parent."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+
+    parent_transcript = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="z-parent",
+        agent_type="general-purpose",
+        description="parent worker",
+        tool_use_id="toolu_parent",
+    )
+    child_transcript = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-child",
+        agent_type="general-purpose",
+        description="nested child",
+        tool_use_id="toolu_child",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "nested-child-output",
+                "message": {"role": "assistant", "content": "working"},
+            }
+        ],
+        spawn_transcript_path=parent_transcript,
+    )
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "isSidechain": True,
+                    "type": "assistant",
+                    "uuid": "mirrored-nested-spawn",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_child",
+                                "name": "Agent",
+                                "input": {"description": "nested child"},
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+        )
+    start_paths: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("type") != "external_subagent_start":
+            return httpx.Response(202, json={})
+        subagent_id = body["data"]["subagent_id"]
+        start_paths[subagent_id] = request.url.path
+        return httpx.Response(
+            202,
+            json={"queued": False, "child_session_id": f"conv_{subagent_id}"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=forwarder.SubagentForwardState(subagents={}),
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+        assert start_paths == {
+            "z-parent": "/v1/sessions/conv_root/events",
+            "a-child": "/v1/sessions/conv_z-parent/events",
+        }
+        assert state.subagents["z-parent"].parent_subagent_id is None
+        assert state.subagents["a-child"].parent_subagent_id == "z-parent"
+
+        reconstructed = forwarder._read_subagent_forward_state(bridge_dir)
+        assert reconstructed == state
+
+        _seed_subagent_on_disk(
+            transcript_path=transcript_path,
+            subagent_id="b-grandchild",
+            agent_type="Explore",
+            description="second nested level",
+            tool_use_id="toolu_grandchild",
+            spawn_transcript_path=child_transcript,
+        )
+        restarted = await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_root",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=reconstructed,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        )
+
+    assert start_paths["b-grandchild"] == "/v1/sessions/conv_a-child/events"
+    assert restarted.subagents["b-grandchild"].parent_subagent_id == "a-child"
 
 
 async def test_subagent_watcher_forwards_transcript_items_to_child_session(
