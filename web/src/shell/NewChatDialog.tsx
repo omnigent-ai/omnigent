@@ -133,7 +133,11 @@ import {
   type SmartRoutingUnavailableCause,
 } from "@/lib/smartRoutingAvailability";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
-import { partitionAgentsByKind, sortAgentsForDisplay } from "@/lib/agentGrouping";
+import {
+  isAcpHarnessAgent,
+  partitionAgentsByKind,
+  sortAgentsForDisplay,
+} from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
@@ -1917,16 +1921,20 @@ export function NewChatLandingScreen() {
     [agents],
   );
 
-  // Split the picker into "Harnesses" (the native terminal CLIs) and
-  // "Agents" (SDK / bundle agents like Polly & Debby plus any custom
-  // user-registered agents). This is the isNativeCodingAgent split, NOT the
-  // builtins/customs split: Polly & Debby are built-ins but belong under
-  // "Agents", not "Harnesses".
+  // Split the picker into "Harnesses" (harness-backed picks — the native
+  // terminal CLIs plus generic-ACP harness agents like Grok / Devin / Kilocode)
+  // and "Agents" (composed SDK / bundle agents like Polly & Debby plus custom
+  // user-registered agents). Harness-backed vs composed, NOT the builtins/customs
+  // split: Polly & Debby are built-ins but are composed agents, so they stay
+  // under "Agents". ACP agents aren't native, so they fold into "More".
   const harnessEntries = useMemo(
-    () => agentList.filter((a) => isNativeCodingAgent(a)),
+    () => agentList.filter((a) => isNativeCodingAgent(a) || isAcpHarnessAgent(a)),
     [agentList],
   );
-  const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
+  const agentEntries = useMemo(
+    () => agentList.filter((a) => !isNativeCodingAgent(a) && !isAcpHarnessAgent(a)),
+    [agentList],
+  );
 
   // "Create custom agent" dialog state and pending bundle. When the user
   // creates a custom agent via the dialog, the bundle input is stored
