@@ -277,6 +277,7 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     NameAlreadyExistsError,
 )
+from omnigent.stores.credential_store import CredentialStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
 
@@ -4566,6 +4567,31 @@ async def cancel_managed_launch_tasks() -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
+async def _owner_credential_env(
+    credential_store: CredentialStore | None, owner: str
+) -> dict[str, str] | None:
+    """
+    Build the per-launch env from the owner's connected credentials.
+
+    :param credential_store: The app's credential store, or ``None`` when
+        the deployment has none configured.
+    :param owner: The launching user, e.g. ``"alice@example.com"``.
+    :returns: ``{"GIT_TOKEN": <token>}`` when the owner has a usable
+        GitHub credential, else ``None`` (today's exact behavior). An
+        undecryptable token (key rotated) logs and launches without.
+    """
+    if credential_store is None:
+        return None
+    cred = await asyncio.to_thread(credential_store.get, owner, "github")
+    if cred is None:
+        return None
+    token = credential_store.decrypt_token(cred)
+    if not token:
+        _logger.warning("github credential for %s is undecryptable — launching without it", owner)
+        return None
+    return {"GIT_TOKEN": token}
+
+
 async def _provision_managed_sandbox(
     *,
     session_id: str,
@@ -4577,6 +4603,7 @@ async def _provision_managed_sandbox(
     relaunch_host: Host | None,
     provider: str | None = None,
     agent_name: str | None = None,
+    credential_store: CredentialStore | None = None,
 ) -> ManagedHostLaunch | None:
     """
     Run the provision phase of a background managed launch.
@@ -4600,6 +4627,8 @@ async def _provision_managed_sandbox(
     :param agent_name: Server-resolved built-in agent name the session
         runs, stamped as the runner Pod's ``omnigent.ai/agent`` classifier
         (Kubernetes only), or ``None`` to leave it unstamped.
+    :param credential_store: The app's credential store, used to inject the
+        owner's ``GIT_TOKEN`` into the launch when connected, or ``None``.
     :returns: The launch result, or ``None`` when the launch failed
         (the tracker entry is already settled with the reason).
     """
@@ -4617,6 +4646,7 @@ async def _provision_managed_sandbox(
         """
         _publish_sandbox_status(session_id, stage)
 
+    extra_env = await _owner_credential_env(credential_store, owner)
     try:
         if relaunch_host is not None:
             return await relaunch_managed_host(
@@ -4626,6 +4656,7 @@ async def _provision_managed_sandbox(
                 repo=repo,
                 agent_name=agent_name,
                 on_stage=_on_stage,
+                extra_env=extra_env,
             )
         return await launch_managed_host(
             config=sandbox_config,
@@ -4635,6 +4666,7 @@ async def _provision_managed_sandbox(
             provider=provider,
             agent_name=agent_name,
             on_stage=_on_stage,
+            extra_env=extra_env,
         )
     except HTTPException as exc:
         _logger.warning(
@@ -9509,6 +9541,7 @@ __all__ = [
     "_native_terminal_failure_from_runner_response",
     "_native_terminal_name_for_harness",
     "_notify_runner_of_bundled_child",
+    "_owner_credential_env",
     "_owner_from_grants",
     "_parse_external_assistant_message",
     "_parse_external_conversation_item",

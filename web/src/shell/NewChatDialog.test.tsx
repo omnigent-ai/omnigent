@@ -63,6 +63,10 @@ vi.mock("@/hooks/useHosts", () => ({
   useStoreCredential: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
   useDetectedCredentials: vi.fn(() => ({ data: [] })),
 }));
+const credentialsMocks = vi.hoisted(() => ({
+  listGithubRepos: vi.fn(),
+}));
+vi.mock("@/lib/credentialsApi", () => credentialsMocks);
 // The setup dialog's copyable command rows call copyText; stub it so a click
 // can be asserted without touching the real clipboard.
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
@@ -677,6 +681,13 @@ function mockAgents(agents: AvailableAgent[]) {
 // recent workspace so the working-directory field seeds to a known path.
 function setupLandingMocks() {
   authenticatedFetchMock.mockReset();
+  credentialsMocks.listGithubRepos.mockReset();
+  credentialsMocks.listGithubRepos.mockResolvedValue({
+    ok: false,
+    error: "github_not_connected",
+    status: 409,
+    code: "github_not_connected",
+  });
   useHostsMock.mockReset();
   useHostModelOptionsMock.mockReset();
   useAvailableAgentsMock.mockReset();
@@ -2501,6 +2512,119 @@ describe("NewChatLandingScreen", () => {
       target: { value: "https://github.com/org/repo" },
     });
     expect(submit.disabled).toBe(false);
+  });
+
+  it("shows connected GitHub repos in a filterable dropdown and fills the URL on selection", async () => {
+    credentialsMocks.listGithubRepos.mockResolvedValue({
+      ok: true,
+      repos: [
+        {
+          full_name: "alice/proj-one",
+          clone_url: "https://github.com/alice/proj-one.git",
+          default_branch: "main",
+          private: false,
+        },
+        {
+          full_name: "alice/proj-two",
+          clone_url: "https://github.com/alice/proj-two.git",
+          default_branch: "main",
+          private: true,
+        },
+      ],
+    });
+    renderLanding({ managed_sandboxes_enabled: true });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    // Let the host-choice dropdown's close-and-restore-focus settle before
+    // opening the repo popover — otherwise its deferred focus restoration
+    // can steal focus back from the repo input mid-test.
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull());
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.focus(screen.getByTestId("new-chat-landing-repo-input"));
+    await waitFor(() => expect(credentialsMocks.listGithubRepos).toHaveBeenCalledTimes(1));
+    const options = await screen.findAllByTestId("new-chat-landing-repo-option");
+    expect(options).toHaveLength(2);
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "proj-two" },
+    });
+    await waitFor(() =>
+      expect(screen.getAllByTestId("new-chat-landing-repo-option")).toHaveLength(1),
+    );
+
+    fireEvent.mouseDown(screen.getByTestId("new-chat-landing-repo-option"));
+    expect((screen.getByTestId("new-chat-landing-repo-input") as HTMLInputElement).value).toBe(
+      "https://github.com/alice/proj-two.git",
+    );
+  });
+
+  it("shows a connect-GitHub hint when GitHub isn't connected", async () => {
+    renderLanding({ managed_sandboxes_enabled: true });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    // Let the host-choice dropdown's close-and-restore-focus settle before
+    // opening the repo popover — otherwise its deferred focus restoration
+    // can steal focus back out of the popover mid-test.
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull());
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.focus(screen.getByTestId("new-chat-landing-repo-input"));
+    await waitFor(() => expect(credentialsMocks.listGithubRepos).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("Connect GitHub in Settings to browse your repos")).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-repo-option")).toBeNull();
+  });
+
+  it("does not show the connect-GitHub hint when credentials are disabled on the deployment", async () => {
+    // A deployment with no GitHub OAuth App / encryption key configured
+    // gets the same 409 as "not connected yet", but a different code —
+    // Settings' Connect button is disabled there too, so the hint would
+    // be a dead end.
+    credentialsMocks.listGithubRepos.mockResolvedValue({
+      ok: false,
+      error: "credentials_disabled",
+      status: 409,
+      code: "credentials_disabled",
+    });
+    renderLanding({ managed_sandboxes_enabled: true });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull());
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.focus(screen.getByTestId("new-chat-landing-repo-input"));
+    await waitFor(() => expect(credentialsMocks.listGithubRepos).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText("Connect GitHub in Settings to browse your repos")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-repo-option")).toBeNull();
+  });
+
+  it("still accepts an arbitrary pasted URL when the repo list is loaded", async () => {
+    credentialsMocks.listGithubRepos.mockResolvedValue({
+      ok: true,
+      repos: [
+        {
+          full_name: "alice/proj-one",
+          clone_url: "https://github.com/alice/proj-one.git",
+          default_branch: "main",
+          private: false,
+        },
+      ],
+    });
+    renderLanding({ managed_sandboxes_enabled: true });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    // Let the host-choice dropdown's close-and-restore-focus settle before
+    // opening the repo popover — otherwise its deferred focus restoration
+    // can steal focus back out of the popover mid-test.
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull());
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.focus(screen.getByTestId("new-chat-landing-repo-input"));
+    await waitFor(() => expect(credentialsMocks.listGithubRepos).toHaveBeenCalledTimes(1));
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "https://github.com/someone-else/other-repo" },
+    });
+    expect(screen.queryByTestId("new-chat-landing-repo-option")).toBeNull();
+    expect((screen.getByTestId("new-chat-landing-repo-input") as HTMLInputElement).value).toBe(
+      "https://github.com/someone-else/other-repo",
+    );
   });
 });
 

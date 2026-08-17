@@ -2517,6 +2517,7 @@ async def launch_managed_host(
     provider: str | None = None,
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> ManagedHostLaunch:
     """
     Provision a sandbox, start a host in it, and wait until it registers.
@@ -2589,6 +2590,7 @@ async def launch_managed_host(
         repo=repo,
         agent_name=agent_name,
         on_stage=on_stage,
+        extra_env=extra_env,
     )
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
 
@@ -2601,6 +2603,7 @@ async def relaunch_managed_host(
     repo: RepoWorkspace | None = None,
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> ManagedHostLaunch:
     """
     Provision a NEW sandbox generation for an existing managed host.
@@ -2674,6 +2677,7 @@ async def relaunch_managed_host(
         agent_name=agent_name,
         on_stage=on_stage,
         keep_host_on_failure=True,
+        extra_env=extra_env,
     )
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
 
@@ -2692,6 +2696,7 @@ async def _start_sandbox_host(
     host_config: dict[str, object] | None,
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> str:
     """Start a host without sending absent optional arguments to legacy launchers."""
     # Gated on the capability, not on the value: start_host is side-effecting and
@@ -2700,8 +2705,8 @@ async def _start_sandbox_host(
     # so the abstract signature does not carry it and the call is cast: the
     # capability is the runtime guarantee the static type cannot express. A
     # launcher declaring it is in-tree and current, so it also takes
-    # `host_config`/`on_stage`, keeping the legacy-omission fan-out below
-    # one-dimensional.
+    # `host_config`/`on_stage`/`extra_env`, keeping the legacy-omission fan-out
+    # below one-dimensional.
     if agent_name is not None and launcher.capabilities.classifies_runner_by_agent:
         start_classified = cast(Callable[..., str], launcher.start_host)
         return await asyncio.to_thread(
@@ -2717,58 +2722,26 @@ async def _start_sandbox_host(
             host_config=host_config,
             on_stage=on_stage,
             agent_name=agent_name,
+            extra_env=extra_env,
         )
-    if host_config is None and on_stage is None:
-        return await asyncio.to_thread(
-            launcher.start_host,
-            sandbox_id,
-            token=token,
-            host_id=host_id,
-            host_name=host_name,
-            server_url=server_url,
-            repo_url=repo_url,
-            repo_branch=repo_branch,
-            repo_name=repo_name,
-        )
-    if host_config is None:
-        return await asyncio.to_thread(
-            launcher.start_host,
-            sandbox_id,
-            token=token,
-            host_id=host_id,
-            host_name=host_name,
-            server_url=server_url,
-            repo_url=repo_url,
-            repo_branch=repo_branch,
-            repo_name=repo_name,
-            on_stage=on_stage,
-        )
-    if on_stage is None:
-        return await asyncio.to_thread(
-            launcher.start_host,
-            sandbox_id,
-            token=token,
-            host_id=host_id,
-            host_name=host_name,
-            server_url=server_url,
-            repo_url=repo_url,
-            repo_branch=repo_branch,
-            repo_name=repo_name,
-            host_config=host_config,
-        )
-    return await asyncio.to_thread(
-        launcher.start_host,
-        sandbox_id,
-        token=token,
-        host_id=host_id,
-        host_name=host_name,
-        server_url=server_url,
-        repo_url=repo_url,
-        repo_branch=repo_branch,
-        repo_name=repo_name,
-        host_config=host_config,
-        on_stage=on_stage,
-    )
+    kwargs: dict[str, object] = {
+        "token": token,
+        "host_id": host_id,
+        "host_name": host_name,
+        "server_url": server_url,
+        "repo_url": repo_url,
+        "repo_branch": repo_branch,
+        "repo_name": repo_name,
+    }
+    # Omitted entirely when unset: a deployment-injected launcher predating
+    # one of these parameters must keep launching.
+    if host_config is not None:
+        kwargs["host_config"] = host_config
+    if on_stage is not None:
+        kwargs["on_stage"] = on_stage
+    if extra_env is not None:
+        kwargs["extra_env"] = extra_env
+    return await asyncio.to_thread(launcher.start_host, sandbox_id, **kwargs)
 
 
 async def _arm_and_start_host(
@@ -2784,6 +2757,7 @@ async def _arm_and_start_host(
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
     keep_host_on_failure: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> str:
     """
     Arm the credential, start the in-sandbox host, and await its
@@ -2853,6 +2827,7 @@ async def _arm_and_start_host(
             host_config=config.host_config,
             agent_name=agent_name,
             on_stage=on_stage,
+            extra_env=extra_env,
         )
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:

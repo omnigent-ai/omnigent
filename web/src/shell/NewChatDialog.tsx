@@ -140,6 +140,7 @@ import {
 } from "@/lib/agentGrouping";
 import { cn } from "@/lib/utils";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
+import { listGithubRepos, type GithubRepoInfo } from "@/lib/credentialsApi";
 import {
   isFullySupportedNativeCodingAgent,
   isNativeCodingAgent,
@@ -2141,6 +2142,45 @@ export function NewChatLandingScreen() {
   const [sandboxRepoBranch, setSandboxRepoBranch] = useState<string>(
     () => landingDraft?.sandboxRepoBranch ?? "",
   );
+  // The repository field doubles as a combobox: focusing it fetches the
+  // caller's GitHub repos (once per dialog instance) if connected, and
+  // typing filters them. A value matching none is used as a plain URL,
+  // unchanged from the field's pre-picker behavior.
+  type GithubRepoPickerState =
+    | { status: "idle" }
+    | { status: "loading" }
+    | { status: "ready"; repos: GithubRepoInfo[] }
+    | { status: "not_connected" }
+    | { status: "error" };
+  const [githubRepoPicker, setGithubRepoPicker] = useState<GithubRepoPickerState>({
+    status: "idle",
+  });
+  const [repoInputFocused, setRepoInputFocused] = useState(false);
+  const fetchGithubRepos = useCallback(() => {
+    if (githubRepoPicker.status !== "idle") return;
+    setGithubRepoPicker({ status: "loading" });
+    void listGithubRepos().then((result) => {
+      if (!result.ok) {
+        // Only the "you haven't connected yet" case gets the "Connect
+        // GitHub in Settings" hint — a deployment with credentials
+        // disabled entirely (or any other failure) has no actionable
+        // next step there, so it falls into the silent error state.
+        setGithubRepoPicker(
+          result.status === 409 && result.code === "github_not_connected"
+            ? { status: "not_connected" }
+            : { status: "error" },
+        );
+        return;
+      }
+      setGithubRepoPicker({ status: "ready", repos: result.repos });
+    });
+  }, [githubRepoPicker]);
+  const filteredGithubRepos = useMemo(() => {
+    if (githubRepoPicker.status !== "ready") return [];
+    const q = sandboxRepoUrl.trim().toLowerCase();
+    if (q === "") return githubRepoPicker.repos;
+    return githubRepoPicker.repos.filter((r) => r.full_name.toLowerCase().includes(q));
+  }, [githubRepoPicker, sandboxRepoUrl]);
   const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
   // The base branch auto-fills from the configured default (Settings › Git)
@@ -4631,15 +4671,74 @@ export function NewChatLandingScreen() {
                           </Tooltip>
                         )}
                       </div>
-                      <input
-                        id="landing-repo-url"
-                        type="text"
-                        value={sandboxRepoUrl}
-                        onChange={(e) => setSandboxRepoUrl(e.target.value)}
-                        placeholder="https://github.com/org/repo"
-                        className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
-                        data-testid="new-chat-landing-repo-input"
-                      />
+                      <div className="relative flex flex-col">
+                        <input
+                          id="landing-repo-url"
+                          type="text"
+                          value={sandboxRepoUrl}
+                          onChange={(e) => setSandboxRepoUrl(e.target.value)}
+                          onFocus={() => {
+                            setRepoInputFocused(true);
+                            fetchGithubRepos();
+                          }}
+                          // Delay so a click on a dropdown option registers
+                          // before the list unmounts on blur.
+                          onBlur={() => setTimeout(() => setRepoInputFocused(false), 120)}
+                          placeholder="https://github.com/org/repo"
+                          role="combobox"
+                          aria-expanded={repoInputFocused && filteredGithubRepos.length > 0}
+                          aria-autocomplete="list"
+                          // Suppress the browser's native autofill dropdown so it
+                          // doesn't overlay our repo combobox. `off` alone is
+                          // ignored by some browsers, so also disable spellcheck /
+                          // autocorrect and give it an unrecognized name.
+                          autoComplete="off"
+                          autoCorrect="off"
+                          autoCapitalize="off"
+                          spellCheck={false}
+                          name="omnigent-sandbox-repo-url"
+                          className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
+                          data-testid="new-chat-landing-repo-input"
+                        />
+                        {repoInputFocused && filteredGithubRepos.length > 0 && (
+                          <div
+                            className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-[12px] border border-border bg-popover p-2 shadow-menu"
+                            data-testid="new-chat-landing-repo-dropdown"
+                          >
+                            <ul className="flex flex-col gap-0.5">
+                              {filteredGithubRepos.map((r) => (
+                                <li key={r.full_name}>
+                                  <button
+                                    type="button"
+                                    // onMouseDown (not onClick): fires before
+                                    // the input's blur, so the selection lands
+                                    // even though blur is about to hide the list.
+                                    onMouseDown={(e) => {
+                                      e.preventDefault();
+                                      setSandboxRepoUrl(r.clone_url);
+                                      setRepoInputFocused(false);
+                                    }}
+                                    className="flex w-full items-center justify-between gap-2 rounded-md px-1.5 py-1 text-left text-sm transition-colors hover:bg-muted dark:hover:bg-muted/50"
+                                    data-testid="new-chat-landing-repo-option"
+                                  >
+                                    <span className="truncate text-foreground">{r.full_name}</span>
+                                    {r.private && (
+                                      <span className="shrink-0 text-[10px] text-muted-foreground">
+                                        private
+                                      </span>
+                                    )}
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                      {githubRepoPicker.status === "not_connected" && (
+                        <p className="text-sm text-muted-foreground">
+                          Connect GitHub in Settings to browse your repos
+                        </p>
+                      )}
                       <input
                         type="text"
                         value={sandboxRepoBranch}

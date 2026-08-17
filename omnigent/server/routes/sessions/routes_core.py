@@ -429,6 +429,7 @@ def register_core_routes(
                     tracker=managed_launches,
                     conversation_store=conversation_store,
                     host_store=host_store_for_managed,
+                    credential_store=getattr(request.app.state, "credential_store", None),
                     host_registry=getattr(request.app.state, "host_registry", None),
                     tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
                     provider=body.sandbox_provider,

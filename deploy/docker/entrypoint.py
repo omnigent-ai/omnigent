@@ -304,6 +304,22 @@ def _build_routing(
     return _build_local_llm_routing_client(server_llm), settings
 
 
+def _resolve_execution_timeout(cfg: dict[str, Any]) -> int:
+    """Resolve the max wall-clock seconds per agent execution.
+
+    Mirrors the CLI's ``execution_timeout`` resolution (``omnigent server
+    --execution-timeout``) minus the flag layer, since a Docker deploy has no
+    CLI invocation to read one from: config file, else ``RuntimeCaps``'s own
+    default (7200s = 2 hours).
+
+    :param cfg: The parsed server config mapping.
+    :returns: The effective timeout in seconds.
+    """
+    from omnigent.runtime.caps import RuntimeCaps
+
+    return int(cfg.get("execution_timeout") or RuntimeCaps.execution_timeout)
+
+
 def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     """Resolve config if needed, wire the stores, and build the app.
 
@@ -356,6 +372,9 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     policy_store = SqlAlchemyPolicyStore(database_url)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(database_url)
     project_store = SqlAlchemyProjectStore(database_url)
+    from omnigent.stores.credential_store import CredentialStore
+
+    credential_store = CredentialStore(database_url)
     # Fail startup loud on a malformed `sandbox:` section (an operator
     # typo should not surface as a runtime 502 on the first managed
     # session); the startup catch-all below logs it.
@@ -374,6 +393,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     routing_client, routing_settings = _build_routing(cfg, server_llm)
 
     caps = RuntimeCaps(
+        execution_timeout=_resolve_execution_timeout(cfg),
         default_policies=parse_default_policies(cfg.get("policies")),
         llm=server_llm,
         routing_client=routing_client,
@@ -419,6 +439,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
         project_store=project_store,
+        credential_store=credential_store,
         auth_provider=auth_provider,
         account_store=account_store,
         # Non-secret auth settings from the config file (admins are the

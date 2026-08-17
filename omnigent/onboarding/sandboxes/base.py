@@ -816,6 +816,7 @@ class SandboxHostLauncher(SandboxLifecycle):
         repo_name: str | None = None,
         host_config: dict[str, object] | None = None,
         on_stage: Callable[[str], None] | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> str:
         """
         Start ``omnigent host`` in the sandbox and return the workspace path.
@@ -835,6 +836,8 @@ class SandboxHostLauncher(SandboxLifecycle):
             content installed into the sandbox's config BEFORE the host starts.
         :param on_stage: Progress observer invoked with ``"cloning"`` and
             ``"starting"``.
+        :param extra_env: Per-launch env pairs for the host process (e.g. the
+            session owner's ``GIT_TOKEN``), or ``None`` for none.
         :returns: The absolute in-sandbox workspace path.
         """
 
@@ -867,6 +870,7 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
         repo_name: str | None = None,
         host_config: dict[str, object] | None = None,
         on_stage: Callable[[str], None] | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> str:
         """
         Start ``omnigent host`` in the sandbox and return the workspace path.
@@ -878,6 +882,8 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
         detached (``setsid``-backgrounded, identity + token in the process
         environment) — all driven through :meth:`run` / :meth:`run_background`.
 
+        :param extra_env: Per-launch env pairs for the host process (e.g. the
+            session owner's ``GIT_TOKEN``), or ``None`` for none.
         :returns: The absolute in-sandbox workspace path.
         """
         home = self.run(sandbox_id, 'printf %s "$HOME"').stdout.strip()
@@ -907,6 +913,7 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
                 (HOST_TOKEN_ENV_VAR, token),
                 (HOST_ID_ENV_VAR, host_id),
                 (HOST_NAME_ENV_VAR, host_name),
+                *sorted((extra_env or {}).items()),
             )
         )
         self.run_background(

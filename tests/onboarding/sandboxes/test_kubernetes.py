@@ -873,3 +873,71 @@ def test_provision_reserves_pod_name_and_no_exec_transport() -> None:
     # It classifies runners by agent, so the managed launch path threads
     # ``agent_name`` into its ``start_host`` (exec-model providers do not).
     assert launcher.capabilities.classifies_runner_by_agent is True
+
+
+# ── extra_env (per-user credentials, e.g. GIT_TOKEN) ────────────────
+
+
+def test_token_secret_carries_extra_env() -> None:
+    """Extra env pairs ride the per-Pod launch-token Secret's stringData."""
+    manifest = build_token_secret_manifest(
+        secret_name="s",
+        namespace="ns",
+        token=_TOKEN,
+        extra={"GIT_TOKEN": "gho_x"},
+    )
+    assert manifest["stringData"]["GIT_TOKEN"] == "gho_x"
+    assert manifest["stringData"][HOST_TOKEN_ENV_VAR] == _TOKEN
+
+
+def test_pod_manifest_references_extra_env_keys_in_both_containers() -> None:
+    """Extra keys land as secretKeyRef env in the host AND init containers."""
+    manifest = build_pod_manifest(**_MANIFEST_KW, extra_env_keys=["GIT_TOKEN"])
+    spec = manifest["spec"]
+    expected = {
+        "name": "GIT_TOKEN",
+        "valueFrom": {
+            "secretKeyRef": {
+                "name": _MANIFEST_KW["token_secret_name"],
+                "key": "GIT_TOKEN",
+            }
+        },
+    }
+    assert expected in spec["containers"][0]["env"]
+    assert expected in spec["initContainers"][0]["env"]
+
+
+def test_pod_manifest_never_inlines_extra_env_values() -> None:
+    """The value only ever lives in the Secret — never in the Pod spec."""
+    manifest = build_pod_manifest(**_MANIFEST_KW, extra_env_keys=["GIT_TOKEN"])
+    assert "gho_" not in json.dumps(manifest)
+
+
+# ── git-auth hint on a private-repo clone failure ───────────────────
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "fatal: could not read Username for 'https://github.com': No such device or address",
+        "remote: Support for password authentication was removed.\nAuthentication failed",
+        "fatal: could not read Password for 'https://github.com'",
+        "fatal: Authentication failed for 'https://github.com/acme/private.git/'",
+    ],
+)
+def test_git_auth_hint_matches_auth_failures(tail: str) -> None:
+    hint = k8s._git_auth_hint(tail)
+    assert hint is not None
+    assert "Credentials" in hint  # points the user at Settings -> Credentials
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "Cloning into '/home/omnigent/workspace/repo'... done.",
+        "fatal: repository 'https://github.com/acme/missing.git/' not found",
+        "",
+    ],
+)
+def test_git_auth_hint_ignores_non_auth_output(tail: str) -> None:
+    assert k8s._git_auth_hint(tail) is None
