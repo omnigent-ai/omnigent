@@ -53,6 +53,9 @@ describe("isAcpHarnessAgent", () => {
     expect(isAcpHarnessAgent({ harness: "acp:devin" })).toBe(true);
     expect(isAcpHarnessAgent({ harness: "acp:kilocode" })).toBe(true);
     expect(isAcpHarnessAgent({ harness: "grok" })).toBe(true);
+    // Bare builtin ACP CLI harness ids (ACP_CLI_HARNESSES): a seeded `devin`
+    // agent carries `harness: "devin"`, not `acp:devin`, so it must be in the id set.
+    expect(isAcpHarnessAgent({ harness: "devin" })).toBe(true);
   });
 
   it("does not misclassify composed agents, native harnesses, or missing harness", () => {

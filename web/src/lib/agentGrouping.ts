@@ -31,7 +31,7 @@ export const BUILTIN_AGENTS = new Set([
 // so the picker groups them under "Harnesses ▸ More", beside OpenCode/Cursor.
 // User-configured ACP agents carry an `acp:<slug>` harness; a builtin ACP CLI
 // harness carries a bare id.
-export const ACP_CLI_HARNESS_IDS = new Set<string>(["grok"]);
+export const ACP_CLI_HARNESS_IDS = new Set<string>(["devin", "grok"]);
 
 /**
  * Whether an agent is backed by the generic ACP harness — a configured
