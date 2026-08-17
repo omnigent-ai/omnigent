@@ -1930,6 +1930,32 @@ def _warn_deprecated_harness_path_env_vars() -> None:
         )
 
 
+def credential_rejection_hint(exc: BaseException) -> str | None:
+    """Return a re-login hint when *exc* is the server rejecting our credentials.
+
+    An expired or invalid access token surfaces as an error carrying a
+    401/403 status (the client SDK's :class:`OmnigentError` sets
+    ``status_code``; server-side errors set ``http_status``). That is a
+    user-actionable condition — sign in again — not a bug to auto-report,
+    so ``main`` shows this hint and exits cleanly instead of rendering the
+    crash screen and prompting to file an issue.
+
+    :param exc: The exception that escaped Click dispatch.
+    :returns: The message to print, or ``None`` when *exc* is not a
+        credential rejection (any non-401/403 error falls through to the
+        normal crash handler).
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "http_status", None)
+    if status not in (401, 403):
+        return None
+    return (
+        f"Authentication failed: the server rejected your credentials (HTTP {status}). "
+        "Your login may have expired — run `omnigent login <server-url>` to sign in again."
+    )
+
+
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.
@@ -2075,6 +2101,16 @@ def main() -> None:
         click.echo("Aborted!", err=True)
         raise SystemExit(1) from exc
     except Exception as exc:
+        # An expired/invalid access token is user-actionable (sign in
+        # again), not a crash to auto-report. Show a re-login hint and exit
+        # cleanly instead of the crash screen + bug-filing prompt, which
+        # would wrongly ask the user to file an issue for their own lapsed
+        # credentials (issue #3231).
+        auth_hint = credential_rejection_hint(exc)
+        if auth_hint is not None:
+            log_cli_exception(exc, prefix="Credential rejection")
+            click.echo(auth_hint, err=True)
+            raise SystemExit(1) from exc
         # Keep the diagnostics log line ("Details logged to …") — the
         # always-on CLI log has more context than this single crash — then
         # hand off to the friendly crash handler for the calm screen,
