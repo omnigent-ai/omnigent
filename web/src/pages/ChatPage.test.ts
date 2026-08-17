@@ -469,6 +469,7 @@ describe("buildPendingBubbles", () => {
 const userBubble = (id: string): Bubble => ({
   kind: "user",
   itemId: id,
+  responseId: `turn_${id}`,
   content: [{ type: "input_text", text: id }],
 });
 const assistantText = (id: string): Bubble => ({

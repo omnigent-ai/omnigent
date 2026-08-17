@@ -408,6 +408,8 @@ export function buildPendingBubbles(
       kind: "user",
       // No server item id yet; tempId keeps React keys stable until promotion.
       itemId: p.tempId,
+      // The committed item supplies the server anchor after promotion.
+      responseId: "",
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -3620,6 +3622,8 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
   const ts = formatBubbleTimestamp(bubble.createdAtS);
+  const forkDialog = useForkDialog();
+  const canFork = Boolean(forkDialog?.canFork && bubble.responseId);
   // Runtime-injected `[System: ...]` notifications (task completion,
   // timer firings, terminal idle) ride in on role=user. When the content
   // is a pure system marker — no attached images or files — swap the
@@ -3760,11 +3764,11 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
           </MessageContent>
         </div>
-        {/* Skip an empty row when there is neither a timestamp nor a copy
+        {/* Skip an empty row when there is neither a timestamp nor an
             action. 40%-visible on touch (no hover), hover/focus-reveal on
             desktop. py-1 matches the design prototype's 24px action row;
             the timestamp rides inside it instead of adding a new row. */}
-        {(ts || text) && (
+        {(ts || text || canFork) && (
           <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
             {ts && (
               <span
@@ -3774,11 +3778,25 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 {ts}
               </span>
             )}
-            {text && (
+            {(text || canFork) && (
               <MessageActions>
-                <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
-                  {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-                </MessageAction>
+                {text && (
+                  <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                    {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+                  </MessageAction>
+                )}
+                {canFork && (
+                  <MessageAction
+                    tooltip="Fork from here"
+                    size="icon-xxs"
+                    data-testid="fork-from-user-message"
+                    onClick={() =>
+                      forkDialog?.openForkDialog({ upToResponseId: bubble.responseId })
+                    }
+                  >
+                    <GitForkIcon size={14} />
+                  </MessageAction>
+                )}
               </MessageActions>
             )}
           </div>
