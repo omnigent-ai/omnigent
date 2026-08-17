@@ -10,6 +10,7 @@ from unittest.mock import patch
 from omnigent.onboarding.ucode_state import (
     UcodeWorkspaceState,
     read_current_ucode_state,
+    read_ucode_agent_model,
     read_ucode_state,
 )
 
@@ -151,6 +152,26 @@ def test_read_ucode_state_returns_none_for_unknown_workspace(tmp_path: Path) -> 
 
     with patch("omnigent.onboarding.ucode_state._STATE_PATH", state_file):
         assert read_ucode_state("https://example-other-workspace.cloud.databricks.com") is None
+
+
+def test_read_ucode_agent_model_returns_workspace_agent_model(tmp_path: Path) -> None:
+    """Workspace lookup returns the selected ucode agent model."""
+    state_file = _write_state(tmp_path, _VALID_STATE)
+
+    with patch("omnigent.onboarding.ucode_state._STATE_PATH", state_file):
+        model = read_ucode_agent_model(_WORKSPACE_URL, "codex")
+
+    assert model == "databricks-gpt-5-5"
+
+
+def test_read_ucode_agent_model_returns_none_for_missing_agent(tmp_path: Path) -> None:
+    """Missing per-agent state leaves callers on their fallback path."""
+    state_file = _write_state(tmp_path, _VALID_STATE)
+
+    with patch("omnigent.onboarding.ucode_state._STATE_PATH", state_file):
+        model = read_ucode_agent_model(_WORKSPACE_URL, "qwen")
+
+    assert model is None
 
 
 def test_read_current_ucode_state_uses_current_workspace(tmp_path: Path) -> None:

@@ -50,6 +50,7 @@ from omnigent.onboarding.provider_config import (
     default_provider_for_harness,
     load_config,
 )
+from omnigent.onboarding.ucode_state import read_ucode_agent_model
 from omnigent.pi_model_compatibility import (
     SYSTEM_AI_RESPONSES_KEYWORDS,
     DatabricksPiSurface,
@@ -424,7 +425,9 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         provider_id=_PI_PROVIDER_ID,
         base_url=f"{host}{_DATABRICKS_ANTHROPIC_GATEWAY_PATH}",
         api="anthropic-messages",
-        model=model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
+        model=model
+        or read_ucode_agent_model(host, "pi")
+        or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token is re-read per request (the auth command attempts a
         # refresh), matching codex-native's refresh semantics.
@@ -840,7 +843,9 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         provider_id=_PI_PROVIDER_ID,
         base_url=_gateway_anthropic_base_url(transport.base_url),
         api="anthropic-messages",
-        model=model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
+        model=model
+        or read_ucode_agent_model(real_workspace_url, "pi")
+        or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token (the codex auth command prints it) is refreshed per
         # request — matching codex-native's refresh semantics.
