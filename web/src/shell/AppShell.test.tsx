@@ -182,17 +182,23 @@ vi.mock("./TerminalsPanel", () => ({
     open,
     initialTerminalKey,
     fluid,
+    onClose,
   }: {
     open: boolean;
     initialTerminalKey: string | null;
     fluid?: boolean;
+    onClose: () => void;
   }) => (
     <div
       data-testid="terminals-panel"
       data-state={open ? "open" : "closed"}
       data-initial-key={initialTerminalKey ?? ""}
       data-fluid={fluid ? "true" : "false"}
-    />
+    >
+      <button type="button" aria-label="Close terminal view" onClick={onClose}>
+        close
+      </button>
+    </div>
   ),
 }));
 
@@ -531,6 +537,44 @@ describe("AppShell header", () => {
     mockConversations([]);
     renderShell("/");
     expect(screen.getByRole("button", { name: /sidebar/i })).toBeInTheDocument();
+  });
+
+  it("lets an automation-created session with a terminal switch Chat → Terminal → Chat", () => {
+    // Scheduled sessions are created directly and do not inherit the
+    // `omnigent.ui=terminal` label used by interactive session creation.
+    mockConversations([{ id: "conv_automation", permission_level: null, labels: {} }]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        {
+          id: "terminal_claude_main",
+          name: "claude",
+          session: "main",
+          running: true,
+        },
+      ],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_automation");
+
+    expect(
+      screen.getByRole("group", { name: /switch between chat and terminal/i }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Terminal view" }));
+    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
+
+    fireEvent.click(screen.getByRole("button", { name: "Close terminal view" }));
+    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
+  });
+
+  it("keeps sessions without a terminal Chat-only", () => {
+    mockConversations([{ id: "conv_chat_only", permission_level: null, labels: {} }]);
+
+    renderShell("/c/conv_chat_only");
+
+    expect(screen.queryByRole("group", { name: /switch between chat and terminal/i })).toBeNull();
   });
 
   it("defaults to chat view on a native Claude session", () => {
