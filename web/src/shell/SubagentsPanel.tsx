@@ -599,14 +599,16 @@ function SubagentRow({
   const Icon = brandChildIcon(child) ?? iconForAgentType(child.tool);
   const primary = childPrimaryLabel(child);
   const isActive = conversationId === child.id;
-  const effectiveModel = child.model_override ?? child.routed_model;
+  const effectiveModel = child.model_override ?? child.routed_model ?? child.llm_model;
   const modelLabel = effectiveModel ? shortModelName(formatModelDisplayName(effectiveModel)) : null;
   const effortLabel = child.reasoning_effort;
   const modelEffortTitle = [
     effectiveModel
       ? child.model_override
         ? `Model: ${effectiveModel}`
-        : `Smart routing picked ${effectiveModel}`
+        : child.routed_model
+          ? `Smart routing picked ${effectiveModel}`
+          : `Spec model: ${effectiveModel}`
       : null,
     effortLabel ? `Reasoning effort: ${effortLabel}` : null,
   ]

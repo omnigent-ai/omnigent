@@ -9139,9 +9139,62 @@ def _child_session_summary_from_conversation(
         # conversation label rather than a new column.
         routed_model=conv.model_override if routing_decision_id is not None else None,
         model_override=conv.model_override,
+        llm_model=_child_llm_model_from_conversation(conv),
         reasoning_effort=conv.reasoning_effort,
         routing_decision_id=routing_decision_id,
     )
+
+
+def _child_llm_model_from_conversation(conv: Conversation | None) -> str | None:
+    """
+    Resolve a child conversation's effective spec model.
+
+    Mirrors the session-snapshot resolver (``spec.executor.model`` with
+    ``sub_agent_name`` spec lookup) so the Agents rail reports the same
+    model the composer read-out shows for spec-defaulted children that
+    carry neither a ``model_override`` nor a routing pin — e.g. native
+    opencode sub-agents whose model comes from the parent profile.
+
+    :param conv: The child conversation, or ``None``.
+    :returns: The model id (e.g. ``"opencode-go/deepseek-v4-flash"``), or
+        ``None`` when the child has no resolvable agent spec.
+    """
+    if conv is None or conv.agent_id is None:
+        return None
+    try:
+        # Imported at call time like ``_resolve_llm_model`` so a facade or
+        # runtime patch is honored by this module's lazy-global lookups.
+        from omnigent.runtime import get_agent_cache
+        from omnigent.runtime._globals import _agent_store
+        from omnigent.runtime.workflow import _find_spec_by_name
+
+        if _agent_store is None:
+            return None
+        agent = _agent_store.get(conv.agent_id)
+        if agent is None or agent.bundle_location is None:
+            return None
+        loaded = get_agent_cache().load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        )
+        spec = loaded.spec
+        if conv.sub_agent_name:
+            child_spec = _find_spec_by_name(spec, conv.sub_agent_name)
+            if child_spec is not None:
+                spec = child_spec
+        return spec.executor.model
+    except (
+        KeyError,
+        AttributeError,
+        ValueError,
+        ImportError,
+        OSError,
+        RuntimeError,
+        StatementError,
+    ):
+        # Best-effort display resolver like ``_resolve_llm_model``: an
+        # uninitialized runtime or missing bundle degrades to "model
+        # unknown" rather than failing the whole child list.
+        return None
 
 
 def _mcp_tool_result(rpc_id: int | str | None, text: str) -> Response:

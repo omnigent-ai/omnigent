@@ -70,14 +70,18 @@ def test_legacy_merge_head_upgrades_to_current_head(tmp_path: Path) -> None:
     engine = sa.create_engine(uri)
     try:
         with engine.begin() as conn:
-            conn.execute(sa.text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+            conn.execute(
+                sa.text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+            )
             conn.execute(
                 sa.text("INSERT INTO alembic_version (version_num) VALUES ('b7c8d9e0f1a2')")
             )
         cfg = _build_alembic_config(uri)
         command.upgrade(cfg, "head")
         with engine.connect() as conn:
-            revision = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+            revision = conn.execute(
+                sa.text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
         assert revision == _NEW_REVISION
     finally:
         engine.dispose()

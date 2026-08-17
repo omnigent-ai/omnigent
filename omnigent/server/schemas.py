@@ -800,6 +800,13 @@ class ChildSessionSummary(BaseModel):
     :param model_override: Explicit model pinned for this child, including
         a model selected directly by the caller rather than by Smart Routing.
         ``None`` when the child inherits the parent/spec model.
+    :param llm_model: The child's effective model resolved from its agent
+        spec (``executor.model``), e.g.
+        ``"opencode-go/deepseek-v4-flash"``. ``None`` when the child has
+        no agent binding or the spec cannot be loaded. Complements
+        :attr:`model_override` / :attr:`routed_model`, which stay ``None``
+        when the child runs the spec default — clients can surface this
+        field so the model label never depends on a pin existing.
     :param routing_decision_id: Identifier of the routing decision that
         produced :attr:`routed_model`, mirroring
         ``RoutingDecisionData.decision_id``. Read from the child's
@@ -828,6 +835,7 @@ class ChildSessionSummary(BaseModel):
     pending_elicitations_count: int = 0
     routed_model: str | None = None
     model_override: str | None = None
+    llm_model: str | None = None
     reasoning_effort: str | None = None
     routing_decision_id: str | None = None
 

@@ -638,6 +638,18 @@
             "description": "Error details from the child's most recent failed run, e.g. `{\"code\": \"required_terminal_exited\", \"message\": \"...\"}`. `None` when the child has no durable failure detail. This is the typed projection of runner-owned failure labels; clients should not parse those labels directly.",
             "title": "Last Task Error"
           },
+          "llm_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The child's effective model resolved from its agent spec (`executor.model`), e.g. `\"opencode-go/deepseek-v4-flash\"`. `None` when the child has no agent binding or the spec cannot be loaded. Complements `model_override` / `routed_model`, which stay `None` when the child runs the spec default \u2014 clients can surface this field so the model label never depends on a pin existing.",
+            "title": "Llm Model"
+          },
           "model_override": {
             "anyOf": [
               {

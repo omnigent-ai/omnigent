@@ -1554,6 +1554,32 @@ describe("SubagentsPanel", () => {
     ).toBeNull();
   });
 
+  it("falls back to the spec model for children without an override or routing pin", () => {
+    // Native opencode sub-agents run the parent profile's spec model with no
+    // model_override and no routing decision — the rail must still label the
+    // model from the summary's llm_model field, not just the effort.
+    mockChildTree({
+      conv_root: [
+        childInfo({
+          id: "conv_spec_model",
+          tool: "researcher",
+          llm_model: "opencode-go/deepseek-v4-flash",
+          reasoning_effort: "max",
+        }),
+      ],
+    });
+
+    const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+    const row = childRow(container, "conv_spec_model");
+    const cue = within(row).getByTestId("subagent-model-effort");
+    expect(cue).toHaveTextContent("deepseek-v4-flash | max");
+    expect(row.querySelector('[data-testid="subagent-model-effort"]')).toHaveAttribute(
+      "title",
+      "Spec model: opencode-go/deepseek-v4-flash · Reasoning effort: max",
+    );
+  });
+
   it("highlights the active grandchild row", () => {
     mockChildTree({
       conv_root: [childInfo({ id: "conv_child", tool: "researcher" })],

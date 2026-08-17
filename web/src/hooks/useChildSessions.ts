@@ -61,6 +61,14 @@ export interface ChildSessionInfo {
   routed_model?: string | null;
   /** Explicit model override requested for this sub-agent, if any. */
   model_override?: string | null;
+  /**
+   * Effective model resolved from the child's agent spec (``executor.model``),
+   * e.g. ``"opencode-go/deepseek-v4-flash"``. ``null`` when the child has no
+   * agent binding or the spec can't be loaded. Lets the rail label the model
+   * for spec-defaulted children (native opencode sub-agents) that carry no
+   * override or routing pin.
+   */
+  llm_model?: string | null;
   /** Reasoning effort persisted for this sub-agent, e.g. ``"high"``. */
   reasoning_effort?: string | null;
 }
@@ -84,6 +92,7 @@ interface ChildSessionWire {
   pending_elicitations_count?: number;
   routed_model?: string | null;
   model_override?: string | null;
+  llm_model?: string | null;
   reasoning_effort?: string | null;
 }
 
@@ -199,6 +208,7 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
     pending_elicitations_count: row.pending_elicitations_count ?? 0,
     routed_model: row.routed_model ?? null,
     model_override: row.model_override ?? null,
+    llm_model: row.llm_model ?? null,
     reasoning_effort: row.reasoning_effort ?? null,
   }));
 }

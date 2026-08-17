@@ -213,6 +213,12 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     # agent_id comes from the conversation row (tasks table removed).
     assert row["agent_id"] == session["agent_id"]
     assert row["reasoning_effort"] == "high"
+    # The child carries no override and was never routed, so the spec
+    # model from its bound agent's bundle is the effective label (runtime
+    # stores are wired by the ``client`` fixture's ``runtime_init``).
+    assert row["model_override"] is None
+    assert row["routed_model"] is None
+    assert row["llm_model"] == "test-agent"
     # agent_name and task fields are None (no tasks table).
     assert row["agent_name"] is None
     assert row["current_task_id"] is None
