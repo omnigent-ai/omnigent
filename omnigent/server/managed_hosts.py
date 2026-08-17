@@ -32,7 +32,7 @@ stores into ``create_app``):
    ``<data_dir>/config.yaml``)::
 
        sandbox:
-         # lakebox|modal|daytona|blaxel|boxlite|cwsandbox|islo|e2b|openshell|kubernetes
+         # lakebox|modal|daytona|blaxel|boxlite|cwsandbox|islo|e2b|opensandbox|openshell|kubernetes
          provider: modal
          server_url: https://omnigent.example.com
          # For SEVERAL providers, replace `provider:` with a `providers:`
@@ -91,6 +91,12 @@ stores into ``create_app``):
            memory_mb: 4096
            disk_gb: 20
           idle_pause_after_s: 900           # optional; null disables idle pause
+         opensandbox:             # optional block (provider: opensandbox)
+           image: docker.io/me/omnigent-host:latest  # default: official image
+           # snapshot_id: snap_123          # mutually exclusive with image
+           env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
+           max_lifetime_s: 86400             # default: 24 hours
+           ready_timeout_s: 300               # cold image pull budget
          openshell:               # optional block (provider: openshell)
            image: docker.io/me/omnigent-host:latest  # default: official image
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
@@ -110,15 +116,16 @@ stores into ``create_app``):
    launcher reads ``DAYTONA_API_KEY`` (plus optional
    ``DAYTONA_API_URL`` / ``DAYTONA_TARGET``), and the Islo launcher
    reads ``ISLO_API_KEY`` (plus optional ``ISLO_BASE_URL``) from the
-   server process environment. The Blaxel launcher reads ``BL_WORKSPACE``
+   server process environment. OpenSandbox reads ``OPEN_SANDBOX_API_KEY``
+   and ``OPEN_SANDBOX_DOMAIN`` (plus optional protocol and proxy settings).
+   The Blaxel launcher reads ``BL_WORKSPACE``
    and ``BL_API_KEY`` or the local ``bl login`` profile. The OpenShell
    launcher needs no API key:
    it connects to the gateway made active with ``openshell gateway
    select`` (``$OPENSHELL_GATEWAY`` / ``~/.config/openshell/active_gateway``,
    or ``sandbox.openshell.cluster``), so the server process needs
-   OpenShell gateway access. ``modal``, ``daytona``, ``blaxel``, ``cwsandbox``,
-   ``islo``, and ``openshell`` have managed-launch support; ``lakebox``
-   parses but rejects at launch.
+   OpenShell gateway access. Every listed provider except ``lakebox`` has
+   managed-launch support; ``lakebox`` parses but rejects at launch.
 
 2. **Direct construction** (embedding deployments): build
    :class:`ManagedSandboxConfig` with a custom
@@ -178,6 +185,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "cwsandbox",
         "islo",
         "e2b",
+        "opensandbox",
         "openshell",
         "kubernetes",
     }
@@ -191,6 +199,7 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
         "cwsandbox",
         "islo",
         "e2b",
+        "opensandbox",
         "openshell",
         "kubernetes",
     }
@@ -1139,6 +1148,39 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         # outlives the (operator-overridable) sandbox lifetime — mirrors
         # the cwsandbox path.
         token_ttl_s = managed_token_ttl_s()
+    elif provider == "opensandbox":
+        from omnigent.onboarding.sandboxes.opensandbox import managed_token_ttl_s
+
+        section = _parse_provider_section(raw, "opensandbox")
+        if section is not None:
+            _reject_unknown_keys(
+                section,
+                {"image", "snapshot_id", "env", "max_lifetime_s", "ready_timeout_s"},
+                "sandbox.opensandbox",
+            )
+        image = _parse_provider_image(raw, "opensandbox")
+        snapshot_id = _parse_provider_string(raw, "opensandbox", "snapshot_id")
+        if image is not None and snapshot_id is not None:
+            raise ValueError(
+                "server config 'sandbox.opensandbox.image' and "
+                "'sandbox.opensandbox.snapshot_id' are mutually exclusive"
+            )
+        max_lifetime_s = _parse_provider_positive_int(raw, "opensandbox", "max_lifetime_s")
+        ready_timeout_s = _parse_provider_positive_int(raw, "opensandbox", "ready_timeout_s")
+        launcher_factory = _opensandbox_launcher_factory(
+            image=image,
+            snapshot_id=snapshot_id,
+            env=_parse_provider_env(raw, "opensandbox"),
+            max_lifetime_s=max_lifetime_s,
+            ready_timeout_s=ready_timeout_s,
+        )
+        try:
+            token_ttl_s = managed_token_ttl_s(max_lifetime_s)
+        except click.ClickException as exc:
+            raise ValueError(
+                "server config 'sandbox.opensandbox.max_lifetime_s' "
+                f"(or OMNIGENT_OPENSANDBOX_MAX_LIFETIME_S) is invalid: {exc.message}"
+            ) from exc
     elif provider == "openshell":
         launcher_factory = _openshell_launcher_factory(
             image=_parse_provider_image(raw, "openshell"),
@@ -1736,6 +1778,30 @@ def _e2b_launcher_factory(
         from omnigent.onboarding.sandboxes.e2b import E2BSandboxLauncher
 
         return E2BSandboxLauncher(template=template, env=env)
+
+    return _build
+
+
+def _opensandbox_launcher_factory(
+    *,
+    image: str | None,
+    snapshot_id: str | None,
+    env: list[str] | None,
+    max_lifetime_s: int | None,
+    ready_timeout_s: int | None,
+) -> Callable[[], SandboxHostLauncher]:
+    """Build the launcher factory for the YAML ``provider: opensandbox`` path."""
+
+    def _build() -> SandboxHostLauncher:
+        from omnigent.onboarding.sandboxes.opensandbox import OpenSandboxLauncher
+
+        return OpenSandboxLauncher(
+            image=image,
+            snapshot_id=snapshot_id,
+            env=env,
+            max_lifetime_s=max_lifetime_s,
+            ready_timeout_s=ready_timeout_s,
+        )
 
     return _build
 

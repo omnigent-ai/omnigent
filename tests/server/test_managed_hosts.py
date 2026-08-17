@@ -21,6 +21,9 @@ from omnigent.entities.agent import Agent
 from omnigent.onboarding.sandboxes.base import render_host_config_write_command
 from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s as blaxel_managed_token_ttl_s
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
+from omnigent.onboarding.sandboxes.opensandbox import (
+    managed_token_ttl_s as opensandbox_managed_token_ttl_s,
+)
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
@@ -59,6 +62,7 @@ from tests.server.helpers import (
     install_fake_islo_launcher,
     install_fake_kubernetes_launcher,
     install_fake_modal_launcher,
+    install_fake_opensandbox_launcher,
     install_fake_openshell_launcher,
 )
 
@@ -196,6 +200,81 @@ def test_parse_modal_without_image_defaults_to_official(
     # image=None → the launcher's own resolution (env var → official
     # default) applies, rather than a config-pinned ref.
     assert fake.image is None
+
+
+def test_parse_valid_opensandbox_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = parse_sandbox_config(
+        {
+            "provider": "opensandbox",
+            "server_url": "https://srv.example.com/",
+            "opensandbox": {
+                "image": "registry.example.com/omnigent-host:v1",
+                "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
+                "max_lifetime_s": 7200,
+                "ready_timeout_s": 240,
+            },
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    assert cfg.provider == "opensandbox"
+    assert cfg.managed_launch_supported is True
+    assert cfg.server_url == "https://srv.example.com"
+    assert cfg.token_ttl_s == opensandbox_managed_token_ttl_s(7200)
+
+    fake = FakeSandboxLauncher()
+    install_fake_opensandbox_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.image == "registry.example.com/omnigent-host:v1"
+    assert fake.snapshot_id is None
+    assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
+    assert fake.max_lifetime_s == 7200
+    assert fake.ready_timeout_s == 240
+
+
+def test_parse_opensandbox_snapshot_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = parse_sandbox_config(
+        {
+            "provider": "opensandbox",
+            "server_url": "https://srv.example.com",
+            "opensandbox": {"snapshot_id": "snap_123"},
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_opensandbox_launcher(monkeypatch, fake)
+    assert cfg.default.launcher_factory() is fake
+    assert fake.image is None
+    assert fake.snapshot_id == "snap_123"
+    assert cfg.default.token_ttl_s == opensandbox_managed_token_ttl_s()
+
+
+@pytest.mark.parametrize(
+    ("section", "message"),
+    [
+        ({"image": "img", "snapshot_id": "snap"}, "mutually exclusive"),
+        ({"max_lifetime_s": 0}, "positive integer"),
+        ({"max_lifetime_s": 30}, "is invalid"),
+        ({"ready_timeout_s": "300"}, "positive integer"),
+        ({"imag": "typo"}, "unknown key"),
+    ],
+)
+def test_parse_opensandbox_rejects_invalid_config(
+    section: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        parse_sandbox_config(
+            {
+                "provider": "opensandbox",
+                "server_url": "https://srv.example.com",
+                "opensandbox": section,
+            }
+        )
 
 
 def test_parse_non_modal_provider_yields_rejecting_factory() -> None:

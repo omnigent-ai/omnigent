@@ -190,6 +190,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         # ctor-monkeypatch shims).
         self.image: str | None = None
         self.template: str | None = None
+        self.snapshot_id: str | None = None
         self.secrets: list[str] | None = None
         self.env: list[str] | None = None
         self.region: str | None = None
@@ -206,6 +207,8 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.memory_mb: int | None = None
         self.disk_gb: int | None = None
         self.idle_pause_after_s: int | None = None
+        self.max_lifetime_s: int | None = None
+        self.ready_timeout_s: int | None = None
         self.cluster: str | None = None
         # Kubernetes ctor wiring (captured by install_fake_kubernetes_launcher).
         self.namespace: str | None = None
@@ -509,6 +512,32 @@ def install_fake_e2b_launcher(
         return fake
 
     monkeypatch.setattr(e2b_mod, "E2BSandboxLauncher", _ctor)
+
+
+def install_fake_opensandbox_launcher(
+    monkeypatch: Any,
+    fake: FakeSandboxLauncher,
+) -> None:
+    """Substitute the fake for ``OpenSandboxLauncher`` at its public seam."""
+    import omnigent.onboarding.sandboxes.opensandbox as opensandbox_mod
+
+    def _ctor(
+        *,
+        image: str | None = None,
+        snapshot_id: str | None = None,
+        env: list[str] | None = None,
+        max_lifetime_s: int | None = None,
+        ready_timeout_s: int | None = None,
+    ) -> FakeSandboxLauncher:
+        fake.image = image
+        fake.snapshot_id = snapshot_id
+        fake.env = env
+        fake.max_lifetime_s = max_lifetime_s
+        fake.ready_timeout_s = ready_timeout_s
+        fake.provider = "opensandbox"  # type: ignore[misc]
+        return fake
+
+    monkeypatch.setattr(opensandbox_mod, "OpenSandboxLauncher", _ctor)
 
 
 def install_fake_openshell_launcher(

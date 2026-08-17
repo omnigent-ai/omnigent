@@ -180,6 +180,9 @@ cwsandbox = ["cwsandbox>=0.24,<1"]
 # server-managed `sandbox.provider: e2b`).
 # Same lazy-import posture as above.
 e2b = ["e2b>=2.26,<3"]
+# OpenSandbox launcher (server-managed `sandbox.provider: opensandbox`).
+# The launcher imports the pre-1.0 SDK lazily so the base install stays small.
+opensandbox = ["opensandbox>=0.1.15,<0.2"]
 # Islo sandbox launcher (`omnigent sandbox --provider islo` and
 # server-managed `sandbox.provider: islo`). The launcher module ships in
 # the base package and imports the SDK lazily, so only users of the
