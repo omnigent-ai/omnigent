@@ -34,6 +34,7 @@ import {
   shouldShowTerminalSurface,
   updateWarmTerminalSurfaces,
   type WarmTerminalEntry,
+  isBackgroundTasksOnly,
   splitSlashCommand,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
@@ -1074,6 +1075,20 @@ describe("workingIndicatorLabel", () => {
   it("ignores the tick while background tasks remain", () => {
     // The count is information, not decoration — it must not rotate away.
     expect(workingIndicatorLabel(2, 5)).toBe("2 background tasks still running");
+  });
+});
+
+// ── isBackgroundTasksOnly ───────────────────────────────────────────────────
+
+describe("isBackgroundTasksOnly", () => {
+  it("is true only when background tasks remain and nothing is blocked", () => {
+    expect(isBackgroundTasksOnly(2, null)).toBe(true);
+    expect(isBackgroundTasksOnly(0, null)).toBe(false);
+  });
+
+  it("yields to a parked dialog so the shimmer still shouts", () => {
+    // blockedOn needs an action; it must never sit as a quiet pill.
+    expect(isBackgroundTasksOnly(2, "permission prompt")).toBe(false);
   });
 });
 
