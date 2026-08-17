@@ -1677,8 +1677,4 @@ def send_interaction_keys_via_tui(
         )
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
-    if not _session_alive(socket_path, tmux_target):
-        raise RuntimeError(
-            "the agy terminal is no longer running (the TUI exited); restart the session"
-        )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)

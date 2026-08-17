@@ -1312,3 +1312,117 @@ async def test_cli_cold_start_falls_back_when_port_unattributable(
 
     assert len(started) == 1
     assert started[0][0] == 52548  # safe candidate fallback (agy is up in the pane)
+
+
+def test_parse_antigravity_cli_model_options() -> None:
+    """parse_antigravity_cli_model_options converts agy models stdout to dicts."""
+    sample_stdout = (
+        "gemini-3.7-flash-high     Gemini 3.7 Flash (High)\n"
+        "gemini-3.1-pro-high       Gemini 3.1 Pro (High)\n"
+        "claude-sonnet-4-6         Claude Sonnet 4.6 (Thinking)\n"
+    )
+    parsed = _mod.parse_antigravity_cli_model_options(sample_stdout)
+    assert len(parsed) == 3
+    assert parsed[0] == {
+        "id": "gemini-3.7-flash-high",
+        "model": "gemini-3.7-flash-high",
+        "displayName": "Gemini 3.7 Flash (High)",
+        "isDefault": False,
+    }
+    assert parsed[2] == {
+        "id": "claude-sonnet-4-6",
+        "model": "claude-sonnet-4-6",
+        "displayName": "Claude Sonnet 4.6 (Thinking)",
+        "isDefault": False,
+    }
+
+
+def test_antigravity_native_model_options_dynamic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """antigravity_native_model_options uses dynamic CLI discovery and marks first default."""
+    sample_options = [
+        {
+            "id": "gemini-3.7-flash-high",
+            "model": "gemini-3.7-flash-high",
+            "displayName": "Gemini 3.7 Flash (High)",
+            "isDefault": False,
+        },
+        {
+            "id": "gemini-3.1-pro-high",
+            "model": "gemini-3.1-pro-high",
+            "displayName": "Gemini 3.1 Pro (High)",
+            "isDefault": False,
+        },
+    ]
+    monkeypatch.setattr(
+        _mod,
+        "list_antigravity_cli_model_options",
+        lambda **kwargs: [dict(o) for o in sample_options],
+    )
+    options = _mod.antigravity_native_model_options(None)
+    assert len(options) == 2
+    assert options[0]["isDefault"] is True
+    assert options[1]["isDefault"] is False
+
+
+def test_antigravity_native_model_options_respects_launch_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Configured model in launch config becomes the default option."""
+    from omnigent.antigravity_native_launch import NativeAntigravityLaunch
+
+    sample_options = [
+        {
+            "id": "gemini-3.7-flash-high",
+            "model": "gemini-3.7-flash-high",
+            "displayName": "Gemini 3.7 Flash (High)",
+            "isDefault": False,
+        },
+        {
+            "id": "gemini-3.1-pro-high",
+            "model": "gemini-3.1-pro-high",
+            "displayName": "Gemini 3.1 Pro (High)",
+            "isDefault": False,
+        },
+    ]
+    monkeypatch.setattr(
+        _mod,
+        "list_antigravity_cli_model_options",
+        lambda **kwargs: [dict(o) for o in sample_options],
+    )
+    launch = NativeAntigravityLaunch(auth_mode="subscription", model="gemini-3.1-pro-high")
+    options = _mod.antigravity_native_model_options(launch)
+    pro_opt = next(opt for opt in options if opt["id"] == "gemini-3.1-pro-high")
+    flash_opt = next(opt for opt in options if opt["id"] == "gemini-3.7-flash-high")
+    assert pro_opt["isDefault"] is True
+    assert flash_opt["isDefault"] is False
+
+
+def test_antigravity_native_model_options_custom_model_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom unlisted model in launch config is prepended as default."""
+    from omnigent.antigravity_native_launch import NativeAntigravityLaunch
+
+    sample_options = [
+        {
+            "id": "gemini-3.7-flash-high",
+            "model": "gemini-3.7-flash-high",
+            "displayName": "Gemini 3.7 Flash (High)",
+            "isDefault": False,
+        },
+    ]
+    monkeypatch.setattr(
+        _mod,
+        "list_antigravity_cli_model_options",
+        lambda **kwargs: [dict(o) for o in sample_options],
+    )
+    launch = NativeAntigravityLaunch(auth_mode="subscription", model="custom-preview-model")
+    options = _mod.antigravity_native_model_options(launch)
+    assert options[0] == {
+        "id": "custom-preview-model",
+        "model": "custom-preview-model",
+        "displayName": "custom-preview-model",
+        "isDefault": True,
+    }
+    assert options[1]["id"] == "gemini-3.7-flash-high"
+    assert options[1]["isDefault"] is False

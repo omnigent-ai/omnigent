@@ -529,6 +529,56 @@ async def test_handle_model_options_rejects_unsupported_harness() -> None:
     )
 
 
+async def test_handle_model_options_uses_antigravity_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Antigravity-native queries discover_antigravity_model_options on the host."""
+    from omnigent import antigravity_native
+
+    monkeypatch.setattr(
+        antigravity_native,
+        "antigravity_native_model_options",
+        lambda config: [
+            {
+                "id": "gemini-3.7-flash-high",
+                "model": "gemini-3.7-flash-high",
+                "displayName": "Gemini 3.7 Flash (High)",
+                "isDefault": True,
+            },
+            {
+                "id": "gemini-3.5-flash-high",
+                "model": "gemini-3.5-flash-high",
+                "displayName": "Gemini 3.5 Flash (High)",
+                "isDefault": False,
+            },
+        ],
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_agy_models", harness="antigravity-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_agy_models",
+        status="ok",
+        models=[
+            {
+                "id": "gemini-3.7-flash-high",
+                "model": "gemini-3.7-flash-high",
+                "displayName": "Gemini 3.7 Flash (High)",
+                "isDefault": True,
+            },
+            {
+                "id": "gemini-3.5-flash-high",
+                "model": "gemini-3.5-flash-high",
+                "displayName": "Gemini 3.5 Flash (High)",
+                "isDefault": False,
+            },
+        ],
+    )
+
+
 async def test_handle_model_options_reports_the_endpoints_wider_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

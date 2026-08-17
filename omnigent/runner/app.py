@@ -4494,6 +4494,14 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _handle_antigravity_native_model_change(
+        conv_id: str,
+        model: str | None,
+    ) -> Response:
+        # Model is persisted to session.model_override and resolved per turn.
+        del conv_id, model
+        return Response(status_code=204)
+
     async def _handle_claude_native_compact(conv_id: str) -> Response:
         from omnigent.claude_native_bridge import (
             bridge_dir_for_bridge_id,
@@ -6878,6 +6886,7 @@ def create_runner_app(
                 "opencode-native",
                 "kiro-native",
                 "pi-native",
+                "antigravity-native",
             ):
                 model = body.get("model") if isinstance(body, dict) else None
                 if model is not None and not isinstance(model, str):
@@ -6912,6 +6921,11 @@ def create_runner_app(
                     )
                 if harness == "pi-native":
                     return await _handle_pi_native_model_change(
+                        conversation_id,
+                        model,
+                    )
+                if harness == "antigravity-native":
+                    return await _handle_antigravity_native_model_change(
                         conversation_id,
                         model,
                     )
@@ -8579,6 +8593,34 @@ def create_runner_app(
             status_code=200,
             content={"models": claude_native_model_options(claude_config)},
         )
+
+    @app.get("/v1/sessions/{session_id}/antigravity-model-options")
+    async def get_session_antigravity_model_options(session_id: str) -> JSONResponse:
+        if _session_harness_name(session_id) != "antigravity-native":
+            return JSONResponse(status_code=200, content={"models": []})
+        try:
+            from omnigent.antigravity_native import antigravity_native_model_options
+            from omnigent.antigravity_native_launch import resolve_native_antigravity_launch
+
+            launch = await asyncio.to_thread(resolve_native_antigravity_launch, model=None)
+            models = await asyncio.to_thread(antigravity_native_model_options, launch)
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "Antigravity-native model discovery failed for session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "antigravity_native_model_options_failed",
+                    "detail": _client_safe_error_detail(
+                        exc,
+                        context="antigravity-native model options",
+                    ),
+                },
+            )
+        return JSONResponse(status_code=200, content={"models": models})
 
     @app.post("/v1/sessions/{session_id}/skills/resolve")
     async def resolve_session_skill(session_id: str, request: Request) -> JSONResponse:

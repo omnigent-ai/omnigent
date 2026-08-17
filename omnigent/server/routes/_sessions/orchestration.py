@@ -137,6 +137,9 @@ from omnigent.server.routes._session_create_validation import (
 # ``__all__`` and the facade's explicit re-exports, preserving its real runtime
 # bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
+    _ANTIGRAVITY_NATIVE_HARNESS,
+    _ANTIGRAVITY_NATIVE_WRAPPER_LABEL_VALUE,
+    _CLAUDE_NATIVE_HARNESS,
     _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S,
     _CLAUDE_NATIVE_MODEL,
     _CLAUDE_NATIVE_UI_LABEL_KEY,
@@ -8891,15 +8894,23 @@ async def _fetch_model_options(
         if cached:
             return cached
         # Cold cache too (e.g. the server restarted while the session
-        # slept). claude-native's catalog is also resolvable by the
+        # slept). claude-native / antigravity-native catalogs are also resolvable by the
         # session's host — the same pre-launch source the new-session
         # picker uses — so fill it from there in the background.
         if (
-            wrapper == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
+            wrapper
+            in (_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE, _ANTIGRAVITY_NATIVE_WRAPPER_LABEL_VALUE)
             and conv.host_id is not None
             and session_id not in _model_options_inflight
         ):
-            task = asyncio.create_task(_load_model_options_from_host(session_id, conv.host_id))
+            harness_name = (
+                _ANTIGRAVITY_NATIVE_HARNESS
+                if wrapper == _ANTIGRAVITY_NATIVE_WRAPPER_LABEL_VALUE
+                else _CLAUDE_NATIVE_HARNESS
+            )
+            task = asyncio.create_task(
+                _load_model_options_from_host(session_id, conv.host_id, harness=harness_name)
+            )
             _model_options_inflight[session_id] = task
 
             def _clear_host_options_inflight(_task: asyncio.Task[None]) -> None:

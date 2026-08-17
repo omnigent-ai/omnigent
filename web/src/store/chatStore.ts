@@ -116,7 +116,12 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { getSessionHost } from "@/lib/sessionHost";
 import { isSystemUserContent } from "@/lib/systemMessage";
-import { isNativeWrapper } from "@/lib/nativeCodingAgents";
+import {
+  CLAUDE_NATIVE_WRAPPER,
+  CODEX_NATIVE_WRAPPER,
+  WRAPPER_LABEL_KEY,
+  isNativeWrapper,
+} from "@/lib/nativeCodingAgents";
 
 export interface SendOptions {
   /**
@@ -2574,10 +2579,10 @@ type NativeModelFamily = "claude" | "codex";
  * :returns: ``"claude"`` / ``"codex"`` for native wrappers, else ``null``.
  */
 function nativeModelFamilyForSession(session: Pick<Session, "labels">): NativeModelFamily | null {
-  switch (session.labels?.["omnigent.wrapper"]) {
-    case "claude-code-native-ui":
+  switch (session.labels?.[WRAPPER_LABEL_KEY]) {
+    case CLAUDE_NATIVE_WRAPPER:
       return "claude";
-    case "codex-native-ui":
+    case CODEX_NATIVE_WRAPPER:
       return "codex";
     default:
       return null;

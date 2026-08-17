@@ -4,6 +4,18 @@ export const WRAPPER_LABEL_KEY = "omnigent.wrapper";
 export const UI_MODE_LABEL_KEY = "omnigent.ui";
 export const UI_MODE_TERMINAL_VALUE = "terminal";
 
+export const CLAUDE_NATIVE_WRAPPER = "claude-code-native-ui";
+export const CODEX_NATIVE_WRAPPER = "codex-native-ui";
+export const CURSOR_NATIVE_WRAPPER = "cursor-native-ui";
+export const KIRO_NATIVE_WRAPPER = "kiro-native-ui";
+export const OPENCODE_NATIVE_WRAPPER = "opencode-native-ui";
+export const PI_NATIVE_WRAPPER = "pi-native-ui";
+export const ANTIGRAVITY_NATIVE_WRAPPER = "antigravity-native-ui";
+
+export const CLAUDE_NATIVE_HARNESS = "claude-native";
+export const CODEX_NATIVE_HARNESS = "codex-native";
+export const ANTIGRAVITY_NATIVE_HARNESS = "antigravity-native";
+
 export type NativeCodingAgentIconKind =
   | "claude"
   | "codex"

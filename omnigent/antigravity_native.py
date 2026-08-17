@@ -64,10 +64,11 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -109,6 +110,7 @@ from omnigent.antigravity_native_bridge import (
     write_tmux_target,
 )
 from omnigent.antigravity_native_launch import (
+    NativeAntigravityLaunch,
     agy_binary_path,
     build_agy_launch,
     resolve_native_antigravity_launch,
@@ -1775,3 +1777,119 @@ def _launch_is_headless() -> bool:
         # A closed/detached stream raises rather than returning False; treat any
         # such failure as "no interactive client" — the safe, non-hanging choice.
         return True
+
+
+_antigravity_model_discovery_cache: dict[str, list[dict[str, object]]] = {}
+
+
+def parse_antigravity_cli_model_options(stdout: str) -> list[dict[str, object]]:
+    """Parse rows from ``agy models`` stdout into model option dicts.
+
+    :param stdout: Output captured from ``agy models``.
+    :returns: List of model option dicts.
+    """
+    options: list[dict[str, object]] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        model_id = parts[0]
+        display_name = parts[1].strip() if len(parts) > 1 else model_id
+        options.append(
+            {
+                "id": model_id,
+                "model": model_id,
+                "displayName": display_name,
+                "isDefault": False,
+            }
+        )
+    return options
+
+
+def list_antigravity_cli_model_options(
+    *,
+    antigravity_path: str | None = None,
+    timeout_s: float = 10.0,
+    env: Mapping[str, str] | None = None,
+) -> list[dict[str, object]]:
+    """Discover available models dynamically by running ``agy models``.
+
+    :param antigravity_path: Optional explicit binary path override.
+    :param timeout_s: Subprocess execution timeout in seconds.
+    :param env: Optional environment overrides.
+    :returns: Discovered model option dicts.
+    """
+    from omnigent.antigravity_native_launch import agy_binary_path
+
+    executable = antigravity_path or agy_binary_path()
+    cached = _antigravity_model_discovery_cache.get(executable)
+    if cached is not None:
+        return [dict(opt) for opt in cached]
+
+    completed = subprocess.run(
+        [executable, "models"],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        check=True,
+        timeout=timeout_s,
+        env=dict(env) if env is not None else None,
+    )
+    parsed = parse_antigravity_cli_model_options(completed.stdout)
+    _antigravity_model_discovery_cache[executable] = parsed
+    return [dict(opt) for opt in parsed]
+
+
+def antigravity_native_model_options(
+    launch_config: NativeAntigravityLaunch | None = None,
+    *,
+    antigravity_path: str | None = None,
+) -> list[dict[str, object]]:
+    """Return model picker rows discovered dynamically from the installed agy CLI.
+
+    :param launch_config: Launch config resolved for the session.
+    :param antigravity_path: Optional explicit binary path override.
+    :returns: Wire-ready model option objects.
+    """
+    try:
+        options = list_antigravity_cli_model_options(antigravity_path=antigravity_path)
+    except Exception:
+        _logger.debug("Failed to discover agy models dynamically via CLI", exc_info=True)
+        options = []
+
+    configured_model = launch_config.model if launch_config is not None else None
+    if not options:
+        if configured_model:
+            return [
+                {
+                    "id": configured_model,
+                    "model": configured_model,
+                    "displayName": configured_model,
+                    "isDefault": True,
+                }
+            ]
+        return []
+
+    has_default = False
+    for opt in options:
+        if configured_model and opt["id"] == configured_model:
+            opt["isDefault"] = True
+            has_default = True
+
+    if not has_default and not configured_model and options:
+        options[0]["isDefault"] = True
+        has_default = True
+
+    if configured_model and not has_default:
+        options.insert(
+            0,
+            {
+                "id": configured_model,
+                "model": configured_model,
+                "displayName": configured_model,
+                "isDefault": True,
+            },
+        )
+
+    return options

@@ -120,6 +120,13 @@ import {
   useChatStore,
 } from "@/store/chatStore";
 import {
+  ANTIGRAVITY_NATIVE_WRAPPER,
+  CLAUDE_NATIVE_WRAPPER,
+  CODEX_NATIVE_WRAPPER,
+  CURSOR_NATIVE_WRAPPER,
+  KIRO_NATIVE_WRAPPER,
+  OPENCODE_NATIVE_WRAPPER,
+  PI_NATIVE_WRAPPER,
   isNativeTerminalSession,
   nativeCodingAgentForHarness,
   nativeCodingAgentForSubagentWrapper,
@@ -4248,6 +4255,7 @@ export function composerHarnessLabel(
   if (modelPickerKind === "cursor") return "Cursor";
   if (modelPickerKind === "kiro") return "Kiro";
   if (modelPickerKind === "opencode") return "OpenCode";
+  if (modelPickerKind === "antigravity") return "Antigravity";
   const display = agentName ? agentDisplayLabel(agentName) : null;
   const harness = sessionHarness ? (harnessLabels[sessionHarness] ?? null) : null;
   if (display && harness) return `${display} (${harness})`;
@@ -5288,8 +5296,9 @@ export function Composer({
     const items = e.clipboardData?.items;
     if (!items) return;
     const pastedFiles: File[] = [];
-    for (const item of items) {
-      if (item.kind === "file") {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item?.kind === "file") {
         const file = item.getAsFile();
         if (file) pastedFiles.push(file);
       }
@@ -5703,14 +5712,6 @@ export function Composer({
               />
             )}
             <div className="flex min-h-9 min-w-0 items-center rounded-lg transition-colors empty:hidden md:min-h-8 has-[button:not([aria-disabled=true])]:hover:bg-muted dark:has-[button:not([aria-disabled=true])]:hover:bg-muted/50 [&>button]:bg-transparent!">
-              <ComposerModelEffortLabel
-                showModels={showModels}
-                showEffort={showEffort}
-                modelPickerKind={modelPickerKind}
-                codexModelOptions={codexModelOptions}
-                costRoutingEligible={costRoutingEligible}
-                harnessLabel={harnessLabel}
-              />
               <ComposerConfigGear
                 harnessLabel={harnessLabel}
                 showModels={showModels}
@@ -5959,7 +5960,8 @@ const EFFORT_LEVELS = ["low", "medium", "high"] as const;
 /** Anthropic-side efforts for claude-native sessions (matches ANTHROPIC_EFFORTS in reasoning_effort.py). */
 const CLAUDE_NATIVE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
-type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi";
+type NativeModelPickerKind =
+  "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "antigravity";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -6016,29 +6018,31 @@ export function effortLevelsForConv(
 export function modelPickerKindForConv(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): NativeModelPickerKind | null {
-  switch (conv?.labels?.["omnigent.wrapper"]) {
-    case "claude-code-native-ui":
+  switch (conv?.labels?.[WRAPPER_LABEL_KEY]) {
+    case CLAUDE_NATIVE_WRAPPER:
       return "claude";
-    case "codex-native-ui":
+    case CODEX_NATIVE_WRAPPER:
       return "codex";
-    case "cursor-native-ui":
+    case CURSOR_NATIVE_WRAPPER:
       return "cursor";
-    case "kiro-native-ui":
+    case KIRO_NATIVE_WRAPPER:
       // Launch-only model selection: kiro applies ``--model`` at launch. Unlike
       // cursor/opencode there is no terminal->web model mirror, so the picker
       // reflects the pre-launch ``model_override`` selection.
       return "kiro";
-    case "opencode-native-ui":
+    case OPENCODE_NATIVE_WRAPPER:
       // Like cursor: a vendor-owns-model wrapper that mirrors its live TUI
       // model into the session ``model_override`` (the forwarder's terminal→web
       // mirror), so the picker surfaces that as the live model.
       return "opencode";
-    case "pi-native-ui":
+    case PI_NATIVE_WRAPPER:
       // Like cursor: the runner types a model switch into the live Pi process
       // (via the bridge inbox → Pi's ``setModel``) and Pi mirrors its own
       // ``/model`` picks back to ``model_override`` via the extension's
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
+    case ANTIGRAVITY_NATIVE_WRAPPER:
+      return "antigravity";
     default:
       return null;
   }
@@ -6495,6 +6499,19 @@ function ComposerConfigGear({
 
   return (
     <>
+      <ComposerModelEffortLabel
+        showModels={showModels}
+        showEffort={showEffort}
+        modelPickerKind={modelPickerKind}
+        codexModelOptions={codexModelOptions}
+        costRoutingEligible={costRoutingEligible}
+        harnessLabel={harnessLabel}
+        disabled={disabled}
+        onClick={() => {
+          if (disabled) return;
+          setOpen(true);
+        }}
+      />
       <TooltipProvider>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -6641,7 +6658,8 @@ function useResolvedComposerModel(
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
-    modelPickerKind === "opencode";
+    modelPickerKind === "opencode" ||
+    modelPickerKind === "antigravity";
   const modelOptions: readonly { id: string; label?: string; displayName?: string }[] =
     usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
@@ -6682,7 +6700,8 @@ function useResolvedComposerModel(
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "opencode" ||
-    modelPickerKind === "pi"
+    modelPickerKind === "pi" ||
+    modelPickerKind === "antigravity"
       ? sessionModelOverride
       : (sessionModelOverride ?? sessionStickyModel);
   // SDK/bundle agents (no native picker) never have the cross-session sticky
@@ -6702,9 +6721,11 @@ function useResolvedComposerModel(
         // on a web pick (which also drives a live ``/model`` switch). Either way
         // the Omnigent-visible model is ``model_override``.
         sessionModelOverride
-      : modelPickerKind === "opencode" || modelPickerKind === "pi"
-        ? // opencode/pi mirror their live TUI model into ``model_override``
-          // (set on a web pick, updated by the extension's model_select
+      : modelPickerKind === "opencode" ||
+          modelPickerKind === "pi" ||
+          modelPickerKind === "antigravity"
+        ? // opencode/pi/antigravity mirror their live TUI model into ``model_override``
+          // (set on a web pick, updated by the extension/reader's model_select
           // handler on a TUI switch); show that, falling back to the
           // launch-resolved model before any switch.
           (sessionModelOverride ?? llmModel)
@@ -6744,6 +6765,8 @@ function ComposerModelEffortLabel({
   codexModelOptions,
   costRoutingEligible,
   harnessLabel,
+  disabled = false,
+  onClick,
 }: {
   showModels: boolean;
   showEffort: boolean;
@@ -6751,18 +6774,26 @@ function ComposerModelEffortLabel({
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
   harnessLabel: string | null;
+  disabled?: boolean;
+  onClick?: () => void;
 }) {
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
+  const isClickable = !disabled && Boolean(onClick);
+
   // Routing picks the model + effort per turn, so the label reads
   // "Smart Routing" with no pinned model/effort — matching the tooltip.
   if (routingOn) {
     return (
       <span
         data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
+        onClick={isClickable ? onClick : undefined}
+        className={cn(
+          "min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground select-none",
+          isClickable && "cursor-pointer hover:text-foreground",
+        )}
       >
         <span className="text-foreground">{SMART_ROUTING_LABEL}</span>
       </span>
@@ -6786,7 +6817,11 @@ function ComposerModelEffortLabel({
     return (
       <span
         data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
+        onClick={isClickable ? onClick : undefined}
+        className={cn(
+          "min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground select-none",
+          isClickable && "cursor-pointer hover:text-foreground",
+        )}
       >
         <span className="text-foreground">{harnessLabel}</span>
       </span>
@@ -6796,7 +6831,11 @@ function ComposerModelEffortLabel({
   return (
     <span
       data-testid="composer-model-effort-label"
-      className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
+      onClick={isClickable ? onClick : undefined}
+      className={cn(
+        "min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground select-none",
+        isClickable && "cursor-pointer hover:text-foreground",
+      )}
     >
       {model && <span className="text-foreground">{model}</span>}
       {model && effortLabel && " "}

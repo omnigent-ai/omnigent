@@ -137,6 +137,9 @@ import { partitionAgentsByKind, sortAgentsForDisplay } from "@/lib/agentGrouping
 import { cn } from "@/lib/utils";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
+  ANTIGRAVITY_NATIVE_HARNESS,
+  CLAUDE_NATIVE_HARNESS,
+  CODEX_NATIVE_HARNESS,
   isFullySupportedNativeCodingAgent,
   isNativeCodingAgent,
   isRecentHarness,
@@ -1398,6 +1401,8 @@ function HarnessConfigModal({
   claudeModelsLoading,
   codexModelOptions,
   codexModelsLoading,
+  agyModelOptions,
+  agyModelsLoading,
   pickedEffort,
   pickedHarness,
   costControlMode,
@@ -1428,6 +1433,8 @@ function HarnessConfigModal({
   claudeModelsLoading: boolean;
   codexModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
   codexModelsLoading: boolean;
+  agyModelOptions: readonly Pick<NativeModelOption, "id" | "displayName" | "isDefault">[];
+  agyModelsLoading: boolean;
   pickedEffort: string;
   pickedHarness: string | null;
   costControlMode: CostControlMode;
@@ -1449,9 +1456,14 @@ function HarnessConfigModal({
   const hasApproval = nativeAgentHasCapability(agent, "approvalMode");
   const hasCursor = nativeAgentHasCapability(agent, "cursorMode");
   const hasAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
-  const isCodex = entryHarness === "codex-native";
-  const modelOptions = isCodex ? codexModelOptions : claudeModelOptions;
-  const modelsLoading = isCodex ? codexModelsLoading : claudeModelsLoading;
+  const isCodex = entryHarness === CODEX_NATIVE_HARNESS;
+  const isAgy = entryHarness === ANTIGRAVITY_NATIVE_HARNESS;
+  const modelOptions = isAgy ? agyModelOptions : isCodex ? codexModelOptions : claudeModelOptions;
+  const modelsLoading = isAgy
+    ? agyModelsLoading
+    : isCodex
+      ? codexModelsLoading
+      : claudeModelsLoading;
   const brainDefault =
     agent.harness != null && agent.harness in brainHarnessLabels ? agent.harness : null;
 
@@ -1508,6 +1520,10 @@ function HarnessConfigModal({
     () => codexModelOptions.map((m) => ({ id: m.id, label: displayModelId(m) })),
     [codexModelOptions],
   );
+  const agyModelSelectOptions = useMemo(
+    () => agyModelOptions.map((m) => ({ id: m.id, label: m.displayName ?? m.id })),
+    [agyModelOptions],
+  );
   const onModelChange = (value: string) => {
     if (value === MODEL_SELECT_SMART) {
       setDraftRouting("on");
@@ -1562,8 +1578,13 @@ function HarnessConfigModal({
       setCursorExecMode(draftCursor);
       if (entryHarness) writeHarnessOption(entryHarness, { mode: draftCursor });
     } else if (hasAgySkip) {
+      setPickedModel(draftModel);
       setAgySkipMode(draftAgySkip);
-      if (entryHarness) writeHarnessOption(entryHarness, { mode: draftAgySkip });
+      if (entryHarness)
+        writeHarnessOption(entryHarness, {
+          mode: draftAgySkip,
+          model: draftModel,
+        });
     } else if (brainDefault) {
       // Picking the spec default clears the override so the session tracks it.
       setPickedHarness(draftHarness === brainDefault ? null : draftHarness, agent.id);
@@ -1745,6 +1766,17 @@ function HarnessConfigModal({
 
           {!autoRouting && hasAgySkip && (
             <>
+              <ConfigRow label="Model" description="Which Antigravity model runs this session">
+                <RoutingModelSelect
+                  value={draftModel || MODEL_SELECT_DEFAULT}
+                  onValueChange={onModelChange}
+                  offerSmartRouting={false}
+                  testId="new-chat-landing-config-agy-model"
+                  models={agyModelSelectOptions}
+                  defaultLabel={defaultModelLabel(agyModelOptions, (m) => m.displayName ?? m.id)}
+                  ariaLabel="Model"
+                />
+              </ConfigRow>
               <ConfigRow label="Permissions" description="What the agent can do without asking">
                 <DescribedSelect
                   value={draftAgySkip}
@@ -2091,12 +2123,17 @@ export function NewChatLandingScreen() {
   );
   const { data: hostClaudeModelOptions, isLoading: hostClaudeModelsLoading } = useHostModelOptions(
     selectedHostId,
-    "claude-native",
+    CLAUDE_NATIVE_HARNESS,
     !sandboxSelected,
   );
   const { data: hostCodexModelOptions, isLoading: hostCodexModelsLoading } = useHostModelOptions(
     selectedHostId,
-    "codex-native",
+    CODEX_NATIVE_HARNESS,
+    !sandboxSelected,
+  );
+  const { data: hostAgyModelOptions, isLoading: hostAgyModelsLoading } = useHostModelOptions(
+    selectedHostId,
+    ANTIGRAVITY_NATIVE_HARNESS,
     !sandboxSelected,
   );
   const claudeModelOptions = useMemo(
@@ -2115,6 +2152,10 @@ export function NewChatLandingScreen() {
   const codexModelOptions = useMemo(
     () => (sandboxSelected ? [] : (hostCodexModelOptions ?? [])),
     [hostCodexModelOptions, sandboxSelected],
+  );
+  const agyModelOptions = useMemo(
+    () => (sandboxSelected ? [] : (hostAgyModelOptions ?? [])),
+    [hostAgyModelOptions, sandboxSelected],
   );
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
@@ -2775,7 +2816,14 @@ export function NewChatLandingScreen() {
     if (supportsAgySkipPermissions) {
       const skipValue =
         AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.label ?? agySkipMode;
-      return [{ label: "Permissions", value: skipValue }, ...routingRow];
+      const modelValue =
+        agyModelOptions.find((m) => m.id === pickedModel)?.displayName ??
+        defaultModelLabel(agyModelOptions, (m) => m.displayName ?? m.id);
+      return [
+        { label: "Model", value: modelValue },
+        { label: "Permissions", value: skipValue },
+        ...routingRow,
+      ];
     }
     if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll) {
       const active = pickedHarness ?? selectedAgent.harness;
@@ -2797,6 +2845,7 @@ export function NewChatLandingScreen() {
     pickedModel,
     claudeModelOptions,
     codexModelOptions,
+    agyModelOptions,
     pickedEffort,
     permissionMode,
     approvalMode,
@@ -4083,10 +4132,16 @@ export function NewChatLandingScreen() {
               onPaste={(e) => {
                 // Pasted images/files attach instead of inserting as text,
                 // mirroring the in-session composer.
-                const pasted = Array.from(e.clipboardData.items)
-                  .filter((item) => item.kind === "file")
-                  .map((item) => item.getAsFile())
-                  .filter((f): f is File => f !== null);
+                const items = e.clipboardData?.items;
+                if (!items) return;
+                const pasted: File[] = [];
+                for (let i = 0; i < items.length; i++) {
+                  const item = items[i];
+                  if (item?.kind === "file") {
+                    const file = item.getAsFile();
+                    if (file) pasted.push(file);
+                  }
+                }
                 if (pasted.length > 0) {
                   e.preventDefault();
                   addFiles(pasted);
@@ -4334,6 +4389,10 @@ export function NewChatLandingScreen() {
                     codexModelOptions={codexModelOptions}
                     codexModelsLoading={
                       !sandboxSelected && selectedHostId !== null && hostCodexModelsLoading
+                    }
+                    agyModelOptions={agyModelOptions}
+                    agyModelsLoading={
+                      !sandboxSelected && selectedHostId !== null && hostAgyModelsLoading
                     }
                     pickedEffort={pickedEffort}
                     pickedHarness={pickedHarness}

@@ -287,6 +287,9 @@ _KIMI_NATIVE_HARNESS = KIMI_NATIVE_CODING_AGENT.harness
 _ANTIGRAVITY_NATIVE_HARNESS = ANTIGRAVITY_NATIVE_CODING_AGENT.harness
 
 
+_ANTIGRAVITY_NATIVE_WRAPPER_LABEL_VALUE = ANTIGRAVITY_NATIVE_CODING_AGENT.wrapper_label
+
+
 _KIRO_NATIVE_WRAPPER_LABEL_VALUE = KIRO_NATIVE_CODING_AGENT.wrapper_label
 
 
@@ -708,6 +711,7 @@ _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
     _CURSOR_NATIVE_WRAPPER_LABEL_VALUE: "cursor-model-options",
     _KIRO_NATIVE_WRAPPER_LABEL_VALUE: "kiro-model-options",
     _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
+    _ANTIGRAVITY_NATIVE_WRAPPER_LABEL_VALUE: "antigravity-model-options",
     # pi-native is deliberately NOT here: its catalog is PUSHED by the resident
     # extension (``external_model_options`` → ``_pushed_model_options_cache``),
     # not fetched from a runner route, so the picker works in every auth path
@@ -783,6 +787,7 @@ __all__ = [
     "_ANTIGRAVITY_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY",
     "_ANTIGRAVITY_NATIVE_SUBAGENT_TYPE_LABEL_KEY",
     "_ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
+    "_ANTIGRAVITY_NATIVE_WRAPPER_LABEL_VALUE",
     "_APPROVAL_TYPE",
     "_BROWSER_ACTION_AWAIT_S",
     "_BROWSER_ACTION_TIMEOUT_RESULT",

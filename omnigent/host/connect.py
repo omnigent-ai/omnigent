@@ -2322,6 +2322,26 @@ class HostProcess:
                 models=models,
             )
 
+        if harness == "antigravity-native":
+            try:
+                from omnigent.antigravity_native import antigravity_native_model_options
+                from omnigent.antigravity_native_launch import resolve_native_antigravity_launch
+
+                launch = await asyncio.to_thread(resolve_native_antigravity_launch, model=None)
+                models = await asyncio.to_thread(antigravity_native_model_options, launch)
+            except Exception:
+                _logger.exception("Failed to resolve pre-launch Antigravity model options")
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve Antigravity model options",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=models,
+            )
+
         if harness != "claude-native":
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
