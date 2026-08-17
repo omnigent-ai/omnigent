@@ -35,6 +35,7 @@ _HOST_ID = "host_e2e_cfg"
 _PROJECT_ID = "proj_e2e_cfg"
 _PROJECT_NAME = "ConfiguredProject"
 _CONFIG_WORKSPACE = "/work/configured-repo"
+_STALE_WORKSPACE = "/work/stale-general-draft"
 # Bare create endpoint (POST captured); NOT the /{id}/... sub-routes.
 _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
 # One project config endpoint: /v1/projects/<id> (not the bare list).
@@ -132,7 +133,17 @@ def test_composer_prefills_from_project_config(seeded_session: tuple[str, str]) 
     _run_in_fresh_loop(_drive_prefill(base_url, session_id))
 
 
-async def _drive_prefill(base_url: str, session_id: str) -> None:
+def test_project_pencil_prefill_beats_general_landing_draft(
+    seeded_session: tuple[str, str],
+) -> None:
+    """A project pencil visit replaces stale draft launch settings with its config."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_prefill(base_url, session_id, via_project_pencil=True))
+
+
+async def _drive_prefill(
+    base_url: str, session_id: str, *, via_project_pencil: bool = False
+) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
@@ -192,18 +203,43 @@ async def _drive_prefill(base_url: str, session_id: str) -> None:
             await page.route(_SESSIONS_RE, handle_sessions)
             await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
 
-            await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
+            if via_project_pencil:
+                await page.add_init_script(
+                    f"""window.localStorage.setItem(
+                        "omnigent:recent-workspaces",
+                        JSON.stringify({{ {_HOST_ID}: ["{_STALE_WORKSPACE}"] }})
+                    );"""
+                )
+                await page.goto(base_url)
+                await expect(
+                    page.get_by_test_id("new-chat-landing-workspace-chip")
+                ).to_contain_text("stale-general-draft", timeout=15_000)
+                await page.get_by_test_id("new-chat-landing-input").fill("keep this draft")
+                await page.get_by_role("link", name=f"New session in {_PROJECT_NAME}").click()
+                await expect(page).to_have_url(
+                    re.compile(rf"/\?project={_PROJECT_NAME}$"), timeout=15_000
+                )
+            else:
+                await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
 
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
+                "configured-repo", timeout=15_000
+            )
             # The agent picker trigger reflects the config-pinned agent (Polly),
             # not the default-ranked Claude Code — proof the config seed won.
             await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
                 "Polly", timeout=15_000
             )
 
-            await page.get_by_test_id("new-chat-landing-input").fill("start here")
+            if via_project_pencil:
+                await expect(page.get_by_test_id("new-chat-landing-input")).to_have_value(
+                    "keep this draft"
+                )
+            else:
+                await page.get_by_test_id("new-chat-landing-input").fill("start here")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
             await _wait_until(lambda: len(create_bodies) == 1)
