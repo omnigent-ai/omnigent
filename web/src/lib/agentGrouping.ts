@@ -26,6 +26,29 @@ export const BUILTIN_AGENTS = new Set([
   "debby",
 ]);
 
+// Builtin ACP CLI harness ids (mirrors ACP_CLI_HARNESSES on the server). Like
+// the native harnesses, these are harness-backed picks — not composed agents —
+// so the picker groups them under "Harnesses ▸ More", beside OpenCode/Cursor.
+// User-configured ACP agents carry an `acp:<slug>` harness; a builtin ACP CLI
+// harness carries a bare id.
+export const ACP_CLI_HARNESS_IDS = new Set<string>(["grok"]);
+
+/**
+ * Whether an agent is backed by the generic ACP harness — a configured
+ * `acp:<slug>` agent (e.g. Devin, Kilocode) or a builtin ACP CLI harness
+ * (e.g. Grok). These belong in the picker's "Harnesses" group with the native
+ * CLIs: selecting one runs a harness, not a composed agent.
+ *
+ * @param agent - Agent to classify (only its `harness` is read).
+ */
+export function isAcpHarnessAgent(
+  agent: Pick<AvailableAgent, "harness"> | null | undefined,
+): boolean {
+  const harness = agent?.harness;
+  if (harness == null) return false;
+  return harness.startsWith("acp:") || ACP_CLI_HARNESS_IDS.has(harness);
+}
+
 // Preferred display order for the built-in group. The server returns
 // agents newest-registered first (agent_store.list sorts by created_at
 // desc), so pin the order users expect; any agent not listed here falls

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
-import { partitionAgentsByKind } from "@/lib/agentGrouping";
+import { isAcpHarnessAgent, partitionAgentsByKind } from "@/lib/agentGrouping";
 
 function agent(overrides: Partial<AvailableAgent> & Pick<AvailableAgent, "name">): AvailableAgent {
   return {
@@ -43,5 +43,22 @@ describe("partitionAgentsByKind", () => {
     ]);
     expect(builtins.map((a) => a.name)).toEqual(["claude-native-ui"]);
     expect(customs.map((a) => a.name)).toEqual(["some-custom"]);
+  });
+});
+
+describe("isAcpHarnessAgent", () => {
+  it("recognizes configured acp:<slug> agents and builtin ACP CLI harnesses", () => {
+    // NewChatDialog routes these into the "Harnesses" group (beside the native
+    // CLIs), not "Agents" — they select a harness to run, not a composed agent.
+    expect(isAcpHarnessAgent({ harness: "acp:devin" })).toBe(true);
+    expect(isAcpHarnessAgent({ harness: "acp:kilocode" })).toBe(true);
+    expect(isAcpHarnessAgent({ harness: "grok" })).toBe(true);
+  });
+
+  it("does not misclassify composed agents, native harnesses, or missing harness", () => {
+    expect(isAcpHarnessAgent({ harness: "claude-sdk" })).toBe(false); // Polly / Debby
+    expect(isAcpHarnessAgent({ harness: "claude-native" })).toBe(false); // native harness
+    expect(isAcpHarnessAgent({ harness: null })).toBe(false);
+    expect(isAcpHarnessAgent(null)).toBe(false);
   });
 });
