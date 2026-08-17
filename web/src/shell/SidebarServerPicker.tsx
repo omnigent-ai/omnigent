@@ -1,6 +1,14 @@
 import { useEffect, useState } from "react";
-import { CheckIcon, ChevronUpIcon, PlusIcon, ServerIcon } from "lucide-react";
+import {
+  CheckIcon,
+  ChevronUpIcon,
+  CopyIcon,
+  ExternalLinkIcon,
+  PlusIcon,
+  ServerIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { showToast } from "@/components/ui/toast";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -15,6 +23,7 @@ import {
   switchServer,
   type ServerPickerInfo,
 } from "@/lib/nativeBridge";
+import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
@@ -36,13 +45,30 @@ function originOf(url: string): string | null {
   }
 }
 
+function openableServerUrl(url: string): string | null {
+  try {
+    const protocol = new URL(url).protocol;
+    return protocol === "http:" || protocol === "https:" ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+async function copyServerUrl(url: string): Promise<void> {
+  try {
+    await copyText(url);
+    showToast("Server URL copied.");
+  } catch {
+    showToast(`Couldn't copy the server URL. Copy it manually: ${url}`, { duration: 0 });
+  }
+}
+
 /**
  * Server picker for the Electron desktop shell, pinned to the sidebar's bottom.
  *
  * A sidebar row (server glyph + current host + an upward chevron) that opens a
- * menu of recently-connected servers — selecting one re-points the whole window
- * via the shell — plus "Connect to new server…", which returns the window to
- * the shell's setup page.
+ * menu for visiting or copying the current URL, switching to a recent server,
+ * or returning to the shell's setup page to connect to a new server.
  *
  * This deliberately lives at the bottom of the sidebar rather than in the
  * window's title bar. The macOS shell hides the native title bar (titleBarStyle
@@ -81,6 +107,7 @@ export function SidebarServerPicker() {
   // out from under us; recents matching the current origin collapse into it.
   const others = info.recentServers.filter((url) => originOf(url) !== info.currentOrigin);
   const currentHost = hostOf(info.currentOrigin);
+  const openUrl = openableServerUrl(info.currentOrigin);
 
   return (
     // shrink-0 keeps the row at its natural height so the scrolling session
@@ -125,6 +152,28 @@ export function SidebarServerPicker() {
               <span className="truncate">{hostOf(url)}</span>
             </DropdownMenuItem>
           ))}
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel className="text-muted-foreground">Current server</DropdownMenuLabel>
+          {openUrl ? (
+            <DropdownMenuItem asChild className="min-h-11 gap-2">
+              <a href={openUrl} target="_blank" rel="noopener noreferrer">
+                <ExternalLinkIcon className="size-4 shrink-0" />
+                Open server in new tab
+              </a>
+            </DropdownMenuItem>
+          ) : (
+            <DropdownMenuItem disabled className="min-h-11 gap-2">
+              <ExternalLinkIcon className="size-4 shrink-0" />
+              Open server in new tab
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem
+            className="min-h-11 gap-2"
+            onSelect={() => void copyServerUrl(info.currentOrigin)}
+          >
+            <CopyIcon className="size-4 shrink-0" />
+            Copy server URL
+          </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem className="gap-2" onSelect={() => openServerSetup()}>
             <PlusIcon className="size-4 shrink-0" />
