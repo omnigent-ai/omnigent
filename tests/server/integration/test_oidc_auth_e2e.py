@@ -288,6 +288,42 @@ async def test_callback_returns_400_on_token_exchange_failure() -> None:
     assert "Token exchange failed" in resp.json()["error"]
 
 
+async def test_github_token_exchange_mints_omnigent_session() -> None:
+    """A user token from this GitHub App can bootstrap CLI auth."""
+    mock_cm = _mock_httpx_client_for_github()
+    transport = _build_oidc_app()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with patch("omnigent.server.routes.auth.httpx.AsyncClient", return_value=mock_cm):
+            resp = await client.post(
+                "/auth/github-token",
+                headers={"Authorization": "Bearer ghu_test_token"},
+            )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["user_id"] == "alice@example.com"
+    payload = jwt.decode(body["token"], _TEST_SECRET, algorithms=["HS256"])
+    assert payload["sub"] == "alice@example.com"
+    assert body["expires_in"] == 8 * 3600
+
+
+async def test_github_token_exchange_rejects_token_from_another_app() -> None:
+    """GitHub's check-token endpoint binds the bearer to this client ID."""
+    mock_cm = _mock_httpx_client_for_github(token_status=404)
+    transport = _build_oidc_app()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with patch("omnigent.server.routes.auth.httpx.AsyncClient", return_value=mock_cm):
+            resp = await client.post(
+                "/auth/github-token",
+                headers={"Authorization": "Bearer ghu_foreign_token"},
+            )
+
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "Token was not issued to this GitHub App"
+
+
 # ── 5. Logout ──────────────────────────────────────────────────────
 
 

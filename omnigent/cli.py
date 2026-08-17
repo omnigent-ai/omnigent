@@ -9504,7 +9504,12 @@ def _remember_default_server(server: str) -> None:
 
 @cli.command("login")
 @click.argument("server_url")
-def login(server_url: str) -> None:
+@click.option(
+    "--github-token",
+    is_flag=True,
+    help="Exchange GH_TOKEN for a session without opening a browser.",
+)
+def login(server_url: str, github_token: bool) -> None:
     """Authenticate with a remote Omnigent server.
 
     Probes the server's auth mode and runs the matching flow:
@@ -9600,6 +9605,38 @@ def login(server_url: str) -> None:
     import webbrowser
 
     from omnigent.cli_auth import store_token
+
+    if github_token:
+        ambient_token = os.environ.get("GH_TOKEN", "").strip()
+        if not ambient_token:
+            raise click.ClickException("--github-token requires GH_TOKEN in the environment.")
+        try:
+            token_resp = _httpx.post(
+                f"{server}/auth/github-token",
+                headers={"Authorization": f"Bearer {ambient_token}"},
+                timeout=10.0,
+            )
+        except _httpx.HTTPError as exc:
+            raise click.ClickException(
+                f"Could not exchange GH_TOKEN with {server}: {exc}"
+            ) from exc
+        if not token_resp.is_success:
+            raise click.ClickException(
+                f"GitHub token login failed ({token_resp.status_code}): {token_resp.text[:200]}"
+            )
+        result = token_resp.json()
+        expires_in = result.get("expires_in", 8 * 3600)
+        import time as _time
+
+        store_token(
+            server_url=server,
+            token=result["token"],
+            user_id=result["user_id"],
+            expires_at=_time.time() + expires_in,
+        )
+        click.echo(f"Logged in as {result['user_id']}")
+        _remember_default_server(server)
+        return
 
     # Step 1: Request a CLI login ticket.
     try:

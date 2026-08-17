@@ -21,7 +21,7 @@ from urllib.parse import urlencode
 import httpx
 import jwt
 from fastapi import APIRouter, Query, Request
-from starlette.responses import RedirectResponse, Response
+from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
@@ -128,6 +128,31 @@ def create_auth_router(
     # (5 min) and single-use. Keyed by ticket ID.
     _cli_tickets: dict[str, _CliTicket] = {}
 
+    def _issue_session(email: str) -> tuple[str, str] | JSONResponse:
+        """Apply admission policy and mint an Omnigent session."""
+        email = email.lower()
+        if not admission.is_admitted(email):
+            domain = email.rsplit("@", 1)[-1] if "@" in email else ""
+            return JSONResponse(
+                status_code=403,
+                content={"error": f"Email domain {domain!r} is not permitted on this server"},
+            )
+        if email in _RESERVED_USERS:
+            return JSONResponse(
+                status_code=403,
+                content={"error": f"Reserved user name {email!r}"},
+            )
+        if permission_store is not None:
+            permission_store.ensure_user(email)
+            promote_if_listed(admin_list, permission_store, email)
+        token = mint_session_cookie(
+            user_id=email,
+            cookie_secret=config.cookie_secret,
+            ttl_hours=config.session_ttl_hours,
+            provider=config.provider_type,
+        )
+        return email, token
+
     @router.get("/login")
     async def login(request: Request) -> Response:
         """Redirect to the IdP's authorization endpoint.
@@ -208,8 +233,6 @@ def create_auth_router(
         :returns: 302 redirect to the app with session cookie set,
             or 400/403 on validation failure.
         """
-        from fastapi.responses import JSONResponse
-
         code = request.query_params.get("code")
         state = request.query_params.get("state")
         if not code or not state:
@@ -293,9 +316,6 @@ def create_auth_router(
                 content={"error": "Could not determine user email from IdP"},
             )
 
-        # Normalize email to lowercase.
-        email = email.lower()
-
         # Redeem an OIDC invite (if one rode along in the signed state)
         # BEFORE the admission check, so the just-bound email passes the
         # domain gate via the invite bypass. Single-use: the token is
@@ -310,39 +330,10 @@ def create_auth_router(
                     str(invite_token), email, now_epoch_seconds=int(time.time())
                 )
 
-        # Admission control: domain allowlist (env ∪ file) plus the
-        # admin-list / invite bypasses. An empty effective allowlist
-        # means "no restriction" (admit any IdP user) — the OSS default.
-        if not admission.is_admitted(email):
-            domain = email.rsplit("@", 1)[-1] if "@" in email else ""
-            return JSONResponse(
-                status_code=403,
-                content={"error": f"Email domain {domain!r} is not permitted on this server"},
-            )
-
-        # Reject reserved user names.
-        if email in _RESERVED_USERS:
-            return JSONResponse(
-                status_code=403,
-                content={"error": f"Reserved user name {email!r}"},
-            )
-
-        # Ensure user exists in the permission store, then apply the
-        # file-backed admin list. Promotion is additive (never demotes)
-        # and is OIDC's only path to admin — the IdP doesn't tell us
-        # who is an operator. ensure_user must run first so the
-        # set_admin UPDATE inside promote_if_listed matches a row.
-        if permission_store is not None:
-            permission_store.ensure_user(email)
-            promote_if_listed(admin_list, permission_store, email)
-
-        # Mint session cookie.
-        session_jwt = mint_session_cookie(
-            user_id=email,
-            cookie_secret=config.cookie_secret,
-            ttl_hours=config.session_ttl_hours,
-            provider=config.provider_type,
-        )
+        issued = _issue_session(email)
+        if isinstance(issued, JSONResponse):
+            return issued
+        email, session_jwt = issued
 
         # Check if this callback fulfills a CLI login ticket.
         ticket_id = state_payload.get("ticket")
@@ -406,6 +397,56 @@ def create_auth_router(
             samesite="lax",
         )
         return response
+
+    if config.provider_type == "github":
+
+        @router.post("/github-token")
+        async def github_token_login(request: Request) -> Response:
+            """Exchange this GitHub App's user token for an Omnigent session."""
+            authorization = request.headers.get("Authorization", "")
+            scheme, _, access_token = authorization.partition(" ")
+            if scheme.lower() != "bearer" or not access_token:
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": "GitHub bearer token required"},
+                )
+
+            headers = {
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2026-03-10",
+            }
+            async with httpx.AsyncClient() as client:
+                check = await client.post(
+                    f"https://api.github.com/applications/{config.client_id}/token",
+                    auth=(config.client_id, config.client_secret),
+                    headers=headers,
+                    json={"access_token": access_token},
+                    timeout=10.0,
+                )
+                if check.status_code != 200:
+                    return JSONResponse(
+                        status_code=401,
+                        content={"error": "Token was not issued to this GitHub App"},
+                    )
+                email = await _resolve_github_email(client, access_token)
+
+            if not email:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "Could not determine user email from GitHub"},
+                )
+            issued = _issue_session(email)
+            if isinstance(issued, JSONResponse):
+                return issued
+            user_id, session_jwt = issued
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "token": session_jwt,
+                    "user_id": user_id,
+                    "expires_in": config.session_ttl_hours * 3600,
+                },
+            )
 
     if _invites_enabled:
 

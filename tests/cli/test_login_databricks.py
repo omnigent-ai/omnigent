@@ -554,6 +554,30 @@ def test_login_oidc_mode_sets_default_server(
     assert cli_mod._load_global_config().get("server") == server
 
 
+def test_login_oidc_with_github_token_skips_browser(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """An explicit GH_TOKEN exchange stores the returned Omnigent session."""
+    server = "http://omni-oidc.internal:6767"
+    fake = _FakeHttpx(responses=[_response(401, body={"login_url": "/auth/login"})])
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+    monkeypatch.setenv("GH_TOKEN", "ghu_test_token")
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, **kw: _response(
+            200,
+            body={"token": "omni-jwt", "user_id": "alice@example.com", "expires_in": 3600},
+        ),
+    )
+
+    result = CliRunner().invoke(cli_group, ["login", "--github-token", server])
+
+    assert result.exit_code == 0, result.output
+    assert "Logged in as alice@example.com" in result.output
+    assert cli_mod._load_global_config().get("server") == server
+
+
 def test_login_failure_leaves_default_server_unchanged(
     monkeypatch: pytest.MonkeyPatch, token_dir: Path
 ) -> None:
