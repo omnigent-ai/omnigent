@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
 
 /**
  * Shared display-name helpers for agents and brain harnesses, used by
@@ -61,8 +62,17 @@ async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HarnessCatalogWire;
   const labels: Record<string, string> = { ...BRAIN_HARNESS_LABELS };
+  // Exclude native TUI wrappers — they are not brain harnesses and should
+  // not offer a harness-override flyout. The harness catalog includes them
+  // (the server knows they exist), but the picker only wants non-native
+  // harnesses that a bundle agent can be switched to at runtime.
+  const nativeHarnesses = new Set<string>(NATIVE_CODING_AGENTS.map((a) => a.harness as string));
   for (const row of body.data ?? []) {
-    if (typeof row.id === "string" && typeof row.label === "string") {
+    if (
+      typeof row.id === "string" &&
+      typeof row.label === "string" &&
+      !nativeHarnesses.has(row.id)
+    ) {
       labels[row.id] = row.label;
     }
   }
