@@ -31,7 +31,7 @@ from playwright.sync_api import Page, expect
 
 _COMPOSER = "Ask the agent anything…"
 _AGENT_INFO_TRIGGER = '[data-testid="agent-info-trigger"]'
-_AGENT_INFO_PANEL = '[data-testid="agent-info-panel"]'
+_AGENT_INFO_PANEL = '[data-testid="agent-info-panel"][data-state="open"]'
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # Time for the popover's open animation (Radix ``duration-150`` zoom/slide) to

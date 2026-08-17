@@ -3,10 +3,17 @@
 Thin SwiftUI/WKWebView shell for Omnigent. Like the Electron app, this target
 loads the server-served web UI instead of shipping a duplicate copy of the SPA.
 
+Use the watchOS companion to monitor sessions, resolve approvals, and send
+replies. Sign in on iPhone to sync the server and scoped cookies through
+WatchConnectivity. Your credentials stay in the watch's device-only Keychain.
+
 ## Development
 
 Open `Omnigent.xcodeproj` in Xcode 26 or newer and run the `Omnigent` scheme on
 an iOS 26 simulator.
+
+Pair an Apple Watch simulator and run `OmnigentWatch`. Open the iPhone app to
+sync a server or renew credentials.
 
 Debug builds allow `http://` web content for local development by enabling
 `NSAllowsArbitraryLoadsInWebContent`. Release builds keep App Transport
@@ -18,6 +25,10 @@ The first version provides native setup chrome, recent servers, WKWebView
 loading, foreground local notifications, app badge updates, and notification
 tap routing back into the SPA. It does not implement APNs, background polling,
 or localhost proxy/CORS behavior.
+
+Pull to refresh the session list. Keep a session open to stream its events;
+after a write, the watch polls for a bounded period. Use iPhone for sign-in,
+structured forms, and new sessions.
 
 ## Managed app configuration
 

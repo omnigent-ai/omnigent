@@ -36,11 +36,29 @@
 		B20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift */; };
 		B20000000000000000000007 /* ManagedConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000007 /* ManagedConfigurationTests.swift */; };
 		B20000000000000000000006 /* MockHTTPServer.swift in Sources (OmnigentTests) */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* MockHTTPServer.swift */; };
+		B20000000000000000000009 /* WatchCompanionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* WatchCompanionTests.swift */; };
 		B40000000000000000000004 /* MockHTTPServer.swift in Sources (OmnigentUITests) */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* MockHTTPServer.swift */; };
 		B40000000000000000000001 /* OmnigentUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000001 /* OmnigentUITests.swift */; };
 		B40000000000000000000002 /* SnapshotHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000002 /* SnapshotHelper.swift */; };
 		B40000000000000000000003 /* RedirectConsentUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000003 /* RedirectConsentUITests.swift */; };
 		B40000000000000000000005 /* ManagedServersUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000005 /* ManagedServersUITests.swift */; };
+		B50000000000000000000001 /* WatchBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000001 /* WatchBridge.swift */; };
+		B50000000000000000000002 /* WatchModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000002 /* WatchModels.swift */; };
+		B50000000000000000000003 /* WatchEndpoint.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000003 /* WatchEndpoint.swift */; };
+		B50000000000000000000021 /* WatchMarkdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000021 /* WatchMarkdown.swift */; };
+		B50000000000000000000010 /* WatchModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000002 /* WatchModels.swift */; };
+		B50000000000000000000011 /* WatchEndpoint.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000003 /* WatchEndpoint.swift */; };
+		B50000000000000000000022 /* WatchMarkdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000021 /* WatchMarkdown.swift */; };
+		B50000000000000000000012 /* WatchCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000012 /* WatchCredentialStore.swift */; };
+		B50000000000000000000013 /* WatchConnectionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000013 /* WatchConnectionManager.swift */; };
+		B50000000000000000000014 /* WatchAPIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000014 /* WatchAPIClient.swift */; };
+		B50000000000000000000015 /* WatchSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000015 /* WatchSessionStore.swift */; };
+		B50000000000000000000016 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000016 /* ContentView.swift */; };
+		B50000000000000000000017 /* WatchSessionDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000017 /* WatchSessionDetailView.swift */; };
+		B50000000000000000000018 /* OmnigentWatchApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000018 /* OmnigentWatchApp.swift */; };
+		B50000000000000000000019 /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000E /* AppIcon.icon */; };
+		B5000000000000000000001A /* OmnigentWatchTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000019 /* OmnigentWatchTheme.swift */; };
+		B50000000000000000000020 /* OmnigentWatch.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = A50000000000000000000020 /* OmnigentWatch.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -58,7 +76,28 @@
 			remoteGlobalIDString = A00000000000000000000006;
 			remoteInfo = Omnigent;
 		};
+		E50000000000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A00000000000000000000005 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A50000000000000000000006;
+			remoteInfo = OmnigentWatch;
+		};
 /* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		C50000000000000000000004 /* Embed Watch Content */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "$(CONTENTS_FOLDER_PATH)/Watch";
+			dstSubfolderSpec = 16;
+			files = (
+				B50000000000000000000020 /* OmnigentWatch.app in Embed Watch Content */,
+			);
+			name = "Embed Watch Content";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		A10000000000000000000001 /* OmnigentApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmnigentApp.swift; sourceTree = "<group>"; };
@@ -92,6 +131,7 @@
 		A20000000000000000000007 /* ManagedConfigurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManagedConfigurationTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000008 /* WorkspaceChromeScriptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceChromeScriptTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000006 /* MockHTTPServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MockHTTPServer.swift; sourceTree = "<group>"; };
+		A20000000000000000000009 /* WatchCompanionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchCompanionTests.swift; sourceTree = "<group>"; };
 		A30000000000000000000003 /* OmnigentUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmnigentUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A40000000000000000000001 /* OmnigentUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmnigentUITests.swift; sourceTree = "<group>"; };
 		A40000000000000000000002 /* SnapshotHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SnapshotHelper.swift; sourceTree = "<group>"; };
@@ -99,6 +139,19 @@
 		A40000000000000000000005 /* ManagedServersUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManagedServersUITests.swift; sourceTree = "<group>"; };
 		A30000000000000000000001 /* Omnigent.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Omnigent.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A30000000000000000000002 /* OmnigentTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmnigentTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A50000000000000000000001 /* WatchBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchBridge.swift; sourceTree = "<group>"; };
+		A50000000000000000000002 /* WatchModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchModels.swift; sourceTree = "<group>"; };
+		A50000000000000000000003 /* WatchEndpoint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchEndpoint.swift; sourceTree = "<group>"; };
+		A50000000000000000000021 /* WatchMarkdown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchMarkdown.swift; sourceTree = "<group>"; };
+		A50000000000000000000012 /* WatchCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchCredentialStore.swift; sourceTree = "<group>"; };
+		A50000000000000000000013 /* WatchConnectionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchConnectionManager.swift; sourceTree = "<group>"; };
+		A50000000000000000000014 /* WatchAPIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchAPIClient.swift; sourceTree = "<group>"; };
+		A50000000000000000000015 /* WatchSessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSessionStore.swift; sourceTree = "<group>"; };
+		A50000000000000000000016 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		A50000000000000000000017 /* WatchSessionDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSessionDetailView.swift; sourceTree = "<group>"; };
+		A50000000000000000000018 /* OmnigentWatchApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmnigentWatchApp.swift; sourceTree = "<group>"; };
+		A50000000000000000000019 /* OmnigentWatchTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmnigentWatchTheme.swift; sourceTree = "<group>"; };
+		A50000000000000000000020 /* OmnigentWatch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OmnigentWatch.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -123,6 +176,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		C50000000000000000000002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -130,6 +190,8 @@
 			isa = PBXGroup;
 			children = (
 				A00000000000000000000003 /* Omnigent */,
+				A50000000000000000000004 /* WatchShared */,
+				A50000000000000000000005 /* OmnigentWatch */,
 				A00000000000000000000004 /* OmnigentTests */,
 				A00000000000000000000009 /* OmnigentUITests */,
 				A00000000000000000000008 /* Platform Assets */,
@@ -141,6 +203,7 @@
 			isa = PBXGroup;
 			children = (
 				A30000000000000000000001 /* Omnigent.app */,
+				A50000000000000000000020 /* OmnigentWatch.app */,
 				A30000000000000000000002 /* OmnigentTests.xctest */,
 				A30000000000000000000003 /* OmnigentUITests.xctest */,
 			);
@@ -168,6 +231,7 @@
 				A10000000000000000000012 /* SafariView.swift */,
 				A10000000000000000000015 /* ManagedConfiguration.swift */,
 				A10000000000000000000016 /* ManagedConfigurationProvider.swift */,
+				A50000000000000000000001 /* WatchBridge.swift */,
 				A1000000000000000000000D /* Assets.xcassets */,
 				A10000000000000000000013 /* PrivacyInfo.xcprivacy */,
 				A1000000000000000000000F /* Info-Debug.plist */,
@@ -187,6 +251,7 @@
 				A20000000000000000000007 /* ManagedConfigurationTests.swift */,
 				A20000000000000000000008 /* WorkspaceChromeScriptTests.swift */,
 				A20000000000000000000006 /* MockHTTPServer.swift */,
+				A20000000000000000000009 /* WatchCompanionTests.swift */,
 			);
 			path = OmnigentTests;
 			sourceTree = "<group>";
@@ -210,6 +275,31 @@
 			name = "Platform Assets";
 			sourceTree = "<group>";
 		};
+		A50000000000000000000004 /* WatchShared */ = {
+			isa = PBXGroup;
+			children = (
+				A50000000000000000000002 /* WatchModels.swift */,
+				A50000000000000000000003 /* WatchEndpoint.swift */,
+				A50000000000000000000021 /* WatchMarkdown.swift */,
+			);
+			path = WatchShared;
+			sourceTree = "<group>";
+		};
+		A50000000000000000000005 /* OmnigentWatch */ = {
+			isa = PBXGroup;
+			children = (
+				A50000000000000000000018 /* OmnigentWatchApp.swift */,
+				A50000000000000000000019 /* OmnigentWatchTheme.swift */,
+				A50000000000000000000016 /* ContentView.swift */,
+				A50000000000000000000017 /* WatchSessionDetailView.swift */,
+				A50000000000000000000015 /* WatchSessionStore.swift */,
+				A50000000000000000000014 /* WatchAPIClient.swift */,
+				A50000000000000000000013 /* WatchConnectionManager.swift */,
+				A50000000000000000000012 /* WatchCredentialStore.swift */,
+			);
+			path = OmnigentWatch;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -220,10 +310,12 @@
 				C00000000000000000000001 /* Sources */,
 				C00000000000000000000002 /* Frameworks */,
 				C00000000000000000000003 /* Resources */,
+				C50000000000000000000004 /* Embed Watch Content */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				E50000000000000000000002 /* PBXTargetDependency */,
 			);
 			name = Omnigent;
 			productName = Omnigent;
@@ -266,6 +358,23 @@
 			productReference = A30000000000000000000003 /* OmnigentUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
+		A50000000000000000000006 /* OmnigentWatch */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D50000000000000000000001 /* Build configuration list for PBXNativeTarget "OmnigentWatch" */;
+			buildPhases = (
+				C50000000000000000000001 /* Sources */,
+				C50000000000000000000002 /* Frameworks */,
+				C50000000000000000000003 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = OmnigentWatch;
+			productName = OmnigentWatch;
+			productReference = A50000000000000000000020 /* OmnigentWatch.app */;
+			productType = "com.apple.product-type.application";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -287,6 +396,9 @@
 						CreatedOnToolsVersion = 16.0;
 						TestTargetID = A00000000000000000000006;
 					};
+					A50000000000000000000006 = {
+						CreatedOnToolsVersion = 26.0;
+					};
 				};
 			};
 			buildConfigurationList = D00000000000000000000001 /* Build configuration list for PBXProject "Omnigent" */;
@@ -305,6 +417,7 @@
 				A00000000000000000000006 /* Omnigent */,
 				A00000000000000000000007 /* OmnigentTests */,
 				A0000000000000000000000A /* OmnigentUITests */,
+				A50000000000000000000006 /* OmnigentWatch */,
 			);
 		};
 /* End PBXProject section */
@@ -334,6 +447,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		C50000000000000000000003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B50000000000000000000019 /* AppIcon.icon in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -359,6 +480,8 @@
 				B10000000000000000000012 /* SafariView.swift in Sources */,
 				B10000000000000000000015 /* ManagedConfiguration.swift in Sources */,
 				B10000000000000000000016 /* ManagedConfigurationProvider.swift in Sources */,
+				B50000000000000000000001 /* WatchBridge.swift in Sources */,
+				B50000000000000000000003 /* WatchEndpoint.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -374,6 +497,9 @@
 				B20000000000000000000007 /* ManagedConfigurationTests.swift in Sources */,
 				B20000000000000000000008 /* WorkspaceChromeScriptTests.swift in Sources */,
 				B20000000000000000000006 /* MockHTTPServer.swift in Sources (OmnigentTests) */,
+				B20000000000000000000009 /* WatchCompanionTests.swift in Sources */,
+				B50000000000000000000002 /* WatchModels.swift in Sources */,
+				B50000000000000000000021 /* WatchMarkdown.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -386,6 +512,24 @@
 				B40000000000000000000003 /* RedirectConsentUITests.swift in Sources */,
 				B40000000000000000000005 /* ManagedServersUITests.swift in Sources */,
 				B40000000000000000000004 /* MockHTTPServer.swift in Sources (OmnigentUITests) */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C50000000000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B50000000000000000000010 /* WatchModels.swift in Sources */,
+				B50000000000000000000011 /* WatchEndpoint.swift in Sources */,
+				B50000000000000000000022 /* WatchMarkdown.swift in Sources */,
+				B50000000000000000000012 /* WatchCredentialStore.swift in Sources */,
+				B50000000000000000000013 /* WatchConnectionManager.swift in Sources */,
+				B50000000000000000000014 /* WatchAPIClient.swift in Sources */,
+				B50000000000000000000015 /* WatchSessionStore.swift in Sources */,
+				B50000000000000000000016 /* ContentView.swift in Sources */,
+				B50000000000000000000017 /* WatchSessionDetailView.swift in Sources */,
+				B50000000000000000000018 /* OmnigentWatchApp.swift in Sources */,
+				B5000000000000000000001A /* OmnigentWatchTheme.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -402,6 +546,11 @@
 			target = A00000000000000000000006 /* Omnigent */;
 			targetProxy = E00000000000000000000003 /* PBXContainerItemProxy */;
 		};
+		E50000000000000000000002 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A50000000000000000000006 /* OmnigentWatch */;
+			targetProxy = E50000000000000000000001 /* PBXContainerItemProxy */;
+		};
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
@@ -409,6 +558,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				APP_DISPLAY_NAME = Omnigent;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
@@ -459,6 +609,7 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
+				OMNIGENT_APP_BUNDLE_ID = ai.omnigent.ios;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = iphoneos;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
@@ -470,6 +621,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				APP_DISPLAY_NAME = Omnigent;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
@@ -514,6 +666,7 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
+				OMNIGENT_APP_BUNDLE_ID = ai.omnigent.ios;
 				SDKROOT = iphoneos;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
@@ -524,7 +677,6 @@
 		D10000000000000000000002 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				APP_DISPLAY_NAME = Omnigent;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_IDENTITY = "Apple Development";
@@ -541,7 +693,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.2;
-				PRODUCT_BUNDLE_IDENTIFIER = ai.omnigent.ios;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(OMNIGENT_APP_BUNDLE_ID)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
@@ -555,7 +707,6 @@
 		D10000000000000000000003 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				APP_DISPLAY_NAME = Omnigent;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_IDENTITY = "Apple Development";
@@ -572,7 +723,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.1.2;
-				PRODUCT_BUNDLE_IDENTIFIER = ai.omnigent.ios;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(OMNIGENT_APP_BUNDLE_ID)";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
@@ -677,6 +828,65 @@
 			};
 			name = Release;
 		};
+		D50000000000000000000002 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 8RMX4WU6F8;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsArbitraryLoads = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "$(APP_DISPLAY_NAME)";
+				INFOPLIST_KEY_WKCompanionAppBundleIdentifier = "$(OMNIGENT_APP_BUNDLE_ID)";
+				INFOPLIST_KEY_WKRunsIndependentlyOfCompanionApp = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.2;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(OMNIGENT_APP_BUNDLE_ID).watchkitapp";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "watchos watchsimulator";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 26.0;
+			};
+			name = Debug;
+		};
+		D50000000000000000000003 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 8RMX4WU6F8;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "$(APP_DISPLAY_NAME)";
+				INFOPLIST_KEY_WKCompanionAppBundleIdentifier = "$(OMNIGENT_APP_BUNDLE_ID)";
+				INFOPLIST_KEY_WKRunsIndependentlyOfCompanionApp = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.2;
+				PRODUCT_BUNDLE_IDENTIFIER = "$(OMNIGENT_APP_BUNDLE_ID).watchkitapp";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "watchos watchsimulator";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 26.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -712,6 +922,15 @@
 			buildConfigurations = (
 				D40000000000000000000002 /* Debug */,
 				D40000000000000000000003 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D50000000000000000000001 /* Build configuration list for PBXNativeTarget "OmnigentWatch" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D50000000000000000000002 /* Debug */,
+				D50000000000000000000003 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

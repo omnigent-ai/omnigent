@@ -8,6 +8,7 @@ struct OmnigentApp: App {
 
   init() {
     NativeNotificationManager.shared.start()
+    WatchBridge.shared.start()
   }
 
   var body: some Scene {
