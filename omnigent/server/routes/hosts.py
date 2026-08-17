@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import secrets
 from typing import Any
 
@@ -45,10 +44,10 @@ from omnigent.onboarding.harness_install import (
     ui_install_key,
     ui_installable_harnesses,
 )
-from omnigent.process_logging import env_truthy
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
+from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_launch
@@ -80,10 +79,6 @@ _MODEL_OPTIONS_TIMEOUT_S = 15.0
 # headroom) keeps a genuine slow install from timing out at the server while
 # the host is still succeeding — a "504 but actually installed" outcome.
 _INSTALL_HARNESS_TIMEOUT_S = 420.0
-# Env var that opts a deployment into the UI harness-install feature (default
-# off). Named once here and shared by the route (this file) and the /v1/info
-# flag in app.py so the two reads can never diverge on a typo.
-HARNESS_INSTALL_ENABLED_ENV = "OMNIGENT_HARNESS_INSTALL_ENABLED"
 
 
 def _host_absent_error(host: Host) -> OmnigentError:
@@ -554,6 +549,7 @@ def create_hosts_router(
     permission_store: PermissionStore | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    feature_flags: FeatureFlags | None = None,
 ) -> APIRouter:
     """Build the router for host REST endpoints.
 
@@ -574,8 +570,11 @@ def create_hosts_router(
         :func:`omnigent.server.app.create_app` always supplies it.
     :param agent_cache: Agent-spec cache used to read the agent's
         ``os_env.cwd`` boundary. Paired with ``agent_store``.
+    :param feature_flags: Immutable deployment release-feature snapshot.
+        When omitted, resolves ``OMNIGENT_FEATURES`` at router construction.
     :returns: A FastAPI router with host endpoints.
     """
+    flags = feature_flags or resolve_feature_flags()
     router = APIRouter()
 
     @router.get("/hosts")
@@ -1256,8 +1255,8 @@ def create_hosts_router(
         may install onto it. Scoped to the UI-installable allowlist (claude,
         codex, pi, opencode, qwen) — curl/brew and interactive-auth harnesses
         are refused. The whole route is gated behind
-        ``OMNIGENT_HARNESS_INSTALL_ENABLED`` (default off): when disabled it
-        returns 404 so the feature is invisible until opted in.
+        ``harness_install`` in ``OMNIGENT_FEATURES`` (default off): when
+        disabled it returns 404 so the feature is invisible until opted in.
 
         Concurrent requests for the same (host, harness) coalesce onto one
         in-flight install so a double-click can't fire two global npm installs.
@@ -1275,9 +1274,9 @@ def create_hosts_router(
             caller is not the host owner, 409 when the host is offline, 502 on
             a host-side install failure, 504 on host timeout.
         """
-        # Feature flag (default off): a disabled route is indistinguishable
-        # from a non-existent one, so the feature is fully dark until opted in.
-        if not env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV)):
+        # A disabled route is indistinguishable from a non-existent one, so
+        # the feature is fully dark until the deployment opts in.
+        if not flags.enabled(Feature.HARNESS_INSTALL):
             raise HTTPException(status_code=404, detail="not found")
 
         # Allowlist (400) is checked before the ownership check (403) so error
@@ -1367,7 +1366,7 @@ def create_hosts_router(
         Backs the Web UI setup dialog's "Add a credential" action so a user can
         configure a Claude / Codex / Pi credential on a connected host without a
         terminal. Owner-scoped, allowlisted, and gated behind
-        ``OMNIGENT_HARNESS_INSTALL_ENABLED`` exactly like the install route
+        ``harness_install`` release feature exactly like the install route
         (404 when disabled). The host daemon does the write with the same
         non-interactive core the ``omnigent setup`` wizard uses.
 
@@ -1391,7 +1390,7 @@ def create_hosts_router(
             the owner, 409 when offline, 502 on host-side failure, 504 on
             timeout.
         """
-        if not env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV)):
+        if not flags.enabled(Feature.HARNESS_INSTALL):
             raise HTTPException(status_code=404, detail="not found")
 
         # Allowlist before ownership (403) so error codes can't enumerate
@@ -1484,7 +1483,7 @@ def create_hosts_router(
         :raises HTTPException: 404 when disabled or host unknown, 403 when not
             the owner, 409 when offline, 502/504 on host failure/timeout.
         """
-        if not env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV)):
+        if not flags.enabled(Feature.HARNESS_INSTALL):
             raise HTTPException(status_code=404, detail="not found")
 
         user_id = require_user(request, auth_provider)

@@ -83,7 +83,8 @@ import {
 
 // Re-exported for tests that import the readiness helpers from this module.
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
-import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import { useHeading, usePoweredBy } from "@/lib/branding";
 import {
   isSlashCommandText,
   rankedSlashCommandNames,
@@ -102,6 +103,7 @@ import {
   type ProjectPrefillState,
 } from "./projectPrefill";
 import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
+import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import {
   readLastHostChoice,
@@ -189,7 +191,8 @@ import {
   parseMentionToken,
   rankMentionEntries,
 } from "@/lib/composerMentions";
-import { OttoEyes } from "@/components/OttoEyes";
+import { BrandLogo } from "@/components/BrandLogo";
+import { PoweredByOmnigent } from "@/components/PoweredByOmnigent";
 import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import type { CostControlMode } from "@/components/CostRoutingControl";
@@ -468,6 +471,7 @@ export function ConnectHostInstructions({
   // "loading" before the boot probe resolves → treat as OSS (no Databricks
   // hints) until known, so the clean UI shows first and lakebox never flashes.
   const databricksFeatures = info !== "loading" && info.databricks_features;
+  const quotedServerUrl = quoteShellArgument(serverUrl);
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
       {label && <p className="text-sm text-muted-foreground">{label}</p>}
@@ -483,7 +487,7 @@ export function ConnectHostInstructions({
           </TabsList>
           <TabsContent value="local">
             <CliCommandBlock
-              command={`omni host --server ${serverUrl}`}
+              command={`omni host --server ${quotedServerUrl}`}
               testIdPrefix="connect-host"
             />
           </TabsContent>
@@ -493,13 +497,16 @@ export function ConnectHostInstructions({
               testIdPrefix="connect-lakebox-create"
             />
             <CliCommandBlock
-              command={`omni sandbox connect --provider lakebox --sandbox-id <id> --server ${serverUrl}`}
+              command={`omni sandbox connect --provider lakebox --sandbox-id <id> --server ${quotedServerUrl}`}
               testIdPrefix="connect-lakebox-connect"
             />
           </TabsContent>
         </Tabs>
       ) : (
-        <CliCommandBlock command={`omni host --server ${serverUrl}`} testIdPrefix="connect-host" />
+        <CliCommandBlock
+          command={`omni host --server ${quotedServerUrl}`}
+          testIdPrefix="connect-host"
+        />
       )}
     </div>
   );
@@ -1006,7 +1013,7 @@ export function AgentHarnessPicker({
   const queryClient = useQueryClient();
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
-  const collapsedBadge = info !== "loading" && info.harness_install_enabled;
+  const collapsedBadge = isFeatureEnabled(info, "harness_install");
   const triggerRef = useRef<HTMLButtonElement>(null);
 
   // Touch devices can't hover, so the desktop submenu flyouts ("More",
@@ -1436,7 +1443,7 @@ function HarnessConfigModal({
 }) {
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
-  const collapsedBadge = info !== "loading" && info.harness_install_enabled;
+  const collapsedBadge = isFeatureEnabled(info, "harness_install");
   const entryHarness = nativeCodingAgentForAvailableAgent(agent)?.harness ?? null;
   const hasPermission = nativeAgentHasCapability(agent, "permissionMode");
   const hasApproval = nativeAgentHasCapability(agent, "approvalMode");
@@ -1896,6 +1903,8 @@ export function NewChatLandingScreen() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const queryClient = useQueryClient();
+  const heading = useHeading();
+  const poweredBy = usePoweredBy();
   const serverUrl = getCliServerUrl();
   const { data: agents } = useAvailableAgents();
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
@@ -2015,7 +2024,7 @@ export function NewChatLandingScreen() {
   // Gates the whole UI-driven setup experience (Set up affordance + dialog +
   // collapsed badge). OFF → the composer/picker fall back to the original
   // "run omni setup" guidance, so a disabled flag is a no-op on the UI.
-  const harnessInstallEnabled = info !== "loading" && info.harness_install_enabled;
+  const harnessInstallEnabled = isFeatureEnabled(info, "harness_install");
   // Unfiltered brain-harness labels: safe for membership checks and for
   // labelling an existing pick, but the OPTIONS offered in the gear modal use
   // the gated `brainHarnessLabels` below, which drops the fully-auto row when
@@ -3911,7 +3920,7 @@ export function NewChatLandingScreen() {
     // the hero reads better optically.
     <div
       ref={setLandingSurface}
-      className="flex flex-1 items-center justify-center"
+      className="relative flex flex-1 items-center justify-center"
       data-testid="new-chat-landing"
     >
       {/* Padding lives inside the 840px cap, so the composer renders at
@@ -3931,11 +3940,13 @@ export function NewChatLandingScreen() {
               </div>
             </span>
           ) : (
-            <OttoEyes className="h-14 w-auto shrink-0" />
+            <BrandLogo variant="eyes" className="h-14 w-auto shrink-0" />
           )}
-          <h1 className="min-w-0 break-words text-center text-[1.5em] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
-            {selectedProject || "What should we build?"}
-          </h1>
+          {selectedProject || heading ? (
+            <h1 className="min-w-0 break-words text-center text-[1.5em] md:text-[2.15em] font-normal tracking-[-0.05em] text-foreground line-clamp-2 sm:text-left">
+              {selectedProject || heading}
+            </h1>
+          ) : null}
         </div>
         <div className="relative flex w-full flex-col gap-1">
           <form
@@ -4905,6 +4916,14 @@ export function NewChatLandingScreen() {
           )}
         </div>
       </div>
+
+      {poweredBy ? (
+        <footer className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center pb-4">
+          <div className="pointer-events-auto">
+            <PoweredByOmnigent />
+          </div>
+        </footer>
+      ) : null}
 
       {/* Connect-host instructions, reachable from the host dropdown even when
           no hosts are online — the zero-host escape hatch. */}

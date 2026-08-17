@@ -55,7 +55,10 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --extra databricks
+        # pexpect drives omnigent polly via PTY for the cli_startup journey.
+        run: |
+          uv sync --extra databricks
+          uv pip install pexpect
 
       # Use the same corpus size as the nightly so baseline numbers are
       # directly comparable. Cache the seeded DB on the schema head + seed

@@ -54,6 +54,10 @@ class ErrorCode:
         rather than 400 (the request is valid against a configured
         host) or 503 (retrying cannot succeed without user action —
         running ``omnigent setup`` on the host machine).
+    :cvar WORKSPACE_MISSING: The session's bound workspace no longer
+        exists on the selected host (HTTP 410). Retrying cannot recreate
+        deleted workspace state; the user must start a session in a valid
+        workspace.
     """
 
     UNAUTHORIZED = "unauthorized"
@@ -70,6 +74,7 @@ class ErrorCode:
     # Keep the string equal to frames.HARNESS_NOT_CONFIGURED_ERROR_CODE —
     # the host's wire error code passes through as the API error code.
     HARNESS_NOT_CONFIGURED = "harness_not_configured"
+    WORKSPACE_MISSING = "workspace_missing"
 
 
 # Single source of truth for error code → HTTP status.
@@ -99,6 +104,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # can't satisfy it until the user runs `omnigent setup` there —
     # neither a 400 (input is fine) nor a 503 (a retry won't help).
     ErrorCode.HARNESS_NOT_CONFIGURED: 412,
+    ErrorCode.WORKSPACE_MISSING: 410,
 }
 
 

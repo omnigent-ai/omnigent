@@ -1718,11 +1718,17 @@ async def _execute_subagent_tool(
 
     # Named mode: (agent, title) spawn-or-continue.
     sub_agent_name = args.get("agent")
-    session_name = args.get("title")
+    llm_title_hint = args.get("title")
     if not isinstance(sub_agent_name, str) or not sub_agent_name:
         return "Error: sys_session_send requires 'agent' (or 'session_id')"
-    if not session_name or not isinstance(session_name, str):
-        return "Error: sys_session_send requires non-empty 'title' string"
+    if llm_title_hint is not None and not isinstance(llm_title_hint, str):
+        llm_title_hint = None
+
+    # When the LLM provides a title that matches an existing child's
+    # session_name (e.g. the structured name from a prior handle), use
+    # it for spawn-or-continue. Otherwise auto-generate a structured
+    # name below.
+    session_name: str | None = llm_title_hint if llm_title_hint else None
 
     # Verify the sub-agent exists in the parent spec.
     if not _has_subagent(sub_agent_name, agent_spec):
@@ -1752,14 +1758,18 @@ async def _execute_subagent_tool(
     if parent_agent_id is None:
         return "Error: cannot resolve parent agent_id for sub-agent dispatch"
 
-    existing = await _find_existing_child_session(
-        server_client=server_client,
-        conversation_id=conversation_id,
-        agent=str(sub_agent_name),
-        title=session_name,
-    )
-    if isinstance(existing, str):
-        return existing
+    # If the LLM provided a title, try to find an existing child.
+    existing: _JsonObject | str | None = None
+    if session_name:
+        existing = await _find_existing_child_session(
+            server_client=server_client,
+            conversation_id=conversation_id,
+            agent=str(sub_agent_name),
+            title=session_name,
+        )
+        if isinstance(existing, str):
+            return existing
+    assert not isinstance(existing, str)
     created_child = False
     child_wrapper_label: str | None = None
     if existing is not None:
@@ -1816,6 +1826,32 @@ async def _execute_subagent_tool(
                 "after completion."
             )
     else:
+        if not session_name:
+            # No title hint — auto-generate a structured session name
+            # (e.g. "researcher-1"). Recover ordinals from existing
+            # children on first spawn after runner restart to avoid
+            # duplicates.
+            _all_children = await _list_child_sessions(
+                server_client=server_client,
+                conversation_id=conversation_id,
+                tool=str(sub_agent_name),
+            )
+            if isinstance(_all_children, str):
+                return (
+                    f"Error: cannot allocate sub-agent name for "
+                    f"{sub_agent_name!r}: failed to list existing "
+                    f"children — {_all_children}"
+                )
+            _runner_app.recover_subagent_ordinals(
+                conversation_id,
+                str(sub_agent_name),
+                _all_children,
+            )
+            ordinal = _runner_app.next_subagent_ordinal(
+                conversation_id,
+                str(sub_agent_name),
+            )
+            session_name = f"{sub_agent_name}-{ordinal}"
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
         # Apply an allowlisted per-dispatch harness override. The sub-agent
         # spec must explicitly opt in via executor.config.allowed_harnesses,
@@ -1990,6 +2026,7 @@ async def _execute_subagent_tool(
 
             session_stream.publish(conversation_id, _evt.model_dump())
 
+    assert session_name is not None
     # Register the child→parent mapping so the runner can fan out the
     # child's status/preview deltas onto the PARENT's stream (the child's
     # own relay isn't running when only the parent is being viewed). The

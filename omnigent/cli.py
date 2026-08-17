@@ -70,7 +70,7 @@ from omnigent.inner import _proc, ui
 from omnigent.integration_daemon import IntegrationDaemon
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
-from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR
+from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR, data_dir
 
 if TYPE_CHECKING:
     import socket
@@ -2185,7 +2185,7 @@ def _runner_loopback_host(host: str) -> str:
     return "127.0.0.1" if host in {"0.0.0.0", "::", ""} else host
 
 
-_HOST_PID_PATH = Path.home() / ".omnigent" / "host.pid"
+_HOST_PID_PATH = data_dir() / "host.pid"
 
 
 # host.pid records the daemon PID + the "target" it serves: a normalized
@@ -2888,7 +2888,7 @@ def _foreground_daemon_record(
         started_at=int(time.time()),
         host_id=host_id,
         resolved_server_url=server_url.rstrip("/") if mode == "local" else None,
-        config_sig=server_config_signature(),
+        config_sig=server_config_signature(include_features=mode == "local"),
     )
 
 
@@ -3015,7 +3015,7 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     _persist_spawned_daemon(
         target=target,
         spawned=spawned,
-        config_sig=server_config_signature(),
+        config_sig=server_config_signature(include_features=not server_url),
     )
     return decision.config_changed
 
@@ -3788,6 +3788,10 @@ def server(
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
     cfg = _load_config(config_path)
+
+    # Let the server-config reader (branding) see the same ``-c`` file.
+    if config_path:
+        os.environ["OMNIGENT_CONFIG"] = str(Path(config_path).resolve())
 
     # CLI args take precedence over config file, which takes precedence
     # over defaults.
