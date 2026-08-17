@@ -1164,6 +1164,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                     "resources",
                     "pvc_mounts",
                     "secret_mounts",
+                    "runtime_class",
                 },
                 "sandbox.kubernetes",
             )
@@ -1182,6 +1183,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             resources=_parse_kubernetes_resources(raw),
             pvc_mounts=pvc_mounts,
             secret_mounts=secret_mounts,
+            runtime_class=_parse_provider_string(raw, "kubernetes", "runtime_class"),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     else:
@@ -2106,6 +2108,7 @@ def _validate_kubernetes_identifiers(
     secret_name: str | None,
     service_account: str | None,
     node_selector: dict[str, str] | None,
+    runtime_class: str | None,
 ) -> None:
     """
     Validate the YAML ``sandbox.kubernetes`` identifiers at parse time.
@@ -2116,6 +2119,7 @@ def _validate_kubernetes_identifiers(
     _validate_dns1123_label(namespace, "namespace")
     _validate_dns1123_subdomain(secret_name, "secret_name")
     _validate_dns1123_subdomain(service_account, "service_account")
+    _validate_dns1123_subdomain(runtime_class, "runtime_class")
     for key, value in (node_selector or {}).items():
         if not _validate_label_key(key):
             raise ValueError(
@@ -2431,6 +2435,7 @@ def _kubernetes_launcher_factory(
     resources: dict[str, object] | None,
     pvc_mounts: list[dict[str, object]] | None,
     secret_mounts: list[dict[str, object]] | None,
+    runtime_class: str | None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
@@ -2456,10 +2461,15 @@ def _kubernetes_launcher_factory(
         or ``None``.
     :param secret_mounts: Normalized Secret file-mount entries added to every
         runner Pod (rotation-friendly credential volumes), or ``None``.
+    :param runtime_class: ``RuntimeClass`` name every runner Pod is scheduled
+        under as ``spec.runtimeClassName`` (e.g. ``kata`` for micro-VM
+        isolation), or ``None`` for the cluster's default runtime.
     :returns: A factory producing parameterized Kubernetes launchers.
     :raises ValueError: When a name or node-selector label is malformed.
     """
-    _validate_kubernetes_identifiers(namespace, secret_name, service_account, node_selector)
+    _validate_kubernetes_identifiers(
+        namespace, secret_name, service_account, node_selector, runtime_class
+    )
 
     def _build() -> SandboxHostLauncher:
         """Construct the Kubernetes launcher (lazy SDK import inside)."""
@@ -2477,6 +2487,7 @@ def _kubernetes_launcher_factory(
             resources=resources,
             pvc_mounts=pvc_mounts,
             secret_mounts=secret_mounts,
+            runtime_class=runtime_class,
         )
 
     return _build
