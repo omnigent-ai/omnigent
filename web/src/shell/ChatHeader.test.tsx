@@ -416,8 +416,10 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
     ).toBeInTheDocument();
   });
 
-  it("omits the toggle for a non-terminal-first session", () => {
-    renderHeaderWithSession(makeTerminalFirstCtx({ isTerminalFirst: false }));
+  it("omits the toggle when the session has no terminal view", () => {
+    renderHeaderWithSession(
+      makeTerminalFirstCtx({ isTerminalFirst: false, terminalsAvailable: false }),
+    );
     expect(screen.queryByRole("group", { name: /switch between chat and terminal/i })).toBeNull();
   });
 

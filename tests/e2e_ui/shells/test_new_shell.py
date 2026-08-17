@@ -8,7 +8,7 @@ and opening the new terminal as a rail tab (its xterm renders in the rail's
 content slot). None of this needs an LLM turn — the user, not the agent,
 launches the shell — so these tests never send a chat message.
 
-Three behaviors are covered:
+Four behaviors are covered:
 
 1. **"+" → Shell launches and opens a shell.** Picking Shell creates a
    ``zsh`` shell that opens as a rail tab (``zsh · u-…``): its xterm
@@ -28,7 +28,11 @@ Three behaviors are covered:
    beside the chat header at the 8px outer inset instead of clearing the
    header like the main-column surfaces.
 
-Both use the function-scoped ``terminal_session`` fixture (registers the
+4. **A session without terminal-first metadata gains the view switcher once a
+   terminal exists.** This matches automation-created sessions, which acquire
+   a live terminal without the ``omnigent.ui=terminal`` creation label.
+
+These tests use the function-scoped ``terminal_session`` fixture (registers the
 ``zsh``-declaring agent and a runner-bound session), so each test gets an
 independent session.
 """
@@ -103,6 +107,28 @@ def test_new_shell_launches_and_opens(page: Page, terminal_session: tuple[str, s
     close_tab.click()
     page.get_by_role("button", name="Close shell").click()
     expect(terminal_view).to_have_count(0)
+
+
+def test_live_terminal_enables_view_switcher_without_terminal_first_metadata(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """An unlabeled session can switch Chat → Terminal → Chat once a terminal exists."""
+    base_url, session_id = terminal_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_role("group", name="Switch between chat and terminal")).to_have_count(0)
+
+    _open_new_shell(page)
+    switcher = page.get_by_role("group", name="Switch between chat and terminal")
+    expect(switcher).to_be_visible(timeout=60_000)
+
+    switcher.get_by_role("button", name="Terminal view").click()
+    terminal_panel = page.get_by_role("heading", name="Shells").locator("xpath=ancestor::aside[1]")
+    expect(terminal_panel).to_be_visible()
+
+    terminal_panel.get_by_role("button", name="Close", exact=True).click()
+    expect(terminal_panel).to_be_hidden()
+    expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible()
 
 
 def test_new_shell_accepts_typed_command(page: Page, terminal_session: tuple[str, str]) -> None:

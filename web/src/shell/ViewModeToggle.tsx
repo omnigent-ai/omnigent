@@ -13,14 +13,21 @@ import { useTerminalFirst } from "./TerminalFirstContext";
  * toggle.
  *
  * Self-gates to null when there's nothing to toggle:
- *   - non-terminal-first sessions,
+ *   - sessions without a terminal view,
  *   - the iOS shell (the switcher is the native Liquid Glass bar there),
  *   - a rail-opened shell owning the main view (isShellView) — its own
  *     close affordance is the way back to chat.
  */
 export function ViewModeToggle() {
   const ctx = useTerminalFirst();
-  if (!ctx || !ctx.isTerminalFirst || ctx.isShellView || isIOSShell()) return null;
+  if (
+    !ctx ||
+    (!ctx.isTerminalFirst && !ctx.terminalsAvailable) ||
+    ctx.isShellView ||
+    isIOSShell()
+  ) {
+    return null;
+  }
 
   const { view, setView, terminalStartingUp } = ctx;
   const terminalLabel = terminalStartingUp ? "Terminal is starting up…" : "Terminal view";
