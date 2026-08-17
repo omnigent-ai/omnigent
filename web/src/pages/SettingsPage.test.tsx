@@ -93,6 +93,7 @@ vi.mock("@/hooks/useConversations", async () => {
     // Picker options are sourced from this dedicated scan, decoupled from the
     // loaded rows so archived-only projects on later pages still appear.
     useArchivedProjectNames: () => ({ data: mocks.projectNames }),
+    useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
     // Mirrors react-query's mutate: per-call `onSuccess` runs once the
     // mutation settles, which is what drives the post-unarchive navigation.
     useArchiveConversation: () => ({

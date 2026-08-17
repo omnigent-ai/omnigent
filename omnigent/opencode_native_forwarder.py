@@ -1043,8 +1043,8 @@ def opencode_tool_output_text(state: _JsonMapping) -> str:
 # resolves the method on the instance. Keys are OpenCode event ``type``
 # discriminators (see openapi.json Event* schemas).
 _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitable[None]]] = {
-    # opencode 1.17.x is part-based: text/tool live on message PARTS, lifecycle
-    # on the message + session. (Verified against a real ``opencode serve``.)
+    # opencode 1.17.x–1.18.x is part-based: text/tool live on message PARTS,
+    # lifecycle on the message + session. (Verified against real ``opencode serve``.)
     "message.updated": OpenCodeNativeForwarder._on_message_updated,
     "message.part.updated": OpenCodeNativeForwarder._on_part_updated,
     # NB: ``message.part.delta`` (live token stream) is intentionally NOT
@@ -1066,7 +1066,7 @@ _HANDLERS: dict[str, Callable[[OpenCodeNativeForwarder, OpenCodeEvent], Awaitabl
     "session.compacted": OpenCodeNativeForwarder._on_compaction_ended,
     # Mirror a TUI model switch back to Omnigent (in-harness session-cmd sync).
     "session.next.model.switched": OpenCodeNativeForwarder._on_model_switched,
-    # Permission ask: 1.17.x emits ``permission.asked``; keep the ``v2`` spelling
+    # Permission ask: pre-1.18 emits ``permission.asked``; keep the ``v2`` spelling
     # too so a point-release rename still routes through the policy gate.
     "permission.asked": OpenCodeNativeForwarder._on_permission_asked,
     "permission.v2.asked": OpenCodeNativeForwarder._on_permission_asked,

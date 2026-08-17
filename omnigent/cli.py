@@ -70,7 +70,7 @@ from omnigent.inner import _proc, ui
 from omnigent.integration_daemon import IntegrationDaemon
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
-from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR
+from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR, data_dir
 
 if TYPE_CHECKING:
     import socket
@@ -2185,7 +2185,7 @@ def _runner_loopback_host(host: str) -> str:
     return "127.0.0.1" if host in {"0.0.0.0", "::", ""} else host
 
 
-_HOST_PID_PATH = Path.home() / ".omnigent" / "host.pid"
+_HOST_PID_PATH = data_dir() / "host.pid"
 
 
 # host.pid records the daemon PID + the "target" it serves: a normalized
@@ -2394,6 +2394,7 @@ def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) ->
         method="GET",
         path=f"/v1/hosts/{url_component(host_id)}",
         timeout_s=timeout_s,
+        host_id=host_id,
     )
     if result.status_code != 200 or not isinstance(result.body, dict):
         return False
@@ -2887,7 +2888,7 @@ def _foreground_daemon_record(
         started_at=int(time.time()),
         host_id=host_id,
         resolved_server_url=server_url.rstrip("/") if mode == "local" else None,
-        config_sig=server_config_signature(),
+        config_sig=server_config_signature(include_features=mode == "local"),
     )
 
 
@@ -3014,7 +3015,7 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     _persist_spawned_daemon(
         target=target,
         spawned=spawned,
-        config_sig=server_config_signature(),
+        config_sig=server_config_signature(include_features=not server_url),
     )
     return decision.config_changed
 
@@ -3140,7 +3141,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     try:
         probe = _httpx.get(
             f"{server}/v1/me",
-            headers=_remote_headers(server_url=server),
+            headers=_remote_headers(server_url=server, host_id=None),
             timeout=10.0,
         )
     except _httpx.HTTPError:
@@ -3199,10 +3200,24 @@ def _ensure_backend(server: str | None) -> str:
         # otherwise the session-create call deep in the REPL bring-up
         # surfaces the edge redirect as an opaque non-JSON-response
         # traceback.
+        #
+        # The auth probe (GET /v1/me, ~0.65s) and the daemon tunnel start
+        # (~2s) are independent — run them concurrently so the auth check
+        # is hidden under the longer daemon wait.
+        import concurrent.futures
+
         server = _resolve_server_url(server)
-        _ensure_databricks_server_auth(server)
-        with runner_startup_progress(initial_message=STARTUP_PHASE_CONNECTING_REMOTE):
-            _ensure_host_daemon(server)
+        with (
+            runner_startup_progress(initial_message=STARTUP_PHASE_CONNECTING_REMOTE),
+            concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            auth_future = pool.submit(_ensure_databricks_server_auth, server)
+            daemon_future = pool.submit(_ensure_host_daemon, server)
+            # Raise auth errors before daemon errors: a login failure is
+            # more actionable than a daemon-connect failure that would
+            # have been caused by the same missing credentials.
+            auth_future.result()
+            daemon_future.result()
         return server
     # Local mode: the daemon spawns (or reuses) a persistent local Omnigent server.
     # On a cold start this is the longest silent gap between the user pressing
@@ -3427,7 +3442,11 @@ def _start_cli_runner_process(
     try:
         with child_logging_popen_kwargs(env) as logging_kwargs:
             runner_proc: subprocess.Popen[bytes] = subprocess.Popen(
-                [sys.executable, "-m", "omnigent.runner._entry"],
+                # This runner inherits the CLI's cwd, so -P is what stops a
+                # checkout you launched from shadowing the installed omnigent
+                # (the daemon and zygote spawns do the same). _entry re-adds the
+                # cwd afterwards, keeping spec-declared local tools importable.
+                [sys.executable, "-P", "-m", "omnigent.runner._entry"],
                 env=env,
                 stdout=log_fh,
                 stderr=log_fh,
@@ -3769,6 +3788,10 @@ def server(
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
     cfg = _load_config(config_path)
+
+    # Let the server-config reader (branding) see the same ``-c`` file.
+    if config_path:
+        os.environ["OMNIGENT_CONFIG"] = str(Path(config_path).resolve())
 
     # CLI args take precedence over config file, which takes precedence
     # over defaults.
@@ -5736,7 +5759,7 @@ def import_session_command(
             response = httpx.post(
                 f"{base_url}/v1/imports",
                 json=payload,
-                headers=_remote_headers(server_url=base_url),
+                headers=_remote_headers(server_url=base_url, host_id=None),
                 timeout=120.0,
             )
         except httpx.RequestError as exc:
@@ -5934,7 +5957,7 @@ def usage(limit: int, server: str | None, as_json: bool) -> None:
 
     with httpx.Client(
         base_url=base_url,
-        headers=_remote_headers(server_url=base_url),
+        headers=_remote_headers(server_url=base_url, host_id=None),
         timeout=60.0,
         trust_env=_trust_env_for(base_url),
     ) as client:
@@ -6018,7 +6041,7 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
 
     with httpx.Client(
         base_url=base_url,
-        headers=_remote_headers(server_url=base_url),
+        headers=_remote_headers(server_url=base_url, host_id=None),
         timeout=30.0,
         trust_env=_trust_env_for(base_url),
     ) as client:
@@ -6260,7 +6283,7 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
 
     with httpx.Client(
         base_url=base_url,
-        headers=_remote_headers(server_url=base_url),
+        headers=_remote_headers(server_url=base_url, host_id=None),
         timeout=120.0,
         trust_env=_trust_env_for(base_url),
     ) as client:
@@ -6479,10 +6502,24 @@ def _materialize_harness_launcher_file(
     if acp_agent is not None:
         if canonical != "acp":
             raise click.ClickException("An ephemeral ACP agent requires the acp harness.")
-        executor["acp_agent"] = {
+        # Embed all fields that affect spawn so the remote server sees the same
+        # agent config as the client. Preserve session_id_mode, send_model,
+        # omnigent_mcp, env_passthrough, and model.
+        agent_dict: dict[str, object] = {
             "name": acp_agent.name,
             "command": acp_agent.command,
         }
+        if acp_agent.model is not None:
+            agent_dict["model"] = acp_agent.model
+        if acp_agent.session_id_mode != "server":
+            agent_dict["session_id_mode"] = acp_agent.session_id_mode
+        if acp_agent.send_model:
+            agent_dict["send_model"] = acp_agent.send_model
+        if not acp_agent.omnigent_mcp:
+            agent_dict["omnigent_mcp"] = acp_agent.omnigent_mcp
+        if acp_agent.env_passthrough:
+            agent_dict["env_passthrough"] = list(acp_agent.env_passthrough)
+        executor["acp_agent"] = agent_dict
 
     raw = {
         "name": display_name,
@@ -6776,7 +6813,7 @@ def _dispatch_native_terminal_harness(
         session_id = _resolve_latest_conversation_id(
             base_url=server,
             agent_name=native_agent.agent_name,
-            headers=_remote_headers(server_url=server),
+            headers=_remote_headers(server_url=server, host_id=None),
         )
         # The user explicitly asked to continue; if there's nothing to continue,
         # fail loud rather than silently starting fresh (matches the REPL's
@@ -7558,6 +7595,17 @@ def run(
             raise click.ClickException("--from-openclaw cannot be combined with --harness.")
         acp_agent = _resolve_openclaw_run_agent(from_openclaw)
         harness = f"acp:{acp_agent.slug}"
+    # Client-side harness resolution for acp:<slug>: resolve the slug before
+    # embedding in the spec so it works with remote servers. The server would resolve
+    # the slug from ITS config (if present), but fails when the agent is only
+    # configured locally on the client. Embedding the resolved agent avoids this gap.
+    # Preserve the existing config-lookup path as fallback; specs authored by hand
+    # still use it.
+    if acp_agent is None and harness is not None and harness.startswith("acp:"):
+        from omnigent.onboarding.acp_auth import resolve_acp_agent
+
+        slug = harness.split(":", 1)[1]
+        acp_agent = resolve_acp_agent(slug)
     direct_server_cli = (
         target is None
         and server_from_cli
@@ -8119,7 +8167,7 @@ def _selected_daemon_records(
 # Databricks CLI). Within a single CLI invocation the token is valid, so
 # resolving once and reusing it is safe. The lock serialises concurrent
 # resolution for the same URL (two threads must not both pay the cost).
-_host_http_headers_cache: dict[str, dict[str, str]] = {}
+_host_http_headers_cache: dict[tuple[str, str | None], dict[str, str]] = {}
 _host_http_headers_lock = threading.Lock()
 
 
@@ -8146,6 +8194,7 @@ def _host_http_json(
     params: dict[str, str | int] | None = None,
     json_body: _HostJsonObject | None = None,
     timeout_s: float = 10.0,
+    host_id: str | None = None,
 ) -> _HostHttpResult:
     """
     Send one management request to an Omnigent server.
@@ -8160,6 +8209,10 @@ def _host_http_json(
         ``{"type": "stop_session", "data": {}}``.
     :param timeout_s: Request timeout in seconds, e.g. ``2.0`` for a
         quick liveness probe. Defaults to ``10.0`` for management calls.
+    :param host_id: The host this request is scoped to (host-control, or a
+        host-backed session event like stop_session), so it reaches the replica
+        holding that host's tunnel. ``None`` for non-host-scoped calls; the
+        builder emits the routing header only on the workspace-hosted server.
     :returns: Decoded HTTP result.
     """
     import httpx
@@ -8167,11 +8220,17 @@ def _host_http_json(
     from omnigent.chat import _remote_headers
 
     try:
-        if base_url not in _host_http_headers_cache:
+        # Cache the resolved headers per (base_url, host_id): the auth resolution
+        # is the expensive part (token mint / CLI shell-out), and the slice-key
+        # varies by the host a call is scoped to, so both belong in the key.
+        cache_key = (base_url, host_id)
+        if cache_key not in _host_http_headers_cache:
             with _host_http_headers_lock:
-                if base_url not in _host_http_headers_cache:
-                    _host_http_headers_cache[base_url] = _remote_headers(server_url=base_url)
-        headers = _host_http_headers_cache[base_url]
+                if cache_key not in _host_http_headers_cache:
+                    _host_http_headers_cache[cache_key] = _remote_headers(
+                        server_url=base_url, host_id=host_id
+                    )
+        headers = _host_http_headers_cache[cache_key]
         with httpx.Client(
             base_url=base_url,
             headers=headers,
@@ -8386,12 +8445,22 @@ def _runner_online_map(
             if isinstance((runner_id := session.get("runner_id")), str) and runner_id
         }
     )
+    # A runner is spawned on exactly one host; its status endpoint reads the
+    # in-memory tunnel registry, so the check must reach that host's replica or
+    # it reports the runner offline. The session rows carry each runner's host.
+    runner_host: dict[str, str] = {}
+    for session in sessions:
+        rid = session.get("runner_id")
+        host = session.get("host_id")
+        if isinstance(rid, str) and rid and isinstance(host, str) and host:
+            runner_host.setdefault(rid, host)
     statuses: dict[str, bool | None] = {}
     for runner_id in runner_ids:
         result = _host_http_json(
             base_url=base_url,
             method="GET",
             path=f"/v1/runners/{url_component(runner_id)}/status",
+            host_id=runner_host.get(runner_id),
         )
         if result.status_code == 200 and isinstance(result.body, dict):
             online = result.body.get("online")
@@ -8472,6 +8541,7 @@ def _add_daemon_host_status(
         base_url=base_url,
         method="GET",
         path=f"/v1/hosts/{url_component(host_id)}",
+        host_id=host_id,
     )
     if host_result.status_code == 200 and isinstance(host_result.body, dict):
         status = host_result.body.get("status")
@@ -8952,11 +9022,27 @@ def _stop_session_on_server(
     """
     from omnigent.claude_native_bridge import url_component
 
+    # This is a standalone CLI process with an empty session→host map, so read
+    # the session's host from its record first: the stop_session event is a
+    # server→runner forward and must reach the replica holding the runner's
+    # tunnel. The metadata GET itself is host-agnostic (served from any replica).
+    host_id: str | None = None
+    info = _host_http_json(
+        base_url=base_url,
+        method="GET",
+        path=f"/v1/sessions/{url_component(session_id)}",
+    )
+    if info.status_code == 200 and isinstance(info.body, dict):
+        host_value = info.body.get("host_id")
+        if isinstance(host_value, str) and host_value:
+            host_id = host_value
+
     result = _host_http_json(
         base_url=base_url,
         method="POST",
         path=f"/v1/sessions/{url_component(session_id)}/events",
         json_body={"type": "stop_session", "data": {}},
+        host_id=host_id,
     )
     if result.status_code == 0:
         raise click.ClickException(

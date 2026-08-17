@@ -171,10 +171,10 @@ a PNG produced this way** — a stray `git add -A` would commit a wrong-renderer
 baseline and break CI. Use the Docker path above to produce a committable PNG.
 
 ```bash
-uv sync --extra all --extra dev
-uv run playwright install --with-deps chromium
+uv sync --extra all --group test
+uv run --no-sync playwright install --with-deps chromium
 pnpm install --frozen-lockfile --filter web
 pnpm --filter web run build
 # First run with no baseline creates one (and fails); subsequent runs compare:
-uv run pytest tests/e2e_ui/visual -m visual --ui-skip-build
+uv run --no-sync pytest tests/e2e_ui/visual -m visual --ui-skip-build
 ```

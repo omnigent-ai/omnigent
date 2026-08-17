@@ -34,6 +34,7 @@ import {
   shouldShowTerminalSurface,
   updateWarmTerminalSurfaces,
   type WarmTerminalEntry,
+  isBackgroundTasksOnly,
   splitSlashCommand,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
@@ -436,6 +437,30 @@ describe("buildPendingBubbles", () => {
     // p.author ("bob") wins over the viewer's selfAuthor ("alice").
     expect(bubble.createdBy).toBe("bob@example.com");
   });
+
+  it("carries the send-time stamp; replayed entries show no re-stamped time", () => {
+    // A fresh send was stamped once in the store at send time — the
+    // optimistic bubble shows THAT time, not a drifting render-time
+    // Date.now(). Snapshot-replayed entries carry no stamp (the server
+    // has none for pending inputs), so the bubble renders no timestamp
+    // rather than pretending the reload time was the send time.
+    const [stamped] = buildPendingBubbles(
+      [
+        {
+          tempId: "tmp_2",
+          content: [{ type: "input_text" as const, text: "hi" }],
+          createdAtS: 1_753_900_000,
+        },
+      ],
+      null,
+    ) as [Extract<Bubble, { kind: "user" }>];
+    expect(stamped.createdAtS).toBe(1_753_900_000);
+    const [replayed] = buildPendingBubbles(
+      [{ tempId: "tmp_3", content: [{ type: "input_text" as const, text: "hi" }] }],
+      null,
+    ) as [Extract<Bubble, { kind: "user" }>];
+    expect(replayed.createdAtS).toBeUndefined();
+  });
 });
 
 // ── mergePendingBubbles ────────────────────────────────────────────────────
@@ -454,9 +479,13 @@ const assistantText = (id: string): Bubble => ({
   error: null,
   items: [{ kind: "text", itemId: id, text: "hi", final: true }],
 });
-const elicitationBubble = (id: string, phase: string): Bubble => ({
+// A card with no turn to anchor to carries the `elicit_*` response id
+// blockStream stamps for exactly that case; pass `responseId` to model a
+// card that DOES belong to a turn (an inline approval, or a question card
+// the walker split into its own bubble).
+const elicitationBubble = (id: string, phase: string, responseId = `elicit_${id}`): Bubble => ({
   kind: "assistant",
-  responseId: id,
+  responseId,
   stableId: id,
   lifecycle: "completed",
   error: null,
@@ -621,6 +650,16 @@ describe("reorderCommittedRequestElicitations", () => {
 
   it("does NOT reorder a tool_call-phase card followed by a user message", () => {
     const committed = [elicitationBubble("e1", "tool_call"), userBubble("u1")];
+    const result = reorderCommittedRequestElicitations(committed);
+    expect(result).toBe(committed);
+    expect(bubbleIds(result)).toEqual(["e1", "u1"]);
+  });
+
+  it("does NOT reorder a card anchored to a turn", () => {
+    // A question/plan card the walker split out of its turn keeps that
+    // turn's response id. It gated nothing — the message after it is a NEW
+    // prompt — so lifting the prompt above it would reorder history.
+    const committed = [elicitationBubble("e1", "pre_tool_use", "resp_1"), userBubble("u1")];
     const result = reorderCommittedRequestElicitations(committed);
     expect(result).toBe(committed);
     expect(bubbleIds(result)).toEqual(["e1", "u1"]);
@@ -1036,6 +1075,20 @@ describe("workingIndicatorLabel", () => {
   it("ignores the tick while background tasks remain", () => {
     // The count is information, not decoration — it must not rotate away.
     expect(workingIndicatorLabel(2, 5)).toBe("2 background tasks still running");
+  });
+});
+
+// ── isBackgroundTasksOnly ───────────────────────────────────────────────────
+
+describe("isBackgroundTasksOnly", () => {
+  it("is true only when background tasks remain and nothing is blocked", () => {
+    expect(isBackgroundTasksOnly(2, null)).toBe(true);
+    expect(isBackgroundTasksOnly(0, null)).toBe(false);
+  });
+
+  it("yields to a parked dialog so the shimmer still shouts", () => {
+    // blockedOn needs an action; it must never sit as a quiet pill.
+    expect(isBackgroundTasksOnly(2, "permission prompt")).toBe(false);
   });
 });
 
@@ -1606,6 +1659,7 @@ describe("routing eligibility gates", () => {
       server_version: null,
       smart_routing_enabled: smartRouting,
       smart_routing_sources: { external: smartRouting, oss: smartRouting },
+      features: {},
       harness_install_enabled: false,
       installable_harnesses: [],
       dictation_available: false,

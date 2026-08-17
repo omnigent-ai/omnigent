@@ -1313,7 +1313,7 @@ def _build_codex_spawn_env(
         agent cache). Threaded through as
         ``HARNESS_CODEX_BUNDLE_DIR`` so the harness wrap's executor
         can also source bundled skills from
-        ``<bundle>/skills/<name>/``.
+        ``<bundle>/skills/<dir>/``.
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
@@ -1385,7 +1385,7 @@ def _build_pi_spawn_env(
     :param workdir: The bundle's on-disk path (extracted by the
         agent cache). Threaded through as ``HARNESS_PI_BUNDLE_DIR``
         so the harness wrap's executor can source bundled skills
-        from ``<bundle>/skills/<name>/``.
+        from ``<bundle>/skills/<dir>/``.
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
@@ -1614,10 +1614,25 @@ def _build_acp_spawn_env(
         omnigent_mcp = embedded.get("omnigent_mcp", True)
         if not isinstance(omnigent_mcp, bool):
             raise ValueError("executor acp_agent omnigent_mcp must be a boolean")
+        session_id_mode = embedded.get("session_id_mode", "server")
+        if session_id_mode not in ("server", "client"):
+            raise ValueError(
+                f"executor acp_agent session_id_mode must be 'server' or 'client', "
+                f"got {session_id_mode!r}"
+            )
+        send_model = embedded.get("send_model", False)
+        if not isinstance(send_model, bool):
+            raise ValueError("executor acp_agent send_model must be a boolean")
+        model = embedded.get("model")
+        if model is not None and not isinstance(model, str):
+            raise ValueError("executor acp_agent model must be a string or null")
         agent = AcpAgentEntry(
             slug=slug or "agent",
             name=name.strip(),
             command=command.strip(),
+            model=model,
+            session_id_mode=session_id_mode,
+            send_model=send_model,
             omnigent_mcp=omnigent_mcp,
             env_passthrough=parse_env_passthrough(embedded.get("env_passthrough")),
         )

@@ -12,11 +12,12 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from sqlalchemy.exc import StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
@@ -36,6 +37,7 @@ from omnigent.runtime import (
     get_terminal_registry,
     pending_elicitations,
     set_harness_process_manager,
+    set_runner_direct_attach_resolver,
     set_runner_router,
     set_runner_ws_factory,
 )
@@ -47,7 +49,8 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
-from omnigent.server.managed_hosts import ManagedSandboxConfig
+from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
+from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
@@ -100,6 +103,45 @@ from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 _logger = logging.getLogger(__name__)
 
 
+class SmartRoutingSourcesInfo(BaseModel):
+    external: bool
+    oss: bool
+
+
+class BrandingLogosInfo(BaseModel):
+    main: str | None
+    loading: str | None
+    favicon: str | None
+
+
+class BrandingInfo(BaseModel):
+    app_name: str | None
+    heading: str | None
+    logos: BrandingLogosInfo
+    powered_by: bool
+
+
+class ServerInfoResponse(BaseModel):
+    accounts_enabled: bool
+    single_user: bool
+    login_url: str | None
+    needs_setup: bool
+    databricks_features: bool
+    managed_sandboxes_enabled: bool
+    sandbox_provider: str | None
+    sandbox_providers: list[str]
+    sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
+    public_sharing_enabled: bool
+    server_version: str
+    smart_routing_enabled: bool
+    smart_routing_sources: SmartRoutingSourcesInfo
+    features: dict[str, bool]
+    harness_install_enabled: bool
+    installable_harnesses: list[str]
+    dictation_available: bool
+    branding: BrandingInfo
+
+
 def _server_version() -> str:
     """Return the server version exposed to clients.
 
@@ -130,10 +172,6 @@ def _register_web_mimetypes() -> None:
         (".map", "application/json"),
         (".wasm", "application/wasm"),
         (".svg", "image/svg+xml"),
-        # Python's mimetypes DB has no ``.webmanifest`` entry, so without this
-        # Starlette serves the PWA manifest as ``application/octet-stream`` and
-        # browsers silently refuse to install the app.
-        (".webmanifest", "application/manifest+json"),
     ):
         mimetypes.add_type(ctype, ext)
 
@@ -762,10 +800,11 @@ def create_app(
     debug_router_modules: list[str] | None = None,
     admins: list[str] | None = None,
     allowed_domains: list[str] | None = None,
-    sandbox_config: ManagedSandboxConfig | None = None,
+    sandbox_config: ManagedSandboxDeployment | None = None,
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
+    feature_flags: FeatureFlags | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -856,6 +895,9 @@ def create_app(
         open to ``ON`` when unset or unrecognized. Reported by
         ``GET /v1/info`` as ``sharing_mode`` so the web app can gate its
         Share controls to match.
+    :param feature_flags: Optional immutable release-feature snapshot.
+        When omitted, resolves the comma-separated ``OMNIGENT_FEATURES``
+        enabled set once at application construction.
     :param public_sharing: Whether public (anyone-with-the-link) read
         access may be granted — i.e. whether the ``__public__`` grant is
         allowed. Orthogonal to ``sharing_mode``: a server can keep normal
@@ -874,6 +916,11 @@ def create_app(
     """
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
+
+    from omnigent.server.server_config import load_branding_snapshot
+
+    branding_snapshot = load_branding_snapshot(server_config)
+    resolved_feature_flags = feature_flags or resolve_feature_flags()
 
     # First-boot admin bootstrap for the accounts auth provider.
     # Runs before any route is mounted so the login page is never
@@ -912,9 +959,17 @@ def create_app(
     from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 
     tunnel_registry = TunnelRegistry()
+    host_registry = HostRegistry()
     runner_router = RunnerRouter(
         registry=tunnel_registry,
         conversation_store=conversation_store,
+        # host_registry answers "is the host on this replica"; host_store adds
+        # the "is it alive anywhere" gate. Together they classify a wrong-replica
+        # miss (re-addressable WRONG_REPLICA) apart from a genuinely offline
+        # runner (RUNNER_UNAVAILABLE) — a host reaped locally but dead everywhere
+        # is the latter, not a false wrong-replica.
+        host_registry=host_registry,
+        host_store=host_store,
     )
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
@@ -924,7 +979,6 @@ def create_app(
         conversation_store,
         RunnerBackgroundTitleGenerator(runner_router),
     )
-    host_registry = HostRegistry()
     # Shared between the host tunnel (which records ``host.runner_exited``
     # reports from daemons) and the runner status endpoint (which surfaces
     # them to clients waiting for a launched runner to connect).
@@ -1021,9 +1075,18 @@ def create_app(
         # Install the tunnel-backed WS factory so browser terminal
         # attach can proxy frames over the same persistent WebSocket
         # the runner already uses for HTTP.
-        from omnigent.server._runner_ws_tunnel import make_tunnel_ws_factory
+        from omnigent.server._runner_ws_tunnel import (
+            make_direct_attach_resolver,
+            make_tunnel_ws_factory,
+        )
 
         set_runner_ws_factory(make_tunnel_ws_factory(runner_router, tunnel_registry))
+        # Companion resolver: lets the terminals API surface a runner's
+        # advertised loopback attach endpoint so a browser on the same
+        # machine can skip the relay entirely.
+        set_runner_direct_attach_resolver(
+            make_direct_attach_resolver(runner_router, tunnel_registry)
+        )
 
         # MCP execution moved to the runner (designs/RUNNER_MCP.md);
         # SessionFilesystemRegistry moved to the runner. Both
@@ -1145,6 +1208,7 @@ def create_app(
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
             set_runner_ws_factory(None)
+            set_runner_direct_attach_resolver(None)
             set_runner_router(None)
             await runner_router.aclose()
 
@@ -1171,6 +1235,8 @@ def create_app(
     app.state.host_store = host_store
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
+    app.state.branding_snapshot = branding_snapshot
+    app.state.feature_flags = resolved_feature_flags
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -1762,8 +1828,8 @@ def create_app(
             "ui": {"server_picker": "sidebar"},
         }
 
-    @app.get("/v1/info")
-    async def info() -> dict[str, bool | str | list[str] | dict[str, bool] | None]:
+    @app.get("/v1/info", response_model=ServerInfoResponse)
+    async def info() -> ServerInfoResponse:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -1832,11 +1898,16 @@ def create_app(
         # generic "New Sandbox". Only surfaced when the option is
         # actually offered; None when no provider is named (embedding
         # configs may leave it unset) so the UI keeps the generic label.
+        # sandbox_providers lists every launch-capable provider (one picker
+        # row each); sandbox_provider keeps naming the first, so a bundle
+        # cached before this field existed still shows its single option.
         managed_sandboxes_enabled = False
         sandbox_provider = None
+        sandbox_providers: list[str] = []
         if sandbox_config is not None and sandbox_config.managed_launch_supported:
             managed_sandboxes_enabled = True
-            sandbox_provider = sandbox_config.provider
+            sandbox_provider = sandbox_config.default.provider
+            sandbox_providers = list(sandbox_config.launchable_providers())
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
         # control (off) or restrict it to read-only (read_only) in lockstep
@@ -1869,17 +1940,10 @@ def create_app(
         except ImportError:
             smart_routing_enabled = False
             smart_routing_sources = {"external": False, "oss": False}
-        # harness_install_enabled gates the web UI's "Install" action for a
-        # missing, npm-installable harness on a connected host. Off by default
-        # (OMNIGENT_HARNESS_INSTALL_ENABLED=1 opts in) while the feature rolls
-        # out; when false the SPA keeps the prior "run omnigent setup" hint.
-        # Read live so flipping the env var takes effect without a rebuild.
-        # The env-var name is shared with the install route so the flag the UI
-        # sees and the flag the route enforces can never drift apart.
-        from omnigent.process_logging import env_truthy
-        from omnigent.server.routes.hosts import HARNESS_INSTALL_ENABLED_ENV
-
-        harness_install_enabled = env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV))
+        # The immutable feature snapshot is shared by capability
+        # advertisement and route enforcement, so frontend and backend cannot
+        # disagree during a process lifetime.
+        harness_install_enabled = app.state.feature_flags.enabled(Feature.HARNESS_INSTALL)
         # installable_harnesses: the exact harness ids the install route accepts
         # (bare ids + native spellings resolving to an npm-installable family),
         # so the SPA offers setup only where it will succeed and never has to
@@ -1897,23 +1961,59 @@ def create_app(
         from omnigent.server.dictation import engine_availability
 
         dictation_available, _ = engine_availability()
-        return {
-            "accounts_enabled": accounts_enabled,
-            "single_user": single_user,
-            "login_url": login_url,
-            "needs_setup": needs_setup,
-            "databricks_features": databricks_features,
-            "managed_sandboxes_enabled": managed_sandboxes_enabled,
-            "sandbox_provider": sandbox_provider,
-            "sharing_mode": sharing_mode.value,
-            "public_sharing_enabled": public_sharing_enabled,
-            "server_version": _server_version(),
-            "smart_routing_enabled": smart_routing_enabled,
-            "smart_routing_sources": smart_routing_sources,
-            "harness_install_enabled": harness_install_enabled,
-            "installable_harnesses": installable_harnesses,
-            "dictation_available": dictation_available,
-        }
+        return ServerInfoResponse.model_validate(
+            {
+                "accounts_enabled": accounts_enabled,
+                "single_user": single_user,
+                "login_url": login_url,
+                "needs_setup": needs_setup,
+                "databricks_features": databricks_features,
+                "managed_sandboxes_enabled": managed_sandboxes_enabled,
+                "sandbox_provider": sandbox_provider,
+                "sandbox_providers": sandbox_providers,
+                "sharing_mode": sharing_mode.value,
+                "public_sharing_enabled": public_sharing_enabled,
+                "server_version": _server_version(),
+                "smart_routing_enabled": smart_routing_enabled,
+                "smart_routing_sources": smart_routing_sources,
+                "features": app.state.feature_flags.frontend_dict(),
+                "harness_install_enabled": harness_install_enabled,
+                "installable_harnesses": installable_harnesses,
+                "dictation_available": dictation_available,
+                "branding": branding_snapshot.config(),
+            }
+        )
+
+    @app.get(
+        "/v1/branding/logo/{variant}",
+        response_class=Response,
+        responses={
+            200: {
+                "description": "Validated raster branding image",
+                "content": {
+                    media_type: {"schema": {"type": "string", "format": "binary"}}
+                    for media_type in (
+                        "image/gif",
+                        "image/jpeg",
+                        "image/png",
+                        "image/webp",
+                        "image/x-icon",
+                    )
+                },
+            },
+            404: {"description": "Branding image not configured or invalid"},
+        },
+    )
+    async def branding_logo(variant: str) -> Response:
+        """Serve a validated public branding asset, or 404 when unset."""
+        asset = branding_snapshot.logo_asset(variant)
+        if asset is None:
+            raise StarletteHTTPException(status_code=404, detail="Branding logo not found")
+        return Response(
+            content=asset.content,
+            media_type=asset.media_type,
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
     async def me(request: Request) -> dict[str, str | bool | None] | JSONResponse:
@@ -2012,6 +2112,7 @@ def create_app(
         create_usage_router(
             conversation_store,
             auth_provider=auth_provider,
+            feature_flags=resolved_feature_flags,
         ),
         prefix="/v1",
         tags=["usage"],
@@ -2478,6 +2579,7 @@ def create_app(
                 permission_store=permission_store,
                 agent_store=agent_store,
                 agent_cache=agent_cache,
+                feature_flags=resolved_feature_flags,
             ),
             prefix="/v1",
             tags=["hosts"],
@@ -2771,10 +2873,10 @@ def _apply_web_ui_cache_headers(response: Response, path: str) -> Response:
     media_type = content_type.partition(";")[0].lower() if content_type is not None else None
     if path.startswith("assets/"):
         response.headers["Cache-Control"] = _WEB_UI_ASSET_CACHE_CONTROL
-    elif path in {"sw.js", "version.json"}:
-        # The service worker and the version sentinel it precaches must
-        # revalidate on every load, or the HTTP cache could mask a deploy for up
-        # to an hour and defeat prompt-to-reload.
+    elif path == "sw.js":
+        # Keep this exemption even after the tombstone worker is deleted in
+        # 0.11.0: a cached ``sw.js`` must never shadow a service worker served at
+        # this path later, or the stale script would win for up to an hour.
         response.headers["Cache-Control"] = _WEB_UI_HTML_CACHE_CONTROL
     elif media_type == "text/html" or path in {"", ".", "index.html"}:
         response.headers["Cache-Control"] = _WEB_UI_HTML_CACHE_CONTROL

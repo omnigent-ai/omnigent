@@ -760,6 +760,7 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
     // routing). Cases that exercise the built-in judge pass the field
     // explicitly.
     smart_routing_sources: { external: infoOverrides.smart_routing_enabled === true, oss: false },
+    features: { harness_install: infoOverrides.harness_install_enabled === true },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -1358,14 +1359,24 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("opens the connect-host instructions from the host dropdown", () => {
-    renderLanding();
+  it("quotes server URLs in host and Lakebox connect commands", () => {
+    setOmnigentHostConfig({ cliServerUrlSuffix: "/api?profile=dev&glob=*" });
+    renderLanding({ databricks_features: true });
     // Radix dropdowns open on pointerdown (a bare click doesn't in jsdom).
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-connect-host"));
-    // The modal mounts the connect instructions with the runnable command.
+
     expect(screen.getByTestId("connect-host-dialog")).toBeTruthy();
-    expect(screen.getByTestId("connect-host-command")).toBeTruthy();
+    expect(screen.getByTestId("connect-host-command")).toHaveTextContent(
+      `omni host --server '${window.location.origin}/api?profile=dev&glob=*'`,
+    );
+
+    const lakeboxTab = screen.getByRole("tab", { name: "Databricks Lakebox" });
+    fireEvent.mouseDown(lakeboxTab);
+    fireEvent.click(lakeboxTab);
+    expect(screen.getByTestId("connect-lakebox-connect-command")).toHaveTextContent(
+      `omni sandbox connect --provider lakebox --sandbox-id <id> --server '${window.location.origin}/api?profile=dev&glob=*'`,
+    );
   });
 
   it("offers connect-host even when no hosts are online (no dead end)", () => {
@@ -2381,6 +2392,68 @@ describe("NewChatLandingScreen", () => {
     expect(body.host_type).toBe("managed");
     expect("host_id" in body).toBe(false);
     expect("git" in body).toBe(false);
+  });
+
+  it("carries the picked provider in the managed create when several are offered", async () => {
+    // A multi-provider server renders one row per provider. Picking the
+    // second (non-default) row must ride into the POST as sandbox_provider,
+    // so the server launches on it rather than the deployment default.
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_providers: ["modal", "e2b"],
+    });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option-e2b"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "audit the repo" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.host_type).toBe("managed");
+    expect(body.sandbox_provider).toBe("e2b");
+  });
+
+  it("reopens on the last-picked provider and highlights its row", async () => {
+    // The sticky pick: choosing e2b persists it, so a fresh landing (module
+    // draft reset, storage kept) reselects e2b and lights its row up rather
+    // than falling back to the default (modal) first row.
+    const first = renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_providers: ["modal", "e2b"],
+    });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option-e2b"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("E2B Sandbox"),
+    );
+    first.unmount();
+    resetLandingDraft();
+
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_providers: ["modal", "e2b"],
+    });
+    // The chip reflects the sticky provider, not the default.
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("E2B Sandbox"),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    // The e2b row carries the active highlight; modal does not.
+    expect(
+      screen.getByTestId("new-chat-landing-sandbox-option-e2b").getAttribute("data-active"),
+    ).toBe("true");
+    expect(
+      screen.getByTestId("new-chat-landing-sandbox-option").getAttribute("data-active"),
+    ).toBeNull();
   });
 
   it("shows host-provided git credentials tooltip content in the sandbox repo popover", async () => {

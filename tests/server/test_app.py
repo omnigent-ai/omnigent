@@ -7,13 +7,16 @@ they live here following the source ↔ test directory mirroring rule.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from PIL import Image
 
 from omnigent.native_coding_agents import (
     ANTIGRAVITY_NATIVE_AGENT_NAME,
@@ -452,6 +455,270 @@ async def test_info_includes_server_version(
     # is a frozen build-time snapshot that can drift from VERSION in a stale
     # editable or "source"-placeholder install.
     assert body["server_version"] == VERSION
+
+
+def _branding_png(color: tuple[int, int, int, int]) -> bytes:
+    output = BytesIO()
+    Image.new("RGBA", (2, 2), color).save(output, format="PNG")
+    return output.getvalue()
+
+
+def _build_branding_app(db_uri: str, tmp_path: Path, label: str) -> FastAPI:
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / f"artifacts-{label}"))
+    return server_app.create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / f"cache-{label}",
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_branding_logo_route_serves_only_validated_asset_pre_auth(
+    db_uri: str,
+    runtime_init: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("branding:\n  logo: logo.png\n")
+    assets = tmp_path / "branding-assets"
+    assets.mkdir()
+    payload = _branding_png((25, 100, 200, 255))
+    (assets / "logo.png").write_bytes(payload)
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+
+    app = _build_branding_app(db_uri, tmp_path, "pre-auth")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/branding/logo/main", headers={"Cookie": ""})
+
+    assert response.status_code == 200
+    assert response.content == payload
+    assert response.headers["content-type"].startswith("image/png")
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_branding_snapshot_performs_no_request_time_io_or_decode(
+    db_uri: str,
+    runtime_init: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent.server import server_config as server_config_module
+
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "branding:\n"
+        "  app_name: Acme\n"
+        "  logo:\n"
+        "    main: logo.png\n"
+        "    loading: ./logo.png\n"
+        "    favicon: logo.png\n"
+    )
+    assets = tmp_path / "branding-assets"
+    assets.mkdir()
+    logo = assets / "logo.png"
+    payload = _branding_png((25, 100, 200, 255))
+    logo.write_bytes(payload)
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+
+    config_loads = 0
+    logo_reads = 0
+    validations = 0
+    pillow_opens = 0
+    original_load = server_config_module.load_server_config
+    original_read_bytes = Path.read_bytes
+    original_validation = server_config_module._validated_image
+    original_image_open = server_config_module.Image.open
+    resolved_logo = logo.resolve()
+
+    def _counted_load() -> dict[str, object]:
+        nonlocal config_loads
+        config_loads += 1
+        return original_load()
+
+    def _counted_read_bytes(path: Path) -> bytes:
+        nonlocal logo_reads
+        if path == resolved_logo:
+            logo_reads += 1
+        return original_read_bytes(path)
+
+    def _counted_validation(
+        path: Path,
+    ) -> server_config_module.BrandingAsset | None:
+        nonlocal validations
+        validations += 1
+        return original_validation(path)
+
+    def _counted_image_open(*args: object, **kwargs: object) -> object:
+        nonlocal pillow_opens
+        pillow_opens += 1
+        return original_image_open(*args, **kwargs)
+
+    monkeypatch.setattr(server_config_module, "load_server_config", _counted_load)
+    monkeypatch.setattr(Path, "read_bytes", _counted_read_bytes)
+    monkeypatch.setattr(server_config_module, "_validated_image", _counted_validation)
+    monkeypatch.setattr(server_config_module.Image, "open", _counted_image_open)
+
+    app = _build_branding_app(db_uri, tmp_path, "no-request-io")
+    startup_counts = (config_loads, logo_reads, validations, pillow_opens)
+    assert startup_counts == (1, 1, 1, 2)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        responses = await asyncio.gather(
+            *(
+                client.get(path, headers={"Cookie": ""})
+                for _ in range(8)
+                for path in (
+                    "/v1/info",
+                    "/v1/branding/logo/main",
+                    "/v1/branding/logo/loading",
+                    "/v1/branding/logo/favicon",
+                )
+            )
+        )
+
+    assert all(response.status_code == 200 for response in responses)
+    assert all(
+        response.content == payload
+        for response in responses
+        if response.request.url.path.startswith("/v1/branding/logo/")
+    )
+    assert (config_loads, logo_reads, validations, pillow_opens) == startup_counts
+
+
+@pytest.mark.asyncio
+async def test_branding_snapshot_is_immutable_and_isolated_per_app(
+    db_uri: str,
+    runtime_init: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    first_dir = tmp_path / "first"
+    first_dir.mkdir()
+    first_config = first_dir / "config.yaml"
+    first_config.write_text("branding:\n  app_name: First\n  logo: logo.png\n")
+    first_assets = first_dir / "branding-assets"
+    first_assets.mkdir()
+    first_logo = first_assets / "logo.png"
+    first_payload = _branding_png((25, 100, 200, 255))
+    first_logo.write_bytes(first_payload)
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(first_config))
+    first_app = _build_branding_app(db_uri, tmp_path, "first")
+
+    updated_payload = _branding_png((200, 100, 25, 255))
+    first_config.write_text("branding:\n  app_name: Updated\n  logo: logo.png\n")
+    first_logo.write_bytes(updated_payload)
+
+    second_dir = tmp_path / "second"
+    second_dir.mkdir()
+    second_config = second_dir / "config.yaml"
+    second_config.write_text("branding:\n  app_name: Second\n  logo: logo.png\n")
+    second_assets = second_dir / "branding-assets"
+    second_assets.mkdir()
+    second_payload = _branding_png((100, 25, 200, 255))
+    (second_assets / "logo.png").write_bytes(second_payload)
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(second_config))
+    second_app = _build_branding_app(db_uri, tmp_path, "second")
+
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(first_config))
+    recreated_app = _build_branding_app(db_uri, tmp_path, "recreated")
+
+    async def _branding(app: FastAPI) -> tuple[dict[str, object], bytes]:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            info = (await client.get("/v1/info")).json()["branding"]
+            logo_response = await client.get("/v1/branding/logo/main")
+        assert logo_response.status_code == 200
+        return info, logo_response.content
+
+    first, second, recreated = await asyncio.gather(
+        _branding(first_app),
+        _branding(second_app),
+        _branding(recreated_app),
+    )
+
+    assert first[0]["app_name"] == "First"
+    assert first[1] == first_payload
+    assert second[0]["app_name"] == "Second"
+    assert second[1] == second_payload
+    assert recreated[0]["app_name"] == "Updated"
+    assert recreated[1] == updated_payload
+
+
+@pytest.mark.asyncio
+async def test_branding_missing_at_startup_remains_missing_until_app_recreation(
+    db_uri: str,
+    runtime_init: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("branding:\n  logo: logo.png\n")
+    assets = tmp_path / "branding-assets"
+    assets.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    missing_app = _build_branding_app(db_uri, tmp_path, "missing")
+
+    payload = _branding_png((25, 100, 200, 255))
+    (assets / "logo.png").write_bytes(payload)
+    recreated_app = _build_branding_app(db_uri, tmp_path, "now-present")
+
+    missing_transport = httpx.ASGITransport(app=missing_app)
+    async with httpx.AsyncClient(
+        transport=missing_transport, base_url="http://test"
+    ) as missing_client:
+        missing_info = (await missing_client.get("/v1/info")).json()["branding"]
+        missing_logo = await missing_client.get("/v1/branding/logo/main")
+
+    recreated_transport = httpx.ASGITransport(app=recreated_app)
+    async with httpx.AsyncClient(
+        transport=recreated_transport, base_url="http://test"
+    ) as recreated_client:
+        recreated_info = (await recreated_client.get("/v1/info")).json()["branding"]
+        recreated_logo = await recreated_client.get("/v1/branding/logo/main")
+
+    assert missing_info["logos"]["main"] is None
+    assert missing_logo.status_code == 404
+    assert recreated_info["logos"]["main"] == "/v1/branding/logo/main"
+    assert recreated_logo.status_code == 200
+    assert recreated_logo.content == payload
+
+
+@pytest.mark.asyncio
+async def test_branding_openapi_declares_binary_images_and_typed_info(
+    client: httpx.AsyncClient,
+) -> None:
+    schema = (await client.get("/openapi.json")).json()
+    logo_response = schema["paths"]["/v1/branding/logo/{variant}"]["get"]["responses"]["200"]
+    assert set(logo_response["content"]) == {
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "image/x-icon",
+    }
+    assert logo_response["content"]["image/png"]["schema"] == {
+        "type": "string",
+        "format": "binary",
+    }
+
+    info_schema = schema["paths"]["/v1/info"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    assert info_schema["$ref"].endswith("/ServerInfoResponse")
+    properties = schema["components"]["schemas"]["ServerInfoResponse"]["properties"]
+    assert properties["branding"]["$ref"].endswith("/BrandingInfo")
+    assert properties["accounts_enabled"]["type"] == "boolean"
 
 
 @pytest.mark.asyncio

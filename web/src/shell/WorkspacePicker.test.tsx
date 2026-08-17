@@ -10,6 +10,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   basename,
   joinPath,
@@ -636,5 +637,43 @@ describe("WorkspacePicker back-to-workspace", () => {
     );
 
     expect(screen.getByTestId("workspace-picker-workspace")).toBeDisabled();
+  });
+});
+
+// The picker opens inside popovers and dialogs, which focus their first
+// tabbable child — the header's Up button. That focus must not reveal its
+// tooltip, or merely opening the picker throws a black label over the listing.
+describe("WorkspacePicker header tooltips", () => {
+  beforeEach(() => {
+    useHostFilesystemMock.mockReset();
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("src", "/Users/corey/repo/src")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("stays hidden when opening the picker focuses the Up button", async () => {
+    render(
+      <Popover>
+        <PopoverTrigger data-testid="open-picker">Working folder</PopoverTrigger>
+        <PopoverContent>
+          <WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" />
+        </PopoverContent>
+      </Popover>,
+    );
+
+    fireEvent.click(screen.getByTestId("open-picker"));
+    const up = await screen.findByTestId("workspace-picker-up");
+    // Radix's own autofocus is what used to trip the tooltip; assert it landed
+    // so the test would notice if the focus behaviour changed instead.
+    expect(up).toHaveFocus();
+    expect(screen.queryByRole("tooltip")).toBeNull();
   });
 });

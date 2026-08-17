@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping
 
+from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 
 # Categories every POSIX CLI needs regardless of vendor: where the user's
@@ -64,6 +65,10 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         # git, not just the one whose bug surfaced it.
         "SSH_AUTH_SOCK",
         OMNIGENT_SESSION_ENV_VAR,
+        # Windows system / profile constants (SYSTEMROOT is mandatory for
+        # Winsock init, USERPROFILE for Path.home(), etc.); no-ops on POSIX
+        # because these names don't exist there. See omnigent._platform.
+        *WINDOWS_ENV_PASSTHROUGH,
     }
 )
 

@@ -34,6 +34,15 @@ class ErrorCode:
         §Elicitation completion invariant.
     :cvar RUNNER_UNAVAILABLE: No online runner can serve the
         requested dispatch (HTTP 503).
+    :cvar WRONG_REPLICA: The session's bound runner exists but its
+        tunnel is not registered on the replica that served this request
+        (HTTP 400). When replicas are sharded by host, a request keyed for
+        one host can reach a replica that doesn't hold its tunnel — the key
+        doesn't match where the tunnel lives. The request itself is valid
+        (the same bytes succeed on the right replica), so the fix is to
+        re-address it: reissue WITHOUT the key and reach the host via the
+        default route. Distinct from ``RUNNER_UNAVAILABLE`` (no runner
+        bound anywhere), which no re-addressing can fix.
     :cvar UNAUTHORIZED: No valid authentication credentials (HTTP 401).
     :cvar FORBIDDEN: Authenticated but insufficient permissions (HTTP 403).
     :cvar RUNNER_CAPABILITY_MISMATCH: The selected runner cannot
@@ -45,6 +54,10 @@ class ErrorCode:
         rather than 400 (the request is valid against a configured
         host) or 503 (retrying cannot succeed without user action —
         running ``omnigent setup`` on the host machine).
+    :cvar WORKSPACE_MISSING: The session's bound workspace no longer
+        exists on the selected host (HTTP 410). Retrying cannot recreate
+        deleted workspace state; the user must start a session in a valid
+        workspace.
     """
 
     UNAUTHORIZED = "unauthorized"
@@ -56,10 +69,12 @@ class ErrorCode:
     INTERNAL_ERROR = "internal_error"
     HARNESS_PROTOCOL_VIOLATION = "harness_protocol_violation"
     RUNNER_UNAVAILABLE = "runner_unavailable"
+    WRONG_REPLICA = "wrong_replica"
     RUNNER_CAPABILITY_MISMATCH = "runner_capability_mismatch"
     # Keep the string equal to frames.HARNESS_NOT_CONFIGURED_ERROR_CODE —
     # the host's wire error code passes through as the API error code.
     HARNESS_NOT_CONFIGURED = "harness_not_configured"
+    WORKSPACE_MISSING = "workspace_missing"
 
 
 # Single source of truth for error code → HTTP status.
@@ -76,11 +91,20 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # can fix them; investigation needed in the harness wrap).
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: 500,
     ErrorCode.RUNNER_UNAVAILABLE: 503,
+    # 400, not 503: the request reached a replica that can't serve it, but the
+    # request is valid — the fix is to re-address it (reissue without the key),
+    # not to wait and retry. A 4xx also keeps this expected routing event out of
+    # 5xx error-rate signals and clear of infra retry policies (which would
+    # resend to the same wrong replica). The distinct code string is what a
+    # key-aware client keys the re-address off; a client that doesn't know the
+    # code just sees a clean client-error, not a phantom outage.
+    ErrorCode.WRONG_REPLICA: 400,
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: 503,
     # 412 Precondition Failed: the request is well-formed but the host
     # can't satisfy it until the user runs `omnigent setup` there —
     # neither a 400 (input is fine) nor a 503 (a retry won't help).
     ErrorCode.HARNESS_NOT_CONFIGURED: 412,
+    ErrorCode.WORKSPACE_MISSING: 410,
 }
 
 

@@ -357,6 +357,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     server_version: null,
     smart_routing_enabled: false,
     smart_routing_sources: { external: false, oss: false },
+    features: {},
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -428,6 +429,7 @@ function mockConversations(
     labels?: Record<string, string>;
     host_id?: string | null;
     runner_id?: string | null;
+    workspace?: string | null;
   }[],
 ) {
   useConvMock.mockReturnValue({
@@ -444,6 +446,7 @@ function mockConversations(
             permission_level: c.permission_level,
             host_id: c.host_id ?? null,
             runner_id: c.runner_id ?? null,
+            workspace: c.workspace ?? null,
           })),
           first_id: null,
           last_id: null,
@@ -1405,6 +1408,7 @@ describe("Subagents tab", () => {
       {
         id: "conv_child_a",
         title: "researcher:auth",
+        task_summary: null,
         tool: "researcher",
         session_name: "auth",
         current_task_status: "completed" as const,
@@ -1500,6 +1504,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -1510,6 +1515,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_b",
           title: "frontend_engineer:rail",
+          task_summary: null,
           tool: "frontend_engineer",
           session_name: "rail",
           current_task_status: "in_progress",
@@ -1544,6 +1550,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -1554,6 +1561,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_b",
           title: "researcher:api",
+          task_summary: null,
           tool: "researcher",
           session_name: "api",
           current_task_status: "completed",
@@ -1777,6 +1785,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -1824,6 +1833,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -1834,6 +1844,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_b",
           title: "researcher:api",
+          task_summary: null,
           tool: "researcher",
           session_name: "api",
           current_task_status: "in_progress",
@@ -1899,6 +1910,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -1909,6 +1921,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_b",
           title: "researcher:api",
+          task_summary: null,
           tool: "researcher",
           session_name: "api",
           current_task_status: "completed",
@@ -1945,6 +1958,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "in_progress",
@@ -2863,6 +2877,7 @@ describe("Mobile session menu", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -2969,6 +2984,7 @@ describe("Mobile session menu", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "in_progress",
@@ -3139,9 +3155,10 @@ describe("AppShell clone/fork action", () => {
     expect(screen.getByTestId("fork-probe")).toHaveAttribute("data-can-fork", "true");
   });
 
-  it("reports canFork=false on a sub-agent (child) session", () => {
-    // The server rejects forking a sub-agent session, so the affordance is
-    // suppressed for children (parentSessionId set on the snapshot).
+  it("exposes canFork on a sub-agent (child) session", () => {
+    // Forking a child is how it gets promoted to a top-level session, so the
+    // affordance must reach children too — they never appear in the sidebar
+    // list, so the loaded snapshot is the only signal the session exists.
     mockConversations([]); // sidebar omits child rows
     useSessionMock.mockReturnValue({
       session: {
@@ -3166,8 +3183,8 @@ describe("AppShell clone/fork action", () => {
 
     renderShell("/c/conv_child");
 
-    // The per-message fork action hides itself off this flag.
-    expect(screen.getByTestId("fork-probe")).toHaveAttribute("data-can-fork", "false");
+    // The per-message fork action shows itself off this flag.
+    expect(screen.getByTestId("fork-probe")).toHaveAttribute("data-can-fork", "true");
   });
 
   it("opens the fork dialog (name suggested from the source title) when clicked", () => {
@@ -3206,6 +3223,47 @@ describe("AppShell clone/fork action", () => {
     const nameInput = screen.getByTestId("fork-session-title-input");
     expect(nameInput).toHaveValue("");
     expect(nameInput).toHaveAttribute("placeholder", "Fork of Auth refactor");
+  });
+
+  it("offers host + directory when forking a child, taken from its parent", () => {
+    // A sub-agent records no workspace or host of its own, so without the
+    // parent's the dialog drops to its no-directory mode and the promoted
+    // session lands unbound — a different, smaller dialog than every other
+    // session's fork.
+    mockConversations([
+      { id: "conv_parent", permission_level: 4, host_id: "host_a", workspace: "/repo" },
+    ]);
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_child",
+        agentId: "ag_x",
+        agentName: null,
+        runnerId: null,
+        status: "idle",
+        createdAt: 0,
+        title: null,
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: "conv_parent",
+        subAgentName: null,
+        kind: "sub_agent",
+        workspace: null,
+        hostId: null,
+      },
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_child");
+    fireEvent.click(screen.getByTestId("fork-probe-open"));
+
+    const dialog = screen.getByTestId("fork-session-dialog");
+    expect(within(dialog).getByText("Host")).toBeInTheDocument();
+    // "Clone" alone is the no-directory form: the fork would be created
+    // unbound instead of started on a host.
+    expect(within(dialog).getByRole("button", { name: "Clone & start" })).toBeInTheDocument();
   });
 });
 

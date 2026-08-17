@@ -1641,6 +1641,9 @@ def test_start_cli_runner_process_uses_token_bound_runner_id(
     assert env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] == "bind-token"
     assert env[RUNNER_PARENT_PID_ENV_VAR] == str(os.getpid())
     assert env[RUNNER_WORKSPACE_ENV_VAR] == str(workspace.resolve())
+    # -P: this runner inherits the CLI's cwd, so launching from inside an
+    # omnigent checkout must not shadow the installed package.
+    assert captured["args"] == [sys.executable, "-P", "-m", "omnigent.runner._entry"]
 
 
 def test_start_cli_runner_process_binds_stable_local_runner_to_generated_token(
@@ -1852,6 +1855,46 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     assert captured["create_app_kwargs"]["runner_tunnel_tokens"] == frozenset(
         {"test-tunnel-token-abc"}
     )
+
+
+def test_server_explicit_config_overrides_omnigent_config_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An explicit ``-c`` is the single server and branding config source."""
+    import uvicorn.server
+
+    inherited = tmp_path / "inherited.yaml"
+    explicit = tmp_path / "explicit.yaml"
+    inherited.write_text("branding:\n  app_name: Inherited\n")
+    explicit.write_text("branding:\n  app_name: Explicit\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(inherited))
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    captured: dict[str, str] = {}
+
+    def _fake_server_run(self: object) -> None:
+        del self
+        captured["config"] = os.environ["OMNIGENT_CONFIG"]
+
+    monkeypatch.setattr(uvicorn.server.Server, "run", _fake_server_run)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "server",
+            "-c",
+            str(explicit),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "44771",
+            "--no-open",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"] == str(explicit.resolve())
 
 
 def test_server_with_explicit_db_does_not_reuse_canonical_server(
@@ -3104,6 +3147,188 @@ def test_run_from_openclaw_forwards_server(
 
     assert result.exit_code == 0, result.output
     assert run_chat.call_args.kwargs["server_url"] == "https://example.com"
+
+
+def test_run_harness_acp_slug_resolves_client_side(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--harness acp:<slug> resolves the slug client-side and embeds the agent.
+
+    When connecting to a remote server, the local client resolves acp:<slug>
+    to find the configured agent, then embeds it in the temp spec so the
+    remote server doesn't need to resolve a local config. Fixes the bug where
+    --harness acp:devin --server <remote> failed because the server couldn't
+    resolve acp:devin from its own config.
+    """
+    import yaml
+
+    from omnigent.runtime.workflow import _build_acp_spawn_env
+    from omnigent.spec import load
+
+    config_home = tmp_path / "omnigent-config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {"acp": {"agents": [{"name": "Devin", "command": "devin --acp", "slug": "devin"}]}}
+        )
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--harness", "acp:devin", "-p", "hello"],
+    )
+
+    assert result.exit_code == 0, result.output
+    run_chat.assert_called_once()
+    generated = Path(run_chat.call_args.kwargs["target"])
+    raw = yaml.safe_load(generated.read_text())
+    # The agent must be embedded in the spec so a remote server can use it
+    assert raw["executor"]["harness"] == "acp:devin"
+    assert raw["executor"]["acp_agent"] == {
+        "name": "Devin",
+        "command": "devin --acp",
+    }
+    # Verify the embedded agent is properly used at runtime
+    env = _build_acp_spawn_env(load(generated))
+    assert env["HARNESS_ACP_COMMAND"] == "devin --acp"
+    assert env["HARNESS_ACP_NAME"] == "Devin"
+
+
+def test_run_harness_acp_slug_embeds_with_remote_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Embedding acp_agent enables --harness acp:<slug> --server <remote> to work.
+
+    The local runner resolves the slug from local config, embeds it in the
+    spec sent to the server, and the server uses the embedded agent instead
+    of trying to resolve a non-existent slug from its own config.
+    """
+    import yaml
+
+    from omnigent.runtime.workflow import _build_acp_spawn_env
+    from omnigent.spec import load
+
+    config_home = tmp_path / "omnigent-config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {
+                            "name": "Local Agent",
+                            "command": "agent stdio",
+                            "slug": "local-agent",
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "run",
+            "--harness",
+            "acp:local-agent",
+            "--server",
+            "https://remote.example.com",
+            "-p",
+            "hi",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    run_chat.assert_called_once()
+    generated = Path(run_chat.call_args.kwargs["target"])
+    raw = yaml.safe_load(generated.read_text())
+    # Agent is embedded so the remote server can use it
+    assert raw["executor"]["acp_agent"]["name"] == "Local Agent"
+    assert raw["executor"]["acp_agent"]["command"] == "agent stdio"
+    # Verify it works through the full spawn path
+    env = _build_acp_spawn_env(load(generated))
+    assert env["HARNESS_ACP_COMMAND"] == "agent stdio"
+
+
+def test_run_harness_acp_slug_embeds_all_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All ACP agent fields survive --harness acp:<slug> embedding round-trip.
+
+    What breaks if this fails: Qwen-shaped agents with `session_id_mode: client`
+    + `send_model: true`, agents with `omnigent_mcp: false` or `env_passthrough`
+    settings lose these critical config knobs when embedded, causing silent
+    runtime behavior changes (e.g., Qwen spawns with server-side session ids,
+    auth env vars unreachable due to deny-by-default passthrough).
+    """
+    import yaml
+
+    from omnigent.runtime.workflow import _build_acp_spawn_env
+    from omnigent.spec import load
+
+    config_home = tmp_path / "omnigent-config"
+    config_home.mkdir()
+    # Configure a Qwen-shaped agent with non-default settings
+    (config_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {
+                            "name": "Qwen",
+                            "command": "qwen --acp",
+                            "session_id_mode": "client",
+                            "send_model": True,
+                            "model": "qwen-vl-max",
+                            "env_passthrough": ["QWEN_API_KEY"],
+                            "slug": "qwen",
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--harness", "acp:qwen", "-p", "test"],
+    )
+
+    assert result.exit_code == 0, result.output
+    run_chat.assert_called_once()
+    generated = Path(run_chat.call_args.kwargs["target"])
+    raw = yaml.safe_load(generated.read_text())
+    # All fields are embedded
+    acp_agent = raw["executor"]["acp_agent"]
+    assert acp_agent["name"] == "Qwen"
+    assert acp_agent["command"] == "qwen --acp"
+    assert acp_agent["session_id_mode"] == "client"
+    assert acp_agent["send_model"] is True
+    assert acp_agent["model"] == "qwen-vl-max"
+    assert acp_agent["env_passthrough"] == ["QWEN_API_KEY"]
+    # Verify spawn env respects the embedded fields
+    env = _build_acp_spawn_env(load(generated))
+    assert env["HARNESS_ACP_COMMAND"] == "qwen --acp"
+    assert env["HARNESS_ACP_SESSION_ID_MODE"] == "client"
+    assert env["HARNESS_ACP_SEND_MODEL"] == "1"
+    assert env["HARNESS_ACP_MODEL"] == "qwen-vl-max"
+    assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == "QWEN_API_KEY"
 
 
 def _capture_profile_env_at_dispatch(
@@ -6411,3 +6636,36 @@ def test_manage_kimi_harness_login_runs_kimi_login(
     _manage_kimi_harness()
 
     login.assert_called_once_with(hi.KIMI_KEY)
+
+
+def test_runner_online_map_keys_status_by_runner_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each runner-status check names the runner's host.
+
+    The status endpoint reads the in-memory tunnel registry, so the check must
+    reach the replica holding that runner's tunnel or it reports the runner
+    offline. A runner is spawned on exactly one host, taken here from the
+    session rows that reference it; a runner with no host row is left unkeyed.
+    """
+    import omnigent.cli as cli
+
+    seen: dict[str, str | None] = {}
+
+    def _fake(*, base_url: str, method: str, path: str, host_id: str | None = None, **_kw):
+        seen[path.rsplit("/", 2)[1]] = host_id  # /v1/runners/{rid}/status
+        return cli._HostHttpResult(status_code=200, body={"online": True})
+
+    monkeypatch.setattr(cli, "_host_http_json", _fake)
+
+    sessions = [
+        {"id": "conv_1", "runner_id": "runner_a", "host_id": "host_1"},
+        {"id": "conv_2", "runner_id": "runner_b", "host_id": "host_2"},
+        {"id": "conv_3", "runner_id": "runner_c"},  # hostless → unkeyed
+    ]
+    result = cli._runner_online_map(
+        base_url="https://ws.example.com/api/2.0/omnigent", sessions=sessions
+    )
+
+    assert result == {"runner_a": True, "runner_b": True, "runner_c": True}
+    assert seen == {"runner_a": "host_1", "runner_b": "host_2", "runner_c": None}

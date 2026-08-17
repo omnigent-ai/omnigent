@@ -3,6 +3,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
 
@@ -50,6 +51,10 @@ const InboxPage = withPageView(
 const TasksPage = withPageView(
   "tasks",
   lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
+);
+const UsagePage = withPageView(
+  "usage",
+  lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
 );
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
@@ -149,6 +154,9 @@ function App({ basename }: AppProps = {}) {
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
           <Route path={`${prefix}/tasks`} element={<TasksPage />} />
+          {isFeatureEnabled(info, "usage_page") && (
+            <Route path={`${prefix}/usage`} element={<UsagePage />} />
+          )}
           {/* Settings renders into the chat outlet so the conversations
               sidebar stays put — entering settings only swaps the card's
               content (the section nav) and the main area. The active section

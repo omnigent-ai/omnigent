@@ -76,7 +76,7 @@ Env vars read at startup:
   exposes only the named ones).
 - ``HARNESS_CODEX_BUNDLE_DIR``: Absolute path to the agent
   bundle's extracted root. When set, the executor also sources
-  bundled skills from ``<bundle>/skills/<name>/SKILL.md``
+  bundled skills from ``<bundle>/skills/<dir>/SKILL.md``
   (in addition to ``~/.codex/skills/``). Bundle skills win on
   name conflicts. Unset for agents without a bundled-skill
   directory.

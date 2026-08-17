@@ -231,7 +231,13 @@ class _FakeRunnerRouter:
     def __init__(self, client: _RecordingRunnerClient) -> None:
         self.client = client
 
-    def client_for_session_resources(self, session_id: str) -> _RoutedRunner:
+    def client_for_session_resources(
+        self,
+        session_id: str,
+        *,
+        conversation: Conversation | None = None,
+    ) -> _RoutedRunner:
+        del session_id, conversation
         return _RoutedRunner(self.client)
 
 

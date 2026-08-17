@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 from typing import Any
 
@@ -37,6 +38,15 @@ _logger = logging.getLogger(__name__)
 # Treat these spec cwd values as "relative" — the agent doesn't pin
 # a specific directory and the workspace is unconstrained.
 _RELATIVE_CWD_PLACEHOLDERS: frozenset[str] = frozenset({"", ".", "./"})
+
+# Matches a Windows drive-letter absolute path such as ``C:\`` or ``C:/``.
+_WINDOWS_ABS_PATH_RE = re.compile(r"^[A-Za-z]:[/\\]")
+
+
+def _is_windows_absolute_path(path: str) -> bool:
+    """Return True for Windows drive-letter absolute paths (``C:\\…`` / ``C:/…``)."""
+    return bool(_WINDOWS_ABS_PATH_RE.match(path))
+
 
 # How long to wait for a host.stat round-trip before giving up. Stat
 # is a single syscall on the host side and a single WS round trip;
@@ -214,7 +224,7 @@ async def validate_workspace(
         The exception message is suitable for surfacing to the
         API caller verbatim.
     """
-    if not workspace.startswith("/"):
+    if not workspace.startswith("/") and not _is_windows_absolute_path(workspace):
         # Belt-and-suspenders. The Pydantic schema layer also
         # rejects this; pin it here so direct callers (tests,
         # other server-internal paths) can't bypass.
