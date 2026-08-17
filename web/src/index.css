@@ -746,6 +746,15 @@ aside[aria-label="Workspace"][data-maximized] {
   align-self: flex-start;
   margin-top: 1rem;
 }
+/* A maximized workspace rail breaks out to inset-0 (the left sidebar collapses
+ * on entry), so its tab strip starts at the window's top-left corner — where
+ * the traffic lights float (0–5rem) and the title-bar cluster sits (5rem–10rem,
+ * z above the rail). Pad the strip past both so its leftmost tab icon clears
+ * them. Only the maximized rail reaches this corner; the docked rail sits right
+ * of the sidebar and is untouched. */
+[data-electron-mac] aside[aria-label="Workspace"][data-maximized] .workspace-tab-strip {
+  padding-left: 10.5rem;
+}
 /* Drag regions are geometric, not z-ordered: anything that overlaps the
  * strip (e.g. the mobile full-screen sidebar overlay) would lose clicks
  * without an explicit counter-region on interactive elements. */
