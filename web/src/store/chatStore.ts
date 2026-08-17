@@ -168,6 +168,19 @@ export interface PendingUserMessage {
   posted?: boolean;
 }
 
+export type InterruptedPromptRecovery =
+  | {
+      text: string;
+      tempId: string;
+      phase: "eligible" | "requested";
+    }
+  | {
+      conversationId: string;
+      text: string;
+      tempId: string;
+      phase: "ready";
+    };
+
 /**
  * A message the user submitted while the agent was busy. It is held
  * client-side — NOT yet POSTed — and shown in the docked queue strip above
@@ -393,6 +406,12 @@ export interface ConversationState {
    * is covered.
    */
   failedSendDraft: { conversationId: string; text: string; files: File[] } | null;
+  /**
+   * Last locally-submitted prompt while it remains safe to recover after an
+   * interrupt. Turn output clears it; the interrupt acknowledgement releases
+   * it to the matching composer.
+   */
+  interruptedPromptRecovery: InterruptedPromptRecovery | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
    * `null`. Conversation-scoped, not a module global, because `status` is now
@@ -1258,6 +1277,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   streamBudgetExceeded: false,
   streamBudgetBannerDismissed: false,
   failedSendDraft: null,
+  interruptedPromptRecovery: null,
   sendLatchedAt: null,
   llmModel: null,
   sessionHarness: null,
@@ -1294,6 +1314,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(files && files.length > 0 ? { files } : {}),
         },
       ],
+      interruptedPromptRecovery: null,
     }));
     // A message queued while the agent is idle (a race where the send routed
     // to the queue but the turn had already ended) would otherwise wait for an
@@ -1547,6 +1568,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(selfAuthor !== null ? { author: selfAuthor } : {}),
         },
       ],
+      interruptedPromptRecovery:
+        !alreadyStreaming && text.trim() !== "" ? { text, tempId, phase: "eligible" } : null,
       // A new turn supersedes the prior turn's background-shell tally: the
       // "N background tasks still running" label must give way to "Working…" the
       // moment the user sends, not linger until the next status edge. The
@@ -1628,6 +1651,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           const patch: Partial<ChatState> = {
             pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
           };
+          if (s.interruptedPromptRecovery?.tempId === tempId) {
+            patch.interruptedPromptRecovery = null;
+          }
           if (!alreadyStreaming) {
             patch.status = "idle";
             patch.sessionStatus = "idle";
@@ -1684,6 +1710,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Roll back the optimistic bubble — no server idle will fire.
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+        ...(s.interruptedPromptRecovery?.tempId === tempId
+          ? { interruptedPromptRecovery: null }
+          : {}),
       }));
       if (!alreadyStreaming) {
         if (failGet().activeResponse !== null) {
@@ -1747,6 +1776,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(selfAuthor !== null ? { author: selfAuthor } : {}),
         },
       ],
+      interruptedPromptRecovery: null,
     }));
 
     // Pin the destination at submit time — see `send` above for why a late
@@ -1850,6 +1880,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         backgroundTaskCount: 0,
         blockedOn: null,
       };
+      if (s.interruptedPromptRecovery?.phase === "eligible") {
+        patch.interruptedPromptRecovery = {
+          ...s.interruptedPromptRecovery,
+          phase: "requested",
+        };
+      }
       if (s.activeResponse?.state === "streaming") {
         patch.activeResponse = {
           ...s.activeResponse,
@@ -4266,14 +4302,17 @@ function applyLiveDelta(set: Setter, messageId: string, delta: string): void {
     if (at === -1) {
       const live = s.activeResponse;
       const responseId = live?.state === "streaming" ? live.responseId : itemId;
-      return { blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId)] };
+      return {
+        blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId)],
+        interruptedPromptRecovery: null,
+      };
     }
     const existing = s.blocks[at]!;
     if (existing.type !== "text_done") return {};
     const fullText = existing.fullText + delta;
     const next = s.blocks.slice();
     next[at] = { ...existing, fullText, hasCodeBlocks: fullText.includes("```") };
-    return { blocks: next };
+    return { blocks: next, interruptedPromptRecovery: null };
   });
 }
 
@@ -4346,6 +4385,9 @@ async function* tapLiveDeltas(
   get: Getter,
 ): AsyncIterable<StreamEvent> {
   for await (const ev of events) {
+    if (ev.type === "text_delta" && ev.delta !== "") {
+      set((s) => (s.interruptedPromptRecovery === null ? {} : { interruptedPromptRecovery: null }));
+    }
     if (ev.type === "text_delta" && ev.messageId !== undefined) {
       if (!isConversationDisposed(id) && !ignored.has(ev.messageId)) {
         // A scheduled wake streams its first deltas ahead of the batch
@@ -4450,6 +4492,22 @@ function revivePendingElicitationBlock(set: Setter, elicitationId: string): void
   });
 }
 
+function blockCrossesPromptRecoveryBoundary(block: AnyBlock): boolean {
+  switch (block.type) {
+    case "response_start":
+    case "response_end":
+    case "user_message":
+    case "routing_decision":
+    case "reasoning_start":
+    case "slash_command":
+    case "compaction_loading":
+    case "compaction":
+      return false;
+    default:
+      return true;
+  }
+}
+
 export async function pumpStreamEvents(
   id: string,
   body: ReadableStream<Uint8Array>,
@@ -4539,6 +4597,12 @@ export async function pumpStreamEvents(
           status: "streaming",
         });
         continue;
+      }
+
+      if (blockCrossesPromptRecoveryBoundary(block)) {
+        set((s) =>
+          s.interruptedPromptRecovery === null ? {} : { interruptedPromptRecovery: null },
+        );
       }
 
       // Native preview cleanup must run before the generic dedup below:
@@ -4756,6 +4820,18 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
       b !== null &&
       "type" in b &&
       (b.type === "input_text" || b.type === "input_image" || b.type === "input_file"),
+  );
+}
+
+function eventMatchesRecoveryPrompt(
+  event: SessionInputConsumedEvent,
+  recovery: InterruptedPromptRecovery | null,
+): boolean {
+  if (recovery === null) return false;
+  return (
+    userContentFromEvent(event)?.some(
+      (block) => block.type === "input_text" && block.text === recovery.text,
+    ) ?? false
   );
 }
 
@@ -5365,6 +5441,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           if (!s.isNativeTerminalSession && s.pendingUserMessages.length > 0) {
             patch.pendingUserMessages = [];
           }
+          if (s.interruptedPromptRecovery?.phase === "eligible") {
+            patch.interruptedPromptRecovery = null;
+          }
         }
         // Surface the error inline when the harness reports a terminal failure
         // with a structured error payload (e.g. token expiration on startup).
@@ -5489,7 +5568,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // steal a real queued message's bubble. Hold the head back for a marker.
           const eventContent = userContentFromEvent(event);
           if (eventContent !== null && isSystemUserContent(eventContent)) return {};
-          if (s.pendingUserMessages.length === 0) return {};
+          if (s.pendingUserMessages.length === 0) {
+            return eventMatchesRecoveryPrompt(event, s.interruptedPromptRecovery)
+              ? {}
+              : { interruptedPromptRecovery: null };
+          }
           return { pendingUserMessages: s.pendingUserMessages.slice(1) };
         }
 
@@ -5563,6 +5646,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             ...s.blocks,
             committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
           ],
+          interruptedPromptRecovery: eventMatchesRecoveryPrompt(event, s.interruptedPromptRecovery)
+            ? s.interruptedPromptRecovery
+            : null,
         };
       });
       return;
@@ -5595,6 +5681,18 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           if (s.interruptedResponseIds.includes(interruptedResponseId)) return {};
           return {
             interruptedResponseIds: [...s.interruptedResponseIds, interruptedResponseId],
+          };
+        });
+      }
+      if (sourceConversationId !== null) {
+        applyToConversation((s) => {
+          if (s.interruptedPromptRecovery?.phase !== "requested") return {};
+          return {
+            interruptedPromptRecovery: {
+              ...s.interruptedPromptRecovery,
+              conversationId: sourceConversationId,
+              phase: "ready",
+            },
           };
         });
       }

@@ -4510,6 +4510,7 @@ export function Composer({
   // Text + attachments handed back by a send that failed before the server
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
+  const interruptedPromptRecovery = useChatStore((s) => s.interruptedPromptRecovery);
   // The conversation whose draft the composer's value/files currently hold.
   // Trails `conversationId` by one commit across a session switch; see the
   // draft-restore effect.
@@ -4847,6 +4848,24 @@ export function Composer({
     return () => useChatStore.getState().clearPendingComposerAttachments();
     // setMentionedItems is a stable useState setter (from useMentionBrowser).
   }, [pendingComposerAttachments, setMentionedItems]);
+
+  useEffect(() => {
+    if (interruptedPromptRecovery?.phase !== "ready") return;
+    if (interruptedPromptRecovery.conversationId !== conversationId) return;
+    if (settledConversationId !== conversationId) return;
+
+    useChatStore.setState({ interruptedPromptRecovery: null });
+    if (
+      valueRef.current.trim() !== "" ||
+      filesRef.current.length > 0 ||
+      mentionedItems.length > 0
+    ) {
+      return;
+    }
+    setValue(interruptedPromptRecovery.text);
+    dirtyRef.current = true;
+    if (!isMobileRef.current) textareaRef.current?.focus();
+  }, [interruptedPromptRecovery, conversationId, settledConversationId, mentionedItems.length]);
 
   // Restore the text (and attachments) of a send that failed, so the user can
   // fix and resend instead of retyping. The composer is empty in the normal
