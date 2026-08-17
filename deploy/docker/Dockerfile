@@ -41,11 +41,15 @@
 #   docker build -t omnigent-host:latest --target host \
 #                -f deploy/docker/Dockerfile .
 #
-# To bake extra harness CLIs into a host image beyond the default set:
+# To bake extra harness CLIs into a host image beyond the default set — by
+# harness name, whether the CLI ships on npm or via a vendor installer:
 #
 #   docker build -t omnigent-host:latest --target host \
 #                -f deploy/docker/Dockerfile \
-#                --build-arg EXTRA_HARNESS_CLIS="opencode-ai@1.17.11" .
+#                --build-arg EXTRA_HARNESS_CLIS="goose jcode opencode" .
+#
+# (See deploy/docker/install-harness-cli.sh for the supported names, optional
+# NAME@VERSION pins, and the npm:<pkg-spec> escape hatch.)
 #
 # Behind corporate package proxies (the host target also installs the
 # harness CLIs from npm, so it needs the npm proxy too):
@@ -214,9 +218,11 @@ ENV PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:${PATH}" \
     IS_SANDBOX=1
 
+# bzip2 extracts goose's .tar.bz2 release archive when EXTRA_HARNESS_CLIS
+# includes goose (see install-harness-cli.sh).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      git tmux procps lsof bubblewrap curl ca-certificates unzip \
+      git tmux procps lsof bubblewrap curl ca-certificates unzip bzip2 \
       iproute2 nftables \
  && rm -rf /var/lib/apt/lists/*
 
@@ -259,26 +265,6 @@ RUN npm install -g --no-audit --no-fund \
       @openai/codex \
       @earendil-works/pi-coding-agent \
  && npm cache clean --force
-
-# Optional additional npm-installable harness CLIs (e.g. opencode-ai, a qwen
-# package) for a downstream deployment that wants a harness beyond the
-# pre-baked set above, without forking this Dockerfile. The pre-baked set has
-# grown one harness at a time with no shared policy yet for what ships by
-# default, so this sidesteps that question entirely rather than expanding it.
-# Off by default: does not change the shipped CLI set. Space-separate multiple
-# specs and pin versions the same way the default set is unpinned/pinned
-# above — e.g.:
-#   --build-arg EXTRA_HARNESS_CLIS="opencode-ai@1.17.11"
-# Mirrors the OMNIGENT_EXTRAS pattern used for optional Python extras above.
-# `set -f` disables pathname expansion for the unquoted expansion below, so a
-# spec containing a shell glob character (*, ?, []) is passed to npm literally
-# instead of being matched against files in the build context.
-ARG EXTRA_HARNESS_CLIS=
-RUN if [ -n "${EXTRA_HARNESS_CLIS}" ]; then \
-        set -f; \
-        npm install -g --no-audit --no-fund ${EXTRA_HARNESS_CLIS} \
-        && npm cache clean --force; \
-    fi
 
 # Kiro CLI is not published as an npm package, and its installer has NO version
 # flag — `curl …/install | bash` always fetches `latest`, so the image was
@@ -361,6 +347,27 @@ RUN set -eu; \
       exit 1; \
     fi; \
     echo "agy ${AGY_VERSION} pinned (sha256 verified)"
+
+# Optional additional harness CLIs for a downstream deployment that wants a
+# harness beyond the pre-baked set above, without forking this Dockerfile —
+# including CLIs that don't ship on npm (goose, jcode). The pre-baked set has
+# grown one harness at a time with no shared policy yet for what ships by
+# default, so this sidesteps that question entirely rather than expanding it.
+# Off by default: does not change the shipped CLI set. Space-separate entries;
+# each is a harness name with an optional @version pin (e.g. "goose
+# jcode@0.75.5 opencode") resolved by deploy/docker/install-harness-cli.sh, or
+# npm:<pkg-spec> for a package with no row there yet. Mirrors the
+# OMNIGENT_EXTRAS pattern used for optional Python extras above. Kept after
+# the pinned installs so iterating on the script doesn't bust their layers.
+# `set -f` disables pathname expansion for the unquoted expansion below, so an
+# entry containing a shell glob character (*, ?, []) reaches the script
+# literally instead of matching files in the build context.
+ARG EXTRA_HARNESS_CLIS=
+COPY deploy/docker/install-harness-cli.sh /tmp/install-harness-cli.sh
+RUN if [ -n "${EXTRA_HARNESS_CLIS}" ]; then \
+        set -f; \
+        bash /tmp/install-harness-cli.sh ${EXTRA_HARNESS_CLIS}; \
+    fi
 
 # Copy the venv and source tree. The editable install's .pth files reference
 # /build/omnigent and /build/sdks/* -- both denied by the k8s Landlock LSM

@@ -91,8 +91,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 USER 0
 
-# curl-minimal and ca-certificates are preinstalled in UBI9.
-RUN dnf install -y --nodocs git tmux unzip \
+# curl-minimal and ca-certificates are preinstalled in UBI9. bzip2 extracts
+# goose's .tar.bz2 release archive when EXTRA_HARNESS_CLIS includes goose (see
+# install-harness-cli.sh).
+RUN dnf install -y --nodocs git tmux unzip bzip2 \
  && dnf clean all
 
 RUN git config --system credential.helper \
@@ -139,6 +141,19 @@ RUN set -eu; \
     [ "$installed" = "$KIRO_CLI_VERSION" ] || { \
       echo "ERROR: kiro-cli reports '${installed:-<none>}', expected '$KIRO_CLI_VERSION'." >&2; exit 1; }; \
     echo "kiro-cli ${KIRO_CLI_VERSION} pinned (sha256 verified)"
+
+# Optional additional harness CLIs beyond the pre-baked set, without forking
+# this Dockerfile — including CLIs that don't ship on npm (goose, jcode).
+# Space-separate harness names with an optional @version pin (e.g. "goose
+# jcode@0.75.5 opencode"), resolved by deploy/docker/install-harness-cli.sh,
+# or npm:<pkg-spec> for a package with no row there yet. Off by default; see
+# the fuller rationale in deploy/docker/Dockerfile — keep in sync.
+ARG EXTRA_HARNESS_CLIS=
+COPY deploy/docker/install-harness-cli.sh /tmp/install-harness-cli.sh
+RUN if [ -n "${EXTRA_HARNESS_CLIS}" ]; then \
+        set -f; \
+        bash /tmp/install-harness-cli.sh ${EXTRA_HARNESS_CLIS}; \
+    fi
 
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /build /build

@@ -72,7 +72,10 @@ table](../kubernetes/overlays/sandbox-runners/README.md#configuration-sandbox-co
 for the shape.
 
 `provider` + `server_url` is a complete config: the image defaults to
-the official prebaked host image and boxes run locally.
+the official prebaked host image and boxes run locally. To bake extra
+harness CLIs into that image (e.g. `goose`, `jcode`), build it with the
+`EXTRA_HARNESS_CLIS` build-arg and point `boxlite.image:` at your copy —
+see [deploy/docker](../docker/README.md#baking-in-extra-harness-clis).
 
 ### Cloud (remote `boxlite serve` pool)
 
