@@ -1,6 +1,14 @@
 import { useEffect, useState } from "react";
-import { CheckIcon, ChevronUpIcon, PlusIcon, ServerIcon } from "lucide-react";
+import {
+  CheckIcon,
+  ChevronUpIcon,
+  CopyIcon,
+  ExternalLinkIcon,
+  PlusIcon,
+  ServerIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { showToast } from "@/components/ui/toast";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -15,6 +23,7 @@ import {
   switchServer,
   type ServerPickerInfo,
 } from "@/lib/nativeBridge";
+import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 import { ownServerName } from "@/lib/serverNames";
@@ -34,6 +43,24 @@ function originOf(url: string): string | null {
     return new URL(url).origin;
   } catch {
     return null;
+  }
+}
+
+function openableServerUrl(url: string): string | null {
+  try {
+    const protocol = new URL(url).protocol;
+    return protocol === "http:" || protocol === "https:" ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+async function copyServerUrl(url: string): Promise<void> {
+  try {
+    await copyText(url);
+    showToast("Server URL copied.");
+  } catch {
+    showToast(`Couldn't copy the server URL. Copy it manually: ${url}`, { duration: 0 });
   }
 }
 
@@ -74,9 +101,8 @@ function serverKey(url: string): string | null {
  * the sidebar's bottom.
  *
  * A sidebar row (server glyph + current host + an upward chevron) that opens a
- * menu of organization-provided and recently-connected servers — selecting one
- * re-points the whole window via the shell — plus "Connect to new server…",
- * which returns the window to the shell's setup page.
+ * menu for visiting or copying the current URL, switching to organization-provided
+ * or recently connected servers, or returning to setup to connect a new server.
  *
  * This deliberately lives at the bottom of the sidebar rather than in the
  * chat surface's top strip. The macOS shell hides the native title bar
@@ -153,6 +179,8 @@ export function SidebarServerPicker() {
     currentManagedName === undefined && currentOwnName !== null
       ? `${currentOwnName} (${currentAddress})`
       : currentHost;
+  const serverUrl = info.currentServer ?? info.currentOrigin;
+  const openUrl = openableServerUrl(serverUrl);
 
   return (
     // shrink-0 keeps the row at its natural height so the scrolling session
@@ -260,6 +288,28 @@ export function SidebarServerPicker() {
               ))}
             </>
           ) : null}
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel className="text-muted-foreground">Current server</DropdownMenuLabel>
+          {openUrl ? (
+            <DropdownMenuItem asChild className="min-h-11 gap-2">
+              <a href={openUrl} target="_blank" rel="noopener noreferrer">
+                <ExternalLinkIcon className="size-4 shrink-0" />
+                Open server in new tab
+              </a>
+            </DropdownMenuItem>
+          ) : (
+            <DropdownMenuItem disabled className="min-h-11 gap-2">
+              <ExternalLinkIcon className="size-4 shrink-0" />
+              Open server in new tab
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem
+            className="min-h-11 gap-2"
+            onSelect={() => void copyServerUrl(serverUrl)}
+          >
+            <CopyIcon className="size-4 shrink-0" />
+            Copy server URL
+          </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem className="gap-2" onSelect={() => openServerSetup()}>
             <PlusIcon className="size-4 shrink-0" />
