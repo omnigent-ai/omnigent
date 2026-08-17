@@ -15,7 +15,7 @@ import { useProjectConfig, useProjects } from "@/hooks/useConversations";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
-import { NewChatLandingScreen } from "./NewChatDialog";
+import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
 
 // A `?project=` visit prefills the composer from the project's STORED config
 // (host / working directory / agent / worktree). A field the config leaves
@@ -149,6 +149,7 @@ async function submitAndReadBody(): Promise<Record<string, unknown>> {
 beforeEach(() => {
   navigateMock.mockReset();
   vi.mocked(authenticatedFetch).mockReset();
+  resetLandingDraft();
   searchParams = new URLSearchParams("project=Alpha");
   localStorage.clear();
   // A recent on the host that the generic seeding would use when the config
@@ -269,6 +270,38 @@ describe("NewChatLandingScreen project prefill", () => {
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(BETA_REPO);
     expect(body.agent_id).toBe("ag_other");
+  });
+
+  it("drops a stale draft from another project's visit so its repo can't shadow this one", async () => {
+    const BETA_REPO = "/Users/corey/projects/beta";
+    vi.mocked(useProjectConfig).mockImplementation((id) => {
+      const data =
+        id === "proj_beta"
+          ? { host_id: "host_1", workspace: BETA_REPO }
+          : { host_id: "host_1", workspace: REPO };
+      return { data, isLoading: false } as ReturnType<typeof useProjectConfig>;
+    });
+    // Visit Beta's composer, let its config seed, then leave WITHOUT
+    // submitting — the unmount preserves the composer state as the
+    // module-scoped landing draft.
+    searchParams = new URLSearchParams("project=Beta");
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("beta"),
+    );
+    cleanup();
+
+    // A later visit to Alpha's composer must bind Alpha's stored repo, not
+    // resurrect Beta's draft (the prefill fills empty slots only, so a
+    // restored draft would win — and point any new worktree at Beta's repo).
+    searchParams = new URLSearchParams("project=Alpha");
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    const body = await submitAndReadBody();
+    expect(body.host_id).toBe("host_1");
+    expect(body.workspace).toBe(REPO);
   });
 
   it("reseeds the SAME project after its stored defaults change (edited then re-opened)", async () => {

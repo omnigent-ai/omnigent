@@ -1861,6 +1861,11 @@ function HarnessConfigModal({
 // when the user navigates into an existing session and back. Module-scoped,
 // not persisted to storage (a page refresh starts clean); cleared on create.
 interface LandingDraft {
+  /** `?project=` of the visit the draft was captured in ("" = plain visit).
+   *  A draft is only restored into the same visit — restoring another
+   *  project's host/workspace would defeat this project's stored defaults
+   *  (the prefill fills empty slots only). */
+  project: string;
   message: string;
   files: File[];
   pickedAgentId: string | null;
@@ -1934,6 +1939,14 @@ export function NewChatLandingScreen() {
   // a new session. The hook hides it whenever the sidebar covers the surface.
   const [landingSurface, setLandingSurface] = useState<HTMLElement | null>(null);
   useNativeServerSwitcherForMainSurface(landingSurface, true);
+
+  // Project driving this visit, when the sidebar's per-project "new session"
+  // pencil landed here with a `?project=` query param. Empty otherwise.
+  // Derived before the draft-seeded state below: a preserved draft from a
+  // DIFFERENT visit is dropped here so its host/workspace can't shadow this
+  // project's stored defaults (the prefill fills empty slots only).
+  const projectParam = searchParams.get("project") ?? "";
+  if (landingDraft !== null && landingDraft.project !== projectParam) landingDraft = null;
 
   const [message, setMessage] = useState<string>(() => landingDraft?.message ?? "");
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -2051,9 +2064,6 @@ export function NewChatLandingScreen() {
   const databricksGitCredentialsTooltipContent = docsLinks?.databricksGitCredentials;
   const showDisabledSandboxWithDocs = !managedSandboxesEnabled && !!newSandboxTooltipContent;
 
-  // Project driving this visit, when the sidebar's per-project "new session"
-  // pencil landed here with a `?project=` query param. Empty otherwise.
-  const projectParam = searchParams.get("project") ?? "";
   // Seeded from the persisted last pick so a returning user starts on the
   // agent they used last; validated against the live list in
   // effectiveAgentId below (a stale id falls back to the default). A
@@ -2247,6 +2257,7 @@ export function NewChatLandingScreen() {
   const onScreenRef = useRef(true);
   const draftRef = useRef<LandingDraft>(null as unknown as LandingDraft);
   draftRef.current = {
+    project: projectParam,
     message,
     files,
     pickedAgentId,
