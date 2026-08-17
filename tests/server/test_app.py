@@ -984,6 +984,126 @@ def test_ensure_default_native_agents_seeds_every_native_agent(
         assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
 
 
+def test_ensure_default_acp_agents_seeds_configured_agent(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured ``acp:<slug>`` agent becomes a picker-renderable built-in.
+
+    This is the ACP analogue of the native seeding: the New-Session picker reads
+    built-ins from ``GET /v1/agents``, so a configured ACP agent must seed to
+    appear — the same way ``opencode-native-ui`` etc. do.
+
+    **What breaks if this fails**: a user with Devin (or any ``acp:`` agent) set
+    up on their machine never sees it in the web picker.
+    """
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+
+    # A display label with a space ("Gemini CLI") must not become the agent name
+    # (spec names are [a-zA-Z0-9_-]+); the slug is used instead.
+    entry = AcpAgentEntry(
+        slug="gemini-cli", name="Gemini CLI", command="gemini --experimental-acp"
+    )
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [entry])
+    # No builtin ACP CLI installed, so only the configured agent seeds.
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
+
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    # Keyed by the slug, not the label.
+    seeded = seed_stores.agent_store.get_by_name("gemini-cli")
+    assert seeded is not None, "configured acp:<slug> agent was not seeded into the picker"
+    assert seed_stores.agent_store.get_by_name("Gemini CLI") is None, (
+        "the invalid space-bearing label must not be used as the agent name"
+    )
+    assert seeded.id == builtin_agent_id("gemini-cli")
+    assert seeded.session_id is None, "built-ins must be session-scope NULL"
+    assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+
+
+def test_ensure_default_acp_agents_seeds_installed_builtin_cli(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A builtin ACP CLI harness whose binary is on PATH seeds a picker built-in."""
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
+    # Every builtin ACP CLI resolves on PATH in this test.
+    monkeypatch.setattr(
+        "omnigent._platform.resolve_cli_binary", lambda _b, **k: "/usr/local/bin/x"
+    )
+
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+    # Keyed by the catalog id (a valid slug), not the display label.
+    for key in ACP_CLI_HARNESSES:
+        assert seed_stores.agent_store.get_by_name(key) is not None, (
+            f"installed builtin ACP CLI {key!r} was not seeded"
+        )
+
+
+def test_ensure_default_acp_agents_noop_when_nothing_set_up(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No configured agents + no installed builtin CLI → nothing seeded.
+
+    **What breaks if this fails**: a remote server (no ``acp:`` config, ACP CLIs
+    absent) shows phantom ACP picker rows that can't launch there.
+    """
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
+
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+    assert seed_stores.agent_store.get_by_name("devin") is None
+    for key in ACP_CLI_HARNESSES:
+        assert seed_stores.agent_store.get_by_name(key) is None
+
+
+def test_ensure_default_acp_agents_survives_unreadable_config(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed ``acp:`` block is skipped, never fatal to server startup."""
+
+    def _boom(*_a: object, **_k: object) -> list[object]:
+        raise ValueError("bad acp: block")
+
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", _boom)
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
+
+    # Must not raise — startup calls this and a bad user config can't take the
+    # whole server down.
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+
+def test_build_acp_bundle_carries_the_harness_id(tmp_path: Path) -> None:
+    """The seeded bundle's spec runs on ``acp:<slug>`` — resolved at spawn.
+
+    **What breaks if this fails**: the picker row exists but launches the wrong
+    (or no) ACP agent because the harness id didn't reach the bundle.
+    """
+    import io
+    import tarfile
+
+    from omnigent.spec import load
+
+    data = server_app._build_acp_bundle(harness="acp:devin", name="devin")
+    dest = tmp_path / "bundle"
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+        tf.extractall(dest, filter="data")
+    spec = load(dest)
+    assert spec.name == "devin"
+    assert spec.executor.config["harness"] == "acp:devin"
+
+
 def test_ensure_default_native_agents_raises_when_provider_missing(
     seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
 ) -> None:
