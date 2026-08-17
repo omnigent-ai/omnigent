@@ -97,7 +97,7 @@ _LOCAL_SERVER_SIG_PATH = _local_data_dir() / "local_server.sig"
 _LOCAL_SERVER_LOG_REF_PATH = _local_data_dir() / "local_server.logpath"
 
 
-def server_config_signature() -> str:
+def server_config_signature(*, include_features: bool = True) -> str:
     """
     Compute a signature of the server-affecting config for one invocation.
 
@@ -111,7 +111,8 @@ def server_config_signature() -> str:
     Covers the inputs that change server behavior at spawn time:
 
     * the resolved auth source — auth mode is baked at boot and cannot be
-      reconfigured in place; and
+      reconfigured in place;
+    * the enabled release-feature set — features are snapshotted at boot; and
     * the installed package version — a running server holds its code in
       memory, so after ``omni upgrade`` (or a manual ``uv tool upgrade``)
       the old process keeps serving pre-upgrade code until it is cycled.
@@ -123,6 +124,9 @@ def server_config_signature() -> str:
     Deliberately narrow otherwise, so unrelated env churn does not force
     needless restarts.
 
+    :param include_features: Include server release features. Remote host
+        daemons connect to a separately managed server, so their signatures
+        exclude local server features.
     :returns: A short hex digest, e.g. ``"3f9a1c2b4d5e6f70"``.
     """
     import hashlib
@@ -130,6 +134,7 @@ def server_config_signature() -> str:
     import json
 
     from omnigent.server.auth import resolve_auth_source
+    from omnigent.server.feature_flags import resolve_feature_flags
 
     try:
         version = importlib.metadata.version("omnigent")
@@ -138,7 +143,14 @@ def server_config_signature() -> str:
         # nothing to key version-drift on, so leave it out of the payload.
         version = ""
 
-    payload = json.dumps({"auth": resolve_auth_source(), "version": version}, sort_keys=True)
+    payload = json.dumps(
+        {
+            "auth": resolve_auth_source(),
+            "features": (resolve_feature_flags().enabled_names() if include_features else ()),
+            "version": version,
+        },
+        sort_keys=True,
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 

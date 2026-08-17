@@ -225,6 +225,7 @@ class Conversation:
     subagent_routing_override: str | None = None
     harness_override: str | None = None
     sub_agent_name: str | None = None
+    task_summary: str | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     workspace: str | None = None

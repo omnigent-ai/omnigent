@@ -74,6 +74,7 @@ const FOLD_EXPAND_ANCHOR_HOLD_MS = 400;
 interface BlockRendererProps {
   items: RenderItem[];
   sessionStatus: SessionStatus;
+  onRetryError?: (item: Extract<RenderItem, { kind: "error" }>) => Promise<void>;
   /**
    * Lifecycle of the turn this bubble renders (`Bubble.lifecycle`).
    * `"streaming"` keeps the process trace expanded; any settled state
@@ -234,6 +235,7 @@ export function BlockRenderer({
   hasPendingElicitation = false,
   lastActivityAtS,
   showsWorking = false,
+  onRetryError,
 }: BlockRendererProps) {
   const { isOwnTurnLive, possiblyLive, isTurnLive } = turnLiveness({
     sessionStatus,
@@ -319,8 +321,10 @@ export function BlockRenderer({
         <TurnWorkedFold workedForS={workedForS} animateCollapse={animateCollapse}>
           {renderSequence(process, { liveEdge: false })}
         </TurnWorkedFold>
-        {exempt.map(({ item, index }) => renderItem(item, index, false, false, false))}
-        {renderSequence(final, { liveEdge: false, indexBase: finalStart })}
+        {exempt.map(({ item, index }) =>
+          renderItem(item, index, false, false, false, onRetryError),
+        )}
+        {renderSequence(final, { liveEdge: false, indexBase: finalStart, onRetryError })}
       </>
     );
   }
@@ -328,6 +332,7 @@ export function BlockRenderer({
   return renderSequence(items, {
     liveEdge: isTurnLive,
     suppressReasoningDuration: showsWorking,
+    onRetryError,
   });
 }
 
@@ -340,7 +345,7 @@ export function BlockRenderer({
  */
 function renderSequence(
   items: RenderItem[],
-  { liveEdge, suppressReasoningDuration = false, indexBase = 0 }: TurnSequenceOptions,
+  { liveEdge, suppressReasoningDuration = false, indexBase = 0, onRetryError }: TurnSequenceOptions,
 ): ReactNode[] {
   const rendered: ReactNode[] = [];
   let previousRenderedItemWasText = false;
@@ -402,6 +407,7 @@ function renderSequence(
         i === reasoningStreamingIdx,
         suppressReasoningDuration,
         followsText,
+        onRetryError,
       ),
     );
     previousRenderedItemWasText = item.kind === "text";
@@ -414,6 +420,7 @@ interface TurnSequenceOptions {
   liveEdge: boolean;
   suppressReasoningDuration?: boolean;
   indexBase?: number;
+  onRetryError?: BlockRendererProps["onRetryError"];
 }
 
 interface TurnPartition {
@@ -734,6 +741,7 @@ function renderItem(
   isReasoningStreaming: boolean,
   suppressReasoningDuration = false,
   followsText = false,
+  onRetryError?: BlockRendererProps["onRetryError"],
 ): ReactNode {
   const key = keyFor(item, index);
   switch (item.kind) {
@@ -825,6 +833,7 @@ function renderItem(
           title={item.title}
           cause={item.cause}
           remediation={item.remediation}
+          onRetry={onRetryError ? () => onRetryError(item) : undefined}
         />
       );
     case "policy_denied":

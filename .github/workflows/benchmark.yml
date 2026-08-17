@@ -180,6 +180,10 @@ jobs:
             --database-uri "${{ steps.db.outputs.uri }}" \
             --sessions "$SESSIONS" --items-per-session "$ITEMS"
 
+      # pexpect drives omnigent polly via PTY for the cli_startup journey.
+      - name: Install CLI startup dependencies
+        run: uv pip install pexpect
+
       - name: Run benchmark
         run: |
           uv run --no-sync dev/benchmarks/omnigent/run.py \
