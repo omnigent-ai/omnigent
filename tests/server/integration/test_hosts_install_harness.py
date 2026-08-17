@@ -9,10 +9,10 @@ owner-scoped, host-forwarded design.
 
 These are the executable acceptance criteria for Milestone 1 of the
 "Setup From the UI" project: turning the dead-end "binary missing"
-warning into a working Install action. The route is gated behind
-``OMNIGENT_HARNESS_INSTALL_ENABLED``; the fixture enables it so the
-happy-path and validation cases can run, and one test asserts the route
-is 404 (invisible) when the flag is off.
+warning into a working Install action. The route is gated by
+``harness_install`` in ``OMNIGENT_FEATURES``; the fixture enables it so the
+happy-path and validation cases can run, and one test asserts the route is 404
+(invisible) when the flag is off.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.server.feature_flags import FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
@@ -58,10 +59,10 @@ _HOST_NAME = "install-test-laptop"
 def _enable_install_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     """Enable the feature flag for every test except the flag-off case.
 
-    The route is invisible (404) unless ``OMNIGENT_HARNESS_INSTALL_ENABLED``
-    is truthy; the happy-path and validation tests need it on.
+    The route is invisible (404) unless ``harness_install`` is in the enabled
+    feature set; the happy-path and validation tests need it on.
     """
-    monkeypatch.setenv("OMNIGENT_HARNESS_INSTALL_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_FEATURES", "harness_install")
 
 
 def _websocket_scope(path: str) -> dict[str, object]:
@@ -455,16 +456,24 @@ async def test_install_coalesces_concurrent_same_family(
 
 async def test_install_harness_route_hidden_when_flag_off(
     install_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     With the flag off the route is 404 — the feature is invisible.
 
     Ships dark by default; only opt-in deployments expose it.
     """
-    monkeypatch.setenv("OMNIGENT_HARNESS_INSTALL_ENABLED", "0")
-    app, _reg, _hs, _cs = install_app
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    _app, registry, host_store, conv_store = install_app
+    off_app = FastAPI()
+    off_app.include_router(
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            feature_flags=FeatureFlags(),
+        ),
+        prefix="/v1",
+    )
+    async with AsyncClient(transport=ASGITransport(app=off_app), base_url="http://test") as client:
         resp = await client.post(f"/v1/hosts/{_HOST_ID}/harnesses/claude/install")
 
     assert resp.status_code == 404

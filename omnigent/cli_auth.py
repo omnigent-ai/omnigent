@@ -39,9 +39,10 @@ _TOKEN_FILE_NAME = "auth_tokens.json"
 def _token_file_path() -> Path:
     """Return the path to the auth token storage file.
 
-    Uses the shared ``~/.omnigent`` state directory.
+    Uses the shared Omnigent state directory, honoring
+    ``OMNIGENT_DATA_DIR``.
 
-    :returns: Path to ``~/.omnigent/auth_tokens.json``.
+    :returns: Path to ``<data-dir>/auth_tokens.json``.
     """
     from omnigent_ui_sdk.terminal._config import state_dir
 

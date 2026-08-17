@@ -1564,6 +1564,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
                 "terminal": expected_terminal,
                 "session_key": "main",
                 "ensure_native_terminal": True,
+                "persist_resource_event": True,
             },
         },
         {

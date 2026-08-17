@@ -34,6 +34,7 @@ import {
   shouldShowTerminalSurface,
   updateWarmTerminalSurfaces,
   type WarmTerminalEntry,
+  isBackgroundTasksOnly,
   splitSlashCommand,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
@@ -1077,6 +1078,20 @@ describe("workingIndicatorLabel", () => {
   });
 });
 
+// ── isBackgroundTasksOnly ───────────────────────────────────────────────────
+
+describe("isBackgroundTasksOnly", () => {
+  it("is true only when background tasks remain and nothing is blocked", () => {
+    expect(isBackgroundTasksOnly(2, null)).toBe(true);
+    expect(isBackgroundTasksOnly(0, null)).toBe(false);
+  });
+
+  it("yields to a parked dialog so the shimmer still shouts", () => {
+    // blockedOn needs an action; it must never sit as a quiet pill.
+    expect(isBackgroundTasksOnly(2, "permission prompt")).toBe(false);
+  });
+});
+
 // ── subAgentComposerLabel ───────────────────────────────────────────────────
 
 describe("subAgentComposerLabel", () => {
@@ -1644,6 +1659,7 @@ describe("routing eligibility gates", () => {
       server_version: null,
       smart_routing_enabled: smartRouting,
       smart_routing_sources: { external: smartRouting, oss: smartRouting },
+      features: {},
       harness_install_enabled: false,
       installable_harnesses: [],
       dictation_available: false,

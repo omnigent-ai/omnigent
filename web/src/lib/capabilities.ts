@@ -45,6 +45,23 @@ export interface SmartRoutingSources {
   oss: boolean;
 }
 
+export interface Branding {
+  app_name: string | null;
+  heading: string | null;
+  logos: {
+    main: string | null;
+    loading: string | null;
+    favicon: string | null;
+  };
+  powered_by: boolean;
+}
+
+/** Release features understood by this frontend build. */
+export type FeatureKey = "usage_page" | "harness_install";
+
+/** Deployment-wide release-feature values advertised by the server. */
+export type FeatureValues = Record<string, boolean>;
+
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
   accounts_enabled: boolean;
@@ -132,8 +149,16 @@ export interface ServerInfo {
    */
   smart_routing_sources: SmartRoutingSources;
   /**
+   * Deployment-wide release features. Missing keys are disabled. The map is
+   * the canonical gate for new frontend surfaces.
+   */
+  features: FeatureValues;
+  /**
+   * Compatibility field for servers/frontends predating ``features``.
+   * New consumers should use :func:`isFeatureEnabled`.
+   *
    * True when the server accepts UI-driven harness installs
-   * (``OMNIGENT_HARNESS_INSTALL_ENABLED=1``). Gates the New Chat dialog's
+   * (``harness_install`` in ``OMNIGENT_FEATURES``). Gates the New Chat dialog's
    * one-click "Install" action for a missing harness. Fails to ``false`` so a
    * failed probe never offers an install the server would reject.
    */
@@ -154,10 +179,42 @@ export interface ServerInfo {
    * backend (Electron, Firefox/Chromium).
    */
   dictation_available: boolean;
+  /** Operator branding, or null when the built-in identity should be used. */
+  branding?: Branding | null;
 }
 
-/** Sentinel used when the probe fails — accounts is off, no login URL. */
-const FALLBACK_SERVER_INFO: ServerInfo = {
+function parseBranding(raw: unknown): Branding | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const value = raw as Record<string, unknown>;
+  const nonEmpty = (candidate: unknown): string | null =>
+    typeof candidate === "string" && candidate.trim() !== "" ? candidate : null;
+  const rawLogos =
+    value.logos !== null && typeof value.logos === "object"
+      ? (value.logos as Record<string, unknown>)
+      : {};
+  const logos = {
+    main: nonEmpty(rawLogos.main),
+    loading: nonEmpty(rawLogos.loading),
+    favicon: nonEmpty(rawLogos.favicon),
+  };
+  const branding = {
+    app_name: nonEmpty(value.app_name),
+    heading: typeof value.heading === "string" ? value.heading : null,
+    logos,
+    powered_by: value.powered_by !== false,
+  };
+  const isEmpty =
+    branding.app_name === null &&
+    branding.heading === null &&
+    logos.main === null &&
+    logos.loading === null &&
+    logos.favicon === null &&
+    branding.powered_by;
+  return isEmpty ? null : branding;
+}
+
+/** Sentinel used when the probe fails — accounts and release features are off. */
+export const FALLBACK_SERVER_INFO: ServerInfo = {
   accounts_enabled: false,
   // Fail to multi-user: a failed probe must not hide account/sharing chrome.
   single_user: false,
@@ -174,9 +231,11 @@ const FALLBACK_SERVER_INFO: ServerInfo = {
   server_version: null,
   smart_routing_enabled: false,
   smart_routing_sources: { external: false, oss: false },
+  features: {},
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
+  branding: null,
 };
 
 /**
@@ -192,6 +251,25 @@ function parseSmartRoutingSources(raw: unknown, routingEnabled: boolean): SmartR
   }
   const sources = raw as Partial<Record<keyof SmartRoutingSources, unknown>>;
   return { external: sources.external === true, oss: sources.oss === true };
+}
+
+function parseFeatures(raw: unknown, harnessInstallEnabled: boolean): FeatureValues {
+  const parsed: FeatureValues = {};
+  if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+    for (const [key, value] of Object.entries(raw)) {
+      if (typeof value === "boolean") parsed[key] = value;
+    }
+  }
+  // A server predating the feature map exposed this one release gate as a
+  // top-level field. Preserve mixed-version behavior without making it a
+  // second source for new features.
+  if (!("harness_install" in parsed)) parsed.harness_install = harnessInstallEnabled;
+  return parsed;
+}
+
+/** Return whether a known release feature is enabled; missing/loading is off. */
+export function isFeatureEnabled(info: ServerInfo | "loading", feature: FeatureKey): boolean {
+  return info !== "loading" && info.features?.[feature] === true;
 }
 
 let cachedServerInfo: ServerInfo | null = null;
@@ -217,6 +295,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
       if (res.ok) {
         const data = (await res.json()) as Partial<ServerInfo>;
         const smartRoutingEnabled = data.smart_routing_enabled === true;
+        const harnessInstallEnabled = data.harness_install_enabled === true;
         cachedServerInfo = {
           accounts_enabled: data.accounts_enabled === true,
           single_user: data.single_user === true,
@@ -240,11 +319,13 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             data.smart_routing_sources,
             smartRoutingEnabled,
           ),
-          harness_install_enabled: data.harness_install_enabled === true,
+          features: parseFeatures(data.features, harnessInstallEnabled),
+          harness_install_enabled: harnessInstallEnabled,
           installable_harnesses: Array.isArray(data.installable_harnesses)
             ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
             : [],
           dictation_available: data.dictation_available === true,
+          branding: parseBranding(data.branding),
         };
         return cachedServerInfo;
       }

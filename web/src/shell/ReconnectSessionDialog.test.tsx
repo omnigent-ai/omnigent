@@ -72,7 +72,7 @@ describe("buildReconnectCommand", () => {
       state: "host_offline",
     });
     expect(cmd).toContain("omnigent host");
-    expect(cmd).toContain("--server https://example.databricksapps.com");
+    expect(cmd).toContain("--server 'https://example.databricksapps.com'");
     // The --profile flag was removed from the CLI; emitting it here would
     // hand users a command that errors with "No such option".
     expect(cmd).not.toContain("--profile");
@@ -103,8 +103,17 @@ describe("buildReconnectCommand", () => {
     });
     expect(cmd).toContain("omnigent run path/to/agent.yaml");
     expect(cmd).toContain("--resume conv_abc123");
-    expect(cmd).toContain("--server https://example.databricksapps.com");
+    expect(cmd).toContain("--server 'https://example.databricksapps.com'");
     expect(cmd).not.toContain("--profile");
+  });
+
+  it("quotes server URLs containing shell metacharacters", () => {
+    const cmd = buildReconnectCommand({
+      conversationId: "conv_query",
+      serverUrl: "https://example.com/api?profile=dev&glob=*",
+      state: "host_offline",
+    });
+    expect(cmd).toContain("--server 'https://example.com/api?profile=dev&glob=*'");
   });
 
   it("emits `omnigent claude --resume` for a claude-native local_stranded session", () => {

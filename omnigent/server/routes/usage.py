@@ -12,6 +12,7 @@ from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.entities import Conversation
 from omnigent.runtime.policies.builder import load_session_usage
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._sessions.helpers import (
     _resolve_harness_impl,
@@ -100,6 +101,8 @@ def _session_cost(usage: dict[str, Any]) -> float:
 def _build_usage_report(
     conversation_store: ConversationStore,
     user_id: str | None,
+    *,
+    include_page_details: bool = False,
 ) -> UsageReport:
     """
     Build the usage report: a daily-rollup cost summary plus session detail.
@@ -117,6 +120,8 @@ def _build_usage_report(
     :param conversation_store: Store to read the rollup and sessions from.
     :param user_id: The caller / ACL scope. ``None`` in single-user mode maps
         to the reserved local owner the daily rollup and grants are keyed by.
+    :param include_page_details: Populate the timeline and display metadata
+        used only by the release-gated web Usage page.
     :returns: The populated :class:`UsageReport`.
     """
     # The daily rollup and session-permission grants key spend by the resolved
@@ -155,16 +160,24 @@ def _build_usage_report(
                     title=conv.title,
                     cost_usd=_session_cost(usage),
                     models=_session_models(usage),
-                    harness=_resolve_session_harness(conv),
-                    llm_model=conv.model_override or _resolve_llm_model(conv),
-                    agent_name=conv.sub_agent_name,
+                    harness=_resolve_session_harness(conv) if include_page_details else None,
+                    llm_model=(
+                        conv.model_override or _resolve_llm_model(conv)
+                        if include_page_details
+                        else None
+                    ),
+                    agent_name=conv.sub_agent_name if include_page_details else None,
                 )
             )
         if not page.has_more:
             break
         after = page.last_id
 
-    daily_costs_raw = conversation_store.list_daily_costs(rollup_user, _EPOCH_DAY)
+    daily_costs_raw = (
+        conversation_store.list_daily_costs(rollup_user, _EPOCH_DAY)
+        if include_page_details
+        else []
+    )
 
     return UsageReport(
         cost_today=cost_today,
@@ -180,6 +193,7 @@ def create_usage_router(
     conversation_store: ConversationStore,
     *,
     auth_provider: AuthProvider | None = None,
+    feature_flags: FeatureFlags | None = None,
 ) -> APIRouter:
     """
     Create the per-user usage-report router.
@@ -190,8 +204,11 @@ def create_usage_router(
     :param conversation_store: Store for the daily rollup and session reads.
     :param auth_provider: Auth provider for user identity. ``None`` disables
         auth (single-user / local mode).
+    :param feature_flags: Immutable deployment release-feature snapshot.
+        When omitted, resolves ``OMNIGENT_FEATURES`` at router construction.
     :returns: The configured router (mounted under ``/v1``).
     """
+    flags = feature_flags or resolve_feature_flags()
     router = APIRouter()
 
     @router.get("/usage", response_model=UsageReport)
@@ -205,6 +222,11 @@ def create_usage_router(
         ``None`` only when auth is disabled — the single-user / local case).
         """
         user_id = require_user(request, auth_provider)
-        return await asyncio.to_thread(_build_usage_report, conversation_store, user_id)
+        return await asyncio.to_thread(
+            _build_usage_report,
+            conversation_store,
+            user_id,
+            include_page_details=flags.enabled(Feature.USAGE_PAGE),
+        )
 
     return router
