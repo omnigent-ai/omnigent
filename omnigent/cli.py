@@ -1625,7 +1625,7 @@ _ACCENT_RGB = (244, 59, 166)
 # object registered under a second name, e.g. ``update`` -> ``upgrade``).
 # Kept runnable/registered but omitted from the ``--help`` listing so the
 # alias isn't shown as a duplicate line.
-_ALIAS_COMMANDS: frozenset[str] = frozenset({"update", "agy"})
+_ALIAS_COMMANDS: frozenset[str] = frozenset({"update", "antigravity"})
 
 
 def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
@@ -1637,13 +1637,10 @@ def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
     The predicates use ``importlib.util.find_spec`` (no heavy import).
     Commands absent from this map are always listed.
     """
-    from omnigent.onboarding.antigravity_auth import antigravity_sdk_installed
     from omnigent.onboarding.cursor_auth import cursor_sdk_installed
 
     return {
         "cursor": cursor_sdk_installed,
-        "antigravity": antigravity_sdk_installed,
-        "agy": antigravity_sdk_installed,
     }
 
 
