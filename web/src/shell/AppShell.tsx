@@ -28,6 +28,7 @@ import {
 } from "@/lib/designModePrompt";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { readDefaultWorkspacePanelOpen } from "@/lib/workspacePanelPreferences";
+import { readDefaultSessionView } from "@/lib/sessionViewPreferences";
 import {
   Dialog,
   DialogContent,
@@ -49,7 +50,6 @@ import {
   AGENT_TERMINAL_IDS,
   inventoryTerminals,
   isAgentTerminalKey,
-  PANEL_NO_TERMINAL_KEY,
   terminalTabKey,
   useTerminals,
 } from "@/hooks/useTerminals";
@@ -101,6 +101,8 @@ import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
 import type { RightRailTab } from "./railTabs";
+
+const SESSION_CHAT_VIEW_KEY = "chat";
 
 /**
  * Top-level layout. The sidebar and right panels are responsive:
@@ -350,6 +352,8 @@ export function AppShell() {
   } = useTerminals(conversationId ?? null, {
     reconcileWhilePending: terminalPending,
   });
+  const hadTerminalRef = useRef(false);
+  const terminalConversationRef = useRef(conversationId);
 
   const debugMode = useDebugMode();
   const { data: conversationsData } = useConversations("", true);
@@ -758,24 +762,25 @@ export function AppShell() {
     [changedFilePaths],
   );
 
-  // Persist the Chat/TUI toggle position per-conversation so leaving and
-  // re-entering a native session doesn't drop the user back into chat
-  // view. sessionStorage scope: same tab, cleared on tab close —
-  // a deliberately narrow scope so a stale "terminal view" preference
-  // can't survive across browser sessions, where the user's mental model
-  // may have moved on.
+  // Persist an explicit Chat/TUI choice per conversation. Terminal keys remain
+  // backward-compatible; terminal-first sessions use a Chat sentinel so an
+  // explicit Chat choice can override the app-global Terminal default.
   const setPanelInitialKey = useCallback(
     (key: string | null) => {
       setPanelInitialKeyState(key);
       if (!conversationId) return;
       const storageKey = `omnigent.web.panel-key:${conversationId}`;
       if (key === null) {
-        sessionStorage.removeItem(storageKey);
+        if (terminalFirst) {
+          sessionStorage.setItem(storageKey, SESSION_CHAT_VIEW_KEY);
+        } else {
+          sessionStorage.removeItem(storageKey);
+        }
       } else {
         sessionStorage.setItem(storageKey, key);
       }
     },
-    [conversationId],
+    [conversationId, terminalFirst],
   );
 
   // Restore the per-session workspace state when switching conversations:
@@ -803,9 +808,6 @@ export function AppShell() {
       return;
     }
     const persisted = readSessionWorkspaceState(conversationId);
-
-    const stored = sessionStorage.getItem(`omnigent.web.panel-key:${conversationId}`);
-    setPanelInitialKeyState(stored);
 
     // Restore the selected rail tab (the Files vs Changes scope is now the tab
     // itself). ``nextTab`` stays null when there's no persisted tab and no file
@@ -858,6 +860,51 @@ export function AppShell() {
 
     stateConvRef.current = conversationId;
   }, [conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Restore an explicit per-session view first; otherwise seed eligible
+  // terminal-first sessions from the Appearance default. Waiting for a usable
+  // terminal keeps stopped and still-starting sessions in Chat.
+  useEffect(() => {
+    if (terminalConversationRef.current !== conversationId) {
+      terminalConversationRef.current = conversationId;
+      hadTerminalRef.current = false;
+    }
+
+    if (!conversationId) {
+      setPanelInitialKeyState(null);
+      return;
+    }
+
+    const stored = sessionStorage.getItem(`omnigent.web.panel-key:${conversationId}`);
+    if (stored === SESSION_CHAT_VIEW_KEY) {
+      setPanelInitialKeyState(null);
+      return;
+    }
+
+    if (!terminalFirst) {
+      setPanelInitialKeyState(stored);
+      return;
+    }
+
+    if (terminals.length === 0) {
+      if (hadTerminalRef.current) return;
+      setPanelInitialKeyState(null);
+      return;
+    }
+
+    if (stored !== null) {
+      setPanelInitialKeyState(stored);
+      return;
+    }
+
+    if (readDefaultSessionView() === "terminal") {
+      const agentTerminal = terminals.find((terminal) => AGENT_TERMINAL_IDS.has(terminal.id));
+      setPanelInitialKeyState(terminalTabKey(agentTerminal ?? terminals[0]));
+      return;
+    }
+
+    setPanelInitialKeyState(null);
+  }, [conversationId, terminalFirst, terminals]);
 
   // Persist the per-session rail tab + open file tabs whenever they change.
   // Keyed on the state (not conversationId) and targeted at the conversation
@@ -1383,17 +1430,14 @@ export function AppShell() {
         setPanelInitialKey(null);
         return;
       }
-      if (terminals.length === 0) {
-        if (terminalFirst) setPanelInitialKey(PANEL_NO_TERMINAL_KEY);
-        return;
-      }
+      if (terminals.length === 0) return;
       // The pill's Terminal view is the AGENT's terminal: target it
       // explicitly (the SDK REPL or the native vendor pane) so the
       // pill never lands on a user shell.
       const agentTerminal = terminals.find((t) => AGENT_TERMINAL_IDS.has(t.id));
       setPanelInitialKey(terminalTabKey(agentTerminal ?? terminals[0]));
     },
-    [terminalFirst, terminals, setPanelInitialKey],
+    [terminals, setPanelInitialKey],
   );
 
   // `terminals` is already runner-accurate (useTerminals empties it when the
@@ -1429,15 +1473,13 @@ export function AppShell() {
   // own terminal) takes over the main view chrome-free:
   // ConnectionIndicator hides the Chat/Terminal pill while this is
   // true, and MainTerminalView renders the shell with its own close
-  // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
-  // "open with no target" stays a pill view.
+  // affordance.
   const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
 
   // A runner stop/disconnect empties the terminal list; if that lands while the
   // terminal view is open, flip back to chat rather than stranding the user on
   // "No terminals available" (and chat is where the composer resumes it).
   // Edge-triggered + startingUp-guarded so a cold boot / relaunch isn't yanked.
-  const hadTerminalRef = useRef(false);
   useEffect(() => {
     if (
       terminalFirst &&
