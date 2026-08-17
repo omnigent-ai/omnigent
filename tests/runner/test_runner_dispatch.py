@@ -4639,6 +4639,246 @@ async def test_sys_session_send_by_id_rejects_closed_child(
 
 
 @pytest.mark.asyncio
+async def test_sys_session_send_by_id_unwedges_stale_local_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    By-id ``sys_session_send`` proceeds when the server snapshot says the
+    child is idle even if the runner-local work entry is stale.
+
+    A missed terminal status edge leaves the local work entry stuck in
+    ``running``, which previously rejected every later send with "already
+    has a launching or running turn" forever — the wedged-child bug that
+    forced orchestrators to abandon healthy sessions and create duplicates.
+    The server snapshot's ``status`` is authoritative; a stale local entry
+    must be reconciled, not treated as a live turn.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts = 0
+    registrations: list[str] = []
+
+    monkeypatch.setattr(
+        runner_app,
+        "register_child_session",
+        lambda child_id, **_kwargs: registrations.append(child_id),
+    )
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app.register_subagent_work(
+        parent_session_id="conv_parent",
+        child_session_id="conv_stale",
+        agent="researcher",
+        title="auth",
+    )
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal event_posts
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_stale":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_stale",
+                    "title": "researcher:auth",
+                    "parent_session_id": "conv_parent",
+                    "status": "idle",
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_stale/events":
+            event_posts += 1
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "session_id": "conv_stale",
+                        "args": "please continue",
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent",
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_stale")
+            runner_app._session_inboxes_ref.pop("conv_parent", None)
+
+    payload = json.loads(output)
+    assert payload["conversation_id"] == "conv_stale"
+    assert payload["status"] == "launching"
+    assert event_posts == 1, "stale local work must not block a send to an idle child"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_by_id_rejects_while_server_says_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    By-id ``sys_session_send`` still rejects a genuinely busy child.
+
+    The server snapshot's ``status: running`` is the authoritative busy
+    signal and must keep rejecting concurrent sends; only stale local
+    bookkeeping (server idle) is reconciled.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts = 0
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal event_posts
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_busy":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_busy",
+                    "title": "researcher:auth",
+                    "parent_session_id": "conv_parent",
+                    "status": "running",
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_busy/events":
+            event_posts += 1
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps(
+                {
+                    "session_id": "conv_busy",
+                    "args": "please continue",
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_parent",
+            session_inbox=session_inbox,
+        )
+
+    assert "already running" in output
+    assert event_posts == 0
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_recovers_child_created_despite_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``sys_session_create`` recovers a child the server created even when
+    the create POST fails client-side.
+
+    The runner's POST can time out while the server keeps processing and
+    commits the child row (and queues the initial message). Previously the
+    tool returned ``{"error": "sys_session_create failed: "}`` (an empty
+    ``asyncio.TimeoutError`` message) for a session that actually exists,
+    so orchestrators retried and spawned duplicate children. The recovery
+    lookup must return the real child's handle instead.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    create_posts = 0
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal create_posts
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_posts += 1
+            raise httpx.ReadTimeout("timed out", request=request)
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent/child_sessions"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "conv_recovered",
+                            "title": "auth",
+                            "agent_id": "ag_x",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
+            server_client=server_client,
+            conversation_id="conv_parent",
+        )
+
+    handle = json.loads(output)
+    assert handle["conversation_id"] == "conv_recovered"
+    assert create_posts == 1
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_timeout_error_names_exception() -> None:
+    """
+    A create POST that genuinely fails reports the exception type, never
+    an empty message.
+
+    ``asyncio.TimeoutError`` stringifies to an empty string, so the old
+    ``f"sys_session_create failed: {exc}"`` produced an error with no
+    actionable detail and no hint that the child may still have been
+    created server-side.
+
+    :raises AssertionError: If the error message omits the exception type.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            raise httpx.ReadTimeout("timed out", request=request)
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "title": "auth"}),
+            server_client=server_client,
+            conversation_id="conv_parent",
+        )
+
+    info = json.loads(output)
+    assert "ReadTimeout" in info["error"]
+    assert info["error"].endswith("timed out")
+
+
+@pytest.mark.asyncio
 async def test_sys_session_send_completion_drains_from_parent_inbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

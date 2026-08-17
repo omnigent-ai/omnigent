@@ -2147,17 +2147,11 @@ async def _execute_subagent_tool(
             )
         child_wrapper_label = _session_wrapper_label(existing)
         existing_work = _runner_app.get_subagent_work(child_session_id)
-        if existing_work is not None and existing_work.status in (
-            "launching",
-            "running",
-            "waiting",
-        ):
-            return (
-                f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
-                "already has a launching or running turn. Use a distinct task-based title "
-                "for independent parallel work; reuse this title only to continue the same "
-                "conversation after completion."
-            )
+        # The server's child summary ``busy`` flag is authoritative; the
+        # runner-local work entry can lag it (a missed terminal edge leaves
+        # the entry ``launching``/``running`` forever and wedges the child
+        # against every later send). When the server says the child is not
+        # busy, reconcile the stale local entry and continue it.
         if existing.get("busy") is True:
             return (
                 f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
@@ -2165,6 +2159,20 @@ async def _execute_subagent_tool(
                 "parallel work; reuse this title only to continue the same conversation "
                 "after completion."
             )
+        if existing_work is not None and existing_work.status in (
+            "launching",
+            "running",
+            "waiting",
+        ):
+            if existing.get("busy") is False:
+                _runner_app.unregister_subagent_work(child_session_id)
+            else:
+                return (
+                    f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
+                    "already has a launching or running turn. Use a distinct task-based title "
+                    "for independent parallel work; reuse this title only to continue the same "
+                    "conversation after completion."
+                )
     else:
         _auto_ordinal = False
         if not session_name:
@@ -2586,11 +2594,26 @@ async def _send_to_existing_session(
     parsed = _parse_session_title(snap_data.get("title"))
     agent_label = parsed.agent or "agent"
     existing_work = _runner_app.get_subagent_work(target_session_id)
-    if existing_work is not None and existing_work.status in ("launching", "running", "waiting"):
+    # The server snapshot's ``status`` is the authoritative busy signal;
+    # the runner-local work entry can lag it (a missed terminal edge leaves
+    # the entry ``launching``/``running`` forever and wedges the child: every
+    # later send fails with "already has a launching or running turn" even
+    # though the child turn is done). When the server says the child is not
+    # in a turn, reconcile the stale local entry and proceed.
+    snapshot_status = snap_data.get("status")
+    if snapshot_status in ("running", "waiting"):
         return (
-            f"Error: session {target_session_id!r} already has a launching or running turn; "
+            f"Error: session {target_session_id!r} is already running; "
             "wait for completion before sending again"
         )
+    if existing_work is not None and existing_work.status in ("launching", "running", "waiting"):
+        if snapshot_status in ("idle", "failed", "created", "queued"):
+            _runner_app.unregister_subagent_work(target_session_id)
+        elif snapshot_status is None:
+            return (
+                f"Error: session {target_session_id!r} already has a launching or running turn; "
+                "wait for completion before sending again"
+            )
     if snap_data.get("busy") is True:
         return (
             f"Error: session {target_session_id!r} is already running; "
@@ -2776,6 +2799,55 @@ def _finalize_created_session(
     )
 
 
+async def _recover_child_created_despite_error(
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    agent_id: str,
+    title: object,
+) -> _JsonObject | None:
+    """
+    Recover a child the server created even though the create POST errored.
+
+    The server-side create can win a race with a client-side transport
+    failure: the runner's POST times out or drops while the server keeps
+    processing and commits the child row (and queues the initial message).
+    The caller then sees an error for a session that actually exists, and
+    an orchestrator that retries blindly spawns duplicate children.
+
+    Looks the child up by ``(parent, agent_id, title)`` — the same row
+    ``POST /v1/sessions`` just committed — and returns a payload shaped
+    like the create response so :func:`_finalize_created_session` can
+    finish registration. Returns ``None`` when the server genuinely did
+    not create anything (or the lookup itself fails).
+
+    :param server_client: Omnigent server client.
+    :param conversation_id: The caller (parent) session id.
+    :param agent_id: The agent the create targeted, e.g. ``"ag_abc123"``.
+    :param title: The caller-supplied child title (or non-str when absent).
+    :returns: A create-response-shaped dict, or ``None``.
+    """
+    if not isinstance(title, str) or not title:
+        return None
+    try:
+        children = await _list_child_sessions(
+            server_client=server_client,
+            conversation_id=conversation_id,
+            limit=50,
+        )
+    except Exception:  # noqa: BLE001 — recovery is best-effort
+        return None
+    if isinstance(children, str):
+        return None
+    for child in children:
+        if child.get("title") == title and child.get("agent_id") == agent_id:
+            return {
+                "id": child.get("id"),
+                "agent_name": child.get("agent_name"),
+                "status": child.get("status") or "created",
+            }
+    return None
+
+
 async def _execute_session_create(
     args: _JsonObject,
     *,
@@ -2872,9 +2944,23 @@ async def _execute_session_create(
         reasoning_effort=args.get("reasoning_effort"),
     )
     try:
-        resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
+        resp = await server_client.post("/v1/sessions", json=body, timeout=60.0)
     except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"sys_session_create failed: {exc}"})
+        recovered = await _recover_child_created_despite_error(
+            server_client,
+            conversation_id,
+            str(agent_id),
+            args.get("title"),
+        )
+        if recovered is not None:
+            return _finalize_created_session(
+                recovered,
+                conversation_id=conversation_id,
+                agent_id=str(agent_id),
+                title=args.get("title"),
+                publish_event=publish_event,
+            )
+        return json.dumps({"error": f"sys_session_create failed: {type(exc).__name__}: {exc}"})
     if resp.status_code == 404:
         return json.dumps({"error": "agent_not_found", "agent_id": agent_id})
     if resp.status_code in (401, 403):
@@ -3050,7 +3136,7 @@ async def _upload_config_bundle(
             timeout=60.0,
         )
     except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"sys_session_create failed: {exc}"})
+        return json.dumps({"error": f"sys_session_create failed: {type(exc).__name__}: {exc}"})
     if resp.status_code in (401, 403):
         return json.dumps({"error": "access_denied", "config_path": config_path})
     if resp.status_code >= 400:
