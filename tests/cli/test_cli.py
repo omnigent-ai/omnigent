@@ -984,10 +984,10 @@ def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
 def test_help_hides_extras_gated_harness_when_sdk_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """cursor/antigravity drop out of the harness list; a notice replaces them."""
+    """cursor/agy drop out of the harness list; a notice replaces them."""
     monkeypatch.setattr(
         "omnigent.cli._harness_extra_checks",
-        lambda: {"cursor": lambda: False, "antigravity": lambda: False},
+        lambda: {"cursor": lambda: False, "agy": lambda: False},
     )
 
     result = CliRunner().invoke(cli, ["--help"])
@@ -1005,17 +1005,17 @@ def test_help_hides_extras_gated_harness_when_sdk_missing(
 def test_help_shows_extras_gated_harness_when_sdk_installed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """cursor/antigravity appear in --help once their extra is importable."""
+    """cursor/agy appear in --help once their extra is importable."""
     monkeypatch.setattr(
         "omnigent.cli._harness_extra_checks",
-        lambda: {"cursor": lambda: True, "antigravity": lambda: True},
+        lambda: {"cursor": lambda: True, "agy": lambda: True},
     )
 
     result = CliRunner().invoke(cli, ["--help"])
 
     assert result.exit_code == 0, result.output
     assert "cursor" in result.output
-    assert "antigravity" in result.output
+    assert "agy" in result.output
     assert "Some harnesses need an optional extra" not in result.output
 
 
