@@ -3619,6 +3619,91 @@ describe("chatStore — send (file attachments)", () => {
 });
 
 describe("chatStore — stop", () => {
+  it("arms the exact prompt when a new turn is submitted", async () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      abortController: new AbortController(),
+    });
+
+    await useChatStore.getState().send("preserve\nthis prompt", "agent_xyz");
+
+    const pending = useChatStore.getState().pendingUserMessages[0]!;
+    expect(useChatStore.getState().interruptedPromptRecovery).toEqual({
+      text: "preserve\nthis prompt",
+      tempId: pending.tempId,
+      phase: "eligible",
+    });
+  });
+
+  it("arms the submitted prompt and releases it only after an early interrupt is confirmed", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      pendingUserMessages: [
+        {
+          tempId: "pend_1",
+          content: [{ type: "input_text", text: "please keep this exact prompt" }],
+        },
+      ],
+      interruptedPromptRecovery: {
+        text: "please keep this exact prompt",
+        tempId: "pend_1",
+        phase: "eligible",
+      },
+      status: "streaming",
+      sessionStatus: "running",
+    });
+
+    // The input can commit before the user reaches Escape. That does not cross
+    // the recovery boundary; only another user message or agent progress does.
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "msg_1",
+      itemType: "message",
+      data: {
+        role: "user",
+        content: [{ type: "input_text", text: "please keep this exact prompt" }],
+      },
+    });
+    useChatStore.getState().stop();
+
+    expect(useChatStore.getState().interruptedPromptRecovery).toEqual({
+      text: "please keep this exact prompt",
+      tempId: "pend_1",
+      phase: "requested",
+    });
+
+    handleSessionEvent({
+      type: "session_interrupted",
+      requestedAt: 1704067200,
+    });
+
+    expect(useChatStore.getState().interruptedPromptRecovery).toEqual({
+      conversationId: "conv_abc",
+      text: "please keep this exact prompt",
+      tempId: "pend_1",
+      phase: "ready",
+    });
+  });
+
+  it("does not release a prompt after turn progress invalidates recovery", () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      interruptedPromptRecovery: {
+        text: "do not restore stale text",
+        tempId: "pend_1",
+        phase: "requested",
+      },
+    });
+
+    useChatStore.setState({ interruptedPromptRecovery: null });
+    handleSessionEvent({
+      type: "session_interrupted",
+      requestedAt: 1704067200,
+    });
+
+    expect(useChatStore.getState().interruptedPromptRecovery).toBeNull();
+  });
+
   it("posts {type: 'interrupt'} to the events endpoint without aborting the local stream", async () => {
     const controller = new AbortController();
     useChatStore.setState({
@@ -5137,6 +5222,11 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       useChatStore.setState({
         blocks: existingBlocks,
         pendingUserMessages: [],
+        interruptedPromptRecovery: {
+          text: "my interrupted prompt",
+          tempId: "pend_mine",
+          phase: "requested",
+        },
       });
 
       handleSessionEvent({
@@ -5157,6 +5247,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(promoted.ctx.itemId).toBe("msg_from_other_client");
       expect(promoted.content).toEqual([{ type: "input_text", text: "from web UI" }]);
       expect(after.pendingUserMessages).toEqual([]);
+      expect(after.interruptedPromptRecovery).toBeNull();
     });
 
     it("threads createdBy onto a cross-client user message for live attribution", () => {
@@ -5571,6 +5662,11 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       bindConversationForTest("conv_bg", {
         activeResponse: { responseId: "resp_bg", state: "streaming", error: null },
         interruptedResponseIds: [],
+        interruptedPromptRecovery: {
+          text: "background prompt",
+          tempId: "pend_bg",
+          phase: "requested",
+        },
       });
       bindConversationForTest("conv_visible");
       useChatStore.setState({
@@ -5590,6 +5686,12 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         error: null,
       });
       expect(bg.get().interruptedResponseIds).toEqual(["resp_bg"]);
+      expect(bg.get().interruptedPromptRecovery).toEqual({
+        conversationId: "conv_bg",
+        text: "background prompt",
+        tempId: "pend_bg",
+        phase: "ready",
+      });
       // The visible turn keeps streaming.
       expect(useChatStore.getState().activeResponse).toEqual({
         responseId: "resp_visible",
@@ -5597,6 +5699,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         error: null,
       });
       expect(useChatStore.getState().interruptedResponseIds).toEqual([]);
+      expect(useChatStore.getState().interruptedPromptRecovery).toBeNull();
     });
 
     it("still applies events delivered by the visible conversation's own stream", () => {
@@ -7501,6 +7604,76 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
 
   const setState = useChatStore.setState as unknown as Parameters<typeof pumpStreamEvents>[3];
   const getState = useChatStore.getState as unknown as Parameters<typeof pumpStreamEvents>[4];
+
+  it("suppresses recovery when assistant output races the interrupt acknowledgement", async () => {
+    useChatStore.setState({
+      conversationId: "conv_interrupt_race",
+      blocks: [],
+      interruptedPromptRecovery: {
+        text: "race-safe prompt",
+        tempId: "pend_race",
+        phase: "requested",
+      },
+    });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    void pumpStreamEvents("conv_interrupt_race", sink.stream, controller, setState, getState);
+
+    sink.push(sse("response.created", { id: "resp_race", status: "in_progress", output: [] }));
+    sink.push(delta("A"));
+    sink.push(
+      sse("session.interrupted", {
+        type: "session.interrupted",
+        data: { requested_at: 1704067200, response_id: "resp_race" },
+      }),
+    );
+    await tick();
+
+    expect(useChatStore.getState().interruptedPromptRecovery).toBeNull();
+    controller.abort();
+  });
+
+  it("suppresses recovery after tool activity without assistant text", async () => {
+    useChatStore.setState({
+      conversationId: "conv_interrupt_tool",
+      blocks: [],
+      interruptedPromptRecovery: {
+        text: "tool-bound prompt",
+        tempId: "pend_tool",
+        phase: "requested",
+      },
+    });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    void pumpStreamEvents("conv_interrupt_tool", sink.stream, controller, setState, getState);
+
+    sink.push(
+      sse("response.created", { id: "resp_tool_boundary", status: "in_progress", output: [] }),
+    );
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "tool_boundary",
+          type: "function_call",
+          response_id: "resp_tool_boundary",
+          call_id: "call_boundary",
+          name: "shell",
+          arguments: '{"command":"pwd"}',
+          status: "in_progress",
+        },
+      }),
+    );
+    sink.push(
+      sse("session.interrupted", {
+        type: "session.interrupted",
+        data: { requested_at: 1704067200, response_id: "resp_tool_boundary" },
+      }),
+    );
+    await tick();
+
+    expect(useChatStore.getState().interruptedPromptRecovery).toBeNull();
+    controller.abort();
+  });
 
   it("coalesces multiple buffered blocks into one in-order append per frame", async () => {
     useChatStore.setState({ conversationId: "conv_batch", blocks: [] });
