@@ -1065,7 +1065,7 @@ function createWindow(targetUrl, opts = {}) {
           // centered there — see the [data-electron-mac] rules in index.css).
           // x:19 preserves hiddenInset's horizontal inset; y centers the ~14px
           // controls ((36-14)/2 ≈ 11). Adjust y by ±1 if it reads off on device.
-          trafficLightPosition: { x: 19, y: 11 },
+          trafficLightPosition: { x: 16, y: 17 },
         }
       : {}),
     webPreferences: {

@@ -713,16 +713,16 @@ aside[aria-label="Workspace"][data-maximized] {
  * controls, while the DOM keeps Search → Settings → toggle (tab order follows
  * importance), so the toggle is reordered visually rather than in the markup.
  *
- * Geometry: left 5rem clears the three lights plus their inset. The buttons
+ * Geometry: left 5.5rem clears the three lights plus their inset. The buttons
  * align to the LIGHTS, not to a text row — macOS paints them OUTSIDE the page
  * (absent from the DOM and from page screenshots), so there is nothing to
  * measure; anchor to the same 2.25rem strip the drag region uses and centre a
- * 1.5rem button in it: (2.25rem − 1.5rem) / 2 = 0.375rem, landing y=18 on the
+ * 1.5rem button in it: (48px - 24px) / 2 = 12px, landing on the
  * lights' centre line. */
 [data-electron-mac] .electron-sidebar-header-actions {
   position: absolute;
-  top: 0.375rem;
-  left: 5rem;
+  top: 0.75rem;
+  left: 5.5rem;
   /* Above the sidebar, which is a positioned sibling at z-index 50 with an
    * opaque gradient background — at any lower layer it paints straight over
    * this cluster (the buttons still measure correctly in the DOM, which is why
