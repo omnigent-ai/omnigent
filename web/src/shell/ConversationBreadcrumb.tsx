@@ -8,10 +8,11 @@ import { cn } from "@/lib/utils";
 /**
  * `[folder] / <title> [/ <sub-agent>]` breadcrumb for the active conversation.
  *
- * Rendered in two places that must stay identical: the chat header's left slot
- * (ChatHeader) and — when the sidebar is collapsed on the macOS shell — the
- * title-bar cluster beside the Settings cog (AppShell), where the header copy
- * would otherwise sit under the traffic lights. Extracted so neither drifts.
+ * Rendered in the chat header's left slot (ChatHeader). On the macOS shell with
+ * the sidebar collapsed the slot is padded clear of the traffic lights and the
+ * title-bar cluster (see `.traffic-light-clearance` in index.css), so the
+ * breadcrumb stays in the header — truncating within its flex — rather than
+ * overlapping the window controls.
  *
  * The caller gates on a resolved `conversationTitle` (this renders nothing
  * useful without one). Segments self-gate: the folder only shows when filed,
@@ -54,7 +55,7 @@ export function ConversationBreadcrumb({
   return (
     <nav
       aria-label="Conversation"
-      className={cn("flex min-w-0 items-center gap-1.5 text-ui", className)}
+      className={cn("conversation-breadcrumb flex min-w-0 items-center gap-1.5 text-ui", className)}
     >
       {projectName && (
         <div className="hidden md:flex min-w-0 items-center gap-1.5 text-ui shrink-0">

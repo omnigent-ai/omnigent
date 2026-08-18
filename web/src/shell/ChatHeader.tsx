@@ -284,12 +284,12 @@ export function ChatHeader({
             <TooltipContent side="bottom">Open sidebar</TooltipContent>
           </Tooltip>
         )}
-        {/* Conversation breadcrumb (shared with AppShell's title-bar cluster,
-            see ConversationBreadcrumb). Gated on a resolved title so it stays
-            empty on the landing composer and while the snapshot loads. The
-            chat-header-breadcrumb class lets index.css hide this copy on the
-            macOS shell when the sidebar is collapsed — the title-bar copy shows
-            it there instead, clear of the traffic lights. */}
+        {/* Conversation breadcrumb (see ConversationBreadcrumb). Gated on a
+            resolved title so it stays empty on the landing composer and while
+            the snapshot loads. min-w-0 on this slot lets it truncate rather than
+            push the right-hand action cluster. On the macOS shell with the
+            sidebar collapsed, the slot's traffic-light-clearance pads it past
+            the window controls + title-bar cluster (index.css). */}
         {conversationId && conversationTitle && (
           <ConversationBreadcrumb
             conversationTitle={conversationTitle}
@@ -298,7 +298,7 @@ export function ChatHeader({
             isChildSession={isChildSession}
             boundAgent={boundAgent}
             wrapperLabel={wrapperLabel}
-            className="chat-header-breadcrumb pr-1"
+            className="pr-1"
           />
         )}
       </div>

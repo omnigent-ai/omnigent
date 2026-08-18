@@ -75,7 +75,6 @@ import {
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
-import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
 import { FileViewerContext } from "./FileViewerContext";
@@ -1567,7 +1566,13 @@ export function AppShell() {
             {isMacElectronShell() && !inSettings && (
               <div className="electron-sidebar-header-actions">
                 <SidebarHeaderActions
-                  expanded={sidebarOpen || sidebarPeek}
+                  // Real docked state — NOT `|| sidebarPeek`. During a peek the
+                  // sidebar isn't pinned open, and `onToggle` below pins it open
+                  // (the else branch, since sidebarOpen is false), so the button
+                  // must read "Open" and expand. Counting peek as expanded made
+                  // it show "Collapse" while a click actually expanded — the
+                  // icon/tooltip lied until the sidebar was really open.
+                  expanded={sidebarOpen}
                   onToggle={() => {
                     // Mirrors the ⌘⌥[ hotkey: a peeking sidebar counts as open,
                     // so toggling from peek pins it open rather than collapsing.
@@ -1587,24 +1592,6 @@ export function AppShell() {
                   onTogglePointerEnter={sidebarOpen || sidebarPeek ? undefined : armTitleBarPeek}
                   onTogglePointerLeave={cancelTitleBarPeek}
                 />
-                {/* Collapsed (peek included): with the docked sidebar gone the
-                    chat header's own breadcrumb would sit under the traffic
-                    lights (it's hidden there — see .chat-header-breadcrumb in
-                    index.css), so surface the same breadcrumb here in the
-                    title-bar strip, right of the Settings cog. Kept through peek
-                    (the card drops below this strip), so it never disappears or
-                    shifts as the card floats in and out. */}
-                {!sidebarOpen && headerConversationTitle && (
-                  <ConversationBreadcrumb
-                    conversationTitle={headerConversationTitle}
-                    projectName={headerProjectName}
-                    titleLinkTo={headerTitleLinkTo}
-                    isChildSession={isChildSession}
-                    boundAgent={boundAgent}
-                    wrapperLabel={wrapperLabel}
-                    className="ml-2 max-w-[30vw]"
-                  />
-                )}
               </div>
             )}
             {/* The server picker is NOT here: it lives at the bottom of the
