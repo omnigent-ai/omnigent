@@ -42,6 +42,7 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     TextChunk,
+    ReasoningChunk,
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
@@ -113,9 +114,11 @@ _AGENT_METHOD_SESSION_PROMPT = "session/prompt"
 
 # Notifications sent *from* the agent to the client
 _CLIENT_NOTIFICATION_SESSION_UPDATE = "session/update"
+_CLIENT_NOTIFICATION_SESSION_CANCEL = "session/cancel"
 
 # session/update.update.sessionUpdate values we care about
 _UPDATE_AGENT_MESSAGE_CHUNK = "agent_message_chunk"
+_UPDATE_AGENT_THOUGHT_CHUNK = "agent_thought_chunk"
 _UPDATE_TOOL_CALL = "tool_call"
 _UPDATE_TOOL_CALL_UPDATE = "tool_call_update"
 
@@ -259,6 +262,8 @@ class QwenExecutor(Executor):
 
         # ACP session id assigned by qwen (returned in session/new response).
         self._session_id: str | None = None
+        # toolCallId -> display name, correlating a tool_call with its update (#4876).
+        self._tool_names: dict[str, str] = {}
 
         # Whether initialize has been sent already.
         self._initialized: bool = False
@@ -1410,14 +1415,41 @@ class QwenExecutor(Executor):
                         accumulated_text.append(text)
                         yield TextChunk(text=text)
 
+                elif update_type == _UPDATE_AGENT_THOUGHT_CHUNK:
+                    content = update.get("content", {})
+                    text = content.get("text", "") if isinstance(content, dict) else ""
+                    if text:
+                        yield ReasoningChunk(delta=text, event_type="reasoning_text")
+
                 elif update_type == _UPDATE_TOOL_CALL:
-                    # Qwen is executing a built-in tool — surface it as info.
-                    tool_title = update.get("title", "tool_call")
-                    logger.debug("qwen tool_call: %s", tool_title)
+                    # Qwen is executing a built-in tool: surface the lifecycle
+                    # so tool cards render (#4876). toolCallId correlates the
+                    # request with its later update.
+                    call_id = update.get("toolCallId")
+                    name = update.get("title") or update.get("kind") or "tool"
+                    raw_input = update.get("rawInput")
+                    args = raw_input if isinstance(raw_input, dict) else {}
+                    if isinstance(call_id, str) and call_id:
+                        self._tool_names[call_id] = str(name)
+                        yield ToolCallRequest(name=str(name), args=args, metadata={"call_id": call_id})
+                    else:
+                        logger.debug("qwen tool_call: %s", name)
 
                 elif update_type == _UPDATE_TOOL_CALL_UPDATE:
-                    # Status update on an in-progress tool call — skip.
-                    pass
+                    status = update.get("status")
+                    call_id = update.get("toolCallId")
+                    if isinstance(call_id, str) and status in ("completed", "failed"):
+                        name = self._tool_names.pop(call_id, "tool")
+                        yield ToolCallComplete(
+                            name=name,
+                            status=(
+                                ToolCallStatus.SUCCESS
+                                if status == "completed"
+                                else ToolCallStatus.ERROR
+                            ),
+                            result=update.get("content") or update.get("rawOutput"),
+                            metadata={"call_id": call_id},
+                        )
 
             elif notification.get("id") is not None and notification.get("method"):
                 # Server-initiated request (e.g. session/request_permission):
@@ -1432,6 +1464,29 @@ class QwenExecutor(Executor):
             # Inbound message = progress; reset the idle deadline. Runs after the
             # human-approval block above so a slow approval doesn't time out.
             deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
+
+    async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002 — one session per process
+        """Abort the running turn via the ACP ``session/cancel`` notification.
+
+        The agent ends the in-flight ``session/prompt`` with a ``cancelled``
+        stop reason, which the ``run_turn`` loop surfaces. Best-effort: a
+        no-op (returns ``False``) without a live session — the Qwen half of
+        #1638 / #4876.
+        """
+        if self._proc is None or self._proc.returncode is not None or self._session_id is None:
+            return False
+        try:
+            await self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "method": _CLIENT_NOTIFICATION_SESSION_CANCEL,
+                    "params": {"sessionId": self._session_id},
+                }
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
+            logger.debug("qwen session/cancel failed: %s", exc)
+            return False
 
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; sessions are per-process)."""
