@@ -335,7 +335,8 @@ export function ErrorBanner({
                 event.stopPropagation();
                 void retry();
               }}
-              className="h-6 shrink-0 gap-1 rounded-[var(--control-radius,var(--radius-lg))] px-2 text-[var(--text-13,13px)] leading-5 text-muted-foreground hover:bg-muted hover:text-foreground"
+              style={{ fontSize: "var(--text-13, 13px)" }}
+              className="h-6 shrink-0 gap-1 rounded-[var(--control-radius,var(--radius-lg))] px-2 leading-5 text-muted-foreground hover:bg-muted hover:text-foreground"
             >
               <RotateCwIcon className="size-3.5" aria-hidden="true" />
               Retry
