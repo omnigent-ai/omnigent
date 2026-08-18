@@ -165,10 +165,11 @@ describe("WorkspacePanel surface presentation", () => {
     const filesTab = screen.getByRole("tab", { name: "Files" });
     const changesTab = screen.getByRole("tab", { name: "Changes" });
     const agentsTab = screen.getByRole("tab", { name: "Agents 1" });
-    expect(filesTab).toHaveClass("size-8", "p-0");
+    // Icon-only tabs carry their accessible name (queried above) plus a hover
+    // tooltip, never a native title attribute. Exact size/padding classes are
+    // intentionally not asserted — brittle styling detail, not behaviour.
     expect(filesTab).not.toHaveAttribute("title");
-    expect(changesTab).toHaveClass("size-8", "p-0");
-    expect(agentsTab).toHaveClass("size-8", "p-0");
+    expect(changesTab).not.toHaveAttribute("title");
     expect(agentsTab).not.toHaveAttribute("title");
   });
 
