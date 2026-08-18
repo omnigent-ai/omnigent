@@ -2011,6 +2011,45 @@ describe("Subagents tab", () => {
     expect(screen.getByRole("tab", { name: /Files/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /Shells/i })).toBeInTheDocument();
   });
+
+  it("keeps the back-to-parent header link when the parent title is unresolved", () => {
+    // Parent is outside the loaded sidebar window and its snapshot has no
+    // title yet. The header used to hide the whole breadcrumb (and the only
+    // in-header climb-out) until a title resolved. The parent id is enough.
+    mockConversations([]);
+    useSessionMock.mockImplementation((id) => {
+      if (id === "conv_child") {
+        return {
+          session: {
+            id: "conv_child",
+            agentId: "ag_child",
+            agentName: null,
+            runnerId: null,
+            status: "idle",
+            createdAt: 0,
+            title: null,
+            labels: {},
+            items: [],
+            pendingElicitations: [],
+            permissionLevel: 4,
+            parentSessionId: "conv_parent",
+            subAgentName: null,
+            kind: "sub_agent",
+          },
+          isLoading: false,
+          error: null,
+        };
+      }
+      return { session: null, isLoading: false, error: null };
+    });
+
+    renderShell("/c/conv_child");
+
+    expect(screen.getByRole("link", { name: "Back to parent session" })).toHaveAttribute(
+      "href",
+      "/c/conv_parent",
+    );
+  });
 });
 
 describe("FilesPanel visibility", () => {

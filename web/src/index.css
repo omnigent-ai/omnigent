@@ -772,11 +772,18 @@ aside[aria-label="Workspace"][data-maximized] {
   -webkit-app-region: no-drag;
 }
 
-/* The iOS/Android native shells carry their own navigation chrome, so the chat
- * header's conversation breadcrumb is redundant there — hide it. Not scoped to
- * a width media query so it holds on wider native shells (e.g. iPad) too. */
-[data-ios-native] .conversation-breadcrumb,
-[data-android-native] .conversation-breadcrumb {
+/* Native shells carry their own chrome (server switcher), so the folder /
+ * title / sub-agent segments are redundant there. Keep the parent-session
+ * link: native back is off and edge-pan opens the sidebar, so that link is
+ * the only in-header climb-out of a sub-agent. Hide the empty nav when there
+ * is no parent link (top-level). Not scoped to a width media query so it
+ * holds on wider native shells (e.g. iPad) too. */
+[data-ios-native] .conversation-breadcrumb:not(:has(> a.breadcrumb-parent-link)),
+[data-android-native] .conversation-breadcrumb:not(:has(> a.breadcrumb-parent-link)) {
+  display: none;
+}
+[data-ios-native] .conversation-breadcrumb > :not(a.breadcrumb-parent-link),
+[data-android-native] .conversation-breadcrumb > :not(a.breadcrumb-parent-link) {
   display: none;
 }
 

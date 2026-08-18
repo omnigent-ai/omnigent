@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
+import { UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { PresenceAvatars } from "@/components/PresenceAvatars";
 import type { Agent } from "@/hooks/useAgents";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -107,8 +108,9 @@ interface ChatHeaderProps {
   conversationId: string | undefined;
   /**
    * Breadcrumb title: the active conversation's display name, or its
-   * immediate parent's when viewing a sub-agent. ``null`` while unresolved
-   * (the breadcrumb stays empty).
+   * immediate parent's when viewing a sub-agent. ``null`` while unresolved.
+   * A child still renders the breadcrumb (and the parent link) when
+   * ``titleLinkTo`` is set — the title falls back to "New session".
    */
   conversationTitle: string | null;
   /**
@@ -284,15 +286,16 @@ export function ChatHeader({
             <TooltipContent side="bottom">Open sidebar</TooltipContent>
           </Tooltip>
         )}
-        {/* Conversation breadcrumb (see ConversationBreadcrumb). Gated on a
-            resolved title so it stays empty on the landing composer and while
-            the snapshot loads. min-w-0 on this slot lets it truncate rather than
-            push the right-hand action cluster. On the macOS shell with the
-            sidebar collapsed, the slot's traffic-light-clearance pads it past
-            the window controls + title-bar cluster (index.css). */}
-        {conversationId && conversationTitle && (
+        {/* Conversation breadcrumb (see ConversationBreadcrumb). Empty on the
+            landing composer. A resolved title is enough; so is titleLinkTo —
+            a child must keep its climb-out while the parent title loads.
+            min-w-0 on this slot lets it truncate rather than push the
+            right-hand action cluster. On the macOS shell with the sidebar
+            collapsed, the slot's traffic-light-clearance pads it past the
+            window controls + title-bar cluster (index.css). */}
+        {conversationId && (conversationTitle || titleLinkTo) && (
           <ConversationBreadcrumb
-            conversationTitle={conversationTitle}
+            conversationTitle={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
             projectName={projectName}
             titleLinkTo={titleLinkTo}
             isChildSession={isChildSession}

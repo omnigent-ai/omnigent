@@ -2,7 +2,7 @@ import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState }
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
 import { PROJECT_LABEL_KEY, useConversations, useProjects } from "@/hooks/useConversations";
-import { conversationDisplayLabel } from "./sidebarNav";
+import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
@@ -448,15 +448,20 @@ export function AppShell() {
   // conversation normally, or its immediate parent when inside a sub-agent
   // (whose own row the sidebar omits, so its title falls back to the parent
   // snapshot). The parent title also links back out, replacing the old "Back"
-  // button. Project membership lives only on the list row (`Conversation`),
-  // never the snapshot, so a parent outside the loaded window shows no folder.
+  // button. A child always gets a title (fallback "New session") so that
+  // climb-out does not wait on the parent row or snapshot. Prefer a real
+  // list/snapshot title over conversationDisplayLabel — that helper's
+  // "New session" fallback would otherwise shadow a titled snapshot.
+  // Project membership lives only on the list row (`Conversation`), never
+  // the snapshot, so a parent outside the loaded window shows no folder.
   const { session: parentSession } = useSession(activeSession?.parentSessionId);
   const { data: projectSummaries } = useProjects();
   const breadcrumbConv = isChildSession ? parentConv : activeConv;
   const headerConversationTitle =
-    (breadcrumbConv ? conversationDisplayLabel(breadcrumbConv) : null) ??
-    (isChildSession ? parentSession?.title : activeSession?.title) ??
-    null;
+    breadcrumbConv?.title ||
+    (isChildSession ? parentSession?.title : activeSession?.title) ||
+    (breadcrumbConv ? conversationDisplayLabel(breadcrumbConv) : null) ||
+    (isChildSession ? UNTITLED_CONVERSATION_LABEL : null);
   const headerProjectName =
     (breadcrumbConv?.project_id != null
       ? projectSummaries?.find((p) => p.id === breadcrumbConv.project_id)?.name

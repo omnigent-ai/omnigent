@@ -244,6 +244,22 @@ describe("ChatHeader — conversation breadcrumb", () => {
     );
     expect(screen.getByText("Sub-agent")).toBeInTheDocument();
   });
+
+  it("still links back to the parent when the breadcrumb title is unresolved", () => {
+    // Parent outside the loaded sidebar window + snapshot title still null.
+    // The climb-out must not wait on a resolved title — titleLinkTo is enough.
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      conversationTitle: null,
+      titleLinkTo: "/c/parent-123",
+    });
+    expect(screen.getByRole("link", { name: "Back to parent session" })).toHaveAttribute(
+      "href",
+      "/c/parent-123",
+    );
+  });
 });
 
 function makeTerminalFirstCtx(

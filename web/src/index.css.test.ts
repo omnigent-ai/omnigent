@@ -596,3 +596,20 @@ describe("index.css electron-mac sidebar header", () => {
     }
   });
 });
+
+describe("index.css native conversation breadcrumb", () => {
+  it("does not hide the parent-session link on iOS/Android native shells", () => {
+    // Native chrome is a server switcher, not session back. A blanket
+    // `.conversation-breadcrumb { display: none }` would also drop the only
+    // in-header climb-out of a sub-agent (native back is off; edge-pan opens
+    // the sidebar). Folder / title / sub-agent may hide; the parent link must
+    // stay.
+    const blanket = cssSource.match(
+      /\[data-ios-native\] \.conversation-breadcrumb\s*,\s*\[data-android-native\] \.conversation-breadcrumb\s*\{[^}]*display:\s*none/,
+    );
+    expect(blanket).toBeNull();
+    expect(cssSource).toMatch(
+      /\[data-ios-native\][\s\S]*breadcrumb-parent-link[\s\S]*\[data-android-native\][\s\S]*breadcrumb-parent-link/,
+    );
+  });
+});

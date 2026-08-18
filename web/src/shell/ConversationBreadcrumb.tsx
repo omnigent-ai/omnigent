@@ -14,9 +14,9 @@ import { cn } from "@/lib/utils";
  * breadcrumb stays in the header — truncating within its flex — rather than
  * overlapping the window controls.
  *
- * The caller gates on a resolved `conversationTitle` (this renders nothing
- * useful without one). Segments self-gate: the folder only shows when filed,
- * the sub-agent only inside a child. The title links back to the parent when
+ * The caller mounts this when there is a title or a parent route to climb
+ * back to. Segments self-gate: the folder only shows when filed, the
+ * sub-agent only inside a child. The title links back to the parent when
  * `titleLinkTo` is set (viewing a sub-agent), else it's plain text.
  */
 export function ConversationBreadcrumb({
@@ -87,7 +87,7 @@ export function ConversationBreadcrumb({
         <Link
           to={titleLinkTo}
           aria-label="Back to parent session"
-          className="truncate text-muted-foreground hover:text-foreground hover:underline"
+          className="breadcrumb-parent-link truncate text-muted-foreground hover:text-foreground hover:underline"
         >
           {conversationTitle}
         </Link>

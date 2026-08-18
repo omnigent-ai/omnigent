@@ -427,9 +427,9 @@ function TerminalTabsStrip({
               }
             }}
             className={cn(
-              // Match FileTabsStrip's pill metrics so shell and file tabs line
-              // up in the same strip.
-              "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-ui font-medium leading-5 transition-colors",
+              // Match FileTabsStrip's pill metrics (h-24 / px-8 / rounded-md)
+              // so shell and file tabs line up in the same strip.
+              "group/tab relative flex h-[24px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-md px-2 text-ui font-medium leading-5 transition-colors",
               active
                 ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
                 : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
@@ -437,7 +437,7 @@ function TerminalTabsStrip({
           >
             <TerminalIcon className="size-4 shrink-0" />
             <span className="min-w-0 truncate text-sm">{name}</span>
-            <span className="absolute inset-y-0 right-[2px] flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
+            <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
               <button
                 type="button"
                 aria-label={`Close ${name}`}

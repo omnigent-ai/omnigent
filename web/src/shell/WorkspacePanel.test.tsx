@@ -322,6 +322,21 @@ describe("WorkspacePanel shell tabs", () => {
     expect(screen.getByText("zsh · u-g9qopr")).toBeInTheDocument();
   });
 
+  it("sizes shell tab pills to the same 24px height as file tabs", () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    renderWorkspace({
+      showShellsTab: true,
+      openFiles: ["src/App.tsx"],
+      openTerminals: [termKey],
+    });
+
+    const fileTab = screen.getByText("App.tsx").closest("[role='button']");
+    const shellTab = screen.getByText("zsh · u-g9qopr").closest("[role='button']");
+    expect(fileTab).toHaveClass("h-[24px]");
+    expect(shellTab).toHaveClass("h-[24px]");
+    expect(shellTab).not.toHaveClass("h-[32px]");
+  });
+
   it("surfaces the active shell's xterm in the content slot", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     renderWorkspace({
