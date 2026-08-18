@@ -475,16 +475,67 @@ def _get_head_db_revision(db_uri: str) -> str:
     return head
 
 
+def _revision_is_known(db_uri: str, revision: str) -> bool:
+    """
+    Report whether *revision* exists in our migrations directory.
+
+    A revision recorded in ``alembic_version`` that this build has
+    never heard of means the database was migrated by a newer
+    omnigent, which Alembic cannot upgrade from — it has no path to
+    start walking.
+
+    :param db_uri: Database URL — only used to build an Alembic
+        ``Config`` pointing at our scripts directory.
+    :param revision: Revision hash read from the database.
+    :returns: ``True`` if the revision resolves against our scripts.
+    """
+    from alembic.script import ScriptDirectory
+    from alembic.script.revision import RevisionError
+    from alembic.util.exc import CommandError
+
+    script = ScriptDirectory.from_config(_build_alembic_config(db_uri))
+    try:
+        # get_revision re-raises resolution failures as CommandError.
+        script.get_revision(revision)
+    except (RevisionError, CommandError):
+        return False
+    return True
+
+
+def _database_ahead_of_build_message(current: str, head: str) -> str:
+    """
+    Explain that the database was written by a newer omnigent.
+
+    Deliberately does not suggest ``omnigent debug db-upgrade``: that
+    command cannot resolve *current* either, so it would fail the same
+    way and send the operator in a circle.
+
+    :param current: Revision recorded in the database.
+    :param head: Head revision this build ships.
+    :returns: The operator-facing error message.
+    """
+    return (
+        f"Omnigent database is at revision {current!r}, which this build does not "
+        f"recognize (its latest revision is {head!r}). The database was created by "
+        f"a newer omnigent and cannot be migrated backwards to match this build. "
+        f"Upgrade omnigent to a version that includes revision {current!r}, or "
+        f"point this one at a different database."
+    )
+
+
 def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     """
     Bring a fresh or stale database to head before the server starts.
 
-    Three cases:
+    Four cases:
 
     - **Fresh DB** (no ``alembic_version`` table) — run migrations to
       head. This covers brand-new SQLite files and freshly created
       Postgres schemas.
     - **At head** — no-op.
+    - **Ahead of head** — the database records a revision this build
+      does not ship, so it was written by a newer omnigent. Fail with
+      that diagnosis; no migration can help.
     - **Behind head** — log a warning, attempt an automatic Alembic
       upgrade to head, then verify that the database reached head.
       If the migration fails, re-raise with context so the server
@@ -494,8 +545,8 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     :param engine: SQLAlchemy engine bound to the target database.
     :param db_uri: Database URL, used both for Alembic config and in
         any migration-failure error message.
-    :raises RuntimeError: If automatic schema migration fails or does
-        not bring the database to head.
+    :raises RuntimeError: If the database is ahead of this build, or if
+        automatic schema migration fails or does not reach head.
     """
     head = _get_head_db_revision(db_uri)
     current = _get_current_db_revision(engine)
@@ -503,6 +554,9 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
     if current is None:
         _run_migrations(engine, db_uri)
         return
+
+    if current != head and not _revision_is_known(db_uri, current):
+        raise RuntimeError(_database_ahead_of_build_message(current, head))
 
     if current != head:
         _logger.warning(

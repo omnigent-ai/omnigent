@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from alembic import command
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 from omnigent.db.utils import (
     _LAKEBASE_POOL_RECYCLE_SECONDS,
@@ -20,6 +20,7 @@ from omnigent.db.utils import (
     _initialize_or_verify_schema,
     _install_lakebase_token_refresh,
     _resolve_lakebase_token_provider,
+    _revision_is_known,
     build_search_snippet,
     builtin_agent_id,
     clear_engine_cache,
@@ -456,6 +457,68 @@ def test_initialize_or_verify_schema_reports_manual_retry_when_auto_migration_fa
     assert uri in msg, (
         f"Error message must include the database URL so the "
         f"command is copy-pastable. Got: {msg!r}"
+    )
+
+
+def test_revision_is_known_distinguishes_shipped_and_unknown_revisions(
+    tmp_path: Path,
+) -> None:
+    """
+    ``_revision_is_known`` resolves against the scripts directory, not
+    the database, so it answers for a URL that has no file behind it.
+    """
+    uri = f"sqlite:///{tmp_path / 'probe.db'}"
+
+    assert _revision_is_known(uri, _get_head_db_revision(uri))
+    assert not _revision_is_known(uri, "ffffffffffff")
+
+
+def test_initialize_or_verify_schema_rejects_db_ahead_of_build(
+    tmp_path: Path,
+) -> None:
+    """
+    A database stamped with a revision this build does not ship is
+    diagnosed as newer than the client, not as stale.
+
+    Alembic cannot upgrade from an unknown revision — it has no path to
+    start walking — so the stale-schema wording used to send operators
+    to ``omnigent debug db-upgrade``, which then failed the same way.
+    """
+    db_path = tmp_path / "ahead.db"
+    uri = _make_db_at_revision(db_path, "head")
+    head = _get_head_db_revision(uri)
+    # Stands in for a revision from a future release. It has to be
+    # written straight into alembic_version: _make_db_at_revision can
+    # only reach revisions that already exist on disk.
+    future_revision = "ffffffffffff"
+    assert not _revision_is_known(uri, future_revision), (
+        f"Fixture revision {future_revision!r} now exists in the "
+        f"migrations directory; pick another absent revision."
+    )
+
+    engine = create_engine(uri)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE alembic_version SET version_num = :rev"),
+                {"rev": future_revision},
+            )
+        with pytest.raises(RuntimeError) as exc_info:
+            _initialize_or_verify_schema(engine, uri)
+    finally:
+        engine.dispose()
+
+    msg = str(exc_info.value)
+    assert future_revision in msg, (
+        f"Error must name the unrecognized revision so the operator can "
+        f"tell which build wrote the database. Got: {msg!r}"
+    )
+    assert head in msg, (
+        f"Error must name this build's head so the operator sees the gap. Got: {msg!r}"
+    )
+    assert "omnigent debug db-upgrade" not in msg, (
+        f"Error must not suggest db-upgrade: it cannot resolve the "
+        f"database's revision either, so the operator would loop. Got: {msg!r}"
     )
 
 

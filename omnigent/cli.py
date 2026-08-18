@@ -9915,11 +9915,24 @@ def debug_db_upgrade(url: str) -> None:
     """
     from sqlalchemy import create_engine
 
-    from omnigent.db.utils import _run_migrations
+    from omnigent.db.utils import (
+        _database_ahead_of_build_message,
+        _get_current_db_revision,
+        _get_head_db_revision,
+        _revision_is_known,
+        _run_migrations,
+    )
 
     click.echo(f"Upgrading {url} ...")
     engine = create_engine(url)
     try:
+        # A database written by a newer omnigent has no upgrade path
+        # here; Alembic would raise an unresolvable-revision error.
+        current = _get_current_db_revision(engine)
+        if current is not None and not _revision_is_known(url, current):
+            raise click.ClickException(
+                _database_ahead_of_build_message(current, _get_head_db_revision(url))
+            )
         _run_migrations(engine, url)
     finally:
         engine.dispose()
