@@ -308,6 +308,20 @@ def test_build_alembic_config_preserves_percent_encoded_database_url() -> None:
     assert config.get_main_option("sqlalchemy.url") == uri
 
 
+def test_alembic_env_override_preserves_percent_encoded_database_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The environment override survives Alembic's ConfigParser boundary."""
+    uri = f"sqlite:///{tmp_path / 'override%25.db'}"
+    config = _build_alembic_config("sqlite:///:memory:")
+    monkeypatch.setenv("OMNIGENT_DB_URL", uri)
+
+    command.upgrade(config, "head")
+
+    assert config.get_main_option("sqlalchemy.url") == uri
+
+
 # ── _initialize_or_verify_schema ────────────────────────
 
 
