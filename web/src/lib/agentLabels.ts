@@ -40,7 +40,13 @@ export interface SetupStepWire {
 interface HarnessCatalogRow {
   id?: string;
   label?: string;
+  // Declared capability profile. Only ``integration_mode`` is read here, to
+  // recognize the generic-ACP family without hardcoding vendor ids.
+  capabilities?: { integration_mode?: string | null } | null;
 }
+
+/** ``capabilities.integration_mode`` of every generic-ACP harness. */
+const ACP_INTEGRATION_MODE = "acp-subprocess";
 
 interface HarnessCatalogWire {
   data?: HarnessCatalogRow[];
@@ -54,6 +60,8 @@ interface HarnessCatalog {
   labels: Record<string, string>;
   /** harness spelling → ordered setup steps (install/auth) the server describes. */
   setupSteps: Record<string, SetupStepWire[]>;
+  /** ids the server declares generic-ACP — see {@link useAcpHarnessIds}. */
+  acpHarnesses: ReadonlySet<string>;
 }
 
 async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
@@ -61,24 +69,28 @@ async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HarnessCatalogWire;
   const labels: Record<string, string> = { ...BRAIN_HARNESS_LABELS };
+  const acpHarnesses = new Set<string>();
   for (const row of body.data ?? []) {
-    if (typeof row.id === "string" && typeof row.label === "string") {
-      labels[row.id] = row.label;
-    }
+    if (typeof row.id !== "string") continue;
+    if (typeof row.label === "string") labels[row.id] = row.label;
+    if (row.capabilities?.integration_mode === ACP_INTEGRATION_MODE) acpHarnesses.add(row.id);
   }
   // The server keys setup_steps by every spelling (codex-native, opencode, …)
   // so the dialog resolves whatever harness the session declares.
   const setupSteps =
     body.setup_steps && typeof body.setup_steps === "object" ? body.setup_steps : {};
-  return { labels, setupSteps };
+  return { labels, setupSteps, acpHarnesses };
 }
 
-// Both hooks share one request + cache entry, each selecting its own slice.
-function useHarnessCatalog<T>(select: (c: HarnessCatalog) => T, fallback: T): T {
+// Every hook below shares one request + cache entry, each selecting its own
+// slice. ``enabled`` lets a caller that is itself disabled avoid provoking the
+// request (the agent picker keeps its catalog read in step with its own fetch).
+function useHarnessCatalog<T>(select: (c: HarnessCatalog) => T, fallback: T, enabled = true): T {
   const { data } = useQuery({
     queryKey: ["harness-labels"],
     queryFn: fetchHarnessCatalog,
     staleTime: 30_000,
+    enabled,
     select,
   });
   return data ?? fallback;
@@ -137,6 +149,28 @@ const NO_SETUP_STEPS: Record<string, SetupStepWire[]> = {};
 /** harness id → the server's ordered setup steps (for the setup dialog). */
 export function useHarnessSetupSteps(): Record<string, SetupStepWire[]> {
   return useHarnessCatalog((c) => c.setupSteps, NO_SETUP_STEPS);
+}
+
+/** harness id → picker label, exactly as the server names it. */
+export function useHarnessLabels(enabled = true): Record<string, string> {
+  return useHarnessCatalog((c) => c.labels, BRAIN_HARNESS_LABELS, enabled);
+}
+
+const NO_ACP_HARNESSES: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Harness ids the server declares generic-ACP (``integration_mode ===
+ * "acp-subprocess"``) — builtin ACP CLI rows (``devin``, ``grok``) and
+ * user-configured ``acp:<slug>`` agents alike.
+ *
+ * Server-derived on purpose: a new builtin ACP row is one data entry in
+ * ``omnigent/acp_cli_harnesses.py``, and the picker recognizes it (grouping +
+ * label) with no frontend change. Empty until the catalog loads, and on a
+ * server too old to report capabilities — callers fall back to the id
+ * heuristic in ``agentGrouping``.
+ */
+export function useAcpHarnessIds(enabled = true): ReadonlySet<string> {
+  return useHarnessCatalog((c) => c.acpHarnesses, NO_ACP_HARNESSES, enabled);
 }
 
 /**
