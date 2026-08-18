@@ -12,6 +12,7 @@ import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { isDatabricksWorkspace, resolveWebSocketUrl } from "@/lib/host";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
@@ -120,6 +121,12 @@ export function TerminalView({
   // Control mode: xterm owns the buffer + mouse, so plain drag selects and
   // the normal copy gesture works — no forced-selection modifier, no hint bar.
   const controlMode = transport === "control";
+  // Touch-primary devices have no Escape key, yet ESC is how you interrupt a
+  // terminal-driven agent; an on-screen control fills the gap (#4944).
+  const isCoarsePointer = useIsCoarsePointer();
+  const sendEscape = useCallback(() => {
+    sessionRef.current?.sendEscape();
+  }, []);
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [resumeError, setResumeError] = useState<string | null>(null);
@@ -446,6 +453,20 @@ export function TerminalView({
       <div className="min-h-0 flex-1 overflow-hidden p-1">
         <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
       </div>
+      {isCoarsePointer && !readOnly && state.kind === "connected" && (
+        <div className="flex shrink-0 justify-end px-2 pb-1">
+          <Button
+            type="button"
+            size="xs"
+            variant="secondary"
+            onClick={sendEscape}
+            data-testid="terminal-escape-button"
+            className="font-mono"
+          >
+            Esc
+          </Button>
+        </div>
+      )}
       {/* PTY transport only: the attached tmux session runs with `mouse on`,
           so a plain click-drag is captured by tmux (copy-mode) instead of
           making a browser selection — the user can't select-and-copy without a
