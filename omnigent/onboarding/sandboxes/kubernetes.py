@@ -1704,6 +1704,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                         _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
                     ),
                 ),
+                # TODO(v0.29): remove this entry once all runners have rolled
+                # past v0.28 — bare Pods are no longer created. Keep in sync
+                # with the pods:create/delete TODO in role.yaml.
                 # Fall back to deleting a bare Pod left by the pre-Job
                 # launcher. Child Pods are named <job>-<rand5> so this only
                 # targets pre-migration bare Pods whose name IS sandbox_id.
