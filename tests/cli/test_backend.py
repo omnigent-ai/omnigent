@@ -737,6 +737,155 @@ def test_daemon_tunnel_recovers_false_when_never_online(
     assert cli._daemon_tunnel_recovers(_online_record(), grace_s=0.0) is False
 
 
+# ── Background-host connect verification (`start` / `host --background`) ──
+
+
+def _patch_background_host_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    online: bool,
+    pid_alive: bool = True,
+) -> dict[str, object]:
+    """Stub ``_run_background_host``'s collaborators for a remote-target run.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temp dir for the host pidfile + daemon registry.
+    :param online: What the host-online probe reports.
+    :param pid_alive: What the PID liveness check reports.
+    :returns: Capture dict; ``terminated`` records ``(pid, force)`` pairs
+        passed to ``_terminate_daemon`` (which also deletes the record, like
+        the real one), ``args``/``calls`` come from the Popen stub.
+    """
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: pid_alive)
+    monkeypatch.setattr(cli, "_daemon_host_online", lambda record, **_kw: online)
+    monkeypatch.setattr(cli, "_ensure_databricks_server_auth", lambda server, **kw: None)
+    # Skip the real alive/connect grace waits — the stubs answer on the
+    # first poll, so only the zeroed deadline matters.
+    monkeypatch.setattr(cli, "_BACKGROUND_HOST_GRACE_S", 0.0)
+    monkeypatch.setattr(cli, "_BACKGROUND_HOST_CONNECT_GRACE_S", 0.0)
+    terminated: list[tuple[int, bool]] = []
+
+    def _fake_terminate(record: cli._HostDaemonRecord, *, force: bool) -> None:
+        terminated.append((record.pid, force))
+        cli._delete_daemon_record(record)
+
+    monkeypatch.setattr(cli, "_terminate_daemon", _fake_terminate)
+    captured["terminated"] = terminated
+    return captured
+
+
+def test_run_background_host_remote_reports_start_once_online(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A fresh remote daemon whose host comes online is reported as started."""
+    captured = _patch_background_host_spawn(monkeypatch, tmp_path, online=True)
+
+    cli._run_background_host(
+        "https://server.example.com", stop_command="omnigent stop", non_interactive=True
+    )
+
+    out = capsys.readouterr().out
+    assert "Started the host daemon in the background" in out
+    assert "https://server.example.com" in out
+    assert captured["terminated"] == []
+
+
+def test_run_background_host_remote_rolls_back_when_never_online(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A fresh daemon that never connects is torn down, not reported started.
+
+    The `start` trap: against a dead server URL the daemon retries forever
+    in its log; reporting success here leaves a live record that blocks the
+    next `start` with "already running" — the state that used to require
+    `omnigent stop` before retrying.
+    """
+    captured = _patch_background_host_spawn(monkeypatch, tmp_path, online=False)
+
+    with pytest.raises(click.ClickException, match="could not connect") as exc:
+        cli._run_background_host(
+            "https://server.example.com", stop_command="omnigent stop", non_interactive=True
+        )
+
+    # Marker type: main() must not append the generic "Run `omnigent stop`"
+    # stale-host hint — the rollback already left nothing to stop.
+    assert isinstance(exc.value, cli._BackgroundHostConnectError)
+    out = capsys.readouterr().out
+    assert "Started the host daemon" not in out
+    assert captured["terminated"] == [(7777, True)]
+    # The rollback leaves a clean slate: the next `start` spawns fresh
+    # instead of reusing a zombie.
+    assert cli._find_daemon_record("https://server.example.com") is None
+
+
+def test_run_background_host_reused_daemon_offline_is_not_torn_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A pre-existing daemon that never connects errors but keeps running.
+
+    The reused daemon may recover when its server returns and can own live
+    sessions, so `start` fails loud and points at the teardown command
+    instead of killing it — but it must not report "already running" as if
+    the host were fine.
+    """
+    captured = _patch_background_host_spawn(monkeypatch, tmp_path, online=False)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=str(tmp_path / "daemon.log"),
+    )
+
+    with pytest.raises(click.ClickException, match="keeps retrying") as exc:
+        cli._run_background_host(
+            "https://server.example.com",
+            stop_command="omnigent host stop --server https://server.example.com",
+            non_interactive=True,
+        )
+
+    assert "omnigent host stop --server https://server.example.com" in str(exc.value)
+    assert isinstance(exc.value, cli._BackgroundHostConnectError)
+    assert captured["terminated"] == []
+    assert "args" not in captured  # reused, not respawned
+
+
+def test_run_background_host_remote_daemon_dies_while_connecting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A daemon that exits mid-connect is reported with its log, then rolled back."""
+    captured = _patch_background_host_spawn(monkeypatch, tmp_path, online=False, pid_alive=False)
+    # The early-death check has its own message; isolate the connect wait's.
+    monkeypatch.setattr(cli, "_confirm_background_host_alive", lambda record: None)
+
+    with pytest.raises(click.ClickException, match="exited while connecting"):
+        cli._run_background_host(
+            "https://server.example.com", stop_command="omnigent stop", non_interactive=True
+        )
+
+    assert captured["terminated"] == [(7777, True)]
+
+
+def test_start_command_remote_dead_server_fails_and_rolls_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`omnigent start --server <dead-url>` exits non-zero and leaves no daemon."""
+    captured = _patch_background_host_spawn(monkeypatch, tmp_path, online=False)
+    monkeypatch.setattr(cli, "_load_effective_config", dict)
+    monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
+
+    result = CliRunner().invoke(cli_group, ["start", "--server", "https://server.example.com"])
+
+    assert result.exit_code != 0
+    assert "could not connect" in result.output
+    assert "Started the host daemon" not in result.output
+    assert captured["terminated"] == [(7777, True)]
+
+
 def test_ensure_backend_exits_clean_on_config_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

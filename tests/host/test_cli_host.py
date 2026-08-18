@@ -682,6 +682,9 @@ def _patch_background_host_spawn(
     monkeypatch.setattr("omnigent.cli._pid_alive", lambda checked: checked == pid)
     # Local mode waits for the server the daemon owns; no real server here.
     monkeypatch.setattr("omnigent.cli._discover_local_server_url", lambda: "http://127.0.0.1:6767")
+    # Remote targets verify the tunnel came online; no real server to probe.
+    monkeypatch.setattr("omnigent.cli._daemon_host_online", lambda record, **_kw: True)
+    monkeypatch.setattr("omnigent.cli._BACKGROUND_HOST_CONNECT_GRACE_S", 0.0)
     log_path = tmp_path / "host-test.log"
     log_path.write_text("")
     spawned_args: list[list[str]] = []
