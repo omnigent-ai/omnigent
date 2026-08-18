@@ -132,17 +132,18 @@ describe("BlockRenderer dispatch", () => {
       },
     ];
 
-    const { container } = render(<BlockRenderer items={items} sessionStatus="idle" />);
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
 
-    const alert = screen.getByRole("alert");
-    expect(alert).toHaveClass("min-w-0");
-    expect(alert).toHaveClass("overflow-hidden");
+    const pill = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
+    expect(pill).toHaveClass("w-[560px]", "max-w-full");
 
-    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
-    const description = container.querySelector('[data-slot="alert-description"]');
-    expect(description).not.toBeNull();
-    expect(description).toHaveClass("min-w-0");
-    expect(description).toHaveClass("overflow-hidden");
+    fireEvent.click(pill);
+    const expandedRegion = screen
+      .getByTestId("error-message-content")
+      .closest("section")?.parentElement;
+    expect(expandedRegion).not.toBeNull();
+    expect(expandedRegion).toHaveClass("min-w-0");
+    expect(expandedRegion).toHaveClass("overflow-hidden");
 
     const messageNode = screen.getByTestId("error-message-content");
     expect(messageNode).toHaveClass("whitespace-pre-wrap");
