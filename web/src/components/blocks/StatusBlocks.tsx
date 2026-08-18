@@ -255,6 +255,7 @@ export function ErrorBanner({
         }}
       />
       <div
+        data-testid="error-pill"
         onClick={() => setExpanded((value) => !value)}
         onMouseEnter={() => setHeaderHovered(true)}
         onMouseLeave={() => setHeaderHovered(false)}

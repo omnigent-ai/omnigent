@@ -197,6 +197,7 @@ describe("ErrorBanner", () => {
     expect(toggle).toHaveAttribute("type", "button");
     expect(toggle).toHaveClass("min-w-0", "flex-1", "bg-transparent", "text-left");
     const pill = toggle.parentElement!.parentElement as HTMLElement;
+    expect(pill).toHaveAttribute("data-testid", "error-pill");
     expect(pill).not.toHaveAttribute("role");
     expect(pill).not.toHaveAttribute("tabindex");
     expect(pill).toHaveClass("rounded-[12px]", "p-[8px]", "w-[560px]", "group/error");
