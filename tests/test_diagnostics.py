@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from omnigent import diagnostics
 from omnigent.diagnostics import collect_snapshot
 from omnigent.version import VERSION
+
+
+@pytest.fixture(autouse=True)
+def _isolated_data_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep the health section hermetic: never read the developer's own logs."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
 
 
 def test_snapshot_local_only_has_no_server_version(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -31,7 +39,15 @@ def test_snapshot_reports_only_known_keys() -> None:
         "auth_source_origin",
         "os",
         "python",
+        "health",
     }
+
+
+def test_snapshot_embeds_the_health_section() -> None:
+    # The health probes have their own tests; here we only assert the snapshot
+    # carries them, since that is the contract a bug report relies on.
+    health = collect_snapshot(server_url=None)["health"]
+    assert set(health) == {"credential", "host_log", "runner_log"}
 
 
 def test_local_auth_source_reflects_env(monkeypatch: pytest.MonkeyPatch) -> None:

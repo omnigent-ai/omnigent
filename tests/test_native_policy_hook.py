@@ -8,6 +8,7 @@ import pytest
 from omnigent import native_policy_hook
 from omnigent.native_policy_hook import (
     _is_login_redirect_or_unauthorized,
+    evaluate_failure_detail,
     evaluation_response_to_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
@@ -727,3 +728,65 @@ def test_policy_hook_reauth_returns_none_without_factory(
         "http://127.0.0.1:6767", {"Content-Type": "application/json"}
     )
     assert reauth() is None
+
+
+def test_evaluate_failure_detail_joins_both_halves() -> None:
+    """Both the server answer and the re-auth reason survive into the detail.
+
+    Reporting only one is what made a dead local credential look like an
+    opaque ``401``: the API error says what the server answered, the re-auth
+    reason says why the retry could not rescue it.
+    """
+    reauth = native_policy_hook.policy_hook_reauth("http://127.0.0.1:6767", {})
+    reauth.failure_reason = "no credential resolved"
+    detail = evaluate_failure_detail("server returned 401: Credential was not sent", reauth)
+    assert detail == "server returned 401: Credential was not sent; no credential resolved"
+
+
+def test_evaluate_failure_detail_keeps_api_error_when_reauth_succeeded() -> None:
+    # A successful re-mint clears failure_reason; the API error is all there is.
+    reauth = native_policy_hook.policy_hook_reauth("http://127.0.0.1:6767", {})
+    reauth.failure_reason = None
+    assert evaluate_failure_detail("server returned 500", reauth) == "server returned 500"
+
+
+def test_evaluate_failure_detail_keeps_reauth_reason_without_api_error() -> None:
+    # The POST never failed, but the re-mint did: that reason must still reach
+    # the user, because hook stderr is discarded by the harness.
+    reauth = native_policy_hook.policy_hook_reauth("http://127.0.0.1:6767", {})
+    reauth.failure_reason = "token mint failed: boom"
+    assert evaluate_failure_detail(None, reauth) == "token mint failed: boom"
+
+
+def test_evaluate_failure_detail_without_reauth_path() -> None:
+    # The relay route has no re-auth callable at all.
+    assert evaluate_failure_detail("server returned 502", None) == "server returned 502"
+
+
+def test_evaluate_failure_detail_returns_none_when_nothing_to_say() -> None:
+    assert evaluate_failure_detail(None, None) is None
+
+
+def test_evaluate_failure_detail_reaches_the_fail_closed_reason() -> None:
+    """The combined detail is what the user actually sees in the block reason."""
+    reauth = native_policy_hook.policy_hook_reauth("http://127.0.0.1:6767", {})
+    reauth.failure_reason = "auth factory returned empty token"
+    detail = evaluate_failure_detail("server returned 403", reauth)
+    output = fail_closed_hook_output("UserPromptSubmit", detail)
+    assert output is not None
+    assert "server returned 403" in str(output)
+    assert "auth factory returned empty token" in str(output)
+
+
+def test_evaluate_failure_detail_bounds_each_half() -> None:
+    """A long SDK exception must not flood the harness UI.
+
+    ``api_error`` already truncates the server body; ``failure_reason`` wraps an
+    exception whose text is unbounded, so both halves are capped the same way.
+    """
+    reauth = native_policy_hook.policy_hook_reauth("http://127.0.0.1:6767", {})
+    reauth.failure_reason = "x" * 5000
+    detail = evaluate_failure_detail("y" * 5000, reauth)
+    assert detail is not None
+    cap = native_policy_hook._DETAIL_PART_MAX_CHARS
+    assert detail == "y" * cap + "; " + "x" * cap

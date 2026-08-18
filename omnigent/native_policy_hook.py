@@ -81,6 +81,11 @@ _RELAY_TOKEN_ENV = "_OMNIGENT_RELAY_TOKEN"
 
 _TOOL_RELAY_FILE = "tool_relay.json"
 
+# Cap on each half of the fail-closed detail. ``api_error`` already truncates the
+# server's body to 200 characters; ``failure_reason`` wraps an SDK exception whose
+# text is unbounded, and the detail lands in a harness UI, so bound it the same way.
+_DETAIL_PART_MAX_CHARS = 200
+
 
 class _EvaluationEvent(TypedDict):
     type: str
@@ -453,6 +458,39 @@ def evaluation_response_to_hook_output(
         return None
 
     return None
+
+
+def evaluate_failure_detail(api_error: str | None, reauth: PolicyHookReauth | None) -> str | None:
+    """Combine the evaluate failure with the re-auth failure into one detail.
+
+    Both halves are needed to act on a fail-closed block, and each alone is
+    misleading:
+
+    - ``api_error`` says what the server answered (e.g. ``"server returned
+      401: ..."``) but not why the retry did not rescue it.
+    - :attr:`PolicyHookReauth.failure_reason` says why the re-mint could not
+      produce a fresh bearer (e.g. ``"no credential resolved"``), which is the
+      actionable half — and stderr from a hook subprocess is discarded by the
+      harness, so this string reaching the block reason is its only route to
+      the user.
+
+    Selecting one over the other drops the other permanently. Reporting
+    ``api_error`` alone turns "your local credential is gone" into an opaque
+    ``401``; reporting only the re-auth reason hides whether the server was
+    even reachable. Both are short, so both are surfaced.
+
+    :param api_error: Short error from :func:`post_evaluate_with_retry`, or
+        ``None`` when the POST itself did not fail.
+    :param reauth: The re-auth callable handed to
+        :func:`post_evaluate_with_retry`, or ``None`` when the caller has no
+        re-auth path (the relay route). Its ``failure_reason`` is read after
+        the fact.
+    :returns: The parts joined by ``"; "``, or ``None`` when neither half has
+        anything to say.
+    """
+    reason = getattr(reauth, "failure_reason", None) if reauth is not None else None
+    parts = [part[:_DETAIL_PART_MAX_CHARS] for part in (api_error, reason) if part]
+    return "; ".join(parts) or None
 
 
 def fail_closed_hook_output(
