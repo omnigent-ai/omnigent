@@ -415,6 +415,12 @@ class TurnContext:
         # Future[ElicitationResult]. Populated by ``elicit``;
         # resolved by the ``approval`` /events handler.
         self._pending_elicitations: dict[str, asyncio.Future[ElicitationResult]] = {}
+        # Human-approval waits in flight (elicitation replies, policy verdicts).
+        # While > 0 the idle watchdog is suspended: heartbeats intentionally do
+        # not reset it, so an unanswered approval would otherwise fail a
+        # legitimate human wait as a wedged turn. The absolute ceiling still
+        # applies (#4854).
+        self._pending_human_waits = 0
         # Layer 3 per-policy-evaluation state:
         # ``evaluation_id`` → Future[PolicyVerdictPayload].
         # Populated by ``evaluate_policy``; resolved by the
@@ -456,8 +462,14 @@ class TurnContext:
         # watchdog deadline forward. Heartbeats are keep-alive, NOT
         # progress — letting them reset the deadline would defeat the
         # watchdog (a wedged turn's 15s heartbeats would keep it alive
-        # forever).
-        if self._reset_idle_watchdog is not None and not isinstance(event, HeartbeatEvent):
+        # forever). Exception: while a human approval (elicitation reply,
+        # policy verdict) is pending, the turn can legitimately emit nothing
+        # but heartbeats for as long as the human takes, so heartbeats DO
+        # reset the deadline then — the absolute ceiling stays the hard cap
+        # (#4854).
+        if self._reset_idle_watchdog is not None and (
+            not isinstance(event, HeartbeatEvent) or self._pending_human_waits > 0
+        ):
             self._reset_idle_watchdog()
         self._event_queue.put_nowait(event)
 
@@ -551,6 +563,7 @@ class TurnContext:
         """
         future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
         self._pending_elicitations[elicitation_id] = future
+        self._pending_human_waits += 1
         self.emit(
             ElicitationRequestEvent(
                 type="response.elicitation_request",
@@ -562,6 +575,7 @@ class TurnContext:
             return await future
         finally:
             self._pending_elicitations.pop(elicitation_id, None)
+            self._pending_human_waits -= 1
 
     async def next_injection(self, timeout: float | None = None) -> CreateResponseRequest | None:
         """
@@ -648,6 +662,7 @@ class TurnContext:
         """
         future: asyncio.Future[PolicyVerdictPayload] = asyncio.get_running_loop().create_future()
         self._pending_policy_evaluations[evaluation_id] = future
+        self._pending_human_waits += 1
         self.emit(
             PolicyEvaluationRequestEvent(
                 type="policy_evaluation.requested",
@@ -681,6 +696,7 @@ class TurnContext:
             )
         finally:
             self._pending_policy_evaluations.pop(evaluation_id, None)
+            self._pending_human_waits -= 1
 
     def _complete_policy_evaluation(
         self, evaluation_id: str, verdict: PolicyVerdictPayload
