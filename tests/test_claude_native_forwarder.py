@@ -7996,3 +7996,20 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
     assert stall_warnings, "the deadline trip must be loudly logged, never silent"
     # The warning's traceback names the stalled await for next-time forensics.
     assert stall_warnings[0].exc_info is not None
+
+
+def test_post_retry_tracker_survives_unbounded_transient_attempts() -> None:
+    """Transient failures retry with no give-up budget, so attempts is
+    unbounded; the backoff exponent must not overflow float conversion at
+    ~1025 attempts (#4885)."""
+    import httpx
+
+    tracker = forwarder._PostRetryTracker(base_delay_s=1.0, max_delay_s=30.0)
+    exc = httpx.RequestError("Databricks token refresh returned no token")
+    last = None
+    for _ in range(3000):
+        last = tracker.record_failure("k", exc)
+    assert last is not None
+    assert last.attempts == 3000
+    assert last.delay_s == 30.0  # capped, and still returned instead of raising
+    assert last.exhausted is False

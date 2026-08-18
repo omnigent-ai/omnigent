@@ -699,8 +699,15 @@ class _PostRetryTracker:
                 exhausted=True,
                 permanent=permanent,
             )
+        # Clamp the EXPONENT, not the result: transient failures retry with no
+        # give-up budget, so attempts is unbounded and 2 ** attempts eventually
+        # overflows float conversion (min() evaluates both operands, so a cap on
+        # the result cannot protect the exponentiation). The exponent cap only
+        # needs to be large enough that base * 2**cap >= max for any base > 0 —
+        # 64 covers every realistic configuration (#4885).
+        exponent = min(max(0, entry.attempts - 1), 64)
         delay_s = min(
-            self._base_delay_s * (2 ** max(0, entry.attempts - 1)),
+            self._base_delay_s * (2 ** exponent),
             self._max_delay_s,
         )
         entry.next_attempt_at = time.monotonic() + delay_s
