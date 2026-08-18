@@ -43,41 +43,49 @@ const mobileMenu = {
 function renderHeader(props: {
   sidebarOpen: boolean;
   isChildSession?: boolean;
-  parentSessionId?: string;
+  conversationId?: string;
+  conversationTitle?: string | null;
+  projectName?: string | null;
+  titleLinkTo?: string;
   boundAgent?: Agent;
   wrapperLabel?: string | null;
   canShare?: boolean;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
 }) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <MemoryRouter initialEntries={["/"]}>
-      <TooltipProvider>
-        <ChatHeader
-          sidebarOpen={props.sidebarOpen}
-          onOpenSidebar={() => {}}
-          isChildSession={props.isChildSession ?? false}
-          parentSessionId={props.parentSessionId}
-          // No active session: PresenceAvatars / AgentInfoButton / right-panel
-          // toggle / mobile FAB all gate on conversationId and stay unmounted,
-          // isolating the left-slot affordances under test.
-          conversationId={undefined}
-          boundAgent={props.boundAgent}
-          wrapperLabel={props.wrapperLabel ?? null}
-          canShare={props.canShare ?? false}
-          shareDisabled={props.shareDisabled}
-          shareDisabledReason={props.shareDisabledReason}
-          onShare={() => {}}
-          hasAgentInfo={false}
-          onAgentInfo={() => {}}
-          hasHeaderMenu={false}
-          showFilesPanel={false}
-          hasRailContent={false}
-          rightPanelOpen={false}
-          onToggleRightPanel={() => {}}
-          mobileMenu={mobileMenu}
-        />
-      </TooltipProvider>
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <ChatHeader
+            sidebarOpen={props.sidebarOpen}
+            onOpenSidebar={() => {}}
+            isChildSession={props.isChildSession ?? false}
+            // Defaults to no active session: PresenceAvatars / AgentInfoButton /
+            // right-panel toggle / mobile FAB all gate on conversationId and
+            // stay unmounted, isolating the left-slot affordances under test.
+            conversationId={props.conversationId}
+            conversationTitle={props.conversationTitle ?? null}
+            projectName={props.projectName ?? null}
+            titleLinkTo={props.titleLinkTo}
+            boundAgent={props.boundAgent}
+            wrapperLabel={props.wrapperLabel ?? null}
+            canShare={props.canShare ?? false}
+            shareDisabled={props.shareDisabled}
+            shareDisabledReason={props.shareDisabledReason}
+            onShare={() => {}}
+            hasAgentInfo={false}
+            onAgentInfo={() => {}}
+            hasHeaderMenu={false}
+            showFilesPanel={false}
+            hasRailContent={false}
+            rightPanelOpen={false}
+            onToggleRightPanel={() => {}}
+            mobileMenu={mobileMenu}
+          />
+        </TooltipProvider>
+      </QueryClientProvider>
     </MemoryRouter>,
   );
 }
@@ -152,29 +160,54 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
   });
 });
 
-describe("ChatHeader — sub-agent affordance", () => {
-  it("renders no back link or sub-agent label on a top-level session", () => {
-    renderHeader({ sidebarOpen: true, isChildSession: false });
-    // Top-level: nothing in the left slot beyond the (hidden) sidebar toggle.
-    expect(screen.queryByRole("link", { name: "Back to parent session" })).toBeNull();
+describe("ChatHeader — conversation breadcrumb", () => {
+  it("renders nothing in the breadcrumb without a resolved title", () => {
+    // Landing composer (no conversationId) / snapshot still loading.
+    renderHeader({ sidebarOpen: true });
+    expect(screen.queryByRole("navigation", { name: "Conversation" })).toBeNull();
+  });
+
+  it("shows a plain title (no folder, no link) for an unfiled top-level session", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "conv-1",
+      conversationTitle: "Fix the login bug",
+    });
+    const title = screen.getByText("Fix the login bug");
+    expect(title).toBeInTheDocument();
+    // Top-level has nowhere to climb, so the title is not a link.
+    expect(title.closest("a")).toBeNull();
+    expect(screen.queryByLabelText(/^Project:/)).toBeNull();
+    // No sub-agent segment.
     expect(screen.queryByText("Sub-agent")).toBeNull();
   });
 
-  it("links back to the parent and surfaces the bound agent name + caption", () => {
+  it("prefixes a folder with the project name in its tooltip when filed", () => {
     renderHeader({
       sidebarOpen: true,
+      conversationId: "conv-1",
+      conversationTitle: "Fix the login bug",
+      projectName: "Payments",
+    });
+    expect(screen.getByLabelText("Project: Payments")).toBeInTheDocument();
+    expect(screen.getByText("Fix the login bug")).toBeInTheDocument();
+  });
+
+  it("appends the sub-agent identity and links the title back to the parent", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
       isChildSession: true,
-      parentSessionId: "parent-123",
+      conversationTitle: "Fix the login bug",
+      titleLinkTo: "/c/parent-123",
       boundAgent: { id: "a1", name: "check-account-eligibility" },
     });
-    // The back affordance must point at the parent session route so the
-    // user can climb out of the sub-agent.
+    // The title is the way back out — it links to the parent session route.
     const back = screen.getByRole("link", { name: "Back to parent session" });
     expect(back).toHaveAttribute("href", "/c/parent-123");
-    // The agent name proves the bound-agent name reached the header, and
-    // the "Sub-agent" caption names the nesting explicitly.
+    expect(back).toHaveTextContent("Fix the login bug");
+    // The sub-agent's bound-agent name is appended on the right.
     expect(screen.getByText("check-account-eligibility")).toBeInTheDocument();
-    expect(screen.getByText("Sub-agent")).toBeInTheDocument();
   });
 
   it("names the product, not the internal wrapper row, on a native sub-agent", () => {
@@ -183,8 +216,10 @@ describe("ChatHeader — sub-agent affordance", () => {
     // (`public_agent_name`). The wrapper label names the product instead.
     renderHeader({
       sidebarOpen: true,
+      conversationId: "child-9",
       isChildSession: true,
-      parentSessionId: "parent-123",
+      conversationTitle: "Fix the login bug",
+      titleLinkTo: "/c/parent-123",
       boundAgent: { id: "a1", name: "claude-native-ui" },
       wrapperLabel: "claude-code-native-ui-subagent",
     });
@@ -192,16 +227,17 @@ describe("ChatHeader — sub-agent affordance", () => {
     expect(screen.queryByText("claude-native-ui")).toBeNull();
   });
 
-  it("falls back to a lone 'Sub-agent' label before the agent snapshot loads", () => {
+  it("falls back to a 'Sub-agent' segment before the agent snapshot loads", () => {
     renderHeader({
       sidebarOpen: true,
+      conversationId: "child-9",
       isChildSession: true,
-      parentSessionId: "parent-123",
+      conversationTitle: "Fix the login bug",
+      titleLinkTo: "/c/parent-123",
       boundAgent: undefined,
     });
-    // Back link still renders (it only needs the parent id). With no agent
-    // name yet, the label collapses to a single "Sub-agent" — never the
-    // redundant "Sub-agent" over "Sub-agent" two-line stack.
+    // Title link still renders (it only needs the parent route); with no agent
+    // name yet, the appended segment reads a plain "Sub-agent".
     expect(screen.getByRole("link", { name: "Back to parent session" })).toHaveAttribute(
       "href",
       "/c/parent-123",
@@ -245,8 +281,9 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
                 sidebarOpen
                 onOpenSidebar={() => {}}
                 isChildSession={false}
-                parentSessionId={undefined}
                 conversationId="sess-1"
+                conversationTitle={null}
+                projectName={null}
                 boundAgent={undefined}
                 wrapperLabel={null}
                 canShare={false}
@@ -266,8 +303,9 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
               sidebarOpen
               onOpenSidebar={() => {}}
               isChildSession={false}
-              parentSessionId={undefined}
               conversationId="sess-1"
+              conversationTitle={null}
+              projectName={null}
               boundAgent={undefined}
               wrapperLabel={null}
               canShare={false}

@@ -746,6 +746,14 @@ aside[aria-label="Workspace"][data-maximized] {
   align-self: flex-start;
   margin-top: 1rem;
 }
+/* Collapsed sidebar on the mac shell: the chat header's left slot reaches the
+ * window corner (traffic-light-clearance is applied), so its breadcrumb would
+ * drop to a second line under the lights. Hide it here — the conversation title
+ * is surfaced instead beside the title-bar cluster (AppShell), right of the
+ * Settings cog. Docked/peeking (no clearance) keeps the breadcrumb in place. */
+[data-electron-mac] .traffic-light-clearance .chat-header-breadcrumb {
+  display: none;
+}
 /* A maximized workspace rail breaks out to inset-0 (the left sidebar collapses
  * on entry), so its tab strip starts at the window's top-left corner — where
  * the traffic lights float (0–5rem) and the title-bar cluster sits (5rem–10rem,
