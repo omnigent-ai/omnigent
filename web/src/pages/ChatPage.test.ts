@@ -848,7 +848,7 @@ describe("computeShowsWorking", () => {
 
   it("parent idle stays idle in the main chat", () => {
     // Busy children are surfaced by the sidebar/Agents rail, not by the
-    // main chat's shimmer or pinned "Working…" pill.
+    // main chat's "Working…" shimmer.
     expect(computeShowsWorking("idle", opts())).toBe(false);
   });
 

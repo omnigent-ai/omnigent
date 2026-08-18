@@ -2090,8 +2090,9 @@ function MainAgentSurface({
                     {/* Working… shimmer, lit for the whole busy turn so the user
                     always sees the session is still going. Suppressed when the
                     last bubble is a compaction spinner — that bubble already
-                    owns the "in-progress" slot. aria-hidden: the pinned pill
-                    owns the single aria-live region (see WorkingStatusPin). */}
+                    owns the "in-progress" slot. Owns the sole aria-live region
+                    announcing the working state (its visible label is
+                    aria-hidden, so the rotating text never re-announces). */}
                     {showWorkingIndicator && <WorkingIndicator />}
                     {/* Terminal-first spin-up cue beneath the just-sent first
                     message: the prompt bubble renders immediately (no
@@ -2117,9 +2118,6 @@ function MainAgentSurface({
                 <LatestTurnSpacer scrollElement={scroller?.el ?? null} />
               </ConversationContent>
               <ConversationScrollButton />
-              {/* Outside ConversationContent so it's pinned to the viewport, not the scroll. See WorkingStatusPin.
-              Suppressed in a sub-agent session: the composer's "Chatting with sub-agent …" tray owns this slot. */}
-              <WorkingStatusPin show={showWorkingIndicator} suppress={subAgentLabel != null} />
               <UserMessageNavConnected
                 goPrev={nav.goPrev}
                 goNext={nav.goNext}
@@ -2281,79 +2279,6 @@ function UserMessageNavConnected(props: React.ComponentProps<typeof UserMessageN
       // sizes regardless of the buttons.
       className={cn(props.className, "md:hidden", isAtBottom && "max-md:hidden")}
     />
-  );
-}
-
-/**
- * Scroll-pinned "Working…" pill — sole aria-live region (inline shimmer is
- * aria-hidden).
- *
- * @param show - True while the main session is working; gates both the
- *   aria-live announcement and the painted tab.
- * @param suppress - Hides the painted tab without silencing the aria-live
- *   region (still gated on ``show``). Set in a sub-agent session, where the
- *   composer's "Chatting with sub-agent …" tray rises in this same slot and
- *   the "Working…" tab would otherwise stack on top of it.
- */
-function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?: boolean }) {
-  const { isAtBottom } = useStickToBottomContext();
-  const bgCount = useChatStore((s) => s.backgroundTaskCount);
-  const blockedOn = useChatStore((s) => s.blockedOn);
-  const agentWorking = useAgentTurnActive();
-  const tick = useWorkingLabelTick();
-  // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
-  // the state; the pinned tab and its announcement yield. While the turn is
-  // active the tab still shows.
-  const showShimmer = show && !isBackgroundTasksOnly(bgCount, blockedOn, agentWorking);
-  const visible = showShimmer && !isAtBottom && !suppress;
-  return (
-    <div
-      // Always mounted (the aria-live region announces on show); bottom-0 sits
-      // it flush on the composer so the tab reads as rising from behind it.
-      role="status"
-      aria-live="polite"
-      data-testid="working-indicator-pin"
-      className={cn(
-        "pointer-events-none absolute inset-x-0 bottom-0 z-20 transition-opacity duration-200",
-        visible ? "opacity-100" : "opacity-0",
-      )}
-    >
-      {/* The single announced string. Held stable at "Working…" so the rotating
-          tab text below never re-announces every few seconds. Present whenever
-          the agent is working, so it announces whether the tab is painted
-          (scrolled up) or collapsed (at the bottom, where the inline shimmer
-          owns the visuals). */}
-      {showShimmer && <span className="sr-only">Working…</span>}
-      {/* Mirror the conversation content column (mx-auto + px-4 + width) so the
-          tab's left edge lines up with the inline shimmer's. */}
-      <div className={cn("mx-auto w-full px-4", CHAT_COLUMN_WIDTH)}>
-        {showShimmer && (
-          // Tab shape (rounded top, no bottom border) so its flat bottom edge
-          // merges into the composer. bg-card-solid, not bg-card: in dark mode
-          // bg-card is a translucent glass surface (the `.dark .bg-card` frosted
-          // backdrop-blur), so the tab read as a see-through pill floating over
-          // the transcript. The opaque solid keeps it readable and, by not
-          // matching the glass rule, lets `border-b-0` actually merge — that
-          // rule's `border` shorthand would otherwise re-add a bottom edge.
-          // aria-hidden: the sr-only span above owns the announcement, so the
-          // rotating label here stays silent to screen readers. Collapses to
-          // sr-only when at the bottom (`!visible`) — the inline shimmer paints
-          // there instead.
-          <div
-            aria-hidden="true"
-            className={cn(
-              "flex w-fit items-center gap-1.5 rounded-t-lg border border-b-0 border-border bg-card-solid px-3 pt-1 pb-1.5",
-              !visible && "sr-only",
-            )}
-          >
-            <BrandLogo variant="icon" className="otto-working h-4 w-auto shrink-0" />
-            <Shimmer className="text-sm font-mono" duration={1.5}>
-              {workingIndicatorLabel(tick, blockedOn)}
-            </Shimmer>
-          </div>
-        )}
-      </div>
-    </div>
   );
 }
 
@@ -3042,16 +2967,25 @@ function WorkingIndicator() {
   if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
   const label = workingIndicatorLabel(tick, blockedOn);
   return (
-    <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
-      <MessageContent>
-        <div className="flex items-center gap-1.5 py-0.5">
-          <BrandLogo variant="icon" className="otto-working h-4 w-auto shrink-0" />
-          <Shimmer className="text-sm font-mono" duration={1.5}>
-            {label}
-          </Shimmer>
-        </div>
-      </MessageContent>
-    </Message>
+    <>
+      {/* Sole aria-live region for the working state. A stable "Working…" (not
+          the rotating label) so screen readers announce the turn once, without
+          re-announcing every few seconds; the visible shimmer below stays
+          aria-hidden. */}
+      <span role="status" aria-live="polite" className="sr-only">
+        Working…
+      </span>
+      <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
+        <MessageContent>
+          <div className="flex items-center gap-1.5 py-0.5">
+            <BrandLogo variant="icon" className="otto-working h-4 w-auto shrink-0" />
+            <Shimmer className="text-sm font-mono" duration={1.5}>
+              {label}
+            </Shimmer>
+          </div>
+        </MessageContent>
+      </Message>
+    </>
   );
 }
 
