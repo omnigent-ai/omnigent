@@ -9553,11 +9553,15 @@ async def _resolve_harness_config(
                 else:
                     spec = _unwrap_resolved_spec(sub_entry)
                     workdir = _resolved_spec_workdir(sub_entry)
-            harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
-            harness = canonicalize_harness(harness) or harness
+            raw_harness = harness_override or spec.executor.config.get("harness") or spec.executor.type
+            harness = canonicalize_harness(raw_harness) or raw_harness
+            # The builder canonicalizes internally, so it accepts the raw
+            # namespaced form; the acp branch needs the ``acp:<slug>`` to
+            # select the configured agent when the bundle's own config has no
+            # acp harness (#4855).
             spawn_env = _build_spawn_env_from_spec(
                 spec,
-                harness,
+                raw_harness,
                 cwd=cwd,
                 workdir=workdir,
                 model_override=model_override,
@@ -9686,6 +9690,7 @@ def _build_spawn_env_from_spec(
     # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to ``acp`` so the
     # dispatch, model-key lookup, and logging below all key off the base harness;
     # the concrete agent's slug is read from the spec by ``_build_acp_spawn_env``.
+    raw_harness_value: str | None = harness if harness.startswith("acp:") else None
     harness = canonicalize_harness(harness) or harness
     effective_spec = spec
     if model_override is not None:
@@ -9736,6 +9741,17 @@ def _build_spawn_env_from_spec(
         elif harness == "goose":
             env = _build_goose_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "acp":
+            # A namespaced override (``acp:<slug>``) on a non-ACP bundle must
+            # reach _build_acp_spawn_env, which reads the slug from
+            # executor.config["harness"]; without this it falls back to the
+            # FIRST configured agent — the wrong one (#4855).
+            raw = raw_harness_value if raw_harness_value is not None else harness
+            if raw.startswith("acp:"):
+                _cfg = dict(getattr(effective_spec.executor, "config", None) or {})
+                _cfg["harness"] = raw
+                effective_spec = effective_spec.model_copy(
+                    update={"executor": effective_spec.executor.model_copy(update={"config": _cfg})}
+                )
             env = _build_acp_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "copilot":
             env = _build_copilot_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
