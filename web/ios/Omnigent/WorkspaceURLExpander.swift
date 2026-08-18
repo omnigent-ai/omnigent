@@ -1,11 +1,20 @@
 import Foundation
 
 enum WorkspaceURLExpander {
-  static let workspaceUIPath = "/ml/omnigents"
+  /// Path the Omnigent SPA is mounted at inside a Databricks workspace. Matches
+  /// Android's `WORKSPACE_UI_PATH` (`Origins.kt`). The Electron shell still uses
+  /// `/ml/omnigents`; see the note in `web/electron/src/url.js`.
+  static let workspaceUIPath = "/omnigent"
+
+  /// Databricks domains that serve a workspace, and therefore mount the SPA at
+  /// ``workspaceUIPath``. `databricksapps.com` is deliberately absent: Apps share
+  /// the workspace login story but serve their own app at the root, with no
+  /// workspace mount to redirect to.
+  private static let workspaceDomains = ["databricks.com", "azuredatabricks.net"]
 
   /// Databricks Apps are served from `*.databricksapps.com` and answer with the
   /// same `server: databricks` header as a workspace, but they are NOT
-  /// workspaces and have no `/ml/omnigents` mount, so expansion is skipped for
+  /// workspaces and have no SPA mount, so expansion is skipped for
   /// these hosts.
   static let databricksAppsHostSuffix = "databricksapps.com"
 
@@ -41,13 +50,44 @@ enum WorkspaceURLExpander {
       guard (http.value(forHTTPHeaderField: "server") ?? "").lowercased() == "databricks" else {
         return url
       }
-      return URL(
-        string:
-          "\(origin.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")))\(workspaceUIPath)"
-      ) ?? url
+      return mounted(url) ?? url
     } catch {
       return url
     }
+  }
+
+  /// The SPA-mount URL for a **bare** Databricks workspace root, or nil for
+  /// anything else — a non-workspace host, or a URL that already carries a path (a
+  /// deliberate deep link we must not override).
+  ///
+  /// A bare workspace root shows the Databricks landing page, not Omnigent, so the
+  /// shell rewrites it. Matched by domain with no probe, mirroring Android's
+  /// `databricksWorkspaceUiUrl`; query and fragment survive because `?o=<org>`
+  /// selects which workspace the request lands in.
+  static func workspaceUIURL(forBareRoot url: URL) -> URL? {
+    guard let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http",
+      isWorkspaceHost(url.host), isBareRoot(url)
+    else {
+      return nil
+    }
+    return mounted(url)
+  }
+
+  /// `url` with its path replaced by ``workspaceUIPath``, preserving scheme, host,
+  /// port, query and fragment.
+  private static func mounted(_ url: URL) -> URL? {
+    guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+      return nil
+    }
+    components.path = workspaceUIPath
+    return components.url
+  }
+
+  /// Whether `host` is, or sits under, a Databricks workspace domain. Matched on a
+  /// dot boundary so a lookalike like `databricks.com.example.org` doesn't qualify.
+  private static func isWorkspaceHost(_ host: String?) -> Bool {
+    guard let host = host?.lowercased() else { return false }
+    return workspaceDomains.contains { host == $0 || host.hasSuffix(".\($0)") }
   }
 
   private static func isBareRoot(_ url: URL) -> Bool {

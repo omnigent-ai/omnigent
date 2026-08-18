@@ -419,7 +419,7 @@ describe("NewChatLandingScreen create flow", () => {
     // inputs (host id, recents, derived home) change, so nothing ever
     // re-filled the field — the chip dropped back to its empty placeholder.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: /corey-laptop/ }));
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
 
     expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo");
   });
@@ -935,6 +935,69 @@ describe("NewChatLandingScreen create flow", () => {
     // "Default" → no flag persisted (undefined is dropped by JSON.stringify),
     // so the runner launches claude with its own default.
     expect(body.terminal_launch_args).toBeUndefined();
+  });
+
+  it("posts --dangerously-skip-permissions when the bypass is picked for antigravity-native", async () => {
+    setAgents([
+      agent({ id: "ag_agy", name: "antigravity-native-ui", display_name: "Antigravity" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_agy" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_agy");
+    pickSelectOption("new-chat-landing-config-agy-skip", "Skip permissions");
+    saveConfig();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    // agy's ONLY pre-emptive control, as a bare single token. Claude's
+    // `["--permission-mode", ...]` pair would be rejected by agy, which has no
+    // such flag — so assert the exact spelling, not merely "some args".
+    expect(body.terminal_launch_args).toEqual(["--dangerously-skip-permissions"]);
+  });
+
+  it("omits terminal_launch_args when antigravity-native permissions are left at default", async () => {
+    setAgents([
+      agent({ id: "ag_agy", name: "antigravity-native-ui", display_name: "Antigravity" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_agy" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    // Anchor so the absence check is not vacuous against a malformed body.
+    expect(body.labels?.["omnigent.wrapper"]).toBe("antigravity-native-ui");
+    // Untouched → agy keeps its own request-review prompt.
+    expect(body.terminal_launch_args).toBeUndefined();
+  });
+
+  it("shows a danger banner while the antigravity-native bypass is selected", async () => {
+    setAgents([
+      agent({ id: "ag_agy", name: "antigravity-native-ui", display_name: "Antigravity" }),
+    ]);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_agy");
+    // agy exposes no firing pre-tool hook, so Omnigent cannot re-gate tools
+    // once this is armed — the banner is the only guardrail the user gets.
+    expect(screen.queryByTestId("new-chat-landing-agy-skip-banner")).toBeNull();
+    pickSelectOption("new-chat-landing-config-agy-skip", "Skip permissions");
+    expect(screen.getByTestId("new-chat-landing-agy-skip-banner")).toBeTruthy();
   });
 
   it("omits model + effort on create when the picker is untouched for claude-native", async () => {

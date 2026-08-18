@@ -30,6 +30,7 @@ from omnigent.runtime.workflow import (
     _build_claude_sdk_spawn_env,
     _build_codex_spawn_env,
     _build_goose_spawn_env,
+    _build_hermes_spawn_env,
     _build_kimi_spawn_env,
     _build_openai_agents_sdk_spawn_env,
     _build_pi_spawn_env,
@@ -1448,6 +1449,86 @@ def test_kimi_os_env_serialized(config_home: Path) -> None:
     assert decoded["sandbox"]["type"] == "darwin_seatbelt"
 
 
+# ── Hermes Agent CLI spawn-env ────────────────────────────────────────────
+
+
+def test_hermes_spawn_env_threads_spec_model_and_skills(config_home: Path) -> None:
+    """The hermes builder emits the model plus the skills filter, and no
+    gateway vars: Hermes owns its file-based auth (``hermes setup`` /
+    ``hermes model``) and has no per-spawn provider override to configure.
+
+    Regression: hermes had no builder at all, so a spec model never reached the
+    subprocess and it silently ran on whatever default Hermes had configured."""
+    _write_config(config_home, {"providers": {}})
+    spec = _make_spec(harness="hermes", model="hermes-4-405b")
+
+    env = _build_hermes_spawn_env(spec, cwd=None, workdir=None)
+
+    assert env == {
+        "HARNESS_HERMES_MODEL": "hermes-4-405b",
+        "HARNESS_HERMES_SKILLS_FILTER": '"all"',
+    }
+
+
+def test_hermes_ignores_global_default_provider(config_home: Path) -> None:
+    """An openai default provider injects no creds into the hermes env.
+
+    Same reasoning as kimi: Hermes reads credentials from its own
+    ``auth.json`` / ``.env`` under ``HERMES_HOME``, so injecting an ambient key
+    the executor cannot pass through would mis-bill the user against a
+    provider their Hermes install never uses."""
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness="hermes")
+
+    env = _build_hermes_spawn_env(spec, cwd=None, workdir=None)
+
+    assert "HARNESS_HERMES_GATEWAY_BASE_URL" not in env
+    assert "HARNESS_HERMES_GATEWAY_API_KEY" not in env
+    assert "HARNESS_HERMES_DATABRICKS_PROFILE" not in env
+
+
+def test_hermes_os_env_serialized(config_home: Path) -> None:
+    """``spec.os_env`` is serialized into ``HARNESS_HERMES_OS_ENV`` so the wrap
+    rebuilds the sandbox spec instead of falling back to ``sandbox=none``.
+
+    This is what makes a sandbox picked in the web session dialog actually
+    confine hermes — without it the harness ran unconfined while the UI
+    reported a sandbox."""
+    import json as _json
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    _write_config(config_home, {"providers": {}})
+    os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=None,
+        sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
+        fork=False,
+    )
+    spec = _make_spec(harness="hermes", os_env=os_env)
+
+    env = _build_hermes_spawn_env(spec, cwd=None, workdir=None)
+
+    assert "HARNESS_HERMES_OS_ENV" in env
+    decoded = _json.loads(env["HARNESS_HERMES_OS_ENV"])
+    assert decoded["sandbox"]["type"] == "linux_bwrap"
+
+
+def test_hermes_omits_reserved_bundle_dir(config_home: Path, tmp_path: Path) -> None:
+    """``workdir`` is accepted for signature parity but not threaded.
+
+    ``HARNESS_HERMES_BUNDLE_DIR`` is reserved in the wrap — there is no
+    ``hermes chat`` flag for it — so emitting it would set a var the executor
+    cannot pass on. Locks the deliberate omission so a future reader doesn't
+    "fix" it without wiring the argv side."""
+    _write_config(config_home, {"providers": {}})
+    spec = _make_spec(harness="hermes")
+
+    env = _build_hermes_spawn_env(spec, cwd=None, workdir=tmp_path)
+
+    assert "HARNESS_HERMES_BUNDLE_DIR" not in env
+
+
 # ---------------------------------------------------------------------------
 # harness.<canonical>.command → OMNIGENT_<NAME>_PATH (spawn-env builders)
 # ---------------------------------------------------------------------------
@@ -1477,6 +1558,7 @@ def _call_builder(builder: object, spec: AgentSpec) -> dict[str, str]:  # type: 
         ("kimi", _build_kimi_spawn_env, "OMNIGENT_KIMI_PATH"),
         ("goose", _build_goose_spawn_env, "OMNIGENT_GOOSE_PATH"),
         ("qwen", _build_qwen_spawn_env, "OMNIGENT_QWEN_PATH"),
+        ("hermes", _build_hermes_spawn_env, "OMNIGENT_HERMES_PATH"),
     ],
 )
 def test_spawn_env_threads_config_command_to_path(
@@ -1504,6 +1586,7 @@ def test_spawn_env_threads_config_command_to_path(
         ("kimi", _build_kimi_spawn_env, "OMNIGENT_KIMI_PATH"),
         ("goose", _build_goose_spawn_env, "OMNIGENT_GOOSE_PATH"),
         ("qwen", _build_qwen_spawn_env, "OMNIGENT_QWEN_PATH"),
+        ("hermes", _build_hermes_spawn_env, "OMNIGENT_HERMES_PATH"),
     ],
 )
 def test_spawn_env_ambient_env_wins_over_config_command(

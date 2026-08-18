@@ -112,6 +112,42 @@ function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
 
+describe("Composer growth layout", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("keeps multiline growth in layout instead of offsetting the form over the transcript", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    const form = ta.closest("form");
+    expect(form).not.toBeNull();
+
+    const originalGetComputedStyle = window.getComputedStyle.bind(window);
+    vi.spyOn(window, "getComputedStyle").mockImplementation((element, pseudoElt) => {
+      if (element === ta) {
+        return {
+          lineHeight: "20px",
+          paddingTop: "0px",
+          paddingBottom: "0px",
+          minHeight: "0px",
+        } as CSSStyleDeclaration;
+      }
+      return originalGetComputedStyle(element, pseudoElt);
+    });
+    Object.defineProperty(ta, "scrollHeight", {
+      configurable: true,
+      get: () => 220,
+    });
+
+    fireEvent.change(ta, { target: { value: "one\ntwo\nthree\nfour" } });
+
+    expect(ta.style.height).toBe("200px");
+    expect(form?.style.marginTop).toBe("");
+  });
+});
+
 describe("Composer Claude goal control", () => {
   afterEach(() => {
     cleanup();
@@ -647,6 +683,10 @@ describe("Composer model/effort label", () => {
       sessionModelOverride: null,
       codexModelOptions: [],
       nativeVendorOwnsModel: false,
+      // Identity-fallback inputs: reset so a case that sets one can't leak it
+      // into the next (the label reads both when no model/effort resolves).
+      sessionHarness: null,
+      subAgentName: null,
     });
   });
   afterEach(() => {
@@ -802,6 +842,37 @@ describe("Composer model/effort label", () => {
       />,
     );
     expect(label()).toHaveTextContent("Polly (Pi)");
+  });
+
+  it("names the vendor, not the Task subagent_type, on a Claude Code sub-agent", () => {
+    // A claude-native sub-agent child has no model of its own, so the label
+    // takes the identity fallback. Its `subAgentName` is Claude's own
+    // `subagent_type` ("general-purpose") and it reuses the parent's
+    // claude-native agent row — neither names the product, so the wrapper
+    // label decides. The instance itself is named in the sub-agent tray.
+    useChatStore.setState({
+      selectedModel: null,
+      selectedEffort: null,
+      llmModel: null,
+      sessionHarness: "claude-native",
+      subAgentName: "general-purpose",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude-native-ui" }],
+          selectedAgentId: "a1",
+          // No picker: the sub-agent is read-only, so it has no model control.
+          modelPickerKind: null,
+          showModels: false,
+          showEffort: false,
+          wrapperLabel: "claude-code-native-ui-subagent",
+          readOnlyReason: "Claude Code sub-agents are read-only",
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("Claude Code");
+    expect(label()).not.toHaveTextContent("General-purpose");
   });
 
   it("does NOT fall back to the bare vendor name for a native wrapper with no model", () => {
@@ -1494,6 +1565,20 @@ describe("Composer file-attachment focus", () => {
     fireEvent.change(fileInput(), { target: { files: [bad] } });
 
     expect(document.activeElement).not.toBe(ta);
+  });
+
+  it("clears the rejection notice once the user types", () => {
+    // The rejected file is never attached, so there is no chip to remove and
+    // nothing else clears the notice. Left sticky it reads as a blocker on a
+    // composer that can actually be submitted.
+    render(<Composer {...composerProps()} />);
+    const bad = new File([new Uint8Array(10)], "clip.mp4", { type: "video/mp4" });
+    fireEvent.change(fileInput(), { target: { files: [bad] } });
+    expect(screen.getByText(/can't be attached/)).toBeTruthy();
+
+    fireEvent.change(textarea(), { target: { value: "never mind, just a question" } });
+
+    expect(screen.queryByText(/can't be attached/)).toBeNull();
   });
 });
 

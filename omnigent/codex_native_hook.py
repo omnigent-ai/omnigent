@@ -228,15 +228,17 @@ def _main_route_turn(argv: list[str]) -> int:
        advertised loopback ``route-turn`` endpoint. ``model`` comes from
        the hook payload, which tracks the LIVE thread model —
        ``config.toml`` reports the stale launch model.
-    3. On a routed verdict: switch the thread with
-       ``thread/settings/update`` (codex binds the turn's model before
-       this hook runs, so the switch lands from the next turn), write the
-       marker, and BLOCK the prompt. The runner then replays it as a
-       normal user turn, which runs on the routed model.
+    3. On a routed verdict: check the pick against this pane's live
+       ``model/list``, switch the thread with ``thread/settings/update``
+       (codex binds the turn's model before this hook runs, so the switch
+       lands from the next turn), write the marker, and BLOCK the prompt.
+       The runner then replays it as a normal user turn, which runs on the
+       routed model.
 
     Fails open everywhere: an absent advertisement, an unreachable
-    endpoint, an unroutable verdict or a failed switch all exit ``0`` with
-    no output, and the prompt runs untouched on the current model.
+    endpoint, an unroutable verdict, a pick this pane's gateway does not
+    serve, or a failed switch all exit ``0`` with no output, and the prompt
+    runs untouched on the current model.
 
     :param argv: CLI argv after the ``route-turn`` subcommand, e.g.
         ``["--bridge-dir", "/tmp/x", "--harness", "codex-native"]``.
@@ -327,14 +329,15 @@ def _main_route_turn(argv: list[str]) -> int:
             _write_marker(bridge_dir, session_id, decision)
         return 0
 
-    if not _apply_thread_model(bridge_dir, model):
+    declined = _apply_thread_model(bridge_dir, model)
+    if declined is not None:
         # No marker: the prompt is about to run, and the marker is what
         # tells the runner to replay it. Writing one here would replay a
         # prompt that already ran. The server-side pin still keeps the
         # next prompt from re-routing.
-        trace_turn_routing(bridge_dir, "fail-open", f"could not switch to {model}")
+        trace_turn_routing(bridge_dir, "fail-open", declined)
         print(
-            f"omnigent codex route-turn hook: could not switch to {model}; "
+            f"omnigent codex route-turn hook: {declined}; "
             "letting the prompt run on the current model",
             file=sys.stderr,
         )
@@ -428,9 +431,9 @@ def _post_json(
     return decoded if isinstance(decoded, dict) else None
 
 
-def _apply_thread_model(bridge_dir: Path, model: str) -> bool:
+def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
     """
-    Switch the live Codex thread onto *model*.
+    Switch the live Codex thread onto *model*, if this pane can serve it.
 
     ``thread/settings/update`` is the thread-level switch (the same one the
     web picker drives through the executor); the app-server accepts a
@@ -439,70 +442,83 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> bool:
     mirrored into ``config.toml`` the way the executor does, so the
     cost-budget gate reads the routed model rather than the launch one.
 
-    The routed catalog id is translated into codex's own spelling first (see
-    :mod:`omnigent.codex_model_vocabulary`) — codex serves either, but only
-    recognizes its own, so an untranslated switch runs the right model while
-    the TUI warns about missing metadata and ``/model`` keeps highlighting
-    the launch slug.
+    The routed id is resolved against this pane's live ``model/list`` first
+    (see :mod:`omnigent.codex_model_vocabulary`), which is both the spelling
+    translation and the reachability check. The routing verdict comes from a
+    server-side gateway map that can go stale, and switching a pane onto a
+    model its gateway cannot serve fails silently at the next turn — so a
+    routed id no row names declines the switch instead, and the pane keeps
+    running on its own model.
 
     :param bridge_dir: Native Codex bridge directory.
     :param model: Routed model id, e.g. ``"databricks-gpt-5-6-luna"``.
-    :returns: ``True`` when Codex accepted the switch.
+    :returns: ``None`` when Codex accepted the switch, else a short reason
+        the switch was declined, for the caller's trace and stderr note.
     """
     import asyncio
 
-    from omnigent.codex_model_vocabulary import codex_model_slug
+    from omnigent.codex_model_vocabulary import codex_reachable_model_slug
     from omnigent.codex_native_app_server import client_for_transport
     from omnigent.codex_native_bridge import write_codex_config_model
     from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
 
     state = read_bridge_state(bridge_dir)
     if state is None:
-        return False
+        return "no bridge state to switch through"
 
     # The spelling codex accepted, mirrored into config.toml below so the
     # file and the live thread never disagree about the model.
-    applied = model
+    applied: str | None = None
+    declined: str | None = None
 
     async def _switch() -> None:
-        nonlocal applied
+        nonlocal applied, declined
         client = client_for_transport(state.socket_path, client_name="omnigent-route-turn-hook")
         await client.connect()
         try:
-            applied = codex_model_slug(model, await _list_codex_models(client))
+            rows = await _list_codex_models(client)
+            if rows is None:
+                declined = "could not read this pane's model catalog"
+                return
+            slug = codex_reachable_model_slug(model, rows)
+            if slug is None:
+                declined = f"routed model not in this pane's catalog ({model})"
+                return
             await client.request(
                 "thread/settings/update",
-                {"threadId": state.thread_id, "model": applied},
+                {"threadId": state.thread_id, "model": slug},
             )
+            applied = slug
         finally:
             await client.close()
 
     try:
         asyncio.run(asyncio.wait_for(_switch(), timeout=SETTINGS_UPDATE_TIMEOUT_S))
     except Exception as exc:  # noqa: BLE001 - any failure means "leave the model alone"
-        print(
-            f"omnigent codex route-turn hook: thread/settings/update failed: {exc}",
-            file=sys.stderr,
-        )
-        return False
+        return f"thread/settings/update failed: {exc}"
+    if declined is not None:
+        return declined
+    if applied is None:
+        return f"could not switch to {model}"
     if not write_codex_config_model(bridge_dir, applied):
         print(
             f"omnigent codex route-turn hook: could not mirror {applied} into config.toml",
             file=sys.stderr,
         )
-    return True
+    return None
 
 
-async def _list_codex_models(client: CodexAppServerClient) -> list[dict[str, object]]:
+async def _list_codex_models(client: CodexAppServerClient) -> list[dict[str, object]] | None:
     """
     Read this session's codex model catalog over an open app-server client.
 
-    Hidden rows are included: they are still switchable, and translating a
-    routed model beats sending a spelling codex has no metadata for.
+    Hidden rows are included: they are still switchable, and a routed model
+    listed only there is reachable all the same.
 
     :param client: Connected app-server client.
-    :returns: Raw ``model/list`` rows, empty when the call fails (the
-        caller then applies the routed id verbatim).
+    :returns: Raw ``model/list`` rows, or ``None`` when the call failed —
+        which is not the same as an empty catalog, and the caller declines
+        the switch rather than reading "no rows" as "not reachable".
     """
     rows: list[dict[str, object]] = []
     cursor: str | None = None
@@ -519,11 +535,12 @@ async def _list_codex_models(client: CodexAppServerClient) -> list[dict[str, obj
             cursor = result.get("nextCursor")
             if not isinstance(cursor, str) or not cursor:
                 break
-    except Exception as exc:  # noqa: BLE001 - an unreadable catalog means "no translation"
+    except Exception as exc:  # noqa: BLE001 - an unreadable catalog means "do not switch"
         print(
             f"omnigent codex route-turn hook: model/list failed: {exc}",
             file=sys.stderr,
         )
+        return None
     return rows
 
 

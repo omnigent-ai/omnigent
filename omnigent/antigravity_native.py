@@ -38,7 +38,13 @@ Differences from the Codex / Claude wrappers (Phase 1 scope):
 * **Workspace = the agy terminal cwd.** agy runs tools in its process working
   directory, so the terminal cwd is pinned to the session working dir; no
   ``--add-dir`` is needed.
-* **Auth is inherited from ``~/.gemini``** — no credential seeding.
+* **Auth stays on the real HOME; config is per-session.** agy launches with
+  ``--gemini_dir=<bridge_dir>/agy-home/.gemini``, so its MCP relay config and
+  settings are session-scoped and the user's real ``~/.gemini`` is never
+  rewritten. ``HOME`` is deliberately left real, because agy's OAuth token can
+  live in the OS keyring (macOS Keychain), which a relocated HOME cannot unlock
+  (#1477); file-based credential markers are copied into the isolated dir for
+  the platforms that use them.
 
 The runner OWNS the agy terminal: binding a runner triggers its idempotent
 auto-create of the antigravity terminal (``runner/app.py``
@@ -88,15 +94,18 @@ from omnigent.antigravity_native_bridge import (
     AGY_PLACEHOLDER_CONVERSATION_PREFIX,
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     AntigravityNativeBridgeState,
+    agy_gemini_dir,
+    agy_home_dir,
     bridge_dir_for_bridge_id,
     clear_bridge_state,
     ensure_agy_feedback_survey_disabled,
-    ensure_agy_onboarding_complete,
     is_placeholder_conversation_id,
     prepare_bridge_dir,
     read_bridge_state,
+    seed_isolated_agy_home,
     update_conversation_id,
     write_bridge_state,
+    write_mcp_config,
     write_tmux_target,
 )
 from omnigent.antigravity_native_launch import (
@@ -121,6 +130,7 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
     error_text,
     launch_or_reuse_daemon_runner,
+    open_daemon_client,
     wait_for_host_online,
     wait_for_runner_online,
 )
@@ -469,7 +479,11 @@ def _run_with_remote_server(
     from omnigent.cli import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
-    headers = _remote_headers(server_url=base_url)
+    # This machine's host id keys the WebSocket attach handshake (and its
+    # reconnects) to the replica holding the runner's tunnel; the CLI can set WS
+    # headers, so it rides the header (emitted only on a host-sharded deployment).
+    host_id = load_or_create_host_identity().host_id
+    headers = _remote_headers(server_url=base_url, host_id=host_id)
     try:
         resolved_session_id = _resolve_session_id_for_resume(
             base_url=base_url,
@@ -489,7 +503,6 @@ def _run_with_remote_server(
             with runner_startup_progress(initial_message="Preparing Antigravity...") as progress:
                 progress.update("Connecting to local daemon...")
                 _ensure_host_daemon(base_url)
-                host_id = load_or_create_host_identity().host_id
                 bundle = None if resolved_session_id is not None else _bundle_agent(spec_path)
                 prepared = await _prepare_antigravity_terminal_via_daemon(
                     base_url=base_url,
@@ -519,7 +532,7 @@ def _run_with_remote_server(
 
                 :returns: None.
                 """
-                new_headers = _remote_headers(server_url=base_url)
+                new_headers = _remote_headers(server_url=base_url, host_id=host_id)
                 headers.clear()
                 headers.update(new_headers)
 
@@ -580,7 +593,9 @@ async def _prepare_antigravity_terminal(
     :raises click.ClickException: If any server operation fails.
     """
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, timeout=timeout) as client:
         bridge_id: str
         conversation_id: str
         resume = False
@@ -772,10 +787,11 @@ async def _prepare_antigravity_terminal_via_daemon(
     :raises click.ClickException: If setup fails.
     """
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         bridge_id: str
         conversation_id: str
         resume = False
+        fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException(
@@ -838,6 +854,7 @@ async def _prepare_antigravity_terminal_via_daemon(
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _update_progress(startup_progress, "Waiting for runner...")
         await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
@@ -962,10 +979,11 @@ async def _launch_and_record(
     # Clear stale turn/conversation state so a fresh launch rediscovers this run's
     # real agy conversation id instead of binding to the previous run's.
     await asyncio.to_thread(clear_bridge_state, bridge_dir)
-    # Pre-accept agy's first-run onboarding wizard (HOME-global) so a headless /
-    # detached launch does not hang waiting for a TTY answer. Idempotent and
-    # offloaded to a thread (file I/O), mirroring the bridge-state writes below.
-    await asyncio.to_thread(ensure_agy_onboarding_complete)
+    # agy's first-run onboarding wizard has no TTY to answer it on a headless /
+    # detached launch, so its completion marker is pre-accepted below by
+    # ``seed_isolated_agy_home`` — in the isolated dir agy actually reads under
+    # ``--gemini_dir``. Seeding the real ``~/.gemini`` marker as well would write
+    # the user's tree for a file this launch never reads.
     argv, env_overrides = build_agy_launch(
         conversation_id=conversation_id if resume else None,
         model=model,
@@ -974,14 +992,29 @@ async def _launch_and_record(
         headless=headless,
         extra_args=antigravity_args,
     )
+    # Scope agy to a per-session isolated Gemini dir, exactly as the runner-owned
+    # launch does. agy has no --mcp-config flag and ignores every ANTIGRAVITY_* env
+    # knob, so its MCP relay config and its settings can only be scoped through the
+    # hidden --gemini_dir. Without this the CLI launch read the user's real
+    # ~/.gemini: agy saw no Omnigent relay (hence no sys_* tools, #1194), and the
+    # survey/trust seeds below rewrote the user's own settings.json. HOME stays real
+    # so keyring-backed auth (macOS Keychain) keeps working (#1477).
+    await asyncio.to_thread(write_mcp_config, bridge_dir)
+    env_overrides = {
+        **env_overrides,
+        **await asyncio.to_thread(
+            seed_isolated_agy_home,
+            bridge_dir,
+            trusted_workspace=Path.cwd().resolve(),
+        ),
+    }
     # agy's feedback survey shares its "esc to cancel" footer with the running-turn
     # marker, so a web turn injected into this CLI-launched session while the survey
-    # is up would be silently lost (#1494). Disable it in the launch HOME before agy
-    # starts. This path emits no HOME override, so agy runs under the real ~/.gemini.
-    await asyncio.to_thread(
-        ensure_agy_feedback_survey_disabled,
-        Path(env_overrides.get("HOME") or Path.home()),
-    )
+    # is up would be silently lost (#1494). Disable it in the isolated dir agy reads
+    # under --gemini_dir, never the user's real ~/.gemini.
+    await asyncio.to_thread(ensure_agy_feedback_survey_disabled, agy_home_dir(bridge_dir))
+    # Lead the args so the flag is never swallowed by a later positional.
+    argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
     _update_progress(startup_progress, "Starting Antigravity terminal...")
     launched = await _launch_antigravity_terminal(
         client,
@@ -1584,9 +1617,11 @@ async def _close_antigravity_terminal(
     :param terminal_id: Terminal resource id.
     :returns: None.
     """
+    from omnigent.cli_auth import open_server_client
+
     try:
-        async with httpx.AsyncClient(
-            base_url=base_url,
+        async with open_server_client(
+            base_url,
             headers=headers,
             timeout=httpx.Timeout(10.0),
         ) as client:

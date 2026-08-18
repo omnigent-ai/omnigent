@@ -61,6 +61,33 @@ const QUERY = `
   }
 `;
 
+// The same node shape as QUERY, for one named PR, plus createdAt for the
+// effective-date floor.
+const ONE_PR_QUERY = `
+  query($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $number) {
+        number
+        state
+        createdAt
+        isDraft
+        authorAssociation
+        author { login __typename }
+        labels(first: 30) { nodes { name } }
+        body
+        timelineItems(last: 50, itemTypes: [UNLABELED_EVENT]) {
+          nodes {
+            ... on UnlabeledEvent {
+              label { name }
+              actor { login }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
 const LINK_QUERY = `
   query($owner: String!, $repo: String!, $number: Int!) {
     repository(owner: $owner, name: $repo) {
@@ -130,27 +157,43 @@ module.exports = async ({ context, github, core }) => {
   const enforce = process.env.ENFORCE === "true";
 
   try {
-    const windowStart = new Date(Date.now() - HOURS_TO_SCAN * MS_PER_HOUR);
-    const cutoff = new Date(
-      Math.max(windowStart.getTime(), new Date(issueLink.EFFECTIVE_FROM).getTime())
-    );
-    const cutoffString = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
-    const searchQuery = `repo:${owner}/${repo} is:pr is:open created:>${cutoffString}`;
-    console.log(`Scanning PRs: ${searchQuery} (enforce=${enforce})`);
-
-    let cursor = null;
-    let hasNextPage = true;
+    // One PR when an event names it, the whole window on the cron sweep. Only the
+    // fetch differs, so both routes reach identical verdicts.
     const allPRs = [];
-    while (hasNextPage) {
-      const response = await github.graphql(QUERY, { cursor, searchQuery });
-      const { remaining, resetAt } = response.rateLimit;
-      console.log(`Rate limit: ${remaining} remaining, resets at ${resetAt}`);
-      const { nodes, pageInfo } = response.search;
-      hasNextPage = pageInfo.hasNextPage;
-      cursor = pageInfo.endCursor;
-      allPRs.push(...nodes);
+    const single = Number(process.env.PR_NUMBER) || null;
+    if (single) {
+      const resp = await github.graphql(ONE_PR_QUERY, { owner, repo, number: single });
+      const pr = resp.repository.pullRequest;
+      if (!pr) {
+        console.log(`#${single} not found; nothing to do.`);
+      } else if (new Date(pr.createdAt) < new Date(issueLink.EFFECTIVE_FROM)) {
+        console.log(`#${single} predates ${issueLink.EFFECTIVE_FROM}; skipping.`);
+      } else {
+        allPRs.push(pr);
+      }
+      console.log(`Checking #${single} (enforce=${enforce})`);
+    } else {
+      const windowStart = new Date(Date.now() - HOURS_TO_SCAN * MS_PER_HOUR);
+      const cutoff = new Date(
+        Math.max(windowStart.getTime(), new Date(issueLink.EFFECTIVE_FROM).getTime())
+      );
+      const cutoffString = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
+      const searchQuery = `repo:${owner}/${repo} is:pr is:open created:>${cutoffString}`;
+      console.log(`Scanning PRs: ${searchQuery} (enforce=${enforce})`);
+
+      let cursor = null;
+      let hasNextPage = true;
+      while (hasNextPage) {
+        const response = await github.graphql(QUERY, { cursor, searchQuery });
+        const { remaining, resetAt } = response.rateLimit;
+        console.log(`Rate limit: ${remaining} remaining, resets at ${resetAt}`);
+        const { nodes, pageInfo } = response.search;
+        hasNextPage = pageInfo.hasNextPage;
+        cursor = pageInfo.endCursor;
+        allPRs.push(...nodes);
+      }
+      console.log(`Found ${allPRs.length} open PRs in the window`);
     }
-    console.log(`Found ${allPRs.length} open PRs in the window`);
 
     // Read from the API, not the checked-out tree, so a PR cannot self-grant by
     // editing the file (same approach as the nudge).

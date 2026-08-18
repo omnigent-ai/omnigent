@@ -164,6 +164,7 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
             {
               id: "conv_child",
               title: null,
+              task_summary: null,
               tool: "researcher",
               session_name: null,
               current_task_status: null,
@@ -221,6 +222,7 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
       {
         id: "conv_child",
         title: null,
+        task_summary: null,
         tool: "researcher",
         session_name: null,
         current_task_status: null,

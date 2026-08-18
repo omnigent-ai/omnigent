@@ -29,7 +29,6 @@ interface ElicitationData {
   phase?: string;
   policy_name?: string;
   content_preview?: string;
-  can_approve?: boolean | null;
 }
 
 type PageState =
@@ -159,11 +158,6 @@ export function ApprovePage() {
             )}
           </AlertTitle>
           <AlertDescription className="flex flex-col gap-2">
-            {state.data.can_approve === false && (
-              <span className="text-sm text-muted-foreground" role="note">
-                Only the session owner or a delegated approver can approve. You can still reject.
-              </span>
-            )}
             <span>{state.data.message}</span>
             {state.data.content_preview && (
               <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
@@ -171,11 +165,7 @@ export function ApprovePage() {
               </pre>
             )}
             <div className="flex flex-wrap gap-2 pt-1">
-              <Button
-                size="sm"
-                onClick={() => void submit("accept")}
-                disabled={state.data.can_approve === false}
-              >
+              <Button size="sm" onClick={() => void submit("accept")}>
                 <CheckIcon className="mr-1 size-3.5" />
                 Approve
               </Button>

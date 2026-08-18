@@ -205,6 +205,7 @@ async def test_create_session_terminal_ensure_routes_claude_native(
 @pytest.mark.asyncio
 async def test_create_session_terminal_ensure_failure_returns_json_without_live_error(
     monkeypatch: pytest.MonkeyPatch,
+    pinned_runner_log: Path,
 ) -> None:
     """
     Native terminal ensure failures are reported to AP, not published live.
@@ -218,6 +219,7 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
     the relay.
 
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param pinned_runner_log: The log path the message must name.
     :returns: None.
     """
     sid = "aefc71354fadf0dd2ae5c224c40e772c"
@@ -257,13 +259,14 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
         )
 
     assert resp.status_code == 500
-    # Structured code is preserved; the message is a fixed client-safe
-    # string. The raw ImportError text ("requires the 'claude' CLI") must
-    # not appear in the HTTP body — it is logged on the runner instead.
+    # Structured code is preserved; the message names the runner log file so
+    # the reader can find the cause. The raw ImportError text ("requires the
+    # 'claude' CLI") must not appear in the HTTP body — only in that log.
     body = resp.json()
     assert body["error"]["code"] == "native_terminal_start_failed"
     assert body["error"]["message"] == (
-        "Native Claude terminal failed to start; see runner logs for details."
+        "Native Claude terminal failed to start; "
+        f"see the runner log for details: {pinned_runner_log}"
     )
     assert "requires the 'claude' CLI" not in body["error"]["message"]
 

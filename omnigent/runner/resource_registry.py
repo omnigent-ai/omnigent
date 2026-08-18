@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -35,6 +36,7 @@ from omnigent.entities.session_resources import (
     terminal_resource_id,
     terminal_resource_view,
 )
+from omnigent.inner.sandbox import contained_realpath, containment_prefix
 
 if TYPE_CHECKING:
     from omnigent.claude_native_status_file import SessionStatusPoller
@@ -95,16 +97,6 @@ _CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS = 1.0
 # don't 5x the capture-pane subprocess load on every terminal.
 _CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS = 0.2
 
-# How long Claude's ``sessions/<pid>.json`` status stays trusted as a *level*
-# after it was written. The file is rewritten only when its value changes, so
-# a ``busy`` written for a delegate or background task outlives the turn that
-# produced it; honouring it forever would pin the session to "Working…" with
-# no way back. Inside this window a quiet pane is read as "parked on a prompt"
-# (the case the pane diff genuinely cannot see) and the session stays running;
-# past it the pane watcher decides. Comfortably above the 1s idle threshold so
-# a real prompt is not lost to the gap between the write and the pane settling.
-_CLAUDE_NATIVE_STATUS_FILE_LEVEL_TTL_SECONDS = 10.0
-
 # Minimum wall-clock interval (seconds) between consecutive
 # ``session.terminal.activity`` emissions for a single terminal. The
 # claude-native agent terminal polls its pane every 200ms
@@ -144,6 +136,10 @@ class TerminalExitEvent:
         specs may contain credentials or other launch-only secrets.
     :param cwd: Working directory used to launch the terminal, if known.
     :param last_output: Last visible pane text captured before exit, if any.
+    :param exit_status: The inner process's exit code, when tmux captured one
+        from ``#{pane_dead_status}`` (terminals with ``keep_alive_after_exit``).
+        ``None`` when unknown — e.g. the tmux server vanished before the status
+        could be read, or the terminal doesn't keep the pane alive after exit.
     :param session_was_idle: Whether the session's last PTY-derived status was
         ``idle`` at exit. ``True`` marks a clean shutdown after the turn
         finished; ``False`` (the default — last seen ``running``, or never
@@ -159,6 +155,7 @@ class TerminalExitEvent:
     args_count: int | None = None
     cwd: str | None = None
     last_output: str | None = None
+    exit_status: int | None = None
     session_was_idle: bool = False
 
 
@@ -170,27 +167,32 @@ def _trim_terminal_exit_output(text: str | None) -> str | None:
     if not stripped:
         return None
     lines = stripped.splitlines()
+    omitted_lines = 0
     if len(lines) > _TERMINAL_EXIT_OUTPUT_MAX_LINES:
-        lines = [
-            f"... omitted {len(lines) - _TERMINAL_EXIT_OUTPUT_MAX_LINES} earlier line(s) ...",
-            *lines[-_TERMINAL_EXIT_OUTPUT_MAX_LINES:],
-        ]
-    clipped = "\n".join(lines)
-    if len(clipped) > _TERMINAL_EXIT_OUTPUT_MAX_CHARS:
-        clipped = (
-            f"... omitted {len(clipped) - _TERMINAL_EXIT_OUTPUT_MAX_CHARS} "
-            "earlier character(s) ...\n"
-            f"{clipped[-_TERMINAL_EXIT_OUTPUT_MAX_CHARS:]}"
-        )
-    return clipped
+        omitted_lines = len(lines) - _TERMINAL_EXIT_OUTPUT_MAX_LINES
+        lines = lines[-_TERMINAL_EXIT_OUTPUT_MAX_LINES:]
+    # Drop whole leading lines until the body fits the char budget, so the
+    # first surviving line is never a mid-word fragment (the "rity reasons"
+    # cut). One line longer than the budget is hard-clipped as a last resort.
+    while len(lines) > 1 and len("\n".join(lines)) > _TERMINAL_EXIT_OUTPUT_MAX_CHARS:
+        lines.pop(0)
+        omitted_lines += 1
+    if len(lines) == 1 and len(lines[0]) > _TERMINAL_EXIT_OUTPUT_MAX_CHARS:
+        lines[0] = lines[0][-_TERMINAL_EXIT_OUTPUT_MAX_CHARS:]
+    if omitted_lines:
+        lines.insert(0, f"... omitted {omitted_lines} earlier line(s) ...")
+    return "\n".join(lines)
 
 
 def _terminal_exit_diagnostics(
     instance: TerminalInstance | None,
-) -> tuple[str | None, int | None, str | None, str | None]:
-    """Extract generic launch/output diagnostics from a terminal instance."""
+) -> tuple[str | None, int | None, str | None, str | None, int | None]:
+    """Extract generic launch/output diagnostics from a terminal instance.
+
+    :returns: ``(command, args_count, cwd, last_output, exit_status)``.
+    """
     if instance is None:
-        return None, None, None, None
+        return None, None, None, None, None
 
     raw_command = getattr(instance, "command", None)
     command = raw_command if isinstance(raw_command, str) and raw_command else None
@@ -212,7 +214,18 @@ def _terminal_exit_diagnostics(
             if isinstance(raw_last_output, str):
                 last_output = _trim_terminal_exit_output(raw_last_output)
 
-    return command, args_count, cwd, last_output
+    exit_status: int | None = None
+    read_exit_status = getattr(instance, "last_exit_status", None)
+    if callable(read_exit_status):
+        try:
+            raw_exit_status = read_exit_status()
+        except Exception:
+            _logger.exception("Failed to read terminal exit status")
+        else:
+            if isinstance(raw_exit_status, int):
+                exit_status = raw_exit_status
+
+    return command, args_count, cwd, last_output, exit_status
 
 
 def _monotonic() -> float:
@@ -227,14 +240,54 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
+# Allowlist rather than a denylist: a denylist only stops the separators it
+# thought to enumerate, and the previous one let a backslash through — a real
+# separator on a Windows host.
+_UNSAFE_SESSION_ID_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
 def _sanitize_session_id(session_id: str) -> str:
     """Sanitize a session id for safe use as a filesystem path component.
 
+    Real ids are ``uuid4().hex``, so this is a no-op for them. It exists so a
+    malformed or hostile id can never become a separator or a parent
+    reference.
+
+    Note the allowlist deliberately keeps ``.`` (ids may carry one), which
+    means it does NOT by itself stop ``.`` or ``..`` — those are handled
+    explicitly below. An allowlist that merely permits dots is not enough.
+
     :param session_id: Raw session/conversation identifier,
         e.g. ``"conv_abc123"`` or ``"user/session"``.
-    :returns: Sanitized string safe for directory names.
+    :returns: A single path component: never empty, never a traversal.
     """
-    return session_id.replace("/", "_").replace("..", "_")
+    safe = _UNSAFE_SESSION_ID_CHARS.sub("_", session_id)
+    # "", ".", "..", "..." — empty or pure traversal once used as a component.
+    if set(safe) <= {"."}:
+        return "_" * max(len(safe), 1)
+    return safe
+
+
+def _contained_session_dir(root: str | Path, session_id: str) -> str:
+    """Join *session_id* under *root* and prove the result stayed there.
+
+    :func:`_sanitize_session_id` already reduces the id to one safe component.
+    This asserts the property that actually matters — the joined path really
+    is inside the runner workspace — instead of trusting that reduction. The
+    two are independent, so a gap in either alone is not enough to escape.
+
+    :param root: Runner workspace root, e.g. ``"/var/omnigent/sessions"``.
+    :param session_id: Raw session/conversation identifier.
+    :returns: Absolute path to the session directory.
+    :raises ValueError: If the joined path escapes *root*.
+    """
+    prefix = containment_prefix(os.path.realpath(str(root)))
+    contained = contained_realpath(
+        os.path.join(str(root), _sanitize_session_id(session_id)), prefix
+    )
+    if contained is None:
+        raise ValueError(f"session id {session_id!r} escapes the runner workspace root {root!r}")
+    return contained
 
 
 def _session_workspace(session_id: str) -> str:
@@ -243,12 +296,13 @@ def _session_workspace(session_id: str) -> str:
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :returns: Absolute path to the session workspace directory.
+    :raises ValueError: If the session id escapes the workspace root.
     """
     root = os.environ.get(
         "OMNIGENT_RUNNER_OS_ENV_ROOT",
         _DEFAULT_WORKSPACE_ROOT,
     )
-    return os.path.join(root, _sanitize_session_id(session_id), "workspace")
+    return os.path.join(_contained_session_dir(root, session_id), "workspace")
 
 
 class SessionResourceRegistry:
@@ -318,6 +372,11 @@ class SessionResourceRegistry:
         # which the turn-start hook also writes — deduping against that one
         # would swallow the turn's real ``running``.
         self._published_session_status: dict[str, tuple[str, str | None]] = {}
+        # Live claude-native status-file pollers, per session. Held so a
+        # reconnect can re-arm them (see :meth:`resync_session_statuses`) — the
+        # poller keeps its own edge/mtime baselines on the watcher thread, and
+        # clearing the registry's baseline alone would leave those intact.
+        self._status_pollers: dict[str, SessionStatusPoller] = {}
         # Optional callback invoked on the event loop when a watched terminal
         # disappears unexpectedly. The callback receives the terminal's
         # lifecycle relationship so the runner can decide whether the owning
@@ -408,6 +467,7 @@ class SessionResourceRegistry:
         """Pop and return the session's recorded PTY status (or ``None``)."""
         with self._lock:
             self._published_session_status.pop(session_id, None)
+            self._status_pollers.pop(session_id, None)
             return self._last_session_status.pop(session_id, None)
 
     def _claim_status_edge(self, session_id: str, status: str, blocked_on: str | None) -> bool:
@@ -432,6 +492,42 @@ class SessionResourceRegistry:
         """Adopt an externally-published *status* as the dedup baseline."""
         with self._lock:
             self._published_session_status[session_id] = (status, None)
+
+    def resync_session_statuses(self) -> None:
+        """Re-arm every status source so it republishes what it already sent.
+
+        Called after the runner's tunnel reconnects. A server recycle (deploy,
+        crash, replica failover) restarts the *listener*, wiping its in-memory
+        status cache — but this runner keeps running, so every dedup baseline
+        still asserts the pre-restart edge was delivered. Nothing re-asserts on
+        its own: Claude's status file is written only when its value *changes*,
+        and the pane watcher's edges are coalesced, so a session mid-turn during
+        the restart would sit on a stale ``idle`` until its next turn boundary —
+        no spinner, no stop button, for the rest of the turn.
+
+        Dropping the published-edge baselines here makes the next poll publish
+        the current status verbatim. The claude-native pollers are re-armed too:
+        they hold their own edge/mtime baselines on the watcher thread, so
+        clearing only this side would leave them silent.
+
+        Deliberately does NOT clear ``_last_session_status`` — that memo
+        classifies terminal exits (clean vs mid-turn crash) and is unrelated to
+        what the server has heard.
+        """
+        with self._lock:
+            sessions = sorted(self._published_session_status)
+            self._published_session_status.clear()
+            pollers = list(self._status_pollers.values())
+        for poller in pollers:
+            poller.resync()
+        if sessions or pollers:
+            _logger.info(
+                "Re-arming session status after tunnel reconnect: "
+                "cleared_edges=%d pollers=%d sessions=%s",
+                len(sessions),
+                len(pollers),
+                sessions,
+            )
 
     def note_session_turn_started(self, session_id: str) -> None:
         """Mark a session as having an in-flight turn.
@@ -692,7 +788,7 @@ class SessionResourceRegistry:
         if self._runner_workspace is not None:
             if self._per_session_workspace:
                 # Isolate sessions under the shared workspace.
-                default_cwd = str(self._runner_workspace / _sanitize_session_id(session_id))
+                default_cwd = _contained_session_dir(self._runner_workspace, session_id)
                 os.makedirs(default_cwd, mode=0o700, exist_ok=True)
                 os.chmod(default_cwd, 0o700)  # ensure mode even if pre-existing
             else:
@@ -791,7 +887,7 @@ class SessionResourceRegistry:
         # don't share a cwd.
         if self._runner_workspace is not None:
             if self._per_session_workspace:
-                default_cwd = str(self._runner_workspace / _sanitize_session_id(session_id))
+                default_cwd = _contained_session_dir(self._runner_workspace, session_id)
             else:
                 default_cwd = str(self._runner_workspace)
             return str(Path(default_cwd).resolve())
@@ -1088,16 +1184,6 @@ class SessionResourceRegistry:
         # means "never emitted", so the first changed tick always fires.
         last_activity_emit: dict[str, float | None] = {"value": None}
 
-        def _blocked_reason() -> str | None:
-            # The reason rides every edge, not just the poller's own, so a
-            # redrawing pane under a dialog doesn't publish a bare ``running``
-            # that erases it.
-            if status_poller is None or not status_poller.asserts_running(
-                ttl_s=_CLAUDE_NATIVE_STATUS_FILE_LEVEL_TTL_SECONDS
-            ):
-                return None
-            return status_poller.blocked_on
-
         def _publish_status(status: str, blocked_on: str | None = None) -> None:
             # Publish one running/idle edge: dedup against the last value,
             # memo for exit classification, and hop to the loop (publishers
@@ -1112,6 +1198,15 @@ class SessionResourceRegistry:
                 return
             self._set_session_status_memo(session_id, status)
             loop.call_soon_threadsafe(status_publisher, session_id, status, blocked_on)
+
+        def _file_owns_status() -> bool:
+            # Once Claude's own status file is readable it is the session's
+            # status: it reports what Claude is doing, where the pane diff only
+            # infers it from redraws. The pane keeps its activity-badge and
+            # pane-death jobs, but must not publish status alongside the file —
+            # two publishers is what made a post-turn redraw fight the file's
+            # ``idle`` and needed a freshness window to arbitrate.
+            return status_poller is not None and status_poller.active
 
         # claude-native additionally reads Claude's own ``sessions/<pid>.json``
         # status (present since Claude Code v2.1.139): it flips on the real
@@ -1129,6 +1224,9 @@ class SessionResourceRegistry:
             if emit_status and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             else None
         )
+        if status_poller is not None:
+            with self._lock:
+                self._status_pollers[session_id] = status_poller
 
         def _on_activity() -> None:
             # Runs on the watcher daemon thread; hop to the loop so the
@@ -1150,15 +1248,20 @@ class SessionResourceRegistry:
                     loop.call_soon_threadsafe(activity_publisher, session_id, resource_id)
             # Pane changed → the agent is working. Coalesce to the
             # idle→running edge so a continuously-redrawing pane doesn't
-            # re-emit ``running`` every poll. Always published, never deferred
-            # to the status file: that file is rewritten only when its value
-            # *changes*, so a turn starting while it already reads ``busy``
-            # produces no write at all — and the session would sit on its
-            # stale ``idle`` for the whole turn with no working indicator.
-            if emit_status:
-                _publish_status("running", _blocked_reason())
+            # re-emit ``running`` every poll. Skipped once the status file owns
+            # the session (see :func:`_file_owns_status`) — a post-turn prompt
+            # redraw is not a new turn, and the file already said so.
+            if emit_status and not _file_owns_status():
+                _publish_status("running")
 
         def _on_exit() -> None:
+            # The pane's process is gone, which the status file cannot report —
+            # a killed Claude never unlinks it, so the record survives holding
+            # its last value. Retire the poller before classifying the exit so
+            # that stale value can't keep owning the session's status.
+            if status_poller is not None:
+                status_poller.retire()
+
             def _schedule() -> None:
                 task = asyncio.create_task(
                     self._handle_terminal_exit(
@@ -1210,16 +1313,12 @@ class SessionResourceRegistry:
             # Pane quiet for the claude-native status threshold → the
             # agent has stopped. Edge-triggered: re-arms only after new
             # output mutates the pane (which flips back to ``running``).
-            # Held back only while the status file *freshly* reports running:
-            # a dialog owning the input quiets the pane without ending the
-            # turn, which the pane diff alone cannot tell from a finished one.
-            # Past that freshness window the pane decides, so a ``busy`` left
-            # standing by a background task can't pin the session to running.
+            # Skipped once the status file owns the session: a dialog owning
+            # the input quiets the pane without ending the turn, and only the
+            # file can tell that from a finished one.
             # Edge ordering: the watcher thread runs idle/exit serially, so
             # this idle commits before any later on_exit reads the memo.
-            if status_poller is None or not status_poller.asserts_running(
-                ttl_s=_CLAUDE_NATIVE_STATUS_FILE_LEVEL_TTL_SECONDS
-            ):
+            if not _file_owns_status():
                 _publish_status("idle")
             # Clear the activity throttle so the next working episode emits
             # its first pulse immediately, keeping the activity badge
@@ -1324,7 +1423,7 @@ class SessionResourceRegistry:
             )
             lifecycle = observed
 
-        command, args_count, cwd, last_output = _terminal_exit_diagnostics(instance)
+        command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
         # Idle = clean shutdown after the turn finished. Anything else (running,
         # or never observed → boot failure) stays a failure.
         session_was_idle = self._take_session_status_memo(session_id) == "idle"
@@ -1353,6 +1452,7 @@ class SessionResourceRegistry:
                     args_count=args_count,
                     cwd=cwd,
                     last_output=last_output,
+                    exit_status=exit_status,
                     session_was_idle=session_was_idle,
                 )
             )
@@ -1445,6 +1545,10 @@ class SessionResourceRegistry:
                 moved_status = self._last_session_status.pop(source_session_id, None)
                 if moved_status is not None and target_session_id not in self._last_session_status:
                     self._last_session_status[target_session_id] = moved_status
+                # The watcher restart below rebuilds the poller under the
+                # target, so drop the source's entry rather than leaving a
+                # retired poller to be re-armed on every later reconnect.
+                self._status_pollers.pop(source_session_id, None)
             try:
                 await entry.instance.set_conversation_link(
                     self._terminal_registry.conversation_link_for_id(target_session_id)

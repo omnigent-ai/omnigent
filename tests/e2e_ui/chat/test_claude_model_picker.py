@@ -540,15 +540,22 @@ def test_composer_model_label_never_shows_the_previous_sessions_model(
     page: Page,
     seeded_session_pair: tuple[str, str, str],
 ) -> None:
-    """Switching Codex → Claude must not paint Codex's model on the way in.
+    """Opening a Claude session must not paint the previous session's model.
 
-    Failure mode this catches: ``switchTo`` clears the session-scoped model
-    fields (``sessionModelOverride`` / ``llmModel`` / ``codexModelOptions``) but
-    deliberately keeps ``selectedModel``, the cross-session sticky pick. The
-    native picker kind flips to Claude immediately (the session query and the
-    sidebar row are already cached), so for the whole snapshot round trip the
-    composer resolves the sticky and reads ``gpt-5.5`` on a Claude session
-    before correcting itself to Sonnet 5.
+    Failure mode this catches: a COLD open clears (never had) the
+    session-scoped model fields (``sessionModelOverride`` / ``llmModel`` /
+    ``codexModelOptions``) but deliberately keeps ``selectedModel``, the
+    cross-session sticky pick. If the composer mounts before the snapshot
+    lands, it resolves that sticky and reads ``gpt-5.5`` on a Claude session
+    before correcting itself to Sonnet 5. The store must hold the hydrating
+    placeholder for the whole snapshot round trip so the composer never
+    mounts against empty session-scoped state.
+
+    Cold open, not switch-back, on purpose: a conversation already visited is
+    now held live (its stream stays open in the background), so returning to
+    it repaints its own settled state with no snapshot fetch and therefore no
+    pre-bind window at all. The first open is the only place this window
+    still exists.
 
     :param page: Playwright page fixture.
     :param seeded_session_pair: ``(base_url, codex_session, claude_session)``
@@ -556,9 +563,8 @@ def test_composer_model_label_never_shows_the_previous_sessions_model(
         native shapes as seen by the browser.
     """
     base_url, codex_session, claude_session = seeded_session_pair
-    # Both sessions need a committed transcript: the store caches (and repaints
-    # from) only non-empty ones, and an empty session falls back to the hydrate
-    # placeholder, which hides the composer instead of painting a stale label.
+    # Both sessions need a committed transcript so the composer renders rather
+    # than falling back to the empty-session state.
     for session_id in (codex_session, claude_session):
         seed_committed_turn(session_id, prompt="ping", reply="pong")
     _patch_native_session_pair(page, codex_session, claude_session)
@@ -571,19 +577,12 @@ def test_composer_model_label_never_shows_the_previous_sessions_model(
 
     label = page.get_by_test_id("composer-model-effort-label")
 
-    # Visit the Claude session first so the return trip is the real-world
-    # switch-back: its snapshot query and transcript are cached, so the
-    # composer stays mounted (no hydrate placeholder) and paints through the
-    # window instead of being replaced by a spinner.
-    page.goto(f"{base_url}/c/{claude_session}")
-    expect(label).to_contain_text("Sonnet 5", timeout=15_000)
-
-    # Open the Codex session — binding it makes gpt-5.5 the sticky pick.
-    page.locator(f'a[href="/c/{codex_session}"]').click()
-    page.wait_for_url(re.compile(rf"/c/{re.escape(codex_session)}"))
+    # Open the Codex session FIRST and only — binding it makes gpt-5.5 the
+    # sticky pick, and leaves Claude never-visited so its open is cold.
+    page.goto(f"{base_url}/c/{codex_session}")
     expect(label).to_contain_text(_CODEX_MODEL_LABEL, timeout=15_000)
 
-    # Switch back to Claude with its snapshot held, and watch every label the
+    # Cold-open Claude with its snapshot held, and watch every label the
     # composer paints under the Claude route.
     page.evaluate("window.__delaySnapshot = true")
     page.evaluate("window.__modelLabelLog = []")

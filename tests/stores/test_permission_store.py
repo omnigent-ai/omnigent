@@ -113,21 +113,6 @@ def test_grant_is_persisted_and_retrievable(store: SqlAlchemyPermissionStore, db
     )
 
 
-def test_grant_persists_delegated_approval_authority(
-    store: SqlAlchemyPermissionStore,
-    db_uri: str,
-) -> None:
-    """Approval delegation survives the permission-store round trip."""
-    _ensure_user(store, "approver@test.com")
-    conv_id = _create_conversation(db_uri)
-
-    store.grant("approver@test.com", conv_id, level=2, can_approve=True)
-
-    fetched = store.get("approver@test.com", conv_id)
-    assert fetched is not None
-    assert fetched.can_approve is True
-
-
 def test_grant_upsert_upgrades_level(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
     """Granting to the same (user, session) pair overwrites the level upward.
 
@@ -840,7 +825,7 @@ def test_resolve_access_direct_grant_only(store: SqlAlchemyPermissionStore, db_u
     """
     _ensure_user(store, "alice@test.com")
     conv_id = _create_conversation(db_uri)
-    store.grant("alice@test.com", conv_id, level=2, can_approve=True)
+    store.grant("alice@test.com", conv_id, level=2)
 
     resolved = store.resolve_access("alice@test.com", conv_id)
 
@@ -852,7 +837,6 @@ def test_resolve_access_direct_grant_only(store: SqlAlchemyPermissionStore, db_u
     assert resolved.public_grant_level is None, (
         f"expected no public grant, got {resolved.public_grant_level}"
     )
-    assert resolved.user_can_approve is True
 
 
 def test_resolve_access_separates_user_and_public_grants(

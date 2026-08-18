@@ -1382,6 +1382,55 @@ async def test_external_routing_client_records_last_error_on_http_failure() -> N
     assert "Credential was not sent" in client.last_error
 
 
+@pytest.mark.asyncio
+async def test_a_routing_api_that_is_not_enabled_is_asked_exactly_once() -> None:
+    """The 404 is account-level configuration, so retrying it only adds latency."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    served = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        nonlocal served
+        served += 1
+        return httpx.Response(
+            404,
+            json={
+                "error_code": "NOT_FOUND",
+                "message": "routing/v1/routes:select is not enabled for this account.",
+            },
+        )
+
+    client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v1")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"h": ["m"]}) is None
+        assert client.permanently_unavailable is True
+        assert await client.route("hi again", {"h": ["m"]}) is None
+    assert served == 1
+    # The reason survives the short circuit, so the chip still says why.
+    assert client.last_error is not None
+    assert "not enabled" in client.last_error
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_404_is_not_latched() -> None:
+    """Only the account-level message is permanent; a stray 404 is retried."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(404, json={"error_code": "NOT_FOUND", "message": "no route"})
+
+    client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v1")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"h": ["m"]}) is None
+    assert client.permanently_unavailable is False
+
+
 def test_router_error_detail_unwraps_nested_message() -> None:
     from omnigent.server.smart_routing import _router_error_detail
 
@@ -3282,3 +3331,124 @@ async def test_route_turn_or_decline_reports_an_ordinary_no_verdict_as_no_error(
     with patch("omnigent.server.smart_routing.route_turn", new=_no_verdict):
         model, verdict, error = await route_turn_or_decline("claude-native", "refactor auth")
     assert (model, verdict, error) == (None, None, None)
+
+
+# ── runner-catalog cache ───────────────────────────────────────────
+
+
+def _counting_catalog_client(models: Sequence[str]) -> MagicMock:
+    """A runner client whose ``get`` counts calls and answers one catalog."""
+    response = MagicMock()
+    response.json.return_value = {
+        "workers": {"self": {"models": [{"id": model} for model in models]}}
+    }
+    response.raise_for_status = MagicMock()
+    client = MagicMock()
+    client.get = AsyncMock(return_value=response)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_a_warm_catalog_cache_costs_no_runner_round_trip() -> None:
+    """The second turn of a session reads the cache instead of the runner."""
+    client = _counting_catalog_client(["databricks-claude-haiku-4-5"])
+
+    first = await fetch_runner_models("conv_warm", client)
+    second = await fetch_runner_models("conv_warm", client)
+
+    assert first == second == {"self": ["databricks-claude-haiku-4-5"]}
+    client.get.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_a_cold_cache_still_fetches_and_routes() -> None:
+    """Nothing cached is the ordinary first turn: it fetches, and it routes."""
+    expected = RoutingResult(
+        model="databricks-claude-opus-4-8",
+        rationale="complex task",
+        harness="self",
+    )
+    client = _counting_catalog_client(
+        ["databricks-claude-haiku-4-5", "databricks-claude-opus-4-8"]
+    )
+    caps = FakeCaps(routing_client=FakeRoutingClient(expected))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        model, _verdict = await route_turn(
+            "claude-sdk",
+            "complex task",
+            session_id="conv_cold",
+            runner_client=client,
+        )
+
+    assert model == "databricks-claude-opus-4-8"
+    client.get.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_a_warm_cache_routes_a_turn_without_touching_the_runner() -> None:
+    """A prefetched catalog takes the runner fetch off the turn path entirely."""
+    from omnigent.server.smart_routing import prefetch_runner_catalog
+
+    expected = RoutingResult(
+        model="databricks-claude-opus-4-8",
+        rationale="complex task",
+        harness="self",
+    )
+    client = _counting_catalog_client(
+        ["databricks-claude-haiku-4-5", "databricks-claude-opus-4-8"]
+    )
+    await prefetch_runner_catalog("conv_prefetched", client)
+    client.get.reset_mock()
+
+    caps = FakeCaps(routing_client=FakeRoutingClient(expected))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        model, _verdict = await route_turn(
+            "claude-sdk",
+            "complex task",
+            session_id="conv_prefetched",
+            runner_client=client,
+        )
+
+    assert model == "databricks-claude-opus-4-8"
+    client.get.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_invalidating_the_catalog_makes_the_next_turn_re_fetch() -> None:
+    """A rebind changes which models a pane can take, so the cache must drop."""
+    from omnigent.server.smart_routing import invalidate_runner_catalog
+
+    client = _counting_catalog_client(["databricks-claude-haiku-4-5"])
+    await fetch_runner_models("conv_rebound", client)
+    invalidate_runner_catalog("conv_rebound")
+    await fetch_runner_models("conv_rebound", client)
+
+    assert client.get.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_runner_is_not_cached_as_no_catalog() -> None:
+    """A booting runner must stay re-fetchable rather than pin an empty answer."""
+    import httpx
+
+    client = MagicMock()
+    client.get = AsyncMock(side_effect=httpx.HTTPError("connection refused"))
+
+    assert await fetch_runner_models("conv_booting", client) is None
+    assert await fetch_runner_models("conv_booting", client) is None
+    assert client.get.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_runner_rebind_invalidates_the_routing_catalog() -> None:
+    """The snapshot-overlay invalidation seam is wired to the routing cache."""
+    from omnigent.server.routes.sessions import _invalidate_runner_backed_snapshot_state
+
+    client = _counting_catalog_client(["databricks-claude-haiku-4-5"])
+    await fetch_runner_models("conv_overlay", client)
+    _invalidate_runner_backed_snapshot_state(
+        "conv_overlay", cancel_inflight=True, drop_model_options=False
+    )
+    await fetch_runner_models("conv_overlay", client)
+
+    assert client.get.call_count == 2

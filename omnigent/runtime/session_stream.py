@@ -102,39 +102,21 @@ def publish(conversation_id: str, event: dict[str, Any]) -> None:
         the union before serializing, so an unmodelled event
         fails loud at the SSE boundary.
     """
-    # Track the current turn's streamed assistant text so a client
-    # (re)connecting mid-turn can replay it, AND get the verdict
-    # on whether this event must be WITHHELD from the live fan-out. The
-    # only suppressed events are claude-native ``output_text.delta`` chunks
-    # whose message has already committed (a duplicate trailing chunk): the
-    # forwarder tails the deltas file separately from the transcript, so a
-    # message's last chunk can be POSTed just AFTER its committed item.
-    # Computed BEFORE fan-out so we can actually drop it — the old order
-    # (fan-out first, record after) could only scrub the reconnect-replay
-    # snapshot, never un-send a delta already on a live subscriber's queue.
-    # Safe to reorder: ``record_publish`` and the fan-out below run with no
-    # ``await`` between them, so within a single ``publish`` call nothing
-    # interleaves — the verdict and the enqueue are one atomic step. (This
-    # holds for both callers: native deltas, the only suppressible events,
-    # arrive on the AP loop via the ``POST /events`` handler; the in-process
-    # relay calls ``publish`` from a workflow thread, where ``record_publish``
-    # never returns a suppress verdict so the reorder is a no-op there.) The
-    # snapshot/live-tail partition is unaffected: a
-    # reconnecting client's prefix is still captured by ``subscribe``'s
-    # ``pre_ready_snapshot`` at slot registration, independent of this order.
-    suppress_live = inflight_text.record_publish(conversation_id, event)
+    # Track reconnect state and centrally suppress or rewrite native deltas
+    # before they reach subscribers.
+    live_event = inflight_text.record_publish(conversation_id, event)
     # Side-channel: keep the cross-session pending-elicitations
     # index in step with the SSE stream. Only acts on
     # ``response.elicitation_request`` events; every other event
     # type is a single dict lookup and a return. A suppressed event is
     # always a text delta, never an elicitation, so this still runs.
     pending_elicitations.record_publish(conversation_id, event)
-    if suppress_live:
+    if live_event is None:
         return
     with _lock:
         subs = list(_subscribers.get(conversation_id, ()))
     for queue, loop in subs:
-        loop.call_soon_threadsafe(_enqueue_or_overflow, queue, event)
+        loop.call_soon_threadsafe(_enqueue_or_overflow, queue, live_event)
 
 
 def close(conversation_id: str) -> None:

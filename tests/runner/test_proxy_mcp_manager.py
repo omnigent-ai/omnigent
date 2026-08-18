@@ -219,10 +219,11 @@ async def test_schemas_for_parses_server_instructions() -> None:
                     }
                 ],
                 "serverInstructions": {
-                    "PipesHub": " Prefer pipeshub_chat. ",
+                    "pipeshub": " Prefer pipeshub_chat. ",
                     "blank": "   ",
                     "bad": 123,
                 },
+                "serverLabels": {"pipeshub": "PipesHub"},
             },
         }
     )
@@ -231,8 +232,38 @@ async def test_schemas_for_parses_server_instructions() -> None:
 
     result = await manager.schemas_for(_make_spec("pipeshub"))
 
-    assert result.server_instructions == {"PipesHub": "Prefer pipeshub_chat."}
+    assert result.server_instructions == {"pipeshub": "Prefer pipeshub_chat."}
+    assert result.server_labels == {"pipeshub": "PipesHub"}
     assert result.tool_names == {"pipeshub__chat"}
+
+
+@pytest.mark.asyncio
+async def test_schemas_for_accepts_snake_case_server_instructions() -> None:
+    """Proxy must accept the runner's snake_case spelling if camelCase is absent."""
+    rpc_resp = _json_resp(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [
+                    {
+                        "name": "pipeshub__chat",
+                        "description": "Chat",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }
+                ],
+                "server_instructions": {"pipeshub": "Prefer pipeshub_chat."},
+                "server_labels": {"pipeshub": "PipesHub MCP"},
+            },
+        }
+    )
+    transport = _StubTransport([rpc_resp])
+    manager = _make_manager(transport)
+
+    result = await manager.schemas_for(_make_spec("pipeshub"))
+
+    assert result.server_instructions == {"pipeshub": "Prefer pipeshub_chat."}
+    assert result.server_labels == {"pipeshub": "PipesHub MCP"}
 
 
 @pytest.mark.asyncio

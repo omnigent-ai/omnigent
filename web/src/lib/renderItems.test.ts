@@ -34,6 +34,7 @@ function ctx(opts?: {
   timestamp?: number;
   createdBy?: string;
   createdAtS?: number;
+  clientCreatedAtS?: number;
 }): BlockContext {
   return {
     agent: opts?.agent ?? "test",
@@ -44,6 +45,7 @@ function ctx(opts?: {
     itemId: opts?.itemId === undefined ? null : opts.itemId,
     ...(opts?.createdBy !== undefined ? { createdBy: opts.createdBy } : {}),
     ...(opts?.createdAtS !== undefined ? { createdAtS: opts.createdAtS } : {}),
+    ...(opts?.clientCreatedAtS !== undefined ? { clientCreatedAtS: opts.clientCreatedAtS } : {}),
   };
 }
 
@@ -147,7 +149,7 @@ describe("buildBubbles — bubble grouping", () => {
     // The blockStream stamps a unique response id on REQUEST-phase
     // elicitations precisely so they do NOT fold into the previous turn's
     // assistant bubble. With that distinct id, the card is its own
-    // elicitation-only bubble, which is what `isRequestElicitationBubble`
+    // elicitation-only bubble, which is what `isStandaloneElicitationBubble`
     // (ChatPage) keys on to lift the prompt above it.
     const blocks: AnyBlock[] = [
       {
@@ -175,6 +177,142 @@ describe("buildBubbles — bubble grouping", () => {
     expect(answer.items.map((i) => i.kind)).toEqual(["text"]);
     const card = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
     expect(card.items.map((i) => i.kind)).toEqual(["elicitation"]);
+  });
+
+  it("an AskUserQuestion card splits its turn into work / card / work", () => {
+    // The user answering a question is a turn boundary, not a step of the
+    // agent's work: the card takes a bubble of its own (so it renders
+    // outside the "Worked for" fold) and the work after the answer folds
+    // under a NEW one. All three carry the SAME response id — the card
+    // arrives mid-turn, so blockStream stamps it with the turn's id.
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "resp_1" }),
+        content: [{ type: "input_text", text: "Set it up" }],
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "resp_1" }),
+        executions: [mkExec("ls", "c1")],
+        iteration: 0,
+      },
+      {
+        type: "elicitation",
+        ctx: ctx({ itemId: null, responseId: "resp_1" }),
+        elicitationId: "elic_ask",
+        message: "Claude wants to call **AskUserQuestion**",
+        phase: "pre_tool_use",
+        policyName: "claude_native_permission",
+        contentPreview: "AskUserQuestion({})",
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept", content: { Framework: "React" } },
+        askUserQuestion: {
+          questions: [
+            {
+              question: "Which framework?",
+              options: [{ label: "React" }, { label: "Vue" }],
+              multiSelect: false,
+            },
+          ],
+        },
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "resp_1" }),
+        executions: [mkExec("write", "c2")],
+        iteration: 0,
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "resp_1" }),
+        fullText: "Wired up React.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["user", "assistant", "assistant", "assistant"]);
+    const before = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
+    const card = bubbles[2] as Extract<Bubble, { kind: "assistant" }>;
+    const after = bubbles[3] as Extract<Bubble, { kind: "assistant" }>;
+    expect(before.items.map((i) => i.kind)).toEqual(["tool"]);
+    expect(card.items.map((i) => i.kind)).toEqual(["elicitation"]);
+    expect(after.items.map((i) => i.kind)).toEqual(["tool", "text"]);
+    // The pre-card work has no answer of its own, so it needs `continued`
+    // to fold behind its own "Worked for" row.
+    expect(before.continued).toBe(true);
+    expect(card.responseId).toBe("resp_1");
+  });
+
+  it("an ExitPlanMode card splits its turn the same way", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "resp_1" }),
+        executions: [mkExec("ls", "c1")],
+        iteration: 0,
+      },
+      {
+        type: "elicitation",
+        ctx: ctx({ itemId: null, responseId: "resp_1" }),
+        elicitationId: "elic_plan",
+        message: "Claude wants to call **ExitPlanMode**",
+        phase: "pre_tool_use",
+        policyName: "claude_native_permission",
+        contentPreview: "ExitPlanMode({...})",
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept" },
+        exitPlanMode: { plan: "# Plan\n\n1. Do the thing" },
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "resp_1" }),
+        fullText: "Done.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "assistant", "assistant"]);
+    expect((bubbles[1] as Extract<Bubble, { kind: "assistant" }>).items.map((i) => i.kind)).toEqual(
+      ["elicitation"],
+    );
+  });
+
+  it("an approval card stays inside the turn it gated", () => {
+    // Approvals are part of the work's history — they fold with the trace
+    // in document order. Only cards that ask the USER split the bubble.
+    const blocks: AnyBlock[] = [
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "resp_1" }),
+        executions: [mkExec("ls", "c1")],
+        iteration: 0,
+      },
+      {
+        type: "elicitation",
+        ctx: ctx({ itemId: null, responseId: "resp_1" }),
+        elicitationId: "elic_push",
+        message: "Allow `git push`?",
+        phase: "tool_call",
+        policyName: "blast_radius",
+        contentPreview: '{"command": "git push"}',
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept" },
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "resp_1" }),
+        fullText: "Pushed.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.length).toBe(1);
+    const turn = bubbles[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(turn.items.map((i) => i.kind)).toEqual(["tool", "elicitation", "text"]);
   });
 
   it("two response_ids produce two assistant bubbles in order", () => {
@@ -748,6 +886,110 @@ describe("buildBubbles — tool joining", () => {
     const items = (bubbles[0] as Extract<Bubble, { kind: "assistant" }>).items;
     const t = items[0] as Extract<RenderItem, { kind: "tool" }>;
     expect(t.state).toBe("no-output");
+  });
+});
+
+describe("buildBubbles — session-driven trailing tool spinner", () => {
+  // claude-native has no streaming `activeResponse` — its running/idle lives
+  // in `sessionStatus`. The `sessionRunning` arg spins the newest turn's
+  // trailing tool phase so a dispatched-but-unresolved tool shows a spinner
+  // instead of "No output", without any bubble reaching lifecycle "streaming".
+  function toolState(bubbles: Bubble[]): string {
+    const asst = bubbles[bubbles.length - 1] as Extract<Bubble, { kind: "assistant" }>;
+    const tool = asst.items.find(
+      (item): item is Extract<RenderItem, { kind: "tool" }> => item.kind === "tool",
+    );
+    expect(tool).toBeDefined();
+    return tool!.state;
+  }
+
+  const danglingToolTurn: AnyBlock[] = [
+    {
+      type: "tool_group",
+      ctx: ctx({ itemId: "fc_1", responseId: "resp_1" }),
+      executions: [mkExec("Bash", "c1")],
+      iteration: 0,
+    },
+  ];
+
+  it("spins the newest turn's trailing tool while the session is running", () => {
+    // No activeResponse (claude-native never opens one), sessionRunning=true.
+    const bubbles = buildBubbles(danglingToolTurn, null, undefined, [], true);
+    expect(toolState(bubbles)).toBe("input-available");
+  });
+
+  it("does not spin when the session is idle (dangling tool resolves to no-output)", () => {
+    // The idle edge can land before the tool's result block — the tool must
+    // settle, not spin forever. This is the property the never-spin tests pin,
+    // now exercised through the session-driven path.
+    const bubbles = buildBubbles(danglingToolTurn, null, undefined, [], false);
+    expect(toolState(bubbles)).toBe("no-output");
+  });
+
+  it("a resolved tool shows its output regardless of session running", () => {
+    const blocks: AnyBlock[] = [
+      ...danglingToolTurn,
+      {
+        type: "tool_result",
+        ctx: ctx({ itemId: "fco_1", responseId: "resp_1" }),
+        name: "",
+        callId: "c1",
+        agentName: "test",
+        output: "done",
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null, undefined, [], true);
+    expect(toolState(bubbles)).toBe("output-available");
+  });
+
+  it("only the NEWEST turn spins — an earlier turn's dangling tool stays no-output", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "fc_old", responseId: "resp_old" }),
+        executions: [mkExec("Read", "c_old")],
+        iteration: 0,
+      },
+      { type: "user_message", ctx: ctx({ itemId: "u1", responseId: "" }), content: [] },
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "fc_new", responseId: "resp_new" }),
+        executions: [mkExec("Bash", "c_new")],
+        iteration: 0,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null, undefined, [], true);
+    const assistants = bubbles.filter(
+      (b): b is Extract<Bubble, { kind: "assistant" }> => b.kind === "assistant",
+    );
+    const oldTool = assistants[0].items.find((item) => item.kind === "tool");
+    const newTool = assistants[1].items.find((item) => item.kind === "tool");
+    expect((oldTool as Extract<RenderItem, { kind: "tool" }>).state).toBe("no-output");
+    expect((newTool as Extract<RenderItem, { kind: "tool" }>).state).toBe("input-available");
+  });
+
+  it("a trailing user message means no live turn — nothing spins", () => {
+    // A just-sent prompt with no assistant output yet: newestAssistantTurnId
+    // returns null, so the earlier turn's tool does not spin.
+    const blocks: AnyBlock[] = [
+      ...danglingToolTurn,
+      { type: "user_message", ctx: ctx({ itemId: "u1", responseId: "" }), content: [] },
+    ];
+    const bubbles = buildBubbles(blocks, null, undefined, [], true);
+    const asst = bubbles.find(
+      (b): b is Extract<Bubble, { kind: "assistant" }> => b.kind === "assistant",
+    )!;
+    const tool = asst.items.find((item) => item.kind === "tool");
+    expect((tool as Extract<RenderItem, { kind: "tool" }>).state).toBe("no-output");
+  });
+
+  it("the cache re-walks on a running→idle flip so a dangling tool stops spinning", () => {
+    // The flip carries no block change; the cache key must still see it move.
+    const cache = createBubbleCache();
+    expect(toolState(buildBubbles(danglingToolTurn, null, cache, [], true))).toBe(
+      "input-available",
+    );
+    expect(toolState(buildBubbles(danglingToolTurn, null, cache, [], false))).toBe("no-output");
   });
 });
 
@@ -2033,15 +2275,203 @@ describe("buildBubbles — routing chip rendered below its user message", () => 
     });
   });
 
-  it("defers only the adjacent chip when two decisions precede a message", () => {
+  it("defers BOTH chips when two session-scoped decisions precede a message", () => {
+    // Nothing of the conversation sits between them, so neither is a preamble:
+    // both are verdicts on the message that follows, in transcript order.
     const blocks: AnyBlock[] = [
       chipBlock("rd_far", "resp_1", "turn"),
       chipBlock("rd_near", "resp_1", "turn"),
       userBlock("u1", "resp_1"),
     ];
     const bubbles = buildBubbles(blocks, null);
-    expect(kinds(bubbles)).toEqual(["routing_decision", "user", "routing_decision"]);
+    expect(kinds(bubbles)).toEqual(["user", "routing_decision", "routing_decision"]);
     expect(chipIds(bubbles)).toEqual(["rd_far", "rd_near"]);
+  });
+
+  it("a sub-agent chip between two decisions blocks the earlier one from moving", () => {
+    // The spawn chip renders standalone where it occurred; deferring the chip
+    // above it past it would reorder the two.
+    const blocks: AnyBlock[] = [
+      chipBlock("rd_session", "resp_1", "turn"),
+      chipBlock("rd_spawn", "resp_1", "native_subagent"),
+      userBlock("u1", "resp_1"),
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(kinds(bubbles)).toEqual(["routing_decision", "routing_decision", "user"]);
+    expect(chipIds(bubbles)).toEqual(["rd_session", "rd_spawn"]);
+  });
+
+  // Rows copied from `GET /v1/sessions/<id>/items` on a session created with
+  // Smart Routing as BOTH the model and the harness. The create records the
+  // pick as a `session` chip before the harness even boots, the first turn
+  // routes again and records a `turn` chip, and the terminal the harness
+  // brought up lands a `resource_event` in between — so the session's first
+  // message has two chips and a non-conversation row above it.
+  describe("auto-harness create (Smart Routing picks the harness too)", () => {
+    const RATIONALE =
+      "Routed to gpt-5-6-luna because trivial task (prompt<300, no errors/refs, " +
+      "llm easy) -> cheapest arm gpt-5-6-luna; never escalate.";
+
+    function resourceEventItem(id: string): ConversationItem {
+      return {
+        id,
+        type: "resource_event",
+        response_id: "ef1ee84af89447898edbbd3acb64a5d2",
+        status: "completed",
+        event_type: "session.resource.created",
+        resource_id: "terminal_codex_main",
+        resource_type: "terminal",
+      } as unknown as ConversationItem;
+    }
+    function promptItem(): ConversationItem {
+      return {
+        id: "msg_user",
+        type: "message",
+        response_id: "codex_019fd3fb",
+        status: "completed",
+        role: "user",
+        content: [{ type: "input_text", text: "what is 2+2?" }],
+      } as unknown as ConversationItem;
+    }
+    function replyItem(): ConversationItem {
+      return {
+        id: "msg_assistant",
+        type: "message",
+        response_id: "codex_019fd3fb",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: "2 + 2 = 4." }],
+      } as unknown as ConversationItem;
+    }
+    /** The captured transcript, with the turn chip's verdict overridable. */
+    function autoItems(turn: RoutingDecisionWire = {}): ConversationItem[] {
+      return [
+        routingDecisionItem({
+          id: "rd_create",
+          response_id: "routing_d55b96265e01448a8c8cbfdb404b8ac1",
+          model: "databricks-gpt-5-6-luna",
+          rationale: RATIONALE,
+          harness: "codex-native",
+          scope: "session",
+          decision_id: "628a03ea-da4b-49cb-b41a-6f7c28598381",
+        }),
+        resourceEventItem("re_1"),
+        resourceEventItem("re_2"),
+        routingDecisionItem({
+          id: "rd_turn",
+          response_id: "routing_52d9826e05be482785570c6e86ff41ec",
+          model: "databricks-gpt-5-6-luna",
+          rationale: RATIONALE,
+          harness: "codex-native",
+          scope: "turn",
+          decision_id: "633569bb-dbfd-4c72-85db-88788583842b",
+          ...turn,
+        }),
+        promptItem(),
+        replyItem(),
+      ];
+    }
+
+    it("renders the create chip BELOW the prompt when the turn re-routes", () => {
+      // The turn scored the task differently, so the create pick is real news
+      // and survives the collapse — and it is still a verdict on this message,
+      // not a preamble to it.
+      const blocks = itemsToBlocks(autoItems({ model: "databricks-gpt-5-6-sol" }));
+      const bubbles = buildBubbles(blocks, null);
+      expect(kinds(bubbles)).toEqual(["user", "routing_decision", "routing_decision", "assistant"]);
+      expect(chipIds(bubbles)).toEqual(["rd_create", "rd_turn"]);
+    });
+
+    it("still collapses the repeated verdict to one chip below the prompt", () => {
+      const bubbles = buildBubbles(itemsToBlocks(autoItems()), null);
+      expect(kinds(bubbles)).toEqual(["user", "routing_decision", "assistant"]);
+      expect(chipIds(bubbles)).toEqual(["rd_turn"]);
+    });
+
+    it("stays stable frame by frame as the auto-harness transcript streams in", () => {
+      expectFrameByFrameStable(itemsToBlocks(autoItems({ model: "databricks-gpt-5-6-sol" })), [
+        "user",
+        "routing_decision",
+        "routing_decision",
+        "assistant",
+      ]);
+    });
+
+    it("defers the lone create chip past the terminal's resource row", () => {
+      // A create whose first turn never recorded its own chip — captured from
+      // an auto-harness session mid-flight.
+      const items = [
+        routingDecisionItem({
+          id: "rd_create",
+          model: "databricks-gpt-5-6-sol",
+          harness: "codex-native",
+          scope: "session",
+        }),
+        resourceEventItem("re_1"),
+        promptItem(),
+        replyItem(),
+      ];
+      const bubbles = buildBubbles(itemsToBlocks(items), null);
+      expect(kinds(bubbles)).toEqual(["user", "routing_decision", "assistant"]);
+    });
+  });
+
+  // The rows a web create pinned to claude-native actually persisted: the
+  // session-scope decision is written AT CREATE, so for a while it is the
+  // session's only item and the prompt exists only as an optimistic pending
+  // bubble (spliced above the chip by `mergePendingBubbles`, tested in
+  // ChatPage.test.ts). These pin the walker's half: one chip throughout, and
+  // it lands below the message with no second position once it is persisted.
+  describe("pinned create routed before its pane launches", () => {
+    function createChip(applied = true): ConversationItem {
+      return routingDecisionItem({
+        id: "rd_create",
+        response_id: "routing_0181ee7e17fa4fa8aa8b18c2d41555e1",
+        model: "databricks-claude-sonnet-5",
+        applied,
+        rationale: "Routed to claude-sonnet-5 because trivial task -> cheapest arm.",
+        harness: "claude-native",
+        scope: "session",
+        decision_id: "2fc19175-929e-41e4-ab4a-6b1c07a0cbe7",
+      });
+    }
+    function prompt(): ConversationItem {
+      return {
+        id: "msg_user",
+        type: "message",
+        role: "user",
+        response_id: "resp_1",
+        status: "completed",
+        content: [{ type: "input_text", text: "what is 2+2?" }],
+      } as unknown as ConversationItem;
+    }
+
+    it("renders the lone create chip while no message has been persisted", () => {
+      const bubbles = buildBubbles(itemsToBlocks([createChip()]), null);
+      expect(kinds(bubbles)).toEqual(["routing_decision"]);
+      expect(chipIds(bubbles)).toEqual(["rd_create"]);
+    });
+
+    it("keeps a DECLINED create chip visible with no message", () => {
+      // Routing failed and the session launched unrouted — the user still has
+      // to see that a decision was attempted.
+      const bubbles = buildBubbles(itemsToBlocks([createChip(false)]), null);
+      expect(kinds(bubbles)).toEqual(["routing_decision"]);
+      expect(bubbles[0]).toMatchObject({ kind: "routing_decision", applied: false });
+    });
+
+    it("renders the chip once, below the prompt, when the message is appended", () => {
+      // Same block list plus the persisted message, through the incremental
+      // cache: the held-and-released region must not paint a stale position.
+      const cache = createBubbleCache();
+      const f1 = itemsToBlocks([createChip()]);
+      expect(kinds(buildBubbles(f1, null, cache))).toEqual(["routing_decision"]);
+      const f2 = [...f1, ...itemsToBlocks([prompt()])];
+      const second = buildBubbles(f2, null, cache);
+      expect(kinds(second)).toEqual(["user", "routing_decision"]);
+      expect(chipIds(second)).toEqual(["rd_create"]);
+      expect(second).toEqual(buildBubbles(f2, null));
+    });
   });
 
   it("static reload: the itemsToBlocks funnel defers the persisted decision too", () => {
@@ -2544,7 +2974,7 @@ describe("buildBubbles — workedForS turn duration", () => {
   const textDone = (
     itemId: string,
     text: string,
-    stamps?: { timestamp?: number; createdAtS?: number },
+    stamps?: { timestamp?: number; createdAtS?: number; clientCreatedAtS?: number },
   ): AnyBlock => ({
     type: "text_done",
     ctx: ctx({ itemId, ...stamps }),
@@ -2592,6 +3022,92 @@ describe("buildBubbles — workedForS turn duration", () => {
         textDone("a2", "b", { createdAtS: 1_753_900_000 }),
       ]).workedForS,
     ).toBeUndefined();
+    // Post-timestamp-feature live shape: live blocks carry BOTH the
+    // page-relative clock and a client-epoch stamp. A mid-turn reload
+    // pairs a server-stamped first block with such a live last block —
+    // the epoch branch must not reach for the client stamp (it lives in
+    // `clientCreatedAtS` precisely so these guards stay single-clock).
+    expect(
+      assistantBubble([
+        textDone("a1", "a", { createdAtS: 1_753_900_000 }),
+        textDone("a2", "b", { timestamp: 42, clientCreatedAtS: 1_753_900_045 }),
+      ]).workedForS,
+    ).toBeUndefined();
+    // …reverse direction, live first block with both stamps.
+    expect(
+      assistantBubble([
+        textDone("a1", "a", { timestamp: 42, clientCreatedAtS: 1_753_900_045 }),
+        textDone("a2", "b", { createdAtS: 1_753_900_000 }),
+      ]).workedForS,
+    ).toBeUndefined();
+  });
+
+  it("spans live blocks that also carry client-epoch stamps via the page clock", () => {
+    // Pure-live turn post-timestamp-feature: every block has a
+    // clientCreatedAtS, but the page-relative branch still decides.
+    const bubble = assistantBubble([
+      textDone("a1", "working…", { timestamp: 10.25, clientCreatedAtS: 1_753_900_000 }),
+      textDone("a2", "done", { timestamp: 116.5, clientCreatedAtS: 1_753_900_106 }),
+    ]);
+    expect(bubble.workedForS).toBeCloseTo(106.25);
+  });
+});
+
+describe("buildBubbles — bubble display timestamps", () => {
+  const userBlock = (stamps: { createdAtS?: number; clientCreatedAtS?: number }): AnyBlock => ({
+    type: "user_message",
+    ctx: ctx({ itemId: "u1", responseId: "resp_1", ...stamps }),
+    content: [{ type: "input_text", text: "hi" }],
+  });
+  const textDone = (
+    itemId: string,
+    stamps?: { timestamp?: number; createdAtS?: number; clientCreatedAtS?: number },
+  ): AnyBlock => ({
+    type: "text_done",
+    ctx: ctx({ itemId, ...stamps }),
+    fullText: "text",
+    hasCodeBlocks: false,
+  });
+
+  it("prefers the server stamp, falls back to the client stamp", () => {
+    // Cold load: the server stamp flows straight through.
+    let bubble = buildBubbles([userBlock({ createdAtS: 1_753_900_000 })], null)[0] as Extract<
+      Bubble,
+      { kind: "user" }
+    >;
+    expect(bubble.createdAtS).toBe(1_753_900_000);
+    // Live: no server stamp yet, the client send-time stamp shows.
+    bubble = buildBubbles([userBlock({ clientCreatedAtS: 1_753_900_001 })], null)[0] as Extract<
+      Bubble,
+      { kind: "user" }
+    >;
+    expect(bubble.createdAtS).toBe(1_753_900_001);
+    // Neither: no timestamp rendered.
+    bubble = buildBubbles([userBlock({})], null)[0] as Extract<Bubble, { kind: "user" }>;
+    expect(bubble.createdAtS).toBeUndefined();
+  });
+
+  it("stamps an assistant group from its first stamped block", () => {
+    const bubble = buildBubbles(
+      [
+        textDone("a1", { clientCreatedAtS: 1_753_900_010 }),
+        textDone("a2", { clientCreatedAtS: 1_753_900_020 }),
+      ],
+      null,
+    )[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(bubble.createdAtS).toBe(1_753_900_010);
+    // The FIRST stamped block wins — the stamp marks when the response
+    // started, even when a later block carries a different clock (the
+    // live-first/server-tail mix can't occur in practice, but the walk
+    // is deterministic either way).
+    const reloaded = buildBubbles(
+      [
+        textDone("a1", { clientCreatedAtS: 1_753_900_010 }),
+        textDone("a2", { createdAtS: 1_753_900_005 }),
+      ],
+      null,
+    )[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(reloaded.createdAtS).toBe(1_753_900_010);
   });
 });
 

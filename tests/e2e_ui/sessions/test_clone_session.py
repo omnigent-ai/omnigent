@@ -28,7 +28,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import configure_mock_llm
+from tests.e2e_ui.conftest import configure_mock_llm, seed_committed_turn
 
 # Unique marker so the copied-transcript assertion can't match
 # UI chrome or another test's message.
@@ -415,3 +415,86 @@ def test_clone_worktree_source_prefills_repo_and_validates_directory(
     assert "git" not in launch, (
         f"untouched worktree prefill must bind the existing worktree without git options: {launch}"
     )
+
+
+def test_clone_submit_spins_while_the_fork_is_in_flight(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The Clone button shows a spinner (not just a fade) until the fork returns.
+
+    A fork waits on the server round trip, so a button that only greys out
+    reads as a hang and users re-click or close the dialog. Guards the
+    in-flight affordance end-to-end: the real dialog, the real fetch, and
+    the real ``Button`` loading overlay.
+
+    Determinism comes from holding the fork response rather than racing it:
+    the route handler parks the request without resolving it, so the
+    in-flight state stays up for as long as the assertions need, then the
+    captured route is released and the flow completes as usual. Catching a
+    naturally-fast fork mid-flight would be a coin flip.
+
+    The transcript is seeded straight into the store (the per-message "Fork
+    from here" action needs a committed assistant response to anchor on),
+    so this neither drives the LLM nor waits on a turn.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` for a pre-created
+        runner-bound session.
+    """
+    base_url, session_id = seeded_session
+
+    seed_committed_turn(
+        session_id,
+        prompt="ping",
+        reply="pong",
+        response_id="resp_spinner",
+    )
+
+    parked: list[Route] = []
+
+    # Returning without resolving parks the request in the browser and
+    # leaves the test's thread free to assert. The route is released below.
+    # Must be a plain function, not ``parked.append``: Playwright stamps an
+    # attribute onto the handler it is given, which a builtin method rejects.
+    def park_fork(route: Route) -> None:
+        parked.append(route)
+
+    page.route(re.compile(r"/v1/sessions/[^/]+/fork"), park_fork)
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
+    expect(assistant).to_be_visible(timeout=30_000)
+    assistant.hover()
+    page.get_by_test_id("fork-from-response").first.click()
+    expect(page.get_by_test_id("fork-session-dialog")).to_be_visible()
+
+    submit = page.get_by_test_id("fork-session-submit")
+    # Before the click: idle — enabled, no spinner. Without this the
+    # after-state below would also pass on a button that always spins.
+    expect(submit).to_be_enabled()
+    expect(submit).not_to_have_attribute("aria-busy", "true")
+    assert submit.locator("svg.animate-spin").count() == 0
+
+    submit.click()
+
+    # In flight: spinner up, button busy and click-proof so the fork can't
+    # be double-submitted.
+    expect(submit.locator("svg.animate-spin")).to_be_visible(timeout=10_000)
+    expect(submit).to_have_attribute("aria-busy", "true")
+    expect(submit).to_be_disabled()
+
+    # Releasing the fork completes the real flow — proving the spinner is a
+    # transient in-flight state and not a stuck button.
+    deadline = time.monotonic() + 10.0
+    while not parked and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert parked, "fork request never reached the route handler"
+    parked[0].continue_()
+
+    expect(page).to_have_url(
+        re.compile(rf"/c/(?!{re.escape(session_id)})(conv_)?[0-9a-f]+"),
+        timeout=30_000,
+    )
+    expect(page.get_by_test_id("fork-session-dialog")).not_to_be_visible()

@@ -780,8 +780,15 @@ class McpServerConnection:
         mapping-shaped mocks used in unit tests. Empty / whitespace-only
         instructions are stored as ``None``.
 
+        First non-empty capture in a lifecycle wins. Reconnect goes through
+        ``finally`` (which clears these fields) so a later successful
+        initialize can replace them. A second initialize in the same
+        lifecycle that would change the stored text is logged and ignored.
+
         :param init_result: Value returned by ``ClientSession.initialize()``.
         """
+        from omnigent.runtime.prompt import MCP_INSTRUCTIONS_PER_SERVER_MAX
+
         instructions: object | None
         if isinstance(init_result, dict):
             instructions = init_result.get("instructions")
@@ -792,17 +799,29 @@ class McpServerConnection:
             if server_info is None:
                 server_info = getattr(init_result, "server_info", None)
 
+        captured: str | None
         if isinstance(instructions, str) and instructions.strip():
-            self._initialize_instructions = instructions.strip()
+            captured = instructions.strip()[:MCP_INSTRUCTIONS_PER_SERVER_MAX]
         else:
-            self._initialize_instructions = None
+            captured = None
 
         name: object | None = None
         if isinstance(server_info, dict):
             name = server_info.get("name")
         elif server_info is not None:
             name = getattr(server_info, "name", None)
-        self._server_info_name = name.strip() if isinstance(name, str) and name.strip() else None
+        captured_name = name.strip() if isinstance(name, str) and name.strip() else None
+
+        if self._initialize_instructions is not None:
+            if captured != self._initialize_instructions:
+                _logger.warning(
+                    "MCP server %r ignored a mid-lifecycle initialize.instructions change",
+                    self.config.name,
+                )
+            return
+
+        self._initialize_instructions = captured
+        self._server_info_name = captured_name
 
     async def _discover_or_use_cache(
         self,

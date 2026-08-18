@@ -1,7 +1,7 @@
 """Browser e2e for the Project settings dialog (project ``config`` defaults).
 
 A project carries owner-private session defaults in its ``config`` JSON
-(``{ host_id?, workspace?, agent_id?, use_worktree? }``). The "Project settings"
+(``{ host_id?, workspace?, agent_id?, use_worktree?, base_branch? }``). The "Project settings"
 dialog (``web/src/shell/ProjectSettingsDialog.tsx``, reached from the
 project-folder kebab) reads and writes that config via ``GET /v1/projects/{id}``
 and ``PATCH /v1/projects/{id}``.
@@ -122,3 +122,78 @@ def test_project_settings_clears_worktree_toggle(
     expect(page.get_by_test_id("project-settings-worktree")).to_have_attribute(
         "data-state", "unchecked"
     )
+
+
+def test_project_settings_base_branch_persists(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The base-branch field shows only with the worktree default on, and persists.
+
+    The base branch only forks a worktree, so its field is hidden until the
+    "Random worktree" toggle is ON. Flipping the toggle reveals it; typing a
+    branch + Save stores ``base_branch`` alongside ``use_worktree:true``.
+    Reopening fetches the stored config and seeds both back.
+    """
+    base_url, session_id = seeded_session
+    project = f"Project {uuid.uuid4().hex[:6]}"
+    _create_project(base_url, project)
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    # Worktree toggle defaults OFF, so the base-branch field is hidden.
+    _open_project_settings(page, project)
+    toggle = page.get_by_test_id("project-settings-worktree")
+    expect(toggle).to_have_attribute("data-state", "unchecked")
+    expect(page.get_by_test_id("project-settings-base-branch")).to_have_count(0)
+
+    # Turning the worktree default ON reveals the base-branch field; fill + save.
+    toggle.click()
+    base_input = page.get_by_test_id("project-settings-base-branch")
+    expect(base_input).to_be_visible()
+    base_input.fill("develop")
+    page.get_by_test_id("project-settings-save").click()
+    expect(page.get_by_test_id("project-settings-save")).to_have_count(0)
+
+    # Reopen — the stored config seeds the toggle ON and the branch back.
+    _open_project_settings(page, project)
+    expect(page.get_by_test_id("project-settings-worktree")).to_have_attribute(
+        "data-state", "checked"
+    )
+    expect(page.get_by_test_id("project-settings-base-branch")).to_have_value("develop")
+
+
+def test_project_settings_drops_base_branch_when_worktree_off(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Turning the worktree default OFF drops a previously stored base branch.
+
+    Starts from a project whose ``config`` has ``use_worktree:true`` and a
+    ``base_branch``. The base-branch field is only meaningful with worktrees on,
+    so flipping the toggle OFF clears the whole config to ``{}`` — reopening
+    seeds the toggle OFF and (once toggled back on) shows a blank base branch.
+    """
+    base_url, session_id = seeded_session
+    project = f"Project {uuid.uuid4().hex[:6]}"
+    project_id = _create_project(base_url, project)
+    _set_project_config(base_url, project_id, {"use_worktree": True, "base_branch": "develop"})
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    # Seeded ON → the base-branch field shows its stored value.
+    _open_project_settings(page, project)
+    expect(page.get_by_test_id("project-settings-base-branch")).to_have_value("develop")
+
+    # Flip the worktree default OFF and save → config clears to {}.
+    page.get_by_test_id("project-settings-worktree").click()
+    page.get_by_test_id("project-settings-save").click()
+    expect(page.get_by_test_id("project-settings-save")).to_have_count(0)
+
+    # Reopen — toggle seeds OFF; toggling back on shows a blank base branch.
+    _open_project_settings(page, project)
+    expect(page.get_by_test_id("project-settings-worktree")).to_have_attribute(
+        "data-state", "unchecked"
+    )
+    page.get_by_test_id("project-settings-worktree").click()
+    expect(page.get_by_test_id("project-settings-base-branch")).to_have_value("")

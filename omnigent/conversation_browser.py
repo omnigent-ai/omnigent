@@ -2,34 +2,52 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import urllib.parse
 import webbrowser
 from collections.abc import Callable
 
-# Databricks workspace-hosted omnigent: the API proxy and the web UI are
-# mounted on different workspace paths. ``conversation_url`` maps the
-# server (API) base onto the UI mount so browser links land on the SPA
-# instead of the JSON API.
-WORKSPACE_API_PATH = "/api/2.0/omnigent"
+# The workspace-hosted API mount (routing-relevant shape) lives in cli_auth
+# next to the header builder that keys off it; the browser-link helpers below
+# only need it to map the API base onto the UI mount. The UI mount is a
+# browser-link concern, so it stays here.
+from omnigent.cli_auth import WORKSPACE_API_PATH
+
 WORKSPACE_UI_PATH = "/omnigent"
 
+# Client-side SPA route for one conversation (see web/src/App.tsx's
+# ``c/:conversationId``). ``conversation_url`` appends it; ``strip_conversation_path``
+# is the inverse, for a URL copied out of the browser's address bar.
+_CONVERSATION_PATH_RE = re.compile(r"/c/[^/]+/?$")
 
-def is_workspace_hosted_url(base_url: str) -> bool:
+
+def strip_conversation_path(url: str) -> str:
     """
-    Whether *base_url* is a Databricks workspace-hosted Omnigent mount.
+    Drop a trailing ``/c/<conversation_id>`` from a server URL.
 
-    True for the API proxy mount (``https://<ws>/api/2.0/omnigent``) the
-    CLI connects to on a workspace. Used to suppress UI a workspace
-    deployment shouldn't surface (e.g. the startup banner's server-version
-    row, since a workspace build reports no meaningful version string).
+    The web UI's address bar shows ``<base>/c/<id>`` for an open
+    conversation, so that is what a user copies when asked for "the
+    omnigent URL". It is a client-side route, not a server mount: the SPA
+    catch-all answers ``GET <base>/c/<id>/v1/me`` with a ``200`` HTML shell,
+    so such a URL passes an auth probe and is accepted as a server, then
+    every real API call 404s because no router owns that prefix. Trimming
+    the route recovers the base the API actually lives on.
 
-    :param base_url: Omnigent server base URL, e.g.
-        ``"https://example.databricks.com/api/2.0/omnigent"``.
-    :returns: ``True`` when the URL path is the workspace API mount.
+    :param url: A server URL, possibly a copied conversation link, e.g.
+        ``"https://app.databricksapps.com/c/9bed9ec6"``.
+    :returns: The URL without the conversation route, e.g.
+        ``"https://app.databricksapps.com"``.
     """
-    return urllib.parse.urlsplit(base_url.rstrip("/")).path == WORKSPACE_API_PATH
+    stripped = url.rstrip("/")
+    parsed = urllib.parse.urlsplit(stripped)
+    trimmed = _CONVERSATION_PATH_RE.sub("", parsed.path)
+    if trimmed == parsed.path:
+        return stripped
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, trimmed, parsed.query, parsed.fragment)
+    )
 
 
 def display_server_url(base_url: str) -> str:

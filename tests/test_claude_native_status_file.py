@@ -266,13 +266,13 @@ def test_unknown_status_clears_dedup_so_next_read_publishes(tmp_path: Path) -> N
     assert published == [RUNNING, RUNNING]
 
 
-def test_asserts_running_only_while_fresh(tmp_path: Path) -> None:
-    """The running level is trusted only briefly after it was written.
+def test_stale_busy_is_reported_as_written(tmp_path: Path) -> None:
+    """A long-standing ``busy`` still reads as running — no freshness window.
 
-    Claude keeps reporting ``busy`` while a delegate or background task is
-    active, long after the turn ended. Treating that as authoritative forever
-    would pin the session to "Working…"; past the window the pane watcher
-    decides again.
+    Claude reports ``busy`` while a delegate or background shell works, which
+    can outlast the turn that started it, and that is correct: it *is* still
+    doing work. The file says what Claude is doing, so we report it as written
+    rather than timing it out and second-guessing with a pane diff.
     """
     sessions = tmp_path / "sessions"
     now = 1785480100.0
@@ -281,7 +281,7 @@ def test_asserts_running_only_while_fresh(tmp_path: Path) -> None:
         pid=1,
         session_id="s",
         status="busy",
-        status_updated_at=int((now - 2) * 1000),
+        status_updated_at=int((now - 3600) * 1000),
     )
     published: list[str] = []
     poller = SessionStatusPoller(
@@ -291,19 +291,100 @@ def test_asserts_running_only_while_fresh(tmp_path: Path) -> None:
         config_dir=tmp_path,
     )
     poller.tick()
-    assert poller.asserts_running(ttl_s=10.0, now=now) is True
-    assert poller.asserts_running(ttl_s=1.0, now=now) is False
+    assert published == [RUNNING]
+    assert poller.active is True
 
-    # An idle level never asserts running, however fresh.
+
+def test_retire_stops_the_file_owning_status(tmp_path: Path) -> None:
+    """A dead pane retires the poller, even with a readable file left behind.
+
+    Claude does not unlink its status file when killed, so the record survives
+    holding whatever it last said — here a ``waiting`` that would otherwise
+    keep asserting the session is parked mid-turn forever. Pane death is the
+    one thing the file cannot report, so the watcher retires the poller and
+    the PTY side owns the outcome.
+    """
+    sessions = tmp_path / "sessions"
     _write_session_file(
-        sessions,
-        pid=1,
-        session_id="s",
-        status="idle",
-        status_updated_at=int(now * 1000),
+        sessions, pid=1, session_id="s", status="waiting", blocked_on="input needed"
+    )
+    published: list[tuple[str, str | None]] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, reason: published.append((status, reason)),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
     )
     poller.tick()
-    assert poller.asserts_running(ttl_s=10.0, now=now) is False
+    assert published == [(RUNNING, "input needed")]
+    assert poller.active is True
+
+    poller.retire()
+    assert poller.active is False
+
+    # The file is still there and still readable; a retired poller reads it no
+    # more, so its stale value cannot keep owning the session's status.
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    poller.tick()
+    assert published == [(RUNNING, "input needed")]
+
+
+def test_resync_republishes_an_unchanged_file(tmp_path: Path) -> None:
+    """A resync makes the next tick re-assert the file's current value.
+
+    The file is rewritten only when its value *changes*, so a poller mid-turn
+    has nothing more to say — which strands the server when the SERVER is what
+    restarted and lost its cache. A resync drops the edge/mtime baselines so the
+    same value publishes again.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    published: list[tuple[str, str | None]] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, reason: published.append((status, reason)),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    poller.tick()
+    assert published == [(RUNNING, None)]
+
+    # Unchanged file: normally silent, which is the whole problem.
+    poller.tick()
+    assert published == [(RUNNING, None)]
+
+    poller.resync()
+    poller.tick()
+    assert published == [(RUNNING, None), (RUNNING, None)]
+    # Still reading the same resolved file — a resync re-asserts a working
+    # poller rather than restarting resolution.
+    assert poller.active is True
+
+
+def test_resync_does_not_revive_a_retired_poller(tmp_path: Path) -> None:
+    """A retired poller stays retired across a reconnect.
+
+    Retirement means the pane's process is gone (or no file ever resolved), so
+    the PTY side owns the outcome. A reconnect must not hand ownership back to a
+    dead Claude's leftover record.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session_file(sessions, pid=1, session_id="s", status="busy")
+    published: list[str] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: published.append(status),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    poller.tick()
+    poller.retire()
+
+    poller.resync()
+    poller.tick()
+
+    assert poller.active is False
+    assert published == [RUNNING]
 
 
 def test_waiting_carries_its_reason(tmp_path: Path) -> None:
@@ -351,12 +432,12 @@ def test_poller_publishes_when_only_the_reason_changes(tmp_path: Path) -> None:
     assert poller.blocked_on == "dialog open"
 
 
-def test_waiting_level_does_not_decay(tmp_path: Path) -> None:
+def test_parked_session_stays_running_indefinitely(tmp_path: Path) -> None:
     """A dialog holds the session open however long it stays up.
 
-    Unlike ``busy`` — which a background task keeps set past its turn — a
-    ``waiting`` clears only when Claude writes a new status, so it is safe to
-    trust indefinitely and wrong to time out (the pane is quiet the whole time).
+    ``waiting`` clears only when Claude writes a new status, so an hour-old
+    parked record still reports running — the pane is quiet the whole time and
+    only the file can tell that from a finished turn.
     """
     sessions = tmp_path / "sessions"
     now = 1785480100.0
@@ -376,4 +457,5 @@ def test_waiting_level_does_not_decay(tmp_path: Path) -> None:
         config_dir=tmp_path,
     )
     poller.tick()
-    assert poller.asserts_running(ttl_s=10.0, now=now) is True
+    assert published == [(RUNNING, "input needed")]
+    assert poller.blocked_on == "input needed"

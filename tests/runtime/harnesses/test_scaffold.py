@@ -497,7 +497,9 @@ async def test_heartbeat_carries_server_time_and_last_event_seq(
     # dataclass repr would fail this.
     import datetime
 
-    parsed = datetime.datetime.strptime(server_time, "%Y-%m-%dT%H:%M:%SZ")
+    parsed = datetime.datetime.strptime(server_time, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=datetime.timezone.utc
+    )
     assert parsed.year >= 2026
 
     # last_event_seq: the sequence_number of the warmup event

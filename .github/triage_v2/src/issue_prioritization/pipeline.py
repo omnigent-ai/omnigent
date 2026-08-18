@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol
@@ -62,7 +62,6 @@ class IssuePrioritizationPipeline:
         scores: ScoreSink,
         artifacts: ArtifactSink,
         engine: ScoreEngine,
-        maintainers: set[str],
         mutation_planner: MutationPlanner | None = None,
         mutation_sink: MutationSink | None = None,
         classification_progress: Callable[[int, int], None] | None = None,
@@ -73,7 +72,6 @@ class IssuePrioritizationPipeline:
         self.scores = scores
         self.artifacts = artifacts
         self.engine = engine
-        self.maintainers = maintainers
         self.mutation_planner = mutation_planner
         self.mutation_sink = mutation_sink
         self.classification_progress = classification_progress
@@ -86,11 +84,7 @@ class IssuePrioritizationPipeline:
         adopt_legacy_bot_priorities: bool = False,
     ) -> PipelineRun:
         now = datetime.now(UTC)
-        issues = [
-            issue
-            for issue in self.source.load_open_issues()
-            if issue.author.lower() not in self.maintainers
-        ]
+        issues = self.source.load_open_issues()
         existing = self.classifications.load()
         contents = {issue.number: issue.content() for issue in issues}
         refresh = {
@@ -135,13 +129,6 @@ class IssuePrioritizationPipeline:
         normalized = []
         for issue in issues:
             normalized_issue = issue.to_issue(resolved[issue.number], now)
-            if self.mutation_planner:
-                severity = self.mutation_planner.severity_override(
-                    issue.labels,
-                    bot_states.get(issue.number),
-                )
-                if severity is not None:
-                    normalized_issue = replace(normalized_issue, severity=severity)
             normalized.append(normalized_issue)
         ranked = tuple(rank_issues(normalized, self.engine))
         current_labels = {issue.number: issue.labels for issue in issues}

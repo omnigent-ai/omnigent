@@ -81,9 +81,9 @@ runs:
         path: .venv
         key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
-    - name: Install project and dev dependencies
+    - name: Install project and test dependencies
       shell: bash
-      run: uv sync --locked --extra all --extra dev
+      run: uv sync --locked --extra all --group test
 
     - name: Install binary dependencies
       # npm install against .github/ci-deps/package.json with --ignore-scripts

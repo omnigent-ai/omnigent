@@ -1,4 +1,4 @@
-"""Tests for CLI-side Smart Routing: preflight, the routed create, and launch."""
+"""Tests for CLI-side Smart Routing: preflight, the armed create, and launch."""
 
 from __future__ import annotations
 
@@ -12,20 +12,12 @@ import respx
 from click import ClickException, UsageError
 from click.testing import CliRunner
 
-from omnigent.cli import (
-    _dispatch_smart_routing,
-    _require_smart_routing_prompt,
-    _run_smart_routing,
-    _smart_routing_capable_harness,
-    _with_routed_model_arg,
-    cli,
-)
+from omnigent.cli import _reject_smart_routing_prompt, _smart_routing_decision, cli
 from omnigent.smart_routing_cli import (
     ROUTING_SESSION_LABELS,
+    arm_smart_routing_session,
     check_smart_routing_available,
-    create_smart_routing_session,
     known_host_id,
-    smart_routing_families,
 )
 
 _BASE = "http://localhost:6767"
@@ -81,11 +73,8 @@ def _mock_hosts(gateway: dict[str, Any] | None) -> None:
 
 
 def _mock_create(**session: Any) -> respx.Route:
-    """Mock the routed create (and its snapshot re-read) with one session body."""
+    """Mock the armed create with one session body."""
     body = {"id": _SESSION_ID, **session}
-    respx.get(f"{_BASE}/v1/sessions/{_SESSION_ID}").mock(
-        return_value=httpx.Response(200, json=body)
-    )
     return respx.post(f"{_BASE}/v1/sessions").mock(return_value=httpx.Response(201, json=body))
 
 
@@ -138,7 +127,7 @@ def test_preflight_reports_the_hosts_own_reason_string() -> None:
 
 @respx.mock
 def test_preflight_ignores_other_families_than_the_requested_one() -> None:
-    """A fixed-harness route only needs its own family to be gateway-backed."""
+    """A per-harness route only needs its own family to be gateway-backed."""
     _mock_info()
     _mock_hosts({"claude-native": True, "codex-native": False})
 
@@ -166,12 +155,6 @@ def test_preflight_reads_the_spelling_it_was_asked_about() -> None:
         check_smart_routing_available(
             base_url=_BASE, harnesses=("native-claude",), host_id=_HOST_ID
         )
-
-
-def test_auto_route_requires_both_native_families() -> None:
-    assert smart_routing_families(None) == ("claude-native", "codex-native")
-    assert smart_routing_families("auto") == ("claude-native", "codex-native")
-    assert smart_routing_families("codex-native") == ("codex-native",)
 
 
 # ── preflight: the machine-local gate ────────────────────────────────────
@@ -234,16 +217,6 @@ def test_preflight_gates_each_harness_on_the_local_gateway_answer(
             continue
         check_smart_routing_available(base_url=_BASE, harnesses=(harness,), host_id=None)
         _assert_downgrade_notice(capsys, expected=() if gatewayed else (harness,))
-    # The auto route picks across both arms, so one arm off the gateway takes
-    # it — unless the built-in judge can answer for that arm instead.
-    auto = smart_routing_families(None)
-    off_gateway = tuple(harness for harness in auto if local[harness] is False)
-    if off_gateway and not oss:
-        with pytest.raises(ClickException, match="not AI-Gateway-backed"):
-            check_smart_routing_available(base_url=_BASE, harnesses=auto, host_id=None)
-    else:
-        check_smart_routing_available(base_url=_BASE, harnesses=auto, host_id=None)
-        _assert_downgrade_notice(capsys, expected=off_gateway)
 
 
 @respx.mock
@@ -343,62 +316,43 @@ def test_local_gateway_inference_never_raises(monkeypatch: pytest.MonkeyPatch) -
     assert smart_routing_cli.local_gateway_inference() == {}
 
 
-# ── the routed create ────────────────────────────────────────────────────
+# ── the armed create ─────────────────────────────────────────────────────
 
 
 @respx.mock
-def test_create_sends_the_routing_contract_for_a_fixed_harness() -> None:
-    """Tier 2 binds the wrapper agent; the harness needs no override."""
-    route = _mock_create(harness="claude-native", model_override="claude-sonnet-5")
+def test_arming_sends_the_mode_but_never_a_message() -> None:
+    """The CLI arms the session; the harness routes the first typed message."""
+    route = _mock_create(harness="claude-native")
 
-    decision = create_smart_routing_session(
+    armed = arm_smart_routing_session(
         base_url=_BASE,
-        prompt="fix the flaky test",
         harness="claude-native",
         host_id=_HOST_ID,
         workspace="/repo",
     )
 
     payload = json.loads(route.calls.last.request.content)
+    # The mode override is what arms Smart Routing (and what the hook's
+    # server-side gate reads); a message would route at create time, which is
+    # the web UI's job, not the CLI's.
     assert payload["cost_control_mode_override"] == "on"
-    assert payload["smart_routing_message"] == "fix the flaky test"
+    assert "smart_routing_message" not in payload
+    assert "harness_override" not in payload
     assert payload["host_type"] == "external"
-    # Bound to the launch host + its workspace: the router's candidate catalog
-    # comes from that host's model options, and the server 400s a host_id with
-    # no workspace.
+    # Bound to the launch host + its workspace: the pane's model catalog comes
+    # from that host, and the server 400s a host_id with no workspace.
     assert payload["host_id"] == _HOST_ID
     assert payload["workspace"] == "/repo"
     assert payload["labels"] == ROUTING_SESSION_LABELS
-    # A fixed harness comes from the bound wrapper agent, so no override is
-    # sent — only the auto route uses the sentinel.
-    assert "harness_override" not in payload
-    assert (decision.session_id, decision.model) == (_SESSION_ID, "claude-sonnet-5")
-    assert decision.notice is None
+    assert armed == type(armed)(session_id=_SESSION_ID, notice=None)
 
 
 @respx.mock
-def test_create_asks_for_a_harness_on_the_auto_route() -> None:
-    """Tier 3 sends the ``auto`` sentinel and reads the bound harness back."""
-    route = _mock_create(harness="codex-native", model_override="gpt-5.4")
-
-    decision = create_smart_routing_session(
-        base_url=_BASE,
-        prompt="port the parser",
-        harness=None,
-        host_id=_HOST_ID,
-        workspace="/repo",
-    )
-
-    assert json.loads(route.calls.last.request.content)["harness_override"] == "auto"
-    assert (decision.harness, decision.model) == ("codex-native", "gpt-5.4")
-
-
-@respx.mock
-def test_create_omits_the_workspace_when_there_is_no_host() -> None:
+def test_arming_omits_the_workspace_when_there_is_no_host() -> None:
     """No host means no workspace either — the server validates them together."""
-    route = _mock_create(harness="claude-native", model_override="claude-sonnet-5")
+    route = _mock_create(harness="claude-native")
 
-    create_smart_routing_session(base_url=_BASE, prompt="hello", harness="claude-native")
+    arm_smart_routing_session(base_url=_BASE, harness="claude-native")
 
     payload = json.loads(route.calls.last.request.content)
     assert "host_id" not in payload
@@ -406,104 +360,58 @@ def test_create_omits_the_workspace_when_there_is_no_host() -> None:
 
 
 @respx.mock
-def test_create_never_deletes_the_routed_session() -> None:
-    """The routed session IS the session — the wrapper attaches to it."""
+def test_arming_binds_the_requested_harnesss_own_wrapper() -> None:
+    """Each harness arms its own built-in wrapper agent, never a placeholder."""
+    from omnigent.db.utils import builtin_agent_id
+
+    route = _mock_create(harness="codex-native")
+
+    arm_smart_routing_session(base_url=_BASE, harness="codex-native")
+
+    payload = json.loads(route.calls.last.request.content)
+    assert payload["agent_id"] == builtin_agent_id("codex-native-ui")
+
+
+@respx.mock
+def test_arming_never_deletes_the_session_it_created() -> None:
+    """The armed session IS the session — the wrapper attaches to it."""
     deleted = respx.delete(f"{_BASE}/v1/sessions/{_SESSION_ID}").mock(
         return_value=httpx.Response(204)
     )
-    _mock_create(harness="claude-native", model_override="claude-sonnet-5")
+    _mock_create(harness="claude-native")
 
-    create_smart_routing_session(base_url=_BASE, prompt="hello", harness="claude-native")
+    arm_smart_routing_session(base_url=_BASE, harness="claude-native")
 
     assert not deleted.called
-
-
-@respx.mock
-def test_create_falls_back_to_the_session_snapshot() -> None:
-    """A create response without the verdict is re-read from the snapshot."""
-    respx.post(f"{_BASE}/v1/sessions").mock(
-        return_value=httpx.Response(201, json={"id": _SESSION_ID})
-    )
-    respx.get(f"{_BASE}/v1/sessions/{_SESSION_ID}").mock(
-        return_value=httpx.Response(
-            200, json={"harness": "codex-native", "model_override": "gpt-5.4-mini"}
-        )
-    )
-
-    decision = create_smart_routing_session(base_url=_BASE, prompt="hello", harness=None)
-
-    assert (decision.harness, decision.model) == ("codex-native", "gpt-5.4-mini")
-
-
-@respx.mock
-def test_create_without_a_prompt_only_turns_smart_routing_on() -> None:
-    # A bare create arms the session; the in-harness hook picks the model.
-    route = _mock_create(harness="claude-native")
-
-    decision = create_smart_routing_session(
-        base_url=_BASE, prompt=None, harness="claude-native", host_id=_HOST_ID, workspace="/repo"
-    )
-
-    payload = json.loads(route.calls.last.request.content)
-    # The mode override is what arms Smart Routing (and what the hook's
-    # server-side gate reads); the message is what would route at create time.
-    assert payload["cost_control_mode_override"] == "on"
-    assert "smart_routing_message" not in payload
-    assert payload["host_id"] == _HOST_ID
-    assert payload["workspace"] == "/repo"
-    assert payload["labels"] == ROUTING_SESSION_LABELS
-    assert decision.session_id == _SESSION_ID
-    # Nothing is routed yet, so an empty pick is the expected answer — not a
-    # "did not pick a model" notice.
-    assert decision.model is None
-    assert decision.notice is None
-
-
-@respx.mock
-def test_create_keeps_the_session_when_no_model_was_picked() -> None:
-    """Fail-open: the session still launches, on the harness default model."""
-    _mock_create(harness="claude-native", model_override=None)
-
-    decision = create_smart_routing_session(
-        base_url=_BASE, prompt="hello", harness="claude-native"
-    )
-
-    assert decision.session_id == _SESSION_ID
-    assert decision.model is None
-    assert decision.notice is not None
-    assert "did not pick a model" in decision.notice
 
 
 # A create that is rejected, unreachable, or missing a session id never blocks
 # the launch: it returns no session and a notice.
 @respx.mock
 @pytest.mark.parametrize(
-    ("mock_kwargs", "harness", "notice_contains"),
+    ("mock_kwargs", "notice_contains"),
     [
-        ({"return_value": httpx.Response(400, text="no native CLI")}, None, "400"),
-        ({"side_effect": httpx.ConnectError("refused")}, "claude-native", "could not reach"),
-        ({"return_value": httpx.Response(201, json={})}, "claude-native", None),
+        ({"return_value": httpx.Response(400, text="runner is offline")}, "400"),
+        ({"side_effect": httpx.ConnectError("refused")}, "could not reach"),
+        ({"return_value": httpx.Response(201, json={})}, "no session id"),
     ],
 )
-def test_create_fails_open(
-    mock_kwargs: dict[str, Any], harness: str | None, notice_contains: str | None
-) -> None:
+def test_arming_fails_open(mock_kwargs: dict[str, Any], notice_contains: str) -> None:
     respx.post(f"{_BASE}/v1/sessions").mock(**mock_kwargs)
 
-    decision = create_smart_routing_session(base_url=_BASE, prompt="hello", harness=harness)
+    armed = arm_smart_routing_session(base_url=_BASE, harness="claude-native")
 
-    assert (decision.session_id, decision.harness, decision.model) == (None, None, None)
-    assert decision.notice is not None
-    if notice_contains is not None:
-        assert notice_contains in decision.notice
+    assert armed.session_id is None
+    assert armed.notice is not None
+    assert notice_contains in armed.notice
 
 
-# ── dispatch ─────────────────────────────────────────────────────────────
+# ── preflight + arm, as the subcommands call it ──────────────────────────
 
 
 @pytest.fixture
 def _routing_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Point the dispatch helpers at a fake backend, daemon, and host identity."""
+    """Point the launch helpers at a fake backend, daemon, and host identity."""
     monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _s: _BASE)
     monkeypatch.setattr("omnigent.cli._ensure_host_daemon", lambda _s: False)
     monkeypatch.setattr(
@@ -513,228 +421,30 @@ def _routing_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @respx.mock
-def test_dispatch_tier2_attaches_the_wrapper_to_the_routed_session(
-    monkeypatch: pytest.MonkeyPatch, _routing_env: None
-) -> None:
-    """A fixed harness keeps its wrapper, gains ``--model``, and attaches."""
+def test_the_decision_binds_the_launch_host_and_cwd(_routing_env: None) -> None:
+    """The armed session runs here, so it carries this host and this workspace."""
     _mock_info()
     _mock_hosts({"claude-native": True})
-    route = _mock_create(harness="claude-native", model_override="claude-opus-4-7")
-    captured: dict[str, Any] = {}
-    monkeypatch.setattr(
-        "omnigent.claude_native.run_claude_native", lambda **kw: captured.update(kw)
-    )
+    route = _mock_create(harness="claude-native")
 
-    _dispatch_smart_routing(
-        harness="claude-native",
-        server=None,
-        prompt="fix the flaky test",
-        model=None,
-        auto_open_conversation=False,
-    )
+    armed = _smart_routing_decision(server=_BASE, harness="claude-native")
 
-    # Attach, not bundle: the routed session already carries the model, the
-    # decision card, and the wrapper labels the server wrote at create.
-    assert captured["session_id"] == _SESSION_ID
-    assert captured["extra_args"] == ("--model", "claude-opus-4-7")
-    assert captured["prompt"] == "fix the flaky test"
+    assert armed.session_id == _SESSION_ID
     payload = json.loads(route.calls.last.request.content)
     assert payload["host_id"] == _HOST_ID
     assert payload["workspace"] == str(Path.cwd().resolve())
 
 
 @respx.mock
-def test_dispatch_tier3_launches_the_harness_the_server_bound(
-    monkeypatch: pytest.MonkeyPatch, _routing_env: None
+def test_the_decision_routes_hostlessly_when_the_server_does_not_know_the_host(
+    _routing_env: None,
 ) -> None:
-    """The auto route picks the harness; the CLI execs that wrapper on it."""
-    _mock_info()
-    _mock_hosts(None)
-    _mock_create(harness="codex-native", model_override="gpt-5.4")
-    captured: dict[str, Any] = {}
-    monkeypatch.setattr("omnigent.codex_native.run_codex_native", lambda **kw: captured.update(kw))
-
-    _dispatch_smart_routing(
-        harness=None,
-        server=None,
-        prompt="port the parser",
-        model=None,
-        auto_open_conversation=False,
-    )
-
-    assert captured["session_id"] == _SESSION_ID
-    assert captured["model"] == "gpt-5.4"
-    assert captured["prompt"] == "port the parser"
-
-
-@respx.mock
-def test_dispatch_launches_bare_when_the_harness_routes_its_own_first_message(
-    monkeypatch: pytest.MonkeyPatch, _routing_env: None, capsys: pytest.CaptureFixture[str]
-) -> None:
-    # No -p on a hooked harness: arm the session, then let the TUI route.
-    _mock_info()
-    _mock_hosts({"claude-native": True})
-    route = _mock_create(harness="claude-native")
-    captured: dict[str, Any] = {}
-    monkeypatch.setattr(
-        "omnigent.claude_native.run_claude_native", lambda **kw: captured.update(kw)
-    )
-
-    _dispatch_smart_routing(
-        harness="claude-native",
-        server=None,
-        prompt=None,
-        model=None,
-        auto_open_conversation=False,
-    )
-
-    payload = json.loads(route.calls.last.request.content)
-    assert payload["cost_control_mode_override"] == "on"
-    assert "smart_routing_message" not in payload
-    assert captured["session_id"] == _SESSION_ID
-    # Nothing was picked at create, so the launch carries no routed --model and
-    # no initial prompt — the hook applies the model on the first typed message.
-    assert captured["extra_args"] == ()
-    assert captured["prompt"] is None
-    assert "Smart Routing is on for this session" in capsys.readouterr().err
-
-
-@respx.mock
-def test_dispatch_bare_preflights_the_pinned_harness(
-    monkeypatch: pytest.MonkeyPatch, _routing_env: None
-) -> None:
-    # A bare launch that cannot be routed fails loud, not silently unrouted.
-    _mock_info()
-    _mock_hosts({"claude-native": False})
-
-    def _must_not_launch(**_kwargs: Any) -> None:
-        raise AssertionError("wrapper launched despite unavailable routing")
-
-    monkeypatch.setattr("omnigent.claude_native.run_claude_native", _must_not_launch)
-
-    with pytest.raises(ClickException, match="not AI-Gateway-backed"):
-        _dispatch_smart_routing(
-            harness="claude-native",
-            server=None,
-            prompt=None,
-            model=None,
-            auto_open_conversation=False,
-        )
-
-
-@respx.mock
-def test_run_smart_routing_launches_a_pinned_codex_bare(
-    monkeypatch: pytest.MonkeyPatch, _routing_env: None
-) -> None:
-    # `run --harness codex-native --smart-routing` with no -p is servable.
-    _mock_info()
-    _mock_hosts({"codex-native": True})
-    route = _mock_create(harness="codex-native")
-    captured: dict[str, Any] = {}
-    monkeypatch.setattr("omnigent.codex_native.run_codex_native", lambda **kw: captured.update(kw))
-
-    _run_smart_routing(**_run_kwargs(harness="codex-native", prompt=None))
-
-    assert "smart_routing_message" not in json.loads(route.calls.last.request.content)
-    assert captured["session_id"] == _SESSION_ID
-    assert captured["model"] is None
-    assert captured["prompt"] is None
-
-
-@respx.mock
-def test_dispatch_fails_open_to_a_fresh_wrapper_session(
-    monkeypatch: pytest.MonkeyPatch, _routing_env: None, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A rejected create still launches — the wrapper bundles its own session."""
-    _mock_info()
-    _mock_hosts(None)
-    respx.post(f"{_BASE}/v1/sessions").mock(return_value=httpx.Response(503, text="down"))
-    captured: dict[str, Any] = {}
-    monkeypatch.setattr(
-        "omnigent.claude_native.run_claude_native", lambda **kw: captured.update(kw)
-    )
-
-    _dispatch_smart_routing(
-        harness=None,
-        server=None,
-        prompt="port the parser",
-        model=None,
-        auto_open_conversation=False,
-    )
-
-    err = capsys.readouterr().err
-    assert "Smart Routing was unavailable" in err
-    assert "launching claude-native" in err
-    assert captured["session_id"] is None
-    assert captured["extra_args"] == ()
-    assert captured["prompt"] == "port the parser"
-
-
-@respx.mock
-def test_dispatch_tier3_falls_back_when_the_pick_cannot_take_a_prompt(
-    monkeypatch: pytest.MonkeyPatch, _routing_env: None, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A harness the CLI cannot hand a prompt to is not a usable pick."""
-    _mock_info()
-    _mock_hosts(None)
-    _mock_create(harness="cursor-native", model_override="composer-2.5")
-    captured: dict[str, Any] = {}
-    monkeypatch.setattr(
-        "omnigent.claude_native.run_claude_native", lambda **kw: captured.update(kw)
-    )
-
-    _dispatch_smart_routing(
-        harness=None,
-        server=None,
-        prompt="port the parser",
-        model=None,
-        auto_open_conversation=False,
-    )
-
-    assert "did not resolve a launchable harness" in capsys.readouterr().err
-    assert captured["extra_args"] == ("--model", "composer-2.5")
-
-
-@respx.mock
-def test_dispatch_preflight_error_blocks_the_launch(
-    monkeypatch: pytest.MonkeyPatch, _routing_env: None
-) -> None:
-    """An unavailable-routing error must stop before any wrapper runs."""
-    _mock_info(enabled=False)
-    _mock_hosts(None)
-
-    def _must_not_launch(**_kwargs: Any) -> None:
-        raise AssertionError("wrapper launched despite unavailable routing")
-
-    monkeypatch.setattr("omnigent.claude_native.run_claude_native", _must_not_launch)
-
-    with pytest.raises(ClickException, match="Smart Routing is not enabled"):
-        _dispatch_smart_routing(
-            harness="claude-native",
-            server=None,
-            prompt="hello",
-            model=None,
-            auto_open_conversation=False,
-        )
-
-
-@respx.mock
-def test_dispatch_routes_hostlessly_when_the_server_does_not_know_the_host(
-    monkeypatch: pytest.MonkeyPatch, _routing_env: None
-) -> None:
-    """An unregistered host degrades to a hostless route, not a failed create."""
+    """An unregistered host degrades to a hostless create, not a failed one."""
     _mock_info()
     respx.get(f"{_BASE}/v1/hosts").mock(return_value=httpx.Response(200, json={"hosts": []}))
-    route = _mock_create(harness="claude-native", model_override="claude-sonnet-5")
-    monkeypatch.setattr("omnigent.claude_native.run_claude_native", lambda **kw: None)
+    route = _mock_create(harness="claude-native")
 
-    _dispatch_smart_routing(
-        harness="claude-native",
-        server=None,
-        prompt="hello",
-        model=None,
-        auto_open_conversation=False,
-    )
+    _smart_routing_decision(server=_BASE, harness="claude-native")
 
     payload = json.loads(route.calls.last.request.content)
     assert "host_id" not in payload
@@ -749,113 +459,60 @@ def test_known_host_id_requires_the_server_to_have_seen_the_host() -> None:
         assert known_host_id(base_url=_BASE, host_id=None) is None
 
 
-# ── flag parsing / rejects ───────────────────────────────────────────────
+@respx.mock
+def test_the_routing_preflight_reads_are_not_on_the_creates_long_budget() -> None:
+    """
+    A wedged server cannot stall the launch before the session exists.
+
+    The preflight GETs already degrade to "unknown", which does not gate, so a
+    long wait buys nothing; the create's own 60s read budget is for the create,
+    which does real work. Asserted against the constants so the two stay
+    distinguishable.
+    """
+    from omnigent.smart_routing_cli import _PREFLIGHT_TIMEOUT, _TIMEOUT
+
+    assert _PREFLIGHT_TIMEOUT.read is not None
+    assert _PREFLIGHT_TIMEOUT.connect is not None
+    assert _PREFLIGHT_TIMEOUT.read <= 8.0
+    assert _TIMEOUT.read is not None
+    assert _PREFLIGHT_TIMEOUT.read < _TIMEOUT.read
 
 
-def test_require_prompt_rejects_missing_text_without_an_in_harness_route() -> None:
-    for value in (None, "   "):
-        with pytest.raises(UsageError, match="needs the text to route"):
-            _require_smart_routing_prompt(value, in_harness_routing=False)
-    assert _require_smart_routing_prompt("hi", in_harness_routing=False) == "hi"
+# ── rejected combinations ────────────────────────────────────────────────
 
 
-def test_require_prompt_allows_missing_text_when_the_harness_routes_its_own() -> None:
-    # The per-harness subcommands default to the in-harness route, so a bare
-    # launch is served instead of rejected.
-    assert _require_smart_routing_prompt(None) is None
-    assert _require_smart_routing_prompt("   ") is None
-    assert _require_smart_routing_prompt("hi") == "hi"
-
-
-def _run_kwargs(**overrides: Any) -> dict[str, Any]:
-    """``_run_smart_routing`` kwargs with a valid routed launch as the baseline."""
-    base: dict[str, Any] = {
-        "target": None,
-        "harness": None,
-        "prompt": "hello",
-        "server": None,
-        "model": None,
-        "resume_conversation_id": None,
-        "resume_picker": False,
-        "resume_latest": False,
-        "auto_open_conversation": False,
-    }
-    base.update(overrides)
-    return base
-
-
-def test_run_smart_routing_rejects_an_agent() -> None:
-    with pytest.raises(ClickException, match="takes no AGENT"):
-        _run_smart_routing(**_run_kwargs(target="examples/hello_world.yaml"))
-
-
-@pytest.mark.parametrize(
-    ("overrides", "flag"),
-    [
-        ({"tools": "coding"}, "--tools"),
-        ({"system_prompt": "be terse"}, "--system-prompt"),
-        ({"log": True}, "--log"),
-        ({"debug_events": True}, "--debug-events"),
-        ({"fork_session_id": "conv_src"}, "--fork"),
-        ({"ephemeral": True}, "--no-session"),
-    ],
-)
-def test_run_smart_routing_rejects_repl_only_options(overrides: dict[str, Any], flag: str) -> None:
-    """A routed launch is still a TUI attach — REPL-only flags fail loud."""
-    with pytest.raises(ClickException, match=flag):
-        _run_smart_routing(**_run_kwargs(**overrides))
-
-
-@pytest.mark.parametrize(
-    ("overrides", "flag"),
-    [
-        ({"resume_conversation_id": "conv_old"}, "--resume"),
-        ({"resume_picker": True}, "--resume"),
-        ({"resume_latest": True}, "--continue"),
-    ],
-)
-def test_run_smart_routing_rejects_resuming(overrides: dict[str, Any], flag: str) -> None:
-    """Routing happens at create, so a routed launch is always a new session."""
-    with pytest.raises(ClickException, match=f"cannot be combined with {flag}"):
-        _run_smart_routing(**_run_kwargs(**overrides))
-
-
-def test_run_smart_routing_rejects_a_non_routable_harness() -> None:
-    with pytest.raises(ClickException, match="does not support --harness 'claude-sdk'"):
-        _run_smart_routing(**_run_kwargs(harness="claude-sdk"))
+def test_reject_prompt_only_fires_on_real_text() -> None:
+    # Whitespace is not a prompt; a bare launch must stay servable.
+    assert _reject_smart_routing_prompt(None) is None
+    assert _reject_smart_routing_prompt("   ") is None
+    with pytest.raises(UsageError, match="cannot be combined with -p"):
+        _reject_smart_routing_prompt("fix the flaky test")
 
 
 @pytest.mark.parametrize(
     "args",
     [
-        ["run", "--smart-routing"],
-        ["run", "--smart-routing", "--harness", "auto"],
+        ["claude", "--smart-routing", "-p", "fix the flaky test"],
+        ["claude", "--smart-routing", "--prompt", "fix the flaky test"],
+        ["codex", "--smart-routing", "-p", "port the parser"],
     ],
 )
-def test_cross_harness_routing_without_a_prompt_is_a_usage_error(args: list[str]) -> None:
-    # Nothing exists to hook before the harness is picked, so -p is required.
+def test_a_prompt_with_smart_routing_is_rejected(args: list[str]) -> None:
+    # The CLI routes what you type in the TUI, so a create-time prompt has no
+    # path — say where it does have one instead of launching unrouted.
     result = CliRunner().invoke(cli, args)
 
     assert result.exit_code == 2, result.output
-    assert "needs the text to route up front here" in result.output
-    assert "no harness that can route from inside itself" in result.output
-    assert '-p "<prompt>"' in result.output
-    assert "--harness claude-native" in result.output
-
-
-def test_a_harness_without_the_first_message_hook_still_needs_a_prompt() -> None:
-    # kiro-native is routable, but it cannot route from inside itself.
-    with pytest.raises(UsageError, match="needs the text to route up front here"):
-        _run_smart_routing(**_run_kwargs(harness="kiro-native", prompt=None))
+    assert "cannot be combined with -p/--prompt" in result.output
+    assert "web UI" in result.output
 
 
 @pytest.mark.parametrize(
     "args",
     [
-        ["run", "--smart-routing", "-p", "hi", "--continue"],
-        ["claude", "--smart-routing", "-p", "hi", "--resume", "conv_old"],
-        ["codex", "--smart-routing", "-p", "hi", "--resume", "conv_old"],
-        ["claude", "--smart-routing", "-p", "hi", "--session", "conv_old"],
+        ["claude", "--smart-routing", "--resume", "conv_old"],
+        ["codex", "--smart-routing", "--resume", "conv_old"],
+        ["claude", "--smart-routing", "--session", "conv_old"],
     ],
 )
 def test_smart_routing_with_a_resume_is_rejected(args: list[str]) -> None:
@@ -865,96 +522,33 @@ def test_smart_routing_with_a_resume_is_rejected(args: list[str]) -> None:
     assert "routes a new session" in result.output
 
 
-@respx.mock
-def test_run_smart_routing_with_a_pinned_harness_routes_the_model_only(
-    monkeypatch: pytest.MonkeyPatch, _routing_env: None
-) -> None:
-    """``run --harness codex-native --smart-routing`` keeps codex, routes model."""
-    _mock_info()
-    _mock_hosts({"codex-native": True})
-    route = _mock_create(harness="codex-native", model_override="gpt-5.4-mini")
-    captured: dict[str, Any] = {}
-    monkeypatch.setattr("omnigent.codex_native.run_codex_native", lambda **kw: captured.update(kw))
-
-    _run_smart_routing(**_run_kwargs(harness="codex-native", prompt="add a --dry-run flag"))
-
-    assert "harness_override" not in json.loads(route.calls.last.request.content)
-    assert captured["model"] == "gpt-5.4-mini"
-    assert captured["session_id"] == _SESSION_ID
-
-
-def test_routable_harnesses_are_the_prompt_capable_native_ones() -> None:
-    assert _smart_routing_capable_harness("claude-native") == "claude-native"
-    assert _smart_routing_capable_harness("codex-native") == "codex-native"
-    assert _smart_routing_capable_harness("kiro-native") == "kiro-native"
-    # Wrappers with no prompt parameter, and non-native harnesses, are out —
-    # including bare ``claude``, which canonicalizes to the SDK harness.
-    assert _smart_routing_capable_harness("cursor-native") is None
-    assert _smart_routing_capable_harness("claude") is None
-    assert _smart_routing_capable_harness("claude-sdk") is None
-    assert _smart_routing_capable_harness(None) is None
-
-
 @pytest.mark.parametrize(
-    ("args", "model", "expected"),
+    "args",
     [
-        ((), "sonnet", ("--model", "sonnet")),
-        (("--verbose",), "sonnet", ("--verbose", "--model", "sonnet")),
-        # An explicit user model wins over the routed default.
-        (("--model", "opus"), "sonnet", ("--model", "opus")),
-        (("--model=opus",), "sonnet", ("--model=opus",)),
-        (("--verbose",), None, ("--verbose",)),
+        ["run", "--smart-routing"],
+        ["run", "--smart-routing", "-p", "review the last commit"],
+        ["run", "--harness", "claude-native", "--smart-routing", "-p", "hi"],
     ],
 )
-def test_routed_model_arg_merge(
-    args: tuple[str, ...], model: str | None, expected: tuple[str, ...]
-) -> None:
-    assert _with_routed_model_arg(args, model) == expected
+def test_run_smart_routing_is_removed(args: list[str]) -> None:
+    # `run` never routed from inside a harness, and its create-time route is
+    # gone — the rejection has to name both surfaces that still route.
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code == 1, result.output
+    assert "per-harness first-message only" in result.output
+    assert "omnigent claude --smart-routing" in result.output
+    assert "web UI" in result.output
+
+
+def test_run_no_longer_advertises_smart_routing() -> None:
+    result = CliRunner().invoke(cli, ["run", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--smart-routing" not in result.output
 
 
 # ── the dedicated subcommands ────────────────────────────────────────────
-
-
-@respx.mock
-def test_claude_subcommand_attaches_to_the_routed_session(
-    monkeypatch: pytest.MonkeyPatch, _routing_env: None
-) -> None:
-    """``omnigent claude --smart-routing -p`` routes, then attaches with --model."""
-    _mock_info()
-    _mock_hosts({"claude-native": True})
-    _mock_create(harness="claude-native", model_override="claude-sonnet-5")
-    captured: dict[str, Any] = {}
-    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
-    monkeypatch.setattr(
-        "omnigent.claude_native.run_claude_native", lambda **kw: captured.update(kw)
-    )
-
-    result = CliRunner().invoke(cli, ["claude", "--smart-routing", "-p", "fix the flaky test"])
-
-    assert result.exit_code == 0, result.output
-    assert captured["session_id"] == _SESSION_ID
-    assert captured["extra_args"] == ("--model", "claude-sonnet-5")
-    assert captured["prompt"] == "fix the flaky test"
-
-
-@respx.mock
-def test_codex_subcommand_attaches_to_the_routed_session(
-    monkeypatch: pytest.MonkeyPatch, _routing_env: None
-) -> None:
-    """Codex takes the routed model first-class, and keeps its own -p delivery."""
-    _mock_info()
-    _mock_hosts({"codex-native": True})
-    _mock_create(harness="codex-native", model_override="gpt-5.4-mini")
-    captured: dict[str, Any] = {}
-    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
-    monkeypatch.setattr("omnigent.codex_native.run_codex_native", lambda **kw: captured.update(kw))
-
-    result = CliRunner().invoke(cli, ["codex", "--smart-routing", "-p", "port the parser"])
-
-    assert result.exit_code == 0, result.output
-    assert captured["session_id"] == _SESSION_ID
-    assert captured["model"] == "gpt-5.4-mini"
-    assert captured["prompt"] == "port the parser"
 
 
 @respx.mock
@@ -965,10 +559,10 @@ def test_codex_subcommand_attaches_to_the_routed_session(
         ("codex", "omnigent.codex_native.run_codex_native"),
     ],
 )
-def test_subcommand_without_a_prompt_arms_the_session_and_launches_bare(
+def test_a_subcommand_arms_the_session_and_launches_bare(
     command: str, launcher: str, monkeypatch: pytest.MonkeyPatch, _routing_env: None
 ) -> None:
-    # `omnigent claude|codex --smart-routing` needs no -p: the hook routes.
+    # `omnigent claude|codex --smart-routing` takes no -p: the hook routes.
     _mock_info()
     _mock_hosts({f"{command}-native": True})
     route = _mock_create(harness=f"{command}-native")
@@ -982,36 +576,36 @@ def test_subcommand_without_a_prompt_arms_the_session_and_launches_bare(
     payload = json.loads(route.calls.last.request.content)
     assert payload["cost_control_mode_override"] == "on"
     assert "smart_routing_message" not in payload
+    # Attach, not bundle: the armed session carries the mode, the wrapper labels
+    # and the decision card the server wrote at create.
     assert captured["session_id"] == _SESSION_ID
     assert captured["prompt"] is None
-    # No create-time pick, so no routed model reaches the wrapper.
+    # Nothing is picked at create, so no routed model reaches the wrapper.
     assert captured["extra_args"] == ()
     assert captured.get("model") is None
     assert "Smart Routing is on for this session" in result.output
 
 
 @respx.mock
-def test_explicit_model_beats_the_routed_pick(
+def test_an_explicit_model_survives_arming(
     monkeypatch: pytest.MonkeyPatch, _routing_env: None
 ) -> None:
-    """Routing fills in a default; a model the user typed still wins."""
+    """Arming picks nothing, so a model the user typed reaches the launch."""
     _mock_info()
     _mock_hosts(None)
-    _mock_create(harness="codex-native", model_override="gpt-5.4-mini")
+    _mock_create(harness="codex-native")
     captured: dict[str, Any] = {}
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     monkeypatch.setattr("omnigent.codex_native.run_codex_native", lambda **kw: captured.update(kw))
 
-    result = CliRunner().invoke(
-        cli, ["codex", "--smart-routing", "-p", "hello", "--model", "gpt-5.4"]
-    )
+    result = CliRunner().invoke(cli, ["codex", "--smart-routing", "--model", "gpt-5.4"])
 
     assert result.exit_code == 0, result.output
     assert captured["model"] == "gpt-5.4"
 
 
 @respx.mock
-def test_claude_subcommand_falls_back_to_a_fresh_session(
+def test_a_subcommand_falls_back_to_a_fresh_session(
     monkeypatch: pytest.MonkeyPatch, _routing_env: None
 ) -> None:
     """A rejected create leaves the wrapper to bundle its own session."""
@@ -1024,11 +618,10 @@ def test_claude_subcommand_falls_back_to_a_fresh_session(
         "omnigent.claude_native.run_claude_native", lambda **kw: captured.update(kw)
     )
 
-    result = CliRunner().invoke(cli, ["claude", "--smart-routing", "-p", "hello"])
+    result = CliRunner().invoke(cli, ["claude", "--smart-routing"])
 
     assert result.exit_code == 0, result.output
     assert captured["session_id"] is None
-    assert captured["prompt"] == "hello"
     assert "Smart Routing was unavailable" in result.output
 
 
@@ -1056,36 +649,36 @@ def test_a_create_rejected_for_a_non_routing_reason_says_so_and_still_launches(
         "omnigent.claude_native.run_claude_native", lambda **kw: captured.update(kw)
     )
 
-    result = CliRunner().invoke(cli, ["claude", "--smart-routing", "-p", "hello"])
+    result = CliRunner().invoke(cli, ["claude", "--smart-routing"])
 
     # Not fatal.
     assert result.exit_code == 0, result.output
     # One explicit line, naming the status the server answered with.
     assert "Smart Routing was unavailable" in result.output
     assert "400" in result.output
-    # And the session still launches, unrouted and prompt in hand.
+    # And the session still launches, unrouted.
     assert captured["session_id"] is None
-    assert captured["prompt"] == "hello"
     assert captured["extra_args"] == ()
 
 
 @respx.mock
-def test_the_routing_preflight_reads_are_not_on_the_creates_long_budget() -> None:
-    """
-    A wedged server cannot stall the launch before the session exists.
+def test_an_unavailable_preflight_blocks_the_launch(
+    monkeypatch: pytest.MonkeyPatch, _routing_env: None
+) -> None:
+    """An unavailable-routing error must stop before any wrapper runs."""
+    _mock_info(enabled=False)
+    _mock_hosts(None)
 
-    The preflight GETs already degrade to "unknown", which does not gate, so a
-    long wait buys nothing; the create's own 60s read budget is for the create,
-    which does real work. Asserted against the constants so the two stay
-    distinguishable.
-    """
-    from omnigent.smart_routing_cli import _PREFLIGHT_TIMEOUT, _TIMEOUT
+    def _must_not_launch(**_kwargs: Any) -> None:
+        raise AssertionError("wrapper launched despite unavailable routing")
 
-    assert _PREFLIGHT_TIMEOUT.read is not None
-    assert _PREFLIGHT_TIMEOUT.connect is not None
-    assert _PREFLIGHT_TIMEOUT.read <= 8.0
-    assert _TIMEOUT.read is not None
-    assert _PREFLIGHT_TIMEOUT.read < _TIMEOUT.read
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.claude_native.run_claude_native", _must_not_launch)
+
+    result = CliRunner().invoke(cli, ["claude", "--smart-routing"])
+
+    assert result.exit_code == 1, result.output
+    assert "Smart Routing is not enabled" in result.output
 
 
 # ── credential-provider gating, end to end ───────────────────────────────
@@ -1093,24 +686,10 @@ def test_the_routing_preflight_reads_are_not_on_the_creates_long_budget() -> Non
 # The shape a Databricks user actually has: Claude Code pointed at the workspace
 # AI Gateway, Codex signed in to a personal ChatGPT subscription. Routing is
 # applied by rewriting the launch model to a gateway catalog id, so only the
-# Claude pane can honour it — every routed entry point into Codex must fail
-# fast, and the auto route (which may land on either arm) with it.
+# Claude pane can honour it — a routed launch into Codex must fail fast.
 
 _CODEX_ON_SUBSCRIPTION = {"claude-native": True, "codex-native": False}
 _NO_GATEWAY_AT_ALL = {"claude-native": False, "codex-native": False}
-
-
-@respx.mock
-def test_auto_route_is_refused_when_only_one_arm_is_gateway_backed() -> None:
-    _mock_info()
-    _mock_hosts(_CODEX_ON_SUBSCRIPTION)
-
-    with pytest.raises(ClickException, match=r"codex-native.*not AI-Gateway-backed"):
-        check_smart_routing_available(
-            base_url=_BASE,
-            harnesses=smart_routing_families(None),
-            host_id=_HOST_ID,
-        )
 
 
 @respx.mock
@@ -1121,7 +700,7 @@ def test_claude_route_survives_codex_being_on_a_subscription() -> None:
 
     check_smart_routing_available(
         base_url=_BASE,
-        harnesses=smart_routing_families("claude-native"),
+        harnesses=("claude-native",),
         host_id=_HOST_ID,
     )
 
@@ -1130,16 +709,10 @@ def test_claude_route_survives_codex_being_on_a_subscription() -> None:
 @pytest.mark.parametrize(
     ("args", "gateway"),
     [
-        # The auto route may land on Codex, so one ungatewayed arm blocks it.
-        (["run", "--smart-routing", "-p", "hello"], _CODEX_ON_SUBSCRIPTION),
-        (
-            ["run", "--harness", "codex-native", "--smart-routing", "-p", "hello"],
-            _CODEX_ON_SUBSCRIPTION,
-        ),
-        (["codex", "--smart-routing", "-p", "hello"], _CODEX_ON_SUBSCRIPTION),
+        (["codex", "--smart-routing"], _CODEX_ON_SUBSCRIPTION),
         # No AI Gateway anywhere: every entry point errors, Claude included.
-        (["run", "--smart-routing", "-p", "hello"], _NO_GATEWAY_AT_ALL),
-        (["claude", "--smart-routing", "-p", "hello"], _NO_GATEWAY_AT_ALL),
+        (["claude", "--smart-routing"], _NO_GATEWAY_AT_ALL),
+        (["codex", "--smart-routing"], _NO_GATEWAY_AT_ALL),
     ],
 )
 def test_smart_routing_entry_points_error_on_an_ungatewayed_harness(

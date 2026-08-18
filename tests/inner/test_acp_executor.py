@@ -15,22 +15,27 @@ Two layers:
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from omnigent.inner import acp_executor as acp_executor_module
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp, _to_acp_mcp_servers
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
+    ExecutorError,
     ReasoningChunk,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
     TurnComplete,
+    describe_exception,
 )
 
 # ---------------------------------------------------------------------------
@@ -222,6 +227,46 @@ def test_usage_update_sets_context_window() -> None:
     assert ex.max_context_tokens() == 200000
 
 
+def test_usage_maps_cached_reads_to_the_canonical_key() -> None:
+    """
+    ``cachedReadTokens`` surfaces as its own ``cache_read_input_tokens``.
+
+    Cache reads are real consumption billed at a fraction of the input rate, so
+    folding them into ``input_tokens`` (or dropping them, as before) misreports
+    cost — in a measured Devin turn 10,944 of 15,637 input tokens were cache
+    reads. ``cache_read_input_tokens`` is the key the SSE layer and AgentInfo
+    already render, so no UI change is needed.
+
+    **What breaks if this fails**: a future token budget computes ~3x the real
+    consumption and fires almost immediately.
+    """
+    usage = AcpExecutor._usage_from_result(
+        {
+            "usage": {
+                "totalTokens": 15675,
+                "inputTokens": 15637,
+                "outputTokens": 38,
+                "cachedReadTokens": 10944,
+            }
+        }
+    )
+    assert usage == {
+        "total_tokens": 15675,
+        "input_tokens": 15637,
+        "output_tokens": 38,
+        "cache_read_input_tokens": 10944,
+    }
+
+
+def test_usage_omits_absent_and_non_integer_fields() -> None:
+    """Agents that report a subset (or garbage) still yield usable usage."""
+    assert AcpExecutor._usage_from_result({"usage": {"totalTokens": 10}}) == {"total_tokens": 10}
+    # ``True`` is an int subclass — it must not be mistaken for a token count.
+    assert AcpExecutor._usage_from_result({"usage": {"inputTokens": True}}) is None
+    assert AcpExecutor._usage_from_result({"usage": {"totalTokens": "nope"}}) is None
+    assert AcpExecutor._usage_from_result({}) is None
+
+
 def test_in_progress_tool_update_emits_nothing() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
     ex._handle_session_update({"sessionUpdate": "tool_call", "toolCallId": "c3", "title": "t"})
@@ -280,6 +325,180 @@ async def test_decide_permission_ask_without_handler_fails_closed() -> None:
 
 
 # ---------------------------------------------------------------------------
+# warm model switch (session/set_config_option)
+# ---------------------------------------------------------------------------
+
+
+def _model_option(current: str, *values: str) -> dict:
+    """A ``config_option_update`` payload advertising a settable model."""
+    return {
+        "sessionUpdate": "config_option_update",
+        "configOptions": [
+            {
+                "id": "model",
+                "currentValue": current,
+                "options": [{"value": v} for v in values],
+            }
+        ],
+    }
+
+
+def test_config_option_update_records_options_and_active_model() -> None:
+    """
+    The agent's ``currentValue`` is the only trustworthy record of the live model.
+
+    **What breaks if this fails**: we'd re-request a switch already in effect, or
+    trust the model's own self-report — which lies (Devin reported ``FAMILY=SWE``
+    after a confirmed switch to Gemini).
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(_model_option("swe-1-7-medium", "swe-1-7-medium", "gemini-3-1-pro"))
+    assert ex._active_model == "swe-1-7-medium"
+    assert "model" in ex._config_option_ids
+
+
+@pytest.mark.asyncio
+async def test_model_override_switches_warm_via_set_config_option() -> None:
+    """
+    A new model is applied with ``session/set_config_option`` using ``configId``.
+
+    ``configId`` is the parameter name the agent expects; ``optionId`` fails with
+    ``missing field 'configId'``. The session is NOT recreated, so the transcript
+    survives the switch.
+
+    **What breaks if this fails**: ``/model`` silently does nothing mid-session,
+    or the switch drops the conversation by respawning.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(_model_option("swe-1-7-medium"))
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {"result": {"configOptions": [{"id": "model", "currentValue": params["value"]}]}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "gemini-3-1-pro-low")
+
+    assert calls == [
+        (
+            "session/set_config_option",
+            {"sessionId": "s1", "configId": "model", "value": "gemini-3-1-pro-low"},
+        )
+    ]
+    assert ex._active_model == "gemini-3-1-pro-low"
+
+
+@pytest.mark.asyncio
+async def test_model_override_noops_when_already_active_or_unset() -> None:
+    """No redundant round-trip when the model is unchanged or unspecified."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(_model_option("swe-1-7-medium"))
+    ex._rpc = AsyncMock()  # type: ignore[assignment]
+
+    await ex._apply_model_override("s1", None)
+    await ex._apply_model_override("s1", "swe-1-7-medium")
+    ex._rpc.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_model_override_skipped_when_agent_has_no_model_option() -> None:
+    """
+    An agent advertising options but no ``model`` one is left alone.
+
+    **What breaks if this fails**: every turn sends a doomed request to agents
+    that simply don't support switching (goose, kilocode, …).
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(
+        {"sessionUpdate": "config_option_update", "configOptions": [{"id": "mode"}]}
+    )
+    ex._rpc = AsyncMock()  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "some-model")
+    ex._rpc.assert_not_awaited()
+    assert ex._model_switch_supported is False
+
+
+@pytest.mark.asyncio
+async def test_model_override_rejection_latches_off_and_does_not_raise() -> None:
+    """
+    A rejected switch is logged and disabled, never fatal.
+
+    **What breaks if this fails**: an agent that doesn't implement
+    ``session/set_config_option`` fails the whole turn instead of answering on
+    the model it already has.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(_model_option("m1"))
+    ex._rpc = AsyncMock(return_value={"error": {"code": -32601, "message": "unsupported"}})  # type: ignore[assignment]
+
+    await ex._apply_model_override("s1", "m2")
+    assert ex._model_switch_supported is False
+    assert ex._active_model == "m1"  # unchanged
+
+    # Latched off: a later turn must not retry.
+    ex._rpc.reset_mock()
+    await ex._apply_model_override("s1", "m3")
+    ex._rpc.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_model_override_trusts_echoed_value_over_request() -> None:
+    """
+    When the agent echoes a ``currentValue`` that differs from the request, we
+    record the echo — not the request.
+
+    An agent may normalize the id or silently keep its current model while still
+    returning success. ``currentValue`` is the only trustworthy record, so
+    ``_active_model`` must reflect it. Because the request was not actually
+    reached, the next turn must be free to retry it.
+
+    **What breaks if this fails**: ``_active_model`` reflects a model the agent
+    never switched to, so a later ``/model`` for the requested id is wrongly
+    skipped as already-active.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(_model_option("swe-1-7-medium"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        # Agent accepts the call but reports a different (normalized) id.
+        return {"result": {"configOptions": [{"id": "model", "currentValue": "gemini-3-1-pro"}]}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "gemini-3-1-pro-low")
+
+    # Echo wins over the request.
+    assert ex._active_model == "gemini-3-1-pro"
+    # The requested id was not reached, so a later turn still attempts it.
+    calls: list[str] = []
+
+    async def tracking_rpc(method, params, timeout=30.0):
+        calls.append(params["value"])
+        return {"result": {"configOptions": [{"id": "model", "currentValue": params["value"]}]}}
+
+    ex._rpc = tracking_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "gemini-3-1-pro-low")
+    assert calls == ["gemini-3-1-pro-low"]
+
+
+@pytest.mark.asyncio
+async def test_model_override_falls_back_to_request_when_no_option_echoed() -> None:
+    """
+    When the agent accepts the switch but echoes no model option, record the
+    requested model.
+
+    **What breaks if this fails**: ``_active_model`` is left stale after a
+    successful switch, so the same switch is re-requested every turn.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(_model_option("swe-1-7-medium"))
+    ex._rpc = AsyncMock(return_value={"result": {}})  # type: ignore[assignment]
+
+    await ex._apply_model_override("s1", "gemini-3-1-pro-low")
+    assert ex._active_model == "gemini-3-1-pro-low"
+
+
+# ---------------------------------------------------------------------------
 # interrupt → session/cancel
 # ---------------------------------------------------------------------------
 
@@ -331,6 +550,20 @@ def test_harness_wrap_builds_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ex._config.send_model_in_session_new is True
     assert ex._config.omnigent_mcp is False
     assert ex._config.model == "gpt-5.3"
+
+
+def test_harness_wrap_reads_env_passthrough_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The wrap decodes the forwarded names, closing parent → child → spawn env."""
+    from omnigent.inner import acp_harness
+
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "grok agent stdio")
+    monkeypatch.setenv("HARNESS_ACP_ENV_PASSTHROUGH", "XAI_API_KEY, GROK_TOKEN ,")
+    monkeypatch.setenv("XAI_API_KEY", "xai-secret")
+    ex = acp_harness._build_acp_executor()
+    assert isinstance(ex, AcpExecutor)
+    assert ex._config.env_passthrough == ("XAI_API_KEY", "GROK_TOKEN")
+    # And it actually lands in the env the agent is spawned with.
+    assert ex._build_spawn_env().get("XAI_API_KEY") == "xai-secret"
 
 
 # ---------------------------------------------------------------------------
@@ -569,3 +802,201 @@ async def test_end_to_end_denied_permission(tmp_path: Path) -> None:
 
     # Turn still completes even though the tool was rejected.
     assert any(isinstance(e, TurnComplete) for e in events)
+
+
+# ---------------------------------------------------------------------------
+# describe_exception — never report a blank turn error (#4281)
+# ---------------------------------------------------------------------------
+
+
+def test_describe_exception_falls_back_to_repr_for_blank_message():
+    """A bare exception whose ``str()`` is empty is described by ``repr()``.
+
+    Regression for #4281: executors reported failures via ``str(exc)``, so a
+    bare ``RuntimeError()`` reached the operator as "inner executor error: "
+    with no detail. The fallback must at least name the exception type.
+    """
+    assert str(RuntimeError()) == ""  # the exact blank-message case from the bug
+    described = describe_exception(RuntimeError())
+    assert described != ""
+    assert "RuntimeError" in described
+
+
+def test_describe_exception_preserves_a_real_message():
+    """When the exception carries a message, it is used verbatim (no repr noise)."""
+    assert describe_exception(ValueError("boom: bad line")) == "boom: bad line"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [RuntimeError(), TimeoutError(), OSError(), Exception()],
+)
+def test_describe_exception_never_blank(exc: BaseException):
+    """No bare stdlib exception yields an empty description."""
+    assert describe_exception(exc).strip() != ""
+
+
+# ---------------------------------------------------------------------------
+# Spawn env: the agent must actually receive credentials (#4281)
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_env_keeps_credential_declared_on_the_agent() -> None:
+    """A name in the agent's own ``env_passthrough`` reaches the subprocess.
+
+    This is the config path a user actually has (an ``acp.agents:`` row).
+    Without it the agent starts unauthenticated and stalls during the
+    handshake, which surfaced as a turn that failed with no message at all.
+    """
+    ex = AcpExecutor(
+        AcpAgentConfig(command="agent stdio", name="Grok", env_passthrough=("XAI_API_KEY",))
+    )
+    with patch.dict(os.environ, {"XAI_API_KEY": "xai-secret"}, clear=False):
+        env = ex._build_spawn_env()
+    assert env.get("XAI_API_KEY") == "xai-secret"
+
+
+def test_spawn_env_keeps_credential_declared_on_the_spec() -> None:
+    """A spec-declared ``os_env.sandbox.env_passthrough`` name still works."""
+    os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=None,
+        sandbox=OSEnvSandboxSpec(type="none", env_passthrough=["XAI_API_KEY"]),
+        fork=False,
+    )
+    ex = AcpExecutor(AcpAgentConfig(command="agent stdio", name="Grok"), os_env=os_env)
+    with patch.dict(os.environ, {"XAI_API_KEY": "xai-secret"}, clear=False):
+        env = ex._build_spawn_env()
+    assert env.get("XAI_API_KEY") == "xai-secret"
+
+
+def test_spawn_env_unions_agent_and_spec_declarations() -> None:
+    """Both sources apply; neither shadows the other."""
+    os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=None,
+        sandbox=OSEnvSandboxSpec(type="none", env_passthrough=["FROM_SPEC"]),
+        fork=False,
+    )
+    ex = AcpExecutor(
+        AcpAgentConfig(command="agent stdio", name="A", env_passthrough=("FROM_AGENT",)),
+        os_env=os_env,
+    )
+    with patch.dict(os.environ, {"FROM_SPEC": "1", "FROM_AGENT": "2"}, clear=False):
+        env = ex._build_spawn_env()
+    assert env.get("FROM_SPEC") == "1"
+    assert env.get("FROM_AGENT") == "2"
+
+
+def test_spawn_env_still_excludes_undeclared_secret() -> None:
+    """Deny-by-default holds: an undeclared provider key is not handed over."""
+    ex = AcpExecutor(AcpAgentConfig(command="agent stdio", name="Grok"))
+    with patch.dict(os.environ, {"UNRELATED_API_KEY": "nope"}, clear=False):
+        env = ex._build_spawn_env()
+    assert "UNRELATED_API_KEY" not in env
+
+
+@pytest.mark.asyncio
+async def test_handshake_timeout_reports_a_non_blank_error(tmp_path: Path) -> None:
+    """An agent that never answers ``session/new`` yields a named error.
+
+    ``asyncio.TimeoutError`` has an empty ``str()``, so reporting the failure by
+    ``str(exc)`` produced the blank "inner executor error: " an operator can't
+    act on.
+    """
+    agent_path = tmp_path / "silent_agent.py"
+    agent_path.write_text(
+        "import sys, json\n"
+        "for line in sys.stdin:\n"
+        "    line = line.strip()\n"
+        "    if not line:\n"
+        "        continue\n"
+        "    msg = json.loads(line)\n"
+        "    if msg.get('method') == 'initialize':\n"
+        "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': msg['id'],\n"
+        "            'result': {'protocolVersion': 1, 'agentCapabilities': {}}}) + '\\n')\n"
+        "        sys.stdout.flush()\n"
+        # session/new deliberately unanswered -> the handshake RPC times out.
+    )
+    command = shlex.join([sys.executable, str(agent_path)])
+
+    ex = AcpExecutor(AcpAgentConfig(command=command, name="Silent"))
+    errors = []
+    with patch.object(acp_executor_module, "_INIT_TIMEOUT_SECONDS", 1.0):
+        try:
+            async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                if isinstance(ev, ExecutorError):
+                    errors.append(ev)
+        finally:
+            await ex.close()
+
+    assert errors, "a stalled handshake must surface an ExecutorError"
+    assert errors[0].message.strip(), "the turn error must never be blank"
+    # Names the stalled call, not just the exception type.
+    assert "session/new" in errors[0].message
+    assert "Silent" in errors[0].message
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics: the agent's own stderr must reach the operator
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_startup_failure_quotes_the_agents_stderr(tmp_path: Path) -> None:
+    """An agent that explains itself on stderr has that text in the turn error.
+
+    A stalled handshake names only the RPC that timed out. The reason usually
+    sits on the agent's stderr ("no API key"), which was drained at debug level
+    into a logger the harness child had no handler for — so it reached nobody.
+    """
+    agent_path = tmp_path / "noisy_agent.py"
+    agent_path.write_text(
+        "import sys, json, time\n"
+        "for line in sys.stdin:\n"
+        "    line = line.strip()\n"
+        "    if not line:\n"
+        "        continue\n"
+        "    msg = json.loads(line)\n"
+        "    if msg.get('method') == 'initialize':\n"
+        "        sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': msg['id'],\n"
+        "            'result': {'protocolVersion': 1, 'agentCapabilities': {}}}) + '\\n')\n"
+        "        sys.stdout.flush()\n"
+        "    elif msg.get('method') == 'session/new':\n"
+        "        sys.stderr.write('ERROR: XAI_API_KEY not set\\n')\n"
+        "        sys.stderr.flush()\n"
+        "        time.sleep(3600)\n"
+    )
+    command = shlex.join([sys.executable, str(agent_path)])
+
+    ex = AcpExecutor(AcpAgentConfig(command=command, name="Grok"))
+    errors = []
+    with patch.object(acp_executor_module, "_INIT_TIMEOUT_SECONDS", 1.0):
+        try:
+            async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                if isinstance(ev, ExecutorError):
+                    errors.append(ev)
+        finally:
+            await ex.close()
+
+    assert errors, "a stalled handshake must surface an ExecutorError"
+    assert "XAI_API_KEY not set" in errors[0].message
+
+
+def test_stderr_ring_is_bounded_and_lines_are_capped() -> None:
+    """A chatty agent can't grow the ring or put a huge line in a UI toast."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", name="A"))
+    for i in range(acp_executor_module._STDERR_RING_LINES * 3):
+        ex._recent_stderr.append(f"line{i}")
+    assert len(ex._recent_stderr) == acp_executor_module._STDERR_RING_LINES
+
+    ex._recent_stderr.clear()
+    ex._recent_stderr.append("x" * 10_000)
+    msg = ex._startup_error_message(TimeoutError())
+    assert len(msg) < 2_000, "a single huge stderr line must not dominate the error"
+
+
+def test_startup_error_names_the_exception_type_when_str_is_empty() -> None:
+    """No stderr and an empty ``str(exc)`` still yields something actionable."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", name="A"))
+    assert "TimeoutError" in ex._startup_error_message(TimeoutError())

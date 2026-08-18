@@ -27,10 +27,15 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent.claude_native_bridge import bridge_dir_for_bridge_id, prepare_bridge_dir
+from omnigent.claude_native_bridge import (
+    BRIDGE_ID_LABEL_KEY,
+    bridge_dir_for_bridge_id,
+    prepare_bridge_dir,
+)
 from omnigent.entities.session_resources import SessionResourceView, terminal_resource_view
 from omnigent.inner.datamodel import TerminalEnvSpec
 from omnigent.runner import create_runner_app
+from omnigent.spec.types import AgentSpec, ToolsConfig
 from omnigent.terminals import TerminalListEntry
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
@@ -722,3 +727,572 @@ async def test_relay_policy_evaluate_rejects_wrong_token(
         assert resp.status_code == 401
     finally:
         relay.close()
+
+
+@pytest.mark.asyncio
+async def test_relay_policy_evaluate_surfaces_upstream_error_in_502_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relay /policies/evaluate returns a 502 whose body names the upstream failure.
+
+    When the refresh-capable server_client raises (e.g. the Databricks token
+    could not be refreshed), the relay must surface that reason instead of the
+    generic http.server 502 page, so the hook's fail-closed ``Detail:`` is
+    actionable rather than an opaque gateway error.
+    """
+    import asyncio
+
+    from omnigent.claude_native_bridge import prepare_bridge_dir as _prep
+    from omnigent.claude_native_bridge import start_tool_relay
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+
+    bridge_dir = _prep("relay-policy-error-test", workspace=tmp_path)
+
+    class _RaisingServerClient:
+        """Fake server_client whose policy POST fails like a lapsed token."""
+
+        async def post(self, *a: object, **kw: object) -> object:
+            raise httpx.RequestError("Databricks token refresh returned no token")
+
+    loop = asyncio.get_running_loop()
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[],
+        tool_executor=lambda name, args: {},  # type: ignore[arg-type]
+        loop=loop,
+        policy_client=_RaisingServerClient(),
+        session_id="conv_err_test",
+    )
+    try:
+        relay_info = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())
+        relay_url = relay_info["url"]
+        relay_token = relay_info["token"]
+
+        async with httpx.AsyncClient() as c:
+            resp = await c.post(
+                f"{relay_url}/policies/evaluate",
+                json={"event": {"type": "PHASE_REQUEST", "target": "", "data": {"text": "hi"}}},
+                headers={"Authorization": f"Bearer {relay_token}"},
+                timeout=5.0,
+            )
+
+        assert resp.status_code == 502
+        # The body must name the upstream cause, not the generic HTML page, so
+        # the hook's fail-closed reason is actionable.
+        assert "Databricks token refresh returned no token" in resp.text
+        assert "<html" not in resp.text.lower()
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_relay_policy_evaluate_truncates_long_upstream_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A very long upstream error is truncated with its leading cause intact.
+
+    The detail is capped before the fixed prefix is prepended, so the 502 body
+    always starts with the actionable prefix + cause and ends with an ellipsis
+    rather than being cut mid-reason by a cap applied to the whole message.
+    """
+    import asyncio
+
+    from omnigent.claude_native_bridge import prepare_bridge_dir as _prep
+    from omnigent.claude_native_bridge import start_tool_relay
+
+    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "root")
+
+    bridge_dir = _prep("relay-policy-trunc-test", workspace=tmp_path)
+
+    class _LongRaisingServerClient:
+        """Fake server_client whose policy POST fails with a very long reason."""
+
+        async def post(self, *a: object, **kw: object) -> object:
+            raise httpx.RequestError("x" * 5000)
+
+    loop = asyncio.get_running_loop()
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[],
+        tool_executor=lambda name, args: {},  # type: ignore[arg-type]
+        loop=loop,
+        policy_client=_LongRaisingServerClient(),
+        session_id="conv_trunc_test",
+    )
+    try:
+        relay_info = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())
+        relay_url = relay_info["url"]
+        relay_token = relay_info["token"]
+
+        async with httpx.AsyncClient() as c:
+            resp = await c.post(
+                f"{relay_url}/policies/evaluate",
+                json={"event": {}},
+                headers={"Authorization": f"Bearer {relay_token}"},
+                timeout=5.0,
+            )
+
+        assert resp.status_code == 502
+        body = resp.text
+        # The actionable prefix + leading cause survive; the tail is elided.
+        assert body.startswith(
+            "omnigent policy-eval proxy could not reach the Omnigent server: RequestError: "
+        )
+        assert body.endswith("...")
+        # Bounded well under the raw 5000-char reason.
+        assert len(body) < 500
+    finally:
+        relay.close()
+
+
+# ---------------------------------------------------------------------------
+# Agent switch: the relay must follow the session's current agent.
+#
+# The relay advertises a spec-derived tool surface. When the session moves to
+# a different agent, the surface the native harness sees has to move with it —
+# otherwise the harness keeps calling tools the new agent never granted, and
+# same-named tools keep the previous agent's schema.
+# ---------------------------------------------------------------------------
+
+
+class _SwitchableServerClient:
+    """Server client stub whose bound agent and bridge id can be reassigned.
+
+    Mutating :attr:`agent_id` / :attr:`bridge_id` between requests simulates
+    a server-side agent switch without restarting the runner: the runner
+    re-reads both after ``POST /v1/sessions/{id}/reset-state`` drops its
+    per-session caches.
+    """
+
+    def __init__(self, agent_id: str, bridge_id: str | None = None) -> None:
+        """
+        Initialize the stub.
+
+        :param agent_id: Agent id reported by ``GET /v1/sessions/{id}``.
+        :param bridge_id: Bridge id reported via the session labels
+            endpoint. ``None`` omits the label so the runner falls back to
+            the session id.
+        :returns: None.
+        """
+        self.agent_id = agent_id
+        self.bridge_id = bridge_id
+
+    class _Response:
+        """Stub 200 response carrying a caller-supplied JSON body."""
+
+        status_code = 200
+
+        def __init__(self, body: dict[str, Any]) -> None:
+            """
+            Initialize the response.
+
+            :param body: JSON body to return from :meth:`json`.
+            :returns: None.
+            """
+            self._body = body
+
+        def json(self) -> dict[str, Any]:
+            """Return the stub JSON body."""
+            return self._body
+
+        def raise_for_status(self) -> None:
+            """No-op: stub always succeeds."""
+
+    async def get(self, url: str, **kwargs: Any) -> _Response:
+        """Serve the session snapshot and label reads the runner performs.
+
+        :param url: Request URL, e.g. ``"/v1/sessions/conv_x/labels"``.
+        :param kwargs: Extra keyword arguments (ignored).
+        :returns: Stub 200 response.
+        """
+        del kwargs
+        if url.endswith("/labels"):
+            labels = {BRIDGE_ID_LABEL_KEY: self.bridge_id} if self.bridge_id else {}
+            return self._Response({"labels": labels})
+        return self._Response({"agent_id": self.agent_id})
+
+    async def post(self, url: str, **kwargs: Any) -> _Response:
+        """Return an empty 200 for any POST request."""
+        del url, kwargs
+        return self._Response({})
+
+    async def patch(self, url: str, **kwargs: Any) -> _Response:
+        """Return an empty 200 for any PATCH request."""
+        del url, kwargs
+        return self._Response({})
+
+
+class _FailingResourceRegistry(_StubResourceRegistry):
+    """Resource registry stub whose terminal launch can be made to fail.
+
+    Setting :attr:`fail_launch` makes the next launch raise ``RuntimeError``,
+    driving the runner's bridge-injected launch-failure rollback.
+    """
+
+    def __init__(self, tmp_path: Path) -> None:
+        """
+        Initialize the stub.
+
+        :param tmp_path: Temporary directory returned as the default env root.
+        :returns: None.
+        """
+        super().__init__(tmp_path)
+        self.fail_launch = False
+
+    async def _launch(self, **kwargs: Any) -> SessionResourceView:
+        """Raise when armed, otherwise defer to the non-spawning stub."""
+        if self.fail_launch:
+            raise RuntimeError("simulated terminal launch failure")
+        return await super()._launch(**kwargs)
+
+
+@pytest.fixture
+def terminal_registry_singleton(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Install a fresh ``TerminalRegistry`` as the runtime singleton.
+
+    ``ToolManager`` registers ``sys_terminal_*`` for a spec that declares
+    ``terminals:``, and looks the registry up via
+    :func:`omnigent.runtime.get_terminal_registry`, which raises unless the
+    runtime was initialized. These tests never run a real runtime, so they
+    install the singleton directly — the same approach
+    ``tests/runner/test_runner_dispatch.py`` uses for the relay schema
+    builder.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.runtime import _globals as rt_globals
+    from omnigent.terminals.registry import TerminalRegistry
+
+    monkeypatch.setattr(rt_globals, "_terminal_registry", TerminalRegistry())
+
+
+def _spec_with_terminals() -> AgentSpec:
+    """Return a spec that grants the ``sys_terminal_*`` family."""
+    return AgentSpec(
+        spec_version=1,
+        name="agent-with-terminals",
+        terminals={"bash": TerminalEnvSpec(command="bash")},
+    )
+
+
+def _spec_without_terminals() -> AgentSpec:
+    """Return a spec that grants no terminal tools."""
+    return AgentSpec(spec_version=1, name="agent-without-terminals")
+
+
+def _spec_with_sub_agent(sub_agent_name: str) -> AgentSpec:
+    """
+    Return a spec granting exactly one named sub-agent.
+
+    ``sys_session_send`` derives its ``agent`` enum from this list, so two
+    such specs advertise the same tool name with different schemas.
+
+    :param sub_agent_name: Sub-agent name to grant, e.g. ``"alpha"``.
+    :returns: Parent spec declaring that single sub-agent.
+    """
+    return AgentSpec(
+        spec_version=1,
+        name=f"parent-of-{sub_agent_name}",
+        tools=ToolsConfig(agents=[sub_agent_name]),
+        sub_agents=[AgentSpec(spec_version=1, name=sub_agent_name)],
+    )
+
+
+def _relay_tool_names(relay_file: Path) -> set[str]:
+    """
+    Return the tool names advertised in a ``tool_relay.json``.
+
+    :param relay_file: Path to the relay advertisement.
+    :returns: Advertised tool names.
+    """
+    return {t["name"] for t in json.loads(relay_file.read_text())["tools"]}
+
+
+def _sub_agent_enum(relay_file: Path) -> set[str]:
+    """
+    Return the ``sys_session_send`` sub-agent enum from a relay file.
+
+    :param relay_file: Path to the relay advertisement.
+    :returns: Allowed ``agent`` values, empty when the tool is absent.
+    """
+    for tool in json.loads(relay_file.read_text())["tools"]:
+        if tool["name"] == "sys_session_send":
+            agent_prop = tool.get("parameters", {}).get("properties", {}).get("agent", {})
+            if enum := agent_prop.get("enum"):
+                return set(enum)
+            for variant in agent_prop.get("anyOf", []):
+                if "enum" in variant:
+                    return set(variant["enum"])
+    return set()
+
+
+def _switch_app(
+    tmp_path: Path,
+    server_client: _SwitchableServerClient,
+    specs: dict[str, AgentSpec],
+    resource_registry: _StubResourceRegistry | None = None,
+) -> FastAPI:
+    """
+    Build a runner app that resolves each agent id to a distinct spec.
+
+    :param tmp_path: Pytest temp directory used for the stub env root.
+    :param server_client: Stub server client reporting the bound agent.
+    :param specs: Agent id → spec the resolver hands back.
+    :param resource_registry: Registry stub. ``None`` builds the default
+        non-spawning one.
+    :returns: The runner FastAPI app.
+    """
+
+    async def spec_resolver(agent_id: str, session_id: str | None) -> AgentSpec | None:
+        del session_id
+        return specs.get(agent_id)
+
+    return create_runner_app(
+        resource_registry=resource_registry or _StubResourceRegistry(tmp_path),
+        server_client=server_client,  # type: ignore[arg-type]  # duck-typed for test
+        spec_resolver=spec_resolver,
+    )
+
+
+async def _launch_bridged(client: httpx.AsyncClient, session_id: str) -> None:
+    """
+    Launch the bridge-injected claude terminal, requiring success.
+
+    :param client: HTTP client bound to the runner app.
+    :param session_id: Session/conversation identifier.
+    :returns: None.
+    """
+    resp = await _launch_terminal(client, session_id, bridge_inject_dir=True)
+    assert resp.status_code == 200, f"terminal launch failed: {resp.text}"
+
+
+async def _reset_state(client: httpx.AsyncClient, session_id: str) -> None:
+    """
+    Drop the runner's per-session caches, as an agent switch does.
+
+    :param client: HTTP client bound to the runner app.
+    :param session_id: Session/conversation identifier.
+    :returns: None.
+    """
+    resp = await client.post(f"/v1/sessions/{session_id}/reset-state")
+    assert resp.status_code == 200, f"reset-state failed: {resp.text}"
+
+
+@pytest.mark.asyncio
+async def test_agent_switch_replaces_relay_in_same_bridge_dir(
+    tmp_path: Path,
+    terminal_registry_singleton: None,
+) -> None:
+    """A switch to an agent without terminals drops the ``sys_terminal_*`` grant.
+
+    Agent A declares ``terminals:``, so the relay advertises the terminal
+    family. Agent B declares none. Once the session is switched and its
+    caches are reset, the next relay lookup must rebuild the advertisement
+    from agent B's spec — keeping agent A's terminal tools would let the
+    harness call a family the current agent never granted.
+    """
+    agent_a, agent_b = "ag_terminals", "ag_plain"
+    server_client = _SwitchableServerClient(agent_a)
+    app = _switch_app(
+        tmp_path,
+        server_client,
+        {agent_a: _spec_with_terminals(), agent_b: _spec_without_terminals()},
+    )
+
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
+            await _launch_bridged(c, session_id)
+            before = _relay_tool_names(relay_file)
+            # Precondition: agent A's spec gate really did grant the family.
+            assert {n for n in before if n.startswith("sys_terminal_")}, (
+                f"agent A declares terminals but advertised no sys_terminal_*: {before}"
+            )
+
+            server_client.agent_id = agent_b
+            await _reset_state(c, session_id)
+            await _launch_bridged(c, session_id)
+
+            after = _relay_tool_names(relay_file)
+            # The whole point of the fix: a stale relay would still be
+            # advertising agent A's terminal family here.
+            assert not {n for n in after if n.startswith("sys_terminal_")}, (
+                f"terminal tools survived a switch to an agent without terminals: {after}"
+            )
+            # The rest of the always-on surface must still be advertised —
+            # the relay was rebuilt, not torn down.
+            assert "list_comments" in after
+    finally:
+        with contextlib.suppress(httpx.HTTPError):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://runner"
+            ) as c:
+                await c.delete(f"/v1/sessions/{session_id}")
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_agent_switch_moves_relay_to_new_bridge_dir(tmp_path: Path) -> None:
+    """A switch that changes the bridge id relays into the new directory.
+
+    Switching between native harness families reassigns the session's
+    bridge id. The relay has to follow: the new bridge directory needs an
+    advertisement (otherwise the new harness sees no relay tools at all),
+    and the old directory's advertisement must be withdrawn.
+    """
+    agent_a, agent_b = "ag_bridge_a", "ag_bridge_b"
+    bridge_a = f"bridge_{uuid.uuid4().hex[:10]}"
+    bridge_b = f"bridge_{uuid.uuid4().hex[:10]}"
+    server_client = _SwitchableServerClient(agent_a, bridge_id=bridge_a)
+    app = _switch_app(
+        tmp_path,
+        server_client,
+        {agent_a: _spec_without_terminals(), agent_b: _spec_without_terminals()},
+    )
+
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    dir_a = bridge_dir_for_bridge_id(bridge_a)
+    dir_b = bridge_dir_for_bridge_id(bridge_b)
+    prepare_bridge_dir(bridge_a, workspace=tmp_path)
+    prepare_bridge_dir(bridge_b, workspace=tmp_path)
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
+            await _launch_bridged(c, session_id)
+            assert (dir_a / _TOOL_RELAY_FILE).exists(), "no relay written for the first bridge"
+
+            server_client.agent_id = agent_b
+            server_client.bridge_id = bridge_b
+            await _reset_state(c, session_id)
+            await _launch_bridged(c, session_id)
+
+            # Without the fix the cached relay short-circuits before the new
+            # bridge dir is computed, so the new harness gets nothing.
+            assert (dir_b / _TOOL_RELAY_FILE).exists(), (
+                "the new bridge directory received no relay after the switch"
+            )
+            # The superseded relay is closed, which unlinks its own file.
+            assert not (dir_a / _TOOL_RELAY_FILE).exists(), (
+                "the previous bridge directory kept a stale relay advertisement"
+            )
+    finally:
+        with contextlib.suppress(httpx.HTTPError):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://runner"
+            ) as c:
+                await c.delete(f"/v1/sessions/{session_id}")
+        for bdir in (dir_a, dir_b):
+            shutil.rmtree(bdir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_agent_switch_rebuilds_same_named_tool_schema(tmp_path: Path) -> None:
+    """Two agents advertising the same tool names get their own schemas.
+
+    Both agents grant ``sys_session_send``, so the advertised name set is
+    identical and a name-level comparison would see no change. The schemas
+    differ: each enumerates only its own sub-agent. After a switch the
+    harness must be handed agent B's contract.
+    """
+    agent_a, agent_b = "ag_alpha", "ag_beta"
+    server_client = _SwitchableServerClient(agent_a)
+    app = _switch_app(
+        tmp_path,
+        server_client,
+        {agent_a: _spec_with_sub_agent("alpha"), agent_b: _spec_with_sub_agent("beta")},
+    )
+
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
+            await _launch_bridged(c, session_id)
+            names_before = _relay_tool_names(relay_file)
+            # Precondition: the spec gate produced the sub-agent enum this
+            # test discriminates on.
+            assert _sub_agent_enum(relay_file) == {"alpha"}
+
+            server_client.agent_id = agent_b
+            await _reset_state(c, session_id)
+            await _launch_bridged(c, session_id)
+
+            # Same tool names on both sides — only the schema moved, which is
+            # exactly the case a name-only refresh check would miss.
+            assert _relay_tool_names(relay_file) == names_before
+            assert _sub_agent_enum(relay_file) == {"beta"}, (
+                "sys_session_send still advertises the previous agent's sub-agents"
+            )
+    finally:
+        with contextlib.suppress(httpx.HTTPError):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://runner"
+            ) as c:
+                await c.delete(f"/v1/sessions/{session_id}")
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_failed_launch_rolls_back_the_relay_it_started(tmp_path: Path) -> None:
+    """A failed bridge-injected launch withdraws the relay that launch installed.
+
+    The rollback used to be gated on "was a relay already present", which a
+    relay left over from the previous agent makes true — so the relay this
+    launch built for the new agent stayed bound and advertised even though
+    the terminal never came up. Rollback is keyed on the relay instance
+    instead, so what this launch installed is what it removes.
+    """
+    agent_a, agent_b = "ag_first", "ag_second"
+    server_client = _SwitchableServerClient(agent_a)
+    registry = _FailingResourceRegistry(tmp_path)
+    app = _switch_app(
+        tmp_path,
+        server_client,
+        {agent_a: _spec_without_terminals(), agent_b: _spec_with_sub_agent("beta")},
+        resource_registry=registry,
+    )
+
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
+            await _launch_bridged(c, session_id)
+            assert relay_file.exists()  # precondition: agent A's relay is up
+
+            server_client.agent_id = agent_b
+            await _reset_state(c, session_id)
+
+            registry.fail_launch = True
+            failed = await _launch_terminal(c, session_id, bridge_inject_dir=True)
+            assert failed.status_code == 500
+
+            assert not relay_file.exists(), (
+                "the relay this failed launch installed stayed bound and advertised"
+            )
+    finally:
+        with contextlib.suppress(httpx.HTTPError):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://runner"
+            ) as c:
+                await c.delete(f"/v1/sessions/{session_id}")
+        shutil.rmtree(bridge_dir, ignore_errors=True)

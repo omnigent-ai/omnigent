@@ -189,7 +189,7 @@ async def test_partial_failure_surfaces_healthy_servers(
 async def test_schemas_for_surfaces_initialize_instructions(
     patch_connection: dict[str, Any],
 ) -> None:
-    """Healthy servers' InitializeResult.instructions must appear keyed by serverInfo.name."""
+    """Healthy servers' InitializeResult.instructions are keyed by unique config name."""
     patch_connection["__tools_for__"]["pipeshub"] = [_make_tool_def("chat")]
     patch_connection["__tools_for__"]["other"] = [_make_tool_def("ping")]
     patch_connection["__instructions_for__"]["pipeshub"] = " Prefer pipeshub_chat. "
@@ -204,7 +204,8 @@ async def test_schemas_for_surfaces_initialize_instructions(
     finally:
         await manager.shutdown()
 
-    assert result.server_instructions == {"PipesHub MCP": "Prefer pipeshub_chat."}
+    assert result.server_instructions == {"pipeshub": "Prefer pipeshub_chat."}
+    assert result.server_labels == {"pipeshub": "PipesHub MCP"}
     assert "other" not in result.server_instructions
 
 
@@ -223,6 +224,37 @@ async def test_schemas_for_falls_back_to_config_name_without_server_info(
         await manager.shutdown()
 
     assert result.server_instructions == {"alpha": "Use alpha tools."}
+    assert result.server_labels == {"alpha": "alpha"}
+
+
+@pytest.mark.asyncio
+async def test_schemas_for_keeps_colliding_display_names(
+    patch_connection: dict[str, Any],
+) -> None:
+    """Two servers advertising the same serverInfo.name must not overwrite each other."""
+    patch_connection["__tools_for__"]["pipeshub"] = [_make_tool_def("chat")]
+    patch_connection["__tools_for__"]["pipeshub-staging"] = [_make_tool_def("chat")]
+    patch_connection["__instructions_for__"]["pipeshub"] = "Prefer prod."
+    patch_connection["__instructions_for__"]["pipeshub-staging"] = "Prefer staging."
+    patch_connection["__info_names_for__"]["pipeshub"] = "PipesHub MCP"
+    patch_connection["__info_names_for__"]["pipeshub-staging"] = "PipesHub MCP"
+
+    manager = RunnerMcpManager()
+    try:
+        result = await manager.schemas_for(
+            _make_spec(_make_config("pipeshub"), _make_config("pipeshub-staging"))
+        )
+    finally:
+        await manager.shutdown()
+
+    assert result.server_instructions == {
+        "pipeshub": "Prefer prod.",
+        "pipeshub-staging": "Prefer staging.",
+    }
+    assert result.server_labels == {
+        "pipeshub": "PipesHub MCP",
+        "pipeshub-staging": "PipesHub MCP",
+    }
 
 
 @pytest.mark.asyncio

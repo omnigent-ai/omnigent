@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  harnessDisplayLabel,
   isSessionScopedDecision,
   routingExtras,
   routingExtrasFromWire,
@@ -134,5 +135,29 @@ describe("showsRoutingDecisionChip", () => {
     [undefined, null, true],
   ] as const)("scope %s with override %s shows: %s", (scope, override, expected) => {
     expect(showsRoutingDecisionChip(scope, override)).toBe(expected);
+  });
+});
+
+describe("harnessDisplayLabel", () => {
+  it("shortens native harness ids", () => {
+    expect(harnessDisplayLabel("claude-native")).toBe("claude");
+    expect(harnessDisplayLabel("codex-native")).toBe("codex");
+  });
+
+  it("leaves SDK ids unchanged", () => {
+    // A bundle agent's (Polly/Debby) SDK children carry no -native suffix.
+    expect(harnessDisplayLabel("codex")).toBe("codex");
+    expect(harnessDisplayLabel("claude-sdk")).toBe("claude-sdk");
+    expect(harnessDisplayLabel("auto")).toBe("auto");
+  });
+
+  it("shortens only a trailing suffix", () => {
+    expect(harnessDisplayLabel("native-brain")).toBe("native-brain");
+  });
+
+  it("returns null when the decision has no harness", () => {
+    expect(harnessDisplayLabel(null)).toBeNull();
+    expect(harnessDisplayLabel(undefined)).toBeNull();
+    expect(harnessDisplayLabel("  ")).toBeNull();
   });
 });

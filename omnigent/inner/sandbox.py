@@ -491,6 +491,194 @@ def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
     return _get_backend(sandbox_spec.type).resolve(spec, cwd)
 
 
+def containment_prefix(root: str | Path) -> str:
+    """
+    Express *root* as a prefix for a containment test.
+
+    The trailing separator is load-bearing: it is what stops a boundary at
+    ``/data`` from admitting a sibling ``/database``, and — because the
+    candidate is put in the same form — it lets the boundary path itself
+    still match.
+
+    Does NOT resolve: callers pass roots that are already canonical (grant
+    roots are resolved when the policy is built), and re-resolving here
+    would put a filesystem syscall in the agent's per-operation guard.
+
+    :param root: Canonical absolute path, e.g. ``"/data"``.
+    :returns: The same path with one trailing separator, e.g. ``"/data/"``.
+    """
+    text = str(root)
+    return text if text.endswith(os.sep) else text + os.sep
+
+
+def contained_realpath(candidate: str, prefix: str) -> str | None:
+    """
+    Fully resolve *candidate*, returning it only if it stays under *prefix*.
+
+    Resolution happens BEFORE the comparison, so neither a ``..`` segment nor
+    a symlink can aim the final path outside the boundary that admitted it.
+
+    Deliberately ``os.path.realpath`` rather than ``Path.resolve()``: the
+    pathlib form is a filesystem access performed through a path object built
+    from unchecked input, so it acts on the path before this function can vet
+    it. ``realpath`` normalizes the string first. (This is also the shape
+    CodeQL's ``py/path-injection`` recognizes as safe — normalize, then test
+    the prefix — so the guard is machine-checkable rather than a claim in a
+    comment.)
+
+    :param candidate: Path to resolve, e.g. ``"/data/../etc/passwd"``.
+    :param prefix: Boundary from :func:`containment_prefix`.
+    :returns: The resolved absolute path, or ``None`` when it escapes.
+    """
+    # Both sides carry a trailing separator for the comparison — that is what
+    # keeps a boundary at "/data" from admitting "/database", and what lets the
+    # boundary directory itself match. Stripped back off before returning so
+    # callers get an ordinary path.
+    probe = os.path.realpath(candidate)
+    if not probe.endswith(os.sep):
+        probe += os.sep
+    if probe.startswith(prefix):
+        return probe.rstrip(os.sep) or os.sep
+    return None
+
+
+@dataclass(frozen=True)
+class ReachableRoot:
+    """
+    One path an environment's file tools are permitted to reach.
+
+    Produced by :func:`reachable_roots`, which is the single source of
+    truth for the grant boundary: the same list drives enforcement (in
+    :func:`omnigent.inner.os_env._assert_within_reach`) and the reach
+    the file-browsing APIs advertise, so the two cannot drift.
+
+    :param path: Resolved absolute path of the grant, e.g.
+        ``Path("/Users/corey/data")``.
+    :param access: ``"write"`` when the grant admits reads and writes,
+        ``"read"`` when it admits reads only.
+    :param origin: Which declaration produced this grant — ``"cwd"``,
+        ``"read_paths"``, ``"write_paths"``, or ``"write_files"``.
+        ``"unconfined"`` marks the synthetic filesystem-root grant that
+        :func:`omnigent.runner.environment_filesystem.resolve_browse_target`
+        adds for an unconfined policy; it is never advertised or returned
+        by :func:`reachable_roots`.
+        Carried for display; enforcement uses :attr:`kind` and
+        :attr:`access`.
+    :param kind: ``"tree"`` when the grant covers the subtree rooted at
+        :attr:`path`, ``"file"`` when it covers exactly that one path.
+    """
+
+    path: Path
+    access: str
+    origin: str
+    kind: str
+
+    @property
+    def prefix(self) -> str:
+        """
+        This grant's boundary in comparison form — the single definition of
+        "inside", shared by :meth:`contains` and by the callers that must
+        inline the comparison (see :func:`contained_realpath`).
+
+        :returns: :attr:`path` with a trailing separator, e.g. ``"/data/"``.
+        """
+        return containment_prefix(self.path)
+
+    def contains(self, resolved: Path) -> bool:
+        """
+        Whether *resolved* falls inside this grant.
+
+        :param resolved: Fully-resolved candidate path.
+        :returns: ``True`` when the grant covers it.
+        """
+        probe = containment_prefix(resolved)
+        if not probe.startswith(self.prefix):
+            return False
+        # A file grant covers exactly one path; equal prefix lengths means the
+        # candidate IS that path rather than something notionally beneath it.
+        return self.kind == "tree" or len(probe) == len(self.prefix)
+
+
+def reachable_roots(cwd: Path, policy: SandboxPolicy) -> list[ReachableRoot]:
+    """
+    Enumerate the paths an environment's file tools may reach.
+
+    Mirrors the grant vocabulary the sandbox backends already populate:
+    *cwd* is always reachable for read and write; ``write_paths`` /
+    ``write_files`` admit reads and writes of their target; ``read_paths``
+    admits reads only. With no grants declared the result is *cwd* alone
+    — the historical confinement, unchanged.
+
+    This describes the FILE-TOOL boundary only. It is deliberately not
+    widened when the policy is inactive: under ``sandbox.type: none`` the
+    co-resident shell is unconfined, but ``sys_os_read`` and friends stay
+    confined here on purpose. Callers that browse on a human's behalf
+    should consult :func:`is_unconfined` separately rather than expecting
+    this list to grow.
+
+    :param cwd: The environment root.
+    :param policy: Resolved sandbox policy carrying the declared grants.
+    :returns: Grants in precedence order, cwd first. Never empty.
+    """
+    # Resolving cwd is what makes the grants comparable to a resolved
+    # candidate path. Callers pass a root that is already contained — see
+    # `_session_workspace` / `compute_default_env_root`, which vet it against
+    # the runner workspace before it ever reaches here.
+    roots = [ReachableRoot(path=cwd.resolve(), access="write", origin="cwd", kind="tree")]
+    roots += [
+        ReachableRoot(path=root, access="write", origin="write_paths", kind="tree")
+        for root in policy.write_roots
+    ]
+    roots += [
+        ReachableRoot(path=grant, access="write", origin="write_files", kind="file")
+        for grant in policy.write_files
+    ]
+    roots += [
+        ReachableRoot(path=root, access="read", origin="read_paths", kind="tree")
+        for root in (policy.read_roots or [])
+    ]
+    return roots
+
+
+def reach_payload(roots: Sequence[ReachableRoot], *, unconfined: bool) -> dict[str, object]:
+    """
+    JSON-ready description of what an environment's file browsing can reach.
+
+    The single definition of this wire shape. Both producers use it — the
+    runner when the agent is awake, and the server when it synthesizes the
+    environment for a sleeping agent — so a browser cannot be told one thing
+    by one and something else by the other.
+
+    :param roots: Grants from :func:`reachable_roots`.
+    :param unconfined: Result of :func:`is_unconfined`.
+    :returns: ``{"unconfined": bool, "roots": [{"path", "access", "origin"}]}``.
+    """
+    return {
+        "unconfined": unconfined,
+        "roots": [
+            {"path": str(root.path), "access": root.access, "origin": root.origin}
+            for root in roots
+        ],
+    }
+
+
+def is_unconfined(policy: SandboxPolicy) -> bool:
+    """
+    Whether the policy leaves the environment without OS-level confinement.
+
+    ``True`` for ``sandbox.type: none``, where no bwrap / seatbelt wrap is
+    applied and the environment's shell runs with the caller's own
+    privileges. File *tools* remain confined to :func:`reachable_roots`
+    regardless; this reports only that the process itself is not boxed in,
+    which is what lets a human-facing browser show paths the shell could
+    already read anyway.
+
+    :param policy: Resolved sandbox policy.
+    :returns: ``True`` when no sandbox backend is active.
+    """
+    return not policy.active
+
+
 def activate_sandbox(policy: SandboxPolicy) -> None:
     if not policy.active:
         return
@@ -1013,8 +1201,8 @@ def _default_sandbox_for_platform() -> OSEnvSandboxSpec:
     Spec-self-containment is preserved: a YAML that explicitly
     declares ``sandbox.type: linux_bwrap`` still routes to the bwrap
     backend and errors loudly on macOS (the author asked for it). The
-    default only fires when ``sandbox:`` is omitted or when the YAML's
-    ``sandbox:`` block declares fields but not ``type:``.
+    default fires when ``sandbox:`` is omitted, when its ``type:`` is
+    omitted, or when ``type: auto`` is selected explicitly.
 
     :returns: :class:`OSEnvSandboxSpec` with the OS-appropriate
         ``type``.
@@ -1032,6 +1220,15 @@ def _default_sandbox_for_platform() -> OSEnvSandboxSpec:
         f"No sandbox backend is available on platform {sys.platform!r}. "
         "Set os_env.sandbox.type='none' explicitly to run without a sandbox."
     )
+
+
+def _resolve_sandbox_type(raw_type: str | None) -> str:
+    """Resolve ``auto`` to the platform default and null to disabled."""
+    if raw_type is None:
+        return "none"
+    if raw_type == "auto":
+        return _default_sandbox_for_platform().type
+    return raw_type
 
 
 def _project_root() -> Path:

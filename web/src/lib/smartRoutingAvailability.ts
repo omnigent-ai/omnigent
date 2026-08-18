@@ -1,11 +1,11 @@
 // Why top-level Smart Routing can (or can't) be offered on the new-chat
 // landing, and how to say so.
 //
-// The landing drops a Smart Routing pick it can't honour. Four different
+// The landing drops a Smart Routing pick it can't honour. Five different
 // conditions cause that, and they need different words: a server with routing
-// switched off is not a host missing a CLI, neither is a deployment whose
-// native wrapper agents aren't registered, and neither is a host whose CLI runs
-// off something other than the workspace AI gateway.
+// switched off is not a deployment whose only router is the built-in judge, is
+// not a deployment whose native wrapper agents aren't registered, and is not a
+// host whose CLI runs off something other than the workspace AI gateway.
 
 import { SMART_ROUTING_LABEL } from "@/lib/agentLabels";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
@@ -21,6 +21,12 @@ export const SMART_ROUTING_ARMS = ["claude-native", "codex-native"] as const;
 export type SmartRoutingUnavailableCause =
   /** The server has routing switched off (`smart_routing_enabled: false`). */
   | { kind: "routing-disabled" }
+  /**
+   * The server's only router is the built-in judge. The native-pane row needs
+   * the external AI-Gateway router to choose which CLI pane launches, so a
+   * judge-only deployment has nothing to answer it.
+   */
+  | { kind: "external-router-required" }
   /** A native wrapper agent Smart Routing binds isn't registered. */
   | { kind: "wrappers-missing" }
   /** Ready-to-run arms are missing on the selected host. */
@@ -29,7 +35,8 @@ export type SmartRoutingUnavailableCause =
    * Arms whose family the host doesn't back with the workspace AI gateway. The
    * external router's apply layer rewrites the model through the gateway, so a
    * CLI pointed anywhere else can't be routed by it even with the CLI
-   * installed. Only fires when the built-in judge can't answer instead.
+   * installed. The built-in judge does not cover for it here — the native-pane
+   * row runs on the external router alone.
    */
   | { kind: "not-gateway-backed"; harnesses: string[] };
 
@@ -59,16 +66,23 @@ export function smartRoutingSourceFor(inputs: {
 }
 
 /**
- * Classify why Smart Routing can't be offered, most-fundamental cause first —
- * routing being off makes the host's CLIs irrelevant, and a CLI that isn't
- * installed makes its inference config irrelevant.
+ * Classify why the top-level native-pane Smart Routing row — the router picks
+ * which native CLI pane launches AND its model — can't be offered,
+ * most-fundamental cause first: routing being off makes the router sources
+ * irrelevant, a source that can't drive the pane makes the host's CLIs
+ * irrelevant, and a CLI that isn't installed makes its inference config
+ * irrelevant.
  *
- * An off-gateway arm is only a loss when the external router is the only one
- * that can answer: with the built-in judge available it routes that arm
- * instead, so ``not-gateway-backed`` stops firing.
+ * Only the external AI-Gateway router drives that pane, so every gate here
+ * reads it alone; a deployment whose only source is the built-in judge keeps
+ * per-harness Smart Routing and loses this row. Scoped to the native-pane row:
+ * a bundle agent's routed brain runs the judge's harness pick happily and gates
+ * on {@link smartRoutingSourceFor} instead.
  *
  * @param inputs - The independent conditions, read off the server flags,
- *   the agent list, and the selected host.
+ *   the agent list, and the selected host. ``externalRoutingAvailable`` is
+ *   optional so an older caller (and a server that predates
+ *   ``smart_routing_sources``) keeps the pre-source answer.
  * @returns The cause, or ``null`` when Smart Routing is available.
  */
 export function smartRoutingUnavailableReason(inputs: {
@@ -76,15 +90,16 @@ export function smartRoutingUnavailableReason(inputs: {
   wrappersRegistered: boolean;
   unreadyHarnesses: readonly string[];
   notGatewayBackedHarnesses?: readonly string[];
-  ossRoutingAvailable?: boolean;
+  externalRoutingAvailable?: boolean;
 }): SmartRoutingUnavailableCause | null {
   if (!inputs.routingEnabled) return { kind: "routing-disabled" };
+  if (inputs.externalRoutingAvailable === false) return { kind: "external-router-required" };
   if (!inputs.wrappersRegistered) return { kind: "wrappers-missing" };
   if (inputs.unreadyHarnesses.length > 0) {
     return { kind: "harnesses-unready", harnesses: [...inputs.unreadyHarnesses] };
   }
   const notBacked = inputs.notGatewayBackedHarnesses ?? [];
-  if (notBacked.length > 0 && inputs.ossRoutingAvailable !== true) {
+  if (notBacked.length > 0) {
     return { kind: "not-gateway-backed", harnesses: [...notBacked] };
   }
   return null;
@@ -135,6 +150,8 @@ export function smartRoutingDroppedMessage(
   switch (cause.kind) {
     case "routing-disabled":
       return `${SMART_ROUTING_LABEL} is turned off on this server — switched to ${to}.`;
+    case "external-router-required":
+      return `${SMART_ROUTING_LABEL} across harnesses needs the workspace AI gateway router on this server — switched to ${to}.`;
     case "wrappers-missing":
       return `${SMART_ROUTING_LABEL} needs the ${armList(SMART_ROUTING_ARMS)} agents registered on this server — switched to ${to}.`;
     case "harnesses-unready":

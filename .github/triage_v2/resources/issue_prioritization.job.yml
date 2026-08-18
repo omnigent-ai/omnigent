@@ -4,17 +4,20 @@ resources:
       name: "[${bundle.target}] Issue prioritization v2"
       max_concurrent_runs: 1
       trigger:
-        pause_status: PAUSED
-        periodic:
-          interval: 6
-          unit: HOURS
+        pause_status: ${var.schedule_pause_status}
+        table_update:
+          table_names:
+            - ${var.catalog}.${var.schema}.${var.source_table}
+          condition: ANY_UPDATED
+          min_time_between_triggers_seconds: 3600
+          wait_after_last_change_seconds: 300
       parameters:
         - name: mode
-          default: dry_run
+          default: ${var.scheduled_mode}
         - name: regrade
           default: "false"
         - name: adopt_legacy_bot_priorities
-          default: "false"
+          default: ${var.scheduled_adopt_legacy_bot_priorities}
       tasks:
         - task_key: score_open_issues
           python_wheel_task:
@@ -33,11 +36,13 @@ resources:
               artifact-dir: /Volumes/${var.catalog}/${var.schema}/${var.artifact_volume_name}
               model-endpoint: ${var.model_endpoint}
               areas-path: ${workspace.file_path}/areas.json
-              maintainers-path: ${workspace.file_path}/MAINTAINER
               label-manifest-path: ${workspace.file_path}/issue-prioritization-labels.json
               github-repo: ${var.github_repo}
               github-secret-scope: ${var.github_secret_scope}
+              github-auth-mode: ${var.github_auth_mode}
               github-token-secret-key: ${var.github_token_secret_key}
+              github-app-client-id-secret-key: ${var.github_app_client_id_secret_key}
+              github-app-private-key-secret-key: ${var.github_app_private_key_secret_key}
               legacy-priority-bot-logins: ${var.legacy_priority_bot_logins}
               allow-github-writes: ${var.allow_github_writes}
           environment_key: default

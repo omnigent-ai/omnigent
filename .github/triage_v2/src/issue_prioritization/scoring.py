@@ -110,8 +110,8 @@ class ScoreEngine:
         self.modules = tuple(modules)
 
     def score(self, issue: Issue) -> ScoreResult:
-        score = self.config.severity_weights[issue.severity]
-        steps = [ScoreStep("severity", "set", score, Decimal(0), score)]
+        score = self.config.impact_weights[issue.impact]
+        steps = [ScoreStep("impact", "set", score, Decimal(0), score)]
         if issue.needs_info:
             score = Decimal(0)
             steps.append(ScoreStep("needs_info", "set", score, steps[-1].score_after, score))

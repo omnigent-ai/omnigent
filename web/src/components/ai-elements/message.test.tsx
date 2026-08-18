@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MessageContent, MessageResponse } from "./message";
+import { Message, MessageAction, MessageActions, MessageContent, MessageResponse } from "./message";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
@@ -32,6 +32,44 @@ describe("MessageContent", () => {
   });
 });
 
+describe("Message", () => {
+  it("keeps the message shrinkable", () => {
+    render(<Message data-testid="message" from="assistant" />);
+
+    expect(screen.getByTestId("message")).toHaveClass("min-w-0");
+  });
+
+  it("keeps a caller's width override alongside min-w-0", () => {
+    render(<Message className="max-w-3xl" data-testid="message" from="assistant" />);
+
+    const message = screen.getByTestId("message");
+    expect(message).toHaveClass("min-w-0", "max-w-3xl");
+  });
+});
+
+describe("MessageAction", () => {
+  it("uses muted color by default and foreground color on hover", () => {
+    render(
+      <MessageAction label="Copy">
+        <svg aria-hidden />
+      </MessageAction>,
+    );
+
+    expect(screen.getByRole("button", { name: "Copy" })).toHaveClass(
+      "text-muted-foreground",
+      "hover:text-foreground",
+    );
+  });
+});
+
+describe("MessageActions", () => {
+  it("uses 12px spacing between actions", () => {
+    render(<MessageActions data-testid="message-actions">Actions</MessageActions>);
+
+    expect(screen.getByTestId("message-actions")).toHaveClass("gap-3");
+  });
+});
+
 describe("MessageResponse", () => {
   it("blocks external image markdown and renders a placeholder", async () => {
     render(<MessageResponse>{"![leak](https://attacker.example/pixel.png)"}</MessageResponse>);
@@ -52,6 +90,20 @@ describe("MessageResponse", () => {
     await waitFor(() => {
       expect(container.firstElementChild).toHaveClass("math-config-b");
     });
+  });
+
+  it("gives prose a break opportunity for an unbroken run (OMNI-2900)", () => {
+    const { container } = render(<MessageResponse>same text</MessageResponse>);
+
+    expect(container.firstElementChild).toHaveClass("wrap-anywhere");
+  });
+
+  it("keeps wrap-anywhere alongside a caller-supplied className", () => {
+    const { container } = render(
+      <MessageResponse className="math-config-a">same text</MessageResponse>,
+    );
+
+    expect(container.firstElementChild).toHaveClass("wrap-anywhere", "math-config-a");
   });
 });
 

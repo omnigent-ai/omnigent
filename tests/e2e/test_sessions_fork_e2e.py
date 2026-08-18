@@ -201,6 +201,7 @@ def _fork_session(
     return fork
 
 
+@pytest.mark.compat_smoke
 def test_full_fork_replays_whole_history(
     http_client: httpx.Client,
     live_runner_id: str,

@@ -29,7 +29,7 @@ separately since they are mostly backlogs or require coordination.
 
 We currently have: 725 issues (360 open / 365 closed).
 
-**1. Issues are splited into `Bug` and `enhancement` (FRs).** This is good, we keep it as-is.
+**1. Issues are split into `Bug` and `Feature` (FRs).** This is good, we keep it as-is.
 
 **2. Most issues are P1 / P2.**
 
@@ -55,7 +55,7 @@ treated equally. For example, ([#2125](https://github.com/omnigent-ai/omnigent/i
 credentials): a real self-hoster blocker, labeled `P2-medium` purely because it's an FR.
 There is no way today for it to outrank a weak P1.
 
-**Propose:** Let's have priorities for FRs too. Since we might filter by `bug`/`enhancement` anyway,
+**Propose:** Let's have priorities for FRs too. Since we might filter by `Bug`/`Feature` anyway,
 this doesn't takeaway anything mentally.
 
 **4. Buckets are too coarse.** 148 (41%) are `comp:harness`, 135 are `comp:server`, 109 are
@@ -95,7 +95,7 @@ gives something to start with.**
 
 ### Axis 1 - Type (unchanged)
 
-`bug` / `enhancement` / `documentation`.
+`Bug` / `Feature` / `Docs`.
 
 ### Axis 2 - Severity (new; done by LLMs)
 

@@ -81,20 +81,33 @@ SERVER_ROUTE_PATH = "/v1/sessions/{session_id}/hooks/route-subagent"
 
 #: Seconds the runner's loopback relay waits for a verdict. Hop 3 of the
 #: timeout budget in the module docstring.
-RELAY_TIMEOUT_S = 7.0
+RELAY_TIMEOUT_S = 14.0
 
 #: Seconds the runner waits on the server relay route. Hop 4, inside which
-#: the routing call itself runs on ``ROUTING_REQUEST_TIMEOUT_S`` (5s).
-SERVER_HOP_TIMEOUT_S = 6.0
+#: the whole server-side route runs — candidate preparation and then the
+#: routing call (``ROUTING_REQUEST_TIMEOUT_S``), not the call alone.
+SERVER_HOP_TIMEOUT_S = 13.0
 
 #: Hop 2 of the budget, restated for the docstring cross-reference. The hook
-#: script owns the value; it cannot import this module (stdlib-only).
-HOOK_REQUEST_TIMEOUT_S = 8.0
+#: script owns the value; it cannot import this module (stdlib-only). Sized
+#: like the first-message hook: it must outlast a healthy route, preparation
+#: included, or a verdict that arrived is thrown away.
+HOOK_REQUEST_TIMEOUT_S = 15.0
 
 #: Conversation label carrying the routing decision behind a session's
 #: ``model_override``, so the child-sessions API can join the two without
 #: a new column or a transcript scan.
 ROUTING_DECISION_LABEL_KEY = "omnigent.routing.decision_id"
+
+#: Conversation label fingerprinting the prompt a create-time route scored.
+#: A native Smart Routing create routes the prompt the user typed on the
+#: landing screen, and that same prompt is then submitted inside the harness —
+#: where the first-prompt hook would score it a second time, seconds later, for
+#: the same verdict. The fingerprint lets that hook recognize its own prompt
+#: and reuse the create's decision. A hash, not the text: a label is metadata
+#: that travels into listings and telemetry, and the user's prompt does not
+#: belong there.
+CREATE_ROUTE_PROMPT_LABEL_KEY = "omnigent.routing.create_prompt"
 
 #: Conversation label marking a session created in auto-harness mode. The
 #: ``harness_override`` sentinel is replaced the moment first-message routing
@@ -216,10 +229,18 @@ class SessionRoutingClass:
         model.
     :param auto_harness: The session also let Smart Routing pick the
         harness, so the router may move its spawns across families.
+    :param turn_routing: The session still needs the ``UserPromptSubmit``
+        first-message routing hook. False once something has already routed
+        the session — a web create that routed the model before the pane
+        launched, or an earlier turn — because the hook's only remaining
+        answer is "already routed", paid for with a round trip per prompt.
+        Independent of ``routing_enabled``: a routed session keeps the
+        extended catalog and its spawn routing.
     """
 
     routing_enabled: bool = False
     auto_harness: bool = False
+    turn_routing: bool = False
 
 
 #: The class a session with no recorded routing state is treated as. Read by
@@ -242,7 +263,8 @@ def routing_class_from_snapshot(
     :param harness_override: ``harness_override``; the ``"auto"`` sentinel
         marks auto-harness until first-message routing replaces it.
     :param labels: Conversation labels, which carry the durable
-        :data:`AUTO_HARNESS_LABEL_KEY` record.
+        :data:`AUTO_HARNESS_LABEL_KEY` record and the
+        :data:`ROUTING_DECISION_LABEL_KEY` a completed route stamps.
     :returns: The session's class.
     """
     auto = harness_override == "auto" or (
@@ -251,9 +273,16 @@ def routing_class_from_snapshot(
     # An auto-harness session is a Smart Routing session by construction, so
     # the label implies routing is on even for a row whose cost-control field
     # was never stamped.
+    routes = routing_enabled(cost_control_mode) or auto
+    # The same label the turn hook reads as its "route once" gate: when it is
+    # already there the hook can only ever answer "already routed", so the
+    # launch omits it instead of registering a per-prompt round trip. A create
+    # whose routing failed stamps nothing, and keeps the hook as its retry.
+    already_routed = bool(labels is not None and labels.get(ROUTING_DECISION_LABEL_KEY))
     return SessionRoutingClass(
-        routing_enabled=routing_enabled(cost_control_mode) or auto,
+        routing_enabled=routes,
         auto_harness=auto,
+        turn_routing=routes and not already_routed,
     )
 
 
@@ -724,12 +753,15 @@ async def _decide(
     # ``raw_model`` / ``applied`` stay truthful to whatever the router picks.
     task = _routing_task(req)
 
-    from omnigent.server.routing_backend import backends_from_caps, select_router
+    from omnigent.server.routing_backend import (
+        backends_from_caps,
+        route_with_fallback,
+        select_router,
+    )
 
-    router = select_router(backends_from_caps(caps), gateway_backed=gateway_backed)
-    if router is None:
+    backends = backends_from_caps(caps)
+    if select_router(backends, gateway_backed=gateway_backed) is None:
         return _unavailable_decision("no routing client configured")
-    client = router.client
 
     candidates = (
         available_models
@@ -750,26 +782,31 @@ async def _decide(
     # allow with no model, the hook leaves ``tool_input`` untouched, and the
     # spawn runs on exactly the model it named.
     raised: str | None = None
+    client: Any = backends.any()  # type: ignore[explicit-any]
+    source: str | None = None
+    result = None
     try:
-        result = await client.route(task, candidates)
+        call = await route_with_fallback(backends, task, candidates, gateway_backed=gateway_backed)
     except Exception as exc:  # noqa: BLE001 — router outages are a normal path here
         _logger.warning(
             "route-subagent: router call failed for session=%s", session_id, exc_info=True
         )
-        result = None
         # A client that raises past its own error reporting leaves
         # ``last_error`` unset; without this the chip said only "no verdict"
         # and the cause lived in the server log alone.
         from omnigent.server.smart_routing import failure_detail
 
         raised = f"router call failed: {failure_detail(exc)}"
+    else:
+        if call is not None:
+            result, client, source = call.result, call.client, call.source
     if result is None or not getattr(result, "model", None):
         detail = (
             _opt_str(getattr(client, "last_error", None)) or raised or "router returned no verdict"
         )
         return _unavailable_decision(detail)
 
-    return replace(_decision_from_result(req, result, candidates), router_source=router.source)
+    return replace(_decision_from_result(req, result, candidates), router_source=source)
 
 
 def _requested_match(req: SubagentRouteRequest, model: str | None) -> bool:

@@ -95,7 +95,6 @@ export interface Permission {
   user_id: string;
   conversation_id: string;
   level: number;
-  can_approve?: boolean;
 }
 
 export async function listPermissions(sessionId: string): Promise<Permission[]> {
@@ -133,19 +132,13 @@ export async function grantPermission(
   sessionId: string,
   userId: string,
   level: number,
-  canApprove?: boolean,
 ): Promise<Permission> {
-  const body = {
-    user_id: userId,
-    level,
-    ...(canApprove === undefined ? {} : { can_approve: canApprove }),
-  };
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/permissions`,
     {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ user_id: userId, level }),
     },
   );
   if (!res.ok) {
@@ -155,6 +148,14 @@ export async function grantPermission(
   return (await res.json()) as Permission;
 }
 
+/**
+ * Remove a permission grant on a session.
+ *
+ * Passing another user's id revokes them (manage access required). Passing the
+ * caller's OWN id leaves the session — "unshare myself", so a shared session
+ * drops out of your sidebar — which the server allows with only read access.
+ * Either way it refuses to remove the owner's grant (403).
+ */
 export async function revokePermission(sessionId: string, userId: string): Promise<void> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(userId)}`,

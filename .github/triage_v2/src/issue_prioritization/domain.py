@@ -11,12 +11,67 @@ class IssueType(StrEnum):
     ENHANCEMENT = "enhancement"
     DOCUMENTATION = "documentation"
 
+    @classmethod
+    def parse(cls, value: object) -> IssueType:
+        normalized = str(value).strip().casefold()
+        aliases = {
+            "bug": cls.BUG,
+            "feature": cls.ENHANCEMENT,
+            "enhancement": cls.ENHANCEMENT,
+            "docs": cls.DOCUMENTATION,
+            "documentation": cls.DOCUMENTATION,
+        }
+        try:
+            return aliases[normalized]
+        except KeyError as exc:
+            raise ValueError(f"unsupported issue type: {value!r}") from exc
 
-class Severity(StrEnum):
-    S0 = "S0"
-    S1 = "S1"
-    S2 = "S2"
-    S3 = "S3"
+    @property
+    def label(self) -> str:
+        return {
+            IssueType.BUG: "Bug",
+            IssueType.ENHANCEMENT: "Feature",
+            IssueType.DOCUMENTATION: "Docs",
+        }[self]
+
+
+class Impact(StrEnum):
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+    @classmethod
+    def parse(cls, value: object) -> Impact:
+        normalized = str(value).strip().casefold()
+        # Remove S-code aliases in v0.3.0 after cached classifications migrate.
+        aliases = {
+            "critical": cls.CRITICAL,
+            "high": cls.HIGH,
+            "medium": cls.MEDIUM,
+            "low": cls.LOW,
+            "s0": cls.CRITICAL,
+            "s1": cls.HIGH,
+            "s2": cls.MEDIUM,
+            "s3": cls.LOW,
+        }
+        try:
+            return aliases[normalized]
+        except KeyError as exc:
+            raise ValueError(f"unsupported impact: {value!r}") from exc
+
+    @property
+    def label(self) -> str:
+        return self.value.title()
+
+    @property
+    def legacy_code(self) -> str:
+        return {
+            Impact.CRITICAL: "S0",
+            Impact.HIGH: "S1",
+            Impact.MEDIUM: "S2",
+            Impact.LOW: "S3",
+        }[self]
 
 
 class Priority(StrEnum):
@@ -32,9 +87,10 @@ class Issue:
     title: str
     url: str
     issue_type: IssueType
-    severity: Severity
+    impact: Impact
     area_keys: tuple[str, ...] = ()
     component_labels: tuple[str, ...] = ()
+    classification_reasoning: str = ""
     duplicate_count: int = 0
     upvote_count: int = 0
     current_priority: Priority | None = None
@@ -49,10 +105,13 @@ class Issue:
             number=int(value["number"]),
             title=str(value.get("title", "")),
             url=str(value.get("url", "")),
-            issue_type=_issue_type(value["type"]),
-            severity=Severity(str(value["severity"])),
+            issue_type=IssueType.parse(value["type"]),
+            impact=Impact.parse(value.get("impact", value.get("severity"))),
             area_keys=_string_tuple(value.get("area_keys", ())),
             component_labels=_string_tuple(value.get("component_labels", ())),
+            classification_reasoning=str(
+                value.get("classification_reasoning", value.get("reasoning", ""))
+            ),
             duplicate_count=max(0, int(value.get("duplicate_count", 0))),
             upvote_count=max(0, int(value.get("upvote_count", 0))),
             current_priority=Priority(str(current_priority)) if current_priority else None,
@@ -82,18 +141,3 @@ def _string_tuple(value: object) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         return ()
     return tuple(str(item) for item in value)
-
-
-def _issue_type(value: object) -> IssueType:
-    normalized = str(value).strip().lower()
-    aliases = {
-        "bug": IssueType.BUG,
-        "feature": IssueType.ENHANCEMENT,
-        "enhancement": IssueType.ENHANCEMENT,
-        "docs": IssueType.DOCUMENTATION,
-        "documentation": IssueType.DOCUMENTATION,
-    }
-    try:
-        return aliases[normalized]
-    except KeyError as exc:
-        raise ValueError(f"unsupported issue type: {value!r}") from exc

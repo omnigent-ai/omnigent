@@ -246,7 +246,7 @@ class AgentObject(BaseModel):
         phases. Empty list when the spec declares no policies
         or when the bundle cannot be loaded.
     :param skills: Skills bundled in the agent spec
-        (``skills/<name>/SKILL.md``). Lets the Web UI's
+        (``skills/<dir>/SKILL.md``). Lets the Web UI's
         new-session composer offer a slash-command menu before a
         session (and its runner) exists. Host-discovered skills
         are runner-owned, so they are NOT listed here — the
@@ -808,6 +808,7 @@ class ChildSessionSummary(BaseModel):
     object: str = "child_session"
     parent_session_id: str
     title: str | None = None
+    task_summary: str | None = None
     tool: str | None = None
     session_name: str | None = None
     kind: str = "sub_agent"
@@ -899,11 +900,23 @@ class ErrorDetail(BaseModel):
 
     :param code: Error code string, e.g. ``"server_error"``,
         ``"invalid_input"``.
-    :param message: Human-readable error description.
+    :param message: Human-readable error description. Always populated; older
+        clients render this verbatim.
+    :param title: Optional short headline naming what went wrong, e.g.
+        ``"Claude Code can't run as root"``. Present when the runner
+        recognized the failure (see ``omnigent.runner.launch_failure``); lets
+        the UI show a clear card title instead of the raw ``code``.
+    :param cause: Optional one/two-sentence explanation of why it failed.
+        Paired with ``title``.
+    :param remediation: Optional concrete next step to fix it, e.g. a command
+        to run. ``None`` when there is no single clear fix.
     """
 
     code: str
     message: str
+    title: str | None = None
+    cause: str | None = None
+    remediation: str | None = None
 
 
 class IncompleteDetails(BaseModel):
@@ -1279,6 +1292,10 @@ class SessionCreateRequest(BaseModel):
         host launch flow (generate binding token, write runner_id,
         send launch frame). ``None`` for CLI-initiated sessions.
         Must be ``None`` when ``host_type`` is ``"managed"``.
+    :param sandbox_provider: Which configured sandbox provider to
+        provision on, e.g. ``"modal"`` — one of the names ``GET /v1/info``
+        reports in ``sandbox_providers``. Only valid with
+        ``host_type: "managed"``; ``None`` takes the server's first.
     :param workspace: Where the session works. For external hosts:
         an absolute path on the host where the runner should start,
         e.g. ``"/Users/corey/universe/src/foo"``. Required when
@@ -1371,6 +1388,7 @@ class SessionCreateRequest(BaseModel):
     sub_agent_name: str | None = None
     host_type: Literal["external", "managed"] = "external"
     host_id: str | None = None
+    sandbox_provider: str | None = None
     workspace: str | None = None
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
@@ -1438,7 +1456,13 @@ class SessionCreateRequest(BaseModel):
                         "host_type 'managed' takes a git repository URL "
                         f"(optionally '#<branch>') as workspace: {exc}"
                     ) from exc
-        elif self.workspace is not None and is_repo_workspace(self.workspace):
+            return self
+        if self.sandbox_provider is not None:
+            raise ValueError(
+                "sandbox_provider only applies to host_type 'managed' — "
+                "external hosts are not server-provisioned"
+            )
+        if self.workspace is not None and is_repo_workspace(self.workspace):
             raise ValueError(
                 "a repository-URL workspace requires host_type 'managed' — "
                 "external hosts take an absolute path on the host"
@@ -1696,9 +1720,6 @@ class SessionResponse(BaseModel):
         permission level on this session: ``1`` = read, ``2`` =
         edit, ``3`` = manage. ``None`` when permissions are
         disabled (single-user mode without a permission store).
-    :param can_approve: Whether the requesting user may accept
-        privileged actions for this session. ``None`` when permissions
-        are disabled.
     :param llm_model: The LLM model identifier from the bound
         agent's spec, e.g. ``"anthropic/claude-sonnet-4-6"``.
         ``None`` when the agent has no explicit ``llm:`` block or
@@ -1875,7 +1896,6 @@ class SessionResponse(BaseModel):
     reasoning_effort: str | None = None
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None
-    can_approve: bool | None = None
     sub_agent_name: str | None = None
     kind: str = "default"
     parent_session_id: str | None = None
@@ -2266,9 +2286,6 @@ class SessionListItem(BaseModel):
         permission level on this session: ``1`` = read, ``2`` =
         edit, ``3`` = manage. ``None`` when permissions are
         disabled.
-    :param can_approve: Whether the requesting user may accept
-        privileged actions for this session. ``None`` when permissions
-        are disabled.
     :param owner: The user_id of the session owner, or ``None``
         when permissions are disabled. Included so the sidebar
         can display the owner without a separate API call.
@@ -2348,7 +2365,6 @@ class SessionListItem(BaseModel):
     host_online: bool | None = None
     reasoning_effort: str | None = None
     permission_level: int | None = None
-    can_approve: bool | None = None
     owner: str | None = None
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
@@ -2423,6 +2439,16 @@ class SessionUsage(BaseModel):
     title: str | None = None
     cost_usd: float = 0.0
     models: dict[str, float] = Field(default_factory=dict)
+    harness: str | None = None
+    llm_model: str | None = None
+    agent_name: str | None = None
+
+
+class DailyCost(BaseModel):
+    """One day's LLM spend for the daily timeline chart."""
+
+    day: str
+    cost_usd: float = 0.0
 
 
 class UsageReport(BaseModel):
@@ -2455,6 +2481,7 @@ class UsageReport(BaseModel):
     cost_last_7d: float = 0.0
     cost_last_30d: float = 0.0
     total_cost_usd: float = 0.0
+    daily_costs: list[DailyCost] = Field(default_factory=list)
     sessions: list[SessionUsage] = Field(default_factory=list)
 
 
@@ -2470,13 +2497,10 @@ class GrantPermissionRequest(BaseModel):
         read access.
     :param level: Numeric permission level: ``1`` = read,
         ``2`` = edit, ``3`` = manage.
-    :param can_approve: Whether the owner delegates privileged-action
-        approval authority to this user.
     """
 
     user_id: str
     level: int = Field(ge=1, le=3)
-    can_approve: bool | None = None
 
 
 class PermissionObject(BaseModel):
@@ -2488,13 +2512,11 @@ class PermissionObject(BaseModel):
         ``"conv_abc123"``.
     :param level: Numeric permission level (1=read, 2=edit,
         3=manage).
-    :param can_approve: Whether this grantee may approve privileged actions.
     """
 
     user_id: str
     conversation_id: str
     level: int
-    can_approve: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -3226,17 +3248,13 @@ class OutputTextDeltaEvent(_SSEEventBase):
     :param type: Always ``"response.output_text.delta"``.
     :param delta: The text fragment for this chunk, e.g.
         ``"Hello"``.
-    :param message_id: For terminal-observed streaming (claude-native),
-        the vendor's stable per-message id, e.g.
-        ``"2ca51d97-2f0f-493a-aed7-85a5b56c5747"``. Lets the web UI scope
-        an in-flight buffer to one assistant message and reconcile it
-        against the final item. ``None`` for ordinary in-process task
-        streaming, where deltas already group by the active response.
+    :param message_id: For native terminal streaming, the provider's stable
+        per-message id, e.g. ``"2ca51d97-2f0f-493a-aed7-85a5b56c5747"``.
+        ``None`` for ordinary in-process task streaming, where deltas group
+        by the active response.
     :param index: 0-based chunk order within the message, e.g. ``3``.
-        ``None`` when not terminal-observed streaming.
-    :param final: ``True`` on the last chunk of a terminal-observed
-        message; ``None`` otherwise. Signals the web UI that no further
-        chunks for ``message_id`` will arrive.
+        Used to suppress repeated chunks; ``None`` for in-process streaming.
+    :param final: Optional provider completion marker for the message.
     """
 
     type: Literal["response.output_text.delta"]

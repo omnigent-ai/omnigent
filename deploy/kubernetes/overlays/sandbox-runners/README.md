@@ -40,6 +40,80 @@ commands inside any Pod. The runner namespace enforces Pod Security `restricted`
 the generated runner Pod is already restricted-compliant (non-root uid 1000, drop
 `ALL` caps, `seccompProfile: RuntimeDefault`, no privilege escalation).
 
+## Agent classifier label (`omnigent.ai/agent`)
+
+Each runner Pod is stamped with `omnigent.ai/agent: <name>` naming the built-in
+agent its session runs, so an admission policy (or any Pod selector) can tell
+which agent a managed runner is running and augment it — the motivating case is
+injecting a workload-scoped credential into only the Pods running a given agent.
+
+The value is a **join key you write into your policy**: it equals the agent name
+exactly. The label is stamped only when two conditions hold, and is **omitted**
+otherwise — the server never emits a mangled or colliding value:
+
+- The session is bound to a **genuine built-in** (operator-seeded) agent. A
+  session-scoped agent whose name merely matches a built-in's fails the gate by
+  design, so a caller cannot self-classify a runner into another agent's
+  identity and attract its credential.
+- The agent name is **already a valid Kubernetes label value**. A name that
+  would need lossy rewriting is dropped rather than coerced, because two
+  distinct names must never collapse onto one credential-selecting value.
+
+### Lifecycle — when a session loses the label
+
+The classifier is re-derived from the bound agent at every launch and relaunch;
+it is never persisted. Some ordinary UI actions therefore drop it:
+
+- **Fork** and **switch-agent** mint a fresh *session-scoped* clone of the
+  agent. That clone fails the built-in gate, so the forked/switched session's
+  runner gets **no** `omnigent.ai/agent` label — and therefore no
+  policy-injected credential.
+- **Switching back does not restore it.** Switch-back takes the same path and
+  mints another session-scoped clone, so a switched session cannot regain the
+  label through the UI. Start a new session on the built-in agent instead.
+- **A running Pod keeps the previous agent's label until it is replaced.** The
+  label is a launch-time snapshot; Pods are not relabelled in place. A changed
+  value lands on the next runner Pod (a relaunch after the sandbox dies), not on
+  the live one.
+
+Whichever condition fails, the omission is logged — check these first when a
+runner Pod unexpectedly carries no credential:
+
+- Failing the built-in gate logs from `resolve_managed_agent_label`
+  (`omnigent/server/managed_hosts.py`), e.g. "agent … is not a genuine built-in;
+  omitting agent label".
+- A name that is not a valid label value logs a `WARNING` from
+  `build_pod_manifest` (`omnigent/onboarding/sandboxes/kubernetes.py`), e.g.
+  "agent … is not a valid omnigent.ai/agent value; runner Pod … stays
+  unclassified". Note the gate upstream will already have logged this agent as
+  classified, so this is the line that explains the missing label.
+
+### What the label does not do
+
+The server will not stamp a value the session is not entitled to, but the label
+is only as trustworthy as the layer that reads it. **A Pod label is an assertion
+by whoever created the Pod**, so before keying anything privileged on it:
+
+- **Restrict who can create Pods in the runner namespace.** Any principal with
+  `create` (or `patch`) on Pods there can set `omnigent.ai/agent` to any value.
+  The server's gate constrains what *the server* stamps, nothing else.
+- **Have the webhook verify the creating identity**, not just the label — e.g.
+  that `AdmissionReview.request.userInfo.username` is the server's service
+  account. Without this, the label alone is forgeable by a namespace-adjacent
+  principal.
+- **Write the policy fail-closed**: inject *when* the label matches, rather than
+  granting a permissive baseline to Pods without one. Resolution is best-effort
+  — a transient store error degrades to an unclassified runner — so absence must
+  never mean "more access". Note the inverse risk if you key a *restriction* on
+  the label: a Pod that loses it also leaves the restricted set, so build
+  restrictions as a default-deny base with this label as the allow-exception.
+- **Treat a credential as bound to the Pod, not the session.** A mutating
+  webhook injects at Pod creation, and `switch-agent` keeps the same runner
+  (host and workspace are untouched), so a session that switches from a
+  credentialed agent keeps that credential mounted for the Pod's remaining
+  lifetime while running the new agent. If that matters, avoid switch-agent for
+  credentialed agents or keep the sandbox's idle timeout short.
+
 ## Prerequisites
 
 1. **A server image built with the `kubernetes` extra.** The overlay's

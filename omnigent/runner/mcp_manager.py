@@ -83,9 +83,11 @@ class McpSchemasResult:
     schemas: list[_JsonObject]
     tool_names: set[str]
     failures: dict[str, str]  # server_name → error message
-    # Display name → InitializeResult.instructions from each healthy server.
+    # Unique config name → InitializeResult.instructions from each healthy server.
     # Empty when no server returned instructions.
     server_instructions: dict[str, str] = field(default_factory=dict)
+    # Unique config name → display heading (serverInfo.name when present).
+    server_labels: dict[str, str] = field(default_factory=dict)
 
 
 def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -> str:
@@ -378,6 +380,7 @@ class RunnerMcpManager:
             tool_names: set[str] = set()
             failures: dict[str, str] = {}
             server_instructions: dict[str, str] = {}
+            server_labels: dict[str, str] = {}
             for ref in refs:
                 server = ref.entry
                 if server.error is not None:
@@ -395,15 +398,18 @@ class RunnerMcpManager:
                 conn = server.connection
                 instructions = getattr(conn, "initialize_instructions", None) if conn else None
                 if isinstance(instructions, str) and instructions.strip():
-                    display = getattr(conn, "server_info_name", None) or ref.config.name
+                    key = ref.config.name
+                    display = getattr(conn, "server_info_name", None)
                     if not isinstance(display, str) or not display.strip():
-                        display = ref.config.name
-                    server_instructions[display] = instructions.strip()
+                        display = key
+                    server_instructions[key] = instructions.strip()
+                    server_labels[key] = display.strip()
             return McpSchemasResult(
                 schemas=schemas,
                 tool_names=tool_names,
                 failures=failures,
                 server_instructions=server_instructions,
+                server_labels=server_labels,
             )
         finally:
             async with self._lock:

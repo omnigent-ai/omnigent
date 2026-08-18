@@ -7,6 +7,7 @@ struct ConnectView: View {
 
   @Environment(\.colorScheme) private var colorScheme
   @EnvironmentObject private var settings: SettingsStore
+  @EnvironmentObject private var managedConfiguration: ManagedConfigurationProvider
   @State private var serverURL: String
   @State private var message: String?
   @State private var isConnecting = false
@@ -86,35 +87,23 @@ struct ConnectView: View {
           .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
           .padding(.top, 12)
 
-        if !settings.recentServers.isEmpty {
-          VStack(alignment: .leading, spacing: 8) {
-            Text("Recent servers")
-              .font(.system(size: 13, weight: .medium))
-              .foregroundStyle(DesignTokens.mutedForeground(colorScheme))
+        // Preset servers sit above recents under their own heading, so an entry
+        // the organization vouches for doesn't read as something the user
+        // happened to type before.
+        if !managedConfiguration.serverURLs.isEmpty {
+          serverSection(
+            title: "Provided by your organization",
+            servers: managedConfiguration.serverURLs.map(\.absoluteString),
+            identifier: "managed-servers"
+          )
+        }
 
-            ForEach(settings.recentServers, id: \.self) { recent in
-              Button {
-                serverURL = recent
-                connect()
-              } label: {
-                Text(recent)
-                  .font(.system(size: 14))
-                  .lineLimit(1)
-                  .truncationMode(.middle)
-                  .frame(maxWidth: .infinity, alignment: .leading)
-                  .padding(.horizontal, 12)
-                  .frame(height: 36)
-                  .overlay {
-                    RoundedRectangle(cornerRadius: DesignTokens.radius)
-                      .stroke(DesignTokens.border(colorScheme), lineWidth: 1)
-                  }
-              }
-              .buttonStyle(.plain)
-              .foregroundStyle(DesignTokens.foreground(colorScheme))
-            }
-          }
-          .padding(.top, 12)
-          .disabled(isConnecting)
+        if !visibleRecentServers.isEmpty {
+          serverSection(
+            title: "Recent servers",
+            servers: visibleRecentServers,
+            identifier: "recent-servers"
+          )
         }
       }
       .frame(maxWidth: 384)
@@ -163,6 +152,46 @@ struct ConnectView: View {
         .contentShape(Rectangle())
     }
     .accessibilityLabel("About Omnigent")
+  }
+
+  private var visibleRecentServers: [String] {
+    ManagedServers.recents(
+      settings.recentServers, excludingManaged: managedConfiguration.serverURLs)
+  }
+
+  private func serverSection(title: String, servers: [String], identifier: String) -> some View {
+    VStack(alignment: .leading, spacing: 8) {
+      Text(title)
+        .font(.system(size: 13, weight: .medium))
+        .foregroundStyle(DesignTokens.mutedForeground(colorScheme))
+
+      ForEach(servers, id: \.self) { server in
+        Button {
+          serverURL = server
+          connect()
+        } label: {
+          Text(server)
+            .font(.system(size: 14))
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .frame(height: 36)
+            .overlay {
+              RoundedRectangle(cornerRadius: DesignTokens.radius)
+                .stroke(DesignTokens.border(colorScheme), lineWidth: 1)
+            }
+            // Without this only the URL's glyphs are hit-testable, so a tap on
+            // the empty part of the pill does nothing.
+            .contentShape(RoundedRectangle(cornerRadius: DesignTokens.radius))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(DesignTokens.foreground(colorScheme))
+        .accessibilityIdentifier("\(identifier)-row")
+      }
+    }
+    .padding(.top, 12)
+    .disabled(isConnecting)
   }
 
   private var primary: Color {

@@ -3,7 +3,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ChatStoreModule from "@/store/chatStore";
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -13,12 +13,14 @@ import {
   deriveHomeDir,
   deriveRepoName,
   describeCreateError,
+  displayNameForHost,
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
   isValidSandboxRepoUrl,
   isValidWorkspace,
   matchSkillInvocation,
   normalizeWorkspacePath,
+  resolveThisMachineHostId,
   sessionsSharingDirectory,
   worktreePathTail,
   NewChatLandingScreen,
@@ -217,6 +219,42 @@ function fsEntry(path: string): HostFilesystemEntry {
 function fakeResponse(status: number, json: () => Promise<unknown>): Response {
   return { status, json } as unknown as Response;
 }
+
+describe("displayNameForHost", () => {
+  const local = { host_id: "host_local", name: "HR4V76FMWY" };
+
+  it("uses an OS-friendly name for a matching host and falls back to its hostname", () => {
+    expect(displayNameForHost(local, "host_local", "Mozilla/5.0 (Macintosh)")).toBe("This Mac");
+    expect(displayNameForHost(local, "host_local", "Mozilla/5.0 (Windows NT 10.0)")).toBe(
+      "This Windows",
+    );
+    expect(displayNameForHost(local, "host_local", "Mozilla/5.0 (X11; Linux x86_64)")).toBe(
+      "This machine",
+    );
+    expect(
+      displayNameForHost(local, "host_local", "Mozilla/5.0 (Linux; Android 15; Pixel 9)"),
+    ).toBe("This Android");
+    expect(
+      displayNameForHost(
+        local,
+        "host_local",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)",
+      ),
+    ).toBe("This iPhone");
+    expect(displayNameForHost(local, "host_local", "Unknown client")).toBe("HR4V76FMWY");
+    expect(displayNameForHost(local, "host_other", "Mozilla/5.0 (Macintosh)")).toBe("HR4V76FMWY");
+    expect(displayNameForHost(local, null, "Mozilla/5.0 (Macintosh)")).toBe("HR4V76FMWY");
+  });
+});
+
+describe("resolveThisMachineHostId", () => {
+  it("prefers Electron identity and only infers a browser host for local single-host servers", () => {
+    expect(resolveThisMachineHostId("host_shell", true, ["host_online"])).toBe("host_shell");
+    expect(resolveThisMachineHostId(null, true, ["host_online"])).toBe("host_online");
+    expect(resolveThisMachineHostId(null, true, ["host_a", "host_b"])).toBeNull();
+    expect(resolveThisMachineHostId(null, false, ["host_online"])).toBeNull();
+  });
+});
 
 // Workspace validation contract — pins the same shape the server
 // validator enforces (per designs/SESSION_WORKSPACE_SELECTION.md):
@@ -722,6 +760,7 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
     // routing). Cases that exercise the built-in judge pass the field
     // explicitly.
     smart_routing_sources: { external: infoOverrides.smart_routing_enabled === true, oss: false },
+    features: { harness_install: infoOverrides.harness_install_enabled === true },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -842,8 +881,36 @@ describe("NewChatLandingScreen", () => {
     // The home page offers an inline chat box rather than the old
     // "click New session in the sidebar" placeholder. If it regressed to
     // the placeholder, the composer input would be absent and this fails.
-    expect(screen.getByText("What should we build?")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
+  });
+
+  it("uses a home-specific focus shadow without a resting shadow or focus border", () => {
+    renderLanding();
+
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    expect(composer).toHaveClass(
+      "border-border",
+      "has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+    );
+    expect(composer).not.toHaveClass("shadow-[var(--composer-shadow)]");
+    expect(composer.className).not.toContain("has-[textarea:focus]:border-");
+  });
+
+  it("matches the session composer internal padding", () => {
+    renderLanding();
+
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveClass(
+      "min-h-[60px]",
+      "max-h-[200px]",
+      "px-4",
+      "pt-3",
+      "pb-2",
+    );
+    expect(screen.getByTestId("new-chat-landing-actions")).toHaveClass("px-2", "pb-2");
+    const footer = screen.getByTestId("new-chat-landing-footer");
+    expect(footer).toHaveClass("py-1.5", "pr-4", "pl-2");
+    expect(footer).not.toHaveClass("-mt-4");
+    expect(footer.parentElement).toHaveClass("gap-1");
   });
 
   it("preserves the typed message and attachments when the landing screen unmounts and remounts", () => {
@@ -867,6 +934,47 @@ describe("NewChatLandingScreen", () => {
     );
     // The attachment chip re-renders from the restored draft.
     expect(screen.getByText("diagram.png")).toBeTruthy();
+  });
+
+  it("hands the draft back when a create the user walked away from is rejected", async () => {
+    // A submitted draft is dropped on unmount — it belongs to the session
+    // being created. But a create the server rejects makes no session, so
+    // the message is the user's again and must survive the round-trip
+    // instead of vanishing with the failed attempt.
+    let rejectCreate: (() => void) | null = null;
+    authenticatedFetchMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          rejectCreate = () =>
+            resolve({
+              ok: false,
+              status: 400,
+              json: async () => ({ detail: "workspace already in use" }),
+              text: async () => "workspace already in use",
+            } as unknown as Response);
+        }),
+    );
+    const first = renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "rebuild the parser" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(rejectCreate).not.toBeNull());
+
+    // The user gives up waiting and opens another session, then the create
+    // comes back rejected.
+    first.unmount();
+    await act(async () => {
+      rejectCreate!();
+    });
+
+    renderLanding();
+    expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
+      "rebuild the parser",
+    );
   });
 
   it("enables submit only once a message, host, agent and valid workspace are set", async () => {
@@ -1251,21 +1359,34 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("opens the connect-host instructions from the host dropdown", () => {
-    renderLanding();
+  it("quotes server URLs in host and Lakebox connect commands", () => {
+    setOmnigentHostConfig({ cliServerUrlSuffix: "/api?profile=dev&glob=*" });
+    renderLanding({ databricks_features: true });
     // Radix dropdowns open on pointerdown (a bare click doesn't in jsdom).
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-connect-host"));
-    // The modal mounts the connect instructions with the runnable command.
+
     expect(screen.getByTestId("connect-host-dialog")).toBeTruthy();
-    expect(screen.getByTestId("connect-host-command")).toBeTruthy();
+    expect(screen.getByTestId("connect-host-command")).toHaveTextContent(
+      `omni host --server '${window.location.origin}/api?profile=dev&glob=*'`,
+    );
+
+    const lakeboxTab = screen.getByRole("tab", { name: "Databricks Lakebox" });
+    fireEvent.mouseDown(lakeboxTab);
+    fireEvent.click(lakeboxTab);
+    expect(screen.getByTestId("connect-lakebox-connect-command")).toHaveTextContent(
+      `omni sandbox connect --provider lakebox --sandbox-id <id> --server '${window.location.origin}/api?profile=dev&glob=*'`,
+    );
   });
 
   it("offers connect-host even when no hosts are online (no dead end)", () => {
     mockHosts([]);
     renderLanding();
     // The chip reads the empty state…
-    expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("No hosts");
+    const hostChip = screen.getByTestId("new-chat-landing-host-chip");
+    expect(hostChip.textContent).toContain("No hosts");
+    expect(hostChip.querySelector(".bg-success")).toBeNull();
+    expect(hostChip.querySelector(".lucide-monitor")).not.toBeNull();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     // …and the connect item is still present, so a fresh user can unblock.
     expect(screen.getByTestId("new-chat-landing-connect-host")).toBeTruthy();
@@ -1346,18 +1467,24 @@ describe("NewChatLandingScreen", () => {
     expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex-native", true);
   });
 
-  it("arms codex full bypass via the Approval dropdown and shows the warning banner", () => {
+  it("arms codex full bypass as a plain Approval option, with no warning banner", () => {
     renderLanding();
-    // Open Codex's (a2) config modal; bypass is the most-permissive Approval option.
+    // Open Codex's (a2) config modal; bypass is the most-permissive Approval
+    // option. It reads back exactly like Claude's "Bypass permissions" — the
+    // dropdown footer blurb carries the stance, with no danger banner.
     openAgentConfig("a2");
-    expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-banner")).toBeNull();
-    pickSelectOption("new-chat-landing-config-approval", "Bypass approvals & sandbox");
-    // The trigger reflects the pick and the in-modal red danger banner appears.
+    openSelect("new-chat-landing-config-approval");
+    fireEvent.pointerEnter(screen.getByRole("option", { name: "Bypass approvals & sandbox" }));
+    expect(screen.getByTestId("new-chat-landing-config-approval-detail").textContent).toContain(
+      "no approval prompts and no command sandbox",
+    );
+    fireEvent.click(screen.getByRole("option", { name: "Bypass approvals & sandbox" }));
     expect(screen.getByTestId("new-chat-landing-config-approval").textContent).toContain(
       "Bypass approvals & sandbox",
     );
-    const banner = screen.getByTestId("new-chat-landing-bypass-sandbox-banner");
-    expect(banner.textContent).toContain("approvals and the sandbox disabled");
+    expect(
+      within(screen.getByTestId("new-chat-landing-config-modal")).queryByRole("alert"),
+    ).toBeNull();
   });
 
   it("disarms the dangerous bypass when the agent changes (re-arm per context)", () => {
@@ -1365,20 +1492,17 @@ describe("NewChatLandingScreen", () => {
     // Arm bypass on Codex (a2): open its config modal, pick Bypass, Save.
     openAgentConfig("a2");
     pickSelectOption("new-chat-landing-config-approval", "Bypass approvals & sandbox");
+    expect(screen.getByTestId("new-chat-landing-config-approval").textContent).toContain(
+      "Bypass approvals & sandbox",
+    );
     saveConfig();
-    // Armed → the persistent banner is up under the composer.
-    expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeTruthy();
 
-    // Switch away to Claude (a1): the armed bypass must clear immediately, so
-    // the persistent banner disappears (Claude has no bypass option at all).
+    // Switch away to Claude (a1) — which has no bypass option at all — then
+    // back to Codex: Approval is back at Default, so bypass must be re-armed
+    // for this fresh context rather than carrying across the agent change.
     selectAgent("a1");
-    expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeNull();
-
-    // Switch back to Codex and reopen its config modal: Approval is back at
-    // Default (no banner) — bypass must be re-armed for this fresh context.
     openAgentConfig("a2");
     expect(screen.getByTestId("new-chat-landing-config-approval").textContent).toContain("Default");
-    expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-banner")).toBeNull();
   });
 
   it("seeds the bypass-sandbox label in the create body when armed", async () => {
@@ -1391,9 +1515,6 @@ describe("NewChatLandingScreen", () => {
     pickSelectOption("new-chat-landing-config-approval", "Bypass approvals & sandbox");
     // Save to commit, then submit a real task.
     saveConfig();
-    // The persistent banner remains visible under the composer after the
-    // config modal closes.
-    expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeTruthy();
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "run the build" },
     });
@@ -1428,7 +1549,7 @@ describe("NewChatLandingScreen", () => {
     expect(banner.textContent).toContain("1 other agent is");
   });
 
-  it("caps each footer chip label with truncate so a long label can't wrap the row", async () => {
+  it("keeps footer chip labels compact, muted and truncated", async () => {
     // Land with `?project=` so the branch chip (worktree) renders alongside the
     // others for the truncate-cap assertions.
     renderLanding({}, "/?project=docs");
@@ -1442,9 +1563,25 @@ describe("NewChatLandingScreen", () => {
     // cap would regress the single-row layout this guards.
     const label = (testid: string) => screen.getByTestId(testid).querySelector("span.truncate");
 
+    for (const testid of [
+      "new-chat-landing-workspace-chip",
+      "new-chat-landing-host-chip",
+      "new-chat-landing-branch-chip",
+    ]) {
+      expect(screen.getByTestId(testid)).toHaveClass("text-sm", "text-muted-foreground");
+      expect(label(testid)).toHaveClass("text-sm");
+      expect(label(testid)).not.toHaveClass("text-foreground");
+    }
     expect(label("new-chat-landing-workspace-chip")?.className).toContain("max-w-40");
     expect(label("new-chat-landing-host-chip")?.className).toContain("max-w-32");
     expect(label("new-chat-landing-branch-chip")?.className).toContain("max-w-32");
+    expect(
+      screen.getByTestId("new-chat-landing-host-chip").querySelector(".bg-success"),
+    ).not.toBeNull();
+    expect(
+      screen.getByTestId("new-chat-landing-host-chip").querySelector(".lucide-monitor"),
+    ).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveTextContent("Worktree");
   });
 
   it("opens the setup dialog and installs an installable harness from it", () => {
@@ -1963,7 +2100,7 @@ describe("NewChatLandingScreen", () => {
     );
     // Sandbox mode chrome comes with the default: repository chip in,
     // workspace/worktree chips out.
-    expect(screen.getByTestId("new-chat-landing-repo-chip")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("Repository");
     expect(screen.queryByTestId("new-chat-landing-workspace-chip")).toBeNull();
   });
 
@@ -2007,7 +2144,7 @@ describe("NewChatLandingScreen", () => {
     // DOCUMENT_POSITION_FOLLOWING means the host item comes after it.
     const sandboxOption = screen.getByTestId("new-chat-landing-sandbox-option");
     const hostItem = screen
-      .getAllByText("machine-1")
+      .getAllByText("This machine")
       .find((el) => el.closest('[role="menuitem"]') !== null);
     expect(hostItem).toBeTruthy();
     expect(
@@ -2017,7 +2154,9 @@ describe("NewChatLandingScreen", () => {
     // worktree chip) — the sandbox default doesn't wedge the normal path.
     fireEvent.click(hostItem!);
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-1"),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "This machine",
+      ),
     );
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeTruthy();
@@ -2253,6 +2392,68 @@ describe("NewChatLandingScreen", () => {
     expect(body.host_type).toBe("managed");
     expect("host_id" in body).toBe(false);
     expect("git" in body).toBe(false);
+  });
+
+  it("carries the picked provider in the managed create when several are offered", async () => {
+    // A multi-provider server renders one row per provider. Picking the
+    // second (non-default) row must ride into the POST as sandbox_provider,
+    // so the server launches on it rather than the deployment default.
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_providers: ["modal", "e2b"],
+    });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option-e2b"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "audit the repo" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.host_type).toBe("managed");
+    expect(body.sandbox_provider).toBe("e2b");
+  });
+
+  it("reopens on the last-picked provider and highlights its row", async () => {
+    // The sticky pick: choosing e2b persists it, so a fresh landing (module
+    // draft reset, storage kept) reselects e2b and lights its row up rather
+    // than falling back to the default (modal) first row.
+    const first = renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_providers: ["modal", "e2b"],
+    });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option-e2b"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("E2B Sandbox"),
+    );
+    first.unmount();
+    resetLandingDraft();
+
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "modal",
+      sandbox_providers: ["modal", "e2b"],
+    });
+    // The chip reflects the sticky provider, not the default.
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("E2B Sandbox"),
+    );
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    // The e2b row carries the active highlight; modal does not.
+    expect(
+      screen.getByTestId("new-chat-landing-sandbox-option-e2b").getAttribute("data-active"),
+    ).toBe("true");
+    expect(
+      screen.getByTestId("new-chat-landing-sandbox-option").getAttribute("data-active"),
+    ).toBeNull();
   });
 
   it("shows host-provided git credentials tooltip content in the sandbox repo popover", async () => {
@@ -2588,6 +2789,56 @@ describe("NewChatLandingScreen attachments", () => {
     // state clears rather than sticking when moving between child elements.
     fireEvent.dragLeave(composer, { dataTransfer: { files: [] } });
     expect(screen.queryByText("Drop files here")).toBeNull();
+  });
+
+  // An unsupported attachment has to be caught HERE, before the session
+  // exists. Letting it through means the upload only 415s after the session
+  // is created and navigated into — stranding the typed message in a session
+  // the user never wanted.
+  it("rejects an unsupported attachment instead of attaching it", () => {
+    renderLanding();
+    const zip = new File([new Uint8Array(10)], "photos.zip", { type: "application/zip" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [zip] },
+    });
+    expect(screen.queryByText("photos.zip")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
+      "only images, PDF, and text/code files are supported",
+    );
+  });
+
+  it("keeps the supported files from a mixed drop and names the rejected one", () => {
+    renderLanding();
+    const composer = screen.getByTestId("new-chat-landing-composer");
+    const ok = new File(["hello"], "notes.txt", { type: "text/plain" });
+    const zip = new File([new Uint8Array(10)], "photos.zip", { type: "application/zip" });
+    fireEvent.drop(composer, { dataTransfer: { files: [ok, zip] } });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.queryByText("photos.zip")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
+      "photos.zip",
+    );
+    // Removing the accepted chip clears the stale rejection notice too.
+    fireEvent.click(screen.getByRole("button", { name: "Remove notes.txt" }));
+    expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
+  });
+
+  it("clears the rejection notice once the user types", () => {
+    // The rejected file is never attached, so there is no chip to remove and
+    // nothing else clears the notice. Left sticky it reads as a blocker on a
+    // composer that can actually be submitted.
+    renderLanding();
+    const zip = new File([new Uint8Array(10)], "photos.zip", { type: "application/zip" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [zip] },
+    });
+    expect(screen.getByTestId("new-chat-landing-attachment-error")).toBeTruthy();
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "never mind, just a question" },
+    });
+
+    expect(screen.queryByTestId("new-chat-landing-attachment-error")).toBeNull();
   });
 });
 
@@ -2942,12 +3193,14 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     const hostItem = screen
-      .getAllByText("machine-1")
+      .getAllByText("This machine")
       .find((el) => el.closest('[role="menuitem"]') !== null);
     expect(hostItem).toBeTruthy();
     fireEvent.click(hostItem!);
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-1"),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "This machine",
+      ),
     );
     // With no custom agents yet, the create item is a top-level row (no
     // "Custom agents" submenu to hide it behind) and opens the dialog.
@@ -2967,11 +3220,13 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     const hostItem = screen
-      .getAllByText("machine-1")
+      .getAllByText("This machine")
       .find((el) => el.closest('[role="menuitem"]') !== null);
     fireEvent.click(hostItem!);
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-1"),
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "This machine",
+      ),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
@@ -3314,6 +3569,53 @@ describe("NewChatLandingScreen smart routing", () => {
     // pinned — a model_override would suppress per-turn routing server-side.
     expect(body.model_override).toBeUndefined();
     expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  // The prompt rides along on a PINNED native create too, so the server routes
+  // the model before the pane launches. Routing after the fact means holding
+  // the first prompt inside the harness and replaying it, which the user sees
+  // as their own message vanishing for seconds.
+  it.each([
+    ["Claude Code", "a1"],
+    ["Codex", "a2"],
+  ] as const)("sends the routing message on a pinned %s create", async (_label, agentId) => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_pinned_routed" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    openAgentConfig(agentId);
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
+    saveConfig();
+
+    const { body } = await submitAndReadBody("refactor the auth module");
+    expect(body.agent_id).toBe(agentId);
+    expect(body.cost_control_mode_override).toBe("on");
+    // Routes only — the real message is still delivered after navigation.
+    expect(body.smart_routing_message).toBe("refactor the auth module");
+    // The harness is the user's own pick — the bound wrapper agent names it —
+    // so only the model is routed, and nothing pins one.
+    expect(body.harness_override).not.toBe("auto");
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("sends no routing message on a pinned harness with routing off", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_pinned_plain" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    const { body } = await submitAndReadBody("refactor the auth module");
+    expect(body.agent_id).toBe("a1");
+    expect(body.cost_control_mode_override).toBeUndefined();
+    expect(body.smart_routing_message).toBeUndefined();
   });
 
   // Sticky Smart Routing: the pick is remembered per harness in the same
@@ -3713,30 +4015,73 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     expect(screen.getByTestId(SMART_ROUTING_ROW)).toBeTruthy();
   });
 
-  // The gateway is the EXTERNAL router's requirement. With the built-in judge
-  // configured it covers the off-gateway arm, so the row the cases above hid
-  // stays — including with no external router at all.
+  // The row launches a native pane whose harness the EXTERNAL router picks, so
+  // the built-in judge cannot stand in for an off-gateway arm the way it does
+  // for a per-harness model pick.
   it.each([
-    ["codex isn't gateway-backed", { "claude-native": true, "codex-native": false }, true],
-    ["claude isn't gateway-backed", { "claude-native": false, "codex-native": true }, true],
-    ["neither is gateway-backed", { "claude-native": false, "codex-native": false }, true],
-    [
-      "neither is gateway-backed and there's no external router",
-      { "claude-native": false, "codex-native": false },
-      false,
-    ],
-  ] as const)(
-    "keeps the row when the built-in judge can answer and %s",
-    (_case, gateway, external) => {
-      mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
-      renderLanding({
-        smart_routing_enabled: true,
-        smart_routing_sources: { external, oss: true },
-      });
-      openPicker();
-      expect(screen.getByTestId(SMART_ROUTING_ROW)).toBeTruthy();
-    },
-  );
+    ["codex isn't gateway-backed", { "claude-native": true, "codex-native": false }],
+    ["claude isn't gateway-backed", { "claude-native": false, "codex-native": true }],
+    ["neither is gateway-backed", { "claude-native": false, "codex-native": false }],
+  ] as const)("hides the row when the judge is configured and %s", (_case, gateway) => {
+    mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
+    renderLanding({
+      smart_routing_enabled: true,
+      smart_routing_sources: { external: true, oss: true },
+    });
+    openPicker();
+    expect(screen.queryByTestId(SMART_ROUTING_ROW)).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+  });
+
+  // The judge-only deployment: no external router, so the pane's harness pick
+  // has nobody to make it. Gateway backing is beside the point.
+  it.each([
+    ["both families gateway-backed", { "claude-native": true, "codex-native": true }],
+    ["the host reports nothing", undefined],
+  ] as const)("hides the row on a judge-only server with %s", (_case, gateway) => {
+    mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
+    renderLanding({
+      smart_routing_enabled: true,
+      smart_routing_sources: { external: false, oss: true },
+    });
+    openPicker();
+    expect(screen.queryByTestId(SMART_ROUTING_ROW)).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+  });
+
+  // Both sources, both arms on the gateway: the one shape that keeps the row —
+  // and the shape a legacy server (no `smart_routing_sources`, just
+  // `smart_routing_enabled: true`) resolves to, so it loses nothing.
+  it("shows the row when the external router is configured alongside the judge", () => {
+    mockHosts([
+      {
+        ...host("online"),
+        gateway_inference: { "claude-native": true, "codex-native": true },
+      } as Host,
+    ]);
+    renderLanding({
+      smart_routing_enabled: true,
+      smart_routing_sources: { external: true, oss: true },
+    });
+    openPicker();
+    expect(screen.getByTestId(SMART_ROUTING_ROW)).toBeTruthy();
+  });
+
+  // Neither source: the row goes, same as judge-only.
+  it("hides the row when the server reports neither source", () => {
+    mockHosts([
+      {
+        ...host("online"),
+        gateway_inference: { "claude-native": true, "codex-native": true },
+      } as Host,
+    ]);
+    renderLanding({
+      smart_routing_enabled: true,
+      smart_routing_sources: { external: false, oss: false },
+    });
+    openPicker();
+    expect(screen.queryByTestId(SMART_ROUTING_ROW)).toBeNull();
+  });
 
   it("announces the gateway as the cause when a host switch takes the row away", async () => {
     mockHosts([
@@ -4260,6 +4605,24 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     },
   );
 
+  // The judge-only deployment. A bundle agent's routed brain runs the judge's
+  // harness pick, so this surface must NOT follow the native-pane row off a
+  // server with no external router — whatever the gateway map says.
+  it.each([
+    ["both arms gateway-backed", { "claude-native": true, "codex-native": true }],
+    ["neither arm gateway-backed", { "claude-native": false, "codex-native": false }],
+    ["the host reports nothing", undefined],
+  ])("keeps the Smart Routing brain on a judge-only server with %s", (_case, gateway) => {
+    mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
+    renderLanding({
+      smart_routing_enabled: true,
+      smart_routing_sources: { external: false, oss: true },
+    });
+    openAgentConfig("ag_debby");
+    openSelect("new-chat-landing-config-harness");
+    expect(screen.getByTestId("new-chat-landing-harness-auto")).toBeTruthy();
+  });
+
   // Sources decide, not the gateway map: with neither router configured the
   // fully-auto brain goes even on a fully gateway-backed host.
   it("offers no Smart Routing brain when the server reports neither source", () => {
@@ -4383,6 +4746,9 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
       expect(body.reasoning_effort).toBeUndefined();
       expect(body.labels).toBeUndefined();
       expect(body.terminal_launch_args).toBeUndefined();
+      // A bundle agent arms at create and routes on the first message event —
+      // its harness isn't decided yet, so there is nothing to route here.
+      expect(body.smart_routing_message).toBeUndefined();
       expect(raw).not.toContain("permission");
     },
   );

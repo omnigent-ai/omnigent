@@ -23,7 +23,7 @@ export function useCursorTooltip(text: string): {
   const tooltip = cursorPos ? (
     <div
       style={{ position: "fixed", left: cursorPos.x, top: cursorPos.y + 14, pointerEvents: "none" }}
-      className="z-50 inline-flex w-fit items-center rounded-md border border-border bg-popover px-3 py-1.5 text-sm text-popover-foreground shadow-sm"
+      className="z-50 inline-flex w-fit items-center rounded-md border border-border bg-popover px-3 py-1.5 text-sm text-popover-foreground shadow-tooltip"
     >
       {text}
     </div>

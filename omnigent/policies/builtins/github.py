@@ -673,6 +673,8 @@ class _ShellOp:
         ``"git push"`` or ``"gh pr create"``.
     :param destructive: Whether the operation is an irreversible delete, gated
         separately by ``allow_destructive``.
+    :param tag_push: Whether this ``git push`` includes tags (``--tags``,
+        ``--follow-tags``, or ``refs/tags/`` refspecs).
     :param force_push: Whether this ``git push`` uses a force flag
         (``--force``, ``-f``, ``--force-with-lease``, ``--force-if-includes``)
         or a ``+refspec`` force prefix.
@@ -684,6 +686,7 @@ class _ShellOp:
     branch_targeted: bool
     detail: str
     destructive: bool = False
+    tag_push: bool = False
     force_push: bool = False
 
 
@@ -749,8 +752,13 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
         positionals = [t for t in args if not t.startswith("-")]
         repo = _repo_from_tokens(args)
         branches: set[str] = set()
+        tag_push = any(t in ("--tags", "--follow-tags") for t in args)
         for refspec in positionals[1:]:
             dest = refspec.split(":", 1)[1] if ":" in refspec else refspec
+            dest = dest.lstrip("+")
+            if dest.startswith("refs/tags/"):
+                tag_push = True
+                continue
             branch = _normalize_branch(dest)
             if branch:
                 branches.add(branch)
@@ -775,6 +783,7 @@ def _classify_git(tokens: list[str]) -> _ShellOp | None:
             branch_targeted=True,
             detail="git push",
             destructive=is_destructive,
+            tag_push=tag_push,
             force_push=is_force,
         )
     return None
@@ -937,6 +946,7 @@ def github_policy(
     write_repos: list[str] | None = None,
     write_branches: list[str] | None = None,
     allow_destructive: bool = False,
+    deny_tag_push: bool = True,
     deny_force_push: bool = True,
     mcp_tool_prefixes: list[str] | None = None,
     shell_tools: list[str] | None = None,
@@ -958,6 +968,11 @@ def github_policy(
     :param allow_destructive: When ``False`` (default), irreversible destructive
         operations (deletes) are denied even on allowed repos. Set to ``True``
         to let destructive operations through normal write gating.
+    :param deny_tag_push: When ``True`` (default), pushing tags to remotes via
+        ``git push --tags``, ``git push --follow-tags``, or explicit
+        ``refs/tags/`` refspecs is denied. Tags are immutable references that
+        downstream CI/CD and release tooling depend on; an agent pushing a tag
+        can trigger releases, deployments, or break semver expectations.
     :param deny_force_push: When ``True`` (default), ``git push`` with force
         flags (``--force``, ``-f``, ``--force-with-lease``,
         ``--force-if-includes``), bundled short flags containing ``f``
@@ -1161,6 +1176,10 @@ def github_policy(
                     f"{deny_reason} Destructive operation `{op.detail}` is blocked by "
                     f"default. Set allow_destructive=true to permit deletes."
                 )
+            if deny_tag_push and op.tag_push:
+                return _deny(
+                    f"{deny_reason} Pushing tags is blocked by policy (deny_tag_push is enabled)."
+                )
             return _gate_write(
                 {op.repo} if op.repo else set(),
                 set(op.branches),
@@ -1268,6 +1287,13 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                     "description": "Allow irreversible destructive operations (deletes). "
                     "When false (default), deletes are denied even on allowed repos.",
                     "default": False,
+                },
+                "deny_tag_push": {
+                    "type": "boolean",
+                    "description": "Block pushing tags to remotes (--tags, --follow-tags, "
+                    "refs/tags/ refspecs). Tags are immutable references that downstream "
+                    "CI/CD depends on.",
+                    "default": True,
                 },
                 "deny_force_push": {
                     "type": "boolean",

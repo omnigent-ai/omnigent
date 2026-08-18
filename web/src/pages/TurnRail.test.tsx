@@ -5,10 +5,10 @@
 // - < 2 turns → renders nothing (nothing to navigate).
 // - one tick (button) per turn, in order, with a jump aria-label.
 // - clicking a tick scrolls the transcript to that user message.
-// - the whole tick band is the hit target (h-4, not just the 2px dash), so a
+// - the whole tick band is the hit target (h-2.5, not just the 2px dash), so a
 //   click matches the hover zone.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TurnRail, type Turn } from "./TurnRail";
 
@@ -64,12 +64,93 @@ describe("TurnRail", () => {
   });
 
   it("gives each tick a full-height hit band, not just the dash", () => {
-    // The clickable button is h-4 (full pitch) so clicking anywhere in a
+    // The clickable button is h-2.5 (full pitch) so clicking anywhere in a
     // tick's band navigates — matching the hover zone. A regression to the
     // old h-2 dash-only target would strand clicks in the between-tick gap.
     renderRail(makeTurns(2));
     const tick = screen.getAllByRole("button")[0]!;
-    expect(tick).toHaveClass("h-4");
+    expect(tick).toHaveClass("h-2.5");
+  });
+
+  it("highlights only the turn whose content region contains the viewport midpoint", async () => {
+    const turns = makeTurns(3);
+    const scroller = document.createElement("div");
+    vi.spyOn(scroller, "getBoundingClientRect").mockReturnValue({
+      top: 0,
+      bottom: 100,
+    } as DOMRect);
+
+    const anchorTops = [-100, 40, 80];
+    const anchors = turns.map((turn, index) => {
+      const anchor = document.createElement("div");
+      anchor.dataset.userMessageId = turn.itemId;
+      vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue({
+        top: anchorTops[index],
+        bottom: anchorTops[index]! + 20,
+      } as DOMRect);
+      document.body.appendChild(anchor);
+      return anchor;
+    });
+
+    render(
+      <TurnRail
+        turns={turns}
+        scroller={{ el: scroller }}
+        hasMoreHistory={false}
+        loadingMoreHistory={false}
+      />,
+    );
+
+    await waitFor(() => {
+      const activeTicks = screen
+        .getAllByRole("button")
+        .filter((tick) => tick.firstElementChild?.classList.contains("bg-foreground"));
+      expect(activeTicks).toHaveLength(1);
+      expect(activeTicks[0]).toHaveAccessibleName("Jump to: prompt number 1");
+    });
+
+    for (const anchor of anchors) anchor.remove();
+  });
+
+  it("keeps the first tick active while the first message is visible", async () => {
+    const turns = makeTurns(3);
+    const scroller = document.createElement("div");
+    vi.spyOn(scroller, "getBoundingClientRect").mockReturnValue({
+      top: 0,
+      bottom: 100,
+    } as DOMRect);
+
+    const anchorRects = [
+      { top: 0, bottom: 20 },
+      { top: 40, bottom: 60 },
+      { top: 80, bottom: 100 },
+    ];
+    const anchors = turns.map((turn, index) => {
+      const anchor = document.createElement("div");
+      anchor.dataset.userMessageId = turn.itemId;
+      vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(anchorRects[index] as DOMRect);
+      document.body.appendChild(anchor);
+      return anchor;
+    });
+
+    render(
+      <TurnRail
+        turns={turns}
+        scroller={{ el: scroller }}
+        hasMoreHistory={false}
+        loadingMoreHistory={false}
+      />,
+    );
+
+    await waitFor(() => {
+      const activeTicks = screen
+        .getAllByRole("button")
+        .filter((tick) => tick.firstElementChild?.classList.contains("bg-foreground"));
+      expect(activeTicks).toHaveLength(1);
+      expect(activeTicks[0]).toHaveAccessibleName("Jump to: prompt number 0");
+    });
+
+    for (const anchor of anchors) anchor.remove();
   });
 
   it("shows the hovered turn's preview when the cursor moves onto a tick", () => {

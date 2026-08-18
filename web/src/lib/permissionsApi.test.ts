@@ -96,17 +96,6 @@ describe("grantPermission", () => {
     });
   });
 
-  it("forwards delegated approval authority explicitly", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({ user_id: "bob", conversation_id: "conv_abc", level: 2, can_approve: true }),
-    );
-
-    await grantPermission("conv_abc", "bob", 2, true);
-
-    const init = fetchMock.mock.calls[0][1] as RequestInit;
-    expect(JSON.parse(init.body as string).can_approve).toBe(true);
-  });
-
   it.each([
     [1, "read"],
     [2, "edit"],
@@ -194,6 +183,39 @@ describe("revokePermission", () => {
     );
     await expect(revokePermission("conv_abc", "self")).rejects.toThrow(
       "Cannot modify your own permissions",
+    );
+  });
+});
+
+describe("revokePermission used to leave (self-revoke)", () => {
+  it("targets the caller's own id — no special path segment", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse(null, { status: 204 }));
+
+    // Leaving is the same endpoint with yourself as the target; the server
+    // allows a self-revoke at read level.
+    await revokePermission("conv_abc", "alice@example.com");
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_abc/permissions/alice%40example.com");
+    expect(init.method).toBe("DELETE");
+  });
+
+  it("surfaces the owner-refusal message on 403", async () => {
+    // An owner can't leave (it would orphan the session); the sidebar shows
+    // this message in its failure toast.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse(
+        {
+          error: {
+            code: "forbidden",
+            message: "Cannot leave a session you own. Delete or archive it instead.",
+          },
+        },
+        { ok: false, status: 403 },
+      ),
+    );
+    await expect(revokePermission("conv_abc", "owner@example.com")).rejects.toThrow(
+      "Cannot leave a session you own",
     );
   });
 });

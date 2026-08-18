@@ -9,23 +9,30 @@ daemon's Popen fallback are all covered.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
+import omnigent
 from omnigent.host.runner_zygote import (
     _ZYGOTE_LOST_EXIT_CODE,
     ZygoteManager,
     ZygoteRunnerProc,
     ZygoteUnavailable,
 )
+from omnigent.runner import _zygote
 from omnigent.runner._zygote import (
     _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR,
     _ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR,
+    _disk_build_stamp,
+    _ZygoteServer,
 )
 
 # The zygote is POSIX-only: these tests exercise os.fork() and pass_fds, which
@@ -120,7 +127,7 @@ def test_fork_runner_reports_pid_and_exit_code(manager: ZygoteManager, tmp_path)
     :param manager: The started manager fixture.
     :param tmp_path: Temp dir for the child's log.
     """
-    proc = manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"))
+    proc = manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"), str(tmp_path))
     assert isinstance(proc, ZygoteRunnerProc)
     assert proc.pid != manager.pid
     assert _wait_exit(proc) == 0
@@ -132,7 +139,7 @@ def test_fork_runner_nonzero_exit_is_reported(manager: ZygoteManager, tmp_path) 
     :param manager: The started manager fixture.
     :param tmp_path: Temp dir for the child's log.
     """
-    proc = manager.fork_runner(_fork_env(7), str(tmp_path / "runner.log"))
+    proc = manager.fork_runner(_fork_env(7), str(tmp_path / "runner.log"), str(tmp_path))
     assert _wait_exit(proc) == 7
 
 
@@ -148,7 +155,7 @@ def test_child_systemexit_code_is_preserved(manager: ZygoteManager, tmp_path) ->
     """
     env = _fork_env(5)
     env["OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_RAISE"] = "1"
-    proc = manager.fork_runner(env, str(tmp_path / "runner.log"))
+    proc = manager.fork_runner(env, str(tmp_path / "runner.log"), str(tmp_path))
     assert _wait_exit(proc) == 5
 
 
@@ -158,9 +165,9 @@ def test_zygote_serves_multiple_forks(manager: ZygoteManager, tmp_path) -> None:
     :param manager: The started manager fixture.
     :param tmp_path: Temp dir for the child logs.
     """
-    first = manager.fork_runner(_fork_env(0), str(tmp_path / "a.log"))
+    first = manager.fork_runner(_fork_env(0), str(tmp_path / "a.log"), str(tmp_path))
     assert _wait_exit(first) == 0
-    second = manager.fork_runner(_fork_env(3), str(tmp_path / "b.log"))
+    second = manager.fork_runner(_fork_env(3), str(tmp_path / "b.log"), str(tmp_path))
     assert second.pid != first.pid
     assert _wait_exit(second) == 3
 
@@ -174,7 +181,7 @@ def test_signal_of_exited_runner_is_a_safe_noop(manager: ZygoteManager, tmp_path
     :param manager: The started manager fixture.
     :param tmp_path: Temp dir for the child's log.
     """
-    proc = manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"))
+    proc = manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"), str(tmp_path))
     assert _wait_exit(proc) == 0
     proc.terminate()
     proc.kill()
@@ -190,7 +197,7 @@ def test_poll_after_stop_reports_live_runner_as_none(manager: ZygoteManager, tmp
     :param manager: The started manager fixture.
     :param tmp_path: Temp dir for the child's log.
     """
-    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"))
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"), str(tmp_path))
     manager.stop()
     try:
         assert proc.poll() is None  # pid still alive -> honestly "still live"
@@ -206,7 +213,7 @@ def test_fork_after_stop_raises_unavailable(manager: ZygoteManager, tmp_path) ->
     """
     manager.stop()
     with pytest.raises(ZygoteUnavailable):
-        manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"))
+        manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"), str(tmp_path))
 
 
 def test_child_env_is_isolated_between_forks(manager: ZygoteManager, tmp_path) -> None:
@@ -225,14 +232,34 @@ def test_child_env_is_isolated_between_forks(manager: ZygoteManager, tmp_path) -
     env_b = _fork_env(0)
     env_b["OMNIGENT_ZYGOTE_MARKER"] = "bbb"
 
-    proc_a = manager.fork_runner(env_a, str(log_a))
+    proc_a = manager.fork_runner(env_a, str(log_a), str(tmp_path))
     assert _wait_exit(proc_a) == 0
-    proc_b = manager.fork_runner(env_b, str(log_b))
+    proc_b = manager.fork_runner(env_b, str(log_b), str(tmp_path))
     assert _wait_exit(proc_b) == 0
 
     assert proc_a.pid != proc_b.pid
     assert "marker=aaa" in log_a.read_text()
     assert "marker=bbb" in log_b.read_text()
+
+
+def test_forked_runner_runs_in_the_requested_workspace(manager: ZygoteManager, tmp_path) -> None:
+    """The forked child chdirs into the workspace, not the zygote's own cwd.
+
+    A daemon may outlive the checkout it started from, so a runner that
+    inherited its cwd would raise ``FileNotFoundError`` from every
+    ``Path.cwd()``. The seam child echoes its cwd to its log.
+
+    :param manager: The started manager fixture (cwd = the pytest process's).
+    :param tmp_path: Temp dir for the workspace and the child's log.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    log = tmp_path / "runner.log"
+
+    proc = manager.fork_runner(_fork_env(0), str(log), str(workspace))
+    assert _wait_exit(proc) == 0
+
+    assert f"cwd={workspace.resolve()}\n" in log.read_text()
 
 
 def test_stale_payload_tty_fd_is_cleared_in_child(manager: ZygoteManager, tmp_path) -> None:
@@ -248,7 +275,7 @@ def test_stale_payload_tty_fd_is_cleared_in_child(manager: ZygoteManager, tmp_pa
     env = _fork_env(0)
     env["OMNIGENT_LOG_TTY_FD"] = "999"  # bogus daemon-side number
     log = tmp_path / "runner.log"
-    proc = manager.fork_runner(env, str(log))
+    proc = manager.fork_runner(env, str(log), str(tmp_path))
     assert _wait_exit(proc) == 0
     assert "tty_fd=\n" in log.read_text()
 
@@ -312,6 +339,30 @@ def test_operator_malloc_override_wins_at_the_zygote_exec(monkeypatch, tmp_path)
     mgr._spawn_zygote_process(child_fd=7)
 
     assert captured["MALLOC_ARENA_MAX"] == "16"
+
+
+def test_zygote_boots_from_inside_an_omnigent_checkout(monkeypatch, tmp_path) -> None:
+    """A daemon whose cwd holds an ``omnigent/`` package still starts a zygote.
+
+    The zygote inherits the daemon's cwd, which ``python -m`` would prepend to
+    ``sys.path``, so a daemon started inside an omnigent checkout would import
+    that checkout instead of the installed package. Booting against a poisoned
+    package proves the spawn keeps cwd off ``sys.path``.
+
+    :param monkeypatch: Fixture used to run from the poisoned directory.
+    :param tmp_path: Temp dir holding the poisoned package and the zygote log.
+    """
+    package = tmp_path / "omnigent"
+    package.mkdir()
+    (package / "__init__.py").write_text('raise ImportError("poisoned omnigent")\n')
+    monkeypatch.chdir(tmp_path)
+
+    mgr = ZygoteManager(log_path=tmp_path / "zygote.log")
+    mgr.start()
+    try:
+        assert mgr.is_running()
+    finally:
+        mgr.stop()
 
 
 # ── Harness-fork path (fork_harness) ──────────────────────────────
@@ -416,6 +467,126 @@ def test_fork_harness_argv_round_trips_to_child(manager: ZygoteManager, tmp_path
     assert f"harness_argv={' '.join(argv)}" in log.read_text()
 
 
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        pytest.param(
+            'BUILD_TIME_EPOCH = 1754848860\nCOMMIT_SHA = "b703a28b"\n',
+            (1754848860.0, "b703a28b"),
+            id="generated",
+        ),
+        pytest.param(None, None, id="missing"),
+        pytest.param("BUILD_TIME_EPOCH = (\n", None, id="half-written"),
+        pytest.param('COMMIT_SHA = "b703a28b"\n', None, id="field-missing"),
+    ],
+)
+def test_disk_build_stamp_reads_the_on_disk_file(tmp_path, content, expected) -> None:
+    """``_disk_build_stamp`` parses the generated file; any failure reads as unknown.
+
+    :param tmp_path: Directory standing in for the installed package dir.
+    :param content: ``_build_info.py`` body, or ``None`` to leave it absent.
+    :param expected: The stamp the probe must return.
+    """
+    if content is not None:
+        (tmp_path / "_build_info.py").write_text(content)
+    assert _disk_build_stamp(package_dir=tmp_path) == expected
+
+
+def test_disk_build_stamp_resolves_package_dir_without_top_level_file(monkeypatch) -> None:
+    """The probe finds ``_build_info.py`` even when ``omnigent.__file__`` is None.
+
+    The zygote is spawned as ``python -m``, which puts the daemon's cwd on
+    sys.path, so a daemon started from a directory that holds an ``omnigent``
+    checkout binds the top-level name to a namespace package with no
+    ``__file__``. Reading it raised ``TypeError`` and killed the zygote at boot
+    before it served a single fork, so the probe keys off its own module path.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    probed: list[Path] = []
+    monkeypatch.setattr(omnigent, "__file__", None)
+    monkeypatch.setattr(
+        importlib.util,
+        "spec_from_file_location",
+        lambda name, location: probed.append(Path(location)),
+    )
+    assert _disk_build_stamp() is None
+    assert probed == [Path(_zygote.__file__).resolve().parents[1] / "_build_info.py"]
+
+
+def _dispatch_fork(
+    server: _ZygoteServer, conn: socket.socket, peer: socket.socket, cmd: str
+) -> dict:
+    """Dispatch one in-process fork request and return the reply.
+
+    :param server: The server under test.
+    :param conn: The socket end handed to the dispatcher.
+    :param peer: The other end, read for the reply.
+    :param cmd: ``"fork"`` (runner) or ``"fork_harness"``.
+    :returns: The decoded reply.
+    """
+    request = {"cmd": cmd, "argv": [], "env": {}}
+    server._dispatch(conn, json.dumps(request).encode("utf-8"))
+    return json.loads(peer.recv(65536).decode("utf-8"))
+
+
+@pytest.mark.parametrize(("cmd", "kind"), [("fork", "runner"), ("fork_harness", "harness")])
+def test_fork_refused_after_in_place_upgrade(monkeypatch, cmd, kind) -> None:
+    """A disk stamp differing from the boot stamp refuses the fork.
+
+    The child resolves its lazily-imported modules from the NEW on-disk files
+    against the OLD pre-imported graph. Both observed failures are this: a
+    harness missing ``describe_exception`` from an in-memory
+    ``omnigent.inner.executor`` that predates it, and a runner whose
+    ``create_app`` cannot import ``omnigent.cli_auth`` from the swapped-out
+    package directory. Refusing makes the caller fall back to a fresh
+    interpreter, which runs the new code coherently.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param cmd: The fork command under test.
+    :param kind: Child kind the error message must name.
+    """
+    daemon, daemon_peer = socket.socketpair()
+    conn, peer = socket.socketpair()
+    server = _ZygoteServer(daemon, graph_stamp=(1000.0, "oldsha"))
+    monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (2000.0, "newsha"))
+    monkeypatch.setattr(os, "fork", lambda: pytest.fail(f"must not fork a mixed-version {kind}"))
+    try:
+        reply = _dispatch_fork(server, conn, peer, cmd)
+        assert "upgraded on disk" in reply["error"]
+        assert kind in reply["error"]
+        assert server._live == set()
+    finally:
+        server._sel.close()
+        for sock in (daemon, daemon_peer, conn, peer):
+            sock.close()
+
+
+@pytest.mark.parametrize("cmd", ["fork", "fork_harness"])
+def test_fork_proceeds_while_disk_stamp_matches(monkeypatch, cmd) -> None:
+    """An unchanged disk stamp forks exactly as before the gate existed.
+
+    ``os.fork`` is faked to a pid so the assertion is purely about the gate
+    letting the request through to the fork path.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param cmd: The fork command under test.
+    """
+    daemon, daemon_peer = socket.socketpair()
+    conn, peer = socket.socketpair()
+    server = _ZygoteServer(daemon, graph_stamp=(1000.0, "sha"))
+    monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (1000.0, "sha"))
+    monkeypatch.setattr(os, "fork", lambda: 4242)
+    try:
+        reply = _dispatch_fork(server, conn, peer, cmd)
+        assert reply == {"pid": 4242}
+        assert 4242 in server._live
+    finally:
+        server._sel.close()
+        for sock in (daemon, daemon_peer, conn, peer):
+            sock.close()
+
+
 def test_zygote_still_serves_daemon_after_harness_fork(manager: ZygoteManager, tmp_path) -> None:
     """A ping still round-trips after a harness fork — the multiplexer survives.
 
@@ -454,15 +625,16 @@ def _sleep_env(seconds: float) -> dict[str, str]:
     }
 
 
-def test_poll_after_zygote_crash_reports_dead_runner(manager: ZygoteManager) -> None:
+def test_poll_after_zygote_crash_reports_dead_runner(manager: ZygoteManager, tmp_path) -> None:
     """A vanished zygote surfaces a dead runner as failed, never eternal alive.
 
     Without this the daemon's ``_watch_runner`` loops forever on ``poll() is
     None`` and reports a gone session as alive.
 
     :param manager: The started manager fixture.
+    :param tmp_path: Temp dir used as the forked child's workspace.
     """
-    proc = manager.fork_runner(_sleep_env(30), "/dev/null")
+    proc = manager.fork_runner(_sleep_env(30), "/dev/null", str(tmp_path))
     assert proc.poll() is None  # child is alive
 
     # Kill the zygote out from under the still-live runner.
@@ -503,7 +675,7 @@ def test_dropped_runner_harness_exit_codes_do_not_leak(manager: ZygoteManager, t
     :param tmp_path: Temp dir for the harness child's log.
     """
     # A runner that lives long enough to host a harness fork, then exits.
-    proc = manager.fork_runner(_sleep_env(2), "/dev/null")
+    proc = manager.fork_runner(_sleep_env(2), "/dev/null", str(tmp_path))
     runner_pid = proc.pid
 
     # The runner's own control socket back to the zygote is internal to the
@@ -606,7 +778,7 @@ def test_zygote_still_forks_after_a_malformed_request(manager: ZygoteManager, tm
     :param tmp_path: Temp dir for the child's log.
     """
     assert "error" in _raw_exchange(manager, b"[]\n")
-    proc = manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"))
+    proc = manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"), str(tmp_path))
     assert _wait_exit(proc) == 0
 
 

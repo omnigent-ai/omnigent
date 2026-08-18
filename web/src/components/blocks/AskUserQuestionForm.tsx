@@ -44,7 +44,6 @@ interface AskUserQuestionFormProps {
   questions: ClaudeQuestion[];
   onSubmit: (answers: AskUserQuestionAnswers) => void;
   onReject: () => void;
-  canSubmit?: boolean;
 }
 
 /**
@@ -83,12 +82,7 @@ function questionKey(question: ClaudeQuestion): string {
   return question.id && question.id.length > 0 ? question.id : question.question;
 }
 
-export function AskUserQuestionForm({
-  questions,
-  onSubmit,
-  onReject,
-  canSubmit = true,
-}: AskUserQuestionFormProps) {
+export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQuestionFormProps) {
   // Currently-visible question (carousel index).
   const [currentIndex, setCurrentIndex] = useState(0);
 
@@ -373,7 +367,7 @@ export function AskUserQuestionForm({
           <Button
             size="sm"
             onClick={handleSubmit}
-            disabled={!allAnswered || !canSubmit}
+            disabled={!allAnswered}
             data-testid="ask-user-question-submit"
           >
             <CheckIcon className="mr-1 size-3.5" />

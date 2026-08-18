@@ -1,7 +1,7 @@
 {
   "name": "omnigent-desktop-electron",
   "productName": "Omnigent",
-  "version": "0.9.0-dev.0",
+  "version": "0.10.0-dev.0",
   "description": "Omnigent desktop shell (Electron edition) — a thin native wrapper around the server-served web UI.",
   "private": true,
   "main": "src/main.js",
@@ -88,8 +88,20 @@
       "gatekeeperAssess": false,
       "notarize": false,
       "target": [
-        "dmg",
-        "zip"
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
       ],
       "publish": [
         {

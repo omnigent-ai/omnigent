@@ -39,6 +39,27 @@ from omnigent.spec.types import AgentSpec
 
 _logger = logging.getLogger(__name__)
 
+
+def _string_map(value: object) -> dict[str, str]:
+    """Keep non-blank string entries from a JSON object; drop everything else."""
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, raw in value.items():
+        if isinstance(key, str) and isinstance(raw, str) and raw.strip():
+            out[key] = raw.strip()
+    return out
+
+
+def _extension_map(result: _JsonObject, *keys: str) -> dict[str, str]:
+    """Read an Omnigent tools/list extension, accepting snake_case or camelCase."""
+    for key in keys:
+        parsed = _string_map(result.get(key))
+        if parsed:
+            return parsed
+    return {}
+
+
 _EventPublisher = Callable[[str, _JsonObject], None]
 
 
@@ -221,18 +242,15 @@ class ProxyMcpManager:
             schemas.append(schema)
             tool_names.add(name)
 
-        raw_instructions = result.get("serverInstructions")
-        server_instructions: dict[str, str] = {}
-        if isinstance(raw_instructions, dict):
-            for key, value in raw_instructions.items():
-                if isinstance(key, str) and isinstance(value, str) and value.strip():
-                    server_instructions[key] = value.strip()
+        raw_instructions = _extension_map(result, "serverInstructions", "server_instructions")
+        raw_labels = _extension_map(result, "serverLabels", "server_labels")
 
         return McpSchemasResult(
             schemas=schemas,
             tool_names=tool_names,
             failures={},
-            server_instructions=server_instructions,
+            server_instructions=raw_instructions,
+            server_labels=raw_labels,
         )
 
     async def call_tool(

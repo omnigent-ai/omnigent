@@ -67,6 +67,7 @@ const useSessionMock = vi.mocked(useSession);
 function childInfo(overrides: Partial<ChildSessionInfo> & { id: string }): ChildSessionInfo {
   return {
     title: null,
+    task_summary: null,
     tool: null,
     session_name: null,
     current_task_status: null,

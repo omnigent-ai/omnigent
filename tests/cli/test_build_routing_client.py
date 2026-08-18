@@ -86,6 +86,46 @@ def test_external_defers_profile_auth_to_per_call() -> None:
     assert client._databricks_profile == "staging"
 
 
+def test_external_falls_back_to_the_deployments_databricks_provider_profile() -> None:
+    """
+    A ``routing:`` block that names no profile still authenticates as the config's.
+
+    Otherwise the client falls through to the ambient SDK chain, which resolves
+    by host or ``[DEFAULT]``: on a workspace with two profiles on one host, the
+    router then authenticates as a different identity than the panes it routes,
+    and re-authing one leaves the other's token expired.
+    """
+    cfg = {
+        "providers": {
+            "ws": {"kind": "databricks", "profile": "eng-ml-agent-platform", "default": True},
+        },
+        "routing": {
+            "provider": "external",
+            "base_url": "https://host/v1",
+            "router_name": "task_v0",
+        },
+    }
+    client = _build_external_routing_client(cfg["routing"], None, cfg)
+    assert isinstance(client, ExternalRoutingClient)
+    assert client._databricks_profile == "eng-ml-agent-platform"
+
+
+def test_externals_own_profile_still_wins_over_the_provider_block() -> None:
+    """An explicitly routed profile is the deployment saying which identity to use."""
+    cfg = {
+        "providers": {"ws": {"kind": "databricks", "profile": "agent"}},
+        "routing": {
+            "provider": "external",
+            "base_url": "https://host/v1",
+            "router_name": "task_v0",
+            "profile": "staging",
+        },
+    }
+    client = _build_external_routing_client(cfg["routing"], None, cfg)
+    assert isinstance(client, ExternalRoutingClient)
+    assert client._databricks_profile == "staging"
+
+
 def test_external_api_key_expands_env(monkeypatch: Any) -> None:
     """api_key is provider-agnostic and ${ENV}-expanded into a bearer header."""
     import httpx

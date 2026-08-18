@@ -114,6 +114,23 @@ export function showsRoutingDecisionChip(
 }
 
 /**
+ * Display form of a decision's harness.
+ *
+ * Every chip says `"claude"` / `"codex"` whatever its scope: the `-native`
+ * suffix is an implementation detail of how the pane runs, and on a chip it
+ * reads as noise. SDK ids (a bundle agent's `codex` / `claude-sdk` children,
+ * or `auto`) carry no suffix and render unchanged.
+ *
+ * @param harness - Harness id carried on the decision, when known.
+ * @returns The display label, or `null` when the decision has no harness.
+ */
+export function harnessDisplayLabel(harness: string | null | undefined): string | null {
+  const id = harness?.trim();
+  if (!id) return null;
+  return id.replace(/-native$/, "");
+}
+
+/**
  * Badge text for a sub-agent-scoped decision, e.g. `"subagent: researcher"`.
  *
  * @param scope - Decision scope; only the sub-agent scopes get a badge.

@@ -19,6 +19,7 @@ from omnigent.runner.subagent_routing import (
     ADVERTISEMENT_FILE,
     AUTO_HARNESS_LABEL_KEY,
     PLAIN_SESSION,
+    ROUTING_DECISION_LABEL_KEY,
     SessionRoutingClass,
     SubagentRouteDecision,
     SubagentRouteRequest,
@@ -1118,20 +1119,25 @@ def test_subagent_routing_enabled_is_two_state(override: str | None, expected: b
         (None, None, {}, SessionRoutingClass()),
         ("off", "codex-native", {}, SessionRoutingClass()),
         # Pinned: Smart Routing as the model, codex chosen as the harness.
-        ("on", "codex-native", {}, SessionRoutingClass(routing_enabled=True)),
+        (
+            "on",
+            "codex-native",
+            {},
+            SessionRoutingClass(routing_enabled=True, turn_routing=True),
+        ),
         # Auto-harness, before first-message routing replaces the sentinel.
         (
             "on",
             "auto",
             {},
-            SessionRoutingClass(routing_enabled=True, auto_harness=True),
+            SessionRoutingClass(routing_enabled=True, auto_harness=True, turn_routing=True),
         ),
         # …and after: the sentinel is gone, the durable label is not.
         (
             "on",
             "codex-native",
             {AUTO_HARNESS_LABEL_KEY: "1"},
-            SessionRoutingClass(routing_enabled=True, auto_harness=True),
+            SessionRoutingClass(routing_enabled=True, auto_harness=True, turn_routing=True),
         ),
         # An auto-harness session is a Smart Routing session by construction,
         # so the label alone implies routing is on.
@@ -1139,7 +1145,27 @@ def test_subagent_routing_enabled_is_two_state(override: str | None, expected: b
             None,
             None,
             {AUTO_HARNESS_LABEL_KEY: "1"},
-            SessionRoutingClass(routing_enabled=True, auto_harness=True),
+            SessionRoutingClass(routing_enabled=True, auto_harness=True, turn_routing=True),
+        ),
+        # Already routed — a web create pinned the model before the pane
+        # launched. The session keeps every other routing affordance; only the
+        # first-message hook is dropped, since it could only say "already
+        # routed" once per prompt.
+        (
+            "on",
+            "claude-native",
+            {ROUTING_DECISION_LABEL_KEY: "rd_1"},
+            SessionRoutingClass(routing_enabled=True),
+        ),
+        # Routing off plus a stale decision label is still plain.
+        ("off", "claude-native", {ROUTING_DECISION_LABEL_KEY: "rd_1"}, SessionRoutingClass()),
+        # An auto session the create could not route keeps its hook: the first
+        # message is its retry.
+        (
+            "on",
+            "auto",
+            {AUTO_HARNESS_LABEL_KEY: "1"},
+            SessionRoutingClass(routing_enabled=True, auto_harness=True, turn_routing=True),
         ),
     ],
 )
@@ -1317,6 +1343,45 @@ async def test_a_gateway_backed_spawn_is_routed_by_the_external_router() -> None
     )
     assert decision.router_source == "databricks-aigw"
     assert local.calls == []
+
+
+async def test_a_spawn_falls_back_to_the_judge_when_the_router_fails() -> None:
+    """A workspace with no routing API must not cost every spawn its decision."""
+    from omnigent.server.routing_backend import RoutingBackends
+
+    external = FakeRoutingClient(
+        None, last_error="router returned HTTP 404: routes:select is not enabled"
+    )
+    local = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="local"))
+    caps = FakeCaps(
+        routing_client=external,
+        routing_backends=RoutingBackends(external=external, local=local),
+    )
+    decision = await resolve_subagent_route(
+        "conv_fallback", _request(), caps=caps, gateway_backed=True
+    )
+    assert decision.router_source == "oss-llm"
+    assert decision.model == CLAUDE_MODEL
+    assert external.calls != []
+
+
+async def test_a_spawn_keeps_the_routers_reason_when_nothing_can_answer() -> None:
+    """Fail-open is unchanged: the spawn runs, the chip carries the reason."""
+    from omnigent.server.routing_backend import RoutingBackends
+
+    external = FakeRoutingClient(None, last_error="router returned HTTP 404: not enabled")
+    local = FakeRoutingClient(None, last_error="the judge had no opinion")
+    caps = FakeCaps(
+        routing_client=external,
+        routing_backends=RoutingBackends(external=external, local=local),
+    )
+    decision = await resolve_subagent_route(
+        "conv_none", _request(), caps=caps, gateway_backed=True
+    )
+    assert decision.action == "allow"
+    assert decision.model is None
+    assert decision.router_source is None
+    assert "the judge had no opinion" in decision.rationale
 
 
 async def test_an_external_only_deployment_cannot_route_an_off_gateway_spawn() -> None:

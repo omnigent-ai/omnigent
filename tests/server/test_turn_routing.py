@@ -47,6 +47,7 @@ class _FakeConv:
     cost_control_mode_override: str | None = "on"
     parent_conversation_id: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
+    subagent_routing_override: str | None = None
 
 
 def _routed_labels() -> dict[str, str]:
@@ -187,6 +188,79 @@ async def test_a_routed_parent_routes_its_child() -> None:
     assert decision.action == "route"
 
 
+async def test_a_pinned_parents_out_of_family_pane_is_not_routed() -> None:
+    rec = _Recorder()
+    decision = await resolve_turn_route(
+        "conv_child",
+        _request(harness="claude-native"),
+        conv=_FakeConv(parent_conversation_id="conv_parent"),
+        parent=_FakeConv(subagent_routing_override="on"),
+        parent_harness="codex-native",
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+    assert decision.action == "allow"
+    assert "model family" in decision.rationale
+    # Nothing was routed, pinned or recorded: the pane keeps its own model.
+    assert rec.routed == []
+    assert rec.pinned == []
+    assert rec.chips == []
+    # Not terminal — the parent's switch can be turned off.
+    assert decision.terminal is False
+
+
+async def test_a_pinned_parents_in_family_pane_still_routes() -> None:
+    rec = _Recorder()
+    decision = await resolve_turn_route(
+        "conv_child",
+        _request(harness="codex-native"),
+        conv=_FakeConv(parent_conversation_id="conv_parent"),
+        parent=_FakeConv(subagent_routing_override="on"),
+        parent_harness="codex-native",
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+    assert decision.action == "route"
+    assert rec.pinned == [ROUTED_MODEL]
+
+
+async def test_an_auto_parents_cross_family_pane_still_routes() -> None:
+    from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+
+    rec = _Recorder()
+    decision = await resolve_turn_route(
+        "conv_child",
+        _request(harness="claude-native"),
+        conv=_FakeConv(parent_conversation_id="conv_parent"),
+        parent=_FakeConv(
+            subagent_routing_override="on",
+            labels={AUTO_HARNESS_LABEL_KEY: "1"},
+        ),
+        parent_harness="codex-native",
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+    assert decision.action == "route"
+
+
+async def test_an_unrouted_parents_cross_family_pane_still_routes() -> None:
+    rec = _Recorder()
+    decision = await resolve_turn_route(
+        "conv_child",
+        _request(harness="claude-native"),
+        conv=_FakeConv(parent_conversation_id="conv_parent"),
+        parent=_FakeConv(),
+        parent_harness="codex-native",
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=rec.persist,
+    )
+    assert decision.action == "route"
+
+
 async def test_a_missing_conversation_allows_unrouted() -> None:
     rec = _Recorder()
     decision = await resolve_turn_route(
@@ -201,6 +275,11 @@ async def test_a_router_outage_allows_the_turn_unrouted() -> None:
         del harness, prompt
         raise RuntimeError("router down")
 
+    declines: list[str] = []
+
+    async def _decline(cause: str) -> None:
+        declines.append(cause)
+
     rec = _Recorder()
     decision = await resolve_turn_route(
         "conv_1",
@@ -209,11 +288,15 @@ async def test_a_router_outage_allows_the_turn_unrouted() -> None:
         route_turn=_boom,
         pin=rec.pin,
         persist=rec.persist,
+        record_decline=_decline,
     )
     assert decision.action == "allow"
     assert "routing unavailable" in decision.rationale
     assert rec.pinned == []
     assert rec.chips == []
+    # The failure is visible: a declined chip names the cause, without
+    # claiming the route-once label (the persist/pin seams stayed silent).
+    assert declines == ["Routing call failed: RuntimeError"]
 
 
 async def test_no_verdict_allows_the_turn_unrouted() -> None:
@@ -221,12 +304,63 @@ async def test_no_verdict_allows_the_turn_unrouted() -> None:
         del harness, prompt
         return None, None
 
+    declines: list[str] = []
+
+    async def _decline(cause: str) -> None:
+        declines.append(cause)
+
     rec = _Recorder()
     decision = await resolve_turn_route(
-        "conv_1", _request(), conv=_FakeConv(), route_turn=_none, pin=rec.pin, persist=rec.persist
+        "conv_1",
+        _request(),
+        conv=_FakeConv(),
+        route_turn=_none,
+        pin=rec.pin,
+        persist=rec.persist,
+        record_decline=_decline,
     )
     assert decision.action == "allow"
     assert rec.chips == []
+    assert declines == ["Routing unavailable (router returned no verdict)"]
+
+
+async def test_benign_allows_record_no_decline_chip() -> None:
+    """Already-routed / routing-off are not failures — they stay chipless."""
+    declines: list[str] = []
+
+    async def _decline(cause: str) -> None:
+        declines.append(cause)
+
+    rec = _Recorder()
+    decision = await resolve_turn_route(
+        "conv_1",
+        _request(),
+        conv=_FakeConv(labels={"omnigent.routing.decision_id": "dec_1"}),
+        route_turn=rec.route,
+        pin=rec.pin,
+        persist=rec.persist,
+        record_decline=_decline,
+    )
+    assert decision.action == "allow"
+    assert declines == []
+
+
+async def test_a_failing_decline_record_does_not_change_the_verdict() -> None:
+    """The chip is a record, not a gate — its own failure must be swallowed."""
+
+    async def _boom(harness: str | None, prompt: str) -> tuple[str | None, dict[str, Any] | None]:
+        del harness, prompt
+        raise RuntimeError("router down")
+
+    async def _decline(cause: str) -> None:
+        del cause
+        raise OSError("store down")
+
+    decision = await resolve_turn_route(
+        "conv_1", _request(), conv=_FakeConv(), route_turn=_boom, record_decline=_decline
+    )
+    assert decision.action == "allow"
+    assert decision.terminal is False
 
 
 async def test_a_failed_pin_declines_the_route() -> None:
@@ -1137,16 +1271,18 @@ def test_the_router_clients_own_timeout_sits_inside_the_hook_budget() -> None:
     assert 0 < default < HOOK_REQUEST_TIMEOUT_S
 
 
-def test_every_routing_budget_stays_in_single_digits() -> None:
+def test_every_routing_budget_stays_inside_the_owners_ceiling() -> None:
     """
-    The owner's ruling: a fail-open that takes 30s is blocking in practice.
+    Both halves of the owner's ruling, which pull against each other.
 
-    The relation tests above only pin the ORDERING, which a 45s ladder
-    satisfies just as well as a 15s one. This pins the magnitude: the two
-    hazard paths — a first-message hook holding a typed prompt and a spawn gate
-    holding an agent's tool call — must give up within seconds, so every
-    request budget on them is a single digit and the harness-registered kill is
-    well inside a quarter of a minute.
+    A fail-open that takes 30s is blocking in practice, so the hazard paths — a
+    first-message hook holding a typed prompt and a spawn gate holding an
+    agent's tool call — must give up well inside half a minute. But a budget
+    tight enough to lose the race with a HEALTHY route is worse than a slow
+    one: the verdict arrives and is thrown away, wasting the attempt and
+    duplicating the prompt. A healthy first message costs catalog preparation
+    (~3s measured) plus the routing call (~1.6s), so every hook budget must
+    clear that comfortably while staying at or under the 15s ceiling.
     """
     from omnigent.inner.hook_scripts.subagent_router import (
         HOOK_TIMEOUT_S as SPAWN_HOOK_TIMEOUT_S,
@@ -1157,9 +1293,11 @@ def test_every_routing_budget_stays_in_single_digits() -> None:
     from omnigent.runner import subagent_routing, turn_routing
     from omnigent.server.smart_routing import ROUTING_REQUEST_TIMEOUT_S
 
-    # The routing call itself, the innermost wait on every path.
-    assert ROUTING_REQUEST_TIMEOUT_S <= 8.0
-    # Each hook's own HTTP budget — what the user actually waits out.
+    # The routing call itself, the innermost wait on every path. It must leave
+    # room under the hops above it for the preparation that precedes it.
+    assert ROUTING_REQUEST_TIMEOUT_S <= 10.0
+    # Each hook's own HTTP budget — what the user actually waits out. The floor
+    # is what a healthy route costs end to end; the ceiling is the owner's 15s.
     for budget in (
         turn_routing.HOOK_REQUEST_TIMEOUT_S,
         turn_routing.RELAY_TIMEOUT_S,
@@ -1170,11 +1308,24 @@ def test_every_routing_budget_stays_in_single_digits() -> None:
         subagent_routing.SERVER_HOP_TIMEOUT_S,
         SPAWN_REQUEST_TIMEOUT_S,
     ):
-        assert 0 < budget < 10.0, budget
+        assert 0 < budget <= 15.0, budget
+    # The two hook budgets carry a typed prompt and a spawn tool call, so they
+    # are the ones that must outlast preparation-plus-call, not just the call.
+    _HEALTHY_ROUTE_S = 3.2 + 1.6
+    for budget in (
+        turn_routing.HOOK_REQUEST_TIMEOUT_S,
+        subagent_routing.HOOK_REQUEST_TIMEOUT_S,
+        SPAWN_REQUEST_TIMEOUT_S,
+    ):
+        assert budget > _HEALTHY_ROUTE_S * 2, budget
     # The outermost hop is the harness's own kill, which only needs enough
     # headroom for the hook script to reach its fail-open branch.
-    assert turn_routing.HARNESS_HOOK_TIMEOUT_S <= 15
-    assert SPAWN_HOOK_TIMEOUT_S <= 15
+    # Claude Code's own UserPromptSubmit default is 30s; the harness must not
+    # be the layer that gives up first, so both kills stay under it.
+    assert turn_routing.HARNESS_HOOK_TIMEOUT_S < 30
+    assert SPAWN_HOOK_TIMEOUT_S < 30
+    assert turn_routing.HARNESS_HOOK_TIMEOUT_S > turn_routing.HOOK_REQUEST_TIMEOUT_S
+    assert SPAWN_HOOK_TIMEOUT_S > SPAWN_REQUEST_TIMEOUT_S
 
 
 def test_the_subagent_ladder_is_strictly_decreasing_inwards() -> None:
@@ -1232,7 +1383,7 @@ def test_the_builtin_judge_shares_the_external_routers_budget() -> None:
     # covers the fallback chain and any pre-request token refresh.
     assert "timeout=ROUTING_REQUEST_TIMEOUT_S" in source
     assert "asyncio.wait_for" in source
-    assert ROUTING_REQUEST_TIMEOUT_S <= 8.0
+    assert ROUTING_REQUEST_TIMEOUT_S <= 10.0
 
 
 # ── Route-once under load, and the manual-pin gap ───────────────────
@@ -1740,3 +1891,87 @@ def test_the_claude_sdk_spawn_hook_is_registered_outside_its_own_request() -> No
     assert "timeout=subagent_router.HOOK_TIMEOUT_S" in source
     assert "timeout=subagent_router.REQUEST_TIMEOUT_S" not in source
     assert HOOK_TIMEOUT_S > REQUEST_TIMEOUT_S
+
+
+# ── Hook omission for an already-routed session ─────────────────────────
+#
+# A web create routes a pinned native pane's model before the terminal exists,
+# and stamps the routing-decision label. Registering the ``UserPromptSubmit``
+# hook on top of that buys nothing — its only answer is "already routed" — and
+# costs a held prompt plus a round trip. The advertisement is the switch, so
+# not starting the router is what leaves the hook out of the payload.
+
+
+def _hook_settings_after_launch(
+    tmp_path: Path,
+    *,
+    harness: str,
+    labels: dict[str, str],
+    session_id: str,
+) -> dict[str, Any]:
+    """Generate a native launch's hook settings for one session snapshot."""
+    from omnigent.codex_native_app_server import (
+        _codex_policy_hooks_settings,
+        _turn_router_advertised,
+    )
+    from omnigent.runner.native.orchestration import _start_turn_router_for_native_session
+    from omnigent.runner.subagent_routing import routing_class_from_snapshot
+
+    routing_class = routing_class_from_snapshot(
+        cost_control_mode="on", harness_override=harness, labels=labels
+    )
+    router = _start_turn_router_for_native_session(
+        session_id,
+        bridge_dir=tmp_path,
+        harness=harness,
+        server_client=_FakeServerClient(),
+        turn_routing=routing_class.turn_routing,
+    )
+    try:
+        if harness == "codex-native":
+            return _codex_policy_hooks_settings(
+                tmp_path, "/venv/bin/python", turn_routing=_turn_router_advertised(tmp_path)
+            )
+        from omnigent.claude_native_bridge import build_hook_settings
+
+        return build_hook_settings(tmp_path, turn_routing=router is not None)
+    finally:
+        shutdown_session_turn_router(session_id, router)
+
+
+def _prompt_submit_commands(settings: dict[str, Any]) -> list[str]:
+    """Every ``UserPromptSubmit`` command in a generated hook payload."""
+    return [
+        hook.get("command", "")
+        for entry in settings["hooks"].get("UserPromptSubmit", [])
+        for hook in entry.get("hooks", [])
+    ]
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
+async def test_a_create_routed_session_launches_without_the_turn_hook(
+    tmp_path: Path, harness: str
+) -> None:
+    from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
+
+    settings = _hook_settings_after_launch(
+        tmp_path,
+        harness=harness,
+        labels={ROUTING_DECISION_LABEL_KEY: "decision-1"},
+        session_id=f"conv_routed_{harness}",
+    )
+    assert not any("route-turn" in command for command in _prompt_submit_commands(settings))
+    assert not (tmp_path / ADVERTISEMENT_FILE).exists()
+
+
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
+async def test_a_declined_create_route_keeps_the_turn_hook(tmp_path: Path, harness: str) -> None:
+    # Fail-open: the create emitted a declined chip and pinned nothing, so no
+    # decision label. The first message is this session's second chance.
+    settings = _hook_settings_after_launch(
+        tmp_path,
+        harness=harness,
+        labels={},
+        session_id=f"conv_declined_{harness}",
+    )
+    assert any("route-turn" in command for command in _prompt_submit_commands(settings))
