@@ -975,6 +975,10 @@ class TerminalInstance:
     # the tmux server itself is launched.
     terminal_transport: str | None = None
     running: bool = False
+    # Set on first successful launch and never cleared: close() must be able
+    # to kill the private tmux server even after the inner process exited and
+    # is_alive() flipped `running` off (see close()).
+    _launched: bool = field(default=False, repr=False, compare=False)
     launch_cwd: str | None = None
     # Owned per-launch egress proxy. ``None`` when the sandbox
     # carries no ``egress_rules`` or the backend doesn't need a
@@ -1252,6 +1256,7 @@ class TerminalInstance:
             )
 
         self.running = True
+        self._launched = True
         self.launch_cwd = effective_cwd
 
     async def send(
@@ -1403,7 +1408,15 @@ class TerminalInstance:
         await self._stop_idle_watcher()
         self._stop_idle_watcher_thread()
 
-        if self.running:
+        # Kill the private tmux server whenever this terminal was launched,
+        # not only while `running` still holds: with keep_alive_after_exit the
+        # inner process exits first, is_alive() flips `running` off as its
+        # documented side effect, and the remain-on-exit session + server would
+        # otherwise outlive the terminal (one leaked tmux server per closed
+        # terminal). Callers previously had to "restore running before close()"
+        # to work around exactly this; kill-server against an already-dead
+        # socket is an ignored error, so an unconditional attempt is safe.
+        if self.running or getattr(self, "_launched", False):
             with contextlib.suppress(RuntimeError):
                 await self._tmux("kill-server")
             self.running = False

@@ -1102,3 +1102,58 @@ async def test_dead_registered_pane_close_restores_running_for_kill_server(
     assert registry.get(sid, "claude", "main") is None, (
         "Stale entry must be removed from the registry"
     )
+
+
+@pytest.mark.asyncio
+async def test_close_kills_server_after_inner_process_exit(tmp_path: Path) -> None:
+    """close() must kill the private tmux server after the inner process has
+    exited (keep_alive_after_exit): is_alive() flips ``running`` off as its
+    documented side effect, and the old ``if self.running`` guard then skipped
+    kill-server -- one leaked tmux server per closed terminal (#4880)."""
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "k.sock",
+        private_dir=tmp_path / "k_private",
+    )
+    (tmp_path / "k_private").mkdir(exist_ok=True)
+    instance.running = True
+    instance._launched = True  # noqa: SLF001 — simulating a successful launch
+    # The pane died; is_alive's documented side effect already flipped running.
+    instance.running = False  # noqa: SLF001
+
+    kill_calls: list[tuple[str, ...]] = []
+
+    async def _fake_tmux(*args: str) -> None:
+        kill_calls.append(args)
+
+    instance._tmux = _fake_tmux  # type: ignore[assignment]
+
+    await instance.close()
+
+    assert any("kill-server" in call for call in kill_calls), (
+        "close() skipped kill-server because the inner process already exited"
+    )
+
+
+@pytest.mark.asyncio
+async def test_close_never_launched_does_not_kill(tmp_path: Path) -> None:
+    """A terminal that was never launched owns no server to kill."""
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "n.sock",
+        private_dir=tmp_path / "n_private",
+    )
+    (tmp_path / "n_private").mkdir(exist_ok=True)
+
+    kill_calls: list[tuple[str, ...]] = []
+
+    async def _fake_tmux(*args: str) -> None:
+        kill_calls.append(args)
+
+    instance._tmux = _fake_tmux  # type: ignore[assignment]
+
+    await instance.close()
+
+    assert not any("kill-server" in call for call in kill_calls)
