@@ -1342,7 +1342,10 @@ class HarnessProcessManager:
         finally:
             if entry.process.returncode is None:
                 try:
-                    entry.process.send_signal(signal.SIGTERM)
+                    # Tree-aware backstop: this process parents the sandbox
+                    # launcher, which forks the real agent. Signalling only the
+                    # handle strands both when an executor close() never runs.
+                    _proc.terminate_tree(entry.process)
                     await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
                 except Exception:
                     # Graceful SIGTERM didn't complete — it timed out, or
@@ -1350,7 +1353,7 @@ class HarnessProcessManager:
                     # mid-teardown). Force-kill best-effort; a process that
                     # is already gone is already done.
                     with contextlib.suppress(Exception):
-                        entry.process.kill()
+                        _proc.kill_tree(entry.process)
                         await entry.process.wait()
             with contextlib.suppress(Exception):
                 close_subprocess_transport(entry.process)
