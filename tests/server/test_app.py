@@ -1651,3 +1651,51 @@ def test_load_debug_routers_collects_entries() -> None:
     _router, prefix, tags = entries[0]
     assert prefix == "/debug"
     assert tags == ["debug"]
+
+
+def test_ensure_default_acp_agents_config_wins_over_same_slug_builtin(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured ``acp:`` agent whose slug equals a builtin row id keeps its
+    explicit configuration instead of being silently overwritten by the builtin
+    CLI row (#4926).
+
+    **What breaks if this fails**: a user who configures ``Devin`` with
+    ``devin acp --model swe-1-7-medium`` gets the builtin row's account-default
+    harness in the picker — their explicit config is discarded with no warning.
+    """
+    import hashlib
+
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+
+    # "devin" is a real builtin ACP CLI catalog id; the display label slugifies
+    # to exactly that id.
+    entry = AcpAgentEntry(
+        slug="devin", name="Devin", command="devin acp --model swe-1-7-medium"
+    )
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [entry])
+    # The builtin binary resolves on PATH, so both sources claim the slug.
+    monkeypatch.setattr(
+        "omnigent._platform.resolve_cli_binary", lambda _b, **k: "/usr/local/bin/x"
+    )
+
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    seeded = seed_stores.agent_store.get_by_name("devin")
+    assert seeded is not None, "same-slug collision seeded nothing at all"
+
+    # The stored bundle must be the CONFIGURED agent's (harness acp:devin), not
+    # the builtin row's (harness devin). The content-addressed location carries
+    # the bundle's sha256, so compare against both candidate bundles.
+    configured_bundle = server_app._build_acp_bundle(harness="acp:devin", name="devin")
+    builtin_bundle = server_app._build_acp_bundle(harness="devin", name="devin")
+    configured_sha = hashlib.sha256(configured_bundle).hexdigest()
+    builtin_sha = hashlib.sha256(builtin_bundle).hexdigest()
+    assert configured_sha != builtin_sha, "test premise: the two bundles differ"
+
+    assert configured_sha in (seeded.bundle_location or ""), (
+        "the builtin ACP CLI row silently overwrote the user-configured acp:devin agent"
+    )
+    assert builtin_sha not in (seeded.bundle_location or "")
