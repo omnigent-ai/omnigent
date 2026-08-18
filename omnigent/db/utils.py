@@ -372,7 +372,8 @@ def _build_alembic_config(db_uri: str) -> Config:
 
     alembic_ini = Path(__file__).parent / "alembic.ini"
     config = Config(str(alembic_ini))
-    config.set_main_option("sqlalchemy.url", db_uri)
+    # ConfigParser requires literal percent signs to be doubled.
+    config.set_main_option("sqlalchemy.url", db_uri.replace("%", "%%"))
     config.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
     return config
 

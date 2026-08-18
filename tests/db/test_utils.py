@@ -299,6 +299,15 @@ def test_create_engine_wires_token_refresh_and_short_recycle(
         engine.dispose()
 
 
+def test_build_alembic_config_preserves_percent_encoded_database_url() -> None:
+    """Alembic accepts URL-encoded credentials without changing the URL."""
+    uri = "postgresql+psycopg://user:p%40ss%25word@db.example.com:5432/app"
+
+    config = _build_alembic_config(uri)
+
+    assert config.get_main_option("sqlalchemy.url") == uri
+
+
 # ── _initialize_or_verify_schema ────────────────────────
 
 
