@@ -131,9 +131,12 @@ describe("ErrorBanner", () => {
 
       fireEvent.keyDown(messageToggle, { key });
       expect(screen.queryByTestId("error-status-icon")).toBeNull();
+      expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
+      fireEvent.click(messageToggle);
       expect(screen.getByTestId("error-disclosure-icon")).toHaveClass("rotate-90");
 
       fireEvent.keyDown(messageToggle, { key });
+      fireEvent.click(messageToggle);
       expect(screen.queryByTestId("error-status-icon")).toBeNull();
       expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
 
@@ -187,7 +190,15 @@ describe("ErrorBanner", () => {
       <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
     );
 
-    const pill = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
+    const toggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
+    // The expand/collapse control is a real button wrapping icon + headline;
+    // the pill container is a plain div so no interactive elements nest.
+    expect(toggle.tagName).toBe("BUTTON");
+    expect(toggle).toHaveAttribute("type", "button");
+    expect(toggle).toHaveClass("min-w-0", "flex-1", "bg-transparent", "text-left");
+    const pill = toggle.parentElement!.parentElement as HTMLElement;
+    expect(pill).not.toHaveAttribute("role");
+    expect(pill).not.toHaveAttribute("tabindex");
     expect(pill).toHaveClass("rounded-[12px]", "p-[8px]", "w-[560px]", "group/error");
     expect(pill.style.background).toContain("color-mix");
     expect(pill.style.border).toContain("color-mix");
@@ -201,9 +212,17 @@ describe("ErrorBanner", () => {
       "leading-6",
       "text-destructive",
     );
+    expect(screen.getByTestId("error-headline")).toHaveAttribute(
+      "title",
+      "The agent's terminal exited unexpectedly, so the session can't continue.",
+    );
+    expect(screen.getByRole("button", { name: "Dismiss error message" })).toHaveClass(
+      "hover:text-foreground",
+    );
 
-    fireEvent.click(pill);
+    fireEvent.click(toggle);
     const message = screen.getByTestId("error-message-content");
+    expect(message.closest("section")!.parentElement).toHaveClass("cursor-auto");
     const copyMessage = screen.getByRole("button", { name: "Copy error message" });
     expect(message).toHaveClass("font-mono", "text-sm", "whitespace-pre-wrap");
     expect(copyMessage).toHaveClass("size-6");
@@ -323,6 +342,39 @@ describe("ErrorBanner", () => {
     expect(screen.getByText("Unrelated transcript content")).toBeInTheDocument();
   });
 
+  it("toggles from the pill body but not from nested action buttons", async () => {
+    let resolveRetry: (() => void) | undefined;
+    const onRetry = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRetry = resolve;
+        }),
+    );
+    render(
+      <ErrorBanner
+        message={TERMINAL_ERROR}
+        source="execution"
+        code="required_terminal_exited"
+        onRetry={onRetry}
+      />,
+    );
+
+    const toggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
+    const pill = toggle.parentElement!.parentElement as HTMLElement;
+    // Clicks on pill padding (outside the headline button) toggle expansion.
+    fireEvent.click(pill);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(pill);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    // Retry starts recovery instead of toggling; dismiss removes the banner.
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("error-reconnecting")).toBeInTheDocument();
+    await act(async () => resolveRetry?.());
+    expect(screen.queryByTestId("error-headline")).toBeNull();
+  });
+
   it("prevents duplicate retries and removes the replacement pill on success", async () => {
     let resolveRetry: (() => void) | undefined;
     const onRetry = vi.fn(
@@ -373,6 +425,9 @@ describe("ErrorBanner", () => {
     );
     expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Dismiss error message" })).toHaveFocus();
+    // The retry-error status row must not toggle the pill when clicked.
+    fireEvent.click(screen.getByRole("status"));
+    expect(screen.queryByText("Message")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
     expect(screen.getByRole("button", { name: "View diagnostics" })).toBeInTheDocument();
   });

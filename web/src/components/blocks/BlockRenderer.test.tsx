@@ -134,10 +134,11 @@ describe("BlockRenderer dispatch", () => {
 
     render(<BlockRenderer items={items} sessionStatus="idle" />);
 
-    const pill = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
+    const toggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
+    const pill = toggle.parentElement!.parentElement as HTMLElement;
     expect(pill).toHaveClass("w-[560px]", "max-w-full");
 
-    fireEvent.click(pill);
+    fireEvent.click(toggle);
     const expandedRegion = screen
       .getByTestId("error-message-content")
       .closest("section")?.parentElement;

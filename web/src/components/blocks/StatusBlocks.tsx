@@ -255,19 +255,7 @@ export function ErrorBanner({
         }}
       />
       <div
-        role="button"
-        tabIndex={0}
-        aria-expanded={expanded}
-        aria-controls={expanded ? messageId : undefined}
         onClick={() => setExpanded((value) => !value)}
-        onKeyDown={(event) => {
-          if (event.target !== event.currentTarget) return;
-          setHeaderFocusVisible(event.currentTarget.matches(":focus-visible"));
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            setExpanded((value) => !value);
-          }
-        }}
         onMouseEnter={() => setHeaderHovered(true)}
         onMouseLeave={() => setHeaderHovered(false)}
         onPointerDown={() => {
@@ -280,18 +268,7 @@ export function ErrorBanner({
         onPointerCancel={() => {
           headerPointerDownRef.current = false;
         }}
-        onFocus={(event) => {
-          if (event.target !== event.currentTarget) return;
-          setHeaderFocusVisible(
-            !headerPointerDownRef.current && event.currentTarget.matches(":focus-visible"),
-          );
-        }}
-        onBlur={(event) => {
-          if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
-          headerPointerDownRef.current = false;
-          setHeaderFocusVisible(false);
-        }}
-        className="group/error relative z-10 w-[560px] max-w-full cursor-pointer rounded-[12px] p-[8px] text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+        className="group/error relative z-10 w-[560px] max-w-full cursor-pointer rounded-[12px] p-[8px] text-foreground"
         style={{
           background:
             "color-mix(in srgb, var(--destructive) 4%, var(--app-shell-bg, var(--background)))",
@@ -299,33 +276,57 @@ export function ErrorBanner({
         }}
       >
         <div className="flex w-full min-w-0 items-start gap-[4px]">
-          <span
-            data-testid="error-leading-slot"
-            className="mt-[4px] mr-[4px] flex h-[18px] w-[18px] shrink-0 items-center justify-center"
+          <button
+            type="button"
+            aria-expanded={expanded}
+            aria-controls={expanded ? messageId : undefined}
+            onClick={(event) => {
+              event.stopPropagation();
+              setExpanded((value) => !value);
+            }}
+            onKeyDown={(event) => {
+              setHeaderFocusVisible(event.currentTarget.matches(":focus-visible"));
+            }}
+            onFocus={(event) => {
+              setHeaderFocusVisible(
+                !headerPointerDownRef.current && event.currentTarget.matches(":focus-visible"),
+              );
+            }}
+            onBlur={() => {
+              headerPointerDownRef.current = false;
+              setHeaderFocusVisible(false);
+            }}
+            className="flex min-w-0 flex-1 cursor-pointer items-start rounded-lg bg-transparent text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
           >
-            {showDisclosureIcon ? (
-              <ChevronRightIcon
-                data-testid="error-disclosure-icon"
-                className={cn(
-                  "size-4 text-muted-foreground transition-transform duration-150 animate-in fade-in group-hover/error:text-foreground",
-                  expanded && "rotate-90",
-                )}
-                aria-hidden="true"
-              />
-            ) : (
-              <AlertCircleIcon
-                data-testid="error-status-icon"
-                className="size-[18px] text-destructive duration-150 animate-in fade-in"
-                aria-hidden="true"
-              />
-            )}
-          </span>
-          <span
-            data-testid="error-headline"
-            className="mr-[4px] min-w-0 flex-1 truncate whitespace-nowrap leading-6 text-destructive"
-          >
-            {headline}
-          </span>
+            <span
+              data-testid="error-leading-slot"
+              className="mt-[4px] mr-[4px] flex h-[18px] w-[18px] shrink-0 items-center justify-center"
+            >
+              {showDisclosureIcon ? (
+                <ChevronRightIcon
+                  data-testid="error-disclosure-icon"
+                  className={cn(
+                    "size-4 text-muted-foreground transition-transform duration-150 animate-in fade-in group-hover/error:text-foreground",
+                    expanded && "rotate-90",
+                  )}
+                  aria-hidden="true"
+                />
+              ) : (
+                <AlertCircleIcon
+                  data-testid="error-status-icon"
+                  className="size-[18px] text-destructive duration-150 animate-in fade-in"
+                  aria-hidden="true"
+                />
+              )}
+            </span>
+            <span
+              data-testid="error-headline"
+              title={headline}
+              className="mr-[4px] min-w-0 flex-1 truncate whitespace-nowrap leading-6 text-destructive"
+            >
+              {headline}
+            </span>
+          </button>
           {retryable ? (
             <Button
               type="button"
@@ -352,7 +353,7 @@ export function ErrorBanner({
               event.stopPropagation();
               setDismissed(true);
             }}
-            className="size-6 shrink-0 rounded-[var(--control-radius,var(--radius-lg))] text-muted-foreground hover:bg-muted hover:text-[var(--button-icon-hover-color)]"
+            className="size-6 shrink-0 rounded-[var(--control-radius,var(--radius-lg))] text-muted-foreground hover:bg-muted hover:text-foreground"
           >
             <XIcon className="size-4" aria-hidden="true" />
           </Button>
@@ -362,6 +363,7 @@ export function ErrorBanner({
             role="status"
             aria-live="assertive"
             aria-atomic="true"
+            onClick={(event) => event.stopPropagation()}
             className="mx-[4px] mt-[8px] text-sm leading-5 break-words text-destructive [overflow-wrap:anywhere]"
           >
             {retryError}
@@ -371,7 +373,7 @@ export function ErrorBanner({
           <div
             id={messageId}
             onClick={(event) => event.stopPropagation()}
-            className="mt-[12px] min-w-0 max-w-full overflow-hidden text-foreground [text-wrap:wrap]"
+            className="mt-[12px] min-w-0 max-w-full cursor-auto overflow-hidden text-foreground [text-wrap:wrap]"
           >
             <section aria-labelledby={`${messageId}-label`} className="min-w-0">
               <div className="mx-[4px] flex items-center justify-between gap-2">
