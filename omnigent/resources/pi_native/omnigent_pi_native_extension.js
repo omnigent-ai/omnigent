@@ -872,19 +872,26 @@ async function applyModelChange(pi, config, ctx, modelId) {
   const id = typeof modelId === "string" ? modelId.trim() : "";
   if (!id) return false;
   const registry = ctx ? ctx.modelRegistry : undefined;
-  // Resolve against whichever listing method exists. Accept EITHER getAll or
-  // getAvailable so the resolve path can never be narrower than the picker's:
-  // postModelOptions lists from getAvailable(), so gating apply on getAll alone
-  // would fail every switch on a hypothetical Pi build exposing only
-  // getAvailable. getAll (the full catalog) is a superset of getAvailable, so
-  // prefer it to resolve; fall back to getAvailable when getAll is absent.
-  const listModels =
+  // Resolve the picked id to a concrete model. A bare id (e.g. "claude-opus-5")
+  // can exist under MULTIPLE providers at once: a keyless built-in vendor entry
+  // AND an authed provider (e.g. the kiro extension provider). getAll() spans the
+  // entire catalog including keyless duplicates, so resolving against it can pick
+  // the keyless variant, whose setModel() then fails with "no API key" even though
+  // an authed variant of the same id exists. The picker (postModelOptions) lists
+  // from getAvailable() -- only models with configured auth -- so resolve against
+  // getAvailable() FIRST to select the authed variant the user actually saw, and
+  // fall back to getAll() only when getAvailable is absent or the id is not there
+  // (keeps the resolve path from being narrower than the picker on Pi builds that
+  // only expose getAll).
+  const getAvailable =
+    registry && typeof registry.getAvailable === "function"
+      ? () => registry.getAvailable()
+      : null;
+  const getAll =
     registry && typeof registry.getAll === "function"
       ? () => registry.getAll()
-      : registry && typeof registry.getAvailable === "function"
-        ? () => registry.getAvailable()
-        : null;
-  if (!pi || typeof pi.setModel !== "function" || !listModels) {
+      : null;
+  if (!pi || typeof pi.setModel !== "function" || (!getAvailable && !getAll)) {
     await postModelChangeError(
       config,
       `Omnigent: could not switch to model "${id}" — this Pi session exposes ` +
@@ -894,7 +901,9 @@ async function applyModelChange(pi, config, ctx, modelId) {
   }
   let model;
   try {
-    model = listModels().find((m) => m && m.id === id);
+    model =
+      (getAvailable ? getAvailable().find((m) => m && m.id === id) : undefined) ||
+      (getAll ? getAll().find((m) => m && m.id === id) : undefined);
   } catch (_err) {
     model = undefined;
   }
