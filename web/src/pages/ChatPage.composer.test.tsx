@@ -4,10 +4,10 @@ import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useChatStore } from "@/store/chatStore";
+import { handleSessionEvent, useChatStore } from "@/store/chatStore";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -111,6 +111,113 @@ function activeRow(): HTMLElement | null {
 function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
+
+describe("Composer interrupted prompt recovery", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("restores and focuses the exact prompt released for the active session", async () => {
+    useChatStore.setState({
+      conversationId: "conv_restore_early",
+      interruptedPromptRecovery: {
+        conversationId: "conv_restore_early",
+        text: "the exact interrupted prompt",
+        tempId: "pend_restore",
+        phase: "ready",
+      },
+    });
+
+    render(<Composer {...composerProps()} />);
+
+    await waitFor(() => expect(textarea().value).toBe("the exact interrupted prompt"));
+    expect(document.activeElement).toBe(textarea());
+    expect(useChatStore.getState().interruptedPromptRecovery).toBeNull();
+  });
+
+  it("preserves a newer draft instead of overwriting it", async () => {
+    useChatStore.setState({
+      conversationId: "conv_restore_newer",
+      interruptedPromptRecovery: null,
+    });
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "newer draft wins" } });
+
+    act(() => {
+      useChatStore.setState({
+        interruptedPromptRecovery: {
+          conversationId: "conv_restore_newer",
+          text: "older interrupted prompt",
+          tempId: "pend_old",
+          phase: "ready",
+        },
+      });
+    });
+
+    await waitFor(() => expect(useChatStore.getState().interruptedPromptRecovery).toBeNull());
+    expect(textarea().value).toBe("newer draft wins");
+  });
+
+  it("does not restore recovery released for another session", async () => {
+    useChatStore.setState({
+      conversationId: "conv_visible",
+      interruptedPromptRecovery: {
+        conversationId: "conv_background",
+        text: "background session prompt",
+        tempId: "pend_background",
+        phase: "ready",
+      },
+    });
+
+    render(<Composer {...composerProps()} />);
+
+    await waitFor(() => expect(textarea().value).toBe(""));
+    expect(useChatStore.getState().interruptedPromptRecovery?.phase).toBe("ready");
+  });
+
+  it("restores the submitted prompt through the Escape interrupt journey", async () => {
+    useChatStore.setState({
+      conversationId: "conv_escape_journey",
+      pendingUserMessages: [
+        {
+          tempId: "pend_escape",
+          content: [{ type: "input_text", text: "adjust and resend me" }],
+        },
+      ],
+      interruptedPromptRecovery: {
+        text: "adjust and resend me",
+        tempId: "pend_escape",
+        phase: "eligible",
+      },
+      status: "streaming",
+      sessionStatus: "running",
+    });
+    const onStop = vi.fn(() => useChatStore.getState().stop());
+    render(<Composer {...composerProps({ status: "streaming", isWorking: true, onStop })} />);
+
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(onStop).toHaveBeenCalledOnce();
+    handleSessionEvent({
+      type: "session_interrupted",
+      requestedAt: 1704067200,
+    });
+
+    await waitFor(() => expect(textarea().value).toBe("adjust and resend me"));
+  });
+
+  it("dismisses the slash menu before Escape can interrupt", () => {
+    useChatStore.setState({ conversationId: "conv_escape_menu", skills: [] });
+    const onStop = vi.fn();
+    render(<Composer {...composerProps({ status: "streaming", isWorking: true, onStop })} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+
+    expect(onStop).not.toHaveBeenCalled();
+    expect(textarea().value).toBe("");
+  });
+});
 
 describe("Composer growth layout", () => {
   afterEach(() => {

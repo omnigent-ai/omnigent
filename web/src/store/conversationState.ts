@@ -53,6 +53,7 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   abortController: true,
   runnerLaunchedAt: true,
   failedSendDraft: true,
+  interruptedPromptRecovery: true,
   sendLatchedAt: true,
   historyGeneration: true,
 };
@@ -110,6 +111,7 @@ export function createInitialConversationState(): ConversationState {
     abortController: null,
     runnerLaunchedAt: null,
     failedSendDraft: null,
+    interruptedPromptRecovery: null,
     sendLatchedAt: null,
     historyGeneration: 0,
   };
