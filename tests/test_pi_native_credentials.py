@@ -1629,3 +1629,18 @@ def test_launch_renders_config_once(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     creds.pi_native_provider_launch(tmp_path / "pi-agent", provider)
 
     assert renders == 1
+
+
+def test_default_claude_model_from_picks_by_tier_then_newest() -> None:
+    """Pi's launch default follows the ``opus > sonnet > …`` precedence, newest first."""
+    from omnigent.pi_native_credentials import _default_claude_model_from
+
+    entries = [
+        {"id": "system.ai.claude-sonnet-5"},
+        {"id": "system.ai.claude-opus-4-8"},
+        {"id": "system.ai.claude-opus-5"},
+    ]
+    # opus outranks sonnet, and opus-5 is the newest opus.
+    assert _default_claude_model_from(entries) == "system.ai.claude-opus-5"
+    # An empty live listing lets the caller fall through to the bundled catalog.
+    assert _default_claude_model_from([]) is None

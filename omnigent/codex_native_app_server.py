@@ -1722,6 +1722,73 @@ def _trust_codex_project(codex_home: Path, cwd: Path) -> None:
     config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
+# DATABRICKS-PATCH(codex-live-model-discovery)
+def _resolve_databricks_codex_model(host: str, profile: str, requested: str | None) -> str:
+    """Resolve the codex launch model against what the workspace serves.
+
+    Codex used to take its model from the bundled MLflow catalog — a
+    third-party listing whose Databricks ids carry the legacy
+    ``databricks-`` spelling the gateway now answers with ``501
+    NOT_IMPLEMENTED ... Use Unity Catalog model services (v3)`` — so a launch
+    could pin a model the workspace will not serve. Resolve from the workspace
+    instead, as claude-native already does: the live Unity Catalog listing,
+    then ucode's cached copy of it, then the bundled catalog as the documented
+    last resort.
+
+    An explicit model is matched against the servable ids, so a legacy
+    ``model_override`` persisted before this change still launches; one the
+    workspace does not serve passes through untouched, because the gateway's
+    error beats a silent substitution.
+
+    :param host: Workspace origin, e.g. ``"https://example.com"``.
+    :param profile: Databricks CLI profile backing the launch.
+    :param requested: Explicit model id, or ``None`` to take the newest
+        servable one.
+    :returns: The model id to pin on the codex launch.
+    """
+    from omnigent.databricks_model_discovery import (
+        discover_databricks_codex_models,
+        select_servable_model,
+    )
+
+    servable: tuple[str, ...] = ()
+    try:
+        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+        creds = resolve_databricks_workspace(profile)
+        # Discover against the host the launch actually posts to. This resolver
+        # honors ``DATABRICKS_HOST`` while the launch host comes from the
+        # profile section alone (``_databricks_gateway_host``), so using
+        # ``creds.host`` here can pin a model discovered on workspace A onto a
+        # launch targeting workspace B. A token that does not match ``host``
+        # simply fails the listing and drops to the ucode-state fallback below,
+        # which is already keyed by ``host``.
+        servable = discover_databricks_codex_models(host, creds.token)
+    except Exception:  # noqa: BLE001 — cached ucode state is the launch fallback
+        _logger.warning(
+            "native-codex: live Databricks model discovery failed for profile %r; "
+            "falling back to ucode state",
+            profile,
+            exc_info=True,
+        )
+        try:
+            from omnigent.onboarding.ucode_state import read_ucode_state
+
+            workspace_state = read_ucode_state(host)
+            if workspace_state is not None:
+                servable = tuple(workspace_state.codex_models)
+        except Exception:  # noqa: BLE001 — the bundled catalog is the last resort
+            _logger.warning(
+                "native-codex: could not read ucode state for %r", profile, exc_info=True
+            )
+
+    if requested:
+        return select_servable_model(requested, servable) or requested
+    if servable:
+        return servable[0]
+    return model_catalog.resolve_catalog_model("databricks", family="openai").model_id
+
+
 def build_codex_native_server(
     *,
     socket_path: Path,
@@ -1803,8 +1870,7 @@ def build_codex_native_server(
         host = host.rstrip("/")
         config_overrides.extend(
             _databricks_codex_config_overrides(
-                model=model
-                or model_catalog.resolve_catalog_model("databricks", family="openai").model_id,
+                model=_resolve_databricks_codex_model(host, profile, model),
                 base_url=_databricks_codex_base_url(host),
                 auth_command=_databricks_codex_auth_command(host, profile),
             )

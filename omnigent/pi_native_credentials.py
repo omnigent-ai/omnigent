@@ -356,6 +356,29 @@ class PiProviderConfig:
         )
 
 
+# DATABRICKS-PATCH(pi-live-model-discovery)
+def _default_claude_model_from(entries: list[_PiModelEntry]) -> str | None:
+    """Pick pi's launch model from the workspace's live Claude entries.
+
+    ``_fetch_pi_model_lists`` reads Unity Catalog model services, so the servable
+    ``system.ai.*`` ids are in hand; without this the launch fell back to the
+    bundled MLflow catalog, whose legacy ``databricks-`` ids the gateway now
+    answers with ``501 … Use Unity Catalog model services (v3)``.
+
+    :param entries: Live Claude entries, e.g. ``[{"id": "system.ai.claude-opus-5"}]``.
+    :returns: The best servable id, or ``None`` when the listing was empty.
+    """
+    from omnigent.databricks_model_discovery import _natural_model_key
+
+    ids = [str(e["id"]) for e in entries if e.get("id")]
+    # The precedence claude-native falls back to; newest within a tier.
+    for tier in ("opus", "sonnet", "haiku", "fable"):
+        matches = [i for i in ids if tier in i.lower()]
+        if matches:
+            return max(matches, key=_natural_model_key)
+    return ids[0] if ids else None
+
+
 def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiProviderConfig | None:
     """Resolve a Databricks-profile provider into Pi gateway config.
 
@@ -424,7 +447,11 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         provider_id=_PI_PROVIDER_ID,
         base_url=f"{host}{_DATABRICKS_ANTHROPIC_GATEWAY_PATH}",
         api="anthropic-messages",
-        model=model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
+        # DATABRICKS-PATCH(pi-live-model-discovery): prefer what the workspace
+        # actually serves (fetched above) over the bundled catalog.
+        model=model
+        or _default_claude_model_from(claude_models)
+        or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token is re-read per request (the auth command attempts a
         # refresh), matching codex-native's refresh semantics.
