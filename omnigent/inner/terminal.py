@@ -77,6 +77,10 @@ _TRANSPORT_PTY_ALIASES = frozenset({TERMINAL_TRANSPORT_PTY, "0", "false", "no", 
 _CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
 _TERMINAL_CONFIG_TABLE = "terminal"
 _TERMINAL_TRANSPORT_CONFIG_KEY = "transport"
+_TERMINAL_MOUSE_CONFIG_KEY = "mouse"
+# Values under ``terminal.mouse`` that turn tmux mouse mode OFF. Any other
+# value (or an absent key) leaves mouse mode ON, its historical default.
+_MOUSE_OFF_ALIASES = frozenset({"0", "false", "no", "off"})
 
 
 def _global_config_path() -> Path:
@@ -114,25 +118,49 @@ def _global_terminal_transport_default() -> str:
 
     :returns: ``"control"`` or ``"pty"``.
     """
-    raw = _read_terminal_transport_config()
+    raw = _read_terminal_config_value(_TERMINAL_TRANSPORT_CONFIG_KEY)
     if raw is not None and raw.strip().lower() in _TRANSPORT_PTY_ALIASES:
         return TERMINAL_TRANSPORT_PTY
     return TERMINAL_TRANSPORT_CONTROL
 
 
-def _read_terminal_transport_config() -> str | None:
-    """Read ``terminal.transport`` from the global config, or ``None``.
+def _terminal_mouse_enabled() -> bool:
+    """Whether managed tmux servers enable mouse mode (historical default: on).
+
+    Reads ``terminal.mouse`` from ``~/.omnigent/config.yaml`` at call time (like
+    the transport default) so an edit takes effect on the next terminal launch,
+    and tests can point :envvar:`OMNIGENT_CONFIG_HOME` at a scratch config.
+    Mouse mode stays ON unless the key is a falsy value (``off`` / ``false`` /
+    ``no`` / ``0``); a missing/unreadable/typo'd value keeps it ON.
+
+    tmux ``mouse on`` is server-global, so it also applies to the local ``tmux
+    attach`` that ``omnigent claude`` / ``omnigent codex`` make in the user's
+    own terminal, where it captures click-drag selection and modifier-clicks
+    and so breaks native terminal copy-paste and cmd-click on links. Users who
+    attach locally and prefer their terminal's own mouse handling set
+    ``terminal.mouse: off``; under the default ``control`` web transport the
+    browser xterm owns its own scrollback/selection, so this does not cost the
+    web terminal its scroll.
+
+    :returns: ``True`` when tmux mouse mode should be enabled.
+    """
+    raw = _read_terminal_config_value(_TERMINAL_MOUSE_CONFIG_KEY)
+    return not (raw is not None and raw.strip().lower() in _MOUSE_OFF_ALIASES)
+
+
+def _read_terminal_config_value(key: str) -> str | None:
+    """Read ``terminal.<key>`` from the global config, or ``None``.
 
     Best-effort: any failure (missing/unreadable file, non-mapping YAML,
     absent table/key, non-string/bool value) returns ``None`` so the caller
-    uses the control default. Never raises.
+    uses its own default. Never raises.
 
     An unquoted YAML ``true``/``false`` parses as a real bool rather than a
     string, so a bool value is normalized to its lowercase string spelling
-    before returning — ``terminal.transport: false`` still selects the PTY
-    alias in :data:`_TRANSPORT_PTY_ALIASES`.
+    before returning — ``terminal.mouse: false`` still matches a falsy alias.
 
-    :returns: The raw configured transport string, or ``None`` when unset.
+    :param key: Key under the ``terminal:`` table, e.g. ``"transport"``.
+    :returns: The raw configured string value, or ``None`` when unset.
     """
     import yaml
 
@@ -150,7 +178,7 @@ def _read_terminal_transport_config() -> str | None:
     table = raw.get(_TERMINAL_CONFIG_TABLE)
     if not isinstance(table, dict):
         return None
-    value = table.get(_TERMINAL_TRANSPORT_CONFIG_KEY)
+    value = table.get(key)
     if isinstance(value, bool):
         return "true" if value else "false"
     return value if isinstance(value, str) else None
@@ -295,8 +323,9 @@ def _tmux_input_option_commands(scrollback: int) -> list[list[str]]:
 
     ``history-limit`` is generated per terminal because it comes from
     ``TerminalEnvSpec.scrollback``. ``mouse on`` makes the attached web
-    terminal scrollable. ``focus-events on`` lets interactive programs
-    observe pane focus changes. ``extended-keys`` with CSI-u formatting
+    terminal scrollable and is included unless ``terminal.mouse`` opts out
+    (see :func:`_terminal_mouse_enabled`). ``focus-events on`` lets interactive
+    programs observe pane focus changes. ``extended-keys`` with CSI-u formatting
     lets programs inside tmux receive Kitty Keyboard Protocol keys such
     as Shift+Enter when the attached terminal supports them. Terminals
     without that protocol ignore tmux's request, and the quiet tmux
@@ -307,14 +336,18 @@ def _tmux_input_option_commands(scrollback: int) -> list[list[str]]:
     :param scrollback: Tmux history limit, e.g. ``10000``.
     :returns: Tmux commands configuring pane input and scrollback.
     """
-    return [
+    commands = [
         ["set-option", "-g", "history-limit", str(scrollback)],
         ["set-option", "-sq", "extended-keys", "on"],
         ["set-option", "-sq", "extended-keys-format", "csi-u"],
-        ["set-option", "-g", "mouse", "on"],
+    ]
+    if _terminal_mouse_enabled():
+        commands.append(["set-option", "-g", "mouse", "on"])
+    commands += [
         ["set-option", "-g", "focus-events", "on"],
         ["set-option", "-g", "escape-time", "0"],
     ]
+    return commands
 
 
 def _tmux_lockdown_commands() -> list[list[str]]:
