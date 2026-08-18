@@ -427,11 +427,21 @@ async def serve_tunnel(
                 if http_status is not None and http_status in _REFRESHABLE_HTTP_STATUSES:
                     http_auth_rejection_streak += 1
                     if http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS:
-                        login_hint = (
-                            f"run `databricks auth login --host {server_url}` to re-authenticate"
-                            if server_url
-                            else "check remote server authentication"
-                        )
+                        if server_url:
+                            from omnigent.cli_auth import load_databricks_workspace_host
+
+                            workspace_host = load_databricks_workspace_host(server_url)
+                            login_hint = (
+                                f"run `databricks auth login --host {workspace_host}` "
+                                "to re-authenticate"
+                                if workspace_host
+                                else (
+                                    f"run `databricks auth login --host {server_url}` "
+                                    "or `omnigent login` to re-authenticate"
+                                )
+                            )
+                        else:
+                            login_hint = "check remote server authentication"
                         raise RuntimeError(
                             f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
                             f"(HTTP {http_status} persisted across "

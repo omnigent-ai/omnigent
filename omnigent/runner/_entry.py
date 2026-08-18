@@ -422,6 +422,10 @@ class _InitialAuthTokenFactory:
             # once a session outlives it. Re-resolve SDK/OIDC in the same call
             # so the request that hit the failure still gets a credential.
             if token is None and getattr(self._fallback_factory, "proxy_auth_failed", False):
+                _logger.info(
+                    "managed-mint proxy bearer expired; re-resolving SDK/OIDC credential for %s",
+                    self._server_url,
+                )
                 self._fallback_factory = _make_auth_token_factory(
                     self._server_url,
                     _allow_initial_token=False,
