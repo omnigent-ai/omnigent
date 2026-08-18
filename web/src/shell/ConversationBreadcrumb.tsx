@@ -61,7 +61,7 @@ export function ConversationBreadcrumb({
           <Tooltip>
             <TooltipTrigger asChild>
               <span
-                className="flex shrink-0 items-center text-muted-foreground opacity-40 hover:opacity-100"
+                className="breadcrumb-folder flex shrink-0 items-center text-muted-foreground opacity-40 hover:opacity-100"
                 aria-label={`Project: ${projectName}`}
               >
                 <FolderIcon className="size-4" />

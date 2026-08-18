@@ -732,7 +732,13 @@ aside[aria-label="Workspace"][data-maximized] {
   display: flex;
   align-items: center;
 
-  & > * > *:last-child {
+  /* Scoped to the Search/Settings/toggle cluster: pull its last button (the
+   * toggle) to the front so it reads Collapse · Search · Settings outward from
+   * the lights. Must NOT match the sibling conversation breadcrumb also
+   * rendered here when collapsed — an unscoped `> * > *:last-child` reordered
+   * the breadcrumb's last segment too, stranding the folder icon to the right
+   * of the title. */
+  & > [data-testid="sidebar-header-actions"] > *:last-child {
     order: -1;
   }
 }
@@ -767,6 +773,14 @@ aside[aria-label="Workspace"][data-maximized] {
  * strip (e.g. the mobile full-screen sidebar overlay) would lose clicks
  * without an explicit counter-region on interactive elements. */
 [data-electron-mac] :is(a, button, input, textarea, [role="button"]) {
+  -webkit-app-region: no-drag;
+}
+/* The title-bar breadcrumb doubles as a window-drag handle (its title is a
+ * plain span, deliberately left draggable). Exclude the folder icon: it's a
+ * tooltip trigger with its own hover state, so it must stay interactive rather
+ * than move the window. Plain <span>, so the interactive-elements rule above
+ * doesn't reach it. */
+[data-electron-mac] .breadcrumb-folder {
   -webkit-app-region: no-drag;
 }
 

@@ -1587,12 +1587,14 @@ export function AppShell() {
                   onTogglePointerEnter={sidebarOpen || sidebarPeek ? undefined : armTitleBarPeek}
                   onTogglePointerLeave={cancelTitleBarPeek}
                 />
-                {/* Collapsed only: with the sidebar gone the chat header's own
-                    breadcrumb would sit under the traffic lights (it's hidden
-                    there — see .chat-header-breadcrumb in index.css), so surface
-                    the same breadcrumb here in the title-bar strip instead, to
-                    the right of the Settings cog. */}
-                {!sidebarOpen && !sidebarPeek && headerConversationTitle && (
+                {/* Collapsed (peek included): with the docked sidebar gone the
+                    chat header's own breadcrumb would sit under the traffic
+                    lights (it's hidden there — see .chat-header-breadcrumb in
+                    index.css), so surface the same breadcrumb here in the
+                    title-bar strip, right of the Settings cog. Kept through peek
+                    (the card drops below this strip), so it never disappears or
+                    shifts as the card floats in and out. */}
+                {!sidebarOpen && headerConversationTitle && (
                   <ConversationBreadcrumb
                     conversationTitle={headerConversationTitle}
                     projectName={headerProjectName}
@@ -1651,7 +1653,15 @@ export function AppShell() {
                 }
               >
                 <ChatHeader
-                  sidebarOpen={sidebarOpen || sidebarPeek}
+                  // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
+                  // is a transient card floating over the collapsed layout (the
+                  // docked sidebar stays w-0), so the header must keep its
+                  // collapsed left slot. Treating peek as open relaid it out —
+                  // the toggle unmounted and the breadcrumb slid left into its
+                  // spot — shifting the title sideways the instant the peek card
+                  // appeared. Left collapsed, the breadcrumb stays put beneath
+                  // the floating card (and in the title-bar strip on mac).
+                  sidebarOpen={sidebarOpen}
                   onOpenSidebar={(peek?: boolean) => {
                     if (peek) {
                       setSidebarPeek(true);
