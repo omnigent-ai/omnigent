@@ -19,14 +19,12 @@ from omnigent.onboarding.harness_readiness import (
 
 @pytest.fixture(autouse=True)
 def _isolate_cursor_credential(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Isolate cursor + copilot credential sources so their readiness is deterministic.
+    """Isolate credential sources so readiness tests are deterministic.
 
-    Cursor readiness keys off a configured ``CURSOR_API_KEY`` and copilot off a
-    GitHub token (the ``cursor:`` / ``copilot:`` config blocks or the
-    environment), so point the config home at an empty tmp dir and clear any
-    ambient ``CURSOR_API_KEY`` / ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` /
-    ``GITHUB_TOKEN`` — otherwise a developer's real key would flip their verdict
-    under these tests.
+    Point the config home at an empty tmp dir and clear ambient provider
+    credentials so a developer's real configuration cannot change verdicts.
+    Copilot SDK readiness is intentionally independent of these values because
+    the backing CLI may use its own persisted OAuth login.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
@@ -381,6 +379,8 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "openai-agents",
         "openai-agents-sdk",
         "agents_sdk",
+        "copilot",
+        "github-copilot",
     ):
         assert result[sdk] is True, f"{sdk} should never be gated"
     # CLI-wrapping spellings — gated, so False when the binary is absent.
@@ -427,15 +427,14 @@ def test_configured_harness_map_gates_only_cli_harnesses(
 def test_configured_harness_map_all_true_with_clis(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Every spelling reads True once the CLIs are installed and the key/token-
-    gated harnesses are satisfied.
+    """Every spelling reads True once CLIs and gated credentials are available.
 
     The CLI harnesses pass their binary check, the SDK harnesses are ungated,
-    cursor (key-gated) is satisfied by a ``CURSOR_API_KEY``, copilot
-    (token-gated) by a ``GH_TOKEN``, antigravity-native (binary + credential
-    gated) by a detected Gemini OAuth credential, kimi (binary + credential
-    gated) by a detected ``kimi login`` credential, and the generic ACP harness
-    (config-gated) by a registered agent — so nothing is reported unconfigured.
+    cursor (key-gated) is satisfied by a ``CURSOR_API_KEY``,
+    antigravity-native (binary + credential gated) by a detected Gemini OAuth
+    credential, kimi (binary + credential gated) by a detected ``kimi login``
+    credential, and the generic ACP harness (config-gated) by a registered
+    agent — so nothing is reported unconfigured.
     """
     import omnigent.onboarding.gemini_auth as _ga
     import omnigent.onboarding.kimi_auth as _ka
