@@ -1,14 +1,29 @@
 import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
+import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { ChatHeader } from "./ChatHeader";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
 } from "./TerminalFirstContext";
+
+const { isIOSShellMock, isAndroidShellMock } = vi.hoisted(() => ({
+  isIOSShellMock: vi.fn(() => false),
+  isAndroidShellMock: vi.fn(() => false),
+}));
+
+vi.mock("@/lib/nativeBridge", async (importOriginal) => {
+  const actual = await importOriginal<typeof NativeBridgeModule>();
+  return {
+    ...actual,
+    isIOSShell: () => isIOSShellMock(),
+    isAndroidShell: () => isAndroidShellMock(),
+  };
+});
 
 // Minimal mobile-menu prop block. All gating booleans are false / counts are
 // zero so the mobile FAB and three-dot menu never render — these tests only
@@ -90,7 +105,11 @@ function renderHeader(props: {
   );
 }
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  isIOSShellMock.mockReturnValue(false);
+  isAndroidShellMock.mockReturnValue(false);
+});
 
 describe("ChatHeader — deployed Share presentation", () => {
   it("matches the compact Vercel action", () => {
@@ -243,6 +262,22 @@ describe("ChatHeader — conversation breadcrumb", () => {
       "/c/parent-123",
     );
     expect(screen.getByText("Sub-agent")).toBeInTheDocument();
+  });
+
+  it("renders a Back control instead of the parent title on iOS/Android native", () => {
+    isIOSShellMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      conversationTitle: "Fix the login bug",
+      titleLinkTo: "/c/parent-123",
+    });
+    const back = screen.getByRole("link", { name: "Back to parent session" });
+    expect(back).toHaveAttribute("href", "/c/parent-123");
+    expect(back).toHaveTextContent("Back");
+    expect(back).not.toHaveTextContent("Fix the login bug");
+    expect(back.querySelector(".lucide-chevron-left")).not.toBeNull();
   });
 
   it("still links back to the parent when the breadcrumb title is unresolved", () => {

@@ -1,6 +1,7 @@
-import { BotIcon, FolderIcon } from "lucide-react";
+import { BotIcon, ChevronLeftIcon, FolderIcon } from "lucide-react";
 import { Link } from "@/lib/routing";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
 import type { Agent } from "@/hooks/useAgents";
 import { cn } from "@/lib/utils";
@@ -52,6 +53,9 @@ export function ConversationBreadcrumb({
   const subAgentName = isChildSession
     ? (nativeCodingAgentForSubagentWrapper(wrapperLabel)?.displayName ?? boundAgent?.name ?? null)
     : null;
+  // iOS/Android native chrome already identifies the session. Restore the
+  // compact "< Back" climb-out there; web / Electron keep the parent name.
+  const nativeMobileBack = isIOSShell() || isAndroidShell();
   return (
     <nav
       aria-label="Conversation"
@@ -87,9 +91,21 @@ export function ConversationBreadcrumb({
         <Link
           to={titleLinkTo}
           aria-label="Back to parent session"
-          className="breadcrumb-parent-link truncate text-muted-foreground hover:text-foreground hover:underline"
+          className={cn(
+            "breadcrumb-parent-link text-muted-foreground hover:text-foreground",
+            nativeMobileBack
+              ? "inline-flex shrink-0 items-center gap-0.5"
+              : "truncate hover:underline",
+          )}
         >
-          {conversationTitle}
+          {nativeMobileBack ? (
+            <>
+              <ChevronLeftIcon className="size-4" />
+              <span>Back</span>
+            </>
+          ) : (
+            conversationTitle
+          )}
         </Link>
       ) : (
         <span className="truncate text-foreground">{conversationTitle}</span>
