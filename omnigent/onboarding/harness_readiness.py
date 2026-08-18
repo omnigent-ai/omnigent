@@ -249,19 +249,12 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
     if canonical == COPILOT_KEY:
         # Copilot runs in-process via the ``github-copilot-sdk`` package (the
         # SDK bundles the CLI binary it drives, so there is no separate binary to
-        # gate on) and authenticates against GitHub's Copilot backend with a
-        # GitHub token. So, like cursor, readiness is whether a token is
-        # resolvable — one stored by ``omnigent setup`` (the ``copilot:`` config
-        # block — see :mod:`omnigent.onboarding.copilot_auth`) or inherited from
-        # the environment. A bad / Copilot-less token surfaces at run time.
-        from omnigent.onboarding.copilot_auth import (
-            COPILOT_TOKEN_ENV_VARS,
-            copilot_github_token_configured,
-        )
-
-        return copilot_github_token_configured() or any(
-            os.environ.get(var) for var in COPILOT_TOKEN_ENV_VARS
-        )
+        # gate on). The backing CLI can authenticate through its own persisted
+        # OAuth login when no explicit token is configured, and that credential
+        # store is intentionally not read by Omnigent. Keep readiness ungated,
+        # like the other SDK harnesses, and surface missing/invalid auth from the
+        # executor's first turn.
+        return True
     if (
         canonical not in _HARNESS_FAMILY
         and canonical not in _PI_HARNESSES
