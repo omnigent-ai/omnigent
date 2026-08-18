@@ -475,6 +475,7 @@ def test_revision_is_known_distinguishes_shipped_and_unknown_revisions(
 
 def test_initialize_or_verify_schema_rejects_db_ahead_of_build(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     A database stamped with a revision this build does not ship is
@@ -483,6 +484,8 @@ def test_initialize_or_verify_schema_rejects_db_ahead_of_build(
     Alembic cannot upgrade from an unknown revision — it has no path to
     start walking — so the stale-schema wording used to send operators
     to ``omnigent debug db-upgrade``, which then failed the same way.
+    Also guards that no migration is attempted: trying one and failing
+    is what produced the original crash.
     """
     db_path = tmp_path / "ahead.db"
     uri = _make_db_at_revision(db_path, "head")
@@ -495,6 +498,11 @@ def test_initialize_or_verify_schema_rejects_db_ahead_of_build(
         f"Fixture revision {future_revision!r} now exists in the "
         f"migrations directory; pick another absent revision."
     )
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("no migration may be attempted for an unknown revision")
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _fail_if_called)
 
     engine = create_engine(uri)
     try:
