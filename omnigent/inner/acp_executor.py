@@ -821,7 +821,8 @@ class AcpExecutor(Executor):
         1. **TOOL_CALL policy** (:attr:`_policy_evaluator`): a hard
            ``POLICY_ACTION_DENY`` denies; ``POLICY_ACTION_ASK`` defers to
            elicitation (and **fails closed** when no handler is wired);
-           ``ALLOW`` / unspecified falls through.
+           ``POLICY_ACTION_ALLOW`` short-circuits to allow; unspecified falls
+           through.
         2. **Human-consent elicitation** (:attr:`_elicitation_handler`): routes
            to the user via a web approval card and returns their accept/deny.
 
@@ -860,7 +861,15 @@ class AcpExecutor(Executor):
                     tool_name,
                 )
                 return allowed
-            # ALLOW / UNSPECIFIED / unknown → fall through to elicitation.
+            if action == "POLICY_ACTION_ALLOW":
+                # An explicit policy ALLOW must short-circuit elicitation: an
+                # always-ask agent raising session/request_permission for every
+                # tool call would otherwise prompt (and, unattended, refuse) on
+                # calls the policy already permits -- --approval-mode=always-ask
+                # plus server-side policies could never run headless (#4928).
+                logger.info("acp permission allowed by policy: tool=%s", tool_name)
+                return True
+            # UNSPECIFIED / unknown → fall through to elicitation.
 
         if handler is not None:
             allowed = bool(await handler(tool_name, tool_input))
