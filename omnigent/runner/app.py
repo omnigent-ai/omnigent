@@ -7297,10 +7297,22 @@ def create_runner_app(
                 "qwen": _qwen_terminal_ensure_locks,
                 "kimi": _kimi_terminal_ensure_locks,
             }[_ensure_agent.key]
+            persist_resource_event = body.get("persist_resource_event") is not False
+
+            def _publish_ensure_event(event_session_id: str, event: _JsonObject) -> None:
+                """Publish terminal readiness, optionally without durable history."""
+                event_type = event.get("type")
+                if not persist_resource_event and event_type in (
+                    "session.resource.created",
+                    "session.resource.deleted",
+                ):
+                    event = {**event, "persist_resource_event": False}
+                _publish_event(event_session_id, event)
+
             _ensure_ctx = NativeLaunchContext(
                 session_id=session_id,
                 resource_registry=resource_registry,
-                publish_event=_publish_event,
+                publish_event=_publish_ensure_event,
                 server_client=server_client,
                 ensure_comment_relay=_ensure_comment_relay_started,
             )

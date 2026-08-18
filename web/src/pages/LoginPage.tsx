@@ -27,6 +27,7 @@
 
 import { useEffect, useState, type FormEvent } from "react";
 import { useSearchParams } from "@/lib/routing";
+import { useAppName } from "@/lib/branding";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { getMe, login as loginRequest } from "@/lib/accountsApi";
@@ -52,6 +53,7 @@ function rememberUsername(value: string): void {
 }
 
 export function LoginPage() {
+  const appName = useAppName();
   const [params] = useSearchParams();
   // `return_to` is set by both identity.ts (on 401 redirect) and the
   // server-side magic-redeem 302 fallback. Trust only same-origin
@@ -143,7 +145,7 @@ export function LoginPage() {
       <div className="w-full max-w-sm space-y-6">
         <div className="space-y-1 text-center">
           <h1 className="text-2xl font-semibold tracking-tight">Sign in</h1>
-          <p className="text-ui text-muted-foreground">Welcome to Omnigent.</p>
+          <p className="text-ui text-muted-foreground">Welcome to {appName}.</p>
         </div>
 
         <form onSubmit={onSubmit} className="space-y-4">

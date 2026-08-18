@@ -800,7 +800,16 @@ def _harness_cli_version_satisfies(
     try:
         parsed = Version(version)
     except InvalidVersion:
-        return False
+        # Fall back to the leading X.Y.Z segment for pre-release version
+        # strings that packaging rejects (e.g. ``0.146.0-alpha.9.2``).
+        # This avoids mis-classifying a newer pre-release as too old.
+        m = re.match(r"^(\d+\.\d+\.\d+)", version)
+        if not m:
+            return False
+        try:
+            parsed = Version(m.group(1))
+        except InvalidVersion:
+            return False
     if spec.min_version is not None:
         try:
             if parsed < Version(spec.min_version):

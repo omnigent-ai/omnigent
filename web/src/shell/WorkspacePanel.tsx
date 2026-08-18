@@ -716,7 +716,7 @@ export function WorkspacePanel({
           horizontal scroller — see below). The outer row never scrolls
           (overflow-x-hidden), so the divider is a fixed boundary that doesn't
           drift when the tabs scroll. */}
-      <div className="shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-2">
+      <div className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-2">
         <Tabs
           // Static group — never compresses (shrink-0) and stays anchored on
           // the LEFT whether or not tabs are open. The open tabs render to its

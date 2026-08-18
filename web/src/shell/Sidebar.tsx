@@ -128,6 +128,7 @@ import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
+import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
@@ -473,6 +474,7 @@ export function Sidebar({
   onOpenSearch,
   peek,
 }: SidebarProps) {
+  const branding = useBranding();
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
   const [selectionMode, setSelectionMode] = useState(false);
@@ -795,12 +797,18 @@ export function Sidebar({
               data-testid="sidebar-brand"
               className="sidebar-brand rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
             >
-              <img
-                src={omnigentWordmark}
-                alt="Omnigent"
-                data-testid="sidebar-wordmark"
-                className="h-[15px] w-auto shrink-0 translate-y-px dark:invert"
-              />
+              {branding.app_name ? (
+                <span className="text-[15px] font-semibold tracking-tight">
+                  {branding.app_name}
+                </span>
+              ) : (
+                <img
+                  src={omnigentWordmark}
+                  alt="Omnigent"
+                  data-testid="sidebar-wordmark"
+                  className="h-[15px] w-auto shrink-0 translate-y-px dark:invert"
+                />
+              )}
             </Link>
             {/* On the macOS shell this copy is hidden and an identical cluster
             renders in the title-bar strip instead (see AppShell), so the icons

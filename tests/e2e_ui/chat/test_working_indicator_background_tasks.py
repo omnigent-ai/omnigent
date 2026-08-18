@@ -2,10 +2,9 @@
 
 A claude-native turn can settle to ``idle`` while background shells keep
 running. The forwarder reports that as ``external_session_status: idle``
-carrying a positive ``background_task_count``, and the web chat must keep
-the working indicator lit — labelled ``"N background tasks still
-running"`` — instead of falling idle like the TUI's "N shells still
-running" banner.
+carrying a positive ``background_task_count``. The turn has ended, so the
+composer's ``background-task-pill`` names the shells instead of the
+"Working…" shimmer (which would misread as the agent still thinking).
 
 Both tests drive the real status edges through the Sessions events route
 (the same path the claude-native forwarder posts to), so they are
@@ -24,6 +23,7 @@ import httpx
 from playwright.sync_api import Page, expect
 
 _WORKING = '[data-testid="working-indicator"]'
+_PILL = '[data-testid="background-task-pill"]'
 
 # Rotating labels the working indicator cycles through — mirror of
 # WORKING_MESSAGES in web/src/pages/ChatPage.tsx. The running-turn label is
@@ -82,21 +82,24 @@ def test_background_task_indicator_label_lifecycle(
     """
     base_url, session_id = seeded_session
     working = page.locator(_WORKING)
+    pill = page.locator(_PILL)
 
-    # 1. Background shells outlive the turn: idle + a positive count. The
-    #    snapshot caches the count, so a fresh page load hydrates it.
+    # 1. Background shells outlive the turn: idle + a positive count. The turn
+    #    has ended, so the pill (not the shimmer) names them. The snapshot
+    #    caches the count, so a fresh page load hydrates it.
     _publish_status(base_url, session_id, "idle", background_task_count=2)
     page.goto(f"{base_url}/c/{session_id}")
-    expect(working).to_contain_text("2 background tasks still running", timeout=15_000)
+    expect(pill).to_contain_text("2 background tasks", timeout=15_000)
+    expect(working).to_have_count(0)
 
     # 2. A new turn starts (the `running` edge a composer send produces): the
-    #    fresh turn supersedes the tally, so the label flips from the
-    #    background-task count to a rotating working label (e.g. "Working…",
-    #    "Cooking…"). Accept any label in the pool — which one shows depends on
-    #    the wall-clock bucket the turn lands on.
+    #    fresh turn supersedes the tally, so the pill gives way to the rotating
+    #    working shimmer (e.g. "Working…", "Cooking…"). Accept any label in the
+    #    pool — which one shows depends on the wall-clock bucket the turn lands
+    #    on.
     _publish_status(base_url, session_id, "running")
     expect(working).to_contain_text(_WORKING_LABEL_RE, timeout=15_000)
-    expect(working).not_to_contain_text("background task", timeout=15_000)
+    expect(pill).to_have_count(0)
 
     # 3. The turn ends with the background shell finished: an authoritative
     #    Stop-hook `0` clears the tally, so the indicator goes out.
@@ -123,17 +126,18 @@ def test_sidebar_spinner_ignores_background_tasks(
     :returns: None.
     """
     base_url, session_id = seeded_session
+    pill = page.locator(_PILL)
     working = page.locator(_WORKING)
     # The badge sits in the row's time-marker slot (a sibling of the row link),
     # and `seeded_session` holds exactly one session — so the lone running badge
     # is this session's. Idle rows render no badge at all.
     running_badge = page.locator('[data-testid="session-state-badge"][data-state="running"]')
 
-    # 1. Background shells outlive the turn → the chat indicator lights up, the
+    # 1. Background shells outlive the turn → the chat pill lights up, the
     #    sidebar row does not.
     _publish_status(base_url, session_id, "idle", background_task_count=1)
     page.goto(f"{base_url}/c/{session_id}")
-    expect(working).to_contain_text("1 background task still running", timeout=15_000)
+    expect(pill).to_contain_text("1 background task", timeout=15_000)
     expect(running_badge).to_have_count(0)
 
     # 2. A real turn still lights the row, so the assertion above is about

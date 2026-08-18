@@ -138,19 +138,50 @@ describe("BlockRenderer dispatch", () => {
     expect(alert).toHaveClass("min-w-0");
     expect(alert).toHaveClass("overflow-hidden");
 
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
     const description = container.querySelector('[data-slot="alert-description"]');
     expect(description).not.toBeNull();
     expect(description).toHaveClass("min-w-0");
     expect(description).toHaveClass("overflow-hidden");
 
-    const messageNode = screen.getByText(/Required terminal exited unexpectedly/);
+    const messageNode = screen.getByTestId("error-message-content");
     expect(messageNode).toHaveClass("whitespace-pre-wrap");
     expect(messageNode).toHaveClass("break-words");
-    expect(messageNode.textContent).toContain(
-      "Lifecycle diagnostics:\nterminal: required-runtime:main",
+    expect(messageNode.textContent).toContain("Required terminal exited unexpectedly");
+    expect(messageNode.textContent).not.toContain("terminal: required-runtime:main");
+
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.getByTestId("error-diagnostics-content").textContent).toContain(
+      "terminal: required-runtime:main",
     );
-    expect(messageNode.textContent).toContain(
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Last captured output" }));
+    expect(screen.getAllByTestId("error-diagnostics-content").at(-1)?.textContent).toContain(
       "  - first diagnostic line\n  - second diagnostic line",
+    );
+  });
+
+  it("suppresses the runner's unavailable last-output diagnostics tab", () => {
+    const items: RenderItem[] = [
+      {
+        kind: "error",
+        itemId: null,
+        source: "execution",
+        code: "required_terminal_exited",
+        message: [
+          "Required terminal exited unexpectedly; the session runtime is no longer available.",
+          "Terminal diagnostics:",
+          "terminal: required-runtime:main",
+          "Last captured terminal output: unavailable. The process exited before Omnigent captured a pane snapshot.",
+        ].join("\n"),
+      },
+    ];
+
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.queryByRole("tab", { name: "Last captured output" })).toBeNull();
+    expect(screen.getByTestId("error-diagnostics-content")).toHaveTextContent(
+      "terminal: required-runtime:main",
     );
   });
 
@@ -173,14 +204,51 @@ describe("BlockRenderer dispatch", () => {
 
     // Headline is the friendly title, not the raw code.
     expect(screen.getByText("Claude Code can't run as root")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: /Claude Code can't run as root/i }));
     // Cause is shown in plain English.
     expect(screen.getByText(/refuses the flag as root/)).toBeDefined();
     // Remediation is surfaced.
     expect(screen.getByText(/Run the host as a non-root user/)).toBeDefined();
-    // Raw diagnostics are folded away behind a Details toggle (collapsed).
-    expect(screen.getByText(/Details/)).toBeDefined();
+    // Raw diagnostics are folded away behind a nested disclosure.
+    expect(screen.getByRole("button", { name: "View diagnostics" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
     // The raw enum is NOT the visible headline.
     expect(screen.queryByText(/Error · required_terminal_exited/)).toBeNull();
+  });
+
+  it("forwards retryable errors once without inventing input replay", async () => {
+    let resolveRetry: (() => void) | undefined;
+    const onRetryError = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRetry = resolve;
+        }),
+    );
+    const item: Extract<RenderItem, { kind: "error" }> = {
+      kind: "error",
+      itemId: null,
+      source: "execution",
+      code: "required_terminal_exited",
+      message: "Terminal stopped",
+    };
+
+    render(<BlockRenderer items={[item]} sessionStatus="idle" onRetryError={onRetryError} />);
+    const retry = screen.getByRole("button", { name: "Retry" });
+    fireEvent.click(retry);
+    fireEvent.click(retry);
+
+    expect(onRetryError).toHaveBeenCalledTimes(1);
+    expect(onRetryError).toHaveBeenCalledWith(item);
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(/^Reconnecting$/);
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    resolveRetry?.();
+    await waitFor(() => {
+      expect(screen.queryByRole("status")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+    });
   });
 
   it("falls back to a code→sentence description for an unclassified failure", () => {
