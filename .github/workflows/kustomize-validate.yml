@@ -34,7 +34,9 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install kustomize
-        uses: imranismail/setup-kustomize@2ba527d4d55f7f4c4c901e97ae7e06df64e9cec4  # v2.1.0
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
 
       - name: Render all overlays
         run: |
