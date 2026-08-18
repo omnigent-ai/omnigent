@@ -325,6 +325,43 @@ def test_debug_logs_host_daemon_alias_reads_host_destination(
     assert "host log" in result.output
 
 
+def test_debug_db_upgrade_explains_database_written_by_newer_build(
+    tmp_path: Path,
+) -> None:
+    """
+    ``debug db-upgrade`` on a database ahead of this build exits with an
+    explanation rather than an Alembic traceback.
+
+    Alembic cannot resolve a revision it does not ship, so the upgrade
+    used to abort with an uncaught ``CommandError`` that reached the
+    crash reporter.
+    """
+    from alembic import command
+    from sqlalchemy import create_engine, text
+
+    from omnigent.db.utils import _build_alembic_config
+
+    uri = f"sqlite:///{tmp_path / 'ahead.db'}"
+    engine = create_engine(uri)
+    try:
+        config = _build_alembic_config(uri)
+        with engine.begin() as conn:
+            config.attributes["connection"] = conn
+            command.upgrade(config, "head")
+        # Stands in for a revision from a future release.
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE alembic_version SET version_num = 'ffffffffffff'"))
+    finally:
+        engine.dispose()
+
+    result = CliRunner().invoke(cli, ["debug", "db-upgrade", uri])
+
+    assert result.exit_code == 1, result.output
+    assert "ffffffffffff" in result.output, result.output
+    assert "newer omnigent" in result.output, result.output
+    assert "Traceback" not in result.output, result.output
+
+
 def _fake_run_claude_native_capture(
     captured: dict[str, object],
 ) -> Callable[..., None]:
