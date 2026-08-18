@@ -2109,7 +2109,7 @@ def main() -> None:
     except click.ClickException as exc:
         log_cli_exception(exc, prefix="Click CLI error")
         exc.show()
-        if suggest_stale_host_recovery:
+        if suggest_stale_host_recovery and not isinstance(exc, _BackgroundHostConnectError):
             print_stale_host_hint()
         raise SystemExit(exc.exit_code) from exc
     except click.Abort as exc:
@@ -7872,6 +7872,22 @@ def _prompt_stop_local_server() -> None:
 # this long and surface its log instead of falsely reporting success.
 _BACKGROUND_HOST_GRACE_S = 2.0
 
+# How long `start` waits for a background daemon's host tunnel to register
+# online before declaring the server unreachable. A healthy connect takes a
+# few seconds; the daemon retries a dead URL forever, so without a bound the
+# command would report success against an offline host.
+_BACKGROUND_HOST_CONNECT_GRACE_S = 15.0
+
+
+class _BackgroundHostConnectError(click.ClickException):
+    """A ``start`` connect failure whose message names the exact recovery.
+
+    The generic stale-host hint ``main`` appends to CLI errors (``Run
+    `omnigent stop`…``) is wrong for these: a rolled-back spawn leaves
+    nothing to stop, and a reused daemon's error already names the precise
+    teardown command.
+    """
+
 
 def _confirm_background_host_alive(record: _HostDaemonRecord) -> None:
     """Fail loud if a freshly spawned background host daemon dies at once.
@@ -7893,6 +7909,41 @@ def _confirm_background_host_alive(record: _HostDaemonRecord) -> None:
         if time.time() >= deadline:
             return
         time.sleep(0.1)
+
+
+def _confirm_background_host_connected(record: _HostDaemonRecord) -> None:
+    """Fail loud if a background daemon's host never comes online.
+
+    A live PID does not mean the daemon connected: against a dead server
+    URL, a refused port, or credentials the server rejects, the daemon
+    retries forever in its log while the host reads offline. Without this
+    probe, ``start`` reports success in that state and the only recovery is
+    ``omnigent stop``.
+
+    :param record: Registry record of the daemon to verify.
+    :raises click.ClickException: If the host is not online within
+        :data:`_BACKGROUND_HOST_CONNECT_GRACE_S`, or the daemon exits
+        while connecting.
+    """
+    from omnigent._runner_startup import format_runner_log_tail
+
+    log_path = Path(record.log_path) if record.log_path else None
+    deadline = time.monotonic() + _BACKGROUND_HOST_CONNECT_GRACE_S
+    while True:
+        if _daemon_host_online(record):
+            return
+        if not _pid_alive(record.pid):
+            raise click.ClickException(
+                f"The host daemon exited while connecting.{format_runner_log_tail(log_path)}"
+            )
+        if time.monotonic() >= deadline:
+            raise click.ClickException(
+                f"The host daemon could not connect to {record.target} — no Omnigent "
+                f"server answered there within {_BACKGROUND_HOST_CONNECT_GRACE_S:.0f}s. "
+                "Check that the server is running and the URL is correct."
+                f"{format_runner_log_tail(log_path)}"
+            )
+        time.sleep(0.5)
 
 
 def _run_background_host(
@@ -7922,8 +7973,8 @@ def _run_background_host(
     :param non_interactive: When ``True``, never launch the browser login —
         fail with the ``omnigent login`` hint instead.
     :raises click.ClickException: If the daemon cannot be spawned, exits
-        immediately after starting, or (local mode) never serves its local
-        Omnigent server.
+        immediately after starting, (remote mode) never connects its host
+        tunnel, or (local mode) never serves its local Omnigent server.
     """
     if server:
         _ensure_databricks_server_auth(server, non_interactive=non_interactive)
@@ -7940,13 +7991,14 @@ def _run_background_host(
         raise click.ClickException(
             "Could not spawn the background host daemon. See ~/.omnigent/logs/host/ for details."
         )
-    if previous is not None and previous.pid == record.pid:
+    reused = previous is not None and previous.pid == record.pid
+    if reused:
         headline = _cli_style("Host daemon already running", fg="yellow", bold=True)
     else:
         _confirm_background_host_alive(record)
         headline = _cli_style("Started the host daemon in the background", fg="green", bold=True)
-    click.echo(f"{headline} (pid {record.pid}).")
     if record.mode == "local":
+        click.echo(f"{headline} (pid {record.pid}).")
         # A local-mode daemon owns the local Omnigent server, so this command is
         # the whole "start everything" step — wait for that server and report
         # its URL, otherwise the Web UI is unreachable without a follow-up
@@ -7956,6 +8008,26 @@ def _run_background_host(
         _update_daemon_resolved_server_url(target, server_url)
     else:
         server_url = target
+        try:
+            _confirm_background_host_connected(record)
+        except click.ClickException as exc:
+            if reused:
+                # Not this invocation's daemon to kill: it may recover when
+                # its server returns, and it can own live sessions. Point at
+                # the teardown instead of rolling back.
+                raise _BackgroundHostConnectError(
+                    f"{exc.message}\nThe running daemon (pid {record.pid}) keeps retrying "
+                    f"in the background; if the target is wrong, stop it with "
+                    f"`{stop_command}` and retry."
+                ) from exc
+            # Roll back the daemon this invocation spawned: leaving it would
+            # report success against an offline host and block the next
+            # `start` with "already running" — the state that used to require
+            # an `omnigent stop` before retrying.
+            with contextlib.suppress(click.ClickException):
+                _terminate_daemon(record, force=True)
+            raise _BackgroundHostConnectError(exc.message) from exc
+        click.echo(f"{headline} (pid {record.pid}).")
     _echo_host_field("server", _cli_style(server_url, fg="cyan"))
     if record.log_path is not None:
         _echo_host_field("log", _display_path(Path(record.log_path)))
