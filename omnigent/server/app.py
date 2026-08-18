@@ -728,7 +728,8 @@ def _ensure_default_acp_agents(
     agent (``harness_is_configured("acp:...")`` treats "in config" as set up) and
     per builtin ACP CLI harness whose binary is on PATH (its readiness gate). On a
     host with no ACP setup — the common remote-server case, where the server holds
-    no ``acp:`` config — this seeds nothing.
+    no ``acp:`` config — this seeds nothing. When both sources name the same
+    harness, the configured agent wins (see :func:`shadowed_builtin_acp_rows`).
 
     Purely additive: it only adds picker rows and never touches native seeding.
     A malformed ``acp:`` block is logged and skipped, never fatal to startup
@@ -747,12 +748,14 @@ def _ensure_default_acp_agents(
 
     # (1) User-configured acp:<slug> agents — "set up" == present in config.
     try:
-        from omnigent.onboarding.acp_auth import acp_agents
+        from omnigent.onboarding.acp_auth import acp_agents, shadowed_builtin_acp_rows
 
         configured = list(acp_agents())
+        shadowed: frozenset[str] = shadowed_builtin_acp_rows(configured)
     except Exception:  # noqa: BLE001 — a malformed acp: block must never break startup
         _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
         configured = []
+        shadowed = frozenset()
     for agent in configured:
         # Key the built-in by the slug, not the display label: agent names must be
         # ``[a-zA-Z0-9_-]+`` (the spec validator rejects spaces/dots), and a label
@@ -767,9 +770,11 @@ def _ensure_default_acp_agents(
         )
 
     # (2) Builtin ACP CLI harnesses (e.g. grok) — "set up" == binary on PATH. Keyed
-    # by the catalog id (already a valid slug), not the display label.
+    # by the catalog id (already a valid slug), not the display label. A row a
+    # configured agent already claims is skipped: both seed the same
+    # ``builtin_agent_id``, so the row would overwrite the user's chosen command.
     for key, row in ACP_CLI_HARNESSES.items():
-        if resolve_cli_binary(row.binary) is None:
+        if key in shadowed or resolve_cli_binary(row.binary) is None:
             continue
         _ensure_builtin_agent(
             agent_store,
