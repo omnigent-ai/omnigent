@@ -745,7 +745,23 @@ def _ensure_default_acp_agents(
     from omnigent._platform import resolve_cli_binary
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 
-    # (1) User-configured acp:<slug> agents — "set up" == present in config.
+    # (1) Builtin ACP CLI harnesses (e.g. grok) — "set up" == binary on PATH. Keyed
+    # by the catalog id (already a valid slug), not the display label. Seeded FIRST
+    # so a same-slug user configuration below wins: a configured ``acp:`` agent
+    # whose slug equals a builtin id (``Devin`` -> ``devin``) used to be silently
+    # overwritten by the builtin row, discarding the explicit config (#4926).
+    for key, row in ACP_CLI_HARNESSES.items():
+        if resolve_cli_binary(row.binary) is None:
+            continue
+        _ensure_builtin_agent(
+            agent_store,
+            artifact_store,
+            agent_cache,
+            name=key,
+            bundle_bytes=_build_acp_bundle(harness=key, name=key),
+        )
+
+    # (2) User-configured acp:<slug> agents — "set up" == present in config.
     try:
         from omnigent.onboarding.acp_auth import acp_agents
 
@@ -764,19 +780,6 @@ def _ensure_default_acp_agents(
             agent_cache,
             name=agent.slug,
             bundle_bytes=_build_acp_bundle(harness=f"acp:{agent.slug}", name=agent.slug),
-        )
-
-    # (2) Builtin ACP CLI harnesses (e.g. grok) — "set up" == binary on PATH. Keyed
-    # by the catalog id (already a valid slug), not the display label.
-    for key, row in ACP_CLI_HARNESSES.items():
-        if resolve_cli_binary(row.binary) is None:
-            continue
-        _ensure_builtin_agent(
-            agent_store,
-            artifact_store,
-            agent_cache,
-            name=key,
-            bundle_bytes=_build_acp_bundle(harness=key, name=key),
         )
 
 
