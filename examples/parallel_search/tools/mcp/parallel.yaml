@@ -1,0 +1,6 @@
+# Parallel Search MCP — live web search and URL fetching.
+# Auto-discovered by omnigent from tools/mcp/*.yaml; no tools block is needed.
+name: parallel
+description: Live web search and URL fetching through Parallel Search MCP.
+transport: http
+url: https://search.parallel.ai/mcp

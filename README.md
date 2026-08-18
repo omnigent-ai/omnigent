@@ -279,6 +279,7 @@ Two example agents ship with the repo, and they make good first sessions:
 omnigent run examples/polly/
 omnigent run examples/debby/
 omnigent run examples/deep-research/
+omnigent run examples/parallel_search/
 
 # ...or on a different harness (sub-agents keep their own):
 omnigent run examples/polly/ --harness <harness>
@@ -301,6 +302,12 @@ cross-checked report. It plans sub-queries, searches the live web and reads
 full pages through an MCP search server, and verifies each claim across
 independent sources. It's also the simplest example to copy from: one agent
 plus one `tools/mcp/*.yaml` server, no sub-agents.
+
+**🌐 Parallel Search** is a standalone variant that uses the free, no-account,
+no-API-key Parallel Search MCP server for live web search and URL fetching.
+See [`examples/parallel_search/`](examples/parallel_search/) for the complete
+agent image and research procedure; the existing Deep Research example and
+its provider remain unchanged.
 
 **Prefer the browser?** One command starts the local server and registers this
 machine as a host:
