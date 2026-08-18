@@ -2521,7 +2521,7 @@ function registerIpc() {
       // Ensure the CLI is authenticated for a remote server first (local needs
       // none) — otherwise the host connect would just fail on a 401.
       const auth = await serverManager.ensureServerAuth(cliPath, serverUrl);
-      if (!auth.ok) result = { ok: false, error: auth.error };
+      if (!auth.ok) result = { ok: false, error: auth.error, authError: auth.authError };
       else if (action === "start")
         result = await serverManager.ensureHostConnected(cliPath, serverUrl);
       else result = await serverManager.restartHost(cliPath, serverUrl);

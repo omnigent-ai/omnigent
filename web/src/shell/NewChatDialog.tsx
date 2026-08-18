@@ -2128,6 +2128,11 @@ export function NewChatLandingScreen() {
   // picker can tag the current machine and offer to auto-connect it.
   const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
   const [connectingThisMachine, setConnectingThisMachine] = useState(false);
+  // Error surfaced when "Run on this machine" fails (sign-in needed, enrollment
+  // declined, server unreachable). Rendered in the composer body with a retry,
+  // so the failure isn't silently swallowed and the user isn't stranded on the
+  // "No hosts" state.
+  const [connectError, setConnectError] = useState<string | null>(null);
   // Defer the connect until the dropdown has actually closed (set on select,
   // consumed in the menu's onOpenChange) — connecting while the menu is open
   // looks janky. A ref so the close handler sees it synchronously.
@@ -3551,9 +3556,24 @@ export function NewChatLandingScreen() {
   async function connectThisMachine() {
     if (connectingThisMachine) return;
     setConnectingThisMachine(true);
+    setConnectError(null);
     try {
+      // A single controlHost("start") blocks through the whole enrollment →
+      // sign-in (browser OAuth) → connect sequence, so on success the machine is
+      // already authed and connected — no separate retry needed. On failure we
+      // MUST surface it: this used to `return` silently, dropping the user back
+      // on "No hosts" with no clue why. An auth failure gets sign-in-flavored
+      // copy; the rendered error carries a "Try again" affordance.
       const res = await controlHost("start");
-      if (!res.ok) return;
+      if (!res.ok) {
+        setConnectError(
+          res.authError
+            ? (res.error ??
+                "Sign-in didn't complete. A browser should have opened — finish signing in, then try again.")
+            : (res.error ?? "Couldn't run on this machine."),
+        );
+        return;
+      }
       const identity = await getHostIdentity();
       setDesktopHost(identity);
       await queryClient.invalidateQueries({ queryKey: ["hosts"] });
@@ -4920,6 +4940,24 @@ export function NewChatLandingScreen() {
           {createError && (
             <p className="text-sm text-destructive" data-testid="new-chat-landing-error">
               {createError}
+            </p>
+          )}
+
+          {connectError && (
+            <p
+              className="flex flex-wrap items-center gap-x-1.5 text-sm text-destructive"
+              data-testid="new-chat-landing-connect-error"
+            >
+              <span>{connectError}</span>
+              <button
+                type="button"
+                className="underline underline-offset-2 hover:no-underline disabled:opacity-60"
+                onClick={() => void connectThisMachine()}
+                disabled={connectingThisMachine}
+                data-testid="new-chat-landing-connect-error-retry"
+              >
+                Try again
+              </button>
             </p>
           )}
         </div>
