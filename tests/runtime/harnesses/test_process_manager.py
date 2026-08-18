@@ -936,10 +936,9 @@ async def test_orphan_sweep_survives_unreadable_tmp_parent(
 ) -> None:
     """An unreadable tmp_parent must not abort manager startup.
 
-    Multi-tenant same-host case: the shared parent can belong to
-    another user and be unreadable to us. ``iterdir()`` then raises
-    PermissionError -- the documented best-effort contract is to log
-    and proceed with boot, not crash the runner.
+    A configured shared parent can be unreadable. ``iterdir()`` then
+    raises PermissionError; the documented best-effort contract is to
+    log and proceed with boot instead of crashing the runner.
     """
     if os.geteuid() == 0:
         pytest.skip("permission checks do not apply to root")
@@ -947,8 +946,7 @@ async def test_orphan_sweep_survives_unreadable_tmp_parent(
     locked_parent.mkdir(mode=0o700)
     (locked_parent / "ap-unreachable").mkdir(mode=0o700)
     # Write+search without read: our own instance dir can be created,
-    # but the sweep cannot enumerate the parent (EACCES on iterdir) --
-    # the shape of a shared parent owned by another user.
+    # but the sweep cannot enumerate the configured shared parent.
     locked_parent.chmod(0o333)
     manager = HarnessProcessManager(tmp_parent=locked_parent)
     try:
@@ -964,12 +962,42 @@ async def test_orphan_sweep_survives_unreadable_tmp_parent(
             await manager.shutdown()
 
 
+async def test_orphan_sweep_survives_tmp_parent_stat_error(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A tmp-parent stat race must not abort manager startup."""
+    real_exists = Path.exists
+    raised = False
+
+    def _racy_exists(self: Path) -> bool:
+        nonlocal raised
+        if self == short_tmp_parent and not raised:
+            raised = True
+            raise OSError("tmp parent changed during sweep")
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", _racy_exists)
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    try:
+        await manager.start()
+        assert manager.instance_dir.exists()
+        assert any(
+            "cannot access" in record.getMessage() and str(short_tmp_parent) in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
 @pytest.mark.posix_only
 async def test_orphan_sweep_skips_unreadable_sibling_and_still_sweeps(
     short_tmp_parent: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A foreign, unreadable ``ap-*`` sibling is skipped, not fatal.
+    """An inaccessible ``ap-*`` sibling is skipped, not fatal.
 
     Plants one mode-0000 sibling (stat of its sentinel raises
     PermissionError) and one readable dead-PID orphan. The sweep must
@@ -978,10 +1006,10 @@ async def test_orphan_sweep_skips_unreadable_sibling_and_still_sweeps(
     """
     if os.geteuid() == 0:
         pytest.skip("permission checks do not apply to root")
-    foreign = short_tmp_parent / "ap-foreignuser"
-    foreign.mkdir(mode=0o700)
-    (foreign / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
-    foreign.chmod(0o000)
+    inaccessible = short_tmp_parent / "ap-inaccessible"
+    inaccessible.mkdir(mode=0o700)
+    (inaccessible / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    inaccessible.chmod(0o000)
 
     dead = short_tmp_parent / "ap-deadsibling"
     dead.mkdir(mode=0o700)
@@ -994,15 +1022,15 @@ async def test_orphan_sweep_skips_unreadable_sibling_and_still_sweeps(
     manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
     try:
         await manager.start()
-        assert foreign.exists(), "unreadable sibling must be skipped, not removed"
+        assert inaccessible.exists(), "unreadable sibling must be skipped, not removed"
         assert not dead.exists(), "readable dead orphan must still be swept"
         assert live.exists(), "live sibling must remain untouched"
         assert any(
-            "cannot inspect" in record.getMessage() and str(foreign) in record.getMessage()
+            "cannot inspect" in record.getMessage() and str(inaccessible) in record.getMessage()
             for record in caplog.records
         )
     finally:
-        foreign.chmod(0o700)
+        inaccessible.chmod(0o700)
         with contextlib.suppress(Exception):
             await manager.shutdown()
 
