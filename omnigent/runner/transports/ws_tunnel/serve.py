@@ -426,7 +426,16 @@ async def serve_tunnel(
                 http_status = _websocket_http_status(exc)
                 if http_status is not None and http_status in _REFRESHABLE_HTTP_STATUSES:
                     http_auth_rejection_streak += 1
-                    if http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS:
+                    # A tunnel that already completed an upgrade proved its
+                    # credentials: a later 401/403 is a network-path artifact
+                    # (VPN drop, intermediary answering before the server) and
+                    # must retry indefinitely rather than exit -- the host
+                    # tunnel gained exactly this ever_connected guard in
+                    # host/connect.py; the runner path is its mirror (#4958).
+                    if (
+                        not ever_connected
+                        and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+                    ):
                         login_hint = (
                             f"run `databricks auth login --host {server_url}` to re-authenticate"
                             if server_url
