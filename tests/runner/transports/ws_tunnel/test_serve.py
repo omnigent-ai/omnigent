@@ -1837,3 +1837,67 @@ async def test_serve_tunnel_no_ssl_context_for_ws(
         monkeypatch, "ws://127.0.0.1:6767/v1/runners/runner_test/tunnel"
     )
     assert captured["kwargs"]["ssl"] is None
+
+
+async def test_serve_tunnel_survives_auth_rejection_after_first_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel that already upgraded once must retry 401s forever.
+
+    A once-connected runner proved its credentials; a later 401/403 is a
+    network-path artifact (VPN drop, intermediary answering the upgrade), and
+    exiting would kill every session the runner serves for a blip (#4958).
+    Mirrors the host tunnel's _ever_connected guard in host/connect.py.
+    """
+    from omnigent.runner.transports.ws_tunnel.serve import _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+
+    attempt = 0
+    shutdown = asyncio.Event()
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+        on_connected: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        del app, tunnel_url, server_url, runner_id, runner_version, auth_token, tunnel_token
+        nonlocal attempt
+        attempt += 1
+        if attempt == 1:
+            # Successful upgrade: report the connection so the loop marks
+            # the runner ever_connected (the real _serve_tunnel_once invokes
+            # this callback once the tunnel is live).
+            if on_connected is not None:
+                on_connected()
+            return
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    async def _sleep(_delay: float) -> None:
+        # Let several streak-caps' worth of rejections land, then stop the loop
+        # to observe that it never exited on its own.
+        if attempt > _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS + 3:
+            shutdown.set()
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    # Returns via the shutdown event, NOT by raising the fatal rejection.
+    await asyncio.wait_for(
+        serve_tunnel(
+            _noop_app,
+            server_url="https://example.databricksapps.com",
+            runner_id="runner_blip_survivor",
+            runner_version="0.1.0",
+            auth_token="tok",
+            shutdown_event=shutdown,
+        ),
+        timeout=10.0,
+    )
+
+    assert attempt > _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS + 3
