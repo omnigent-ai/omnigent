@@ -15,6 +15,7 @@ Two layers:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shlex
 import sys
@@ -1000,3 +1001,32 @@ def test_startup_error_names_the_exception_type_when_str_is_empty() -> None:
     """No stderr and an empty ``str(exc)`` still yields something actionable."""
     ex = AcpExecutor(AcpAgentConfig(command="x", name="A"))
     assert "TimeoutError" in ex._startup_error_message(TimeoutError())
+
+
+def test_tool_hook_config_not_clobbered_and_warns_on_foreign_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A pre-existing hooks.v1.json omnigent didn't write is preserved, with a loud warning.
+
+    What breaks if this fails: omnigent silently overwrites a user's own
+    Devin/Claude-Code hook config, or silently installs nothing and leaves the
+    operator believing tool gating is active for this session when it is not.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x", tool_hooks="claude-code"), cwd=str(tmp_path))
+    ex._session_id = "s1"
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    foreign = claude_dir / "hooks.v1.json"
+    foreign.write_text('{"hooks": {"PreToolUse": [{"hooks": [{"command": "./my-guard.sh"}]}]}}')
+
+    with caplog.at_level(logging.WARNING):
+        ex._write_tool_hook_config("s1")
+
+    # The operator's file is left intact — not clobbered by omnigent.
+    kept = foreign.read_text()
+    assert "my-guard.sh" in kept
+    assert "omnigent.acp_tool_use_hook" not in kept
+    # No relay dir created for a session we did not gate.
+    assert not (tmp_path / ".omnigent-hook-relay").exists()
+    # And it warned loudly that gating is NOT active.
+    assert any("not written by omnigent" in r.getMessage() for r in caplog.records)

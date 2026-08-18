@@ -58,6 +58,9 @@ class AcpAgentEntry:
         authenticates with, so an agent that reads one must name it here or it
         starts unauthenticated. Names only — values are read from the host
         environment at spawn, never stored in the config file.
+    :param tool_hooks: Hook configuration format, e.g. ``"claude-code"`` to gate
+        the agent's own internal tools via Omnigent policy. ``"none"`` (default)
+        disables hooks. Agents reading this format benefit regardless of name.
     """
 
     slug: str
@@ -68,6 +71,7 @@ class AcpAgentEntry:
     send_model: bool = False
     omnigent_mcp: bool = True
     env_passthrough: tuple[str, ...] = ()
+    tool_hooks: str = "none"
 
 
 def slugify(name: str) -> str:
@@ -157,6 +161,9 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
         omnigent_mcp = raw.get("omnigent_mcp", True)
         if not isinstance(omnigent_mcp, bool):
             raise ValueError("acp agent omnigent_mcp must be a boolean")
+        tool_hooks = raw.get("tool_hooks", "none")
+        if not isinstance(tool_hooks, str) or tool_hooks not in ("none", "claude-code"):
+            tool_hooks = "none"
         entries.append(
             AcpAgentEntry(
                 slug=slug,
@@ -167,6 +174,7 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
                 send_model=bool(raw.get("send_model", False)),
                 omnigent_mcp=omnigent_mcp,
                 env_passthrough=parse_env_passthrough(raw.get("env_passthrough")),
+                tool_hooks=tool_hooks,
             )
         )
     return entries
@@ -208,6 +216,8 @@ def acp_agents_settings(entries: list[AcpAgentEntry]) -> dict[str, object]:
             item["omnigent_mcp"] = False
         if e.env_passthrough:
             item["env_passthrough"] = list(e.env_passthrough)
+        if e.tool_hooks != "none":
+            item["tool_hooks"] = e.tool_hooks
         agents.append(item)
     return {ACP_CONFIG_KEY: {_AGENTS_FIELD: agents}}
 

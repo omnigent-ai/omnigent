@@ -123,3 +123,61 @@ def test_env_passthrough_rejects_a_value_instead_of_a_name() -> None:
 def test_env_passthrough_rejects_non_names(value: object) -> None:
     with pytest.raises(ValueError, match="env_passthrough"):
         acp_agents({"acp": {"agents": [{"name": "A", "command": "a", "env_passthrough": value}]}})
+
+
+def test_tool_hooks_defaults_to_none() -> None:
+    """tool_hooks defaults to "none" and is omitted from settings when not changed."""
+    entries = acp_agents({"acp": {"agents": [{"name": "Devin", "command": "devin acp"}]}})
+    assert entries[0].tool_hooks == "none"
+    assert acp_agents_settings(entries) == {
+        "acp": {
+            "agents": [
+                {"name": "Devin", "command": "devin acp"},
+            ]
+        }
+    }
+
+
+def test_tool_hooks_round_trips_when_enabled() -> None:
+    """tool_hooks round-trips through parse → persist when enabled."""
+    entries = acp_agents(
+        {
+            "acp": {
+                "agents": [
+                    {
+                        "name": "Devin",
+                        "command": "devin acp",
+                        "tool_hooks": "claude-code",
+                    },
+                ]
+            }
+        }
+    )
+    assert entries[0].tool_hooks == "claude-code"
+    assert acp_agents_settings(entries) == {
+        "acp": {
+            "agents": [
+                {
+                    "name": "Devin",
+                    "command": "devin acp",
+                    "tool_hooks": "claude-code",
+                },
+            ]
+        }
+    }
+
+
+def test_tool_hooks_ignores_invalid_values() -> None:
+    """Invalid tool_hooks values fall back to "none"."""
+    entries = acp_agents(
+        {
+            "acp": {
+                "agents": [
+                    {"name": "A", "command": "a", "tool_hooks": "invalid"},
+                    {"name": "B", "command": "b", "tool_hooks": 123},
+                    {"name": "C", "command": "c", "tool_hooks": None},
+                ]
+            }
+        }
+    )
+    assert [e.tool_hooks for e in entries] == ["none", "none", "none"]

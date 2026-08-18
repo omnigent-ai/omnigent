@@ -26,6 +26,9 @@ Env vars read at startup:
 - ``HARNESS_ACP_SEND_MODEL``: ``"1"`` to send the model in ``session/new``.
 - ``HARNESS_ACP_OMNIGENT_MCP``: ``"0"`` to disable Omnigent's MCP relay;
   ``session/new`` still receives an empty ``mcpServers`` array.
+- ``HARNESS_ACP_TOOL_HOOKS``: Hook configuration format, e.g. ``"claude-code"``
+  to gate the agent's own internal tools via Omnigent policy; omit or unset to
+  disable (the default).
 - ``HARNESS_ACP_OS_ENV``: JSON-encoded :class:`OSEnvSpec`. When unset, falls
   back to ``caller_process`` + ``sandbox=none``.
 - ``HARNESS_ACP_ENV_PASSTHROUGH``: comma-separated environment variable *names*
@@ -57,6 +60,7 @@ _ENV_MODEL = "HARNESS_ACP_MODEL"
 _ENV_SESSION_ID_MODE = "HARNESS_ACP_SESSION_ID_MODE"
 _ENV_SEND_MODEL = "HARNESS_ACP_SEND_MODEL"
 _ENV_OMNIGENT_MCP = "HARNESS_ACP_OMNIGENT_MCP"
+_ENV_TOOL_HOOKS = "HARNESS_ACP_TOOL_HOOKS"
 _ENV_CWD = "HARNESS_ACP_CWD"
 _ENV_OS_ENV = "HARNESS_ACP_OS_ENV"
 _ENV_ENV_PASSTHROUGH = "HARNESS_ACP_ENV_PASSTHROUGH"
@@ -126,6 +130,7 @@ def _build_acp_executor() -> Executor:
     session_id_mode = os.environ.get(_ENV_SESSION_ID_MODE, "").strip() or "server"
     send_model = _env_enabled(_ENV_SEND_MODEL, default=False)
     omnigent_mcp = _env_enabled(_ENV_OMNIGENT_MCP, default=True)
+    tool_hooks = os.environ.get(_ENV_TOOL_HOOKS, "").strip() or "none"
     cwd = os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None
 
     config = AcpAgentConfig(
@@ -136,6 +141,7 @@ def _build_acp_executor() -> Executor:
         send_model_in_session_new=send_model,
         omnigent_mcp=omnigent_mcp,
         env_passthrough=_env_passthrough_names(),
+        tool_hooks=tool_hooks,
     )
     return AcpExecutor(config=config, cwd=cwd, os_env=_resolve_os_env())
 

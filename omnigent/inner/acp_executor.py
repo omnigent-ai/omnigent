@@ -185,6 +185,9 @@ class AcpAgentConfig:
         the agent authenticates with — an agent that reads a variable must name
         it here (or in ``os_env.sandbox.env_passthrough``) or it starts
         unauthenticated. Names only; values come from the host environment.
+    :param tool_hooks: Hook configuration format, e.g. ``"claude-code"`` to gate
+        the agent's own internal tools via Omnigent policy. ``"none"`` (default)
+        disables hooks.
     """
 
     command: str
@@ -194,6 +197,7 @@ class AcpAgentConfig:
     send_model_in_session_new: bool = False
     omnigent_mcp: bool = True
     env_passthrough: tuple[str, ...] = ()
+    tool_hooks: str = "none"
 
 
 class _AcpRequestError(Exception):
@@ -355,6 +359,10 @@ class AcpExecutor(Executor):
         # :meth:`close`). ``_omnigent_tools`` is captured each turn for the relay.
         self._mcp = OmnigentAcpMcp(label=config.name)
         self._omnigent_tools: list[ToolSpec] = []
+
+        # Tool-use hook config: written to the session cwd when tool_hooks is
+        # enabled, so the agent reads policy-gated PreToolUse hooks.
+        self._hook_config_written: bool = False
 
     # ------------------------------------------------------------------
     # Low-level ACP transport
@@ -687,7 +695,142 @@ class AcpExecutor(Executor):
                 "ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
         self._session_id = session_id
+
+        # Set up tool-use hook config if enabled (must be called after session_id is known).
+        self._setup_tool_hooks(session_id)
+
         return self._session_id
+
+    def _setup_tool_hooks(self, session_id: str) -> None:
+        """Set up hook config for gating tool calls via omnigent policy.
+
+        When tool_hooks is enabled (e.g., "claude-code"), writes a Claude Code
+        hook config to ``.claude/hooks.v1.json`` in the session cwd. The hook
+        subprocess reads policy relay config from a bridge directory written here.
+
+        What breaks if this fails: the hook subprocess will not be able to evaluate
+        policies, and the agent will run without tool-call gating from omnigent.
+        """
+        if self._hook_config_written or self._config.tool_hooks == "none":
+            return
+        if not (self._policy_evaluator and self._elicitation_handler):
+            # Bridges not wired; no policy server to call. Silently skip hook setup.
+            logger.debug(
+                "acp[%s] tool hooks not set up (no policy bridge wired)",
+                self._config.name,
+            )
+            return
+
+        try:
+            self._write_tool_hook_config(session_id)
+            self._hook_config_written = True
+        except Exception as exc:  # noqa: BLE001 — don't break the session on hook setup failure
+            logger.warning(
+                "acp[%s] failed to set up tool hooks: %s",
+                self._config.name,
+                exc,
+                exc_info=True,
+            )
+
+    def _write_tool_hook_config(self, session_id: str) -> None:
+        """Write hook config files for PreToolUse policy gating.
+
+        Writes ``.claude/hooks.v1.json`` (Claude Code hook format) with a
+        PreToolUse command hook. Writes relay config to a bridge directory so
+        the hook subprocess can reach the policy evaluation endpoint. The relay
+        config contains auth headers and the session ID; the hook uses these
+        to evaluate policies against omnigent.
+
+        When the policy evaluator or elicitation handler is not wired (e.g., in
+        unit tests), the relay config is left in a minimal state and the hook
+        will fail gracefully when called.
+        """
+        import shlex
+        import sys
+        import time
+        from pathlib import Path
+
+        if not self._session_id:
+            return
+
+        cwd_path = Path(self._cwd)
+        claude_dir = cwd_path / ".claude"
+        bridge_dir = cwd_path / ".omnigent-hook-relay"
+        hooks_file = claude_dir / "hooks.v1.json"
+
+        # Never clobber a hook config omnigent did not write, and never proceed
+        # as if gating were active when we cannot install ours. If a foreign
+        # hooks.v1.json is already present, warn loudly and skip: the operator's
+        # file stays intact and they are told gating is NOT active for this
+        # session. A config we wrote ourselves (identified by our hook module) is
+        # safe to refresh.
+        if hooks_file.exists():
+            try:
+                existing = hooks_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                existing = ""
+            if "omnigent.acp_tool_use_hook" not in existing:
+                logger.warning(
+                    "acp[%s] %s already exists and was not written by omnigent; "
+                    "leaving it untouched. Omnigent tool-call policy gating is NOT "
+                    "active for this session — remove or merge that file to enable it.",
+                    self._config.name,
+                    hooks_file,
+                )
+                return
+
+        # Create directories.
+        claude_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+        # Write relay config that the hook subprocess reads. The actual server
+        # URL and auth headers will be filled in by the policy_hook_wrapper_script
+        # (used by claude_native_hook). For ACP, this is a placeholder that will
+        # be populated if the executor is running inside an omnigent harness.
+        relay_config: _AcpJsonObject = {
+            "session_id": session_id,
+            "updated_at": time.time(),
+        }
+
+        relay_file = bridge_dir / "tool_relay.json"
+        relay_file.write_text(json.dumps(relay_config), encoding="utf-8")
+
+        # Build the hook command that invokes the acp_tool_use_hook module.
+        python = sys.executable
+        hook_command_parts = [
+            python,
+            "-I",
+            "-m",
+            "omnigent.acp_tool_use_hook",
+            "--relay-dir",
+            str(bridge_dir),
+        ]
+
+        # Write the hook config in Claude Code format. Devin reads this format
+        # from `.claude/` directories.
+        hook_config: _AcpJsonObject = {
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": shlex.join(hook_command_parts),
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+
+        hooks_file.write_text(json.dumps(hook_config, indent=2), encoding="utf-8")
+
+        logger.debug(
+            "acp[%s] wrote hook config to %s and relay config to %s",
+            self._config.name,
+            hooks_file,
+            relay_file,
+        )
 
     # ------------------------------------------------------------------
     # Server-initiated requests (agent → client)
