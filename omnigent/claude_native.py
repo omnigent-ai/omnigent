@@ -32,8 +32,8 @@ from omnigent.runtime.tool_result_replay import (
 )
 
 # termios/tty are POSIX-only and drive the native (tmux/PTY) Claude terminal,
-# which is disabled on Windows. Guard the import (special-cased by mypy, which
-# type-checks on Linux) so importing this module never crashes the CLI there.
+# which is disabled on Windows. Guard the import so static checking keeps the
+# POSIX path typed without making module import crash the CLI on Windows.
 if sys.platform != "win32":
     import termios
     import tty

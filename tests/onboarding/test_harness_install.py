@@ -175,11 +175,133 @@ def test_cli_probe_timeout_defaults_lenient_but_readiness_passes_short(
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
     assert recorded[-1] == 30.0
 
+    # The positive verdict above is now TTL-cached; drop it so the second
+    # call actually probes (this test is about timeout plumbing, and the
+    # cache behavior has its own tests below).
+    hi._LOGIN_PROBE_CACHE.clear()
     assert (
         hi.harness_cli_logged_in(ANTHROPIC_FAMILY, timeout=hi.READINESS_CLI_PROBE_TIMEOUT_S)
         is True
     )
     assert recorded[-1] == hi.READINESS_CLI_PROBE_TIMEOUT_S == 10.0
+
+
+def test_login_probe_caches_positive_verdicts_with_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A logged-in verdict is served from cache until its TTL expires.
+
+    Readiness refreshes across every host daemon exec ``auth status``
+    per pass; without the cache that compounds into a constant ambient
+    subprocess storm on machines with many idle hosts.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    runs: list[list[str]] = []
+
+    def _positive_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        runs.append(argv)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout='{"loggedIn": true}', stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _positive_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert len(runs) == 1, "second call within the TTL must be cache-served"
+
+    # Expire the entry: the next call must probe again.
+    for cache_key in hi._LOGIN_PROBE_CACHE:
+        hi._LOGIN_PROBE_CACHE[cache_key] = 0.0
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert len(runs) == 2
+
+
+def test_login_probe_never_caches_negative_verdicts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not-logged-in must re-probe every call.
+
+    The setup wizard confirms a just-completed login via this function; a
+    cached negative would report the fresh login as failed for the TTL.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    runs: list[list[str]] = []
+
+    def _negative_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        runs.append(argv)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=1, stdout='{"loggedIn": false}', stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _negative_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is False
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is False
+    assert len(runs) == 2, "negative verdicts must never be cache-served"
+
+
+def test_logout_invalidates_login_probe_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful logout is confirmed live, not from the cached positive."""
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    logged_in = True
+
+    def _stateful_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal logged_in
+        if "logout" in argv:
+            logged_in = False
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+        body = '{"loggedIn": true}' if logged_in else '{"loggedIn": false}'
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0 if logged_in else 1, stdout=body, stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _stateful_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert hi.harness_logout(ANTHROPIC_FAMILY) is True, (
+        "logout must invalidate the cached positive and confirm live"
+    )
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is False
+
+
+def test_version_probe_caches_by_binary_signature(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--version`` parses cache against (path, mtime, size); failures don't.
+
+    The output is a pure function of the binary bytes, so a swap (upgrade)
+    must re-probe and an unchanged binary must never be probed twice.
+    """
+    binary = tmp_path / "fake-cli"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    spec = hi.harness_install_spec(ANTHROPIC_FAMILY)
+    assert spec is not None
+    runs: list[list[str]] = []
+    fail_first = True
+
+    def _version_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        runs.append(argv)
+        if fail_first:
+            raise OSError("scripted probe failure")
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="1.2.3", stderr="")
+
+    monkeypatch.setattr(hi.subprocess, "run", _version_run)
+
+    # A failed probe is not cached — the next call tries again.
+    assert hi._harness_cli_version_string(spec, str(binary)) is None
+    fail_first = False
+    assert hi._harness_cli_version_string(spec, str(binary)) == "1.2.3"
+    assert hi._harness_cli_version_string(spec, str(binary)) == "1.2.3"
+    assert len(runs) == 2, "unchanged binary must be version-cached after one success"
+
+    # Swapping the binary (new mtime/size) must re-probe.
+    binary.write_text("#!/bin/sh\n# upgraded\n", encoding="utf-8")
+    os.utime(binary, ns=(1, 1))
+    assert hi._harness_cli_version_string(spec, str(binary)) == "1.2.3"
+    assert len(runs) == 3
 
 
 def test_cursor_install_spec_is_login_only_no_npm() -> None:

@@ -149,7 +149,7 @@ describe("buildBubbles — bubble grouping", () => {
     // The blockStream stamps a unique response id on REQUEST-phase
     // elicitations precisely so they do NOT fold into the previous turn's
     // assistant bubble. With that distinct id, the card is its own
-    // elicitation-only bubble, which is what `isRequestElicitationBubble`
+    // elicitation-only bubble, which is what `isStandaloneElicitationBubble`
     // (ChatPage) keys on to lift the prompt above it.
     const blocks: AnyBlock[] = [
       {
@@ -177,6 +177,142 @@ describe("buildBubbles — bubble grouping", () => {
     expect(answer.items.map((i) => i.kind)).toEqual(["text"]);
     const card = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
     expect(card.items.map((i) => i.kind)).toEqual(["elicitation"]);
+  });
+
+  it("an AskUserQuestion card splits its turn into work / card / work", () => {
+    // The user answering a question is a turn boundary, not a step of the
+    // agent's work: the card takes a bubble of its own (so it renders
+    // outside the "Worked for" fold) and the work after the answer folds
+    // under a NEW one. All three carry the SAME response id — the card
+    // arrives mid-turn, so blockStream stamps it with the turn's id.
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "resp_1" }),
+        content: [{ type: "input_text", text: "Set it up" }],
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "resp_1" }),
+        executions: [mkExec("ls", "c1")],
+        iteration: 0,
+      },
+      {
+        type: "elicitation",
+        ctx: ctx({ itemId: null, responseId: "resp_1" }),
+        elicitationId: "elic_ask",
+        message: "Claude wants to call **AskUserQuestion**",
+        phase: "pre_tool_use",
+        policyName: "claude_native_permission",
+        contentPreview: "AskUserQuestion({})",
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept", content: { Framework: "React" } },
+        askUserQuestion: {
+          questions: [
+            {
+              question: "Which framework?",
+              options: [{ label: "React" }, { label: "Vue" }],
+              multiSelect: false,
+            },
+          ],
+        },
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "resp_1" }),
+        executions: [mkExec("write", "c2")],
+        iteration: 0,
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "resp_1" }),
+        fullText: "Wired up React.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["user", "assistant", "assistant", "assistant"]);
+    const before = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
+    const card = bubbles[2] as Extract<Bubble, { kind: "assistant" }>;
+    const after = bubbles[3] as Extract<Bubble, { kind: "assistant" }>;
+    expect(before.items.map((i) => i.kind)).toEqual(["tool"]);
+    expect(card.items.map((i) => i.kind)).toEqual(["elicitation"]);
+    expect(after.items.map((i) => i.kind)).toEqual(["tool", "text"]);
+    // The pre-card work has no answer of its own, so it needs `continued`
+    // to fold behind its own "Worked for" row.
+    expect(before.continued).toBe(true);
+    expect(card.responseId).toBe("resp_1");
+  });
+
+  it("an ExitPlanMode card splits its turn the same way", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "resp_1" }),
+        executions: [mkExec("ls", "c1")],
+        iteration: 0,
+      },
+      {
+        type: "elicitation",
+        ctx: ctx({ itemId: null, responseId: "resp_1" }),
+        elicitationId: "elic_plan",
+        message: "Claude wants to call **ExitPlanMode**",
+        phase: "pre_tool_use",
+        policyName: "claude_native_permission",
+        contentPreview: "ExitPlanMode({...})",
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept" },
+        exitPlanMode: { plan: "# Plan\n\n1. Do the thing" },
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "resp_1" }),
+        fullText: "Done.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "assistant", "assistant"]);
+    expect((bubbles[1] as Extract<Bubble, { kind: "assistant" }>).items.map((i) => i.kind)).toEqual(
+      ["elicitation"],
+    );
+  });
+
+  it("an approval card stays inside the turn it gated", () => {
+    // Approvals are part of the work's history — they fold with the trace
+    // in document order. Only cards that ask the USER split the bubble.
+    const blocks: AnyBlock[] = [
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "resp_1" }),
+        executions: [mkExec("ls", "c1")],
+        iteration: 0,
+      },
+      {
+        type: "elicitation",
+        ctx: ctx({ itemId: null, responseId: "resp_1" }),
+        elicitationId: "elic_push",
+        message: "Allow `git push`?",
+        phase: "tool_call",
+        policyName: "blast_radius",
+        contentPreview: '{"command": "git push"}',
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept" },
+      },
+      {
+        type: "text_done",
+        ctx: ctx({ itemId: "a1", responseId: "resp_1" }),
+        fullText: "Pushed.",
+        hasCodeBlocks: false,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.length).toBe(1);
+    const turn = bubbles[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(turn.items.map((i) => i.kind)).toEqual(["tool", "elicitation", "text"]);
   });
 
   it("two response_ids produce two assistant bubbles in order", () => {

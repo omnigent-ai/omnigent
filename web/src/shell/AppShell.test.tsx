@@ -357,6 +357,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     server_version: null,
     smart_routing_enabled: false,
     smart_routing_sources: { external: false, oss: false },
+    features: {},
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -1407,6 +1408,7 @@ describe("Subagents tab", () => {
       {
         id: "conv_child_a",
         title: "researcher:auth",
+        task_summary: null,
         tool: "researcher",
         session_name: "auth",
         current_task_status: "completed" as const,
@@ -1502,6 +1504,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -1512,6 +1515,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_b",
           title: "frontend_engineer:rail",
+          task_summary: null,
           tool: "frontend_engineer",
           session_name: "rail",
           current_task_status: "in_progress",
@@ -1546,6 +1550,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -1556,6 +1561,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_b",
           title: "researcher:api",
+          task_summary: null,
           tool: "researcher",
           session_name: "api",
           current_task_status: "completed",
@@ -1779,6 +1785,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -1826,6 +1833,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -1836,6 +1844,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_b",
           title: "researcher:api",
+          task_summary: null,
           tool: "researcher",
           session_name: "api",
           current_task_status: "in_progress",
@@ -1901,6 +1910,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -1911,6 +1921,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_b",
           title: "researcher:api",
+          task_summary: null,
           tool: "researcher",
           session_name: "api",
           current_task_status: "completed",
@@ -1947,6 +1958,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "in_progress",
@@ -2865,6 +2877,7 @@ describe("Mobile session menu", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -2971,6 +2984,7 @@ describe("Mobile session menu", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "in_progress",

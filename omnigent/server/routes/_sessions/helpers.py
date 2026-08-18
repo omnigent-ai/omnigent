@@ -8679,6 +8679,7 @@ def _child_session_summary_from_conversation(
         id=conv.id,
         parent_session_id=parent_session_id,
         title=display_title,
+        task_summary=conv.task_summary,
         tool=tool,
         session_name=session_name,
         created_at=conv.created_at,

@@ -85,19 +85,23 @@ cd omnigent
 
 uv python install
 uv venv --python "$(cat .python-version)"
-uv sync --extra all --extra dev
+uv sync --extra all --group dev
 source .venv/bin/activate    # or prefix commands with `uv run`
 ```
+
+Repository-only dependencies use PEP 735 groups: `lint` for static checks and
+code generation, `test` for pytest, and `dev` for both. Product capabilities
+remain installable extras. Plain `uv sync` installs neither group by default.
 
 Common checks:
 
 Pyrefly is the canonical Python type checker for the repository.
 
 ```bash
-uv run pytest                      # Python tests (e2e/live skipped by default)
-uv run ruff check . && uv run ruff format --check .
-uv run --no-sync pyrefly check     # Python type checking (core and client SDK)
-uv run pre-commit run --all-files
+uv run --no-sync pytest                      # Python tests (e2e/live skipped by default)
+uv run --no-sync ruff check . && uv run --no-sync ruff format --check .
+uv run --no-sync pyrefly check               # Python type checking (core and client SDK)
+uv run --no-sync pre-commit run --all-files
 ```
 
 When touching `web/`:
@@ -135,7 +139,7 @@ test. A fresh worktree needs its own Python environment first:
 
 ```bash
 cd /path/to/omnigent-worktree
-uv sync --extra all --extra dev
+uv sync --extra all --group dev
 omnidev
 ```
 

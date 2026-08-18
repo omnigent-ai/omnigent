@@ -21,6 +21,9 @@ variables:
       UC schema (catalog.schema) holding the OTel destination tables.
       The platform writes to <schema>.otel_logs, otel_metrics, otel_spans.
     default: main.omnigent_logs
+  features:
+    description: "Comma-separated deployment-wide release features."
+    default: ""
 
 resources:
   apps:
@@ -44,6 +47,8 @@ resources:
             value_from: artifact_volume
           - name: OTEL_TRACES_SAMPLER
             value: 'always_on'
+          - name: OMNIGENT_FEATURES
+            value: "${var.features}"
       resources:
         - name: postgres
           postgres:

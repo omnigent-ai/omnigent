@@ -26,7 +26,7 @@ Writes a timestamped result set:
       summary.md              human-readable latency write-up (this tool)
 
 Runs from a repo checkout only (imports ``dev.benchmarks`` + ``tests``), with
-the ``[loadtest,dev,agents-sdk]`` extras. Knobs: ``--users`` (N hosts),
+the ``loadtest`` and ``agents-sdk`` extras. Knobs: ``--users`` (N hosts),
 ``--spawn-rate``, ``--run-time``, ``--sessions-per-user``, ``--turns-per-session``,
 ``--reply-words``, ``--out-dir``.
 """
@@ -363,7 +363,7 @@ def main() -> int:
         if importlib.util.find_spec(mod) is None:
             sys.exit(
                 f"{pkg} not importable under {sys.executable} — install the extras: "
-                "pip install -e '.[loadtest,dev,agents-sdk]' (run from a repo checkout)."
+                "uv sync --extra loadtest --extra agents-sdk (run from a repo checkout)."
             )
     out_dir = _resolve_out_dir(args.out_dir)
     return asyncio.run(_boot_and_run(args, out_dir))
