@@ -4609,3 +4609,170 @@ def test_direct_spawn_keeps_the_workspace_off_sys_path(
     _host, popen_argvs = _spawn_with_fake_zygote(monkeypatch, tmp_path, zygote)
 
     assert popen_argvs[0][1:] == ["-P", "-m", "omnigent.runner._entry"]
+
+
+async def test_on_resume_from_suspend_aborts_live_tunnel() -> None:
+    """A detected wake aborts the live tunnel and flags a prompt reconnect.
+
+    ``_on_resume_from_suspend`` runs synchronously on the event loop; with a
+    live ``self._ws`` it must abort the transport — so ``_serve_frames``'
+    blocked ``recv`` raises at once instead of waiting out the ~90s keepalive —
+    and set the woke flag that ``run`` reads to skip the reconnect backoff.
+
+    :returns: None.
+    """
+    host = _make_host_process()
+
+    class _Transport:
+        """asyncio-transport stub that records an ``abort()``."""
+
+        def __init__(self) -> None:
+            self.aborted = False
+
+        def abort(self) -> None:
+            """Record the forced close.
+
+            :returns: None.
+            """
+            self.aborted = True
+
+    transport = _Transport()
+    host._ws = SimpleNamespace(transport=transport)  # type: ignore[assignment]
+
+    host._on_resume_from_suspend(3600.0)
+
+    assert transport.aborted is True
+    assert host._woke_from_suspend is True
+
+
+async def test_on_resume_from_suspend_noop_without_live_tunnel() -> None:
+    """With no live tunnel the resume hook does nothing and sets no flag.
+
+    A wake during a reconnect backoff has no socket to abort; the flag must
+    stay clear so an unrelated later drop is not spuriously reclassified as a
+    prompt reconnect.
+
+    :returns: None.
+    """
+    host = _make_host_process()
+    assert host._ws is None
+
+    host._on_resume_from_suspend(3600.0)
+
+    assert host._woke_from_suspend is False
+
+
+async def test_run_reconnects_promptly_after_suspend(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """After a wake, run() aborts the dead tunnel and reconnects at once.
+
+    Drives the real reconnect loop against a *loopback* server, where an
+    abrupt drop is NOT auto-classified as a benign ingress recycle — so a
+    prompt reconnect here is attributable to the suspend-resume path, not the
+    recycle heuristic. A fake watcher fires a resume once the tunnel is live;
+    the real ``_on_resume_from_suspend`` aborts it, and the loop must reconnect
+    (not hang or exit) and attribute the drop to the resume.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Log capture fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+
+    class _BlockingTunnel:
+        """Accepted tunnel whose ``recv()`` blocks until the transport aborts."""
+
+        def __init__(self) -> None:
+            self._dead = asyncio.Event()
+            self.transport = SimpleNamespace(abort=self._dead.set)
+
+        async def send(self, data: str | bytes) -> None:
+            """Accept the ``host.hello`` frame silently.
+
+            :param data: Encoded frame payload (ignored).
+            :returns: None.
+            """
+            del data
+
+        async def recv(self) -> str:
+            """Block until aborted, then fail like a dropped connection.
+
+            :returns: Never returns a frame.
+            :raises ConnectionClosedError: Once the transport is aborted.
+            """
+            await self._dead.wait()
+            raise ConnectionClosedError(None, None)
+
+    class _BlockingConnect:
+        """Async-CM for a successful upgrade to a blocking tunnel."""
+
+        def __init__(self, tunnel: _BlockingTunnel) -> None:
+            self._tunnel = tunnel
+
+        async def __aenter__(self) -> _BlockingTunnel:
+            """Complete the handshake with the blocking tunnel.
+
+            :returns: The blocking tunnel.
+            """
+            return self._tunnel
+
+        async def __aexit__(self, *exc_info: object) -> bool:
+            """No-op async-CM exit.
+
+            :param exc_info: Standard ``__aexit__`` triple (unused).
+            :returns: ``False`` so the disconnect propagates.
+            """
+            del exc_info
+            return False
+
+    tunnel = _BlockingTunnel()
+    connect_calls = {"n": 0}
+
+    def _connect(url: str, **kwargs: object) -> object:
+        """Serve one live tunnel, then stop the loop.
+
+        :param url: Tunnel URL (ignored).
+        :param kwargs: Connect kwargs (ignored).
+        :returns: A blocking-tunnel CM on the first call; a CM that cancels
+            the loop thereafter.
+        """
+        del url, kwargs
+        connect_calls["n"] += 1
+        if connect_calls["n"] == 1:
+            return _BlockingConnect(tunnel)
+        return _HandshakeFailingConnect(asyncio.CancelledError())
+
+    host = _make_host_process()  # loopback server_url (http://localhost:8000)
+
+    async def _fake_watch(on_resume: object, **_kwargs: object) -> None:
+        """Simulate a wake once the first tunnel is live, then idle.
+
+        :param on_resume: The host's real resume hook.
+        :param _kwargs: Ignored watcher tuning args.
+        :returns: None.
+        """
+        # Wait until _serve_frames has set self._ws so there is a live socket
+        # to abort (otherwise the resume hook would be a no-op).
+        while host._ws is None:
+            await asyncio.sleep(0)
+        on_resume(3600.0)  # type: ignore[operator]
+        await asyncio.Event().wait()
+
+    import websockets.asyncio.client as ws_client
+
+    import omnigent.runner._entry as entry_mod
+
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
+    monkeypatch.setattr(ws_client, "connect", _connect)
+    monkeypatch.setattr("omnigent.host.connect.watch_for_resume", _fake_watch)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await host.run()
+
+    # Two connects: the initial live tunnel + the prompt reconnect after wake.
+    assert connect_calls["n"] == 2
+    # The disconnect was attributed to the resume, and the flag was consumed.
+    assert any("resumed from suspend" in r.message for r in caplog.records)
+    assert host._woke_from_suspend is False

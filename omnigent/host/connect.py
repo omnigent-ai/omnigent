@@ -128,6 +128,7 @@ from omnigent.runner.transports.ws_tunnel.limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from omnigent.suspend_watch import watch_for_resume
 from omnigent.tls import client_ssl_context
 from omnigent.version import VERSION
 
@@ -898,6 +899,15 @@ class HostProcess:
         # Strong refs to in-flight frame tasks (create_task results are
         # otherwise GC-able); each discards itself on completion.
         self._frame_tasks: set[asyncio.Task[None]] = set()
+        # Background watcher that force-drops a stale tunnel on wake from system
+        # suspend (laptop sleep) so the reconnect loop reattaches at once
+        # instead of waiting out the ~90s keepalive timeout. See run() /
+        # _on_resume_from_suspend.
+        self._suspend_task: asyncio.Task[None] | None = None
+        # Set by _on_resume_from_suspend when it aborts a live tunnel after a
+        # detected resume; read+cleared in run()'s reconnect handler to force a
+        # prompt reconnect (skip the backoff).
+        self._woke_from_suspend = False
 
     def _tracked_runner_pids(self) -> set[int]:
         """PIDs of runners this host spawned and still tracks directly.
@@ -2634,6 +2644,12 @@ class HostProcess:
         self._reaper_task = asyncio.create_task(
             self._orphan_reaper_loop(), name="host-orphan-reaper"
         )
+        # Detect wake from system suspend (laptop sleep) and force-drop the
+        # then-dead tunnel so the reconnect loop reattaches within seconds
+        # instead of waiting out the ~90s keepalive ping timeout.
+        self._suspend_task = asyncio.create_task(
+            watch_for_resume(self._on_resume_from_suspend), name="host-suspend-watch"
+        )
         # Warm the runner zygote now: start() blocks on its one-time import
         # of the runner graph (~1-2s), which otherwise lands inside the first
         # session launch of the daemon's life. Best-effort — a failure
@@ -2749,16 +2765,29 @@ class HostProcess:
                     # A silent-connect streak overrides the recycle fast path:
                     # prompt reconnects are for endpoints that answer.
                     silent_churn = self._silent_connect_streak >= _SILENT_CONNECT_ESCALATE_ATTEMPTS
-                    recycle = (
-                        explicit_recycle
-                        or (ingress_recycle and not _url_is_loopback(self._server_url))
-                    ) and not silent_churn
+                    # A resume from system suspend (laptop wake) always reconnects
+                    # promptly: _on_resume_from_suspend already aborted the dead
+                    # tunnel, but the abrupt "no close frame" that abort produces
+                    # counts as a benign recycle only on a REMOTE server — a local
+                    # server would otherwise ride the escalating backoff. OR woke in
+                    # outside the silent-churn gate so wake never takes the slow path.
+                    woke = self._woke_from_suspend
+                    self._woke_from_suspend = False
+                    recycle = woke or (
+                        (
+                            explicit_recycle
+                            or (ingress_recycle and not _url_is_loopback(self._server_url))
+                        )
+                        and not silent_churn
+                    )
                     wait_s = _RECONNECT_BASE_S if recycle else backoff
                     _logger.warning(
                         "Host tunnel disconnected: %s. Reconnecting in %.1fs%s",
                         exc,
                         wait_s,
-                        " (recycle — prompt reconnect)" if recycle else "",
+                        " (resumed from suspend — prompt reconnect)"
+                        if woke
+                        else (" (recycle — prompt reconnect)" if recycle else ""),
                     )
                     await asyncio.sleep(wait_s)
                     import random
@@ -2780,6 +2809,11 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._reaper_task
                 self._reaper_task = None
+            if self._suspend_task is not None:
+                self._suspend_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._suspend_task
+                self._suspend_task = None
             if self._zygote_prestart_task is not None:
                 self._zygote_prestart_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -2801,6 +2835,43 @@ class HostProcess:
                 with contextlib.suppress(Exception):
                     self._zygote.stop()
                 self._zygote = None
+
+    def _on_resume_from_suspend(self, gap_s: float) -> None:
+        """Force-drop the tunnel after a detected wake from system suspend.
+
+        On laptop sleep the WebSocket becomes a half-open socket the server
+        already dropped; without this the reconnect loop waits out the ~90s
+        keepalive ping timeout (:data:`TUNNEL_KEEPALIVE_PING_TIMEOUT_S`),
+        leaving the host — and every session it owns — offline that whole
+        time. Aborting the transport makes :meth:`_serve_frames`' ``recv``
+        raise ``ConnectionClosed`` now, and the flag makes :meth:`run` skip the
+        backoff so the reconnect is prompt.
+
+        No-op when no connection is live (e.g. the wake landed during a
+        reconnect backoff): there is nothing to abort, and the pending backoff
+        sleep's deadline is already past so it reconnects immediately anyway.
+        The flag is only set when a live tunnel was actually aborted, so a
+        wake-during-backoff never triggers a spurious prompt reconnect.
+
+        Runs synchronously on the event loop (invoked by the suspend watcher),
+        so reading ``self._ws`` and aborting is atomic w.r.t. ``_serve_frames``
+        — no lock needed.
+
+        :param gap_s: Approximate seconds the machine was asleep (for logging).
+        :returns: None.
+        """
+        ws = self._ws
+        if ws is None:
+            return
+        self._woke_from_suspend = True
+        _logger.info(
+            "Resumed from suspend (~%.0fs); dropping stale host tunnel to reconnect",
+            gap_s,
+        )
+        transport = getattr(ws, "transport", None)
+        if transport is not None:
+            with contextlib.suppress(Exception):
+                transport.abort()
 
     def _cleanup_runners(self) -> None:
         """Terminate all live runners on shutdown.
