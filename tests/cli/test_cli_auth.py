@@ -689,9 +689,8 @@ def test_refresh_survives_unwritable_state_dir(token_dir, monkeypatch) -> None:
     """A lock/persist failure degrades to None instead of raising, so the
     caller can still fall back to its other credential sources."""
     import omnigent.cli_auth as ca
-    from omnigent.cli_auth import refresh_stored_token, store_token
 
-    store_token(
+    ca.store_token(
         "http://localhost:6767",
         token="stale",
         user_id="a@x",
@@ -705,7 +704,7 @@ def test_refresh_survives_unwritable_state_dir(token_dir, monkeypatch) -> None:
         yield  # pragma: no cover
 
     monkeypatch.setattr(ca, "_token_file_lock", _unwritable)
-    assert refresh_stored_token("http://localhost:6767") is None
+    assert ca.refresh_stored_token("http://localhost:6767") is None
 
 
 def test_load_token_min_remaining_declines_near_expiry(token_dir) -> None:
