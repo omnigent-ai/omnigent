@@ -799,7 +799,7 @@ def test_repl_recover_after_runner_death(
     tmp_path: Path,
 ) -> None:
     """
-    ``--server`` auto-relaunches a killed daemon-owned runner.
+    ``--server`` restarts a killed daemon-owned runner in place.
 
     Uses the mock LLM server for deterministic marker responses.
 
@@ -844,9 +844,8 @@ def test_repl_recover_after_runner_death(
                 recovered_runner_id = _wait_session_runner_online(
                     server.base_url,
                     first_result.session_id,
-                    previous_runner_id=first_result.runner_id,
                 )
-                assert recovered_runner_id != first_result.runner_id
+                assert recovered_runner_id == first_result.runner_id
                 clean_exit(child, timeout=_EXIT_TIMEOUT)
             finally:
                 child.close(force=True)

@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -189,6 +190,12 @@ _LOG_TAIL_MAX_LINES = 15
 # client's online-poll cadence (daemon_launch.DAEMON_POLL_INTERVAL_S),
 # so a crashed runner is reported within about one client poll.
 _RUNNER_WATCH_INTERVAL_S = 0.5
+
+# Restart unexpected runner exits in place while the host daemon is healthy.
+# The rolling window prevents a deterministic failure from crash-looping.
+_RUNNER_RESTART_MAX_ATTEMPTS = 3
+_RUNNER_RESTART_WINDOW_S = 60.0
+_RUNNER_RESTART_BASE_DELAY_S = 0.5
 
 # Cadence of the orphan-reaper sweep. The host installs itself as a child
 # subreaper (Linux — see :func:`_install_child_subreaper`), so a harness's
@@ -774,6 +781,15 @@ def _paginate_list_dir(
     )
 
 
+@dataclass(frozen=True)
+class _RunnerLaunchSpec:
+    """Inputs the host needs to restart a runner in place."""
+
+    env: dict[str, str]
+    session_slug: str
+    workspace: Path
+
+
 @dataclass
 class _RunnerHandle:
     """A spawned runner subprocess and where its output lands.
@@ -783,10 +799,15 @@ class _RunnerHandle:
         ``Path("~/.omnigent/logs/runner/runner-ab12.log")``.
         Read back for diagnostics when the runner dies before
         connecting its tunnel.
+    :param launch_spec: Inputs for an automatic restart. ``None`` when
+        this handle is not recoverable.
+    :param restarting: Whether the watcher is replacing an exited process.
     """
 
     proc: subprocess.Popen[bytes] | ZygoteRunnerProc
     log_path: Path
+    launch_spec: _RunnerLaunchSpec | None = None
+    restarting: bool = False
 
 
 class HostRetryableConnectionError(Exception):
@@ -1115,13 +1136,18 @@ class HostProcess:
         return None
 
     def _alive_runner_ids(self) -> list[str]:
-        """Return IDs of runners that are still alive.
+        """Return IDs of runners that are alive or being recovered.
 
-        Cleans up dead entries as a side effect.
+        A launchable dead handle is retained for its watcher to restart. Other
+        dead entries are cleaned up as before.
 
-        :returns: List of alive runner ID strings.
+        :returns: List of active runner ID strings.
         """
-        dead = [rid for rid, handle in self._runners.items() if handle.proc.poll() is not None]
+        dead = [
+            rid
+            for rid, handle in self._runners.items()
+            if handle.proc.poll() is not None and handle.launch_spec is None
+        ]
         for rid in dead:
             self._runners.pop(rid)
         return list(self._runners.keys())
@@ -1369,6 +1395,11 @@ class HostProcess:
         _session_slug = (
             re.sub(r"[^\w-]", "", frame.session_id)[:32] + "-" if frame.session_id else ""
         )
+        launch_spec = _RunnerLaunchSpec(
+            env=dict(env),
+            session_slug=_session_slug,
+            workspace=workspace,
+        )
 
         # Spawning blocks (log-file open, plus the zygote's one-time import on
         # first launch), so run it off the event loop. Shielded so a
@@ -1402,7 +1433,11 @@ class HostProcess:
                 error=_runner_exit_error(proc.returncode, log_path),
             )
 
-        self._runners[runner_id] = _RunnerHandle(proc=proc, log_path=log_path)
+        self._runners[runner_id] = _RunnerHandle(
+            proc=proc,
+            log_path=log_path,
+            launch_spec=launch_spec,
+        )
         watcher = asyncio.create_task(self._watch_runner(runner_id))
         self._watcher_tasks.add(watcher)
         watcher.add_done_callback(self._watcher_tasks.discard)
@@ -1556,13 +1591,14 @@ class HostProcess:
             log_fh.close()
 
     def _discard_abandoned_spawn(self, spawn: asyncio.Future[Any]) -> None:
-        """Tear down a runner whose launch was cancelled before registration.
+        """Tear down a runner whose spawn was cancelled before registration.
 
-        ``_handle_launch`` shields the spawn, so a cancellation still lets the
-        fork land — but nothing registered it in ``self._runners``, so it would
-        never be watched, stopped, or reaped (and the zygote would hold its exit
-        status forever). Kill it off the loop, since for a zygote-forked runner
-        the terminate/wait round-trips are blocking control-socket exchanges.
+        Initial launches and supervised restarts shield the spawn, so a
+        cancellation still lets the fork land — but nothing registered it in
+        ``self._runners``, so it would never be watched, stopped, or reaped (and
+        the zygote would hold its exit status forever). Kill it off the loop,
+        since for a zygote-forked runner the terminate/wait round-trips are
+        blocking control-socket exchanges.
 
         :param spawn: The completed spawn future.
         """
@@ -1648,8 +1684,10 @@ class HostProcess:
         the runner's :class:`subprocess.Popen`. A runner tracked with a
         still-running process is ``alive`` (covers a runner that is still
         booting — it is inserted at ``Popen`` time, before its tunnel
-        connects — so the server waits for it). A tracked-but-exited
-        process is ``dead``. A runner this host has no record of is
+        connects — so the server waits for it). A tracked-but-exited process
+        scheduled for recovery also reads ``alive`` so the server does not
+        launch a competing replacement; other exited processes are ``dead``.
+        A runner this host has no record of is
         ``unknown`` — it was stopped (``_handle_stop`` popped it) or a
         fresh post-restart host never spawned it; either way it will never
         connect, so the server relaunches without waiting.
@@ -1660,30 +1698,30 @@ class HostProcess:
         handle = self._runners.get(frame.runner_id)
         if handle is None:
             status = "unknown"
+        elif handle.restarting:
+            # Keep the server's connect grace while the replacement starts.
+            status = "alive"
         else:
             # poll() is a lock-free waitpid for a direct-Popen runner, but a
             # blocking control-socket round-trip (bounded only by the 30s
             # control timeout, and contended against a booting zygote) for a
             # zygote-forked one — so run it off the loop, matching
             # _watch_runner / _handle_stop, lest a slow zygote stall the daemon.
-            status = "alive" if await asyncio.to_thread(handle.proc.poll) is None else "dead"
+            returncode = await asyncio.to_thread(handle.proc.poll)
+            status = "alive" if returncode is None or handle.launch_spec is not None else "dead"
         return HostRunnerStatusResultFrame(
             request_id=frame.request_id,
             status=status,
         )
 
     async def _watch_runner(self, runner_id: str) -> None:
-        """Watch a spawned runner and report an unexpected exit.
+        """Watch a spawned runner, recovering bounded unexpected exits.
 
-        Polls the runner subprocess until it exits. An exit while the
-        runner is still tracked in ``self._runners`` is unexpected (a
-        ``host.stop_runner`` pops the entry *before* terminating), so
-        the watcher composes the exit error — code plus log tail — and
-        reports it to the server via ``host.runner_exited``. Without
-        this, a runner that crashes before connecting its tunnel
-        (auth rejection, bad env, import error) leaves the client
-        polling to a timeout with the cause stranded in a log file on
-        this host.
+        An exit while the runner remains tracked is unexpected because
+        ``host.stop_runner`` removes the handle before terminating it. The
+        watcher restarts unexpected non-zero exits with the original launch
+        inputs. Clean exits remain wake-on-message; repeated crashes exhaust
+        the retry budget and retain the existing ``host.runner_exited`` error.
 
         :param runner_id: The runner to watch, e.g.
             ``"runner_abc123..."``.
@@ -1693,28 +1731,92 @@ class HostProcess:
         handle = self._runners.get(runner_id)
         if handle is None:  # pragma: no cover — spawned just before us
             return
-        # poll() is a lock-free waitpid for a direct-Popen runner, but a
-        # blocking control-socket round-trip (with lock contention against a
-        # booting zygote) for a zygote-forked one — so run it off the event
-        # loop to avoid freezing the daemon on the enabled path.
-        while await asyncio.to_thread(handle.proc.poll) is None:
-            await asyncio.sleep(_RUNNER_WATCH_INTERVAL_S)
-        if self._runners.get(runner_id) is not handle:
-            # _handle_stop (or _cleanup_runners) removed it first —
-            # an intentional termination, not a crash to report.
-            return
-        if handle.proc.returncode == 0:
-            # A clean exit (code 0) is a graceful shutdown, not a crash — the
-            # idle reaper shutting an inactive runner down, or any orderly
-            # self-exit. Reporting it as host.runner_exited would attach a
-            # scary "runner process exited" error to a session the user only
-            # has to message to reactivate, so stay silent. A non-zero exit
-            # below is a genuine crash and still reports its cause.
-            _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
-            return
-        error = _runner_exit_error(handle.proc.returncode, handle.log_path)
-        _logger.warning("Runner %s died unexpectedly: %s", runner_id, error)
-        await self._report_runner_exit(runner_id, error)
+        await self._supervise_runner(runner_id, handle)
+
+    async def _supervise_runner(self, runner_id: str, handle: _RunnerHandle) -> None:
+        """Restart consecutive runner crashes within a bounded rolling window."""
+        crash_times: list[float] = []
+        while True:
+            while await asyncio.to_thread(handle.proc.poll) is None:
+                await asyncio.sleep(_RUNNER_WATCH_INTERVAL_S)
+            if self._runners.get(runner_id) is not handle:
+                return
+            if handle.proc.returncode == 0:
+                # Idle reaping and other orderly exits stay wake-on-message.
+                handle.launch_spec = None
+                _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
+                return
+
+            error = _runner_exit_error(handle.proc.returncode, handle.log_path)
+            launch_spec = handle.launch_spec
+            now = time.monotonic()
+            crash_times = [
+                crashed_at
+                for crashed_at in crash_times
+                if now - crashed_at < _RUNNER_RESTART_WINDOW_S
+            ]
+            crash_times.append(now)
+            if launch_spec is None or len(crash_times) > _RUNNER_RESTART_MAX_ATTEMPTS:
+                if launch_spec is not None:
+                    error += (
+                        "\nAutomatic restart stopped after "
+                        f"{_RUNNER_RESTART_MAX_ATTEMPTS} attempts within "
+                        f"{_RUNNER_RESTART_WINDOW_S:g}s."
+                    )
+                self._runners.pop(runner_id, None)
+                _logger.warning("Runner %s died unexpectedly: %s", runner_id, error)
+                await self._report_runner_exit(runner_id, error)
+                return
+
+            attempt = len(crash_times)
+            delay_s = _RUNNER_RESTART_BASE_DELAY_S * (2 ** (attempt - 1))
+            handle.restarting = True
+            _logger.warning(
+                "Runner %s died unexpectedly; restarting in %.1fs (attempt %d/%d): %s",
+                runner_id,
+                delay_s,
+                attempt,
+                _RUNNER_RESTART_MAX_ATTEMPTS,
+                error,
+            )
+            await asyncio.sleep(delay_s)
+            if self._runners.get(runner_id) is not handle:
+                return
+            spawn = asyncio.ensure_future(
+                asyncio.to_thread(
+                    self._spawn_runner_proc,
+                    dict(launch_spec.env),
+                    launch_spec.session_slug,
+                    launch_spec.workspace,
+                )
+            )
+            try:
+                proc, log_path = await asyncio.shield(spawn)
+            except asyncio.CancelledError:
+                spawn.add_done_callback(self._discard_abandoned_spawn)
+                raise
+            except OSError as exc:
+                self._runners.pop(runner_id, None)
+                error += f"\nAutomatic restart failed: {exc}"
+                _logger.warning("Runner %s restart failed: %s", runner_id, exc)
+                await self._report_runner_exit(runner_id, error)
+                return
+            if self._runners.get(runner_id) is not handle:
+                # A stop raced the blocking spawn. Do not orphan its result.
+                await asyncio.to_thread(self._stop_runner_proc, proc)
+                return
+            handle = _RunnerHandle(
+                proc=proc,
+                log_path=log_path,
+                launch_spec=launch_spec,
+            )
+            self._runners[runner_id] = handle
+            _logger.info("Restarted runner %s (pid=%d)", runner_id, proc.pid)
+            print(
+                f"  ↻ Runner restarted: {runner_id} (pid={proc.pid})\n"
+                f"    log: {display_log_path(log_path)}",
+                flush=True,
+            )
 
     async def _report_runner_exit(self, runner_id: str, error: str) -> None:
         """Send a ``host.runner_exited`` report, queueing on failure.

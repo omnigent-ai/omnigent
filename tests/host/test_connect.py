@@ -1281,6 +1281,7 @@ async def test_watch_runner_reports_unexpected_exit(
     """
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_RESTART_MAX_ATTEMPTS", 0)
     host = _make_host_process()
     tunnel = _FakeTunnel()
     host._ws = tunnel  # type: ignore[assignment] — duck-typed send
@@ -1329,6 +1330,166 @@ async def test_watch_runner_reports_unexpected_exit(
     # The report carries the exit code and the log tail with the cause.
     assert "code 3" in report.error
     assert "tunnel rejected: crash-cause" in report.error
+
+
+async def test_watch_runner_restarts_unexpected_exit_in_place(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient runner crash is restarted without rebinding the session."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_RESTART_BASE_DELAY_S", 0.0)
+    host = _make_host_process()
+    host._zygote = None
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment] — duck-typed send
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+    spawned: list[subprocess.Popen[bytes]] = []
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        command = "sleep 0.2; exit 3" if not spawned else "sleep 60"
+        proc = original_popen(
+            ["sh", "-c", command],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+        spawned.append(proc)
+        return proc
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_restart",
+        binding_token="tok_restart",
+        workspace=str(workspace),
+    )
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+        runner_id = token_bound_runner_id("tok_restart")
+
+        deadline = time.monotonic() + 5.0
+        while len(spawned) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert len(spawned) == 2, "runner was not restarted after its transient crash"
+        assert host._runners[runner_id].proc is spawned[1]
+        assert spawned[1].poll() is None
+        assert tunnel.sent == []
+
+        stop = await host._handle_stop(
+            HostStopRunnerFrame(request_id="req_restart_stop", runner_id=runner_id)
+        )
+        assert stop.status == "stopped"
+
+    await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+    assert tunnel.sent == []
+
+
+async def test_watch_runner_cancelled_midrestart_does_not_leak_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling a blocked restart tears down the unregistered process."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_RESTART_BASE_DELAY_S", 0.0)
+    host = _make_host_process()
+    host._zygote = None
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+    spawned: list[subprocess.Popen[bytes]] = []
+    restart_spawned = threading.Event()
+    release_restart = threading.Event()
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        command = ["sh", "-c", "sleep 0.1; exit 3"] if not spawned else ["sleep", "60"]
+        proc = original_popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+        spawned.append(proc)
+        if len(spawned) == 2:
+            restart_spawned.set()
+            release_restart.wait(10.0)
+        return proc
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_cancel_restart",
+        binding_token="tok_cancel_restart",
+        workspace=str(workspace),
+    )
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+        watcher = next(iter(host._watcher_tasks))
+        assert await asyncio.to_thread(restart_spawned.wait, 5.0)
+        watcher.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await watcher
+        finally:
+            release_restart.set()
+
+    assert len(spawned) == 2
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and spawned[1].poll() is None:
+        await asyncio.sleep(0.05)
+    assert spawned[1].poll() is not None, "cancelled restart leaked an untracked runner"
+    host._cleanup_runners()
+
+
+async def test_watch_runner_reports_after_restart_budget_is_exhausted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deterministic runner crash stops retrying and keeps its diagnostics."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_RESTART_BASE_DELAY_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_RESTART_MAX_ATTEMPTS", 2)
+    host = _make_host_process()
+    host._zygote = None
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment] — duck-typed send
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+    spawned: list[subprocess.Popen[bytes]] = []
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        proc = original_popen(
+            ["sh", "-c", "sleep 0.1; exit 7"],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+        spawned.append(proc)
+        return proc
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_crash_loop",
+        binding_token="tok_crash_loop",
+        workspace=str(workspace),
+    )
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+        await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+
+    assert len(spawned) == 3
+    assert len(tunnel.sent) == 1
+    report = decode_host_frame(tunnel.sent[0])
+    assert isinstance(report, HostRunnerExitedFrame)
+    assert "code 7" in report.error
+    assert "Automatic restart stopped after 2 attempts within 60s" in report.error
 
 
 async def test_watch_runner_silent_on_intentional_stop(
