@@ -53,6 +53,7 @@ def test_omnigent_error_with_harness_violation_code_returns_500() -> None:
         (ErrorCode.CONFLICT, 409),
         (ErrorCode.INTERNAL_ERROR, 500),
         (ErrorCode.HARNESS_PROTOCOL_VIOLATION, 500),
+        (ErrorCode.SUB_AGENT_UNRESOLVED, 404),
     ],
 )
 def test_all_error_codes_have_http_status_mapping(code: str, expected_status: int) -> None:
