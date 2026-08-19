@@ -88,6 +88,51 @@ async def test_session_new_server_mode_adopts_returned_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_new_records_standard_model_config_option() -> None:
+    """ACP config-option categories identify the live model; option ids are agent-defined."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        return {
+            "result": {
+                "sessionId": "srv-42",
+                "configOptions": [
+                    {
+                        "id": "active-model",
+                        "category": "model",
+                        "currentValue": "grok-4.6",
+                    }
+                ],
+            }
+        }
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_session()
+
+    assert ex._active_model == "grok-4.6"
+    assert ex._model_config_option_id == "active-model"
+
+
+@pytest.mark.asyncio
+async def test_session_new_records_legacy_model_state() -> None:
+    """Grok 1.0.4's preview ``models`` state still reports its real launch model."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        return {
+            "result": {
+                "sessionId": "srv-42",
+                "models": {"currentModelId": "grok-4.6", "availableModels": []},
+            }
+        }
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_session()
+
+    assert ex._active_model == "grok-4.6"
+
+
+@pytest.mark.asyncio
 async def test_session_new_sends_empty_mcp_servers_when_omnigent_mcp_disabled() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=False))
     captured: dict = {}
@@ -602,7 +647,13 @@ for line in sys.stdin:
             "agentCapabilities": {"promptCapabilities": {"image": False}},
         }})
     elif method == "session/new":
-        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "fake-session-1"}})
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "sessionId": "fake-session-1",
+            "models": {"currentModelId": "grok-4.5", "availableModels": []},
+        }})
+        update("fake-session-1", {"sessionUpdate": "config_option_update", "configOptions": [
+            {"id": "active-model", "category": "model", "currentValue": "grok-4.6"},
+        ]})
     elif method == "session/prompt":
         sid = msg["params"]["sessionId"]
         chunk(sid, "agent_thought_chunk", "planning")
@@ -663,7 +714,12 @@ async def test_end_to_end_against_fake_acp_agent(tmp_path: Path) -> None:
 
     completions = [e for e in events if isinstance(e, TurnComplete)]
     assert len(completions) == 1
-    assert completions[0].usage == {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+    assert completions[0].usage == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "model": "grok-4.6",
+    }
 
     tool_reqs = [e for e in events if isinstance(e, ToolCallRequest)]
     assert tool_reqs[0].name == "shell" and tool_reqs[0].args == {"command": "echo hi"}

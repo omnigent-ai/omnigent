@@ -57,6 +57,7 @@ from omnigent.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
 )
+from omnigent.onboarding.provider_config import harness_owns_its_credential
 from omnigent.policies.types import (
     ElicitationRequest,
     EvaluationContext,
@@ -250,6 +251,7 @@ from omnigent.server.routes._sessions.helpers import (
     _parse_external_conversation_item,
     _pending_elicitation_snapshot_for_session,
     _permission_level_from_grants,
+    _persist_external_model_change,
     _persist_native_policy_notice,
     _persist_session_status_error_labels,
     _persist_stored_session_bundle,
@@ -5674,7 +5676,7 @@ async def _relay_runner_stream(
                     None,
                     conversation_store,
                 )
-            else:
+            elif _session_status_cache.get(session_id) != "idle":
                 # Publish a failed status so the client's SSE stream sees a
                 # clean error event instead of silent truncation (#1114).
                 disconnect_error = ErrorDetail(
@@ -6068,6 +6070,29 @@ async def _relay_runner_stream_once(
                     # response so policy callables can read
                     # event["context"]["usage"]["total_cost_usd"].
                     if evt_type == "response.completed":
+                        response = event.get("response")
+                        usage = response.get("usage") if isinstance(response, dict) else None
+                        reported_model = usage.get("model") if isinstance(usage, dict) else None
+                        if isinstance(reported_model, str) and reported_model:
+                            conv = await asyncio.to_thread(
+                                conversation_store.get_conversation,
+                                session_id,
+                            )
+                            harness = _resolve_harness(conv)
+                            if (
+                                conv is not None
+                                and harness is not None
+                                and harness_owns_its_credential(harness)
+                            ):
+                                await _persist_external_model_change(
+                                    session_id,
+                                    conv,
+                                    SessionEventInput(
+                                        type="external_model_change",
+                                        data={"model": reported_model},
+                                    ),
+                                    conversation_store,
+                                )
                         # Persist the turn's usage (cost + token buckets) so
                         # policy callables can read
                         # event["context"]["usage"]["total_cost_usd"] and the
@@ -9087,6 +9112,7 @@ async def _get_session_snapshot(
     llm_model: str | None = None
     context_window: int | None = None
     agent_name: str | None = None
+    harness_owns_model = False
     if agent_store is not None and agent_cache is not None and conv.agent_id is not None:
         try:
             agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
@@ -9108,6 +9134,8 @@ async def _get_session_snapshot(
                         child_spec = _find_spec_by_name(spec, conv.sub_agent_name)
                         if child_spec is not None:
                             spec = child_spec
+                    effective_harness = conv.harness_override or _spec_harness(spec)
+                    harness_owns_model = harness_owns_its_credential(effective_harness)
                     # Prefer the spec's name over the agent row's: a
                     # switch-created session-scoped clone is named
                     # "<builtin> (switch ag_…)" for row disambiguation,
@@ -9115,7 +9143,7 @@ async def _get_session_snapshot(
                     # carries the clean identity (e.g. "claude-native-ui").
                     if spec.name:
                         agent_name = spec.name
-                    llm_model = spec.executor.model
+                    llm_model = None if harness_owns_model else spec.executor.model
 
                     # Size the context ring against whatever the next turn will
                     # actually run, using the SAME resolver the runner uses to
@@ -9136,7 +9164,7 @@ async def _get_session_snapshot(
                     # event loop and serialize every concurrent snapshot.
                     context_window = await asyncio.to_thread(
                         resolve_effective_context_window,
-                        spec.executor.context_window,
+                        None if harness_owns_model else spec.executor.context_window,
                         llm_model,
                         model_override=conv.model_override,
                     )

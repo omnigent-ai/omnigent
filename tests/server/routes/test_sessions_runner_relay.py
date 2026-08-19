@@ -249,6 +249,59 @@ class _ScriptedRunnerClient:
 
 
 @pytest.mark.asyncio
+async def test_relay_persists_acp_reported_model(db_uri: str) -> None:
+    """A vendor-owned ACP model becomes the session's durable active model."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation()
+    store.update_conversation(conv.id, harness_override="grok")
+    release = asyncio.Event()
+    fake_runner = _ScriptedRunnerClient(
+        release,
+        [
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_grok_model",
+                    "model": "polly",
+                    "usage": {"model": "grok-4.6"},
+                },
+            }
+        ],
+    )
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            conv.id,
+            "runner_grok_model",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(conv.id)
+        release.set()
+
+        model_event = await collector.next_event()
+        assert model_event["type"] == "session.model"
+        assert model_event["conversation_id"] == conv.id
+        assert model_event["model"] == "grok-4.6"
+        assert store.get_conversation(conv.id).model_override == "grok-4.6"
+    finally:
+        release.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(conv.id)
+        if handle is not None:
+            await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
 async def test_relay_text_flush_publishes_persisted_item(db_uri: str) -> None:
     """
     The relay's text flush publishes the persisted message to live clients.
@@ -772,6 +825,36 @@ class _ScriptedThenDropRunnerClient:
     ) -> _ScriptedThenDropStreamResponse:
         del method, path, timeout
         return _ScriptedThenDropStreamResponse(self._frames, self._gate)
+
+
+@pytest.mark.asyncio
+async def test_relay_keeps_completed_session_idle_when_tunnel_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later tunnel close must not retroactively fail a completed turn."""
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.0)
+
+    async def drop(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise orchestration._RelayTransportLost(intentional=False)
+
+    monkeypatch.setattr(orchestration, "_relay_runner_stream_once", drop)
+    session_id = "6d8fd21e91f746929cdf56ed9a9f5032"
+    orchestration._session_status_cache[session_id] = "idle"
+    store = _RecordingLabelStore()
+
+    try:
+        await orchestration._relay_runner_stream(
+            session_id,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            store,  # type: ignore[arg-type]
+        )
+        assert orchestration._session_status_cache.get(session_id) == "idle"
+        assert store.labels.get(session_id) is None
+    finally:
+        orchestration._session_status_cache.pop(session_id, None)
 
 
 @pytest.mark.asyncio
