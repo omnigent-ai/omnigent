@@ -13,10 +13,11 @@
 // single header row (identity + close X). There is no tab strip —
 // shells are enumerated and created in the rail's Shells tab.
 
-import { TerminalIcon, XIcon } from "lucide-react";
+import { LoaderCircleIcon, PauseCircleIcon, TerminalIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { TerminalView } from "@/components/blocks/TerminalView";
 import { AGENT_TERMINAL_IDS, terminalTabKey, useTerminals } from "@/hooks/useTerminals";
+import { resumeSession } from "@/lib/sessionsApi";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -49,6 +50,10 @@ interface MainTerminalViewProps {
    * instead. Default false (owner / single-user).
    */
   readOnly?: boolean;
+  /** True when the runner or resumable host is asleep and can be woken here. */
+  resumeRequired?: boolean;
+  /** Whether the current viewer has edit access to invoke the resume action. */
+  canResume?: boolean;
   /**
    * Exposes the outer terminal surface so the iOS native shell can show its
    * server switcher only while this surface is actually frontmost.
@@ -61,10 +66,14 @@ export function MainTerminalView({
   initialTerminalKey,
   visible = true,
   readOnly = false,
+  resumeRequired = false,
+  canResume = true,
   onSurfaceElement,
 }: MainTerminalViewProps) {
   const { terminals } = useTerminals(conversationId);
   const terminalFirstCtx = useTerminalFirst();
+  const [resumeState, setResumeState] = useState<"idle" | "resuming" | "error">("idle");
+  const [resumeError, setResumeError] = useState<string | null>(null);
   // The agent's own terminal (SDK REPL / native vendor pane) — the
   // auto-selection target and the pane the pill's Terminal view shows.
   const agentTerminals = useMemo(
@@ -91,6 +100,11 @@ export function MainTerminalView({
   useEffect(() => {
     if (initialTerminalKey) setActiveKey(initialTerminalKey);
   }, [initialTerminalKey]);
+
+  useEffect(() => {
+    setResumeState("idle");
+    setResumeError(null);
+  }, [conversationId, resumeRequired]);
 
   // Auto-select on mount / when the active terminal disappears. The
   // fallback prefers the agent's own terminal so a closed shell drops
@@ -132,6 +146,19 @@ export function MainTerminalView({
     [onSurfaceElement],
   );
 
+  const handleResume = useCallback(async () => {
+    if (!canResume || resumeState === "resuming") return;
+    setResumeState("resuming");
+    setResumeError(null);
+    try {
+      await resumeSession(conversationId);
+      // Keep the connecting state until liveness flips and this prompt unmounts.
+    } catch (error) {
+      setResumeState("error");
+      setResumeError(error instanceof Error ? error.message : "Unable to resume this session.");
+    }
+  }, [canResume, conversationId, resumeState]);
+
   return (
     // Outer wrapper fills the main column. `pt-14` clears the 56px
     // absolute-positioned AppShell header on desktop. The workspace rail now
@@ -154,7 +181,38 @@ export function MainTerminalView({
       className="main-terminal-view flex min-h-0 flex-1 flex-col px-3 pt-14 pb-1.5"
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-sm">
-        {terminals.length === 0 ? (
+        {resumeRequired ? (
+          <div
+            data-testid="terminal-resume-prompt"
+            className="flex flex-1 flex-col items-center justify-center gap-3 text-center"
+          >
+            <PauseCircleIcon className="size-6 text-muted-foreground" />
+            <div>
+              <p className="font-medium text-foreground">Session paused</p>
+              <p className="mt-1 text-muted-foreground text-sm">
+                {canResume
+                  ? "Resume the session to reconnect and view its terminal."
+                  : "An editor must resume the session before its terminal is available."}
+              </p>
+            </div>
+            {canResume && (
+              <button
+                type="button"
+                onClick={() => void handleResume()}
+                disabled={resumeState === "resuming"}
+                className="inline-flex cursor-pointer items-center gap-2 rounded-md bg-primary px-3 py-2 font-medium text-primary-foreground text-sm hover:bg-primary/90 disabled:cursor-default disabled:opacity-60"
+              >
+                {resumeState === "resuming" && <LoaderCircleIcon className="size-4 animate-spin" />}
+                {resumeState === "resuming" ? "Resuming session…" : "Resume session"}
+              </button>
+            )}
+            {resumeError && (
+              <p role="alert" className="max-w-md text-destructive text-sm">
+                {resumeError}
+              </p>
+            )}
+          </div>
+        ) : terminals.length === 0 ? (
           <div className="flex flex-1 items-center justify-center text-muted-foreground text-ui">
             No terminals available.
           </div>

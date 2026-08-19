@@ -1,9 +1,10 @@
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type TerminalInfo, useTerminals } from "@/hooks/useTerminals";
+import { resumeSession } from "@/lib/sessionsApi";
 import { MainTerminalView } from "./MainTerminalView";
 import type { TerminalFirstContextValue } from "./TerminalFirstContext";
 import { TerminalFirstContextProvider } from "./TerminalFirstContext";
@@ -47,6 +48,10 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useTerminals: vi.fn(),
 }));
 
+vi.mock("@/lib/sessionsApi", () => ({
+  resumeSession: vi.fn(),
+}));
+
 // Marker stand-in: MainTerminalView must NOT render the new-shell
 // affordance in any state (creation lives in the rail's Shells tab) —
 // the mock makes a regression visible if the import ever returns.
@@ -55,6 +60,7 @@ vi.mock("./NewTerminalButton", () => ({
 }));
 
 const useTerminalsMock = vi.mocked(useTerminals);
+const resumeSessionMock = vi.mocked(resumeSession);
 
 const REPL_TERMINAL: TerminalInfo = {
   id: "terminal_tui_main",
@@ -99,6 +105,8 @@ function renderView({
   initialTerminalKey = null,
   readOnly = false,
   conversationId = "conv_sdk",
+  resumeRequired = false,
+  canResume = true,
   setView,
 }: {
   terminals: TerminalInfo[];
@@ -106,6 +114,8 @@ function renderView({
   initialTerminalKey?: string | null;
   readOnly?: boolean;
   conversationId?: string;
+  resumeRequired?: boolean;
+  canResume?: boolean;
   setView?: (view: "chat" | "terminal") => void;
 }) {
   useTerminalsMock.mockReturnValue({ terminals, isLoading: false, error: null });
@@ -115,6 +125,8 @@ function renderView({
         conversationId={conversationId}
         initialTerminalKey={initialTerminalKey}
         readOnly={readOnly}
+        resumeRequired={resumeRequired}
+        canResume={canResume}
       />
     </TerminalFirstContextProvider>,
   );
@@ -122,9 +134,53 @@ function renderView({
 
 beforeEach(() => {
   useTerminalsMock.mockReset();
+  resumeSessionMock.mockReset();
 });
 
 afterEach(cleanup);
+
+describe("MainTerminalView — paused sessions", () => {
+  it("resumes from the terminal prompt without sending a message", async () => {
+    let resolveResume: (() => void) | undefined;
+    resumeSessionMock.mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolveResume = resolve;
+      }),
+    );
+    renderView({ terminals: [], resumeRequired: true });
+
+    expect(screen.getByText("Session paused")).toBeInTheDocument();
+    const button = screen.getByRole("button", { name: "Resume session" });
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    expect(resumeSessionMock).toHaveBeenCalledOnce();
+    expect(resumeSessionMock).toHaveBeenCalledWith("conv_sdk");
+    expect(screen.getByRole("button", { name: "Resuming session…" })).toBeDisabled();
+
+    resolveResume?.();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Resuming session…" })).toBeDisabled(),
+    );
+  });
+
+  it("shows resume failures and allows retry", async () => {
+    resumeSessionMock.mockRejectedValueOnce(new Error("Reconnect its host and try again."));
+    renderView({ terminals: [], resumeRequired: true });
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Reconnect its host and try again.");
+    expect(screen.getByRole("button", { name: "Resume session" })).toBeEnabled();
+  });
+
+  it("does not offer a resume action to read-only viewers", () => {
+    renderView({ terminals: [], resumeRequired: true, canResume: false });
+
+    expect(screen.getByText(/an editor must resume/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+  });
+});
 
 describe("MainTerminalView — terminal-first SDK sessions", () => {
   it("renders the REPL chrome-free: shells and the + stay out of the pill view", () => {

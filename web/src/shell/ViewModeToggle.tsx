@@ -22,7 +22,8 @@ export function ViewModeToggle() {
   const ctx = useTerminalFirst();
   if (!ctx || !ctx.isTerminalFirst || ctx.isShellView || isIOSShell()) return null;
 
-  const { view, setView, terminalsAvailable, terminalStartingUp } = ctx;
+  const { view, setView, terminalsAvailable, terminalResumable = false, terminalStartingUp } = ctx;
+  const terminalEnabled = terminalsAvailable || terminalResumable;
   const terminalLabel = terminalStartingUp ? "Terminal is starting up…" : "Terminal view";
 
   return (
@@ -42,12 +43,13 @@ export function ViewModeToggle() {
       >
         <MessagesSquareIcon className="size-3.5" />
       </ViewModeSegment>
-      {/* Terminal stays disabled until a PTY is reachable; the spinner while
-          it's coming up reads as "loading" rather than a dead segment. */}
+      {/* A paused session remains selectable so its terminal surface can
+          offer the explicit resume action. Other unavailable terminals stay
+          disabled; a spinner marks active startup. */}
       <ViewModeSegment
         label={terminalLabel}
         active={view === "terminal"}
-        disabled={!terminalsAvailable}
+        disabled={!terminalEnabled}
         onClick={() => setView("terminal")}
         testId="view-mode-terminal"
       >

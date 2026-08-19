@@ -1270,6 +1270,59 @@ def bash_terminal_spec(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_resume_session_wakes_runner_without_dispatching_event(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /resume invokes the resource wake ladder and returns no content."""
+    from omnigent.server.routes.sessions import routes_resources
+
+    called: dict[str, Any] = {}
+    runner_client = object()
+
+    async def _ensure_runner_connected(**kwargs: Any) -> tuple[object, Conversation]:
+        called.update(kwargs)
+        return runner_client, kwargs["conv"]
+
+    monkeypatch.setattr(
+        routes_resources,
+        "ensure_runner_connected",
+        _ensure_runner_connected,
+    )
+
+    resp = await client.post("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resume")
+
+    assert resp.status_code == 204
+    assert resp.content == b""
+    assert called["session_id"] == "79b22ebd2309e48fdeb450c65611d51b"
+    assert called["conv"].id == "79b22ebd2309e48fdeb450c65611d51b"
+
+
+@pytest.mark.asyncio
+async def test_resume_session_reports_non_wakeable_runner(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /resume preserves reconnect guidance for a stranded session."""
+    from omnigent.server.routes.sessions import routes_resources
+
+    async def _ensure_runner_connected(**kwargs: Any) -> tuple[None, Conversation]:
+        return None, kwargs["conv"]
+
+    monkeypatch.setattr(
+        routes_resources,
+        "ensure_runner_connected",
+        _ensure_runner_connected,
+    )
+
+    resp = await client.post("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resume")
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == ErrorCode.RUNNER_UNAVAILABLE
+    assert "Reconnect its host" in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
 async def test_create_terminal_proxies_to_runner(
     client: httpx.AsyncClient,
     bash_terminal_spec: None,
