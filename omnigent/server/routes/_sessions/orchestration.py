@@ -200,6 +200,7 @@ from omnigent.server.routes._sessions.helpers import (
     _build_new_item,
     _build_policy_engine_from_spec,
     _child_session_summary_from_conversation,
+    _cleanup_worktree_on_archive,
     _codex_subagent_labels_from_body,
     _coerce_cumulative_field,
     _collect_descendant_conversation_ids,
@@ -652,6 +653,11 @@ async def _archive_stop(
     "working" against a dead pane — the failure
     :func:`_stop_session_host_runner` exists to prevent.
 
+    When the session owns a git worktree, archive also attempts cleanup:
+    :func:`_cleanup_worktree_on_archive` removes the worktree (and its
+    branch) only after verifying removal would lose nothing, and records
+    why on the session's labels when it keeps the directory instead.
+
     Every step is best-effort: a wedged, offline, or already-stopped
     runner must not leave the session un-archived.
 
@@ -675,29 +681,53 @@ async def _archive_stop(
             exc_info=True,
         )
         return
-    if conv is None or not conv.host_id or not conv.runner_id:
+    if conv is None:
         return
-    # Mark the tunnel drop intentional BEFORE tearing it down so the relay
-    # renders a quiet stopped state rather than "runner_disconnected".
-    _intentional_stop_sessions.add(session_id)
+    if conv.host_id and conv.runner_id:
+        # Mark the tunnel drop intentional BEFORE tearing it down so the
+        # relay renders a quiet stopped state rather than
+        # "runner_disconnected".
+        _intentional_stop_sessions.add(session_id)
+        try:
+            delivered = await _facade._stop_session_host_runner(
+                session_id,
+                conv.host_id,
+                conv.runner_id,
+                host_registry,
+            )
+        except Exception:  # noqa: BLE001
+            _logger.debug(
+                "Archive host-runner teardown failed for %s",
+                session_id,
+                exc_info=True,
+            )
+            delivered = False
+        if not delivered:
+            # No tunnel drop will follow, so the marker would outlive this
+            # stop and later swallow a genuine runner_disconnected as a
+            # quiet idle.
+            _intentional_stop_sessions.discard(session_id)
+
+    # Worktree cleanup is independent of the runner teardown above: a
+    # session without a live runner (never started, already stopped, or
+    # host-relaunched) can still own a worktree. Best-effort and
+    # safety-gated inside — it never raises by contract, but keep the
+    # guard so an unexpected error can't fail the archive teardown.
     try:
-        delivered = await _facade._stop_session_host_runner(
-            session_id,
-            conv.host_id,
-            conv.runner_id,
-            host_registry,
+        await _cleanup_worktree_on_archive(
+            session_id=session_id,
+            workspace=conv.workspace,
+            git_branch=conv.git_branch,
+            host_id=conv.host_id,
+            conversation_store=conversation_store,
+            host_registry=host_registry,
         )
     except Exception:  # noqa: BLE001
         _logger.debug(
-            "Archive host-runner teardown failed for %s",
+            "Archive worktree cleanup failed for %s",
             session_id,
             exc_info=True,
         )
-        delivered = False
-    if not delivered:
-        # No tunnel drop will follow, so the marker would outlive this stop
-        # and later swallow a genuine runner_disconnected as a quiet idle.
-        _intentional_stop_sessions.discard(session_id)
 
 
 def _spawn_archive_stop(

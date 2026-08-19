@@ -34,6 +34,7 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostInspectWorktreeResultFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
@@ -655,6 +656,21 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "worktrees": frame.worktrees,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostInspectWorktreeResultFrame):
+            inspect_wt_future = conn.pending_inspect_worktrees.pop(frame.request_id, None)
+            if inspect_wt_future is not None and not inspect_wt_future.done():
+                inspect_wt_future.set_result(
+                    {
+                        "status": frame.status,
+                        "dirty_files": frame.dirty_files,
+                        "unpushed_commits": frame.unpushed_commits,
+                        "merged": frame.merged,
+                        "default_ref": frame.default_ref,
                         "error": frame.error,
                     }
                 )

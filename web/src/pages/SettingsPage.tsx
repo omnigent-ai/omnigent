@@ -92,6 +92,7 @@ import {
 } from "@/hooks/useConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { absoluteTime } from "@/lib/relativeTime";
+import { WORKTREE_KEPT_LABEL, worktreeKeptNote } from "@/lib/worktreeKept";
 import { useNavigate } from "@/lib/routing";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import {
@@ -2028,6 +2029,11 @@ function ArchivedRow({ conversation }: { conversation: Conversation }) {
   const [deleteOpen, setDeleteOpen] = useState(false);
   const label = conversationDisplayLabel(conversation);
   const busy = archive.isPending || del.isPending;
+  // Set by archive-time worktree cleanup when it left the worktree in
+  // place (uncommitted/unpushed/unmerged work, another session using it,
+  // or no way to verify) — the user should know the directory is still
+  // on disk and why.
+  const worktreeKept = worktreeKeptNote(conversation.labels?.[WORKTREE_KEPT_LABEL]);
 
   return (
     <li
@@ -2041,6 +2047,11 @@ function ArchivedRow({ conversation }: { conversation: Conversation }) {
         <div className="text-sm text-muted-foreground">
           {absoluteTime(conversation.updated_at * 1000)}
         </div>
+        {worktreeKept !== null && (
+          <div className="text-sm text-muted-foreground" data-testid="worktree-kept-note">
+            {worktreeKept}
+          </div>
+        )}
       </div>
       {/* Actions reveal on hover (desktop) / always shown on touch. */}
       <div className="flex shrink-0 items-center gap-1 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
