@@ -102,6 +102,52 @@ def test_create_preserves_existing_config(tmp_path: Path) -> None:
     assert data["profile"] == "oss", "Existing 'profile' key should survive host section creation"
 
 
+def test_name_only_config_gets_generated_host_id(tmp_path: Path) -> None:
+    """
+    A config.yaml that names the host but omits host_id should keep the
+    provided name and get a freshly generated host_id — the name must
+    not be clobbered by the machine hostname.
+
+    If the name comes back as the hostname, the partial section was
+    discarded instead of completed.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"server": "http://example.com", "host": {"name": "my-custom-host"}})
+    )
+
+    identity = load_or_create_host_identity(config_path)
+
+    assert identity.name == "my-custom-host", (
+        "provided host name must be preserved, not replaced by the hostname"
+    )
+    assert len(identity.host_id) == 32, "a host_id should be generated when absent"
+    int(identity.host_id, 16)  # raises ValueError if not valid hex
+
+    # The generated id is persisted so it's stable across calls.
+    with open(config_path) as f:
+        data = yaml.safe_load(f)
+    assert data["host"]["host_id"] == identity.host_id
+    assert data["host"]["name"] == "my-custom-host"
+    assert data["server"] == "http://example.com", "existing keys must survive"
+
+
+def test_name_only_config_host_id_stable_across_calls(tmp_path: Path) -> None:
+    """
+    Once a host_id is generated for a name-only config, a second call
+    must return the same id (the persisted section is read, not
+    regenerated).
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"host": {"name": "my-custom-host"}}))
+
+    first = load_or_create_host_identity(config_path)
+    second = load_or_create_host_identity(config_path)
+
+    assert first.host_id == second.host_id
+    assert first.name == second.name == "my-custom-host"
+
+
 def test_env_override_returns_identity_without_touching_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

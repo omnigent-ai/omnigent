@@ -30,6 +30,14 @@ The Vite dev server proxies `/v1` and `/api` to `http://localhost:6767`. Set
 OMNIGENT_URL=http://localhost:9000 pnpm run dev
 ```
 
+To develop against a Databricks workspace-hosted server, point `OMNIGENT_URL`
+at the bare workspace origin — the dev proxy fills in the `/api/2.0/omnigent`
+mount and authenticates with your `databricks auth login` token automatically:
+
+```bash
+OMNIGENT_URL=https://my-workspace.databricks.com pnpm run dev
+```
+
 Additional `omnigent server` options:
 
 | Flag                  | Default                | Description                          |

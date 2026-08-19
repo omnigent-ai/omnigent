@@ -44,6 +44,7 @@ from ._events import (
     ToolResult,
 )
 from ._sse import parse_sse_stream
+from ._timeouts import _SSE_TIMEOUT
 from ._tool_handler import (
     CompactionEndCtx,
     CompactionStartCtx,
@@ -232,7 +233,12 @@ class ResponsesNamespace:
                 model_override=model_override,
             )
 
-            async with self._http.stream("POST", f"{self._base}/v1/responses", json=body) as resp:
+            async with self._http.stream(
+                "POST",
+                f"{self._base}/v1/responses",
+                json=body,
+                timeout=_SSE_TIMEOUT,
+            ) as resp:
                 if resp.status_code >= 400:
                     await resp.aread()
                     raise_for_status(resp.status_code, response_body(resp))

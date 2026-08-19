@@ -15,7 +15,7 @@ import base64
 import os
 import re
 import stat
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, ParamSpec
 
@@ -27,16 +27,37 @@ from omnigent.entities.environment_filesystem import (
     FilesystemEntry,
     FilesystemPathNotFound,
     InvalidPath,
+    PathUnreachable,
     TextEditRequest,
     WriteFileResult,
 )
 from omnigent.entities.pagination import PagedList
-from omnigent.inner.os_env import _DEFAULT_READ_LIMIT
+from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
+from omnigent.inner.async_utils import run_sync_on_thread
+from omnigent.inner.os_env import (
+    _DEFAULT_READ_LIMIT,
+    _edit_impl,
+    _read_impl,
+    _write_impl,
+)
+from omnigent.inner.sandbox import (
+    ReachableRoot,
+    contained_realpath,
+    containment_prefix,
+    is_unconfined,
+    reachable_roots,
+)
 
 if TYPE_CHECKING:
     from omnigent.inner.os_env import OpResult, OSEnvironment
 
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
+# Cap on entries a single search may examine. Distinct from the result
+# cap: a query matching little or nothing never fills the results, so
+# without this a search from a large directory would walk it entirely.
+# Deterministic (count, not wall clock) so the same tree always yields
+# the same answer, and sized to match the sandbox cwd scan budget.
+_SEARCH_SCAN_BUDGET = 50000
 _Params = ParamSpec("_Params")
 
 
@@ -178,6 +199,29 @@ async def _run_os_env_async(
     return await method(*args, **kwargs)
 
 
+async def _run_impl_direct(
+    fn: Callable[..., OpResult],  # type: ignore[explicit-any]
+    *args: object,
+) -> OpResult:
+    """Run an ``os_env`` implementation in-process, in the helper's shape.
+
+    Used for paths admitted only because the environment is unconfined, where
+    there is no sandbox to route around. The helper subprocess reports
+    failures as ``{"error": ...}``; calling the implementation directly would
+    instead raise, turning an ordinary permission denial (writing under
+    ``/etc`` as a non-root user) into a 500. Mapping it here keeps both
+    routes indistinguishable to callers.
+
+    :param fn: The implementation to run.
+    :param args: Positional arguments for it.
+    :returns: The result dict, or ``{"error": ...}`` on an OS-level failure.
+    """
+    try:
+        return await run_sync_on_thread(fn, *args)
+    except OSError as exc:
+        return {"error": str(exc)}
+
+
 def _validate_path(relative_path: str) -> str:
     """Validate and normalize a relative path.
 
@@ -197,6 +241,83 @@ def _validate_path(relative_path: str) -> str:
     if normalized == ".":
         return ""
     return normalized
+
+
+def is_absolute_request(path: str) -> bool:
+    """Whether a client-supplied path names an absolute location.
+
+    The filesystem routes accept either a workspace-relative path (the
+    historical contract) or an absolute one. A path is absolute exactly
+    when it starts with ``/`` — the same rule the filesystem itself uses.
+    ``~`` is deliberately NOT expanded here: the environment metadata
+    already reports ``home``, so the caller expands it and sends a real
+    path rather than relying on whose home the runner would guess.
+
+    :param path: Client-supplied path string, e.g. ``"src/app.py"`` or
+        ``"/etc/hosts"``.
+    :returns: ``True`` for absolute paths.
+    """
+    return path.startswith("/")
+
+
+def resolve_browse_target(
+    absolute_path: str,
+    roots: Sequence[ReachableRoot],
+    *,
+    unconfined: bool,
+    need_write: bool = False,
+) -> Path:
+    """Resolve an absolute browse target and authorize it.
+
+    Authorization has two tiers, mirroring what the environment can
+    actually do:
+
+    - A path inside one of *roots* is reachable by the environment's own
+      file tools, so browsing it is exactly as permitted as the agent
+      reading it.
+    - When *unconfined* (``sandbox.type: none``), no OS-level sandbox is
+      applied and the environment's shell already reads *and writes*
+      anything the runner can, so neither browsing nor editing there grants
+      reach that was being withheld. The caller has additionally cleared the
+      same permission level that grants shell access. Confined environments
+      get no such widening — their grants are the whole story, and a read
+      grant still never admits a write.
+
+    :param absolute_path: Absolute path supplied by the caller.
+    :param roots: Grants from :func:`omnigent.inner.sandbox.reachable_roots`.
+    :param unconfined: Result of :func:`omnigent.inner.sandbox.is_unconfined`.
+    :param need_write: ``True`` for mutating operations, which read grants
+        do not admit.
+    :returns: The resolved absolute path.
+    :raises InvalidPath: On a malformed path.
+    :raises PathUnreachable: When no grant covers it and the environment
+        is confined.
+    """
+    if "\x00" in absolute_path:
+        raise InvalidPath("Path contains NUL bytes")
+    # An unconfined environment's reach IS the filesystem root — stating it as
+    # a root keeps every return below a containment check, rather than having
+    # one branch hand back an unchecked path.
+    allowed = (
+        [*roots, ReachableRoot(path=Path("/"), access="write", origin="unconfined", kind="tree")]
+        if unconfined
+        else roots
+    )
+    for root in allowed:
+        if need_write and root.access != "write":
+            continue
+        # Resolution happens inside the check, so a ".." segment or symlink
+        # cannot aim the final path out of the grant that admitted it.
+        contained = contained_realpath(absolute_path, root.prefix)
+        if contained is None:
+            continue
+        # A file grant covers exactly one path, not a subtree beneath it.
+        if root.kind == "tree" or contained == str(root.path):
+            return Path(contained)
+    raise PathUnreachable(
+        f"Path {absolute_path!r} is outside this session's reach",
+        [str(root.path) for root in roots],
+    )
 
 
 def _entry_from_stat(
@@ -259,23 +380,145 @@ class CallerProcessFilesystem:
     def __init__(self, os_env: OSEnvironment) -> None:
         self._os_env = os_env
         self._root = Path(os_env.cwd).resolve()
+        self._root_prefix = containment_prefix(self._root)
+        policy = getattr(os_env, "sandbox", None)
+        if policy is None:
+            # Backends that carry no resolved policy keep the historical
+            # cwd-only confinement rather than inheriting a wider default.
+            self._roots: list[ReachableRoot] = [
+                ReachableRoot(path=self._root, access="write", origin="cwd", kind="tree")
+            ]
+            self._unconfined = False
+        else:
+            self._roots = reachable_roots(self._root, policy)
+            self._unconfined = is_unconfined(policy)
 
-    def _resolve(self, path: str) -> Path:
-        """Resolve a relative path to an absolute path under root.
+    @property
+    def reach(self) -> tuple[list[ReachableRoot], bool]:
+        """The grants this environment can reach, and whether it is unconfined.
 
-        :param path: Relative path within the environment.
-        :returns: Resolved absolute path.
-        :raises InvalidPath: If path escapes the root.
+        :returns: ``(roots, unconfined)`` for advertising reach to callers.
         """
+        return self._roots, self._unconfined
+
+    def _resolve(self, path: str, *, need_write: bool = False) -> Path:
+        """Resolve a client-supplied path to an absolute path.
+
+        Relative paths keep the historical contract: normalized, traversal
+        rejected, and confined under the environment root. Absolute paths
+        take the browse-authorization route instead.
+
+        :param path: Relative path within the environment, or an absolute
+            path elsewhere on the filesystem.
+        :param need_write: ``True`` for mutating operations.
+        :returns: Resolved absolute path.
+        :raises InvalidPath: If a relative path escapes the root.
+        :raises PathUnreachable: If an absolute path is out of reach.
+        """
+        if self._absolute(path):
+            return resolve_browse_target(
+                path, self._roots, unconfined=self._unconfined, need_write=need_write
+            )
         validated = _validate_path(path)
         if not validated:
             return self._root
-        full = (self._root / validated).resolve()
+        # `_validate_path` rejects absolute paths and "..", but that is a check
+        # on the string; this re-checks the RESOLVED path, which is what stops
+        # an in-workspace symlink pointing outward.
+        contained = contained_realpath(os.path.join(str(self._root), validated), self._root_prefix)
+        if contained is None:
+            raise InvalidPath(f"Path {path!r} escapes the environment root")
+        return Path(contained)
+
+    def _absolute(self, path: str) -> bool:
+        """Whether this request should be handled as an absolute path.
+
+        Absolute paths take the browse-authorization route, which admits
+        them only when a declared grant covers them or the environment is
+        unconfined. WHO may ask is the server's decision, not this
+        process's: it gates absolute paths on session ownership before
+        proxying (see ``_browse_level`` in the resources routes). The
+        runner cannot see the caller's identity, so it does not try to.
+
+        :param path: Client-supplied path.
+        :returns: ``True`` to take the absolute-path route.
+        """
+        return is_absolute_request(path)
+
+    def _within_grants(self, resolved: Path, *, need_write: bool = False) -> bool:
+        """Whether a grant covers this path *for the access being requested*.
+
+        Grants are what the environment's own file tools can reach, so a
+        path a grant covers can be served through the helper. A path no
+        grant covers was admitted only because the environment is
+        unconfined, and must not be routed through the helper's guard.
+
+        *need_write* matters because the two are not the same set: a write
+        landing inside a READ grant is not something the helper will do, so
+        routing it there would deny a write that an unconfined environment
+        is otherwise allowed to make (its shell can already do it).
+
+        :param resolved: Fully-resolved absolute path.
+        :param need_write: ``True`` when the caller intends to mutate.
+        :returns: ``True`` when a grant admits that access.
+        """
+        return any(
+            root.contains(resolved)
+            for root in self._roots
+            if not need_write or root.access == "write"
+        )
+
+    def _entry_path(self, full: Path) -> str:
+        """Path to report on a returned entry.
+
+        Relative to the environment root for anything inside it (the
+        historical shape), absolute otherwise — a path outside the root has
+        no meaningful relative form, and ``relative_to`` would raise.
+
+        :param full: Resolved absolute path.
+        :returns: The entry's reported path.
+        """
         try:
-            full.relative_to(self._root)
-        except ValueError as exc:
-            raise InvalidPath(f"Path {path!r} escapes the environment root") from exc
-        return full
+            return str(full.relative_to(self._root))
+        except ValueError:
+            return str(full)
+
+    def _write_route(self, path: str) -> tuple[str, Path | None]:
+        """Resolve a mutating op's target and decide how to reach it.
+
+        :param path: Client-supplied path.
+        :returns: ``(target, direct)``. ``target`` is the string to hand the
+            sandboxed helper; ``direct`` is set instead when the path was
+            admitted only because the environment is unconfined, in which
+            case there is no sandbox to route around and the op runs
+            in-process against that resolved path.
+        :raises InvalidPath: On a malformed relative path.
+        :raises PathUnreachable: When no grant covers an absolute path and
+            the environment is confined.
+        """
+        if not self._absolute(path):
+            return _validate_path(path), None
+        resolved = self._resolve(path, need_write=True)
+        if self._within_grants(resolved, need_write=True):
+            return str(resolved), None
+        return str(resolved), resolved
+
+    def _target(self, path: str) -> tuple[str, str]:
+        """Path to hand the helper, plus the prefix for returned entry paths.
+
+        For a relative request the helper is given the validated relative
+        path (it runs with cwd at the environment root) and entries are
+        reported under that same prefix, unchanged. For an absolute request
+        the helper is given the resolved absolute path and entries are
+        reported relative to it — the response envelope carries the base.
+
+        :param path: Client-supplied path.
+        :returns: ``(target, prefix)``.
+        """
+        if self._absolute(path):
+            return str(self._resolve(path)), ""
+        validated = _validate_path(path) if path else ""
+        return validated or ".", validated
 
     async def list_dir(
         self,
@@ -310,8 +553,7 @@ class CallerProcessFilesystem:
 
         from omnigent.entities.pagination import paginate_in_memory
 
-        validated = _validate_path(path) if path else ""
-        target = validated or "."
+        target, prefix = self._target(path)
 
         # Shell-quote the generated script; target is embedded via json.dumps.
         # Per-entry try/except handles broken symlinks.
@@ -350,7 +592,7 @@ class CallerProcessFilesystem:
             raw = []
         for item in raw:
             name = item["n"]
-            rel = os.path.join(validated, name) if validated else name
+            rel = os.path.join(prefix, name) if prefix else name
             entry_type: Literal["file", "directory"] = "directory" if item["t"] == "d" else "file"
             entries.append(
                 FilesystemEntry(
@@ -376,10 +618,11 @@ class CallerProcessFilesystem:
         self,
         query: str,
         *,
+        path: str = "",
         include: list[str] | None = None,
         exclude: list[str] | None = None,
         limit: int = 500,
-    ) -> list[FilesystemEntry]:
+    ) -> tuple[list[FilesystemEntry], bool]:
         """Search for files recursively by name/path substring and glob filters.
 
         Walks the full directory tree via ``os.walk()`` inside the sandbox and
@@ -422,7 +665,9 @@ class CallerProcessFilesystem:
         if not q:
             # A query is required; a whitespace-only query would match every
             # file, so return nothing instead of walking the whole tree.
-            return []
+            return [], False
+
+        start, _prefix = self._target(path)
 
         include_regexes = [_glob_to_regex(p) for p in (include or [])]
         exclude_regexes = [_glob_to_regex(p) for p in (exclude or [])]
@@ -435,20 +680,37 @@ class CallerProcessFilesystem:
                 "import os, json, re",
                 f"q = {_json.dumps(q)}",
                 f"limit = {limit}",
+                f"start = {_json.dumps(start)}",
+                f"budget = {_SEARCH_SCAN_BUDGET}",
+                f"depri = set({_json.dumps(list(_DEFAULT_DEPRIORITIZED_DIRS))})",
                 f"inc = [re.compile(p, re.IGNORECASE) for p in {_json.dumps(include_regexes)}]",
                 f"exc = [re.compile(p, re.IGNORECASE) for p in {_json.dumps(exclude_regexes)}]",
                 "results = []",
-                "for dirpath, dirnames, filenames in os.walk('.'):",
+                "scanned = 0",
+                "truncated = False",
+                "for dirpath, dirnames, filenames in os.walk(start):",
                 "    # Prune excluded subtrees (e.g. node_modules) from the walk.",
                 "    kept = []",
                 "    for d in sorted(dirnames):",
-                "        dp = os.path.normpath(os.path.join(dirpath, d))",
+                "        dp = os.path.relpath(os.path.join(dirpath, d), start)",
                 "        if any(r.match(dp) for r in exc):",
                 "            continue",
                 "        kept.append(d)",
+                "    # Spend the scan budget on the real tree first: dependency and",
+                "    # cache dirs are walked last, and are what a capped scan drops.",
+                "    kept.sort(key=lambda d: d in depri)",
                 "    dirnames[:] = kept",
+                "    scanned += len(kept)",
                 "    for fname in sorted(filenames):",
-                "        p = os.path.normpath(os.path.join(dirpath, fname))",
+                "        # A query matching little or nothing never trips the result",
+                "        # cap, so the walk needs its own bound. Counted per entry:",
+                "        # per-directory would let one huge directory overshoot it.",
+                "        scanned += 1",
+                "        if scanned >= budget:",
+                "            truncated = True",
+                "            break",
+                "        full = os.path.join(dirpath, fname)",
+                "        p = os.path.relpath(full, start)",
                 "        if exc and any(r.match(p) for r in exc):",
                 "            continue",
                 "        if inc and not any(r.match(p) for r in inc):",
@@ -456,16 +718,19 @@ class CallerProcessFilesystem:
                 "        if q not in fname.lower() and q not in p.lower():",
                 "            continue",
                 "        try:",
-                "            st = os.stat(p)",
+                "            # stat the FULL path: p is relative to `start`, but the",
+                "            # helper's cwd is the workspace root, so stat(p) would",
+                "            # miss -- or worse, stat a same-named workspace file.",
+                "            st = os.stat(full)",
                 "            results.append({'n': fname, 'p': p, 's': st.st_size,",
                 "                'm': int(st.st_mtime)})",
                 "        except OSError:",
                 "            results.append({'n': fname, 'p': p, 's': None, 'm': None})",
                 "        if len(results) >= limit:",
                 "            break",
-                "    if len(results) >= limit:",
+                "    if truncated or len(results) >= limit:",
                 "        break",
-                "print(json.dumps(results))",
+                "print(json.dumps({'r': results, 't': truncated}))",
             ]
         )
         result = await _run_os_env_async(
@@ -478,12 +743,13 @@ class CallerProcessFilesystem:
         entries: list[FilesystemEntry] = []
         stdout = result.get("stdout", "")
         try:
-            raw = _json.loads(stdout)
+            payload = _json.loads(stdout)
         except _json.JSONDecodeError as exc:
             raise RuntimeError(
                 f"search_files: unexpected output from sandbox script: {stdout!r}"
             ) from exc
-        for item in raw:
+        truncated = bool(payload.get("t"))
+        for item in payload.get("r", []):
             entries.append(
                 FilesystemEntry(
                     id=item["p"],
@@ -495,7 +761,7 @@ class CallerProcessFilesystem:
                 )
             )
         entries.sort(key=lambda e: e.path)
-        return entries
+        return entries, truncated
 
     async def read(
         self,
@@ -520,21 +786,49 @@ class CallerProcessFilesystem:
         :raises FilesystemPathNotFound: If the file does not exist.
         :raises FileTooLarge: If the file exceeds the size limit.
         """
-        validated = _validate_path(path) if path else ""
-        if not validated:
-            raise InvalidPath("Cannot read the environment root")
-
         byte_cap = max_bytes or _MAX_READ_BYTES
+
+        if self._absolute(path):
+            resolved = self._resolve(path)
+            if self._within_grants(resolved):
+                target = str(resolved)
+            else:
+                # Only reachable when the environment is unconfined —
+                # ``_resolve`` rejects out-of-grant paths otherwise — so there
+                # is no sandbox to route around. Runs the same implementation
+                # the helper would, minus the file-tool cwd guard, which is an
+                # agent-tool policy rather than a browsing boundary.
+                direct = await _run_impl_direct(_read_impl, resolved, 1, limit, byte_cap)
+                return self._file_content(path, direct, byte_cap)
+        else:
+            target = _validate_path(path) if path else ""
+            if not target:
+                raise InvalidPath("Cannot read the environment root")
 
         result = await _run_os_env_async(
             self._os_env.read,
-            validated,
+            target,
             limit=limit,
             # Inline binary content up to the byte cap so it can be served to
             # the viewer / download. (The agent read path omits this and gets a
             # descriptor only — see ``_read_impl``.)
             max_binary_bytes=byte_cap,
         )
+        return self._file_content(path, result, byte_cap)
+
+    def _file_content(self, path: str, result: OpResult, byte_cap: int) -> FileContent:
+        """Convert a read result into typed content.
+
+        Shared by both read routes — through the helper for paths the
+        environment's file tools can reach, and in-process for unconfined
+        browsing — so encoding and truncation behave identically either way.
+
+        :param path: Path as requested, echoed onto the result.
+        :param result: Raw result from the read implementation.
+        :param byte_cap: Maximum bytes to return.
+        :returns: The file content.
+        :raises FilesystemPathNotFound: If the read reported an error.
+        """
         if "error" in result:
             raise FilesystemPathNotFound(f"Path {path!r} not found")
 
@@ -596,26 +890,21 @@ class CallerProcessFilesystem:
             always creates parents.
         :returns: Write result with change tracking.
         """
-        validated = _validate_path(path)
+        target, direct = self._write_route(path)
         content_str = content.decode("utf-8")
 
-        result = await _run_os_env_async(
-            self._os_env.write,
-            validated,
-            content_str,
-        )
+        if direct is not None:
+            result = await _run_impl_direct(_write_impl, direct, content_str)
+        else:
+            result = await _run_os_env_async(self._os_env.write, target, content_str)
         if "error" in result:
             raise FilesystemPathNotFound(result.get("error", f"Write failed for {path!r}"))
 
         created = result.get("created", False)
         bytes_written = result.get("bytes_written", len(content))
 
-        full = self._resolve(path)
-        entry = _entry_from_stat(
-            self._root,
-            full,
-            str(full.relative_to(self._root)),
-        )
+        full = self._resolve(path, need_write=True)
+        entry = _entry_from_stat(self._root, full, self._entry_path(full))
         return WriteFileResult(
             operation="write",
             path=path,
@@ -695,7 +984,7 @@ class CallerProcessFilesystem:
             TextReplacement,
         )
 
-        validated = _validate_path(path)
+        target, direct = self._write_route(path)
 
         replacements: list[TextReplacement] = []
         if edit.edits is not None:
@@ -710,18 +999,27 @@ class CallerProcessFilesystem:
         else:
             raise InvalidPath("old_text/new_text or edits list is required")
 
-        if len(replacements) == 1:
+        edits_list = [{"oldText": r.old_text, "newText": r.new_text} for r in replacements]
+        single = len(replacements) == 1
+        if direct is not None:
+            result = await _run_impl_direct(
+                _edit_impl,
+                direct,
+                replacements[0].old_text if single else None,
+                replacements[0].new_text if single else None,
+                None if single else edits_list,
+            )
+        elif single:
             result = await _run_os_env_async(
                 self._os_env.edit,
-                validated,
+                target,
                 old_text=replacements[0].old_text,
                 new_text=replacements[0].new_text,
             )
         else:
-            edits_list = [{"oldText": r.old_text, "newText": r.new_text} for r in replacements]
             result = await _run_os_env_async(
                 self._os_env.edit,
-                validated,
+                target,
                 edits=edits_list,
             )
 
@@ -731,12 +1029,8 @@ class CallerProcessFilesystem:
         total_count = result.get("replacements", len(replacements))
         bytes_written = result.get("bytes_written", 0)
 
-        full = self._resolve(path)
-        entry = _entry_from_stat(
-            self._root,
-            full,
-            str(full.relative_to(self._root)),
-        )
+        full = self._resolve(path, need_write=True)
+        entry = _entry_from_stat(self._root, full, self._entry_path(full))
         return EditFileResult(
             operation="edit",
             path=path,
@@ -820,7 +1114,7 @@ class CallerProcessFilesystem:
         :raises FilesystemPathNotFound: If the path does not exist.
         :raises DirectoryNotEmpty: If non-empty without recursive.
         """
-        validated = _validate_path(path)
+        validated, _direct = self._write_route(path)
         if not validated:
             raise InvalidPath("Cannot delete the environment root")
 

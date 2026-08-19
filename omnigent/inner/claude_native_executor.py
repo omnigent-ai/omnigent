@@ -29,6 +29,7 @@ from omnigent.inner.executor import (
     Message,
     ToolSpec,
     TurnComplete,
+    describe_exception,
 )
 from omnigent.inner.native_attachments import attachment_reference_line
 
@@ -192,7 +193,7 @@ class ClaudeNativeExecutor(Executor):
                         content=text,
                     )
         except RuntimeError as exc:
-            yield ExecutorError(message=str(exc))
+            yield ExecutorError(message=describe_exception(exc))
             return
         yield TurnComplete(response=None)
 

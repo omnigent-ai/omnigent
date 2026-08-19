@@ -26,6 +26,7 @@ from omnigent.runtime.workflow import (
     _build_copilot_spawn_env,
     _build_cursor_spawn_env,
     _build_goose_spawn_env,
+    _build_hermes_spawn_env,
     _build_qwen_spawn_env,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -39,6 +40,7 @@ _BUILDERS = [
     ("goose", _build_goose_spawn_env, "HARNESS_GOOSE_CWD"),
     ("copilot", _build_copilot_spawn_env, "HARNESS_COPILOT_CWD"),
     ("acp", _build_acp_spawn_env, "HARNESS_ACP_CWD"),
+    ("hermes", _build_hermes_spawn_env, "HARNESS_HERMES_CWD"),
 ]
 
 

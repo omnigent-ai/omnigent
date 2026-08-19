@@ -23,10 +23,12 @@ import {
 const terminalSessionMock = vi.hoisted(() => ({
   instances: [] as {
     url: string;
+    container: HTMLDivElement;
     nativeSelection: boolean;
     onState: (state: ConnectionState) => void;
     dispose: ReturnType<typeof vi.fn>;
     setTheme: ReturnType<typeof vi.fn>;
+    focus: ReturnType<typeof vi.fn>;
   }[],
 }));
 
@@ -37,9 +39,10 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
   TerminalSession: class {
     dispose = vi.fn();
     setTheme = vi.fn();
+    focus = vi.fn();
 
     constructor(
-      _container: HTMLDivElement,
+      container: HTMLDivElement,
       url: string,
       onState: (state: ConnectionState) => void,
       _isDark?: boolean,
@@ -49,10 +52,12 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     ) {
       terminalSessionMock.instances.push({
         url,
+        container,
         nativeSelection,
         onState,
         dispose: this.dispose,
         setTheme: this.setTheme,
+        focus: this.focus,
       });
     }
   },
@@ -84,16 +89,28 @@ describe("buildAttachPath", () => {
     );
   });
 
+  it("appends ?omnigent_slice_key=host_id for host-sharded routing", () => {
+    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, "host_123")).toBe(
+      "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?omnigent_slice_key=host_123",
+    );
+  });
+
   it("appends ?transport= when a transport override is given", () => {
-    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, "control")).toBe(
+    expect(buildAttachPath("conv_abc", "terminal_bash_s1", false, undefined, "control")).toBe(
       "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?transport=control",
     );
   });
 
-  it("combines read_only and transport params", () => {
-    const path = buildAttachPath("conv_abc", "terminal_bash_s1", true, "control");
+  it("combines read_only, slice_key, and transport params", () => {
+    const path = buildAttachPath("conv_abc", "terminal_bash_s1", true, "host_789", "control");
     expect(path).toContain("read_only=true");
+    expect(path).toContain("omnigent_slice_key=host_789");
     expect(path).toContain("transport=control");
+  });
+
+  it("omits ?omnigent_slice_key when no hostId is provided", () => {
+    const path = buildAttachPath("conv_abc", "terminal_bash_s1", false);
+    expect(path.includes("omnigent_slice_key")).toBe(false);
   });
 
   it("omits ?transport when no override is given", () => {
@@ -147,6 +164,78 @@ describe("control-mode transport", () => {
     expect(inst.url).not.toContain("transport");
     expect(inst.nativeSelection).toBe(false);
     expect(screen.getByTestId("terminal-selection-hint")).toBeInTheDocument();
+  });
+});
+
+describe("hidden pre-warmed surface", () => {
+  it("keeps one live session across an active flip and focuses on reveal", async () => {
+    // Mount hidden (a pre-warmed attach behind the chat view): the
+    // session dials immediately — that is the whole point of the
+    // pre-warm — but must not take focus away from the composer.
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const inst = terminalSessionMock.instances[0];
+    expect(inst.focus).not.toHaveBeenCalled();
+
+    // Reveal: the SAME session is kept (no re-dial — a second instance
+    // here means the flip reconnected the WebSocket) and focused, since
+    // the WS-open auto-focus was a no-op while hidden.
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+    await waitFor(() => expect(inst.focus).toHaveBeenCalledTimes(1));
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    expect(inst.dispose).not.toHaveBeenCalled();
+
+    // Hiding again neither disposes nor re-focuses.
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />);
+    expect(inst.dispose).not.toHaveBeenCalled();
+    expect(inst.focus).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not focus on a plain active mount (WS-open handles it)", async () => {
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    // No reveal edge — the session's own WS-open focus owns this case;
+    // an extra explicit call would steal focus on every reconnect.
+    expect(terminalSessionMock.instances[0].focus).not.toHaveBeenCalled();
+  });
+});
+
+describe("late direct-attach advert", () => {
+  it("retires the outgoing session when the advert lands on a live terminal", async () => {
+    // The runner's loopback advert reaches the client on a terminals
+    // refetch — after the terminal has already dialed. That prop change
+    // re-runs the attach ref for the SAME mount node (React 18 hands the
+    // node back rather than remounting, and skips the ref's cleanup), so
+    // the attach itself has to retire its predecessor. Without that,
+    // xterm stacks a second instance inside one node — two helper
+    // textareas, two renderers, two live bridges.
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />,
+    );
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    const relayed = terminalSessionMock.instances[0];
+
+    rerender(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        directAttachUrl={
+          "ws://127.0.0.1:54321/v1/sessions/conv_abc" +
+          "/resources/terminals/terminal_bash_s1/attach?token=t"
+        }
+      />,
+    );
+    await act(async () => {});
+
+    // Same node, so this is a re-attach rather than a remount — which is
+    // exactly why the predecessor cannot be left running.
+    const readvertised = terminalSessionMock.instances.at(-1)!;
+    expect(readvertised).not.toBe(relayed);
+    expect(readvertised.container).toBe(relayed.container);
+    expect(relayed.dispose).toHaveBeenCalled();
   });
 });
 
@@ -389,6 +478,50 @@ describe("automatic reconnect", () => {
       // Restore the default prototype getter for later tests.
       delete (document as { visibilityState?: unknown }).visibilityState;
     }
+  });
+
+  it("re-dials with a fresh budget when a hidden warm surface is revealed", async () => {
+    // A warm surface parked behind another session's view: the transport
+    // flaps with nobody watching and the background reconnect loop burns
+    // its whole budget.
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+    );
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(1);
+
+    for (const [, delay] of RECONNECT_BACKOFF_MS.entries()) {
+      closeNewest(1006);
+      // oxlint-disable-next-line no-await-in-loop
+      await elapse(delay);
+    }
+    closeNewest(1006);
+    await elapse(60_000);
+    const exhausted = RECONNECT_BACKOFF_MS.length + 1;
+    expect(terminalSessionMock.instances).toHaveLength(exhausted);
+
+    // Reveal: a user is now looking at the dead pane — that is the retry
+    // signal, same as a tab thaw. One fresh dial, budget restored.
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(exhausted + 1);
+  });
+
+  it("does not resurrect a deliberately closed terminal on reveal", async () => {
+    const { rerender } = render(
+      <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+    );
+    await act(async () => {});
+    closeNewest(4405);
+    await elapse(60_000);
+    expect(terminalSessionMock.instances).toHaveLength(1);
+
+    // The server ended this terminal on purpose; revealing the surface
+    // must keep the dead-end overlay, not loop on the same answer.
+    rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active />);
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    expect(screen.getByText("Bridge closed: code 4405")).toBeInTheDocument();
   });
 });
 

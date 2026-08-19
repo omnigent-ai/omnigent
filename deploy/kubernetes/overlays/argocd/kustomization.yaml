@@ -1,0 +1,44 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ArgoCD overlay for the kubernetes sandbox provider. Adds safety annotations
+# (Prune=false on stateful resources, Ingress in a late wave) onto the
+# sandbox-runners overlay. ArgoCD's built-in kind ordering already sequences
+# Namespace → SA → Role → ConfigMap → Secret → Service → Deployment → Ingress,
+# so explicit sync waves are not needed for ordering — only to prevent the
+# Ingress health gate from blocking the sync on clusters without a controller.
+
+resources:
+  - ../sandbox-runners
+
+patches:
+  # Namespaces and the artifact PVC must survive Application deletion and
+  # accidental prune (a rename in base/ or a stale targetRevision). Without
+  # Prune=false, `kubectl delete application omnigent` cascades through the
+  # finalizer to both namespaces and everything inside them — including the
+  # operator-created omnigent-creds Secret and any pvc_mounts claims.
+  - target:
+      kind: Namespace
+    patch: |
+      - op: add
+        path: /metadata/annotations/argocd.argoproj.io~1sync-options
+        value: Prune=false
+  - target:
+      kind: PersistentVolumeClaim
+    patch: |
+      - op: add
+        path: /metadata/annotations/argocd.argoproj.io~1sync-options
+        value: Prune=false
+
+  # The Ingress depends on an ingress controller (nginx by default) and
+  # cert-manager. ArgoCD scores an Ingress without status.loadBalancer as
+  # Progressing, so on a cluster with no controller the sync stalls forever.
+  # Putting it in wave 1 (everything else is implicit wave 0) means nothing
+  # gates on its health. ArgoCD's kind ordering already applies it last within
+  # a wave, so this only affects the health gate.
+  - target:
+      kind: Ingress
+    patch: |
+      - op: add
+        path: /metadata/annotations/argocd.argoproj.io~1sync-wave
+        value: "1"

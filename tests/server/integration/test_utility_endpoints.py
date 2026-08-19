@@ -14,6 +14,9 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from fastapi import FastAPI
+
+from omnigent.server.feature_flags import Feature, FeatureFlags
 
 pytestmark = pytest.mark.asyncio
 
@@ -82,8 +85,11 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["needs_setup"] is False
     assert isinstance(data["databricks_features"], bool)
     assert isinstance(data["managed_sandboxes_enabled"], bool)
-    # harness_install_enabled gates the UI Install action; default off unless
-    # OMNIGENT_HARNESS_INSTALL_ENABLED is set, so it's false in the test app.
+    assert data["features"] == {
+        "usage_page": False,
+        "harness_install": False,
+    }
+    # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False
     # installable_harnesses is the allowlist the SPA offers setup for; blank
     # while the feature is off so the UI never offers an install the disabled
@@ -117,7 +123,9 @@ async def test_info_single_user_false_without_marker(
 
 
 async def test_info_advertises_installable_harnesses_when_enabled(
-    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With the feature on, ``/v1/info`` publishes the install allowlist.
 
@@ -126,12 +134,13 @@ async def test_info_advertises_installable_harnesses_when_enabled(
     declares (``codex-native``), not just the bare ids.
     """
     from omnigent.onboarding.harness_install import ui_installable_harnesses
-    from omnigent.server.routes.hosts import HARNESS_INSTALL_ENABLED_ENV
 
-    monkeypatch.setenv(HARNESS_INSTALL_ENABLED_ENV, "1")
+    enabled = FeatureFlags(frozenset({Feature.HARNESS_INSTALL}))
+    monkeypatch.setattr(app.state, "feature_flags", enabled)
     resp = await client.get("/v1/info")
     assert resp.status_code == 200
     data = resp.json()
+    assert data["features"]["harness_install"] is True
     assert data["harness_install_enabled"] is True
     assert set(data["installable_harnesses"]) == set(ui_installable_harnesses())
     assert "codex-native" in data["installable_harnesses"]

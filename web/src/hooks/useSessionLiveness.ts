@@ -190,12 +190,16 @@ function isOwner(conv: Pick<Conversation, "permission_level"> | null | undefined
  *   When the runner is down but the host is up, this upgrades the idle
  *   `runner_asleep` state to `starting` — the relaunch is happening now,
  *   so the user sees a "Connecting…" intermediate instead of a silent gap.
+ * @param opts.launchedAt Epoch ms when this client last asked a host to
+ *   launch a runner outside the send path (a host switch). Extends the
+ *   startup grace to that launch, so the move shows "Starting up…" rather
+ *   than an idle `runner_asleep` with no indicator at all.
  * @returns The single active liveness variant.
  */
 export function useSessionLiveness(
   sessionId: string | undefined,
   conv: LivenessRow | null | undefined,
-  opts?: { turnActive?: boolean },
+  opts?: { turnActive?: boolean; launchedAt?: number | null },
 ): SessionLiveness {
   const runnerOnline = useSessionRunnerOnline(sessionId);
   const hostOnline = useSessionHostOnline(sessionId);
@@ -241,6 +245,16 @@ export function useSessionLiveness(
     createdAt > 0 &&
     Date.now() / 1000 - createdAt < STARTING_GRACE_S
   ) {
+    return { kind: "starting" };
+  }
+
+  // 2'. Same grace for a runner this client just asked a host to launch
+  // outside the send path (a host switch). Deliberately NOT gated on
+  // `runnerEverOnline`: the point of a switch is that the previous runner
+  // WAS online and is now gone, so the session genuinely re-enters cold
+  // boot. Epoch ms, unlike `created_at`.
+  const launchedAt = opts?.launchedAt;
+  if (typeof launchedAt === "number" && Date.now() - launchedAt < STARTING_GRACE_S * 1000) {
     return { kind: "starting" };
   }
 

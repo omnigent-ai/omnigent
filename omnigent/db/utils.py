@@ -406,9 +406,12 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
     config = _build_alembic_config(db_uri)
     # Pass a shared connection so Alembic operates within the same
     # engine (required for SQLite in-memory databases, and avoids
-    # creating a second connection pool).
+    # creating a second connection pool). The connection is handed over
+    # outside any transaction so Alembic owns transaction demarcation:
+    # a migration with an autocommit_block (CREATE INDEX CONCURRENTLY)
+    # cannot suspend an externally-begun transaction.
     with query_name_scope("omnigent.database.run_migrations"):
-        with engine.begin() as connection:
+        with engine.connect() as connection:
             config.attributes["connection"] = connection
             command.upgrade(config, "head")
         # Belt-and-suspenders: if a future migration is added but a

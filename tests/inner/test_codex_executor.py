@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from omnigent.codex_model_vocabulary import codex_spawn_model
 from omnigent.inner.codex_executor import (
     _TURN_EVENT_WARN_SECONDS,
     CodexExecutor,
@@ -36,6 +37,7 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
+from omnigent.model_fallbacks import CODEX_DEFAULT_MODEL
 
 
 def _run(coro):
@@ -419,7 +421,9 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertIsInstance(events[2], ToolCallComplete)
             self.assertIsInstance(events[3], TurnComplete)
             self.assertEqual(fake_session.calls[0]["system_prompt"], "Be helpful.")
-            self.assertEqual(fake_session.calls[0]["model"], "catalog-openai-openai-default")
+            # Codex's own login defaults from codex's catalog, not the generic
+            # OpenAI one, whose newest row is a family alias codex rejects.
+            self.assertEqual(fake_session.calls[0]["model"], CODEX_DEFAULT_MODEL)
             self.assertEqual(fake_session.calls[0]["tools"][0]["name"], "calculate")
 
         _run(_t())
@@ -3444,5 +3448,32 @@ def test_run_turn_cli_config_passes_no_model_to_thread_create():
         ):
             pass
         assert fake_session.calls[0]["model"] is None
+
+    _run(_t())
+
+
+def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
+    """With no model anywhere, a codex-login turn gets a model codex accepts.
+
+    The bundled OpenAI catalog's newest row is the bare family alias
+    ``gpt-5.6``, which a ChatGPT-account backend rejects with a 400, so this
+    path must default from codex's own catalog instead.
+    """
+
+    async def _t():
+        fake_session = _FakeAppSession([[TurnComplete(response="done")]])
+        executor = CodexExecutor(
+            codex_path="/bin/echo",
+            app_session_factory=lambda **kwargs: fake_session,
+        )
+        async for _ in executor.run_turn(
+            [{"role": "user", "content": "hi", "session_id": "s1"}],
+            [],
+            "",
+        ):
+            pass
+        model = fake_session.calls[0]["model"]
+        assert model == CODEX_DEFAULT_MODEL
+        assert codex_spawn_model(model) == model, "not codex's own spelling"
 
     _run(_t())

@@ -107,7 +107,9 @@ final class WebViewModel: ObservableObject {
     return String(format: "%g", Double(value))
   }
 
-  static func javascriptString(_ value: String) -> String {
+  /// `nonisolated` because it touches no main-actor state — a pure formatter, so
+  /// non-isolated callers (e.g. `WorkspaceChromeScript`) can share it.
+  nonisolated static func javascriptString(_ value: String) -> String {
     guard let data = try? JSONEncoder().encode(value),
       let encoded = String(data: data, encoding: .utf8)
     else {

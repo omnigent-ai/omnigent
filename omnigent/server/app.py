@@ -12,11 +12,12 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from sqlalchemy.exc import StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
@@ -36,6 +37,7 @@ from omnigent.runtime import (
     get_terminal_registry,
     pending_elicitations,
     set_harness_process_manager,
+    set_runner_direct_attach_resolver,
     set_runner_router,
     set_runner_ws_factory,
 )
@@ -47,7 +49,8 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
-from omnigent.server.managed_hosts import ManagedSandboxConfig
+from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
+from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
@@ -100,6 +103,45 @@ from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 _logger = logging.getLogger(__name__)
 
 
+class SmartRoutingSourcesInfo(BaseModel):
+    external: bool
+    oss: bool
+
+
+class BrandingLogosInfo(BaseModel):
+    main: str | None
+    loading: str | None
+    favicon: str | None
+
+
+class BrandingInfo(BaseModel):
+    app_name: str | None
+    heading: str | None
+    logos: BrandingLogosInfo
+    powered_by: bool
+
+
+class ServerInfoResponse(BaseModel):
+    accounts_enabled: bool
+    single_user: bool
+    login_url: str | None
+    needs_setup: bool
+    databricks_features: bool
+    managed_sandboxes_enabled: bool
+    sandbox_provider: str | None
+    sandbox_providers: list[str]
+    sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
+    public_sharing_enabled: bool
+    server_version: str
+    smart_routing_enabled: bool
+    smart_routing_sources: SmartRoutingSourcesInfo
+    features: dict[str, bool]
+    harness_install_enabled: bool
+    installable_harnesses: list[str]
+    dictation_available: bool
+    branding: BrandingInfo
+
+
 def _server_version() -> str:
     """Return the server version exposed to clients.
 
@@ -130,10 +172,6 @@ def _register_web_mimetypes() -> None:
         (".map", "application/json"),
         (".wasm", "application/wasm"),
         (".svg", "image/svg+xml"),
-        # Python's mimetypes DB has no ``.webmanifest`` entry, so without this
-        # Starlette serves the PWA manifest as ``application/octet-stream`` and
-        # browsers silently refuse to install the app.
-        (".webmanifest", "application/manifest+json"),
     ):
         mimetypes.add_type(ctype, ext)
 
@@ -155,7 +193,17 @@ _API_ONLY_LANDING_HTML = Path(__file__).parent / "static" / "api_only_landing.ht
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
-_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1"})
+_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1", ".well-known"})
+
+# Envelope version of GET /.well-known/omnigent.json (see the route for the
+# full contract). Bump ONLY for a change a client cannot absorb by ignoring
+# what it doesn't recognize: a removed/renamed field, or a changed meaning for
+# an existing one. Adding a new field is invisible to older clients and must
+# NOT bump this — they read the fields they know and skip the rest.
+#
+# Clients gate on `>=`, never `==`: a newer server must keep working with an
+# older desktop shell.
+WELL_KNOWN_MANIFEST_VERSION = 1
 _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
@@ -471,6 +519,7 @@ def _ensure_default_agents(
     :param agent_cache: Cache for loaded agent specs.
     """
     _ensure_default_native_agents(agent_store, artifact_store, agent_cache)
+    _ensure_default_acp_agents(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
@@ -617,6 +666,125 @@ def _ensure_default_native_agents(
         )
 
 
+# Light framing for a seeded ACP picker agent. ACP agents run their own tool
+# loop, so the vendor CLI supplies the real behavior; this is just enough to
+# name the role.
+_ACP_AGENT_PROMPT = (
+    "You are a coding agent running inside Omnigent through the Agent Client "
+    "Protocol. Help the user with software engineering tasks in their workspace: "
+    "read and edit files, run commands, investigate, and implement changes. Work "
+    "within the current repository, explain what you are doing, and when you finish "
+    "a task tell the user how to verify it."
+)
+
+
+def _build_acp_bundle(*, harness: str, name: str) -> bytes:
+    """
+    Materialize a one-file ACP picker agent and tar it.
+
+    ACP agents have no provider row (unlike :func:`_build_native_bundle`), so the
+    spec is a generated single YAML on the debby-style directory path: just the
+    ``acp:<slug>`` (or builtin ACP CLI) harness id. The launch command is resolved
+    from the host's own ``acp:`` config (user agents) or PATH (builtin CLI rows)
+    at spawn time, so nothing host-specific is baked into the bundle.
+
+    :param harness: The harness id, e.g. ``"acp:devin"`` or ``"grok"``.
+    :param name: The agent name / stable-id seed — a valid ``[a-zA-Z0-9_-]+``
+        slug (e.g. ``"devin"``, ``"grok"``), never a display label with spaces.
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    import yaml
+
+    from omnigent.spec import materialize_bundle
+
+    raw = {
+        "spec_version": 1,
+        "name": name,
+        "prompt": _ACP_AGENT_PROMPT,
+        "executor": {"type": "omnigent", "config": {"harness": harness}},
+        "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        source = Path(tmpdir) / "src"
+        source.mkdir()
+        (source / "config.yaml").write_text(yaml.safe_dump(raw, sort_keys=False))
+        bundle_dir = materialize_bundle(source, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_acp_agents(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Seed a picker agent for each ACP harness set up on THIS server's host.
+
+    Native harnesses seed a fixed ``<harness>-ui`` agent each
+    (:func:`_ensure_default_native_agents`). ACP agents are host config rather
+    than a fixed catalog, so seed one agent per user-configured ``acp:<slug>``
+    agent (``harness_is_configured("acp:...")`` treats "in config" as set up) and
+    per builtin ACP CLI harness whose binary is on PATH (its readiness gate). On a
+    host with no ACP setup — the common remote-server case, where the server holds
+    no ``acp:`` config — this seeds nothing. When both sources name the same
+    harness, the configured agent wins (see :func:`shadowed_builtin_acp_rows`).
+
+    Purely additive: it only adds picker rows and never touches native seeding.
+    A malformed ``acp:`` block is logged and skipped, never fatal to startup
+    (mirrors the dynamic ``acp:*`` catalog rows in ``harness_plugins``).
+
+    Note: a seeded row is keyed by the agent's display name, so renaming a
+    configured ACP agent leaves the old picker row behind until the store is
+    reseeded — acceptable since native names are fixed and never rename.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    from omnigent._platform import resolve_cli_binary
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+    # (1) User-configured acp:<slug> agents — "set up" == present in config.
+    try:
+        from omnigent.onboarding.acp_auth import acp_agents, shadowed_builtin_acp_rows
+
+        configured = list(acp_agents())
+        shadowed: frozenset[str] = shadowed_builtin_acp_rows(configured)
+    except Exception:  # noqa: BLE001 — a malformed acp: block must never break startup
+        _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
+        configured = []
+        shadowed = frozenset()
+    for agent in configured:
+        # Key the built-in by the slug, not the display label: agent names must be
+        # ``[a-zA-Z0-9_-]+`` (the spec validator rejects spaces/dots), and a label
+        # like "Gemini CLI" would fail to load. The web picker capitalizes the slug
+        # for display (e.g. ``devin`` -> "Devin").
+        _ensure_builtin_agent(
+            agent_store,
+            artifact_store,
+            agent_cache,
+            name=agent.slug,
+            bundle_bytes=_build_acp_bundle(harness=f"acp:{agent.slug}", name=agent.slug),
+        )
+
+    # (2) Builtin ACP CLI harnesses (e.g. grok) — "set up" == binary on PATH. Keyed
+    # by the catalog id (already a valid slug), not the display label. A row a
+    # configured agent already claims is skipped: both seed the same
+    # ``builtin_agent_id``, so the row would overwrite the user's chosen command.
+    for key, row in ACP_CLI_HARNESSES.items():
+        if key in shadowed or resolve_cli_binary(row.binary) is None:
+            continue
+        _ensure_builtin_agent(
+            agent_store,
+            artifact_store,
+            agent_cache,
+            name=key,
+            bundle_bytes=_build_acp_bundle(harness=key, name=key),
+        )
+
+
 def _build_debby_bundle() -> bytes:
     """
     Build a gzipped tarball of the ``examples/debby`` agent bundle.
@@ -752,10 +920,11 @@ def create_app(
     debug_router_modules: list[str] | None = None,
     admins: list[str] | None = None,
     allowed_domains: list[str] | None = None,
-    sandbox_config: ManagedSandboxConfig | None = None,
+    sandbox_config: ManagedSandboxDeployment | None = None,
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
+    feature_flags: FeatureFlags | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -846,6 +1015,9 @@ def create_app(
         open to ``ON`` when unset or unrecognized. Reported by
         ``GET /v1/info`` as ``sharing_mode`` so the web app can gate its
         Share controls to match.
+    :param feature_flags: Optional immutable release-feature snapshot.
+        When omitted, resolves the comma-separated ``OMNIGENT_FEATURES``
+        enabled set once at application construction.
     :param public_sharing: Whether public (anyone-with-the-link) read
         access may be granted — i.e. whether the ``__public__`` grant is
         allowed. Orthogonal to ``sharing_mode``: a server can keep normal
@@ -864,6 +1036,11 @@ def create_app(
     """
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
+
+    from omnigent.server.server_config import load_branding_snapshot
+
+    branding_snapshot = load_branding_snapshot(server_config)
+    resolved_feature_flags = feature_flags or resolve_feature_flags()
 
     # First-boot admin bootstrap for the accounts auth provider.
     # Runs before any route is mounted so the login page is never
@@ -902,9 +1079,17 @@ def create_app(
     from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 
     tunnel_registry = TunnelRegistry()
+    host_registry = HostRegistry()
     runner_router = RunnerRouter(
         registry=tunnel_registry,
         conversation_store=conversation_store,
+        # host_registry answers "is the host on this replica"; host_store adds
+        # the "is it alive anywhere" gate. Together they classify a wrong-replica
+        # miss (re-addressable WRONG_REPLICA) apart from a genuinely offline
+        # runner (RUNNER_UNAVAILABLE) — a host reaped locally but dead everywhere
+        # is the latter, not a false wrong-replica.
+        host_registry=host_registry,
+        host_store=host_store,
     )
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
@@ -914,7 +1099,6 @@ def create_app(
         conversation_store,
         RunnerBackgroundTitleGenerator(runner_router),
     )
-    host_registry = HostRegistry()
     # Shared between the host tunnel (which records ``host.runner_exited``
     # reports from daemons) and the runner status endpoint (which surfaces
     # them to clients waiting for a launched runner to connect).
@@ -1011,9 +1195,18 @@ def create_app(
         # Install the tunnel-backed WS factory so browser terminal
         # attach can proxy frames over the same persistent WebSocket
         # the runner already uses for HTTP.
-        from omnigent.server._runner_ws_tunnel import make_tunnel_ws_factory
+        from omnigent.server._runner_ws_tunnel import (
+            make_direct_attach_resolver,
+            make_tunnel_ws_factory,
+        )
 
         set_runner_ws_factory(make_tunnel_ws_factory(runner_router, tunnel_registry))
+        # Companion resolver: lets the terminals API surface a runner's
+        # advertised loopback attach endpoint so a browser on the same
+        # machine can skip the relay entirely.
+        set_runner_direct_attach_resolver(
+            make_direct_attach_resolver(runner_router, tunnel_registry)
+        )
 
         # MCP execution moved to the runner (designs/RUNNER_MCP.md);
         # SessionFilesystemRegistry moved to the runner. Both
@@ -1135,6 +1328,7 @@ def create_app(
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
             set_runner_ws_factory(None)
+            set_runner_direct_attach_resolver(None)
             set_runner_router(None)
             await runner_router.aclose()
 
@@ -1161,6 +1355,8 @@ def create_app(
     app.state.host_store = host_store
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
+    app.state.branding_snapshot = branding_snapshot
+    app.state.feature_flags = resolved_feature_flags
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -1691,8 +1887,69 @@ def create_app(
         """
         return {"version": _server_version()}
 
-    @app.get("/v1/info")
-    async def info() -> dict[str, bool | str | list[str] | dict[str, bool] | None]:
+    @app.get("/.well-known/omnigent.json")
+    async def well_known_manifest() -> dict[str, object]:
+        """Version manifest for NON-BROWSER clients — chiefly the desktop shell.
+
+        The desktop shell ships and updates on its own cadence, so any
+        installed build can meet any server version. The shell is the side
+        that must adapt (the user may not update it for months), and to adapt
+        it first has to know what it is talking to. This endpoint is that
+        answer, fetched BEFORE the SPA loads — unlike ``/v1/info``, which the
+        SPA reads after boot and which is therefore useless to the shell when
+        deciding how to open a window in the first place.
+
+        Contract, in the order a client should apply it:
+
+        1. ``manifest_version`` (int) versions this ENVELOPE. Clients gate on
+           ``>=``, never ``==``, so a newer server keeps working with an older
+           shell. See :data:`WELL_KNOWN_MANIFEST_VERSION` for when it bumps —
+           adding a field never does.
+        2. ``server_version`` (str) is the installed omnigent package version,
+           the same value as ``/api/version`` and ``/v1/info.server_version``.
+           Informational: for display and bug reports, NOT for gating. Gate on
+           the fields below, which state capability directly rather than making
+           every client hardcode "which release added X".
+        3. ``min_desktop_version`` (str | null) is the oldest desktop build this
+           server still supports. Null means no floor — the overwhelmingly
+           common case, and what every shipped shell must treat as "fine".
+           A server sets it only to signal a genuinely breaking change.
+        4. Everything else is additive detail an older client may ignore
+           wholesale. ``ui`` describes where server-driven chrome lives, so a
+           shell can place its own window furniture without guessing from the
+           version number: ``server_picker`` is ``"sidebar"`` on builds that
+           dock the picker at the sidebar's bottom (it was ``"titlebar"``,
+           centered in the macOS title-bar strip, before this).
+
+        Unknown fields MUST be ignored, and a missing manifest (404 — every
+        server older than this route) MUST be treated as the pre-manifest
+        baseline, not an error: the shell falls back to its current behavior.
+        That is what makes an old shell + new server and a new shell + old
+        server both work.
+
+        Authentication: intentionally UNAUTHED, like ``/v1/info``. A client
+        must be able to read this before it holds a session cookie — the whole
+        point is to consult it before loading the app. It exposes only the
+        version already public via ``/api/version`` plus coarse UI-shape
+        strings, so there is nothing here to leak.
+
+        Served under ``/.well-known/`` (RFC 8615) so it sits at a fixed,
+        guessable path that never collides with an SPA client route.
+
+        :returns: The manifest described above.
+        """
+        return {
+            "manifest_version": WELL_KNOWN_MANIFEST_VERSION,
+            "server_version": _server_version(),
+            # No floor today: every desktop build in the wild works against
+            # this server. Kept present-but-null so clients can rely on the
+            # key existing and exercise the "no floor" path from day one.
+            "min_desktop_version": None,
+            "ui": {"server_picker": "sidebar"},
+        }
+
+    @app.get("/v1/info", response_model=ServerInfoResponse)
+    async def info() -> ServerInfoResponse:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -1761,11 +2018,16 @@ def create_app(
         # generic "New Sandbox". Only surfaced when the option is
         # actually offered; None when no provider is named (embedding
         # configs may leave it unset) so the UI keeps the generic label.
+        # sandbox_providers lists every launch-capable provider (one picker
+        # row each); sandbox_provider keeps naming the first, so a bundle
+        # cached before this field existed still shows its single option.
         managed_sandboxes_enabled = False
         sandbox_provider = None
+        sandbox_providers: list[str] = []
         if sandbox_config is not None and sandbox_config.managed_launch_supported:
             managed_sandboxes_enabled = True
-            sandbox_provider = sandbox_config.provider
+            sandbox_provider = sandbox_config.default.provider
+            sandbox_providers = list(sandbox_config.launchable_providers())
         # sharing_mode is the server's session-sharing policy
         # (on/read_only/off), surfaced so the web app can hide the Share
         # control (off) or restrict it to read-only (read_only) in lockstep
@@ -1798,17 +2060,10 @@ def create_app(
         except ImportError:
             smart_routing_enabled = False
             smart_routing_sources = {"external": False, "oss": False}
-        # harness_install_enabled gates the web UI's "Install" action for a
-        # missing, npm-installable harness on a connected host. Off by default
-        # (OMNIGENT_HARNESS_INSTALL_ENABLED=1 opts in) while the feature rolls
-        # out; when false the SPA keeps the prior "run omnigent setup" hint.
-        # Read live so flipping the env var takes effect without a rebuild.
-        # The env-var name is shared with the install route so the flag the UI
-        # sees and the flag the route enforces can never drift apart.
-        from omnigent.process_logging import env_truthy
-        from omnigent.server.routes.hosts import HARNESS_INSTALL_ENABLED_ENV
-
-        harness_install_enabled = env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV))
+        # The immutable feature snapshot is shared by capability
+        # advertisement and route enforcement, so frontend and backend cannot
+        # disagree during a process lifetime.
+        harness_install_enabled = app.state.feature_flags.enabled(Feature.HARNESS_INSTALL)
         # installable_harnesses: the exact harness ids the install route accepts
         # (bare ids + native spellings resolving to an npm-installable family),
         # so the SPA offers setup only where it will succeed and never has to
@@ -1826,23 +2081,59 @@ def create_app(
         from omnigent.server.dictation import engine_availability
 
         dictation_available, _ = engine_availability()
-        return {
-            "accounts_enabled": accounts_enabled,
-            "single_user": single_user,
-            "login_url": login_url,
-            "needs_setup": needs_setup,
-            "databricks_features": databricks_features,
-            "managed_sandboxes_enabled": managed_sandboxes_enabled,
-            "sandbox_provider": sandbox_provider,
-            "sharing_mode": sharing_mode.value,
-            "public_sharing_enabled": public_sharing_enabled,
-            "server_version": _server_version(),
-            "smart_routing_enabled": smart_routing_enabled,
-            "smart_routing_sources": smart_routing_sources,
-            "harness_install_enabled": harness_install_enabled,
-            "installable_harnesses": installable_harnesses,
-            "dictation_available": dictation_available,
-        }
+        return ServerInfoResponse.model_validate(
+            {
+                "accounts_enabled": accounts_enabled,
+                "single_user": single_user,
+                "login_url": login_url,
+                "needs_setup": needs_setup,
+                "databricks_features": databricks_features,
+                "managed_sandboxes_enabled": managed_sandboxes_enabled,
+                "sandbox_provider": sandbox_provider,
+                "sandbox_providers": sandbox_providers,
+                "sharing_mode": sharing_mode.value,
+                "public_sharing_enabled": public_sharing_enabled,
+                "server_version": _server_version(),
+                "smart_routing_enabled": smart_routing_enabled,
+                "smart_routing_sources": smart_routing_sources,
+                "features": app.state.feature_flags.frontend_dict(),
+                "harness_install_enabled": harness_install_enabled,
+                "installable_harnesses": installable_harnesses,
+                "dictation_available": dictation_available,
+                "branding": branding_snapshot.config(),
+            }
+        )
+
+    @app.get(
+        "/v1/branding/logo/{variant}",
+        response_class=Response,
+        responses={
+            200: {
+                "description": "Validated raster branding image",
+                "content": {
+                    media_type: {"schema": {"type": "string", "format": "binary"}}
+                    for media_type in (
+                        "image/gif",
+                        "image/jpeg",
+                        "image/png",
+                        "image/webp",
+                        "image/x-icon",
+                    )
+                },
+            },
+            404: {"description": "Branding image not configured or invalid"},
+        },
+    )
+    async def branding_logo(variant: str) -> Response:
+        """Serve a validated public branding asset, or 404 when unset."""
+        asset = branding_snapshot.logo_asset(variant)
+        if asset is None:
+            raise StarletteHTTPException(status_code=404, detail="Branding logo not found")
+        return Response(
+            content=asset.content,
+            media_type=asset.media_type,
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
     async def me(request: Request) -> dict[str, str | bool | None] | JSONResponse:
@@ -1941,6 +2232,7 @@ def create_app(
         create_usage_router(
             conversation_store,
             auth_provider=auth_provider,
+            feature_flags=resolved_feature_flags,
         ),
         prefix="/v1",
         tags=["usage"],
@@ -2066,47 +2358,44 @@ def create_app(
         )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
-    async def _on_runner_disconnect(runner_id: str) -> None:
-        """Mark the turns *this* runner interrupted as offline.
 
-        Filters by ``runner_id`` against ``conversation_store`` so a
-        disconnect on one runner does not flip every cached session
-        (e.g. sessions owned by other runners on the same server, or
-        sessions left in the module-level cache by earlier tests on
-        the same xdist worker) to ``"failed"``.
-        :func:`_mark_runner_sessions_offline` then narrows that set to
-        the sessions actually mid-turn and stamps the disconnect cause
-        on them, so idle sub-agents keep their finished state and the
-        interrupted ones read as a recoverable disconnect.
+    # Pending per-runner grace timers: a disconnect schedules the
+    # failed-marking after RUNNER_DISCONNECT_GRACE_S instead of doing it
+    # immediately, so transient tunnel drops (ingress recycles,
+    # sleep-wake reconnects) that re-register within the grace never
+    # flap their sessions to failed.
+    _disconnect_grace_tasks: dict[str, asyncio.Task[None]] = {}
+
+    def _cancel_disconnect_grace(runner_id: str) -> None:
+        """Cancel and forget the pending disconnect-grace timer, if any."""
+        pending = _disconnect_grace_tasks.pop(runner_id, None)
+        if pending is not None and not pending.done():
+            pending.cancel()
+
+    async def _mark_disconnected_runner_failed(runner_id: str) -> None:
+        """Reconcile a dropped runner's sessions once the grace expires.
+
+        A runner that re-registered inside the grace makes this a no-op
+        via the live-tunnel re-check (the same newest-wins rule the
+        immediate path used); one still gone hands its bound sessions to
+        :func:`_mark_runner_sessions_offline`, which fails only the
+        interrupted turns and stamps the disconnect cause.
 
         :param runner_id: The disconnected runner's id.
         """
-        from omnigent.server.routes.sessions import _mark_runner_sessions_offline
+        from omnigent.server.routes.sessions import (
+            RUNNER_DISCONNECT_GRACE_S,
+            _mark_runner_sessions_offline,
+        )
         from omnigent.server.schemas import ErrorDetail
 
-        # Newest-wins guard: a superseded tunnel's teardown fires this
-        # hook after a fresh tunnel for the same ``runner_id`` already
-        # registered (``TunnelRegistry.register`` retires the old
-        # session, whose helper tasks then error out and run this
-        # teardown). Marking the runner's sessions ``failed`` here would
-        # clobber the live tunnel's recovery: reconnect-recovery
-        # (``_on_runner_connect`` -> ``_publish_runner_recovered_status``)
-        # may have just cleared a stale ``runner_disconnected`` failure,
-        # and this stale disconnect would silently re-fail the session.
-        # If a live tunnel is registered for this runner, the runner is
-        # NOT offline, so skip. Mirrors the registry's own
-        # generation-guarded ``deregister``.
+        await asyncio.sleep(RUNNER_DISCONNECT_GRACE_S)
         if tunnel_registry.get(runner_id) is not None:
             _logger.info(
-                "Runner %s disconnect superseded by a live tunnel; skipping offline-marking",
+                "Runner %s reconnected within the disconnect grace; skipping offline-marking",
                 runner_id,
             )
             return
-        runner_session_initializer.invalidate_runner(runner_id)
-        # Graceful disconnect: clear the persisted liveness stamp so other
-        # replicas flip offline immediately rather than after the TTL.
-        session_live_state.clear_runner_liveness(runner_id)
-
         # Direct by-runner lookup: read-after-write consistent (the
         # listing path may be served from an eventually-consistent
         # search index in alternate store backends) and
@@ -2131,6 +2420,66 @@ def create_app(
             conversation_store,
         )
 
+    async def _on_runner_disconnect(runner_id: str) -> None:
+        """Schedule offline-marking for the turns *this* runner interrupted.
+
+        Filters by ``runner_id`` against ``conversation_store`` so a
+        disconnect on one runner does not flip every cached session
+        (e.g. sessions owned by other runners on the same server, or
+        sessions left in the module-level cache by earlier tests on
+        the same xdist worker) to ``"failed"``.
+        :func:`_mark_runner_sessions_offline` then narrows that set to
+        the sessions actually mid-turn and stamps the disconnect cause
+        on them, so idle sub-agents keep their finished state and the
+        interrupted ones read as a recoverable disconnect.
+
+        The user-visible failed flip waits out a reconnect grace
+        (``RUNNER_DISCONNECT_GRACE_S``): transient drops re-register
+        well inside it and the timer's live-tunnel re-check turns them
+        into no-ops, so routine recycles never flap sessions to failed.
+        Runner invalidation and liveness clearing stay immediate so
+        reconnect re-initialization still happens.
+
+        :param runner_id: The disconnected runner's id.
+        """
+        # Newest-wins guard: a superseded tunnel's teardown fires this
+        # hook after a fresh tunnel for the same ``runner_id`` already
+        # registered (``TunnelRegistry.register`` retires the old
+        # session, whose helper tasks then error out and run this
+        # teardown). Marking the runner's sessions ``failed`` here would
+        # clobber the live tunnel's recovery: reconnect-recovery
+        # (``_on_runner_connect`` -> ``_publish_runner_recovered_status``)
+        # may have just cleared a stale ``runner_disconnected`` failure,
+        # and this stale disconnect would silently re-fail the session.
+        # If a live tunnel is registered for this runner, the runner is
+        # NOT offline, so skip. Mirrors the registry's own
+        # generation-guarded ``deregister``.
+        if tunnel_registry.get(runner_id) is not None:
+            _logger.info(
+                "Runner %s disconnect superseded by a live tunnel; skipping offline-marking",
+                runner_id,
+            )
+            return
+        runner_session_initializer.invalidate_runner(runner_id)
+        # Graceful disconnect: clear the persisted liveness stamp so other
+        # replicas flip offline immediately rather than after the TTL.
+        session_live_state.clear_runner_liveness(runner_id)
+
+        # Replace any pending timer so a rapid drop-reconnect-drop gives
+        # each outage a full grace window.
+        _cancel_disconnect_grace(runner_id)
+        task = asyncio.create_task(
+            _mark_disconnected_runner_failed(runner_id),
+            name=f"runner-disconnect-grace-{runner_id}",
+        )
+        _disconnect_grace_tasks[runner_id] = task
+
+        def _clear_grace_slot(t: asyncio.Task[None]) -> None:
+            if _disconnect_grace_tasks.get(runner_id) is t:
+                _disconnect_grace_tasks.pop(runner_id, None)
+
+        task.add_done_callback(_clear_grace_slot)
+
     async def _on_runner_exited(runner_id: str, error: str) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.
 
@@ -2152,6 +2501,10 @@ def create_app(
         from omnigent.server.routes.sessions import _mark_runner_sessions_offline
         from omnigent.server.schemas import ErrorDetail
 
+        # The crash report is authoritative and carries the richer cause;
+        # cancel any pending disconnect-grace timer so it can't re-run the
+        # disconnect reconciliation on top of it.
+        _cancel_disconnect_grace(runner_id)
         affected = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
@@ -2346,6 +2699,7 @@ def create_app(
                 permission_store=permission_store,
                 agent_store=agent_store,
                 agent_cache=agent_cache,
+                feature_flags=resolved_feature_flags,
             ),
             prefix="/v1",
             tags=["hosts"],
@@ -2639,10 +2993,10 @@ def _apply_web_ui_cache_headers(response: Response, path: str) -> Response:
     media_type = content_type.partition(";")[0].lower() if content_type is not None else None
     if path.startswith("assets/"):
         response.headers["Cache-Control"] = _WEB_UI_ASSET_CACHE_CONTROL
-    elif path in {"sw.js", "version.json"}:
-        # The service worker and the version sentinel it precaches must
-        # revalidate on every load, or the HTTP cache could mask a deploy for up
-        # to an hour and defeat prompt-to-reload.
+    elif path == "sw.js":
+        # Keep this exemption even after the tombstone worker is deleted in
+        # 0.11.0: a cached ``sw.js`` must never shadow a service worker served at
+        # this path later, or the stale script would win for up to an hour.
         response.headers["Cache-Control"] = _WEB_UI_HTML_CACHE_CONTROL
     elif media_type == "text/html" or path in {"", ".", "index.html"}:
         response.headers["Cache-Control"] = _WEB_UI_HTML_CACHE_CONTROL

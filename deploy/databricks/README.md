@@ -147,6 +147,17 @@ UC Volume wheel paths because `uv lock` validates path sources locally.
 
 Re-running is safe — every step is idempotent.
 
+Release features are off by default. Enable one or more for the whole app by
+adding the comma-separated deploy argument, then reload the web app after the
+redeploy:
+
+```bash
+--features usage_page,harness_install
+```
+
+See [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for the current
+inventory and rollback procedure.
+
 > [!TIP]
 > To lock against a private PyPI mirror or proxy instead of public
 > PyPI, set `UV_INDEX_URL` before running `deploy.py`.
