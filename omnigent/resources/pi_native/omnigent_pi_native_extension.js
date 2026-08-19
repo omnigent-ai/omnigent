@@ -436,6 +436,56 @@ function mcpInputRequired(json) {
  *   200 response; ``piResult`` is a terminal fail-closed tool result the caller
  *   returns as-is.
  */
+/**
+ * Bounded classification for a 2xx ``/mcp`` reply that is not an MCP JSON body.
+ *
+ * ``resp.ok`` is not proof of a JSON answer: an authenticating edge (reverse
+ * proxy, IdP) in front of the server can answer any route with a sign-in
+ * document and status 200. The text names the classification only — never the
+ * body, headers, or URL — because a sign-in document routinely carries tokens
+ * and tenant identifiers.
+ */
+function nonJsonMcpPiResult() {
+  return {
+    content: [
+      {
+        type: "text",
+        text:
+          "Omnigent tool call failed: the server answered 2xx with a non-JSON " +
+          "body, which usually means an authenticating proxy or sign-in page " +
+          "answered instead of Omnigent. Re-authenticate and retry.",
+      },
+    ],
+    isError: true,
+  };
+}
+
+/**
+ * False when ``resp`` declares a content type that is not JSON.
+ *
+ * A declared ``text/html`` (the sign-in case) is rejected. An absent or
+ * unreadable content type is not treated as a signal, so the parse attempt
+ * stays the decider there.
+ */
+function mcpContentTypeIsJson(resp) {
+  let declared = null;
+  try {
+    // Both the property read and the lookup are inside the try: a `headers`
+    // getter can throw just as `get()` can.
+    const headers = resp && resp.headers;
+    if (headers && typeof headers.get === "function") {
+      declared = headers.get("content-type");
+    }
+  } catch (_headerErr) {
+    // An unreadable header is not a signal, so fall through to the parse.
+    // Swallow it here: letting it reach the outer catch would put its message —
+    // which can quote header or body text — into the tool result.
+    return true;
+  }
+  if (typeof declared !== "string" || declared.trim() === "") return true;
+  return /^application\/(?:[\w.+-]+\+)?json\s*(?:;|$)/i.test(declared.trim());
+}
+
 async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
   const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/mcp`;
   const body = JSON.stringify({
@@ -466,7 +516,16 @@ async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
         },
       };
     }
-    return { json: await resp.json() };
+    // Status, content type, and parseability must all agree before this body is
+    // treated as an MCP response. A parse failure is classified here rather
+    // than by the outer catch, whose message would echo the offending body back
+    // through ``err.message``.
+    if (!mcpContentTypeIsJson(resp)) return { piResult: nonJsonMcpPiResult() };
+    try {
+      return { json: await resp.json() };
+    } catch (_parseErr) {
+      return { piResult: nonJsonMcpPiResult() };
+    }
   } catch (err) {
     return {
       piResult: {
