@@ -2071,6 +2071,9 @@ export function NewChatLandingScreen() {
   // text it inserts (and insert at the caret rather than the draft's end).
   const dictation = useDictationInsert(message, setMessage, textareaRef);
   const isComposingRef = useRef(false);
+  // Timer for the deferred compositionend reset below; cancelled when a new
+  // composition starts so a stale flush can't disarm the IME guard.
+  const composingResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // maxRows 9 = 180px of 20px lines, matching the composer's 200px
   // border-box max (180px content + 16px top / 4px bottom padding).
   useAutoGrowTextarea(textareaRef, message, 9);
@@ -4195,10 +4198,24 @@ export function NewChatLandingScreen() {
                 dismissMention();
               }}
               onCompositionStart={() => {
+                // Safari can start a new composition (segment switch) before
+                // the previous compositionend's deferred reset runs — drop it,
+                // or it clears the flag mid-composition.
+                if (composingResetRef.current !== null) {
+                  clearTimeout(composingResetRef.current);
+                  composingResetRef.current = null;
+                }
                 isComposingRef.current = true;
               }}
               onCompositionEnd={() => {
-                isComposingRef.current = false;
+                // Safari fires compositionend BEFORE the confirming Enter's
+                // keydown, which looks ordinary (isComposing=false,
+                // keyCode=13, not 229). Defer the reset a macrotask so the IME
+                // guard still sees composition active and ignores that Enter.
+                composingResetRef.current = setTimeout(() => {
+                  composingResetRef.current = null;
+                  isComposingRef.current = false;
+                }, 0);
               }}
               onKeyDown={(e) => {
                 if (isImeCompositionKeyEvent(e, isComposingRef.current)) {

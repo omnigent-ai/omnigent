@@ -210,6 +210,14 @@ async function waitForWorkspaceSeed(): Promise<void> {
   );
 }
 
+/**
+ * Flush the deferred isComposing reset queued by compositionend — one
+ * macrotask, matching the gap before a user's next deliberate Enter.
+ */
+async function flushCompositionReset(): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
 /** Open the git-worktree popover so its branch fields mount. */
 function openWorktree(): void {
   fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
@@ -471,7 +479,74 @@ describe("NewChatLandingScreen create flow", () => {
     expect(authenticatedFetch).not.toHaveBeenCalled();
     expect(navigateMock).not.toHaveBeenCalled();
 
+    // compositionend defers the isComposing reset to the next macrotask so the
+    // Safari confirming Enter (next test) still observes composition active.
+    // Here the confirming Enter already fired mid-composition above; the next
+    // Enter is a deliberate create, but only once the deferred reset flushes.
     fireEvent.compositionEnd(input);
+    await flushCompositionReset();
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
+  it("does not create a session when Safari fires the confirming Enter after compositionend", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "オムニジェント" } });
+
+    // Safari order: compositionend BEFORE the confirming keydown, which looks
+    // ordinary (isComposing=false, keyCode=13). Only the deferred reset keeps
+    // the guard armed through this keydown.
+    fireEvent.compositionEnd(input);
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    expect(navigateMock).not.toHaveBeenCalled();
+
+    // After the deferred reset flushes, a deliberate Enter creates the session.
+    await flushCompositionReset();
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
+  it("keeps the guard armed when a new composition starts before the deferred reset flushes", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: "オムニ" } });
+
+    // Safari segment switch: compositionend then a new compositionstart before
+    // the queued reset runs. compositionstart must cancel it — otherwise the
+    // stale flush clears the flag during the second composition.
+    fireEvent.compositionEnd(input);
+    fireEvent.compositionStart(input);
+    await flushCompositionReset();
+
+    fireEvent.change(input, { target: { value: "オムニジェント" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    expect(navigateMock).not.toHaveBeenCalled();
+
+    // Ending the second composition re-arms the reset, so the next Enter
+    // creates the session.
+    fireEvent.compositionEnd(input);
+    await flushCompositionReset();
     fireEvent.keyDown(input, { key: "Enter" });
 
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));

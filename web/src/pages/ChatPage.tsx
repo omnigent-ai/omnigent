@@ -4541,6 +4541,9 @@ export function Composer({
   // text it inserts (and insert at the caret rather than the draft's end).
   const dictation = useDictationInsert(value, setValue, textareaRef);
   const isComposingRef = useRef(false);
+  // Timer for the deferred compositionend reset below; cancelled when a new
+  // composition starts so a stale flush can't disarm the IME guard.
+  const composingResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Highlight overlay mirroring the textarea; scroll-synced so the tinted
   // `/skill` token stays aligned once the draft grows past the visible rows.
   const backdropRef = useRef<HTMLDivElement>(null);
@@ -5495,10 +5498,25 @@ export function Composer({
               dictation.noteFocus();
             }}
             onCompositionStart={() => {
+              // Safari can start a new composition (segment switch) before the
+              // previous compositionend's deferred reset runs — drop it, or it
+              // clears the flag mid-composition.
+              if (composingResetRef.current !== null) {
+                clearTimeout(composingResetRef.current);
+                composingResetRef.current = null;
+              }
               isComposingRef.current = true;
             }}
             onCompositionEnd={() => {
-              isComposingRef.current = false;
+              // Safari fires compositionend BEFORE the keydown of the Enter
+              // that confirmed the composition, and that keydown looks
+              // ordinary (isComposing=false, keyCode=13, not the 229 IME
+              // fallback). Defer the reset a macrotask so the IME guard in
+              // handleKeyDown still sees composition active and ignores it.
+              composingResetRef.current = setTimeout(() => {
+                composingResetRef.current = null;
+                isComposingRef.current = false;
+              }, 0);
             }}
             onKeyDown={handleKeyDown}
             onBlur={() => {
