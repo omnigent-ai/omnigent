@@ -2409,3 +2409,35 @@ def test_maybe_prewarm_ambient_detection_gates_on_launch_harness(
     monkeypatch.setenv(RUNNER_LAUNCH_HARNESS_ENV_VAR, "claude-native")
     _maybe_prewarm_ambient_detection()
     assert prewarms == ["prewarm"]
+
+
+def test_auth_token_factory_refreshes_expired_oidc_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wiring that actually keeps an unattended host alive: when the stored
+    OIDC token has lapsed but a login-issued refresh grant is present, the
+    auth-token factory returns the REFRESHED token — so the next reconnect
+    authenticates instead of crash-looping. Guards the load->refresh->fallback
+    integration in ``_factory`` (only the unit-level refresh was covered before).
+    """
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    # A plain `omnigent login` host on the stored-OIDC-token path: no host
+    # bootstrap bearer and no managed-sandbox delegation.
+    monkeypatch.delenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.delenv("OMNIGENT_RUNNER_DELEGATED_AUTH", raising=False)
+    # Stored token reads as unusable (expired / inside the renewal window)...
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    # ...but the refresh grant mints a fresh session JWT.
+    refresh_calls: list[str] = []
+
+    def _refresh(url: str) -> str:
+        refresh_calls.append(url)
+        return "refreshed-jwt"
+
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", _refresh)
+
+    factory = _make_auth_token_factory()
+
+    assert factory is not None
+    assert factory() == "refreshed-jwt"
+    assert refresh_calls, "the refresh path must have run"

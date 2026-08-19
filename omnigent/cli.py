@@ -11255,9 +11255,7 @@ def _accounts_login(server: str) -> None:
     try:
         resp = _httpx.post(
             f"{server}/auth/login",
-            # issue_refresh: ask for a login-issued refresh grant so the
-            # host/CLI can renew unattended (older servers ignore it).
-            json={"username": username, "password": password, "issue_refresh": True},
+            json={"username": username, "password": password},
             timeout=10.0,
         )
     except _httpx.HTTPError as exc:
