@@ -2322,6 +2322,24 @@ class HostProcess:
                 models=models,
             )
 
+        if harness == "pi-native":
+            try:
+                from omnigent.pi_native_credentials import pi_native_model_options
+
+                pi_models = await asyncio.to_thread(pi_native_model_options)
+            except Exception:
+                _logger.exception("Failed to resolve pre-launch Pi model options")
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve Pi model options",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=pi_models,
+            )
+
         if harness != "claude-native":
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,

@@ -123,6 +123,42 @@ async def test_handle_model_options_uses_host_claude_configuration(
     )
 
 
+async def test_handle_model_options_uses_host_pi_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pi's launch picker uses only models configured through Omnigent."""
+    from omnigent import pi_native_credentials
+
+    monkeypatch.setattr(
+        pi_native_credentials,
+        "pi_native_model_options",
+        lambda: [
+            {
+                "id": "omnigent-openai/system.ai.gpt-5-6-sol",
+                "model": "omnigent-openai/system.ai.gpt-5-6-sol",
+                "displayName": "omnigent-openai/GPT 5.6 Sol",
+            }
+        ],
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_pi_models", harness="pi-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_pi_models",
+        status="ok",
+        models=[
+            {
+                "id": "omnigent-openai/system.ai.gpt-5-6-sol",
+                "model": "omnigent-openai/system.ai.gpt-5-6-sol",
+                "displayName": "omnigent-openai/GPT 5.6 Sol",
+            }
+        ],
+    )
+
+
 async def test_handle_model_options_uses_codex_provider_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
