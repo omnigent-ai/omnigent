@@ -35,6 +35,7 @@ from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
@@ -339,6 +340,9 @@ _LOOPBACK_REFUSED_FATAL_ATTEMPTS = 30
 # endpoint that accepts and never speaks is functionally down.
 _SILENT_CONNECT_ESCALATE_ATTEMPTS = 10
 
+# Capability discovery is advisory and must not delay the host channel forever.
+_HOST_CAPABILITY_INIT_TIMEOUT_S = 15.0
+
 # Host-environment variables a spawned runner is allowed to inherit.
 # Deliberately an allowlist (not ``{**os.environ}``): the host runs as the
 # user, so its environment holds the user's personal secrets (API keys,
@@ -597,8 +601,8 @@ _LOGIN_REDIRECT_FATAL_ATTEMPTS = 3
 class HostConnectError(Exception):
     """A non-retryable failure while opening the host tunnel.
 
-    Raised when the WebSocket upgrade fails in a way that reconnecting
-    can never fix — the Databricks Apps proxy bounced the connection to
+    Raised when connection setup or the server reports a failure that
+    reconnecting cannot fix — the Databricks Apps proxy bounced the connection to
     a login page (wrong/absent workspace credentials), the server
     returned a permanent ``4xx`` (unauthenticated, unauthorized, or a
     build that predates the host API), or a loopback server refused a
@@ -781,6 +785,10 @@ class _RunnerHandle:
     log_path: Path
 
 
+class HostRetryableConnectionError(Exception):
+    """Server-reported channel failure that should use reconnect backoff."""
+
+
 class HostProcess:
     """Manages the host daemon lifecycle.
 
@@ -818,6 +826,12 @@ class HostProcess:
         # server — where the same failures retry forever instead of killing a
         # host with running sessions.
         self._ever_connected = False
+        # Capability discovery belongs to daemon initialization, not the
+        # connection handshake. Reconnects reuse this snapshot while the live
+        # refresh task keeps it current.
+        self._configured_harnesses: dict[str, HarnessAvailability] | None = None
+        self._gateway_inference: dict[str, bool] | None = None
+        self._capabilities_initialized = False
         # Consecutive login-page redirects; reset by a successful upgrade.
         self._login_redirect_streak = 0
         # Consecutive 401/403 upgrade rejections on an already-connected host;
@@ -2536,6 +2550,67 @@ class HostProcess:
             ],
         )
 
+    async def _probe_configured_harnesses(
+        self,
+        *,
+        startup: bool,
+    ) -> dict[str, HarnessAvailability] | None:
+        """Collect harness readiness without letting a probe break the channel."""
+        try:
+            return await asyncio.to_thread(configured_harness_map)
+        except Exception as exc:
+            _logger.exception("Host harness readiness probe failed")
+            if startup:
+                print(
+                    "⚠ Could not inspect installed harnesses; the host will "
+                    f"connect with harness readiness unknown: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return None
+
+    async def _probe_gateway_inference(self, *, startup: bool) -> dict[str, bool] | None:
+        """Collect gateway metadata without letting a probe break the channel."""
+        try:
+            return await asyncio.to_thread(gateway_inference_map)
+        except Exception as exc:
+            _logger.exception("Host gateway-inference probe failed")
+            if startup:
+                print(
+                    "⚠ Could not inspect gateway inference; the host will "
+                    f"connect with gateway backing unknown: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return None
+
+    async def _initialize_capabilities(self) -> None:
+        """Build the initial capability snapshot once, before any handshake."""
+        if self._capabilities_initialized:
+            return
+        try:
+            configured, gateway = await asyncio.wait_for(
+                asyncio.gather(
+                    self._probe_configured_harnesses(startup=True),
+                    self._probe_gateway_inference(startup=True),
+                ),
+                timeout=_HOST_CAPABILITY_INIT_TIMEOUT_S,
+            )
+        except TimeoutError:
+            configured = gateway = None
+            _logger.error(
+                "Host capability discovery exceeded %.0fs; continuing with unknown metadata",
+                _HOST_CAPABILITY_INIT_TIMEOUT_S,
+            )
+            print(
+                "⚠ Host capability discovery timed out; connecting with readiness unknown.",
+                file=sys.stderr,
+                flush=True,
+            )
+        self._configured_harnesses = configured
+        self._gateway_inference = gateway
+        self._capabilities_initialized = True
+
     async def run(self) -> None:
         """Run the host process with reconnection.
 
@@ -2548,6 +2623,11 @@ class HostProcess:
             authorization / outdated server, or a loopback server that
             kept refusing connections (the local server is gone).
         """
+        # Capability probes may shell out or inspect local config, so perform
+        # them once during daemon initialization. They are advisory: a broken
+        # harness is reported as unknown and must not prevent registration.
+        await self._initialize_capabilities()
+
         # Reap orphaned harness/tool grandchildren that reparent here when a
         # runner dies (this host is PID 1 in a container, or a subreaper
         # otherwise). Without this they pile up as <defunct> zombies and can
@@ -2876,20 +2956,7 @@ class HostProcess:
         return None
 
     async def _serve_frames(self, ws: websockets.asyncio.client.ClientConnection) -> None:
-        """Announce readiness, then service host frames until disconnect.
-
-        Sends the ``host.hello`` frame, prints the success banner, then
-        loops dispatching launch/stop/stat/list_dir/worktree requests and
-        answering runner pings until the connection closes. Harness-readiness
-        updates run in a separate task (:meth:`_harness_readiness_loop`) so a
-        slow probe can never stall this receive loop.
-
-        :param ws: The open tunnel connection returned by the websockets
-            client.
-        :returns: None. Returns when the receive loop is broken.
-        :raises Exception: On WebSocket disconnect or error — propagated
-            to the reconnect loop in :meth:`run`.
-        """
+        """Send the cached host hello, then service frames until disconnect."""
         _tel_opt_out = False
         try:
             from omnigent.telemetry.client import is_disabled as _tel_disabled
@@ -2905,32 +2972,27 @@ class HostProcess:
                 _tel_install_id = _get_install_id()
         except Exception:  # noqa: BLE001
             pass
-        configured_harnesses = await asyncio.to_thread(configured_harness_map)
-        gateway_inference = await asyncio.to_thread(gateway_inference_map)
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
             name=self._identity.name,
             runners=self._alive_runner_ids(),
-            # Off the event loop: probes PATH and reads local config.
-            # The loop below refreshes changes; launch remains authoritative.
-            configured_harnesses=configured_harnesses,
-            gateway_inference=gateway_inference,
+            configured_harnesses=self._configured_harnesses,
+            gateway_inference=self._gateway_inference,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
         )
-        await ws.send(encode_host_frame(hello))
+        try:
+            encoded_hello = encode_host_frame(hello)
+        except Exception as exc:
+            raise HostConnectError(f"Could not encode host.hello: {exc}") from exc
+        await ws.send(encoded_hello)
         self._ws = ws
-        # Flush exit reports that raced a disconnect: a runner that died
-        # while the tunnel was down would otherwise never be reported and
-        # the waiting client would poll to its timeout.
+        # Reports raised while disconnected must wait until registration; the
+        # server cannot route them before this connection owns the host.
         for runner_id, error in list(self._unreported_exits.items()):
             del self._unreported_exits[runner_id]
             await self._report_runner_exit(runner_id, error)
-        # ``print`` (not ``_logger.warning``) so the user always sees the
-        # success line after the noisy ``databricks.sdk`` warnings —
-        # otherwise the terminal goes silent after auth and there's no
-        # signal the WS handshake actually completed.
         print(
             f"✓ Connected as {self._identity.name!r} "
             f"({self._identity.host_id}), {len(hello.runners)} live runner(s). "
@@ -2938,23 +3000,19 @@ class HostProcess:
             flush=True,
         )
 
-        # Readiness refresh runs in its own task, never on this receive loop:
-        # a harness probe that blocks (a hung CLI ``--version`` / ``auth
-        # status``) must not delay ``ws.recv()`` or the inline keepalive pong
-        # the server's watchdog counts as liveness, or it closes the tunnel
-        # with ``4003 ping timeout``.
-        readiness_task = asyncio.create_task(
-            self._harness_readiness_loop(ws, configured_harnesses)
-        )
+        readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
         try:
             while True:
                 raw = await ws.recv()
-                # Any inbound frame proves the server end is alive — the
-                # reconnect loop's silent-connect streak keys off this.
                 self._conn_frame_received = True
                 if isinstance(raw, str):
-                    # Each frame is handled on its own task so a slow handler
-                    # (a model-options CLI exec, a long git walk) can't
+                    # Connection-control frames decide whether this receive
+                    # loop exits or reconnects, so handle them inline. Ordinary
+                    # request frames run concurrently below; exceptions raised
+                    # on those detached tasks are intentionally contained.
+                    self._raise_connection_error_from_raw(raw)
+                    # Each request frame is handled on its own task so a slow
+                    # handler (a model-options CLI exec, a long git walk) can't
                     # head-of-line block the frames behind it — measured
                     # 0.3-1.3s of added session-create latency when a launch
                     # or stat queued behind one. Responses correlate by
@@ -2970,58 +3028,65 @@ class HostProcess:
     async def _harness_readiness_loop(
         self,
         ws: websockets.asyncio.client.ClientConnection,
-        initial: dict[str, HarnessAvailability],
     ) -> None:
-        """
-        Push harness-readiness updates on a timer, off the receive loop.
-
-        Runs as its own task so a slow readiness probe (a harness CLI whose
-        ``--version`` / ``auth status`` subprocess hangs) can never delay
-        ``ws.recv()`` or the inline keepalive pong — the cause of spurious
-        ``4003 ping timeout`` disconnects. Recomputes the map on the quick
-        cadence gated by a cheap "did an unavailable harness just become ready"
-        check and on the full cadence unconditionally, sending a
-        :class:`HostHarnessReadinessFrame` only when the map changes.
-
-        :param ws: The open tunnel connection used to send update frames.
-        :param initial: The readiness map already reported in ``host.hello``;
-            the baseline the first update diffs against.
-        :returns: None. Runs until cancelled when the connection ends.
-        """
-        configured = initial
-        # Gateway-backing baseline, recomputed with readiness: a flip alone
-        # (same binaries, new credentials) must reach the server without a
-        # reconnect.
-        gateway = await asyncio.to_thread(gateway_inference_map)
+        """Refresh advisory capabilities without endangering the tunnel."""
+        configured = self._configured_harnesses
+        gateway = self._gateway_inference
         loop = asyncio.get_running_loop()
         next_quick = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
         next_full = loop.time() + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
         while True:
             await asyncio.sleep(max(0.0, min(next_quick, next_full) - loop.time()))
             now = loop.time()
-            refresh_full = now >= next_full
+            refresh_full = configured is None or now >= next_full
             if now >= next_quick:
                 next_quick = now + HARNESS_READINESS_REFRESH_INTERVAL_S
-                if not refresh_full:
-                    refresh_full = await asyncio.to_thread(
-                        _unavailable_harness_became_ready, configured
-                    )
+                if not refresh_full and configured is not None:
+                    try:
+                        refresh_full = await asyncio.to_thread(
+                            _unavailable_harness_became_ready, configured
+                        )
+                    except Exception:
+                        _logger.exception("Host harness quick readiness probe failed")
             if not refresh_full:
                 continue
-            latest = await asyncio.to_thread(configured_harness_map)
-            latest_gateway = await asyncio.to_thread(gateway_inference_map)
+
+            latest = await self._probe_configured_harnesses(startup=False)
+            latest_gateway = await self._probe_gateway_inference(startup=False)
             next_full = now + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
-            if latest != configured or latest_gateway != gateway:
+            new_configured = latest if latest is not None else configured
+            new_gateway = latest_gateway if latest_gateway is not None else gateway
+            if new_configured is None:
+                continue
+            if new_configured != configured or new_gateway != gateway:
                 await ws.send(
                     encode_host_frame(
                         HostHarnessReadinessFrame(
-                            configured_harnesses=latest,
-                            gateway_inference=latest_gateway,
+                            configured_harnesses=new_configured,
+                            gateway_inference=new_gateway,
                         )
                     )
                 )
-                configured = latest
-                gateway = latest_gateway
+                configured = new_configured
+                gateway = new_gateway
+                self._configured_harnesses = configured
+                self._gateway_inference = gateway
+
+    def _raise_connection_error(self, frame: HostConnectionErrorFrame) -> None:
+        """Raise the lifecycle exception requested by a server error frame."""
+        message = f"Host connection failed during {frame.stage}: {frame.error}"
+        if frame.retryable:
+            raise HostRetryableConnectionError(message)
+        raise HostConnectError(message)
+
+    def _raise_connection_error_from_raw(self, raw: str) -> None:
+        """Handle connection-level frames before request-task dispatch."""
+        try:
+            frame = decode_host_frame(raw)
+        except ValueError:
+            return
+        if isinstance(frame, HostConnectionErrorFrame):
+            self._raise_connection_error(frame)
 
     def _start_frame_task(self, ws: websockets.asyncio.client.ClientConnection, raw: str) -> None:
         """Handle one inbound frame on its own task, off the receive loop.
@@ -3112,6 +3177,10 @@ class HostProcess:
             ignored.
         :returns: None.
         """
+        if isinstance(frame, HostConnectionErrorFrame):
+            # Defensive for direct callers; production handles this inline in
+            # _serve_frames so detached request tasks cannot swallow it.
+            self._raise_connection_error(frame)
         if isinstance(frame, HostLaunchRunnerFrame):
             # Frames run on concurrent tasks, but launch/stop must keep their
             # arrival order relative to each other (a stop for a session must

@@ -1569,12 +1569,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(selfAuthor !== null ? { author: selfAuthor } : {}),
         },
       ],
-      // A new turn supersedes the prior turn's background-shell tally: the
-      // "N background tasks still running" label must give way to "Working…" the
-      // moment the user sends, not linger until the next status edge. The
-      // count is sticky (see the `session_status` handler) precisely so a
-      // trailing idle can't wipe it, so it has to be cleared explicitly here.
-      backgroundTaskCount: 0,
+      // A new turn does NOT supersede the background-shell tally: shells
+      // launched in an earlier turn keep running across the turn boundary, so
+      // the composer pill must stay lit alongside the "Working…" shimmer rather
+      // than blink off the moment the user sends. The count is sticky (see the
+      // `session_status` handler) and the next Stop hook re-reports it
+      // authoritatively. Only the parked-dialog reason clears — a fresh send is
+      // not parked on a dialog.
       blockedOn: null,
     }));
 
@@ -5308,11 +5309,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // after it appeared. So: an explicit count is authoritative (a Stop
         // hook's `0` clears it, so a finished shell drops the indicator on the
         // next turn end; a positive count sets it); `undefined` leaves it
-        // untouched; and a new turn (`running`) or a failure clears it —
-        // mirroring the server's `_publish_status`.
+        // untouched. A new `running` turn does NOT clear it — background shells
+        // outlive turn boundaries, so the pill stays lit alongside the "Working…"
+        // shimmer and the next Stop hook re-reports authoritatively. Only a
+        // failure clears it (a dead session may never post another count to drop
+        // a stale tally). Mirrors the server's `_publish_status`.
         if (event.backgroundTaskCount !== undefined) {
           patch.backgroundTaskCount = event.backgroundTaskCount;
-        } else if (event.status === "running" || event.status === "failed") {
+        } else if (event.status === "failed") {
           patch.backgroundTaskCount = 0;
         }
         if (event.responseId !== undefined && event.status === "running") {

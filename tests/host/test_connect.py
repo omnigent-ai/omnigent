@@ -22,12 +22,14 @@ from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
+    HostRetryableConnectionError,
     _build_runner_env,
     _RunnerHandle,
     run_host_process,
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
     HostDetectCredentialsFrame,
@@ -1016,12 +1018,22 @@ class _FakeTunnel:
         self.sent.append(data)
 
     async def recv(self) -> str:
-        """Simulate an immediate disconnect.
-
-        :returns: Never returns.
-        :raises ConnectionError: Always — ends the serve loop.
-        """
+        """Simulate an immediate disconnect after hello."""
         raise ConnectionError("test disconnect")
+
+
+class _ConnectionErrorTunnel:
+    """Tunnel that returns one server connection error after host.hello."""
+
+    def __init__(self, frame: HostConnectionErrorFrame) -> None:
+        self.frame = frame
+        self.sent: list[str] = []
+
+    async def send(self, data: str) -> None:
+        self.sent.append(data)
+
+    async def recv(self) -> str:
+        return encode_host_frame(self.frame)
 
 
 class _RecordingWS:
@@ -1076,9 +1088,11 @@ async def test_live_host_refreshes_harness_readiness_without_reconnect(
         0.01,
     )
     host = _make_host_process()
+    host._configured_harnesses = {"pi": False}
+    host._gateway_inference = {"codex": True}
     ws = _RecordingWS()
 
-    task = asyncio.create_task(host._harness_readiness_loop(ws, {"pi": False}))
+    task = asyncio.create_task(host._harness_readiness_loop(ws))
     try:
         await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
     finally:
@@ -1106,9 +1120,11 @@ async def test_live_host_full_refresh_detects_auth_completion(
         0.01,
     )
     host = _make_host_process()
+    host._configured_harnesses = {"codex": "needs-auth"}
+    host._gateway_inference = {"codex": True}
     ws = _RecordingWS()
 
-    task = asyncio.create_task(host._harness_readiness_loop(ws, {"codex": "needs-auth"}))
+    task = asyncio.create_task(host._harness_readiness_loop(ws))
     try:
         await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
     finally:
@@ -1138,9 +1154,11 @@ async def test_live_host_does_not_repeat_unchanged_readiness(
         0.01,
     )
     host = _make_host_process()
+    host._configured_harnesses = {"codex": "needs-auth"}
+    host._gateway_inference = {"codex": True}
     ws = _RecordingWS()
 
-    task = asyncio.create_task(host._harness_readiness_loop(ws, {"codex": "needs-auth"}))
+    task = asyncio.create_task(host._harness_readiness_loop(ws))
     try:
         # Let at least two full refreshes recompute-and-compare before stopping.
         for _ in range(400):
@@ -1173,9 +1191,11 @@ async def test_live_host_repushes_when_only_gateway_inference_changes(
         0.01,
     )
     host = _make_host_process()
+    host._configured_harnesses = {"codex": True}
+    host._gateway_inference = {"codex": False}
     ws = _RecordingWS()
 
-    task = asyncio.create_task(host._harness_readiness_loop(ws, {"codex": True}))
+    task = asyncio.create_task(host._harness_readiness_loop(ws))
     try:
         await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
     finally:
@@ -1459,6 +1479,57 @@ async def test_unreported_exit_flushes_after_reconnect(
     # The queue drained — a retained entry would re-send on every
     # reconnect forever.
     assert host._unreported_exits == {}
+
+
+async def test_capability_probe_timeout_does_not_block_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A hung startup probe degrades to unknown metadata after its deadline."""
+    host = _make_host_process()
+    never = asyncio.Event()
+
+    async def _blocked(*, startup: bool) -> None:
+        del startup
+        await never.wait()
+
+    monkeypatch.setattr(host, "_probe_configured_harnesses", _blocked)
+    monkeypatch.setattr(host, "_probe_gateway_inference", _blocked)
+    monkeypatch.setattr("omnigent.host.connect._HOST_CAPABILITY_INIT_TIMEOUT_S", 0.01)
+
+    await host._initialize_capabilities()
+
+    assert host._configured_harnesses is None
+    assert host._gateway_inference is None
+    assert "capability discovery timed out" in capsys.readouterr().err
+
+
+async def test_capability_probe_failure_does_not_block_registration(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Optional startup discovery fails visibly but hello still reaches the server."""
+
+    def _denied() -> dict[str, bool]:
+        raise PermissionError(13, "Permission denied", "/usr/local/bin/codex")
+
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _denied)
+    monkeypatch.setattr(
+        "omnigent.host.connect.gateway_inference_map",
+        lambda: {"codex": False},
+    )
+    host = _make_host_process()
+    await host._initialize_capabilities()
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.configured_harnesses is None
+    assert hello.gateway_inference == {"codex": False}
+    assert "Permission denied: '/usr/local/bin/codex'" in capsys.readouterr().err
 
 
 async def test_hello_advertises_installed_version() -> None:
@@ -3201,10 +3272,7 @@ class _DroppedTunnel:
     """
 
     def __init__(self, frames_before_drop: int = 0) -> None:
-        """Store the inbound-frame script.
-
-        :param frames_before_drop: Frames to serve before dropping.
-        """
+        """Store the inbound-frame script."""
         self._frames_left = frames_before_drop
 
     async def send(self, data: str | bytes) -> None:
@@ -3215,11 +3283,7 @@ class _DroppedTunnel:
         """
 
     async def recv(self) -> str:
-        """Serve scripted frames, then fail like an abrupt close.
-
-        :returns: An undecodable frame while any are scripted.
-        :raises ConnectionClosedError: Once the script is exhausted.
-        """
+        """Serve scripted frames, then drop."""
         if self._frames_left > 0:
             self._frames_left -= 1
             return "not-a-decodable-frame"
@@ -4089,20 +4153,12 @@ async def test_silent_connect_streak_escalates_and_slows_reconnects(
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Accepted-but-silent connections escalate past a bounded streak.
-
-    An endpoint that accepts the upgrade and never sends a frame used to
-    classify every drop as a benign ingress recycle and hammer it at the
-    prompt cadence forever (observed: ~6s cycles for 7 hours, silently).
-    Past the streak the host must log ONE error, warn the terminal once,
-    and drop to normal backoff.
-    """
+    """Repeated accepted-but-silent connections escalate to slow backoff."""
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._SILENT_CONNECT_ESCALATE_ATTEMPTS", 3)
     monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
     monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
-    # Five accepted-silent connections (threshold 3), then stop.
     spy = _ConnectSpy([None, None, None, None, None, asyncio.CancelledError()])
     _patch_connect(monkeypatch, spy)
     host = _host()
@@ -4110,14 +4166,13 @@ async def test_silent_connect_streak_escalates_and_slows_reconnects(
     with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
         await host.run()
 
-    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert len(errors) == 1, "must escalate exactly once per episode"
+    errors = [record for record in caplog.records if record.levelno == logging.ERROR]
+    assert len(errors) == 1
     assert "3 consecutive connections but never responded" in errors[0].message
-    # The terminal notice reached stderr exactly once.
     assert capsys.readouterr().err.count("never responded") == 1
-    # Cadence flip: below the threshold the drops ride the recycle fast
-    # path; at/after it they must not.
-    reconnects = [r.message for r in caplog.records if "Reconnecting in" in r.message]
+    reconnects = [
+        record.message for record in caplog.records if "Reconnecting in" in record.message
+    ]
     assert len(reconnects) == 5
     assert "(recycle — prompt reconnect)" in reconnects[1]
     assert "(recycle — prompt reconnect)" not in reconnects[-1]
@@ -4127,18 +4182,12 @@ async def test_inbound_frame_resets_silent_connect_streak(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """One received frame proves the endpoint alive and resets the streak.
-
-    Only CONSECUTIVE silent connections may escalate — a healthy
-    connection in between (any inbound frame, even one the dispatcher
-    ignores) restarts the count, so ordinary recycles never trip it.
-    """
+    """Any inbound frame resets consecutive silent-connection accounting."""
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_CAP_S", 0.0)
     monkeypatch.setattr("omnigent.host.connect._SILENT_CONNECT_ESCALATE_ATTEMPTS", 3)
     monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
     monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
-    # 2 silent, one frame-serving (resets), 2 silent: never 3 in a row.
     spy = _ConnectSpy([None, None, 1, None, None, asyncio.CancelledError()])
     _patch_connect(monkeypatch, spy)
     host = _host()
@@ -4147,7 +4196,70 @@ async def test_inbound_frame_resets_silent_connect_streak(
         await host.run()
 
     assert host._silent_connect_streak == 2
-    assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert not [record for record in caplog.records if record.levelno == logging.ERROR]
+
+
+async def test_connection_error_frame_fails_loudly_on_live_receive_path() -> None:
+    """A non-retryable server error escapes the live receive loop."""
+    host = _host()
+    tunnel = _ConnectionErrorTunnel(
+        HostConnectionErrorFrame(
+            stage="registration",
+            error="database unavailable",
+            retryable=False,
+        )
+    )
+
+    with pytest.raises(HostConnectError, match="registration: database unavailable"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+
+    assert len(tunnel.sent) == 1
+    assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
+    assert host._frame_tasks == set()
+
+
+async def test_retryable_connection_error_escapes_live_receive_path() -> None:
+    """A retryable server error reaches the reconnect loop's exception class."""
+    host = _host()
+    tunnel = _ConnectionErrorTunnel(
+        HostConnectionErrorFrame(
+            stage="registration",
+            error="database restarting",
+            retryable=True,
+        )
+    )
+
+    with pytest.raises(HostRetryableConnectionError, match="registration: database restarting"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+
+    assert host._frame_tasks == set()
+
+
+async def test_capabilities_are_initialized_once_across_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconnect handshakes reuse startup metadata instead of rerunning probes."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    calls = {"readiness": 0, "gateway": 0}
+
+    def _readiness() -> dict[str, bool]:
+        calls["readiness"] += 1
+        return {"pi": True}
+
+    def _gateway() -> dict[str, bool]:
+        calls["gateway"] += 1
+        return {"codex": True}
+
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _readiness)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", _gateway)
+    spy = _ConnectSpy([None, None, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    await host.run()
+
+    assert spy.call_count == 3
+    assert calls == {"readiness": 1, "gateway": 1}
 
 
 class _FakeZygote:

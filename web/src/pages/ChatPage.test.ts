@@ -848,7 +848,7 @@ describe("computeShowsWorking", () => {
 
   it("parent idle stays idle in the main chat", () => {
     // Busy children are surfaced by the sidebar/Agents rail, not by the
-    // main chat's shimmer or pinned "Working…" pill.
+    // main chat's "Working…" shimmer.
     expect(computeShowsWorking("idle", opts())).toBe(false);
   });
 
@@ -1020,75 +1020,69 @@ describe("shouldShowWorkingIndicator", () => {
 
 describe("workingIndicatorLabel — parked on a dialog", () => {
   it("names what the agent is waiting on", () => {
-    expect(workingIndicatorLabel(0, 0, "permission prompt")).toBe("Blocked on: permission prompt");
+    expect(workingIndicatorLabel(0, "permission prompt")).toBe("Blocked on: permission prompt");
   });
 
-  it("outranks the background tally and the rotation", () => {
+  it("outranks the rotation", () => {
     // Being blocked on the user is the one state that needs an action, and the
     // dialog may exist only in the terminal tab — so it must not be buried
-    // under a rotating "Cooking…" or a background-shell count.
-    expect(workingIndicatorLabel(3, 2, "dialog open")).toBe("Blocked on: dialog open");
+    // under a rotating "Cooking…".
+    expect(workingIndicatorLabel(2, "dialog open")).toBe("Blocked on: dialog open");
   });
 
   it("falls back to the normal label when not parked", () => {
-    expect(workingIndicatorLabel(0, 0, null)).toBe("Working…");
-    expect(workingIndicatorLabel(1, 0, null)).toBe("1 background task still running");
+    expect(workingIndicatorLabel(0, null)).toBe("Working…");
   });
 });
 
 describe("workingIndicatorLabel", () => {
-  it("shows the plain Working label when no background tasks remain", () => {
+  it("shows the plain Working label at the first tick", () => {
     expect(workingIndicatorLabel(0)).toBe("Working…");
   });
 
-  it("treats a negative count as no background tasks", () => {
-    // Defensive: the store seeds 0, but a stale/negative tally must never
-    // produce a nonsensical "-1 background tasks" label.
-    expect(workingIndicatorLabel(-1)).toBe("Working…");
-  });
-
-  it("uses the singular noun for exactly one background task", () => {
-    expect(workingIndicatorLabel(1)).toBe("1 background task still running");
-  });
-
-  it("pluralizes the noun for more than one background task", () => {
-    expect(workingIndicatorLabel(3)).toBe("3 background tasks still running");
+  it("does not report background tasks — the pill owns that count", () => {
+    // The shimmer is the working indicator; the background-task tally lives in
+    // BackgroundTaskPill, so the label never mentions it regardless of tick.
+    expect(workingIndicatorLabel(0)).toBe("Working…");
+    expect(workingIndicatorLabel(5)).toBe(WORKING_MESSAGES[5 % WORKING_MESSAGES.length]);
   });
 
   it("pins the first rotation message to 'Working…'", () => {
     // A fresh tick and the default arg both land on index 0, so this label
-    // must stay "Working…" — the invariant the (0) / (-1) cases rely on.
+    // must stay "Working…".
     expect(WORKING_MESSAGES[0]).toBe("Working…");
-    expect(workingIndicatorLabel(0, 0)).toBe("Working…");
+    expect(workingIndicatorLabel(0)).toBe("Working…");
   });
 
   it("rotates through the message pool by tick", () => {
-    expect(workingIndicatorLabel(0, 1)).toBe(WORKING_MESSAGES[1]);
-    expect(workingIndicatorLabel(0, 2)).toBe(WORKING_MESSAGES[2]);
+    expect(workingIndicatorLabel(1)).toBe(WORKING_MESSAGES[1]);
+    expect(workingIndicatorLabel(2)).toBe(WORKING_MESSAGES[2]);
   });
 
   it("wraps the rotation modulo the pool length", () => {
-    expect(workingIndicatorLabel(0, WORKING_MESSAGES.length)).toBe("Working…");
-    expect(workingIndicatorLabel(0, WORKING_MESSAGES.length + 1)).toBe(WORKING_MESSAGES[1]);
-  });
-
-  it("ignores the tick while background tasks remain", () => {
-    // The count is information, not decoration — it must not rotate away.
-    expect(workingIndicatorLabel(2, 5)).toBe("2 background tasks still running");
+    expect(workingIndicatorLabel(WORKING_MESSAGES.length)).toBe("Working…");
+    expect(workingIndicatorLabel(WORKING_MESSAGES.length + 1)).toBe(WORKING_MESSAGES[1]);
   });
 });
 
 // ── isBackgroundTasksOnly ───────────────────────────────────────────────────
 
 describe("isBackgroundTasksOnly", () => {
-  it("is true only when background tasks remain and nothing is blocked", () => {
-    expect(isBackgroundTasksOnly(2, null)).toBe(true);
-    expect(isBackgroundTasksOnly(0, null)).toBe(false);
+  it("is true only once the turn ends with background tasks and nothing blocked", () => {
+    // Turn over (not working) + shells linger → the pill owns the state.
+    expect(isBackgroundTasksOnly(2, null, false)).toBe(true);
+    expect(isBackgroundTasksOnly(0, null, false)).toBe(false);
+  });
+
+  it("yields while the turn is still active so the shimmer shows too", () => {
+    // running/waiting or a local send in flight: the agent's turn is live, so
+    // the "Working…" shimmer wins and the pill sits alongside it.
+    expect(isBackgroundTasksOnly(2, null, true)).toBe(false);
   });
 
   it("yields to a parked dialog so the shimmer still shouts", () => {
     // blockedOn needs an action; it must never sit as a quiet pill.
-    expect(isBackgroundTasksOnly(2, "permission prompt")).toBe(false);
+    expect(isBackgroundTasksOnly(2, "permission prompt", false)).toBe(false);
   });
 });
 
