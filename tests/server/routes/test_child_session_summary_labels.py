@@ -25,7 +25,7 @@ def _child(labels: dict[str, str]) -> Conversation:
         updated_at=200,
         root_conversation_id="conv_parent",
         title="tool:child-task",
-        agent_id="ag_test",
+        agent_id=None,
         labels=labels,
     )
 

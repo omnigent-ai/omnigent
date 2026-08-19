@@ -525,6 +525,17 @@
             "description": "Status of the latest task, e.g. `\"completed\"`, `\"in_progress\"`, `\"failed\"`. `None` if no tasks exist.",
             "title": "Current Task Status"
           },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harness"
+          },
           "id": {
             "description": "Child conversation/session identifier, e.g. `\"conv_child123\"`.",
             "title": "Id",
