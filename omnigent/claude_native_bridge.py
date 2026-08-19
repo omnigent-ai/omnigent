@@ -3176,10 +3176,16 @@ def kill_session(
         there is no live session to kill.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in
-        time, or if the ``tmux kill-session`` invocation fails.
+        time, or if ``tmux kill-session`` fails for an unexpected reason.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
+    try:
+        _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
+    except RuntimeError as exc:
+        detail = str(exc).lower()
+        if "can't find session" in detail or "no server running on" in detail:
+            return
+        raise
 
 
 def inject_slash_command(

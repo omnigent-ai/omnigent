@@ -5072,6 +5072,44 @@ async def test_sys_cancel_task_stops_terminal_claude_native_entry() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "cancelled"),
+    [("completed", False), ("cancelled", True)],
+)
+async def test_sys_cancel_task_returns_cached_finished_claude_native_status(
+    status: str,
+    cancelled: bool,
+) -> None:
+    """Finished Claude work does not issue a redundant hard-stop."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    parent_id = "conv_parent_finished"
+    child_id = f"conv_child_{status}"
+    entry = runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="worker",
+        title="implementation",
+        wrapper_label="claude-code-native-ui",
+    )
+    entry.status = status
+
+    try:
+        output = json.loads(
+            await _cancel_subagent_task(
+                {"task_id": child_id},
+                conversation_id=parent_id,
+                server_client=None,
+            )
+        )
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+
+    assert output == {"cancelled": cancelled, "task_id": child_id, "status": status}
+
+
+@pytest.mark.asyncio
 async def test_sys_cancel_task_stops_evicted_claude_native_entry() -> None:
     """Server metadata restores the cleanup path after local eviction."""
     from omnigent.runner.tool_dispatch import _cancel_subagent_task

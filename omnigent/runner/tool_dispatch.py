@@ -7098,10 +7098,11 @@ async def _cancel_subagent_task(
     # A dispatched child sits in ``launching`` until its runtime emits a real
     # busy edge (see ``mark_subagent_work_started``). Cancellation must still
     # route to the child during that window — otherwise cancelling a slow-to-
-    # start sub-agent would silently no-op and leave it running. A terminal
+    # start sub-agent would silently no-op and leave it running. A failed
     # claude-native entry still falls through because its pane may be alive.
     is_claude_native = entry.wrapper_label == CLAUDE_NATIVE_WRAPPER_VALUE
-    if entry.status not in ("launching", "running", "waiting") and not is_claude_native:
+    can_stop_failed_claude = is_claude_native and entry.status == "failed"
+    if entry.status not in ("launching", "running", "waiting") and not can_stop_failed_claude:
         return json.dumps(
             {
                 "cancelled": entry.status == "cancelled",

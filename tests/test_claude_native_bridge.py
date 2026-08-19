@@ -3855,16 +3855,19 @@ def test_kill_session_raises_when_tmux_target_never_published(
         kill_session(tmp_path / "bridge", timeout_s=0.0)
 
 
-def test_kill_session_raises_on_tmux_failure(
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "no server running on /tmp/example/tmux.sock",
+        "can't find session: main",
+    ],
+)
+def test_kill_session_is_idempotent_when_tmux_is_absent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    stderr: str,
 ) -> None:
-    """
-    Non-zero ``tmux kill-session`` exit propagates as a RuntimeError.
-
-    The runner handler maps this to a 503 so a wedged tmux server
-    surfaces as a failed stop rather than a silent success.
-    """
+    """A stale tmux advertisement still counts as a successful stop."""
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
@@ -3877,21 +3880,36 @@ def test_kill_session_raises_on_tmux_failure(
 
         returncode = 1
         stdout = ""
-        stderr = "no server running on /tmp/example/tmux.sock"
 
     def _fake_run(cmd: list[str], **kwargs: object) -> _FakeCompleted:
-        """
-        Return a fake non-zero CompletedProcess.
-
-        :param cmd: Argv list passed to subprocess.run.
-        :param kwargs: Subprocess kwargs (ignored).
-        :returns: A fake CompletedProcess with rc=1.
-        """
+        """Return a fake non-zero CompletedProcess."""
         del cmd, kwargs
-        return _FakeCompleted()
+        result = _FakeCompleted()
+        result.stderr = stderr
+        return result
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="no server running"):
+    kill_session(bridge_dir)
+
+
+def test_kill_session_raises_on_unexpected_tmux_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unexpected tmux failures remain visible to the stop caller."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="main",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del cmd, kwargs
+        return SimpleNamespace(returncode=1, stdout="", stderr="permission denied")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="permission denied"):
         kill_session(bridge_dir)
 
 
