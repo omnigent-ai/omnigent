@@ -1842,19 +1842,35 @@ def register_events_routes(
         if conv.host_id is not None and host_store_for_managed is not None:
             bound_host = await asyncio.to_thread(host_store_for_managed.get_host, conv.host_id)
             if bound_host is not None and bound_host.sandbox_id is not None:
-                keep_shared_coda_host = False
-                if bound_host.sandbox_provider == "coda":
-                    remaining = await asyncio.to_thread(
-                        conversation_store.list_conversations,
-                        limit=1000,
-                        kind=None,
-                    )
-                    keep_shared_coda_host = any(
-                        session.host_id == bound_host.host_id for session in remaining.data
-                    )
-                if not keep_shared_coda_host:
-                    from omnigent.server.managed_hosts import terminate_managed_host
+                from omnigent.server.managed_hosts import terminate_managed_host
 
+                if bound_host.sandbox_provider == "coda":
+                    # A CoDA host is shared, so "still in use?" and "terminate"
+                    # must be one critical section against session creation's
+                    # adoption. Otherwise: we count 0 -> a concurrent create
+                    # adopts this host -> we terminate it underneath that new
+                    # session. The lock is the same object routes_core.py takes
+                    # around its capacity check and DB bind.
+                    adoption_lock = getattr(request.app.state, "coda_adoption_lock", None)
+                    if adoption_lock is None:
+                        adoption_lock = asyncio.Lock()
+                        request.app.state.coda_adoption_lock = adoption_lock
+                    async with adoption_lock:
+                        # Count by host_id rather than paging the conversation
+                        # table: a listing capped at N rows undercounts once the
+                        # installation has more than N sessions, and the host is
+                        # then terminated while sessions are still bound to it.
+                        remaining = await asyncio.to_thread(
+                            conversation_store.count_conversations_by_host_id,
+                            bound_host.host_id,
+                        )
+                        if remaining == 0:
+                            await terminate_managed_host(
+                                bound_host,
+                                host_store_for_managed,
+                                getattr(request.app.state, "sandbox_config", None),
+                            )
+                else:
                     await terminate_managed_host(
                         bound_host,
                         host_store_for_managed,
