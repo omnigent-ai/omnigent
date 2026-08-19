@@ -536,6 +536,11 @@ extend-exclude = [
     # Protobuf-generated code (DO NOT EDIT); not ours to restyle.
     "omnigent/api/**/*_pb2.py",
     "omnigent/api/**/*_pb2.pyi",
+    # Notebook fixtures for the file-viewer preview feature: intentionally
+    # messy edge-case content (quote styles, spacing, a deliberately broken
+    # notebook that isn't even valid JSON) that exists to be rendered, not
+    # reformatted. ruff format would rewrite them or error on the broken one.
+    "web/src/shell/__fixtures__",
 ]
 
 [tool.ruff.lint]
