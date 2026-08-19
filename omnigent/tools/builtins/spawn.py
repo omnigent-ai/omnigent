@@ -542,6 +542,7 @@ class SysSessionListTool(Tool):
                         },
                         "cursor": {
                             "type": "string",
+                            "maxLength": 40000,
                             "description": (
                                 "Opaque continuation cursor from a prior "
                                 "sys_session_list result's page.next_cursor."

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
 import httpx
 import pytest
 
+from omnigent.runner import tool_dispatch
 from omnigent.runner.tool_dispatch import execute_tool
 
 _ROW_COUNT = 12
@@ -104,6 +106,167 @@ async def _session_list_with_rows(
             server_client=client,
             conversation_id="conv_caller",
         )
+
+
+async def _call_agent(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    arguments: dict[str, object],
+) -> dict[str, object]:
+    return json.loads(
+        await execute_tool(
+            tool_name="sys_agent_list",
+            arguments=json.dumps(arguments),
+            server_client=client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+    )
+
+
+async def _call_session(
+    client: httpx.AsyncClient,
+    arguments: dict[str, object],
+) -> dict[str, object]:
+    return json.loads(
+        await execute_tool(
+            tool_name="sys_session_list",
+            arguments=json.dumps(arguments),
+            server_client=client,
+            conversation_id="conv_caller",
+        )
+    )
+
+
+def _encode_cursor_payload(payload: object) -> str:
+    return (
+        base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        .decode("ascii")
+        .rstrip("=")
+    )
+
+
+@pytest.mark.asyncio
+async def test_size_fitter_checks_larger_page_after_smaller_cursor_does_not_fit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A long intermediate cursor must not hide a larger page that fits."""
+    monkeypatch.setattr(
+        tool_dispatch,
+        "_scan_local_agent_configs",
+        lambda _path: [
+            {
+                "name": "large",
+                "path": "/workspace/a.yaml",
+                "description": "d" * 96_000,
+            },
+            {"name": "small", "path": "/workspace/z.yaml", "description": "small"},
+        ],
+    )
+    monkeypatch.setattr(
+        tool_dispatch,
+        "_encode_discovery_cursor",
+        lambda *args: (
+            "x" * 5_000 if args[-1]["local_configs"] in {1, ("at", "/workspace/a.yaml")} else "x"
+        ),
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/agents":
+            return _server_page(
+                request,
+                [
+                    {
+                        "id": "ag_fixed",
+                        "name": "fixed",
+                        "description": "f" * 1_000,
+                        "harness": "claude-sdk",
+                    }
+                ],
+            )
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(404)
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        payload = await _call_agent(client, tmp_path, {"limit": 2})
+
+    assert "error" not in payload
+    assert payload["page"]["limit"] == 2
+    assert [row["name"] for row in payload["local_configs"]] == ["large", "small"]
+    assert len(json.dumps(payload)) <= 100_000
+
+
+@pytest.mark.asyncio
+async def test_failed_first_source_read_remains_retryable(tmp_path: Path) -> None:
+    """A source that did not answer is pending, not exhausted."""
+    agents_status = 503
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/agents":
+            if agents_status != 200:
+                return httpx.Response(agents_status)
+            return _server_page(request, _agent_rows(large=False))
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(404)
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        first = await _call_agent(client, tmp_path, {"limit": 3})
+        agents_status = 200
+        second = await _call_agent(
+            client,
+            tmp_path,
+            {"limit": 3, "cursor": first["page"]["next_cursor"]},
+        )
+
+    assert first["builtins"] == []
+    assert first["page"]["has_more"]["builtins"] is True
+    assert [row["agent_id"] for row in second["builtins"]] == [
+        "ag_00",
+        "ag_01",
+        "ag_02",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_source_is_not_refetched_while_other_source_continues(
+    tmp_path: Path,
+) -> None:
+    """An exhausted section stays distinct from an unread failed section."""
+    agent_reads = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal agent_reads
+        if request.url.path == "/v1/agents":
+            agent_reads += 1
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/sessions":
+            return _server_page(request, _session_rows(large=False))
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(404)
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        first = await _call_agent(client, tmp_path, {"limit": 3})
+        await _call_agent(
+            client,
+            tmp_path,
+            {"limit": 3, "cursor": first["page"]["next_cursor"]},
+        )
+
+    assert agent_reads == 1
 
 
 @pytest.mark.asyncio
@@ -410,6 +573,172 @@ async def test_sys_agent_list_pages_local_configs_beyond_server_fetch_limit(
         "limit": 100,
         "has_more": {"builtins": False, "session_agents": False, "local_configs": False},
     }
+
+
+@pytest.mark.asyncio
+async def test_local_config_continuation_uses_last_returned_path(tmp_path: Path) -> None:
+    """Edits before the resume path do not skip or repeat later configs."""
+    configs_dir = tmp_path / ".omnigent" / "agent-configs"
+    configs_dir.mkdir(parents=True)
+    for index in range(6):
+        (configs_dir / f"cfg-{index}.yaml").write_text(
+            f"name: cfg-{index}\n",
+            encoding="utf-8",
+        )
+
+    first = json.loads(await _agent_list_with_empty_server(tmp_path, {"limit": 3}))
+    (configs_dir / "cfg-0.yaml").unlink()
+    second = json.loads(
+        await _agent_list_with_empty_server(
+            tmp_path,
+            {"limit": 3, "cursor": first["page"]["next_cursor"]},
+        )
+    )
+
+    assert [row["name"] for row in first["local_configs"]] == ["cfg-0", "cfg-1", "cfg-2"]
+    assert [row["name"] for row in second["local_configs"]] == ["cfg-3", "cfg-4", "cfg-5"]
+
+
+@pytest.mark.asyncio
+async def test_cursor_is_bound_to_tool_sections_and_filters(tmp_path: Path) -> None:
+    """A cursor cannot be replayed under a different listing contract."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/agents":
+            return _server_page(request, _agent_rows(large=False))
+        if request.url.path == "/v1/sessions":
+            return _server_page(request, _session_rows(large=False))
+        if request.url.path == "/v1/sessions/conv_caller/child_sessions":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        agent_page = await _call_agent(client, tmp_path, {"limit": 3})
+        wrong_tool = await _call_session(
+            client,
+            {"limit": 3, "cursor": agent_page["page"]["next_cursor"]},
+        )
+        session_page = await _call_session(
+            client,
+            {"limit": 3, "agent_name": "researcher"},
+        )
+        wrong_filter = await _call_session(
+            client,
+            {
+                "limit": 3,
+                "agent_name": "planner",
+                "cursor": session_page["page"]["next_cursor"],
+            },
+        )
+
+    assert "different tool" in wrong_tool["error"]
+    assert "different filter" in wrong_filter["error"]
+
+
+@pytest.mark.asyncio
+async def test_cursor_envelope_is_strict_and_bounded(tmp_path: Path) -> None:
+    """Unknown fields, malformed state, and oversized cursors are rejected."""
+    payload = {
+        "v": 1,
+        "tool": "sys_agent_list",
+        "filters": {},
+        "sections": {
+            "builtins": ["start", None],
+            "session_agents": ["start", None],
+            "local_configs": ["start", None],
+        },
+    }
+
+    payload["unknown"] = True
+    unknown = _encode_cursor_payload(payload)
+    payload.pop("unknown")
+    payload["sections"].pop("session_agents")
+    missing_section = _encode_cursor_payload(payload)
+    malformed = _encode_cursor_payload(
+        {
+            "v": 1,
+            "tool": "sys_agent_list",
+            "filters": {},
+            "sections": {
+                "builtins": [],
+                "session_agents": None,
+                "local_configs": None,
+            },
+        }
+    )
+
+    unknown_result = json.loads(await _agent_list_with_empty_server(tmp_path, {"cursor": unknown}))
+    malformed_result = json.loads(
+        await _agent_list_with_empty_server(tmp_path, {"cursor": malformed})
+    )
+    missing_section_result = json.loads(
+        await _agent_list_with_empty_server(tmp_path, {"cursor": missing_section})
+    )
+    oversized_result = json.loads(
+        await _agent_list_with_empty_server(tmp_path, {"cursor": "a" * 40_001})
+    )
+
+    assert "invalid pagination cursor" in unknown_result["error"]
+    assert "invalid pagination cursor" in missing_section_result["error"]
+    assert "invalid pagination cursor" in malformed_result["error"]
+    assert "too long" in oversized_result["error"]
+
+
+@pytest.mark.parametrize(
+    "broken_response",
+    [
+        pytest.param(httpx.Response(503), id="failed-status"),
+        pytest.param(httpx.Response(200, text="not json"), id="malformed-json"),
+        pytest.param(
+            httpx.Response(
+                200,
+                json={"data": [], "has_more": "false", "last_id": None},
+            ),
+            id="invalid-envelope",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unusable_server_envelope_remains_retryable(
+    tmp_path: Path,
+    broken_response: httpx.Response,
+) -> None:
+    """An unusable 200 response does not falsely exhaust its source."""
+    broken = False
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/agents":
+            return broken_response if broken else _server_page(request, _agent_rows(large=False))
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(404)
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        first = await _call_agent(client, tmp_path, {"limit": 3})
+        broken = True
+        failed = await _call_agent(
+            client,
+            tmp_path,
+            {"limit": 3, "cursor": first["page"]["next_cursor"]},
+        )
+        broken = False
+        retried = await _call_agent(
+            client,
+            tmp_path,
+            {"limit": 3, "cursor": failed["page"]["next_cursor"]},
+        )
+
+    assert failed["builtins"] == []
+    assert failed["page"]["has_more"]["builtins"] is True
+    assert [row["agent_id"] for row in retried["builtins"]] == ["ag_03", "ag_04", "ag_05"]
 
 
 @pytest.mark.parametrize(

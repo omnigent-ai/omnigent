@@ -613,13 +613,19 @@ _DISCOVERY_LIST_MAX_LIMIT = 100
 # tools stay below the same Omnigent-owned budget instead of guessing a
 # harness-specific limit.
 _DISCOVERY_LIST_OUTPUT_MAX_CHARS = 100_000
+_DISCOVERY_CURSOR_MAX_CHARS = 40_000
+_DISCOVERY_START = "start"
+_DISCOVERY_AT = "at"
+_DISCOVERY_END = "end"
+_DiscoveryState = tuple[str, str | None]
 
 
 def _discovery_list_window(
     args: _JsonObject,
     tool_name: str,
     page_sections: tuple[str, ...],
-) -> tuple[int | None, dict[str, str | int | None]] | str:
+    filters: _JsonObject,
+) -> tuple[int | None, dict[str, _DiscoveryState], bool] | str:
     """Validate discovery pagination and decode its opaque continuation cursor."""
     limit = args.get("limit")
     if "limit" in args and (
@@ -636,35 +642,65 @@ def _discovery_list_window(
             }
         )
     cursor = args.get("cursor")
-    state: dict[str, str | int | None] = {
-        name: 0 if name == "local_configs" else None for name in page_sections
-    }
+    state: dict[str, _DiscoveryState] = dict.fromkeys(page_sections, (_DISCOVERY_START, None))
     if cursor is None:
-        return cast(int | None, limit), state
+        return cast(int | None, limit), state, False
     if not isinstance(cursor, str) or not cursor:
         return json.dumps({"error": f"{tool_name}: 'cursor' must be a non-empty string"})
+    if len(cursor) > _DISCOVERY_CURSOR_MAX_CHARS:
+        return json.dumps({"error": f"{tool_name}: pagination cursor is too long"})
     try:
         padding = "=" * (-len(cursor) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(cursor + padding).decode("utf-8"))
+        raw = base64.b64decode(cursor + padding, altchars=b"-_", validate=True)
+        payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
         return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
-    if not isinstance(payload, dict) or payload.get("v") != 1:
+    if not isinstance(payload, dict) or set(payload) != {"v", "tool", "filters", "sections"}:
         return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
-    for name, default in state.items():
-        value = payload.get(name, default)
-        if name == "local_configs":
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
-        elif value is not None and not isinstance(value, str):
+    if payload.get("v") != 1:
+        return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+    if payload.get("tool") != tool_name:
+        return json.dumps({"error": f"{tool_name}: cursor was minted by a different tool"})
+    if payload.get("filters") != filters:
+        return json.dumps({"error": f"{tool_name}: cursor uses different filter arguments"})
+    sections = payload.get("sections")
+    if not isinstance(sections, dict) or set(sections) != set(page_sections):
+        return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+    for name in state:
+        value = sections.get(name)
+        if not isinstance(value, list) or len(value) != 2:
             return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
-        state[name] = value
-    return cast(int | None, limit), state
+        tag, position = value
+        if tag in {_DISCOVERY_START, _DISCOVERY_END}:
+            if position is not None:
+                return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+        elif tag == _DISCOVERY_AT:
+            if not isinstance(position, str) or not position:
+                return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+        else:
+            return json.dumps({"error": f"{tool_name}: invalid pagination cursor"})
+        state[name] = (tag, cast(str | None, position))
+    return cast(int | None, limit), state, True
 
 
-def _encode_discovery_cursor(state: dict[str, str | int | None]) -> str:
+def _encode_discovery_cursor(
+    tool_name: str,
+    filters: _JsonObject,
+    state: dict[str, _DiscoveryState],
+) -> str | None:
     """Serialize a discovery continuation cursor without exposing its shape."""
-    payload = json.dumps({"v": 1, **state}, separators=(",", ":")).encode("utf-8")
-    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    payload = json.dumps(
+        {
+            "v": 1,
+            "tool": tool_name,
+            "filters": filters,
+            "sections": {name: list(value) for name, value in state.items()},
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    cursor = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    return cursor if len(cursor) <= _DISCOVERY_CURSOR_MAX_CHARS else None
 
 
 @dataclass(frozen=True)
@@ -674,21 +710,52 @@ class _DiscoveryPage:
     rows: list[_JsonObject]
     has_more: bool
     next_after: str | None = None
+    failed: bool = False
+
+
+def _parse_discovery_page(body: object) -> _DiscoveryPage:
+    """Validate the server envelope before trusting its continuation state."""
+    if not isinstance(body, dict):
+        return _DiscoveryPage([], False, failed=True)
+    data = body.get("data")
+    if not isinstance(data, list):
+        return _DiscoveryPage([], False, failed=True)
+    rows: list[_JsonObject] = []
+    for row in data:
+        if not isinstance(row, dict):
+            return _DiscoveryPage([], False, failed=True)
+        row_id = row.get("id")
+        if not isinstance(row_id, str) or not row_id:
+            return _DiscoveryPage([], False, failed=True)
+        rows.append(row)
+    has_more = body.get("has_more", False)
+    last_id = body.get("last_id")
+    if not isinstance(has_more, bool):
+        return _DiscoveryPage([], False, failed=True)
+    if last_id is not None and (not isinstance(last_id, str) or not last_id):
+        return _DiscoveryPage([], False, failed=True)
+    if has_more and last_id is None:
+        return _DiscoveryPage([], False, failed=True)
+    return _DiscoveryPage(rows, has_more, cast(str | None, last_id))
 
 
 def _bounded_discovery_result(
     sections: dict[str, list[_JsonObject]],
     *,
     limit: int | None,
-    cursor_state: dict[str, str | int | None],
+    cursor_state: dict[str, _DiscoveryState],
+    continued: bool,
     source_pages: dict[str, _DiscoveryPage],
     page_sections: tuple[str, ...] | None = None,
+    tool_name: str,
+    filters: _JsonObject,
 ) -> str:
     """Keep a small legacy result intact, otherwise return a fitting page."""
     complete = json.dumps(sections)
     if (
         limit is None
-        and not any(cursor_state.values())
+        and not continued
+        and not any(page.failed for page in source_pages.values())
         and not any(page.has_more for page in source_pages.values())
         and len(complete) <= _DISCOVERY_LIST_OUTPUT_MAX_CHARS
     ):
@@ -697,7 +764,7 @@ def _bounded_discovery_result(
     requested_limit = limit or _DISCOVERY_LIST_MAX_LIMIT
     paged = page_sections or tuple(sections)
 
-    def _candidate(candidate_limit: int) -> str:
+    def _candidate(candidate_limit: int) -> str | None:
         page = dict(sections)
         has_more: dict[str, bool] = {}
         next_state = dict(cursor_state)
@@ -706,38 +773,52 @@ def _bounded_discovery_result(
             page_rows = rows[:candidate_limit]
             page[name] = page_rows
             source_page = source_pages[name]
+            if source_page.failed:
+                # A failed read proves neither progress nor exhaustion. Keep
+                # the incoming position so the continuation retries it.
+                has_more[name] = True
+                continue
             has_more[name] = len(rows) > candidate_limit or source_page.has_more
-            if name == "local_configs":
-                start = cast(int, cursor_state[name])
-                next_state[name] = start + len(page_rows)
+            if not has_more[name]:
+                next_state[name] = (_DISCOVERY_END, None)
             elif page_rows:
-                identifier = "agent_id" if name == "builtins" else "session_id"
-                next_state[name] = _optional_string(page_rows[-1].get(identifier))
-            elif source_page.has_more:
-                next_state[name] = source_page.next_after
+                if name == "local_configs":
+                    position = _optional_string(page_rows[-1].get("path"))
+                else:
+                    identifier = "agent_id" if name == "builtins" else "session_id"
+                    position = _optional_string(page_rows[-1].get(identifier))
+                if position is not None:
+                    next_state[name] = (_DISCOVERY_AT, position)
+            elif source_page.has_more and source_page.next_after is not None:
+                next_state[name] = (_DISCOVERY_AT, source_page.next_after)
         metadata: dict[str, object] = {
             "limit": candidate_limit,
             "has_more": has_more,
         }
         if any(has_more.values()):
-            metadata["next_cursor"] = _encode_discovery_cursor(next_state)
+            cursor = _encode_discovery_cursor(tool_name, filters, next_state)
+            if cursor is None:
+                return None
+            metadata["next_cursor"] = cursor
         return json.dumps({**page, "page": metadata})
 
-    low = 1
-    high = requested_limit
-    best: str | None = None
-    while low <= high:
-        candidate_limit = (low + high) // 2
+    # Cursor size depends on the last returned row, so serialized page size is
+    # not monotonic in the row limit. Check the bounded public range directly.
+    for candidate_limit in range(requested_limit, 0, -1):
         candidate = _candidate(candidate_limit)
-        if len(candidate) <= _DISCOVERY_LIST_OUTPUT_MAX_CHARS:
-            best = candidate
-            low = candidate_limit + 1
-        else:
-            high = candidate_limit - 1
-    if best is not None:
-        return best
+        if candidate is not None and len(candidate) <= _DISCOVERY_LIST_OUTPUT_MAX_CHARS:
+            return candidate
 
     empty_page = _candidate(0)
+    if empty_page is None:
+        return json.dumps(
+            {
+                "error": (
+                    f"Discovery continuation exceeds the {_DISCOVERY_CURSOR_MAX_CHARS}-character "
+                    "cursor limit."
+                )
+            }
+        )
     if len(empty_page) > _DISCOVERY_LIST_OUTPUT_MAX_CHARS:
         kind = "fixed_section"
         oversized_sections = [
@@ -3888,16 +3969,23 @@ async def _execute_session_query_tool(
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
 
     if tool_name == "sys_session_list":
-        window = _discovery_list_window(args, tool_name, ("sessions",))
+        agent_name = args.get("agent_name")
+        window = _discovery_list_window(
+            args,
+            tool_name,
+            ("sessions",),
+            {"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+        )
         if isinstance(window, str):
             return window
-        limit, cursor_state = window
+        limit, cursor_state, continued = window
         return await _session_list_via_rest(
             conversation_id,
             server_client,
-            args.get("agent_name"),
+            agent_name,
             limit=limit,
             cursor_state=cursor_state,
+            continued=continued,
         )
     if tool_name == "sys_session_get_history":
         return await _session_get_history_via_rest(args, server_client)
@@ -4215,10 +4303,11 @@ async def _execute_agent_tool(
             args,
             tool_name,
             ("builtins", "session_agents", "local_configs"),
+            {},
         )
         if isinstance(window, str):
             return window
-        limit, cursor_state = window
+        limit, cursor_state, continued = window
         return await _agent_list_via_rest(
             server_client,
             agent_spec=agent_spec,
@@ -4226,6 +4315,7 @@ async def _execute_agent_tool(
             runner_workspace=runner_workspace,
             limit=limit,
             cursor_state=cursor_state,
+            continued=continued,
         )
     session_id = args.get("session_id")
     if not isinstance(session_id, str) or not session_id:
@@ -4426,17 +4516,14 @@ async def _agent_list_fetch(
             params["after"] = after
         resp = await server_client.get(path, params=params, timeout=30.0)
     except Exception:  # noqa: BLE001
-        return _DiscoveryPage([], False)
+        return _DiscoveryPage([], False, failed=True)
     if resp.status_code != 200:
-        return _DiscoveryPage([], False)
-    body = _string_object_dict(resp.json())
-    if body is None:
-        return _DiscoveryPage([], False)
-    return _DiscoveryPage(
-        _json_object_list(body.get("data")),
-        body.get("has_more") is True,
-        _optional_string(body.get("last_id")),
-    )
+        return _DiscoveryPage([], False, failed=True)
+    try:
+        body = resp.json()
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return _DiscoveryPage([], False, failed=True)
+    return _parse_discovery_page(body)
 
 
 def _scan_local_agent_configs(configs_dir: Path) -> list[_JsonObject]:
@@ -4599,7 +4686,8 @@ async def _agent_list_via_rest(
     conversation_id: str | None,
     runner_workspace: Path | None,
     limit: int | None,
-    cursor_state: dict[str, str | int | None],
+    cursor_state: dict[str, _DiscoveryState],
+    continued: bool,
 ) -> str:
     """
     List launchable agents across built-ins, session-bound, and local.
@@ -4636,27 +4724,43 @@ async def _agent_list_via_rest(
         bounded page with continuation metadata.
     """
     source_limit = limit or _AGENT_LIST_PAGE_LIMIT
-    builtins_page = await _agent_list_fetch(
-        "/v1/agents",
-        server_client,
-        after=cast(str | None, cursor_state["builtins"]),
-        limit=source_limit,
+    builtins_page = (
+        _DiscoveryPage([], False)
+        if cursor_state["builtins"][0] == _DISCOVERY_END
+        else await _agent_list_fetch(
+            "/v1/agents",
+            server_client,
+            after=cursor_state["builtins"][1],
+            limit=source_limit,
+        )
     )
-    sessions_page = await _agent_list_fetch(
-        "/v1/sessions",
-        server_client,
-        after=cast(str | None, cursor_state["session_agents"]),
-        limit=source_limit,
+    sessions_page = (
+        _DiscoveryPage([], False)
+        if cursor_state["session_agents"][0] == _DISCOVERY_END
+        else await _agent_list_fetch(
+            "/v1/sessions",
+            server_client,
+            after=cursor_state["session_agents"][1],
+            limit=source_limit,
+        )
     )
     spec = _effective_runner_os_env_spec(agent_spec, conversation_id, runner_workspace)
     assert spec.cwd is not None
     configs_dir = Path(spec.cwd) / _AGENT_CONFIG_SUBDIR
     local_configs = await asyncio.to_thread(_scan_local_agent_configs, configs_dir)
-    local_start = cast(int, cursor_state["local_configs"])
+    local_state, local_after = cursor_state["local_configs"]
+    if local_state == _DISCOVERY_END:
+        remaining_configs = []
+    elif local_after is not None:
+        remaining_configs = [
+            row for row in local_configs if str(row.get("path", "")) > local_after
+        ]
+    else:
+        remaining_configs = local_configs
     listing = _project_agent_list(
         builtins_page.rows,
         sessions_page.rows,
-        local_configs[local_start : local_start + source_limit],
+        remaining_configs[:source_limit],
     )
     listing["builtins"] = _in_spawn_family(
         listing["builtins"], await _spawn_family(server_client, conversation_id)
@@ -4665,12 +4769,15 @@ async def _agent_list_via_rest(
         listing,
         limit=limit,
         cursor_state=cursor_state,
+        continued=continued,
+        tool_name="sys_agent_list",
+        filters={},
         source_pages={
             "builtins": builtins_page,
             "session_agents": sessions_page,
             "local_configs": _DiscoveryPage(
                 listing["local_configs"],
-                local_start + len(listing["local_configs"]) < len(local_configs),
+                len(listing["local_configs"]) < len(remaining_configs),
             ),
         },
     )
@@ -4726,7 +4833,8 @@ async def _session_list_via_rest(
     agent_name: object = None,
     *,
     limit: int | None,
-    cursor_state: dict[str, str | int | None],
+    cursor_state: dict[str, _DiscoveryState],
+    continued: bool,
 ) -> str:
     """
     Return the two-view session list: ``sub_agents`` + global ``sessions``.
@@ -4751,16 +4859,23 @@ async def _session_list_via_rest(
         bounded page with continuation metadata.
     """
     sub_agents = await _collect_sub_agents(conversation_id, server_client)
-    sessions_page = await _collect_global_sessions(
-        server_client,
-        agent_name,
-        after=cast(str | None, cursor_state["sessions"]),
-        limit=limit or _AGENT_LIST_PAGE_LIMIT,
+    sessions_page = (
+        _DiscoveryPage([], False)
+        if cursor_state["sessions"][0] == _DISCOVERY_END
+        else await _collect_global_sessions(
+            server_client,
+            agent_name,
+            after=cursor_state["sessions"][1],
+            limit=limit or _AGENT_LIST_PAGE_LIMIT,
+        )
     )
     return _bounded_discovery_result(
         {"sub_agents": cast(list[_JsonObject], sub_agents), "sessions": sessions_page.rows},
         limit=limit,
         cursor_state=cursor_state,
+        continued=continued,
+        tool_name="sys_session_list",
+        filters={"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
     )
@@ -4929,13 +5044,17 @@ async def _collect_global_sessions(
     try:
         resp = await server_client.get("/v1/sessions", params=params, timeout=30.0)
     except Exception:  # noqa: BLE001
-        return _DiscoveryPage([], False)
+        return _DiscoveryPage([], False, failed=True)
     if resp.status_code != 200:
-        return _DiscoveryPage([], False)
-    body = _string_object_dict(resp.json())
-    if body is None:
-        return _DiscoveryPage([], False)
-    rows = _json_object_list(body.get("data"))
+        return _DiscoveryPage([], False, failed=True)
+    try:
+        body = resp.json()
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return _DiscoveryPage([], False, failed=True)
+    page = _parse_discovery_page(body)
+    if page.failed:
+        return page
+    rows = page.rows
     online = await _resolve_runner_online_map(rows, server_client)
     return _DiscoveryPage(
         [
@@ -4954,8 +5073,8 @@ async def _collect_global_sessions(
             }
             for r in rows
         ],
-        body.get("has_more") is True,
-        _optional_string(body.get("last_id")),
+        page.has_more,
+        page.next_after,
     )
 
 
