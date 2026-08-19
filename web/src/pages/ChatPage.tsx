@@ -195,6 +195,7 @@ import {
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
+import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
@@ -1707,6 +1708,11 @@ function MainAgentSurface({
   // staring at a fresh session during a slow MCP boot sees the startup band
   // instead of a bare "What should we work on?" empty state.
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
+  // Session publishes a task list — pins the collapsible Plan accordion above
+  // the thread. When set, the accordion (a solid bar) clears the floating
+  // header and occludes scrolled content, so the viewport drops its top fade
+  // and reserves only a small gap instead of the full header clearance.
+  const hasTasks = useChatStore((s) => s.todos.length > 0);
   // Render the inline terminal whenever the user has opted in via the
   // connection pill. The terminal surface owns its no-terminal state,
   // including stopped/resumable sessions, and the connection indicator
@@ -1991,6 +1997,13 @@ function MainAgentSurface({
       {terminalSurfaces}
       {!showTerminal && (
         <>
+          {/* Task tracker pinned above the thread. Sibling of the viewport (not
+          an overlay) so it shrinks the scroll area rather than covering
+          messages. mt clears the floating header (h-14 mobile / h-12 desktop).
+          Self-hides with no tasks. ponytail: header offset is the web height;
+          native shells (data-ios/android) size their header via CSS vars — not
+          tuned here. */}
+          <ChatPlanAccordion className="mt-14 md:mt-12" />
           {/* Wrapper div gives us a ref to scope the SelectionPopup to the
           conversation area without requiring Conversation to forward refs. */}
           <div
@@ -1999,8 +2012,10 @@ function MainAgentSurface({
           >
             {/* chat-scroll-fade masks the viewport's top edge so scrolling
             content dissolves into the canvas before reaching the
-            ChatHeader overlay's controls (geometry in index.css). */}
-            <Conversation className="chat-scroll-fade flex-1">
+            ChatHeader overlay's controls (geometry in index.css). Dropped
+            when the Plan accordion is pinned above — its solid bar already
+            occludes content scrolling past the viewport's top edge. */}
+            <Conversation className={cn(!hasTasks && "chat-scroll-fade", "flex-1")}>
               {/* Override ConversationContent's default spacing so the thread keeps
               16px side gutters and consecutive agent turns read as one thread.
               The left inset grows *continuously* as the conversation area
@@ -2019,7 +2034,11 @@ function MainAgentSurface({
               <ConversationContent
                 scrollClassName="transcript-hide-native-scrollbar"
                 className={cn(
-                  "chat-conversation-content mx-auto w-full gap-4 px-4 pt-20 pb-6",
+                  "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6",
+                  // pt-20 reserves the floating-header clearance + fade band.
+                  // With the Plan accordion pinned above, the header is already
+                  // cleared, so only a small gap below the accordion is needed.
+                  hasTasks ? "pt-4" : "pt-20",
                   "md:pl-[clamp(1rem,(54rem-100cqi)*0.5+1rem,1.5rem)]",
                   CHAT_COLUMN_WIDTH,
                 )}
@@ -2115,7 +2134,12 @@ function MainAgentSurface({
                 Always mounted — including for an empty new conversation — so
                 a fast first send cannot become the captured initial anchor.
                 Last child so it measures everything above it. */}
-                <LatestTurnSpacer scrollElement={scroller?.el ?? null} />
+                <LatestTurnSpacer
+                  scrollElement={scroller?.el ?? null}
+                  // Match the reduced pt-4 top inset so a framed turn rests just
+                  // below the Plan accordion, not under the (now absent) fade band.
+                  topGapPx={hasTasks ? 16 : undefined}
+                />
               </ConversationContent>
               <ConversationScrollButton />
               <UserMessageNavConnected
@@ -2128,8 +2152,10 @@ function MainAgentSurface({
             </Conversation>
             {/* Constant-height scrollbar. Sibling of Conversation for the same
             reason as JumpToTopButton — outside the chat-scroll-fade mask, which
-            would otherwise dissolve it against the header. */}
-            <TranscriptScrollbar scroller={scroller} />
+            would otherwise dissolve it against the header. With the Plan
+            accordion pinned above, this container already starts below the
+            header, so the track drops its header-clearing top inset. */}
+            <TranscriptScrollbar scroller={scroller} topInset={hasTasks ? 12 : undefined} />
             {/* Hover the top edge to reveal a pill that loads all older history and
             scrolls to the first message. Rendered here (a wrapper sibling of
             Conversation) rather than inside it so it escapes the chat-scroll-fade
@@ -2554,8 +2580,14 @@ const MAX_RESERVED_VIEWPORT_FRACTION = 1 / 3;
  */
 export function LatestTurnSpacer({
   scrollElement,
+  // Gap left above the pinned anchor. Defaults to clearing the top fade band;
+  // with the Plan accordion pinned above (fade dropped, container already below
+  // the header), the caller passes the small content inset so a framed turn
+  // rests just below the accordion instead of 80px lower.
+  topGapPx = PINNED_ANCHOR_TOP_GAP_PX,
 }: {
   scrollElement?: HTMLElement | null;
+  topGapPx?: number;
 } = {}) {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef: React.RefObject<HTMLElement>;
@@ -2621,14 +2653,11 @@ export function LatestTurnSpacer({
     const viewport = scrollEl.clientHeight;
     const next = Math.max(
       0,
-      Math.min(
-        viewport - anchorToEnd - PINNED_ANCHOR_TOP_GAP_PX,
-        viewport * MAX_RESERVED_VIEWPORT_FRACTION,
-      ),
+      Math.min(viewport - anchorToEnd - topGapPx, viewport * MAX_RESERVED_VIEWPORT_FRACTION),
     );
     const current = Number.parseFloat(spacerEl.style.height) || 0;
     if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
-  }, [ctx.scrollRef, scrollElement]);
+  }, [ctx.scrollRef, scrollElement, topGapPx]);
 
   useLayoutEffect(() => {
     measure();
