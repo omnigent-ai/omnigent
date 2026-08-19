@@ -6,6 +6,7 @@ import {
   isThemePalette,
   PALETTES,
   readThemePalette,
+  themePaletteLabel,
   themeSelections,
   themePalettes,
   writeThemePalette,
@@ -24,10 +25,17 @@ describe("themePalette", () => {
     expect(DEFAULT_PALETTE).toBe("omni");
   });
 
+  it("uses Omnigent Paper in light mode and Omnigent Plum in dark mode", () => {
+    const palette = PALETTES.find((item) => item.id === "otto-ink");
+    expect(palette).toBeDefined();
+    expect(themePaletteLabel(palette!, false)).toBe("Omnigent Paper");
+    expect(themePaletteLabel(palette!, true)).toBe("Omnigent Plum");
+  });
+
   it("round-trips a valid palette", () => {
-    writeThemePalette("github");
-    expect(readThemePalette()).toBe("github");
-    expect(localStorage.getItem(STORAGE_KEY)).toBe(JSON.stringify("github"));
+    writeThemePalette("otto-ink");
+    expect(readThemePalette()).toBe("otto-ink");
+    expect(localStorage.getItem(STORAGE_KEY)).toBe(JSON.stringify("otto-ink"));
   });
 
   it("round-trips the custom theme selection", () => {
@@ -59,6 +67,7 @@ describe("themePalette", () => {
   it("guards known vs unknown palette ids", () => {
     expect(isThemePalette("github")).toBe(true);
     expect(isThemePalette("omni")).toBe(true);
+    expect(isThemePalette("otto-ink")).toBe(true);
     expect(isThemePalette("nord")).toBe(true);
     expect(isThemePalette("nope")).toBe(false);
     expect(isThemePalette(undefined)).toBe(false);

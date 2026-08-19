@@ -24,6 +24,7 @@ const STORAGE_KEY = "omnigent:ui-theme-palette";
 /** Selectable color palettes. The first entry is the default (brand) look. */
 export const themePalettes = [
   "omni",
+  "otto-ink",
   "dracula",
   "github",
   "catppuccin",
@@ -56,8 +57,10 @@ export interface PaletteSwatch {
 
 export interface PaletteMeta {
   id: ThemePalette;
-  /** Display name shown under the swatch. */
+  /** Display name shown under the swatch in light mode. */
   label: string;
+  /** Optional display name shown when the app is in dark mode. */
+  darkLabel?: string;
   /** One-line description of the palette's character. */
   blurb: string;
   /** Swatch colors for the light rendering of this palette. */
@@ -82,6 +85,27 @@ export const PALETTES: readonly PaletteMeta[] = [
       text: "#11171c",
     },
     dark: { bg: "#160e24", card: "#28223a", accent: "#df3c85", border: "#2a2440", text: "#f4f5f7" },
+  },
+  {
+    // Keep the persisted id for compatibility with existing preferences.
+    id: "otto-ink",
+    label: "Omnigent Paper",
+    darkLabel: "Omnigent Plum",
+    blurb: "Warm paper by day and deep plum surfaces at night.",
+    light: {
+      bg: "#fdfdfc",
+      card: "#ffffff",
+      accent: "#d4387f",
+      border: "#e7e5e2",
+      text: "#11171c",
+    },
+    dark: {
+      bg: "#121113",
+      card: "#242126",
+      accent: "#df3c85",
+      border: "#343136",
+      text: "#f2edf0",
+    },
   },
   {
     id: "dracula",
@@ -149,6 +173,11 @@ export const PALETTES: readonly PaletteMeta[] = [
     dark: { bg: "#2e3440", card: "#3b4252", accent: "#88c0d0", border: "#4c566a", text: "#eceff4" },
   },
 ] as const;
+
+/** Return the user-facing palette name for the currently resolved mode. */
+export function themePaletteLabel(palette: PaletteMeta, isDark: boolean): string {
+  return isDark ? (palette.darkLabel ?? palette.label) : palette.label;
+}
 
 /**
  * Return whether a string is a supported palette id.
