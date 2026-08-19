@@ -70,7 +70,7 @@ from omnigent.inner import _proc, ui
 from omnigent.integration_daemon import IntegrationDaemon
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
-from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR, data_dir
+from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR, data_dir, env_truthy
 
 if TYPE_CHECKING:
     import socket
@@ -1930,6 +1930,44 @@ def _warn_deprecated_harness_path_env_vars() -> None:
         )
 
 
+REQUIRE_WRAPPER_ENV = "OMNIGENT_REQUIRE_WRAPPER"
+WRAPPER_COMMAND_ENV = "OMNIGENT_WRAPPER_COMMAND"
+WRAPPER_BYPASS_ENV = "OMNIGENT_WRAPPER_BYPASS"
+
+
+def _wrapper_guard_error(env: Mapping[str, str], prog: str) -> str | None:
+    """Return the block message when a naked ``omni`` call is refused, else ``None``.
+
+    A deployment that wraps the CLI (e.g. ``isaac omni``) sets
+    ``OMNIGENT_REQUIRE_WRAPPER`` so direct calls are refused; the wrapper sets
+    ``OMNIGENT_WRAPPER_BYPASS`` around its own invocation to pass through, and
+    ``OMNIGENT_WRAPPER_COMMAND`` names the command to suggest instead.
+    """
+    if not env_truthy(env.get(REQUIRE_WRAPPER_ENV)):
+        return None
+    if env_truthy(env.get(WRAPPER_BYPASS_ENV)):
+        return None
+    redirect = (env.get(WRAPPER_COMMAND_ENV) or "").strip()
+    if redirect:
+        detail = f"Use `{redirect}` instead, or set {WRAPPER_BYPASS_ENV}=1 to run it directly."
+    else:
+        detail = f"Set {WRAPPER_BYPASS_ENV}=1 to run it directly."
+    return f"Error: running `{prog}` directly is disabled in this environment.\n{detail}"
+
+
+def _enforce_wrapper_guard() -> None:
+    """Exit early when a naked ``omni``/``omnigent`` call is blocked by an operator."""
+    # argv[0] is the console-script name (``omni``/``omnigent``); ``python -m
+    # omnigent`` reports ``__main__.py``, so fall back to the canonical name.
+    prog = os.path.basename(sys.argv[0])
+    if not prog or prog == "__main__.py":
+        prog = "omnigent"
+    message = _wrapper_guard_error(os.environ, prog)
+    if message is not None:
+        click.echo(message, err=True)
+        raise SystemExit(2)
+
+
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.
@@ -1960,6 +1998,11 @@ def main() -> None:
     from omnigent.crash_handler import install_crash_handler
 
     install_crash_handler(app_name="omnigent", repo="omnigent-ai/omnigent")
+
+    # Operators can force all use through a wrapper (e.g. `isaac omni`) by
+    # setting OMNIGENT_REQUIRE_WRAPPER; the wrapper sets OMNIGENT_WRAPPER_BYPASS
+    # to pass through. Refuse naked calls before any work happens.
+    _enforce_wrapper_guard()
 
     cwd = os.getcwd()
     if cwd not in sys.path:
@@ -3008,7 +3051,8 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     mode_args = ["--local"] if not server_url else ["--server", server_url]
     args = [sys.executable, "-m", "omnigent.host._daemon_entry", *mode_args]
     spawned = _spawn_host_daemon_process(
-        args=args, env=_build_host_daemon_env(server_url=server_url)
+        args=args,
+        env=_build_host_daemon_env(server_url=server_url),
     )
     if spawned is None:
         return False
@@ -7828,6 +7872,9 @@ def _prompt_stop_local_server() -> None:
 # server URL, missing credentials) leaves nothing on the terminal, so we wait
 # this long and surface its log instead of falsely reporting success.
 _BACKGROUND_HOST_GRACE_S = 2.0
+# A detached process isn't ready merely because its PID survived. Wait until
+# the server confirms the host row and live tunnel are online.
+_BACKGROUND_HOST_REGISTRATION_GRACE_S = 30.0
 
 
 def _confirm_background_host_alive(record: _HostDaemonRecord) -> None:
@@ -7840,16 +7887,48 @@ def _confirm_background_host_alive(record: _HostDaemonRecord) -> None:
     deadline = time.time() + _BACKGROUND_HOST_GRACE_S
     while True:
         if not _pid_alive(record.pid):
-            from omnigent._runner_startup import format_runner_log_tail
-
-            log_path = Path(record.log_path) if record.log_path else None
             raise click.ClickException(
                 "The host daemon exited immediately after starting."
-                f"{format_runner_log_tail(log_path)}"
+                f"{_background_host_log_detail(record.log_path)}"
             )
         if time.time() >= deadline:
             return
         time.sleep(0.1)
+
+
+def _background_host_log_detail(log_path: str | None) -> str:
+    """Return the host log path and a short failure tail."""
+    if log_path is None:
+        return ""
+    path = Path(log_path)
+    detail = f"\nHost log: {path}"
+    try:
+        tail = path.read_bytes()[-4096:].decode("utf-8", errors="replace").strip()
+    except OSError:
+        return detail
+    if tail:
+        detail += "\n--- host log tail ---\n" + "\n".join(tail.splitlines()[-12:])
+    return detail
+
+
+def _confirm_background_host_registered(record: _HostDaemonRecord) -> None:
+    """Wait until the detached daemon completes server registration."""
+    deadline = time.monotonic() + _BACKGROUND_HOST_REGISTRATION_GRACE_S
+    while True:
+        if not _pid_alive(record.pid):
+            raise click.ClickException(
+                "The host daemon exited before registering with the server."
+                f"{_background_host_log_detail(record.log_path)}"
+            )
+        if _daemon_host_online(record, timeout_s=1.0):
+            return
+        if time.monotonic() >= deadline:
+            raise click.ClickException(
+                "The host daemon started but did not register with the server "
+                f"within {_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s."
+                f"{_background_host_log_detail(record.log_path)}"
+            )
+        time.sleep(0.2)
 
 
 def _run_background_host(
@@ -7879,7 +7958,7 @@ def _run_background_host(
     :param non_interactive: When ``True``, never launch the browser login —
         fail with the ``omnigent login`` hint instead.
     :raises click.ClickException: If the daemon cannot be spawned, exits
-        immediately after starting, or (local mode) never serves its local
+        immediately, fails to register, or (local mode) never serves its local
         Omnigent server.
     """
     if server:
@@ -7889,30 +7968,40 @@ def _run_background_host(
     _ensure_host_daemon(server or None)
     record = _find_daemon_record(target)
     if record is None:
-        # No record for this target: either the live local-mode daemon already
-        # serves the requested URL, or the spawn itself failed.
+        # A local daemon may already own the requested URL under its local
+        # registry key. It is reusable only after its host is online too.
         if _local_daemon_serves_target(target, server or None):
-            click.echo(f"The local host daemon already serves {target}.")
-            return
+            local_record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
+            if local_record is not None:
+                _confirm_background_host_registered(local_record)
+                click.echo(f"The local host daemon already serves {target}.")
+                return
         raise click.ClickException(
             "Could not spawn the background host daemon. See ~/.omnigent/logs/host/ for details."
         )
-    if previous is not None and previous.pid == record.pid:
-        headline = _cli_style("Host daemon already running", fg="yellow", bold=True)
-    else:
-        _confirm_background_host_alive(record)
-        headline = _cli_style("Started the host daemon in the background", fg="green", bold=True)
+    reused = previous is not None and previous.pid == record.pid
+    try:
+        if not reused:
+            _confirm_background_host_alive(record)
+        if record.mode == "local":
+            # The status probe needs the daemon-owned server's loopback URL.
+            server_url = _discover_local_server_url()
+            _update_daemon_resolved_server_url(target, server_url)
+            record = _find_daemon_record(target) or record
+        else:
+            server_url = target
+        _confirm_background_host_registered(record)
+    except click.ClickException:
+        if not reused:
+            with contextlib.suppress(click.ClickException):
+                _terminate_daemon(record, force=True)
+        raise
+    headline = _cli_style(
+        "Host daemon already running" if reused else "Started the host daemon in the background",
+        fg="yellow" if reused else "green",
+        bold=True,
+    )
     click.echo(f"{headline} (pid {record.pid}).")
-    if record.mode == "local":
-        # A local-mode daemon owns the local Omnigent server, so this command is
-        # the whole "start everything" step — wait for that server and report
-        # its URL, otherwise the Web UI is unreachable without a follow-up
-        # `omnigent server status`. Resolved after the headline above so a cold
-        # start isn't a silent terminal.
-        server_url = _discover_local_server_url()
-        _update_daemon_resolved_server_url(target, server_url)
-    else:
-        server_url = target
     _echo_host_field("server", _cli_style(server_url, fg="cyan"))
     if record.log_path is not None:
         _echo_host_field("log", _display_path(Path(record.log_path)))

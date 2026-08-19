@@ -1,7 +1,8 @@
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
-import { useConversations } from "@/hooks/useConversations";
+import { PROJECT_LABEL_KEY, useConversations, useProjects } from "@/hooks/useConversations";
+import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
@@ -440,6 +441,37 @@ export function AppShell() {
     () => allConversations?.find((c) => c.id === activeSession?.parentSessionId) ?? null,
     [allConversations, activeSession?.parentSessionId],
   );
+  // ── Header breadcrumb ─────────────────────────────────────────────────
+  // The chat header shows the conversation's title, prefixed by a folder icon
+  // when the session is filed under a project, and with the sub-agent identity
+  // appended when viewing a child. Title + project come from the active
+  // conversation normally, or its immediate parent when inside a sub-agent
+  // (whose own row the sidebar omits, so its title falls back to the parent
+  // snapshot). The parent title also links back out, replacing the old "Back"
+  // button. A child always gets a title (fallback "New session") so that
+  // climb-out does not wait on the parent row or snapshot. Prefer a real
+  // list/snapshot title over conversationDisplayLabel — that helper's
+  // "New session" fallback would otherwise shadow a titled snapshot.
+  // Project membership lives only on the list row (`Conversation`), never
+  // the snapshot, so a parent outside the loaded window shows no folder.
+  const { session: parentSession } = useSession(activeSession?.parentSessionId);
+  const { data: projectSummaries } = useProjects();
+  const breadcrumbConv = isChildSession ? parentConv : activeConv;
+  const headerConversationTitle =
+    breadcrumbConv?.title ||
+    (isChildSession ? parentSession?.title : activeSession?.title) ||
+    (breadcrumbConv ? conversationDisplayLabel(breadcrumbConv) : null) ||
+    (isChildSession ? UNTITLED_CONVERSATION_LABEL : null);
+  const headerProjectName =
+    (breadcrumbConv?.project_id != null
+      ? projectSummaries?.find((p) => p.id === breadcrumbConv.project_id)?.name
+      : undefined) ??
+    breadcrumbConv?.labels?.[PROJECT_LABEL_KEY] ??
+    null;
+  const headerTitleLinkTo =
+    isChildSession && activeSession?.parentSessionId
+      ? `/c/${activeSession.parentSessionId}`
+      : undefined;
   // Positive "this is a top-level session" signal for the top-level-only
   // actions (Share/Clone). Gating those on ``!isChildSession`` flickered:
   // while the snapshot loads ``activeSession`` is null, so ``isChildSession``
@@ -1539,7 +1571,13 @@ export function AppShell() {
             {isMacElectronShell() && !inSettings && (
               <div className="electron-sidebar-header-actions">
                 <SidebarHeaderActions
-                  expanded={sidebarOpen || sidebarPeek}
+                  // Real docked state — NOT `|| sidebarPeek`. During a peek the
+                  // sidebar isn't pinned open, and `onToggle` below pins it open
+                  // (the else branch, since sidebarOpen is false), so the button
+                  // must read "Open" and expand. Counting peek as expanded made
+                  // it show "Collapse" while a click actually expanded — the
+                  // icon/tooltip lied until the sidebar was really open.
+                  expanded={sidebarOpen}
                   onToggle={() => {
                     // Mirrors the ⌘⌥[ hotkey: a peeking sidebar counts as open,
                     // so toggling from peek pins it open rather than collapsing.
@@ -1601,13 +1639,21 @@ export function AppShell() {
                 style={
                   {
                     "--workspace-panel-offset": workspacePanelVisible
-                      ? `${inlinePanelWidth + 16}px`
+                      ? `${inlinePanelWidth}px`
                       : "0px",
                   } as CSSProperties
                 }
               >
                 <ChatHeader
-                  sidebarOpen={sidebarOpen || sidebarPeek}
+                  // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
+                  // is a transient card floating over the collapsed layout (the
+                  // docked sidebar stays w-0), so the header must keep its
+                  // collapsed left slot. Treating peek as open relaid it out —
+                  // the toggle unmounted and the breadcrumb slid left into its
+                  // spot — shifting the title sideways the instant the peek card
+                  // appeared. Left collapsed, the breadcrumb stays put beneath
+                  // the floating card (and in the title-bar strip on mac).
+                  sidebarOpen={sidebarOpen}
                   onOpenSidebar={(peek?: boolean) => {
                     if (peek) {
                       setSidebarPeek(true);
@@ -1618,8 +1664,10 @@ export function AppShell() {
                     }
                   }}
                   isChildSession={isChildSession}
-                  parentSessionId={activeSession?.parentSessionId}
                   conversationId={conversationId}
+                  conversationTitle={headerConversationTitle}
+                  projectName={headerProjectName}
+                  titleLinkTo={headerTitleLinkTo}
                   boundAgent={boundAgent}
                   wrapperLabel={wrapperLabel}
                   canShare={canShare}

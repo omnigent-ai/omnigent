@@ -27,6 +27,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.host.frames import (
+    HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsResultFrame,
@@ -45,6 +46,7 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
     decode_host_frame,
+    encode_host_frame,
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -228,25 +230,30 @@ def create_host_tunnel_router(
 
         await ws.accept()
         conn: HostConnection | None = None
+        host_persisted = False
+        stage = "hello"
         try:
             raw = await ws.receive_text()
             frame = decode_host_frame(raw)
             if not isinstance(frame, HostHelloFrame):
-                await ws.close(code=4001, reason="expected host.hello frame")
+                error = "expected host.hello frame"
+                await _send_connection_error(ws, stage="hello", error=error)
+                await ws.close(code=4001, reason=error)
                 return
 
+            stage = "protocol"
             remote_major = frame.frame_protocol_version
             if remote_major != SUPPORTED_FRAME_PROTOCOL_MAJOR:
-                await ws.close(
-                    code=4002,
-                    reason=(
-                        f"frame_protocol_version mismatch: "
-                        f"server supports {SUPPORTED_FRAME_PROTOCOL_MAJOR}, "
-                        f"host sent {remote_major}"
-                    ),
+                error = (
+                    f"frame_protocol_version mismatch: "
+                    f"server supports {SUPPORTED_FRAME_PROTOCOL_MAJOR}, "
+                    f"host sent {remote_major}"
                 )
+                await _send_connection_error(ws, stage="protocol", error=error)
+                await ws.close(code=4002, reason=error)
                 return
 
+            stage = "registration"
             await asyncio.to_thread(
                 host_store.upsert_on_connect,
                 host_id=host_id,
@@ -255,7 +262,9 @@ def create_host_tunnel_router(
                 allow_host_id_reown=allow_host_id_reown,
                 configured_harnesses=frame.configured_harnesses,
             )
+            host_persisted = True
 
+            stage = "registry"
             conn = host_registry.register(
                 host_id,
                 ws,
@@ -266,6 +275,7 @@ def create_host_tunnel_router(
             # started learns the host's gateway backing here, so a server
             # restart converges as soon as each host reconnects.
             host_registry.record_gateway_inference(host_id, frame.gateway_inference)
+            stage = "connected"
             _logger.info(
                 "Host %s connected (version=%s, name=%s, runners=%s)",
                 host_id,
@@ -362,14 +372,45 @@ def create_host_tunnel_router(
                             "on_host_disconnect callback failed for %s",
                             host_id,
                         )
-        except Exception:
+        except Exception as exc:
             _logger.exception("Host tunnel error for %s", host_id)
-            # Same guard as above: don't touch a host we never registered.
+            retryable = stage in {"registration", "registry", "connected"}
+            await _send_connection_error(
+                ws,
+                stage=stage,
+                error=str(exc),
+                retryable=retryable,
+            )
+            with contextlib.suppress(Exception):
+                await ws.close(code=4005, reason="host connection failed")
             if conn is not None:
                 if host_registry.deregister(host_id, conn=conn):
                     await asyncio.to_thread(host_store.set_offline, host_id)
+            elif host_persisted:
+                await asyncio.to_thread(host_store.set_offline, host_id)
 
     return router
+
+
+async def _send_connection_error(
+    ws: WebSocket,
+    *,
+    stage: str,
+    error: str,
+    retryable: bool = False,
+) -> None:
+    """Best-effort error report while the accepted WebSocket is writable."""
+    message = error or "unknown server error"
+    with contextlib.suppress(Exception):
+        await ws.send_text(
+            encode_host_frame(
+                HostConnectionErrorFrame(
+                    stage=stage,
+                    error=message,
+                    retryable=retryable,
+                )
+            )
+        )
 
 
 async def _refuse_upgrade(ws: WebSocket, *, status: int, reason: str) -> None:

@@ -713,16 +713,16 @@ aside[aria-label="Workspace"][data-maximized] {
  * controls, while the DOM keeps Search → Settings → toggle (tab order follows
  * importance), so the toggle is reordered visually rather than in the markup.
  *
- * Geometry: left 5rem clears the three lights plus their inset. The buttons
+ * Geometry: left 5.5rem clears the three lights plus their inset. The buttons
  * align to the LIGHTS, not to a text row — macOS paints them OUTSIDE the page
  * (absent from the DOM and from page screenshots), so there is nothing to
  * measure; anchor to the same 2.25rem strip the drag region uses and centre a
- * 1.5rem button in it: (2.25rem − 1.5rem) / 2 = 0.375rem, landing y=18 on the
+ * 1.5rem button in it: (48px - 24px) / 2 = 12px, landing on the
  * lights' centre line. */
 [data-electron-mac] .electron-sidebar-header-actions {
   position: absolute;
-  top: 0.375rem;
-  left: 5rem;
+  top: 0.75rem;
+  left: 5.5rem;
   /* Above the sidebar, which is a positioned sibling at z-index 50 with an
    * opaque gradient background — at any lower layer it paints straight over
    * this cluster (the buttons still measure correctly in the DOM, which is why
@@ -732,19 +732,21 @@ aside[aria-label="Workspace"][data-maximized] {
   display: flex;
   align-items: center;
 
+  /* Read Collapse · Search · Settings outward from the window controls: pull
+   * the cluster's last button (the toggle) to the front. */
   & > * > *:last-child {
     order: -1;
   }
 }
 /* With the sidebar closed the chat header's left slot reaches the window
- * corner where the traffic lights float — drop just that slot below them,
- * mirroring the sidebar's own top margin. Applied to the slot, not the
- * header bar, so the right action cluster (share, panel toggles) stays up
- * in the title-bar strip. flex-start anchors the margin to the bar's top
- * (the header centers its items, which would otherwise split the offset). */
+ * corner where the traffic lights float and the title-bar cluster
+ * (Search/Settings/toggle) sits. Pad the slot past both (same 10.5rem the
+ * maximized rail uses below) so the conversation breadcrumb starts to the
+ * right of the Settings cog — it then truncates within the header flex and
+ * never collides with the right-hand action cluster. Applied to the slot, not
+ * the header bar, so that right cluster stays put. */
 [data-electron-mac] .traffic-light-clearance {
-  align-self: flex-start;
-  margin-top: 1rem;
+  padding-left: 10.5rem;
 }
 /* A maximized workspace rail breaks out to inset-0 (the left sidebar collapses
  * on entry), so its tab strip starts at the window's top-left corner — where
@@ -760,6 +762,29 @@ aside[aria-label="Workspace"][data-maximized] {
  * without an explicit counter-region on interactive elements. */
 [data-electron-mac] :is(a, button, input, textarea, [role="button"]) {
   -webkit-app-region: no-drag;
+}
+/* The title-bar breadcrumb doubles as a window-drag handle (its title is a
+ * plain span, deliberately left draggable). Exclude the folder icon: it's a
+ * tooltip trigger with its own hover state, so it must stay interactive rather
+ * than move the window. Plain <span>, so the interactive-elements rule above
+ * doesn't reach it. */
+[data-electron-mac] .breadcrumb-folder {
+  -webkit-app-region: no-drag;
+}
+
+/* Native shells carry their own chrome (server switcher), so the folder /
+ * title / sub-agent segments are redundant there. Keep the parent-session
+ * link: native back is off and edge-pan opens the sidebar, so that link is
+ * the only in-header climb-out of a sub-agent. Hide the empty nav when there
+ * is no parent link (top-level). Not scoped to a width media query so it
+ * holds on wider native shells (e.g. iPad) too. */
+[data-ios-native] .conversation-breadcrumb:not(:has(> a.breadcrumb-parent-link)),
+[data-android-native] .conversation-breadcrumb:not(:has(> a.breadcrumb-parent-link)) {
+  display: none;
+}
+[data-ios-native] .conversation-breadcrumb > :not(a.breadcrumb-parent-link),
+[data-android-native] .conversation-breadcrumb > :not(a.breadcrumb-parent-link) {
+  display: none;
 }
 
 /* iOS native shell (SwiftUI/WKWebView) runs the webview full-screen under the
