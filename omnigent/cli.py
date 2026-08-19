@@ -2957,19 +2957,67 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
     return None
 
 
+def _conflicting_daemon_is_stale_zombie(conflict: _HostDaemonRecord) -> bool:
+    """
+    Return whether a conflicting daemon is a zombie safe to auto-reap.
+
+    A conflict is a live PID, but a live process is not a working host: a
+    local daemon whose server tunnel is offline and does not recover within
+    the grace window (local server restart, laptop sleep, dropped loopback,
+    ungraceful exit) can't serve anyone, yet blocks a fresh foreground
+    ``host`` with an "already running" error until the user runs
+    ``omnigent host stop`` by hand.
+
+    Scoped like the background reuse path's tunnel-health heal
+    (:func:`_reuse_existing_daemon_record`):
+
+    * only ``"local"`` conflicts are judged — a remote daemon connects to a
+      server we don't own and can't restart, so its own reconnect loop owns
+      transient tunnel drops; we never reap it off a health probe that a
+      local network blip could fail; and
+    * a daemon younger than :data:`_DAEMON_REUSE_MIN_AGE_S` is assumed to be
+      a concurrent invocation's process still connecting, and is never
+      judged a zombie.
+
+    :param conflict: Live conflicting daemon record.
+    :returns: ``True`` when the conflict is a local daemon old enough to
+        judge whose tunnel is offline (and does not recover within the
+        grace window).
+    """
+    if conflict.mode != "local":
+        return False
+    age_s = time.time() - conflict.started_at
+    if age_s < _DAEMON_REUSE_MIN_AGE_S:
+        return False
+    return not _daemon_tunnel_recovers(conflict)
+
+
 def _claim_foreground_daemon_record(
     record: _HostDaemonRecord,
 ) -> _HostDaemonRecord | None:
     """
     Persist a foreground daemon record unless a live duplicate exists.
 
+    A conflicting daemon whose process is alive but whose server tunnel is
+    offline and won't recover (a zombie) is torn down automatically and this
+    process takes over, so a wedged host no longer forces a manual
+    ``omnigent host stop`` before restarting. A conflict that is still
+    serving its tunnel — or a teardown that does not take — is surfaced as
+    before rather than killed out from under whoever is using it.
+
     :param record: Foreground process record, e.g. one with
         ``pid == os.getpid()``.
     :returns: Previous record for the same target, or ``None``.
-    :raises click.ClickException: If a live daemon already serves the
-        same target.
+    :raises click.ClickException: If a live, tunnel-healthy daemon already
+        serves the same target.
     """
     conflict = _live_daemon_conflict(record)
+    if conflict is not None and _conflicting_daemon_is_stale_zombie(conflict):
+        _terminate_host_unit(conflict, reason="host tunnel is offline")
+        # Re-evaluate: a separate live daemon could still serve this target,
+        # or the teardown may not have taken. Never start a duplicate host —
+        # surface a surviving conflict rather than heal blindly.
+        conflict = _live_daemon_conflict(record)
     if conflict is not None:
         # server_url is None in local mode; "" makes the hint say --server "".
         stop_command = _host_stop_command(conflict.server_url or "")
@@ -8096,6 +8144,13 @@ def host(
     The server URL may be given positionally (``omnigent host
     <url>``) or via ``--server <url>``. A leading ``status``, ``stop``,
     or ``stop-session`` token still runs that management subcommand.
+
+    If a local host from an earlier run is wedged — its process is alive
+    but its server tunnel is dead (laptop sleep, dropped connection, local
+    server restart) — this reclaims it automatically instead of failing
+    with "already running", so you no longer have to run ``omnigent host
+    stop`` first. A local host still actively serving its tunnel, and any
+    remote host, are left alone.
 
     When the target server is Databricks-fronted and you are not signed
     in, ``host`` runs the same flow ``omnigent login`` would before

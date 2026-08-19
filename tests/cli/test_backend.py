@@ -544,6 +544,220 @@ def test_ensure_host_daemon_young_offline_daemon_not_torn_down(
     assert "args" not in captured  # reused despite being offline (still connecting)
 
 
+def _foreground_claim_record(pid: int = 9999) -> cli._HostDaemonRecord:
+    """Build the record a foreground ``host`` process wants to claim.
+
+    :param pid: This foreground process's pid, distinct from any conflict.
+    :returns: A local-mode foreground record (``log_path is None``).
+    """
+    return cli._HostDaemonRecord(
+        pid=pid,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=None,
+        started_at=1_000_100,
+        host_id="host_abc",
+        resolved_server_url="http://127.0.0.1:8123",
+        config_sig=cli.server_config_signature(),
+    )
+
+
+def test_claim_foreground_heals_offline_tunnel_zombie(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A foreground ``host`` auto-reaps a live-but-offline conflicting daemon.
+
+    The manual-``host stop`` fix: an old conflicting daemon whose process is
+    alive but whose tunnel is offline can't serve anyone, so tear it down and
+    let this process claim the target instead of erroring.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=str(tmp_path / "daemon.log"),
+        started_at=1_000_000,
+        config_sig=cli.server_config_signature(),
+        resolved_server_url="http://127.0.0.1:8123",
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)  # past min-age
+    monkeypatch.setattr(cli, "_daemon_tunnel_recovers", lambda record, **_kw: False)
+    torn_down: list[str] = []
+
+    def _teardown(record: cli._HostDaemonRecord, *, reason: str) -> None:
+        torn_down.append(reason)
+        cli._delete_daemon_record(record)  # real teardown clears the record
+
+    monkeypatch.setattr(cli, "_terminate_host_unit", _teardown)
+
+    previous = cli._claim_foreground_daemon_record(_foreground_claim_record())
+
+    assert len(torn_down) == 1 and "offline" in torn_down[0]
+    assert previous is None  # the reaped zombie is not handed back for restore
+    claimed = cli._find_daemon_record("local")
+    assert claimed is not None and claimed.pid == 9999  # this process took over
+
+
+def test_claim_foreground_refuses_healthy_conflict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A live, tunnel-healthy conflicting daemon is never killed out from under.
+
+    The auto-heal is scoped to zombies: a daemon still serving its tunnel
+    keeps the original "already running — stop it first" guard.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=str(tmp_path / "daemon.log"),
+        started_at=1_000_000,
+        config_sig=cli.server_config_signature(),
+        resolved_server_url="http://127.0.0.1:8123",
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)  # past min-age
+    monkeypatch.setattr(cli, "_daemon_tunnel_recovers", lambda record, **_kw: True)
+    torn_down: list[str] = []
+    monkeypatch.setattr(
+        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+    )
+
+    with pytest.raises(click.ClickException, match="already running"):
+        cli._claim_foreground_daemon_record(_foreground_claim_record())
+
+    assert torn_down == []  # healthy daemon left alone
+
+
+def test_claim_foreground_young_conflict_not_reaped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A freshly-spawned conflicting daemon (still connecting) is not reaped.
+
+    Below the min-age threshold a concurrent invocation's just-spawned daemon
+    is assumed to be mid-connect: don't probe it, don't kill it — surface the
+    conflict so we never race it.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=str(tmp_path / "daemon.log"),
+        started_at=1_000_000,
+        config_sig=cli.server_config_signature(),
+        resolved_server_url="http://127.0.0.1:8123",
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli.time, "time", lambda: 1_000_002.0)  # younger than min-age
+
+    def _must_not_probe(record: object, **_kw: object) -> bool:
+        raise AssertionError("young daemon must not be probed/torn down")
+
+    monkeypatch.setattr(cli, "_daemon_tunnel_recovers", _must_not_probe)
+    torn_down: list[str] = []
+    monkeypatch.setattr(
+        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+    )
+
+    with pytest.raises(click.ClickException, match="already running"):
+        cli._claim_foreground_daemon_record(_foreground_claim_record())
+
+    assert torn_down == []
+
+
+def test_claim_foreground_surfaces_conflict_when_teardown_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A zombie that survives teardown is surfaced, not overwritten.
+
+    Guards the re-evaluation: if the reap does not take (record still live
+    afterwards), never start a duplicate host — raise instead.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=str(tmp_path / "daemon.log"),
+        started_at=1_000_000,
+        config_sig=cli.server_config_signature(),
+        resolved_server_url="http://127.0.0.1:8123",
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)  # past min-age
+    monkeypatch.setattr(cli, "_daemon_tunnel_recovers", lambda record, **_kw: False)
+    torn_down: list[str] = []
+    # Teardown "runs" but leaves the record in place (kill did not take).
+    monkeypatch.setattr(
+        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+    )
+
+    with pytest.raises(click.ClickException, match="already running"):
+        cli._claim_foreground_daemon_record(_foreground_claim_record())
+
+    assert len(torn_down) == 1 and "offline" in torn_down[0]  # reap was attempted once
+
+
+def test_claim_foreground_remote_conflict_not_probed_or_reaped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A remote conflict keeps the fast refuse — never probed, never reaped.
+
+    Auto-heal is local-only: a remote daemon connects to a server we don't
+    own, so its own reconnect loop owns transient drops. Reaping it off a
+    tunnel probe (that a local network blip could fail) would be wrong, and
+    the probe itself would add latency to a previously-instant refuse.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        started_at=1_000_000,
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)  # old, but remote
+
+    def _must_not_probe(record: object, **_kw: object) -> bool:
+        raise AssertionError("remote conflict must not be tunnel-probed")
+
+    monkeypatch.setattr(cli, "_daemon_tunnel_recovers", _must_not_probe)
+    torn_down: list[str] = []
+    monkeypatch.setattr(
+        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+    )
+
+    record = cli._HostDaemonRecord(
+        pid=9999,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=None,
+        started_at=1_000_100,
+        host_id="host_abc",
+        config_sig=cli.server_config_signature(),
+    )
+    with pytest.raises(click.ClickException, match="already running"):
+        cli._claim_foreground_daemon_record(record)
+
+    assert torn_down == []
+
+
 def _online_record() -> cli._HostDaemonRecord:
     """Build a local daemon record suitable for host-online probing.
 
