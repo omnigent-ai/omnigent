@@ -2855,13 +2855,31 @@ class _RecordingAgentStore:
     ``AttributeError`` instead of silently returning a MagicMock.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, existing: SimpleNamespace | None = None) -> None:
+        self.existing = existing
         self.created: list[dict[str, Any]] = []
+        self.updated: list[dict[str, Any]] = []
 
-    def get_by_name(self, name: str) -> None:
-        """:returns: Always ``None`` — fresh store, no collisions."""
+    def get_by_name(self, name: str) -> SimpleNamespace | None:
+        """:returns: The configured existing agent, if any."""
         del name
-        return
+        return self.existing
+
+    def update(
+        self,
+        agent_id: str,
+        bundle_location: str,
+        *,
+        description: str | None,
+    ) -> None:
+        """Record an in-place refresh for assertions."""
+        self.updated.append(
+            {
+                "agent_id": agent_id,
+                "bundle_location": bundle_location,
+                "description": description,
+            },
+        )
 
     def delete(self, agent_id: str) -> None:
         """Stubbed — replace-path not exercised by these tests."""
@@ -3065,6 +3083,170 @@ def test_preregister_agent_stored_tarball_rehydrates(tmp_path: Path) -> None:
     with tempfile.TemporaryDirectory() as extracted_dir:
         spec = load(stored_bytes, dest=Path(extracted_dir))
     assert spec.name == "supervisor-probe"
+
+
+def test_preregister_agent_repairs_stale_description_without_replacing_bundle(
+    tmp_path: Path,
+) -> None:
+    """A current bundle still reconciles separately stored agent metadata."""
+    agent_dir = tmp_path / "metadata-agent"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "metadata-agent",
+            "description": "Current route description.",
+            "executor": {"config": {"harness": "openai-agents"}},
+        },
+    )
+
+    first_store = _RecordingAgentStore()
+    first_artifacts = _RecordingArtifactStore()
+    _preregister_agent(agent_dir, first_store, first_artifacts, _RecordingAgentCache())
+    created = first_store.created[0]
+
+    existing = SimpleNamespace(
+        id=created["agent_id"],
+        bundle_location=f"ag_{created['bundle_location']}",
+        description="Retired route description.",
+    )
+    refresh_store = _RecordingAgentStore(existing)
+    refresh_artifacts = _RecordingArtifactStore()
+    refresh_cache = _RecordingAgentCache()
+
+    _preregister_agent(agent_dir, refresh_store, refresh_artifacts, refresh_cache)
+
+    assert refresh_store.updated == [
+        {
+            "agent_id": created["agent_id"],
+            "bundle_location": existing.bundle_location,
+            "description": "Current route description.",
+        },
+    ]
+    assert refresh_artifacts.puts == []
+    assert refresh_cache.replaces == []
+
+
+def test_preregister_agent_clears_stale_description_when_spec_omits_it(
+    tmp_path: Path,
+) -> None:
+    """The registered spec is authoritative when it has no description."""
+    agent_dir = tmp_path / "undescribed-agent"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "undescribed-agent",
+            "executor": {"config": {"harness": "openai-agents"}},
+        },
+    )
+    first_store = _RecordingAgentStore()
+    _preregister_agent(
+        agent_dir,
+        first_store,
+        _RecordingArtifactStore(),
+        _RecordingAgentCache(),
+    )
+    created = first_store.created[0]
+    existing = SimpleNamespace(
+        id=created["agent_id"],
+        bundle_location=created["bundle_location"],
+        description="Description absent from the authoritative spec.",
+    )
+    refresh_store = _RecordingAgentStore(existing)
+
+    _preregister_agent(
+        agent_dir,
+        refresh_store,
+        _RecordingArtifactStore(),
+        _RecordingAgentCache(),
+    )
+
+    assert refresh_store.updated[0]["description"] is None
+
+
+def test_preregister_agent_no_drift_is_a_noop(tmp_path: Path) -> None:
+    """Current bundle and metadata do not bump the agent version."""
+    agent_dir = tmp_path / "current-agent"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "current-agent",
+            "description": "Already current.",
+            "executor": {"config": {"harness": "openai-agents"}},
+        },
+    )
+    first_store = _RecordingAgentStore()
+    _preregister_agent(
+        agent_dir,
+        first_store,
+        _RecordingArtifactStore(),
+        _RecordingAgentCache(),
+    )
+    created = first_store.created[0]
+    existing = SimpleNamespace(
+        id=created["agent_id"],
+        bundle_location=created["bundle_location"],
+        description="Already current.",
+    )
+    refresh_store = _RecordingAgentStore(existing)
+    refresh_artifacts = _RecordingArtifactStore()
+    refresh_cache = _RecordingAgentCache()
+
+    _preregister_agent(agent_dir, refresh_store, refresh_artifacts, refresh_cache)
+
+    assert refresh_store.updated == []
+    assert refresh_artifacts.puts == []
+    assert refresh_cache.replaces == []
+
+
+def test_preregister_agent_refreshes_description_with_changed_bundle(
+    tmp_path: Path,
+) -> None:
+    """A bundle replacement and its list-facing description stay atomic."""
+    agent_dir = tmp_path / "replace-agent"
+    agent_dir.mkdir()
+    config = {
+        "spec_version": 1,
+        "name": "replace-agent",
+        "description": "Old route description.",
+        "executor": {"config": {"harness": "openai-agents"}},
+    }
+    _write_config(agent_dir, config)
+
+    first_store = _RecordingAgentStore()
+    _preregister_agent(
+        agent_dir,
+        first_store,
+        _RecordingArtifactStore(),
+        _RecordingAgentCache(),
+    )
+    created = first_store.created[0]
+    config["description"] = "New route description."
+    _write_config(agent_dir, config)
+
+    existing = SimpleNamespace(
+        id=created["agent_id"],
+        bundle_location=f"ag_{created['bundle_location']}",
+        description="Old route description.",
+    )
+    refresh_store = _RecordingAgentStore(existing)
+    refresh_artifacts = _RecordingArtifactStore()
+    refresh_cache = _RecordingAgentCache()
+
+    _preregister_agent(agent_dir, refresh_store, refresh_artifacts, refresh_cache)
+
+    assert refresh_store.updated[0]["description"] == "New route description."
+    assert refresh_store.updated[0]["bundle_location"] != created["bundle_location"]
+    assert refresh_store.updated[0]["bundle_location"].startswith(
+        f"ag_{created['agent_id']}/",
+    )
+    assert refresh_artifacts.puts[0][0] == refresh_store.updated[0]["bundle_location"]
+    assert refresh_cache.replaces[0][1] == refresh_store.updated[0]["bundle_location"]
 
 
 # ── no-AGENT harness launch ───────────────────────────

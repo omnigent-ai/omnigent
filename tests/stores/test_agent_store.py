@@ -218,11 +218,12 @@ def test_list_asc_with_after_cursor(agent_store: SqlAlchemyAgentStore) -> None:
 
 
 def test_update_agent(agent_store: SqlAlchemyAgentStore) -> None:
-    """update() changes bundle_location, bumps version, sets updated_at."""
+    """update() changes bundle state while preserving omitted metadata."""
     agent = agent_store.create(
         agent_id="409a6849f6efefc6ba8da809a29b9b0b",
         name="updatable",
         bundle_location="ag_test_upd/hash1",
+        description="Keep this description.",
     )
     # version=1 and updated_at=None on creation
     assert agent.version == 1
@@ -235,6 +236,33 @@ def test_update_agent(agent_store: SqlAlchemyAgentStore) -> None:
     assert updated.updated_at is not None
     # Name stays the same
     assert updated.name == "updatable"
+    assert updated.description == "Keep this description."
+
+
+def test_update_agent_description(agent_store: SqlAlchemyAgentStore) -> None:
+    """update() can replace or explicitly clear list-facing metadata."""
+    agent_store.create(
+        agent_id="f1d61fe1fc6f4b85bea07984f2cc3f9a",
+        name="described",
+        bundle_location="described/hash1",
+        description="Old description.",
+    )
+
+    replaced = agent_store.update(
+        "f1d61fe1fc6f4b85bea07984f2cc3f9a",
+        "described/hash2",
+        description="New description.",
+    )
+    assert replaced is not None
+    assert replaced.description == "New description."
+
+    cleared = agent_store.update(
+        "f1d61fe1fc6f4b85bea07984f2cc3f9a",
+        "described/hash3",
+        description=None,
+    )
+    assert cleared is not None
+    assert cleared.description is None
 
 
 def test_update_nonexistent_agent(agent_store: SqlAlchemyAgentStore) -> None:
