@@ -10854,10 +10854,8 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
             "Install it first: https://docs.databricks.com/dev-tools/cli/install.html"
         )
     # Pass --profile so the CLI doesn't stall on its interactive profile-name
-    # prompt. The derived name reuses an existing profile for this host, else
-    # the workspace's DNS label — the same default the prompt would have shown.
-    # Token resolution stays host-keyed (see _databricks_workspace_token), so
-    # naming the cfg section here doesn't couple resolution to the name.
+    # prompt; the derived name reuses an existing profile for this host, else
+    # the workspace's DNS label. Token resolution stays host-keyed regardless.
     from omnigent.onboarding.setup import (
         _derive_workspace_profile_name,
         _existing_profile_hosts,
