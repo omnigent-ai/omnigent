@@ -95,6 +95,9 @@ _UPGRADE_INDEX_TIMEOUT_SECONDS = 10.0
 # ``direct_url.json`` in place of a URL's userinfo. See
 # ``_unredact_ssh_userinfo`` for why we have to repair it.
 _REDACTED_USERINFO = "****"
+# Homebrew bottles record ``brew`` in ``INSTALLER``; the tap formula is the
+# only upgrade source (pip into the Cellar is clobbered on the next bump).
+_BREW_TAP_FORMULA = "omnigent-ai/tap/omnigent"
 
 
 @dataclass
@@ -1416,12 +1419,13 @@ class _UpgradeSuggestion:
         Always populated.
     :param runnable: ``True`` when ``command`` is a real shell
         invocation we can execute via ``subprocess.run`` —
-        i.e. the installer is one of uv / pip / pipx / poetry
+        i.e. the installer is one of uv / pip / pipx / poetry / brew
         (or pip-as-fallback for an unknown installer with a known
         VCS URL). ``False`` for the unknown-installer prose
-        fallbacks (``"reinstall X from ..."``) which exist to be
-        read, not run; the interactive "run this now?" prompt is
-        suppressed in that case.
+        fallbacks (``"reinstall X from ..."``) and for requests the
+        installer cannot honor (a pinned version or added extras on a
+        Homebrew install), which exist to be read, not run; the
+        interactive "run this now?" prompt is suppressed in that case.
     """
 
     command: str
@@ -1493,7 +1497,7 @@ def _build_upgrade_suggestion(
     """Build the right upgrade command for the user's install shape.
 
     Picks based on ``detected_installer`` (uv / pip / pipx / poetry /
-    unknown) and whether ``direct_url.json`` recorded a VCS URL.
+    brew / unknown) and whether ``direct_url.json`` recorded a VCS URL.
 
     :param info: Metadata from ``_read_installed_wheel_info``.
     :param allow_prerelease: When ``True`` (``omni upgrade --pre``), append
@@ -1554,6 +1558,28 @@ def _build_upgrade_suggestion(
         )
 
     # Registry install — no VCS URL recorded.
+    if installer == "brew":
+        # `brew upgrade` takes neither a version pin nor extras, so refuse
+        # those rather than silently ignoring them.
+        if target_version:
+            return _UpgradeSuggestion(
+                command=(
+                    f"upgrade {_DIST_NAME} with `brew upgrade {_BREW_TAP_FORMULA}` — Homebrew "
+                    f"installs whatever version the tap currently carries and cannot pin "
+                    f"{target_version}"
+                ),
+                runnable=False,
+            )
+        if extras:
+            return _UpgradeSuggestion(
+                command=(
+                    f"upgrade {_DIST_NAME} with `brew upgrade {_BREW_TAP_FORMULA}` — the formula "
+                    f"bundles its own extras and cannot add {_extras_str(extras)}"
+                ),
+                runnable=False,
+            )
+        return _UpgradeSuggestion(command=f"brew upgrade {_BREW_TAP_FORMULA}", runnable=True)
+
     registry_spec = _package_spec(version=target_version, extras=extras)
     if installer == "uv":
         if target_version or extras:

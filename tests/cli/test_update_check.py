@@ -884,6 +884,8 @@ def test_read_wheel_info_handles_corrupt_direct_url(
         # poetry path — included for completeness; poetry is rare for
         # CLI tool installs but the format is documented.
         ("poetry", None, "poetry update omnigent", True),
+        # Homebrew bottle — upgrades through the tap, never pip into the keg.
+        ("brew", None, "brew upgrade omnigent-ai/tap/omnigent", True),
         # Unknown installer WITH a VCS URL — we know the source but
         # not the tool, so the suggestion is prose ("reinstall X from
         # <url>"), not a command. Must be runnable=False so the
@@ -1560,6 +1562,48 @@ def test_build_upgrade_suggestion_preserves_uv_tool_extras() -> None:
         _build_upgrade_suggestion(_make_info("uv", extras=("server", "all"))).command
         == "uv tool install --reinstall omnigent[all,server]"
     )
+
+
+def test_build_upgrade_suggestion_brew_is_runnable() -> None:
+    """A Homebrew bottle upgrades through the tap, not through pip.
+
+    The bottle records ``brew`` in ``INSTALLER`` and ships no
+    ``direct_url.json``, so it lands on the registry path. Before this branch
+    existed it fell through to the unknown-installer prose and ``omni
+    upgrade`` dead-ended with "No automatic upgrade command is known".
+    """
+    suggestion = _build_upgrade_suggestion(_make_info("brew"))
+    assert suggestion.command == "brew upgrade omnigent-ai/tap/omnigent"
+    assert suggestion.runnable is True
+    assert "pip" not in suggestion.command
+
+
+def test_build_upgrade_suggestion_brew_prerelease_has_no_flag() -> None:
+    """``--pre`` is a no-op for brew: ``brew upgrade`` takes no such flag."""
+    assert (
+        _build_upgrade_suggestion(_make_info("brew"), allow_prerelease=True).command
+        == "brew upgrade omnigent-ai/tap/omnigent"
+    )
+
+
+def test_build_upgrade_suggestion_brew_refuses_pinned_version() -> None:
+    """A pinned version on brew is refused, not silently dropped.
+
+    ``brew upgrade`` installs whatever the tap carries, so a runnable command
+    here would land on a different version than ``--target-version`` asked for.
+    """
+    suggestion = _build_upgrade_suggestion(_make_info("brew"), target_version="0.2.0")
+    assert suggestion.runnable is False
+    assert "0.2.0" in suggestion.command
+    assert "brew upgrade omnigent-ai/tap/omnigent" in suggestion.command
+
+
+def test_build_upgrade_suggestion_brew_refuses_extras() -> None:
+    """Extras on brew are refused: the formula bundles its own set."""
+    suggestion = _build_upgrade_suggestion(_make_info("brew", extras=("all",)))
+    assert suggestion.runnable is False
+    assert "[all]" in suggestion.command
+    assert "brew upgrade omnigent-ai/tap/omnigent" in suggestion.command
 
 
 def test_build_upgrade_suggestion_uv_target_version() -> None:
