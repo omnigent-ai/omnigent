@@ -673,6 +673,19 @@ export async function describeCreateError(res: Response): Promise<string> {
 }
 
 /**
+ * Chip styling for the inline `<code>` commands in the harness warning notice.
+ *
+ * A bare `<code>` picks up nothing but Tailwind's preflight (mono family, 1em),
+ * so it inherits the notice's amber body color with no fill — the command, the
+ * one thing the user has to copy, ends up the least distinguishable part of the
+ * sentence. This is the app's existing inline-command chip (ApprovalCard,
+ * HarnessSetupDialog, ChatPage). `text-foreground` is explicit rather than
+ * inherited: amber on `bg-muted` is only 4.4:1, under the 4.5:1 AA floor at
+ * this text size, while foreground-on-muted is 13:1 light / 9.5:1 dark.
+ */
+const HARNESS_WARNING_CODE_CLASS = "rounded bg-muted px-1 py-0.5 font-mono text-foreground";
+
+/**
  * The pre-feature "run omni setup" guidance (ReactNode), shown under the
  * composer when the UI-driven setup feature is OFF.
  *
@@ -693,16 +706,16 @@ function harnessWarningMessage(
   if (reason === "needs-auth" && isCodex) {
     return (
       <>
-        {agentName} needs Codex authentication on {hostName} — run <code>codex login</code> on that
-        machine.
+        {agentName} needs Codex authentication on {hostName} — run{" "}
+        <code className={HARNESS_WARNING_CODE_CLASS}>codex login</code> on that machine.
       </>
     );
   }
   if (reason === "needs-auth" && !!harness && isNativeCursorHarness(harness)) {
     return (
       <>
-        {agentName} needs Cursor login on {hostName} — run <code>cursor-agent login</code> on that
-        machine.
+        {agentName} needs Cursor login on {hostName} — run{" "}
+        <code className={HARNESS_WARNING_CODE_CLASS}>cursor-agent login</code> on that machine.
       </>
     );
   }
@@ -712,14 +725,16 @@ function harnessWarningMessage(
   if (reason === "version-too-low") {
     return (
       <>
-        {agentName} has an outdated CLI on {hostName} — run <code>omni setup</code>, or upgrade the
-        CLI directly on that machine.
+        {agentName} has an outdated CLI on {hostName} — run{" "}
+        <code className={HARNESS_WARNING_CODE_CLASS}>omni setup</code>, or upgrade the CLI directly
+        on that machine.
       </>
     );
   }
   return (
     <>
-      {agentName} isn&apos;t configured on {hostName} — run <code>omni setup</code> on that machine.
+      {agentName} isn&apos;t configured on {hostName} — run{" "}
+      <code className={HARNESS_WARNING_CODE_CLASS}>omni setup</code> on that machine.
     </>
   );
 }

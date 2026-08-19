@@ -1884,6 +1884,27 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-harness-setup")).toBeNull();
   });
 
+  it("renders the inline command as a chip, not bare amber text", () => {
+    // Regression for #3987. The <code> commands in the flag-off guidance used
+    // to be bare, so Tailwind's preflight gave them nothing but the mono family
+    // and they inherited the notice's amber with no fill — the command, the one
+    // thing the user has to copy, was the least distinguished part of the
+    // sentence.
+    mockHosts([
+      { ...host("online"), configured_harnesses: { "codex-native": "needs-auth" } } as Host,
+    ]);
+    renderLanding();
+    selectUnconfiguredAgent("a2");
+
+    const warning = screen.getByTestId("new-chat-landing-harness-warning");
+    const code = warning.querySelector("code");
+    expect(code?.textContent).toBe("codex login");
+    // Spelled out rather than compared against the const, which would make the
+    // assertion tautological. text-foreground has to be explicit: inheriting
+    // the notice's amber onto bg-muted is 4.4:1, under the 4.5:1 AA floor.
+    expect(code?.className).toBe("rounded bg-muted px-1 py-0.5 font-mono text-foreground");
+  });
+
   it("suppresses the conflict banner once a git branch is named", async () => {
     useDirectorySessionsMock.mockReturnValue({
       data: [conv({ id: "s1", host_id: "host_1", workspace: "/Users/corey/repo" })],
