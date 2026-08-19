@@ -511,8 +511,10 @@ def seed_isolated_agy_home(
 ) -> dict[str, str]:
     """Seed the per-session isolated agy Gemini dir and return env overrides.
 
-    Copies known file-based agy OAuth markers + onboarding/migration state (NEVER
-    moving or modifying the real files) into ``<bridge_dir>/agy-home/.gemini``.
+    Copies known file-based agy OAuth markers, the user's ``settings.json``
+    (backend config such as the GCP project/location block), and
+    onboarding/migration state (NEVER moving or modifying the real files) into
+    ``<bridge_dir>/agy-home/.gemini``.
     The runner keeps agy's real ``HOME`` intact and passes this directory through
     ``--gemini_dir``; on macOS that is required because agy uses keyring-backed
     auth that is not portable to a relocated ``HOME``. The relay's
@@ -546,22 +548,42 @@ def seed_isolated_agy_home(
             dst.write_bytes(src.read_bytes())
             os.chmod(dst, 0o600)
 
+    # Seed the user's real settings as the base of the isolated settings file —
+    # they carry backend config agy needs at turn time, notably the ``gcp``
+    # block (project + location) for GCP/enterprise logins, without which every
+    # turn fails server-side with ``invalid location: ""``. Copied only when the
+    # isolated file is absent so a re-seed never clobbers per-session edits (the
+    # trust / survey seeders then merge their keys on top).
+    real_settings = real_home / ".gemini" / "antigravity-cli" / "settings.json"
+    iso_settings = iso_gemini / "antigravity-cli" / "settings.json"
+    if real_settings.is_file() and not iso_settings.exists():
+        with contextlib.suppress(OSError):
+            iso_settings.write_bytes(real_settings.read_bytes())
+            os.chmod(iso_settings, 0o600)
+
     # Seed the onboarding-complete marker so the first-run wizard never blocks a
-    # headless launch (same state ``ensure_agy_onboarding_complete`` writes).
+    # headless launch. The user's real marker is preferred: it carries auth-flow
+    # state the synthetic default lacks (``enterpriseOnboardingComplete``,
+    # ``previousAuthMethod``), without which an enterprise/GCP login re-enters
+    # the first-run wizard and blocks TUI injection.
     onboarding = iso_gemini / "antigravity-cli" / "cache" / "onboarding.json"
+    real_onboarding = real_home / ".gemini" / "antigravity-cli" / "cache" / "onboarding.json"
     with contextlib.suppress(OSError):
-        onboarding.write_text(
-            json.dumps(
-                {
-                    "consumerOnboardingComplete": True,
-                    "enterpriseOnboardingComplete": False,
-                    "onboardingComplete": True,
-                },
-                sort_keys=True,
+        if real_onboarding.is_file():
+            onboarding.write_bytes(real_onboarding.read_bytes())
+        else:
+            onboarding.write_text(
+                json.dumps(
+                    {
+                        "consumerOnboardingComplete": True,
+                        "enterpriseOnboardingComplete": False,
+                        "onboardingComplete": True,
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
             )
-            + "\n",
-            encoding="utf-8",
-        )
 
     # Seed the migration marker so agy does not churn a from-scratch migration on
     # first launch under the fresh Gemini dir (cosmetic; agy creates it itself otherwise).
