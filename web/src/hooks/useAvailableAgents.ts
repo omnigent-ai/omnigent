@@ -1,7 +1,8 @@
 import { useQuery, type QueryClient } from "@tanstack/react-query";
+import { useMemo } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { agentRootName } from "@/lib/forkHarness";
-import { capitalizeAgentName } from "@/lib/agentLabels";
+import { capitalizeAgentName, useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
 import {
   nativeCodingAgentForAvailableAgent,
   nativeCodingAgentForAgentName,
@@ -31,6 +32,13 @@ export interface AvailableAgent {
   // same-named `omnigent run` upload, but lets a newer upload supersede a
   // user-registered template (builtin === false).
   builtin?: boolean;
+  // True when the server declares this agent's harness generic-ACP (harness
+  // catalog ``integration_mode === "acp-subprocess"``) — a builtin ACP CLI row
+  // (devin / grok) or a user-configured ``acp:<slug>`` agent. Stamped on by
+  // {@link useAvailableAgents}; absent until the catalog loads and on servers
+  // that don't report capabilities, where grouping falls back to the id
+  // heuristic in ``agentGrouping``.
+  acpHarness?: boolean;
   // Creation epoch of a catalog agent — recency signal for same-name
   // supersession. Deliberately NOT updated_at: `--agent` re-registration
   // rewrites a template's bundle on every server restart (non-reproducible
@@ -380,11 +388,53 @@ interface UseAvailableAgentsOptions {
   enabled?: boolean;
 }
 
+/**
+ * Stamp the server's generic-ACP identity onto fetched agents.
+ *
+ * The fetchers above can't read the harness catalog (it's a hook), so the ACP
+ * flag and the vendor label are applied here instead. The label matters: a
+ * seeded ACP agent's ``name`` is a slug, so the capitalization fallback renders
+ * Grok Build as "Grok" and a user's "My Devin Agent" as "My-devin-agent". The
+ * catalog carries the real label for both — the vendor's for a builtin row, the
+ * user's own for a configured ``acp:<slug>`` agent.
+ *
+ * Returns the input array untouched when the catalog hasn't loaded, so a
+ * consumer's ``useMemo`` doesn't churn on an equivalent copy.
+ */
+function applyAcpHarnessCatalog(
+  agents: AvailableAgent[],
+  acpHarnessIds: ReadonlySet<string>,
+  harnessLabels: Record<string, string>,
+): AvailableAgent[] {
+  if (acpHarnessIds.size === 0) return agents;
+  return agents.map((agent) => {
+    const harness = agent.harness;
+    if (harness == null || !acpHarnessIds.has(harness)) return agent;
+    return {
+      ...agent,
+      acpHarness: true,
+      display_name: harnessLabels[harness] ?? agent.display_name,
+    };
+  });
+}
+
 export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
+  const enabled = options.enabled ?? true;
+  // Read the catalog under the same gate: a disabled picker must not provoke a
+  // request. Both values are cached references, so the memoized select keeps a
+  // stable identity and TanStack doesn't hand consumers a fresh array per render.
+  const acpHarnessIds = useAcpHarnessIds(enabled);
+  const harnessLabels = useHarnessLabels(enabled);
+  const select = useMemo(
+    () => (agents: AvailableAgent[]) =>
+      applyAcpHarnessCatalog(agents, acpHarnessIds, harnessLabels),
+    [acpHarnessIds, harnessLabels],
+  );
   return useQuery({
     queryKey: ["available-agents"],
     queryFn: fetchAvailableAgents,
-    enabled: options.enabled ?? true,
+    enabled,
     staleTime: 30_000,
+    select,
   });
 }

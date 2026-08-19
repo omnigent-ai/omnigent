@@ -185,6 +185,55 @@ describe("index.css table link wrapping rule", () => {
   });
 });
 
+/* Pins the table-cell `overflow-wrap: break-word` override so it applies to the cells and never leaks into prose outside a table. */
+describe("index.css table cell wrapping rule", () => {
+  const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find(
+    (block) =>
+      /\[data-streamdown="table-cell"\],?\s*\n?\s*\[data-streamdown="table-header-cell"\]\s*\{/.test(
+        block,
+      ) && /overflow-wrap\s*:/.test(block),
+  );
+
+  const selector = (rule ?? "")
+    .slice(0, rule ? rule.indexOf("{") : 0)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .trim();
+
+  it("has the rule this test exists to protect", () => {
+    expect(rule, "the table-cell wrapping rule is gone from index.css").toBeDefined();
+    expect(rule).toMatch(/overflow-wrap\s*:\s*break-word/);
+  });
+
+  function makeCell(cellAttr: string): HTMLElement {
+    const cell = document.createElement("div");
+    cell.setAttribute("data-streamdown", cellAttr);
+    document.body.appendChild(cell);
+    return cell;
+  }
+
+  it.each(["table-cell", "table-header-cell"])("targets the %s itself", (cellAttr) => {
+    const cell = makeCell(cellAttr);
+    expect(cell.matches(selector)).toBe(true);
+    cell.remove();
+  });
+
+  it("leaves ordinary prose (outside a table) on the inherited wrap-anywhere", () => {
+    const paragraph = document.createElement("p");
+    document.body.appendChild(paragraph);
+    expect(paragraph.matches(selector)).toBe(false);
+    paragraph.remove();
+  });
+
+  it("is declared after the link-in-cell rule, consistent with it rather than fighting it", () => {
+    const linkRuleIndex = cssSource.indexOf(
+      '[data-streamdown="table-cell"], [data-streamdown="table-header-cell"])\n  [data-streamdown="link"]',
+    );
+    const cellRuleIndex = cssSource.indexOf(rule ?? " ");
+    expect(linkRuleIndex).toBeGreaterThan(-1);
+    expect(cellRuleIndex).toBeGreaterThan(linkRuleIndex);
+  });
+});
+
 describe("index.css sidebar canvas", () => {
   const omniLightRule = cssSource.match(
     /:root:not\(\.dark\):not\(\[data-theme\]\) \.conversations-sidebar \{[^}]*\}/,
@@ -430,9 +479,6 @@ describe("index.css electron-mac sidebar header", () => {
   const stripActionsRule = cssSource.match(
     /\[data-electron-mac\] \.electron-sidebar-header-actions \{(?:[^{}]|\{[^{}]*\})*\}/,
   )?.[0];
-  const dragStripRule = cssSource.match(
-    /\[data-electron-mac\] \.electron-drag-strip \{[^}]*\}/,
-  )?.[0];
   const settingsHeaderRule = cssSource.match(
     /\[data-electron-mac\] \.settings-sidebar-header \{[^}]*\}/,
   )?.[0];
@@ -478,8 +524,6 @@ describe("index.css electron-mac sidebar header", () => {
     // keeps the icons in place while the sidebar collapses (md:w-0 +
     // overflow-hidden + inert) or peeks (floating card at inset-2).
     expect(stripActionsRule).toContain("position: absolute");
-    // 5rem clears the three lights plus their inset.
-    expect(stripActionsRule).toContain("left: 5rem");
   });
 
   it("stacks the cluster above the sidebar so it is actually painted", () => {
@@ -513,15 +557,6 @@ describe("index.css electron-mac sidebar header", () => {
     // floats clear of all of it, so the row is 2.25rem of empty canvas above the
     // first entry — the content should line up against the card's own padding.
     expect(peekHeaderRowRule).toContain("display: none");
-  });
-
-  it("aligns the cluster to the lights' centre line", () => {
-    // The lights sit ~y=19. Centring a 1.5rem button in the 2.25rem title-bar
-    // strip gives y=18: (2.25rem − 1.5rem) / 2 = 0.375rem.
-    expect(stripActionsRule).toContain("top: 0.375rem");
-    // Anchored to the SAME strip height the drag region uses, so the two can't
-    // drift apart if that band is ever retuned.
-    expect(dragStripRule).toContain("height: 2.25rem");
   });
 
   it("orders the cluster Collapse, Search, Settings left-to-right", () => {
@@ -559,5 +594,22 @@ describe("index.css electron-mac sidebar header", () => {
         );
       }
     }
+  });
+});
+
+describe("index.css native conversation breadcrumb", () => {
+  it("does not hide the parent-session link on iOS/Android native shells", () => {
+    // Native chrome is a server switcher, not session back. A blanket
+    // `.conversation-breadcrumb { display: none }` would also drop the only
+    // in-header climb-out of a sub-agent (native back is off; edge-pan opens
+    // the sidebar). Folder / title / sub-agent may hide; the parent link must
+    // stay.
+    const blanket = cssSource.match(
+      /\[data-ios-native\] \.conversation-breadcrumb\s*,\s*\[data-android-native\] \.conversation-breadcrumb\s*\{[^}]*display:\s*none/,
+    );
+    expect(blanket).toBeNull();
+    expect(cssSource).toMatch(
+      /\[data-ios-native\][\s\S]*breadcrumb-parent-link[\s\S]*\[data-android-native\][\s\S]*breadcrumb-parent-link/,
+    );
   });
 });

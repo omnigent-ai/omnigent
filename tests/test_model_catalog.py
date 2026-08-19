@@ -1661,3 +1661,96 @@ def test_keychain_credential_ref_degrades_not_crashes(
     assert listing.source == "none"
     assert not listing.models
     assert listing.note, "degraded keychain row must carry an explanatory note"
+
+
+def test_model_services_listing_is_scoped_and_paginated() -> None:
+    """The UC model-services listing is scoped to ``system.ai`` and follows pages.
+
+    Unscoped and unpaged, the endpoint walks the whole metastore and returns one
+    page of whatever schemas sort first, so a workspace serving many models
+    reported a handful of unrelated user schemas with a ``next_page_token`` this
+    call never followed. Scope to ``schemas/system.ai`` and page through.
+    """
+    from omnigent import model_catalog
+
+    requests_seen: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        assert request.headers["authorization"] == "Bearer token"
+        page_token = request.url.params.get("page_token")
+        if page_token is None:
+            return httpx.Response(
+                200,
+                json={
+                    "model_services": [
+                        {
+                            "name": "model-services/system.ai.gpt-5-6-sol",
+                            "supported_api_types": ["openai/v1/responses"],
+                        }
+                    ],
+                    "next_page_token": "p2",
+                },
+                request=request,
+            )
+        assert page_token == "p2"
+        return httpx.Response(
+            200,
+            json={
+                "model_services": [
+                    {
+                        "name": "model-services/system.ai.claude-opus-5",
+                        "supported_api_types": ["anthropic/v1/messages"],
+                    }
+                ]
+            },
+            request=request,
+        )
+
+    entries = model_catalog.fetch_databricks_model_service_entries(
+        "https://workspace.example.com/",
+        "token",
+        transport=httpx.MockTransport(_handler),
+    )
+
+    assert [entry.id for entry in entries] == ["system.ai.gpt-5-6-sol", "system.ai.claude-opus-5"]
+    assert len(requests_seen) == 2
+    assert requests_seen[0].url.params["parent"] == "schemas/system.ai"
+    assert requests_seen[0].url.params["max_results"]
+
+
+def test_model_services_listing_stops_on_repeated_page_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A looping endpoint returns the pages collected so far instead of raising.
+
+    Every caller treats an exception as "no listing" and falls back to the
+    bundled catalog's retired ``databricks-`` ids, so failing loud would
+    reintroduce the 501 this scoping fix removes; a partial list still launches.
+    """
+    from omnigent import model_catalog
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model_services": [
+                    {
+                        "name": "model-services/system.ai.gpt-5-6-sol",
+                        "supported_api_types": ["openai/v1/responses"],
+                    }
+                ],
+                "next_page_token": "same",  # never advances
+            },
+            request=request,
+        )
+
+    with caplog.at_level("WARNING", logger="omnigent.model_catalog"):
+        entries = model_catalog.fetch_databricks_model_service_entries(
+            "https://workspace.example.com",
+            "token",
+            transport=httpx.MockTransport(_handler),
+        )
+
+    assert [entry.id for entry in entries]  # partial list kept, not an exception
+    assert any("repeated a page token" in record.message for record in caplog.records)

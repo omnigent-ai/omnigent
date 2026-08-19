@@ -44,6 +44,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -97,6 +103,9 @@ class Journey:
         per op, so 100+ iterations would blow the CI time budget; they cap at a
         few samples per run and lean on ``--runs`` for repeats. ``None`` (HTTP
         journeys) means no cap.
+    :param skip_warmup: When ``True``, the warmup phase is skipped regardless
+        of ``--warmup``. Useful for expensive journeys where even a single
+        warmup iteration would waste significant time.
     :param description: Human-readable one-liner for ``--list``.
     """
 
@@ -110,6 +119,7 @@ class Journey:
     needs_runner: bool = False
     needs_host: bool = False
     max_iterations: int | None = None
+    skip_warmup: bool = False
     description: str = ""
 
     async def run_setup(self, env: BenchEnvironment) -> JourneyContext:
@@ -131,10 +141,13 @@ def _failure_reason(exc: Exception) -> str:
     """Classify an exception into a stable failure-breakdown label.
 
     HTTP status errors key off their status code (``"HTTP 500"``) so the same
-    server error groups across ops; anything else keys off its class name.
+    server error groups across ops; RuntimeErrors include the message so CI
+    failure breakdowns show the actual cause; anything else keys off class name.
     """
     if isinstance(exc, httpx.HTTPStatusError):
         return f"HTTP {exc.response.status_code}"
+    if isinstance(exc, RuntimeError):
+        return f"RuntimeError: {exc}"
     return exc.__class__.__name__
 
 
@@ -235,7 +248,8 @@ async def run_latency(
     except Exception as exc:  # noqa: BLE001 — a setup failure is a recorded data point
         return _setup_failed_result(exc)
     try:
-        for _ in range(warmup):
+        effective_warmup = 0 if journey.skip_warmup else warmup
+        for _ in range(effective_warmup):
             with contextlib.suppress(Exception):  # warmup errors are non-fatal
                 await journey.run_prepare(env, ctx)
                 await journey.measure(env, ctx)
@@ -681,6 +695,12 @@ async def _measure_read_runner_file(env: BenchEnvironment, ctx: JourneyContext) 
 
 # ── policy evaluate ──────────────────────────────────────────
 
+
+def _bench_policy_allow(_event: dict) -> dict:  # type: ignore[type-arg]
+    """Benchmark policy function: always ALLOW. Self-contained in this module."""
+    return {"result": "allow"}
+
+
 _POLICY_EVALUATE_PAYLOAD = {
     "event": {
         "type": "PHASE_TOOL_CALL",
@@ -707,15 +727,24 @@ async def _setup_policy_evaluate_session(env: BenchEnvironment) -> str:
 
     import yaml
 
+    # Build a bundle like BenchEnvironment._agent_bundle but with a policy
+    # declared so any_policies_apply is true and the full engine runs.
+    executor: dict[str, object] = {
+        "type": "omnigent",
+        "model": env.model,
+        "config": {"harness": env.harness},
+    }
     config: dict[str, object] = {
         "spec_version": 1,
         "name": "bench-policy-agent",
+        "prompt": "benchmark",
+        "executor": executor,
         "guardrails": {
             "policies": {
                 "allow_all": {
                     "type": "function",
                     "on": ["tool_call"],
-                    "function": "tests.runtime.policies.conftest._always_allow",
+                    "function": "dev.benchmarks.omnigent.journeys._bench_policy_allow",
                 }
             }
         },
@@ -728,16 +757,17 @@ async def _setup_policy_evaluate_session(env: BenchEnvironment) -> str:
         tar.addfile(info, io.BytesIO(payload))
     bundle = buf.getvalue()
 
+    # Register the agent + create a session in one call via the bundle upload
+    # path (``POST /v1/sessions`` multipart). ``/v1/agents`` is GET-only.
     resp = await env.client.post(
-        "/v1/agents",
+        "/v1/sessions",
+        data={"metadata": "{}"},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
     )
     resp.raise_for_status()
-    agent_id = resp.json()["id"]
-
-    session_resp = await env.client.post("/v1/sessions", json={"agent_id": agent_id})
-    session_resp.raise_for_status()
-    session_id = session_resp.json()["id"]
+    body = resp.json()
+    # Bundle upload returns ``session_id`` (not ``id``).
+    session_id = body.get("session_id") or body["id"]
 
     # Warm the spec + policy caches — the measured iteration is steady-state.
     for _ in range(2):
@@ -757,6 +787,148 @@ async def _measure_policy_evaluate(env: BenchEnvironment, ctx: JourneyContext) -
         json=_POLICY_EVALUATE_PAYLOAD,
     )
     resp.raise_for_status()
+
+
+# ── CLI startup (omnigent polly against the local bench server) ──────────────
+
+# Signal that the REPL is ready — the last spinner message before the prompt.
+# polly (omnigent run) emits this just before the agent REPL appears.
+_CLI_STARTUP_READY_SIGNAL = "Launching your agent"
+
+# Per-attempt timeout. With the bench host daemon pre-running (needs_host=True),
+# polly reuses it; remaining work is session + runner connect ~5-20s on CI.
+_CLI_STARTUP_TIMEOUT_S = 60
+
+# ~5s per attempt; cap so a large --iterations stays in budget.
+_CLI_STARTUP_MAX_ITERATIONS = 3
+
+
+async def _prepare_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> None:
+    """Stop stale daemons before each timed cli_startup iteration.
+
+    A leftover host daemon from the previous iteration causes the next
+    ``omnigent polly`` to fail with "runner tunnel rejection (HTTP 401)"
+    or "host is on another replica". Runs outside the latency timer.
+    """
+    del env
+    omnigent_bin = os.environ.get("OMNIGENT_BIN") or shutil.which("omnigent")
+    if omnigent_bin is None:
+        return
+    await asyncio.to_thread(
+        subprocess.run,
+        [omnigent_bin, "stop"],
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+
+
+async def _measure_cli_startup(env: BenchEnvironment, _ctx: JourneyContext) -> None:
+    """Time ``omnigent polly --server`` from invocation to REPL ready.
+
+    Spawns ``omnigent polly --server <local>`` via pexpect and times until
+    ``"Launching your agent…"`` appears — the last spinner message before the
+    agent REPL. Using polly (the bundled openai-agents harness) avoids any
+    external binary dependency while exercising the same startup path as
+    ``omnigent claude``: daemon start, session create, runner launch, and
+    runner connect.
+
+    Requires ``pexpect``. No external LLM binary needed.
+
+    :param env: Benchmark environment — ``env.base_url`` is the local server URL.
+    :param _ctx: Unused (no setup context).
+    :raises RuntimeError: On timeout or process exit before the ready signal.
+    """
+    try:
+        import pexpect
+    except ImportError as exc:
+        raise RuntimeError(
+            "pexpect is required for cli_startup. Install with: pip install pexpect"
+        ) from exc
+
+    omnigent_bin = os.environ.get("OMNIGENT_BIN") or shutil.which("omnigent")
+    if omnigent_bin is None:
+        raise RuntimeError("omnigent binary not found. Set OMNIGENT_BIN or add omnigent to PATH.")
+
+    child = pexpect.spawn(
+        omnigent_bin,
+        args=["polly", "--server", env.base_url],
+        timeout=_CLI_STARTUP_TIMEOUT_S,
+        encoding="utf-8",
+        codec_errors="ignore",
+        env=dict(os.environ),
+    )
+    try:
+        idx = child.expect([pexpect.TIMEOUT, pexpect.EOF, _CLI_STARTUP_READY_SIGNAL])
+        if idx == 0:
+            raise RuntimeError(
+                f"Timed out after {_CLI_STARTUP_TIMEOUT_S}s waiting for "
+                f"{_CLI_STARTUP_READY_SIGNAL!r}"
+            )
+        if idx == 1:
+            output = (child.before or "").strip()
+            raise RuntimeError(
+                f"Process exited before {_CLI_STARTUP_READY_SIGNAL!r}. "
+                f"Last output: {output[-200:]!r}"
+            )
+        child.sendline("/exit")
+        child.expect([pexpect.EOF, pexpect.TIMEOUT], timeout=10)
+    finally:
+        if child.isalive():
+            child.terminate(force=True)
+
+
+# ── native hook spawn (no server involved) ───────────────────
+
+# Claude Code blocks its TUI on command hooks, so one hook subprocess's whole
+# lifetime is user-visible latency: the MessageDisplay hook runs once per
+# streamed text chunk, and the same interpreter+import cost fronts every
+# statusline refresh and per-tool-call policy hook. Spawn the per-chunk hook
+# exactly as Claude Code does — isolated interpreter, module entrypoint, JSON
+# payload on stdin — and time the full process lifetime. The import-graph side
+# of this guarantee is pinned by tests/test_claude_native_message_display_hook.
+_HOOK_SPAWN_PAYLOAD = json.dumps(
+    {
+        "hook_event_name": "MessageDisplay",
+        "message_id": "bench-message",
+        "index": 0,
+        "final": False,
+        "delta": "benchmark chunk",
+    }
+).encode()
+
+
+async def _setup_hook_spawn(env: BenchEnvironment) -> JourneyContext:
+    """A throwaway bridge dir for the hook's appended deltas file."""
+    del env
+    return tempfile.mkdtemp(prefix="omnigent-bench-hook-")
+
+
+async def _measure_hook_spawn(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Spawn the MessageDisplay hook once, as Claude Code does, and wait."""
+    del env
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-I",
+        "-m",
+        "omnigent.claude_native_message_display_hook",
+        "--bridge-dir",
+        str(ctx),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate(_HOOK_SPAWN_PAYLOAD)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"hook exited {proc.returncode}: {stderr.decode('utf-8', 'replace')[:200]}"
+        )
+
+
+async def _teardown_hook_spawn(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Remove the throwaway bridge dir."""
+    del env
+    shutil.rmtree(str(ctx), ignore_errors=True)
 
 
 # ── registry ─────────────────────────────────────────────────
@@ -904,8 +1076,32 @@ ALL_JOURNEYS: dict[str, Journey] = {
             max_iterations=_RUNNER_FS_MAX_ITERATIONS,
             description="GET .../environments/default/filesystem/{path} — runner file read proxy.",
         ),
+        Journey(
+            name="native_hook_spawn",
+            kind="latency",
+            measure=_measure_hook_spawn,
+            setup=_setup_hook_spawn,
+            teardown=_teardown_hook_spawn,
+            description="Spawn the per-chunk MessageDisplay hook exactly as Claude Code does.",
+        ),
+        Journey(
+            name="cli_startup",
+            kind="latency",
+            measure=_measure_cli_startup,
+            prepare=_prepare_cli_startup,
+            max_iterations=_CLI_STARTUP_MAX_ITERATIONS,
+            skip_warmup=True,
+            description=(
+                "Spawn `omnigent polly --server` and time invocation → REPL ready "
+                "(daemon + session + runner connect). No LLM call needed. "
+                "Requires pexpect."
+            ),
+        ),
     )
 }
+
+# Registry alias — kept for callers that enumerate opt-in journeys explicitly.
+OPT_IN_JOURNEYS: dict[str, Journey] = {}
 
 
 def resolve_journeys(names: list[str] | None) -> list[Journey]:

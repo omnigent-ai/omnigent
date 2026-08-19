@@ -20,8 +20,8 @@ the unit tests.
 
 1. **You're on the branch you want to test.** The copilot harness is an
    optional extra — install it (without disturbing other extras) with
-   `uv sync --frozen --extra dev --extra copilot`. NB: a bare
-   `uv run --frozen --extra dev` re-syncs the venv and **prunes** the copilot
+   `uv sync --frozen --group test --extra copilot`. NB: a bare
+   `uv run --frozen --group test` re-syncs the venv and **prunes** the copilot
    SDK; for live testing call `.venv/bin/omni` / `.venv/bin/python` directly and
    avoid `uv run` mid-session.
 2. **The SDK is installed:**
@@ -169,7 +169,7 @@ final answer lands server-side — read it over the AP API
 - **Spawn env:** `_build_copilot_spawn_env` in `omnigent/runtime/workflow.py`
 
 ```bash
-uv run --frozen --extra dev python -m pytest \
+uv run --frozen --group test python -m pytest \
   tests/inner/test_copilot_executor.py \
   tests/inner/test_copilot_harness.py \
   tests/runtime/test_copilot_spawn_env.py \

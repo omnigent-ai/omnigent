@@ -10272,11 +10272,12 @@ def test_resolve_native_codex_launch_no_provider_sets_login_fallback_summary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """No configured provider -> summary names the login fallback (#2745)."""
-    from omnigent.onboarding import detected, provider_config
+    from omnigent.onboarding import ambient, detected, provider_config
     from omnigent.runtime import workflow
 
     monkeypatch.setattr(provider_config, "load_config", dict)
-    monkeypatch.setattr(detected, "codex_config_provider_dismissed", lambda cfg: False)
+    monkeypatch.setattr(ambient, "codex_config_detection", lambda: None)
+    monkeypatch.setattr(detected, "dismissed_detection_names", lambda cfg: frozenset())
     monkeypatch.setattr(detected, "effective_config_with_detected", lambda cfg: {})
     monkeypatch.setattr(provider_config, "default_provider_for_harness", lambda cfg, harness: None)
     monkeypatch.setattr(workflow, "_load_global_auth", lambda: None)
@@ -10292,11 +10293,12 @@ def test_resolve_native_codex_launch_databricks_provider_sets_summary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A Databricks provider default -> summary names the ucode profile (#2745)."""
-    from omnigent.onboarding import detected, provider_config
+    from omnigent.onboarding import ambient, detected, provider_config
 
     entry = SimpleNamespace(kind=provider_config.DATABRICKS_KIND, profile="my-profile")
     monkeypatch.setattr(provider_config, "load_config", dict)
-    monkeypatch.setattr(detected, "codex_config_provider_dismissed", lambda cfg: False)
+    monkeypatch.setattr(ambient, "codex_config_detection", lambda: None)
+    monkeypatch.setattr(detected, "dismissed_detection_names", lambda cfg: frozenset())
     monkeypatch.setattr(
         provider_config, "default_provider_for_harness", lambda cfg, harness: entry
     )

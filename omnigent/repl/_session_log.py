@@ -79,11 +79,9 @@ _LOG_SCHEMA_VERSION = 1
 # this module while disambiguating their output via this field.
 _LOG_FORMAT = "omnigent-conversation"
 
-# Default log directory. Derives from the shared ``state_dir()``
-# (``~/.omnigent``) so the root is defined in one place. Mirrors
-# the legacy non-AP path's ``~/.omnigent/logs/`` (see
-# ``_default_session_log_path`` in ``omnigent/inner/cli.py``) so
-# users don't have to learn a new location when migrating. Created
+# Default log directory. Derives from the shared ``state_dir()`` so
+# ``OMNIGENT_DATA_DIR`` isolates it without replacing ``HOME``. The
+# fallback remains the legacy ``~/.omnigent/logs/`` location. Created
 # on first write.
 DEFAULT_LOG_DIR = state_dir() / "logs"
 DEFAULT_LOG_ZIP_DIR = DEFAULT_LOG_DIR

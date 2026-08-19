@@ -20,6 +20,7 @@ mod paths;
 mod pod;
 mod ports;
 mod process;
+mod profile;
 mod shellhook;
 mod state;
 mod supervisor;
@@ -97,6 +98,10 @@ enum Command {
 /// Flags for the default (no-subcommand) pod-supervisor run.
 #[derive(clap::Args, Debug)]
 struct RunArgs {
+    /// Process profile for an Omnigent integration with a different repository layout.
+    #[arg(long)]
+    profile: Option<PathBuf>,
+
     /// Force the backend server port (default: probe from 6767).
     #[arg(long)]
     server_port: Option<u16>,
@@ -180,7 +185,7 @@ fn main() -> Result<()> {
 /// running supervisor (the common case: server up, you run a command).
 fn run_omnigent(args: RunArgs, passthrough: Vec<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let repo_root = paths::find_repo_root(&cwd)?;
+    let repo_root = paths::find_repo_root(&cwd, false)?;
     let pod_dir = match &args.pod_dir {
         Some(p) => p.clone(),
         None => paths::default_pod_dir(&repo_root)?,
@@ -208,7 +213,19 @@ fn run_omnigent(args: RunArgs, passthrough: Vec<String>) -> Result<()> {
 #[tokio::main]
 async fn run_supervisor(args: RunArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let repo_root = paths::find_repo_root(&cwd)?;
+    let repo_root = paths::find_repo_root(&cwd, args.profile.is_some())?;
+    let profile = args
+        .profile
+        .as_deref()
+        .map(|path| {
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                repo_root.join(path)
+            };
+            profile::Profile::load(&path)
+        })
+        .transpose()?;
     let pod_dir = match &args.pod_dir {
         Some(p) => p.clone(),
         None => paths::default_pod_dir(&repo_root)?,
@@ -231,12 +248,13 @@ async fn run_supervisor(args: RunArgs) -> Result<()> {
     } else {
         Vec::new()
     };
-    let pod = Arc::new(Pod::create(
+    let pod = Arc::new(Pod::create_with_profile(
         repo_root,
         pod_dir,
         ports,
         args.vite_host,
         trusted_origins,
+        profile,
     )?);
 
     let shared = Shared::new(&pod);
@@ -246,7 +264,7 @@ async fn run_supervisor(args: RunArgs) -> Result<()> {
     // for the whole session.
     let _watcher = watcher::spawn(
         &pod.repo_root,
-        &pod.omnigent_dir(),
+        &pod.backend_dir(),
         shared.clone(),
         args.debug,
         cmd_tx.clone(),

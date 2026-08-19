@@ -13,9 +13,11 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
+    HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
+    decode_host_frame,
     encode_host_frame,
 )
 from omnigent.server.auth import AuthProvider
@@ -305,6 +307,63 @@ async def test_host_tunnel_upserts_db_on_connect(
     assert host.status == "online"
 
 
+async def test_host_tunnel_reports_registration_failure(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-registration server exception closes with an actionable stage."""
+    app, registry, store = host_app
+
+    def _fail_upsert(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(store, "upsert_on_connect", _fail_upsert)
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await comm.send_input(
+        {"type": "websocket.receive", "text": _make_hello()},
+    )
+
+    sent = await comm.receive_output(timeout=1.0)
+    assert sent["type"] == "websocket.send"
+    error = decode_host_frame(sent["text"])
+    assert error == HostConnectionErrorFrame(
+        stage="registration",
+        error="database unavailable",
+        retryable=True,
+    )
+    close = await comm.receive_output(timeout=1.0)
+    assert close["type"] == "websocket.close"
+    assert close["code"] == 4005
+    assert registry.get(_HOST_ID) is None
+
+
+async def test_registry_failure_marks_persisted_host_offline(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure after the upsert must not leave a ghost-online host row."""
+    app, registry, store = host_app
+
+    def _fail_register(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("registry unavailable")
+
+    monkeypatch.setattr(registry, "register", _fail_register)
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await comm.send_input({"type": "websocket.receive", "text": _make_hello()})
+
+    sent = await comm.receive_output(timeout=1.0)
+    error = decode_host_frame(sent["text"])
+    assert error == HostConnectionErrorFrame(
+        stage="registry",
+        error="registry unavailable",
+        retryable=True,
+    )
+    await _wait_offline(store, _HOST_ID)
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert host.status == "offline"
+
+
 async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
     db_uri: str,
 ) -> None:
@@ -413,6 +472,12 @@ async def test_host_tunnel_rejects_bad_protocol_version(
         {"type": "websocket.receive", "text": bad_hello},
     )
 
+    sent = await comm.receive_output(timeout=1.0)
+    assert sent["type"] == "websocket.send"
+    error = decode_host_frame(sent["text"])
+    assert isinstance(error, HostConnectionErrorFrame)
+    assert error.stage == "protocol"
+    assert "frame_protocol_version mismatch" in error.error
     close = await comm.receive_output(timeout=1.0)
     assert close["type"] == "websocket.close"
     assert close.get("code") == 4002
@@ -442,6 +507,14 @@ async def test_host_tunnel_rejects_non_hello_first_frame(
         {"type": "websocket.receive", "text": result_frame},
     )
 
+    sent = await comm.receive_output(timeout=1.0)
+    assert sent["type"] == "websocket.send"
+    error = decode_host_frame(sent["text"])
+    assert error == HostConnectionErrorFrame(
+        stage="hello",
+        error="expected host.hello frame",
+        retryable=False,
+    )
     close = await comm.receive_output(timeout=1.0)
     assert close["type"] == "websocket.close"
     assert close.get("code") == 4001

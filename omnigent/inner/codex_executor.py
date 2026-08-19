@@ -3035,7 +3035,7 @@ class CodexExecutor(Executor):
             ``RetryPolicy()`` defaults — see Phase 1f of
             ``designs/RETRY_ACROSS_HARNESSES.md``.
         :param bundle_dir: The agent bundle's extracted on-disk path.
-            When set, ``<bundle_dir>/skills/<name>/SKILL.md`` files are
+            When set, ``<bundle_dir>/skills/<dir>/SKILL.md`` files are
             symlinked into the per-conversation ``$CODEX_HOME/skills/``
             so Codex auto-discovers them. ``None`` skips bundle-skill
             wiring (host-installed ``~/.codex/skills/`` only, subject to
