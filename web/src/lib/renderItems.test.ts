@@ -3087,7 +3087,7 @@ describe("buildBubbles — bubble display timestamps", () => {
     expect(bubble.createdAtS).toBeUndefined();
   });
 
-  it("stamps an assistant group from its first stamped block", () => {
+  it("stamps an assistant group from its freshest stamped block", () => {
     const bubble = buildBubbles(
       [
         textDone("a1", { clientCreatedAtS: 1_753_900_010 }),
@@ -3095,19 +3095,49 @@ describe("buildBubbles — bubble display timestamps", () => {
       ],
       null,
     )[0] as Extract<Bubble, { kind: "assistant" }>;
-    expect(bubble.createdAtS).toBe(1_753_900_010);
-    // The FIRST stamped block wins — the stamp marks when the response
-    // started, even when a later block carries a different clock (the
-    // live-first/server-tail mix can't occur in practice, but the walk
-    // is deterministic either way).
+    expect(bubble.createdAtS).toBe(1_753_900_020);
+    // The FRESHEST stamp wins regardless of which clock carried it —
+    // a mid-turn reload pairs server-stamped history with a live tail,
+    // and the display must reflect the latest activity, not whichever
+    // block walked first.
     const reloaded = buildBubbles(
       [
-        textDone("a1", { clientCreatedAtS: 1_753_900_010 }),
-        textDone("a2", { createdAtS: 1_753_900_005 }),
+        textDone("a1", { createdAtS: 1_753_900_005 }),
+        textDone("a2", { clientCreatedAtS: 1_753_900_010 }),
       ],
       null,
     )[0] as Extract<Bubble, { kind: "assistant" }>;
     expect(reloaded.createdAtS).toBe(1_753_900_010);
+  });
+
+  it("keeps a long turn's timestamp current instead of pinned to turn start", () => {
+    // Regression: a long turn under one response id showed the FIRST
+    // item's stamp, so an actively streaming "latest message" read
+    // 30+ minutes behind the wall clock.
+    const turnStart = 1_753_900_000;
+    const bubble = buildBubbles(
+      [
+        textDone("a1", { createdAtS: turnStart }),
+        textDone("a2", { createdAtS: turnStart + 40 * 60 }),
+        textDone("a3", { createdAtS: turnStart + 41 * 60 }),
+      ],
+      null,
+    )[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(bubble.createdAtS).toBe(turnStart + 41 * 60);
+  });
+
+  it("never moves the group timestamp backwards for a backdated tail block", () => {
+    // A late-arriving block can carry an older stamp (a relay-backdated
+    // tool result); the displayed time must not jump back.
+    const bubble = buildBubbles(
+      [
+        textDone("a1", { createdAtS: 1_753_900_000 }),
+        textDone("a2", { createdAtS: 1_753_900_300 }),
+        textDone("a3", { createdAtS: 1_753_900_100 }),
+      ],
+      null,
+    )[0] as Extract<Bubble, { kind: "assistant" }>;
+    expect(bubble.createdAtS).toBe(1_753_900_300);
   });
 });
 

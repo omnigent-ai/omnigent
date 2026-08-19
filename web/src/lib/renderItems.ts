@@ -189,8 +189,9 @@ export type Bubble =
        * trailing answer of its own.
        */
       continued?: boolean;
-      /** Epoch seconds of the first block in the group — server-stamped
-       *  from history, client-stamped while live. Display-only. */
+      /** Freshest epoch stamp in the group (latest activity) —
+       *  server-stamped from history, client-stamped while live.
+       *  Display-only. */
       createdAtS?: number;
     }
   | { kind: "compaction_loading"; itemId: string }
@@ -960,10 +961,16 @@ function walkBubbles(
     lastBubbleCount = 1;
     const workedForS = turnWorkedForS(groupBlocks);
     const lastActivityAtS = turnLastActivityAtS(groupBlocks);
-    // Server stamp on cold load, client stamp while live — display only.
+    // Freshest stamp in the group — server stamp on cold load, client
+    // stamp while live, either clock display-only. The max tracks latest
+    // activity and never jumps back for a backdated tail block.
     const groupCreatedAtS = groupBlocks
       .map((bk) => bk.ctx.createdAtS ?? bk.ctx.clientCreatedAtS)
-      .find((v) => v !== undefined);
+      .reduce<number | undefined>(
+        (freshest, v) =>
+          v !== undefined && (freshest === undefined || v > freshest) ? v : freshest,
+        undefined,
+      );
     bubbles.push({
       kind: "assistant",
       responseId: groupResponseId,
