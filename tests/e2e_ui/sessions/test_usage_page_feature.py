@@ -107,10 +107,11 @@ def test_session_table_shows_other_harnesses_badge(
     page.route("**/v1/usage", handle_usage)
     page.goto(f"{live_server}/usage")
 
-    table = page.locator("table")
-    expect(table).to_be_visible(timeout=30_000)
-    row = table.locator("tr", has_text="Multi-harness session")
-    expect(row).to_be_visible()
+    expect(page.get_by_test_id("usage-nav")).to_be_visible(timeout=30_000)
+    expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible()
+
+    row = page.locator("table tr", has_text="Multi-harness session")
+    expect(row).to_be_visible(timeout=10_000)
     expect(row.get_by_text("claude-sdk")).to_be_visible()
     badge = row.get_by_text("+2")
     expect(badge).to_be_visible()
