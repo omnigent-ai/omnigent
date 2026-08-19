@@ -34,6 +34,9 @@ Env vars read at startup:
   value is read from this process's own environment.
 - ``HARNESS_ACP_PROMPT_TIMEOUT_S``: optional idle (time-without-progress) deadline in
   seconds for a prompt turn (default 300); must be positive and finite or the child aborts.
+- ``HARNESS_ACP_PERMISSION_MODE``: Omnigent permission stance, ``auto`` (default) or
+  ``bypassPermissions`` — the latter skips the approval card for a tool call no
+  policy had an opinion on, so a headless agent runs without parking on prompts.
 """
 
 from __future__ import annotations
@@ -60,6 +63,8 @@ _ENV_OMNIGENT_MCP = "HARNESS_ACP_OMNIGENT_MCP"
 _ENV_CWD = "HARNESS_ACP_CWD"
 _ENV_OS_ENV = "HARNESS_ACP_OS_ENV"
 _ENV_ENV_PASSTHROUGH = "HARNESS_ACP_ENV_PASSTHROUGH"
+_ENV_PERMISSION_MODE = "HARNESS_ACP_PERMISSION_MODE"
+_DEFAULT_PERMISSION_MODE = "auto"
 
 
 def _env_enabled(name: str, *, default: bool) -> bool:
@@ -127,6 +132,7 @@ def _build_acp_executor() -> Executor:
     send_model = _env_enabled(_ENV_SEND_MODEL, default=False)
     omnigent_mcp = _env_enabled(_ENV_OMNIGENT_MCP, default=True)
     cwd = os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None
+    permission_mode = os.environ.get(_ENV_PERMISSION_MODE, "").strip() or _DEFAULT_PERMISSION_MODE
 
     config = AcpAgentConfig(
         command=command,
@@ -136,6 +142,7 @@ def _build_acp_executor() -> Executor:
         send_model_in_session_new=send_model,
         omnigent_mcp=omnigent_mcp,
         env_passthrough=_env_passthrough_names(),
+        permission_mode=permission_mode,
     )
     return AcpExecutor(config=config, cwd=cwd, os_env=_resolve_os_env())
 

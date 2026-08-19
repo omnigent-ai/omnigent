@@ -634,6 +634,150 @@ def test_permission_outcome_ignores_an_unoffered_scope() -> None:
 
 
 # ---------------------------------------------------------------------------
+# permission_mode (bypassPermissions)
+# ---------------------------------------------------------------------------
+
+
+def _bypass_executor() -> AcpExecutor:
+    """An executor whose spec opted out of approval cards."""
+    return AcpExecutor(AcpAgentConfig(command="x", permission_mode="bypassPermissions"))
+
+
+@pytest.mark.asyncio
+async def test_bypass_permissions_skips_the_card() -> None:
+    """``bypassPermissions`` allows a policy-silent call without prompting.
+
+    **What breaks if this fails**: a headless ACP worker (a polly sub-agent, a
+    scheduled task) parks on an approval card nobody is watching, so the turn
+    stalls rather than running unattended.
+    """
+    ex = _bypass_executor()
+    ex._elicitation_handler = AsyncMock(return_value=True)
+    ex._elicitation_choice_handler = AsyncMock(return_value="Allow")
+
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
+    ex._elicitation_handler.assert_not_awaited()
+    ex._elicitation_choice_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bypass_permissions_still_denies_on_policy_deny() -> None:
+    """Policy runs in every mode, so a DENY still blocks under bypass.
+
+    This is the invariant that makes the mode safe to offer: it waives the
+    *human* gate, never the user's own rules.
+    """
+    ex = _bypass_executor()
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    class _V:
+        action = "POLICY_ACTION_DENY"
+
+    ex._policy_evaluator = AsyncMock(return_value=_V())
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_bypass_permissions_still_prompts_on_policy_ask() -> None:
+    """A policy that says ASK outranks bypass — the user asked to be asked."""
+    ex = _bypass_executor()
+
+    class _V:
+        action = "POLICY_ACTION_ASK"
+
+    ex._policy_evaluator = AsyncMock(return_value=_V())
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
+    ex._elicitation_handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_default_permission_mode_still_asks() -> None:
+    """The ``auto`` default is unchanged: a policy-silent call still prompts.
+
+    **What breaks if this fails**: every ACP agent silently stops asking for
+    approval — the mode would be a default-off switch instead of an opt-in.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    assert ex._config.permission_mode == "auto"
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
+    ex._elicitation_handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unrecognized_permission_mode_still_asks() -> None:
+    """Only the exact ``bypassPermissions`` waives the card; anything else prompts.
+
+    A typo (``"bypass"``) or a mode borrowed from another harness
+    (``"acceptEdits"``) must fail toward asking, not toward silence.
+    """
+    for mode in ("bypass", "acceptEdits", "default", ""):
+        ex = AcpExecutor(AcpAgentConfig(command="x", permission_mode=mode))
+        ex._elicitation_handler = AsyncMock(return_value=True)
+        assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None), mode
+        assert ex._elicitation_handler.await_count == 1, mode
+
+
+@pytest.mark.asyncio
+async def test_bypass_never_sends_the_agents_own_bypass_option() -> None:
+    """Bypass answers each request; it never tells the agent to stop asking.
+
+    Devin offers ``switch_bypass`` ("switch to bypass mode"). Selecting it would
+    end the request stream, so omnigent would no longer see the agent's tool
+    calls and the TOOL_CALL policy could not gate them. The narrow
+    ``allow_once`` grant keeps every later call visible.
+    """
+    ex = _bypass_executor()
+    ex._elicitation_handler = AsyncMock(return_value=True)
+    params = {
+        "toolCall": {"title": "shell"},
+        "options": [
+            {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+            {
+                "optionId": "switch_bypass",
+                "name": "Yes, switch to bypass mode",
+                "kind": "allow_always",
+            },
+            {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+        ],
+    }
+
+    allow, option_id = await ex._decide_permission(params)
+    assert ex._permission_outcome(params, allow=allow, option_id=option_id) == {
+        "outcome": {"outcome": "selected", "optionId": "allow_once"}
+    }
+
+
+def test_harness_wrap_reads_permission_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The wrap decodes the forwarded mode, closing spawn env → child config."""
+    from omnigent.inner import acp_harness
+
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "devin acp")
+    monkeypatch.setenv("HARNESS_ACP_PERMISSION_MODE", "bypassPermissions")
+    ex = acp_harness._build_acp_executor()
+    assert isinstance(ex, AcpExecutor)
+    assert ex._config.permission_mode == "bypassPermissions"
+    assert ex._bypass_permissions is True
+
+
+def test_harness_wrap_permission_mode_defaults_to_auto(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unset (or blank) var leaves the wrap prompting, as before this option."""
+    from omnigent.inner import acp_harness
+
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "devin acp")
+    monkeypatch.delenv("HARNESS_ACP_PERMISSION_MODE", raising=False)
+    assert acp_harness._build_acp_executor()._config.permission_mode == "auto"
+
+    monkeypatch.setenv("HARNESS_ACP_PERMISSION_MODE", "   ")
+    ex = acp_harness._build_acp_executor()
+    assert ex._config.permission_mode == "auto"
+    assert ex._bypass_permissions is False
+
+
+# ---------------------------------------------------------------------------
 # warm model switch (session/set_config_option)
 # ---------------------------------------------------------------------------
 

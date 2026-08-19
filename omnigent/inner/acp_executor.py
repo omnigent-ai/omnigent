@@ -190,6 +190,11 @@ class AcpAgentConfig:
         the agent authenticates with — an agent that reads a variable must name
         it here (or in ``os_env.sandbox.env_passthrough``) or it starts
         unauthenticated. Names only; values come from the host environment.
+    :param permission_mode: Omnigent permission stance, e.g. ``"auto"``
+        (default) or ``"bypassPermissions"``. Only the latter changes anything:
+        it skips the human approval card for a request no policy had an opinion
+        on, matching claude-sdk's ``can_use_tool`` gate. Policy still runs in
+        every mode, so a DENY still blocks and an explicit ASK still prompts.
     """
 
     command: str
@@ -199,6 +204,7 @@ class AcpAgentConfig:
     send_model_in_session_new: bool = False
     omnigent_mcp: bool = True
     env_passthrough: tuple[str, ...] = ()
+    permission_mode: str = "auto"
 
 
 class _AcpRequestError(Exception):
@@ -837,6 +843,18 @@ class AcpExecutor(Executor):
             args = cached if isinstance(cached, dict) else {}
         return str(name), args
 
+    @property
+    def _bypass_permissions(self) -> bool:
+        """Whether the user opted out of approval cards for this agent.
+
+        Mirrors :class:`~omnigent.inner.claude_sdk_executor.ClaudeSDKExecutor`'s
+        ``can_use_tool`` stance: ``"bypassPermissions"`` and nothing else, so the ``"auto"``
+        default keeps prompting. (Cursor also treats ``"auto"`` as no-prompt;
+        ACP agents ask only about actions they consider permission-worthy, so
+        silencing the default would drop meaningful prompts.)
+        """
+        return self._config.permission_mode == "bypassPermissions"
+
     @staticmethod
     def _permission_options(params: _AcpJsonObject) -> list[_AcpJsonObject]:
         """The agent's offered options, each an ``{optionId, name, kind}`` dict."""
@@ -906,7 +924,10 @@ class AcpExecutor(Executor):
            ``ALLOW`` / unspecified falls through.
         2. **Human-consent elicitation**: the agent's own options via
            :attr:`_elicitation_choice_handler`, else a yes/no card via
-           :attr:`_elicitation_handler`.
+           :attr:`_elicitation_handler`. Skipped under
+           ``permission_mode="bypassPermissions"`` — but only for a request no
+           policy had an opinion on, so a DENY still blocks and a policy that
+           says ASK still prompts.
 
         When neither bridge is wired (standalone / unit tests), falls back to
         allow so direct use of the executor isn't blocked. In normal runner
@@ -946,8 +967,15 @@ class AcpExecutor(Executor):
                 return await self._ask_user(tool_name, tool_input, params)
             # ALLOW / UNSPECIFIED / unknown → fall through to elicitation.
 
-        if can_ask:
+        if can_ask and not self._bypass_permissions:
             return await self._ask_user(tool_name, tool_input, params)
+        if can_ask:
+            # bypassPermissions: no policy had an opinion and the user asked not
+            # to be prompted. Logged at info so the audit trail still names what
+            # ran unreviewed. Answered per-request (never the agent's own bypass
+            # option) so every later call stays visible to policy.
+            logger.info("acp permission allowed (bypassPermissions): tool=%s", tool_name)
+            return True, None
 
         logger.debug("acp permission allowed (no policy/elicitation wired): tool=%s", tool_name)
         return True, None
