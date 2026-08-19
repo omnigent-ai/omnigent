@@ -3168,9 +3168,9 @@ describe("buildBubbles — bubble display timestamps", () => {
     expect(bubbles.map((b) => b.kind)).toEqual(["assistant", "user", "assistant"]);
     // Premise: the absorbed result renders into bubble A's tool card.
     const bubbleA = bubbles[0] as Extract<Bubble, { kind: "assistant" }>;
-    expect(bubbleA.items.some((it) => it.kind === "tool" && it.output === "late output")).toBe(
-      true,
-    );
+    expect(
+      bubbleA.items.some((item) => item.kind === "tool" && item.output === "late output"),
+    ).toBe(true);
     // Bubble B keeps its own freshest stamp, not the foreign result's.
     const bubbleB = bubbles[2] as Extract<Bubble, { kind: "assistant" }>;
     expect(bubbleB.createdAtS).toBe(1_753_900_200);
