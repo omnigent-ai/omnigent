@@ -64,8 +64,24 @@ def _seed_active_turn(bridge_dir: Path, active_turn_id: str | None) -> None:
             thread_id="thread_test",
             codex_home=str(bridge_dir / "codex-home"),
             active_turn_id=active_turn_id,
+            cwd=str(bridge_dir),
         ),
     )
+
+
+def test_bridge_state_preserves_native_working_directory(tmp_path: Path) -> None:
+    """Bridge state retains the cwd used for web-driven Codex turns."""
+    _seed_active_turn(tmp_path, "turn_1")
+
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.cwd == str(tmp_path)
+
+    clear_active_turn_id_if_matches(tmp_path, "turn_1")
+
+    updated = read_bridge_state(tmp_path)
+    assert updated is not None
+    assert updated.cwd == str(tmp_path)
 
 
 @pytest.fixture

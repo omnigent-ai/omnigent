@@ -76,6 +76,8 @@ class CodexNativeBridgeState:
         ``"0196..."``.
     :param codex_home: Private per-session ``CODEX_HOME`` path, e.g.
         ``"/home/user/.omnigent/codex-native/x/codex-home"``.
+    :param cwd: Native Codex thread working directory, e.g.
+        ``"/home/user/project"``.
     :param active_turn_id: Current Codex turn id, if one is running,
         e.g. ``"turn_abc123"``.
     """
@@ -85,6 +87,7 @@ class CodexNativeBridgeState:
     thread_id: str
     codex_home: str
     active_turn_id: str | None = None
+    cwd: str | None = None
 
 
 def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
@@ -425,6 +428,7 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
                     "thread_id": state.thread_id,
                     "codex_home": state.codex_home,
                     "active_turn_id": state.active_turn_id,
+                    "cwd": state.cwd,
                 },
                 handle,
                 sort_keys=True,
@@ -686,6 +690,7 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
     thread_id = raw.get("thread_id")
     codex_home = raw.get("codex_home")
     active_turn_id = raw.get("active_turn_id")
+    cwd = raw.get("cwd")
     if (
         not isinstance(session_id, str)
         or not session_id
@@ -706,6 +711,7 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
         thread_id=thread_id,
         codex_home=codex_home,
         active_turn_id=parsed_active_turn_id,
+        cwd=cwd if isinstance(cwd, str) and cwd else None,
     )
 
 
@@ -729,6 +735,7 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
             thread_id=state.thread_id,
             codex_home=state.codex_home,
             active_turn_id=active_turn_id,
+            cwd=state.cwd,
         ),
     )
 
@@ -757,6 +764,7 @@ def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | Non
             thread_id=thread_id,
             codex_home=state.codex_home,
             active_turn_id=active_turn_id,
+            cwd=state.cwd,
         ),
     )
 
@@ -802,6 +810,7 @@ def clear_active_turn_id_if_matches(bridge_dir: Path, completed_turn_id: str | N
             thread_id=state.thread_id,
             codex_home=state.codex_home,
             active_turn_id=None,
+            cwd=state.cwd,
         ),
     )
     return True
