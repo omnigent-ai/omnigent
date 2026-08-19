@@ -7,6 +7,7 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
+import { useViewModeToggleHotkey } from "@/hooks/useViewModeToggleHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
@@ -1477,6 +1478,10 @@ export function AppShell() {
       terminalStartingUp,
     ],
   );
+
+  // ⌘⌥T / Ctrl+Alt+T uses the same TerminalFirstContext transition as the
+  // header control and native bridge. Embedded hosts retain their own chords.
+  useViewModeToggleHotkey(terminalFirstContextValue, !isEmbedded);
 
   // Opener for the fork/clone dialog, shared with descendants via
   // ForkDialogContext. ChatPage's per-message "Fork from here" action is

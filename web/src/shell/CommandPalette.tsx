@@ -26,9 +26,11 @@ import {
   PanelRightIcon,
   SettingsIcon,
   SquarePenIcon,
+  TerminalIcon,
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
+import { canToggleTerminalFirstView } from "@/hooks/useViewModeToggleHotkey";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
   Command,
@@ -39,6 +41,7 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
+import { useTerminalFirst } from "./TerminalFirstContext";
 
 export interface CommandPaletteProps {
   open: boolean;
@@ -101,6 +104,7 @@ export function CommandPalette({
   onToggleRightSidebar,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
+  const terminalFirst = useTerminalFirst();
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
 
@@ -163,8 +167,19 @@ export function CommandPalette({
         keywords: ["panel", "right", "files", "terminal"],
         run: onToggleRightSidebar,
       },
+      ...(canToggleTerminalFirstView(terminalFirst)
+        ? [
+            {
+              id: "toggle-view-mode",
+              label: "Toggle chat / terminal view",
+              icon: TerminalIcon,
+              keywords: ["terminal", "chat", "view", "shell", "pty"],
+              run: () => terminalFirst.setView(terminalFirst.view === "chat" ? "terminal" : "chat"),
+            },
+          ]
+        : []),
     ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar],
+    [navigate, onToggleLeftSidebar, onToggleRightSidebar, terminalFirst],
   );
 
   const filteredActions = useMemo(() => {

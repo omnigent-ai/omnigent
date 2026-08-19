@@ -122,7 +122,7 @@ describe("ViewModeToggle", () => {
     // Radix opens on a real pointer move over the trigger (the wrapper span),
     // so a bare pointerEnter on the button wouldn't surface the tooltip.
     fireEvent.pointerMove(chatSegment().parentElement!, { pointerType: "mouse" });
-    expect(await screen.findByRole("tooltip")).toHaveTextContent("Chat view");
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(/Chat view · (⌘⌥T|Ctrl\+Alt\+T)/);
   });
 
   it("disables the Terminal segment and shows a spinner while the terminal is coming up", () => {
