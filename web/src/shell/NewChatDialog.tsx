@@ -107,6 +107,7 @@ import {
   prefillDone,
   projectPrefillStep,
   type ProjectPrefillConfig,
+  type ProjectPrefillNotice,
   type ProjectPrefillState,
 } from "./projectPrefill";
 import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
@@ -1983,6 +1984,15 @@ function HarnessConfigModal({
 // when the user navigates into an existing session and back. Module-scoped,
 // not persisted to storage (a page refresh starts clean); cleared on create.
 interface LandingDraft {
+  /** `?project=` of the visit the draft was captured in ("" = plain visit).
+   *  A draft is only restored into the same visit — restoring another
+   *  project's host/workspace would defeat this project's stored defaults
+   *  (the prefill fills empty slots only). */
+  project: string;
+  /** The project chip's selection when the draft was captured, which can differ
+   *  from the visit's `project` (the user picked one in the composer). Restored
+   *  alongside the workspace it seeded, so the two stay consistent. */
+  selectedProject: string;
   message: string;
   files: File[];
   pickedAgentId: string | null;
@@ -2062,6 +2072,14 @@ export function NewChatLandingScreen() {
   // a new session. The hook hides it whenever the sidebar covers the surface.
   const [landingSurface, setLandingSurface] = useState<HTMLElement | null>(null);
   useNativeServerSwitcherForMainSurface(landingSurface, true);
+
+  // Project driving this visit, when the sidebar's per-project "new session"
+  // pencil landed here with a `?project=` query param. Empty otherwise.
+  // Derived before the draft-seeded state below: a preserved draft from a
+  // DIFFERENT visit is dropped here so its host/workspace can't shadow this
+  // project's stored defaults (the prefill fills empty slots only).
+  const projectParam = searchParams.get("project") ?? "";
+  if (landingDraft !== null && landingDraft.project !== projectParam) landingDraft = null;
 
   const [message, setMessage] = useState<string>(() => landingDraft?.message ?? "");
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -2179,9 +2197,6 @@ export function NewChatLandingScreen() {
   const databricksGitCredentialsTooltipContent = docsLinks?.databricksGitCredentials;
   const showDisabledSandboxWithDocs = !managedSandboxesEnabled && !!newSandboxTooltipContent;
 
-  // Project driving this visit, when the sidebar's per-project "new session"
-  // pencil landed here with a `?project=` query param. Empty otherwise.
-  const projectParam = searchParams.get("project") ?? "";
   // Seeded from the persisted last pick so a returning user starts on the
   // agent they used last; validated against the live list in
   // effectiveAgentId below (a stale id falls back to the default). A
@@ -2292,18 +2307,26 @@ export function NewChatLandingScreen() {
   const [prefilledBranch, setPrefilledBranch] = useState<string>(
     () => landingDraft?.prefilledBranch ?? "",
   );
-  // Project to file the new session under. Empty = unfiled. Stamped as the
+  // Project to file the new session under, and the project whose stored
+  // defaults drive the prefill below. Empty = unfiled. Stamped as the
   // `omni_project` label at create (so the row is filed from its first sidebar
   // appearance), then promoted to first-class `project_id` right after.
   // Pre-filled from the `?project=` param so the sidebar's per-project
-  // "new session" pencil lands here with the project already selected.
-  const [selectedProject, setSelectedProject] = useState<string>(() => projectParam);
+  // "new session" pencil lands here with the project already selected; the
+  // composer's project chip sets it too.
+  const [selectedProject, setSelectedProject] = useState<string>(
+    () => landingDraft?.selectedProject ?? projectParam,
+  );
   // The landing screen stays mounted while the `?project=` param changes (e.g.
   // clicking a different project's pencil), so the lazy initializer above won't
-  // re-run — sync the selection to the param whenever it changes.
-  useEffect(() => {
+  // re-run — sync the selection to the param whenever it changes. Done during
+  // render (not in an effect) so the prefill below sees the new project in the
+  // same pass the param changed, rather than seeding once for the old one.
+  const [syncedProjectParam, setSyncedProjectParam] = useState<string>(projectParam);
+  if (syncedProjectParam !== projectParam) {
+    setSyncedProjectParam(projectParam);
     setSelectedProject(projectParam);
-  }, [projectParam]);
+  }
   // Permission mode for Claude Code (claude --permission-mode). Only
   // meaningful for the claude-native wrapper; ignored otherwise. Lives in
   // the footer tray's Advanced settings menu.
@@ -2395,6 +2418,8 @@ export function NewChatLandingScreen() {
   const onScreenRef = useRef(true);
   const draftRef = useRef<LandingDraft>(null as unknown as LandingDraft);
   draftRef.current = {
+    project: projectParam,
+    selectedProject,
     message,
     files,
     pickedAgentId,
@@ -2466,18 +2491,19 @@ export function NewChatLandingScreen() {
     };
   }, []);
 
-  // Project prefill: a project-driven visit seeds the composer from the
-  // project's stored defaults (host / working directory / agent / worktree).
-  // `?project=` carries the project NAME, so resolve it to the first-class id
-  // the config endpoint needs; a label-only folder (id null) or plain visit
-  // has no config to read.
+  // Project prefill: the selected project seeds the composer from its stored
+  // defaults (host / working directory / agent / worktree) — whether it was
+  // selected by the sidebar pencil (`?project=`) or by the composer's own
+  // project chip. The selection carries the project NAME, so resolve it to the
+  // first-class id the config endpoint needs; a label-only folder (id null) or
+  // no selection has no config to read.
   const { data: projectList, isLoading: projectListLoading } = useProjects();
   const configProjectId = useMemo(
     () =>
-      projectParam !== ""
-        ? ((projectList ?? []).find((p) => p.name === projectParam)?.id ?? null)
+      selectedProject !== ""
+        ? ((projectList ?? []).find((p) => p.name === selectedProject)?.id ?? null)
         : null,
-    [projectList, projectParam],
+    [projectList, selectedProject],
   );
   const { data: storedProjectConfig, isLoading: projectConfigLoading } =
     useProjectConfig(configProjectId);
@@ -2486,10 +2512,10 @@ export function NewChatLandingScreen() {
   // (plain visit / label-only folder / genuinely empty config), so it settles
   // immediately and the generic defaults take over.
   const prefillConfig = useMemo<ProjectPrefillConfig | undefined>(() => {
-    // A project-scoped visit must resolve name → id via the projects list
+    // A project-scoped composer must resolve name → id via the projects list
     // before we know whether there's a config to read — until it loads, the id
     // is falsely null, so wait rather than settle prematurely.
-    if (projectParam !== "" && projectListLoading) return undefined;
+    if (selectedProject !== "" && projectListLoading) return undefined;
     if (configProjectId !== null && projectConfigLoading) return undefined;
     const c = storedProjectConfig;
     if (!c) return {};
@@ -2500,7 +2526,7 @@ export function NewChatLandingScreen() {
       useWorktree: c.use_worktree,
     };
   }, [
-    projectParam,
+    selectedProject,
     projectListLoading,
     configProjectId,
     projectConfigLoading,
@@ -2511,8 +2537,12 @@ export function NewChatLandingScreen() {
   // host/workspace defaults below hold off until it settles so they can't win
   // the race against the project's stored values.
   const [prefill, setPrefill] = useState<ProjectPrefillState>(() =>
-    initialPrefillState(projectParam),
+    initialPrefillState(landingDraft?.selectedProject ?? projectParam),
   );
+  // Something the prefill had to announce instead of silently doing (today:
+  // the project's configured host is offline, so the session is about to bind
+  // to the last-used location instead). Rendered under the composer.
+  const [prefillNotice, setPrefillNotice] = useState<ProjectPrefillNotice | null>(null);
   // The generic defaults gate on the location track only — the agent seed
   // waits on its own fetch and must not hold up the host/workspace fill.
   const prefillSettled = prefill.phase === "settled";
@@ -2532,42 +2562,59 @@ export function NewChatLandingScreen() {
     [prefillConfig],
   );
 
-  // The landing screen stays mounted while `?project=` changes (clicking
-  // another project's pencil), so re-create a fresh visit by hand: clear
-  // every seedable slot and restart the machine. Values the user set are
-  // reset too — a pencil click means "set me up for this project". Also
-  // restart when the SAME project's stored defaults change (the user edited
-  // its settings, then re-opened its composer): `projectParam` stays put, so
-  // without this the already-settled machine would keep the stale seeds.
+  // The `?project=` this effect last acted on, so it can tell a URL-driven
+  // visit (a pencil click) from a pick in the composer's project chip.
+  const lastPrefillParamRef = useRef(projectParam);
+
+  // The landing screen stays mounted while the selected project changes
+  // (clicking another project's pencil, or picking one in the chip), so
+  // re-create a fresh visit by hand: clear every seedable slot and restart the
+  // machine. Values the user set are reset too — selecting a project means
+  // "set me up for this project" — but the typed message is never touched.
+  // Also restart when the SAME project's stored defaults change (the user
+  // edited its settings, then re-opened its composer): the selection stays put,
+  // so without this the already-settled machine would keep the stale seeds.
   useEffect(() => {
-    const projectChanged = prefill.project !== projectParam;
+    const paramChanged = lastPrefillParamRef.current !== projectParam;
+    lastPrefillParamRef.current = projectParam;
+    const projectChanged = prefill.project !== selectedProject;
     const configChanged =
       !projectChanged &&
-      projectParam !== "" &&
+      selectedProject !== "" &&
       prefillConfigSig !== null &&
       seededConfigSigRef.current !== null &&
       prefillConfigSig !== seededConfigSigRef.current;
     if (!projectChanged && !configChanged) return;
+    // Clearing the chip back to "no project" only changes where the session is
+    // FILED, so leave the location the user is looking at alone. Just disarm
+    // the machine so a later pick seeds again from scratch.
+    if (projectChanged && !paramChanged && selectedProject === "") {
+      seededConfigSigRef.current = null;
+      setPrefillNotice(null);
+      setPrefill(initialPrefillState(""));
+      return;
+    }
     setSandboxSelected(false);
     setSelectedHostId(null);
-    setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
+    setPickedAgentId(selectedProject !== "" ? null : readLastAgentId());
     setWorkspace("");
     setBranchName("");
+    setPrefillNotice(null);
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
     seededConfigSigRef.current = prefillConfigSig;
-    setPrefill(initialPrefillState(projectParam));
-  }, [projectParam, prefill.project, prefillConfigSig]);
+    setPrefill(initialPrefillState(selectedProject));
+  }, [projectParam, selectedProject, prefill.project, prefillConfigSig]);
 
   // Record the config the machine settled from, once it's loaded and the
   // machine is done, so the reseed effect above can spot a later change to it
   // (the reseed on a project switch runs before the config has loaded, leaving
   // the signature `null` until this fills it in).
   useEffect(() => {
-    if (prefill.project !== projectParam) return;
+    if (prefill.project !== selectedProject) return;
     if (prefillConfigSig === null || !prefillDone(prefill)) return;
     seededConfigSigRef.current = prefillConfigSig;
-  }, [prefill, projectParam, prefillConfigSig]);
+  }, [prefill, selectedProject, prefillConfigSig]);
 
   // Auto-select an option so a session can be started without an explicit
   // pick. Prefer the user's last explicit choice (persisted across visits);
@@ -3311,7 +3358,7 @@ export function NewChatLandingScreen() {
   // unset. An opt-in worktree is generated by the dedicated effect below once
   // the workspace is in place.
   useEffect(() => {
-    if (prefill.project !== projectParam || prefillDone(prefill)) return;
+    if (prefill.project !== selectedProject || prefillDone(prefill)) return;
     const step = projectPrefillStep(prefill, {
       hosts,
       // The pickable list, not the raw one — a hidden agent's id would seed
@@ -3325,6 +3372,7 @@ export function NewChatLandingScreen() {
     });
     if (step === null) return;
     const { writes } = step;
+    if (step.notice !== undefined) setPrefillNotice(step.notice);
     if (writes.selectSandbox) {
       setSandboxSelected(true);
       setSandboxProvider(defaultSandboxProvider());
@@ -3340,7 +3388,7 @@ export function NewChatLandingScreen() {
     setPrefill(step.state);
   }, [
     prefill,
-    projectParam,
+    selectedProject,
     hosts,
     agents,
     agentList,
@@ -3361,7 +3409,7 @@ export function NewChatLandingScreen() {
   // typed branch / existing-worktree prefill is never clobbered.
   useEffect(() => {
     if (prefillConfig?.useWorktree !== true) return;
-    if (prefill.project !== projectParam || !prefillDone(prefill)) return;
+    if (prefill.project !== selectedProject || !prefillDone(prefill)) return;
     if (sandboxSelected || selectedHostId === null || workspaceTrimmed === "") return;
     if (branchName !== "" || prefilledBranch !== "") return;
     if (worktreeSeededForRef.current === workspaceTrimmed) return;
@@ -3373,7 +3421,7 @@ export function NewChatLandingScreen() {
   }, [
     prefillConfig,
     prefill,
-    projectParam,
+    selectedProject,
     sandboxSelected,
     selectedHostId,
     workspaceTrimmed,
@@ -5032,9 +5080,52 @@ export function NewChatLandingScreen() {
                 </Popover>
               )}
 
-              {/* The session's project membership (from a `?project=` landing)
-                is shown in the hero heading instead of a tray chip; filing on
-                create still uses `selectedProject`. */}
+              {/* Project chip — the session's project membership. Picking one
+                here does what the sidebar pencil does: file the session under
+                the project AND seed the composer from that project's stored
+                defaults (host / working directory / agent / worktree), so a
+                session filed under a project always starts in its repo.
+                Hidden until there's a project to pick. */}
+              {(projectList ?? []).length > 0 && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      className="flex h-6 cursor-pointer items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      data-testid="new-chat-landing-project-chip"
+                    >
+                      <FolderIcon className="ui-icon" />
+                      <span className="hidden max-w-32 truncate text-sm sm:block">
+                        {selectedProject || "No project"}
+                      </span>
+                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="min-w-52">
+                    <DropdownMenuItem
+                      onSelect={() => setSelectedProject("")}
+                      data-active={selectedProject === "" ? "true" : undefined}
+                      className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                      data-testid="new-chat-landing-project-none"
+                    >
+                      No project
+                    </DropdownMenuItem>
+                    {(projectList ?? []).map((p) => (
+                      <DropdownMenuItem
+                        key={p.id ?? p.name}
+                        onSelect={() => setSelectedProject(p.name)}
+                        data-active={selectedProject === p.name ? "true" : undefined}
+                        className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                      >
+                        <span className="flex items-center gap-2">
+                          <FolderIcon className="size-4 text-muted-foreground" />
+                          <span className="truncate text-sm">{p.name}</span>
+                        </span>
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
             </div>
             {/* The agent / harness picker moved out of the tray and into the
                 composer's right action cluster (next to Send) — see
@@ -5080,6 +5171,26 @@ export function NewChatLandingScreen() {
                   hostName: harnessWarningHost?.name,
                   fallbackAgentName: selectedAgent?.display_name,
                 })}
+              </span>
+            </p>
+          )}
+
+          {/* The project's configured host is offline, so its working
+              directory was dropped and this session is about to start in the
+              last-used location instead. Warn rather than silently re-bind —
+              creating in another project's repo is invisible afterwards. */}
+          {prefillNotice?.kind === "host-offline" && (
+            <p
+              className="flex items-center gap-2 pl-2 text-xs text-amber-600 dark:text-amber-500"
+              data-testid="new-chat-landing-project-host-offline"
+            >
+              <TriangleAlertIcon className="size-3.5 shrink-0" />
+              <span>
+                {selectedProject}'s configured host (
+                {allHosts.find((h) => h.host_id === prefillNotice.hostId)?.name ??
+                  prefillNotice.hostId}
+                ) is offline — this session will start in the last-used location instead. Check the
+                working directory before sending.
               </span>
             </p>
           )}

@@ -76,6 +76,23 @@ interface ProjectPrefillWrites {
 }
 
 /**
+ * Something the composer must SAY rather than silently do. Today's only case:
+ * the project's configured host isn't online, so its workspace is dropped and
+ * the generic defaults bind the session to whatever repo was used last — a
+ * silent rebinding the user would otherwise only discover after the fact.
+ */
+export interface ProjectPrefillNotice {
+  kind: "host-offline";
+  hostId: string;
+}
+
+/** Mutable sink for a step's outputs, so both tracks can add to it. */
+interface StepOutput {
+  writes: ProjectPrefillWrites;
+  notice?: ProjectPrefillNotice;
+}
+
+/**
  * One transition. null = keep waiting for data; otherwise the next state
  * plus slot writes to apply (fill-empty-only; the component enforces that).
  * The agent seed and the location phase advance independently, mirroring
@@ -84,8 +101,13 @@ interface ProjectPrefillWrites {
 export function projectPrefillStep(
   state: ProjectPrefillState,
   inputs: ProjectPrefillInputs,
-): { state: ProjectPrefillState; writes: ProjectPrefillWrites } | null {
-  const writes: ProjectPrefillWrites = {};
+): {
+  state: ProjectPrefillState;
+  writes: ProjectPrefillWrites;
+  notice?: ProjectPrefillNotice;
+} | null {
+  const out: StepOutput = { writes: {} };
+  const writes = out.writes;
   let next = state;
 
   // Config still loading for a project that has one — wait so a generic default
@@ -108,11 +130,11 @@ export function projectPrefillStep(
     }
   }
 
-  const location = locationStep(next, inputs, writes);
+  const location = locationStep(next, inputs, out);
   if (location !== null) next = location;
 
   if (next === state) return null; // both tracks waiting on data
-  return { state: next, writes };
+  return { state: next, writes, notice: out.notice };
 }
 
 /** The location track's terminal phase; the generic defaults resume from here. */
@@ -124,10 +146,11 @@ function settled(state: ProjectPrefillState): ProjectPrefillState {
 function locationStep(
   state: ProjectPrefillState,
   inputs: ProjectPrefillInputs,
-  writes: ProjectPrefillWrites,
+  out: StepOutput,
 ): ProjectPrefillState | null {
   if (state.phase !== "location") return null;
   const { hosts, selectedHostId, config } = inputs;
+  const writes = out.writes;
 
   // A stored sandbox default: select the sandbox (gated on the server still
   // offering it), unless the user already picked a host / the sandbox. The
@@ -143,9 +166,9 @@ function locationStep(
   // The online check needs the host list — wait for it.
   if (hosts === undefined) return null;
 
-  // Seed the configured host only when it's online (silently dropped
-  // otherwise, so an offline default can't set up a create that only fails),
-  // and only when the user hasn't already picked a different host / the sandbox.
+  // Seed the configured host only when it's online (dropped otherwise — with a
+  // notice, below — so an offline default can't set up a create that only
+  // fails), and only when the user hasn't already picked a host / the sandbox.
   const configHostOnline =
     config?.hostId != null &&
     hosts.some((h) => h.host_id === config.hostId && h.status === "online");
@@ -153,6 +176,18 @@ function locationStep(
     configHostOnline &&
     !inputs.sandboxSelected &&
     (selectedHostId === null || selectedHostId === config!.hostId);
+  // Configured host present but not online: nothing is seeded, so the generic
+  // defaults will bind this session to the last-used host and repo. Say so —
+  // an unannounced rebinding is how a session ends up filed under one project
+  // while running in another project's checkout.
+  if (
+    config?.hostId != null &&
+    !configHostOnline &&
+    !inputs.sandboxSelected &&
+    selectedHostId === null
+  ) {
+    out.notice = { kind: "host-offline", hostId: config.hostId };
+  }
   if (configHostUsable) {
     writes.hostId = config!.hostId;
     // A configured workspace seeds the field; without one, the composer's
