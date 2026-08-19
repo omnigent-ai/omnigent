@@ -9,11 +9,9 @@ import { cn } from "@/lib/utils";
 /**
  * `[folder] / <title> [/ <sub-agent>]` breadcrumb for the active conversation.
  *
- * Rendered in the chat header's left slot (ChatHeader). On the macOS shell with
- * the sidebar collapsed the slot is padded clear of the traffic lights and the
- * title-bar cluster (see `.traffic-light-clearance` in index.css), so the
- * breadcrumb stays in the header — truncating within its flex — rather than
- * overlapping the window controls.
+ * Rendered in the center of the chat header on desktop and beside the sidebar
+ * toggle on mobile. The header's equal outer columns keep it centered on the
+ * chat without overlapping either side's controls.
  *
  * The caller mounts this when there is a title or a parent route to climb
  * back to. Segments self-gate: the folder only shows when filed, the
