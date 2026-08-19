@@ -95,8 +95,7 @@ class TestSysAgentListTool:
         assert func["name"] == "sys_agent_list"
         params = func["parameters"]
         assert "default" not in params["properties"]["limit"]
-        assert params["properties"]["offset"]["default"] == 0
-        assert "maximum" not in params["properties"]["offset"]
+        assert params["properties"]["cursor"]["type"] == "string"
         assert params.get("additionalProperties") is False
 
     def test_invoke_raises(self) -> None:

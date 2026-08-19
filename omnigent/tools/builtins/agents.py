@@ -232,8 +232,8 @@ class SysAgentListTool(Tool):
             "session_agents row's session_id) only to inspect or fork "
             "an agent's config. Calls without pagination keep the complete "
             "result while it fits the tool-output budget; larger results "
-            "return a page with has_more metadata. Pass limit and offset "
-            "to continue."
+            "return a page with has_more metadata and an opaque "
+            "next_cursor. Pass that cursor to continue."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -260,11 +260,12 @@ class SysAgentListTool(Tool):
                                 "Omit it to keep the complete result while it fits."
                             ),
                         },
-                        "offset": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "default": 0,
-                            "description": "Zero-based offset applied to each source.",
+                        "cursor": {
+                            "type": "string",
+                            "description": (
+                                "Opaque continuation cursor from a prior "
+                                "sys_agent_list result's page.next_cursor."
+                            ),
                         },
                     },
                     "additionalProperties": False,

@@ -810,8 +810,7 @@ def test_session_list_schema_exposes_bounded_pagination() -> None:
 
     assert "default" not in properties["limit"]
     assert properties["limit"]["maximum"] == 100
-    assert properties["offset"]["default"] == 0
-    assert "maximum" not in properties["offset"]
+    assert properties["cursor"]["type"] == "string"
 
 
 def test_close_unknown_conversation_id_returns_not_found(

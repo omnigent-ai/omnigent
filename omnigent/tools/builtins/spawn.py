@@ -502,7 +502,7 @@ class SysSessionListTool(Tool):
             "sessions running that agent. Calls without pagination keep "
             "the complete result while it fits the tool-output budget; "
             "larger global session lists return a page with has_more "
-            "metadata. Pass limit and offset to continue; sub_agents stays "
+            "metadata and an opaque next_cursor. Pass that cursor to continue; sub_agents stays "
             "complete."
         )
 
@@ -540,11 +540,12 @@ class SysSessionListTool(Tool):
                                 "Omit it to keep the complete result while it fits."
                             ),
                         },
-                        "offset": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "default": 0,
-                            "description": "Zero-based offset into 'sessions'.",
+                        "cursor": {
+                            "type": "string",
+                            "description": (
+                                "Opaque continuation cursor from a prior "
+                                "sys_session_list result's page.next_cursor."
+                            ),
                         },
                     },
                     "required": [],

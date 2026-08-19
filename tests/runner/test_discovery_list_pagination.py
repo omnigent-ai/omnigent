@@ -40,6 +40,27 @@ def _session_rows(*, large: bool) -> list[dict[str, object]]:
     ]
 
 
+def _server_page(
+    request: httpx.Request,
+    rows: list[dict[str, object]],
+) -> httpx.Response:
+    """Return a cursor page from *rows*, honoring the server's ``after`` contract."""
+    after = request.url.params.get("after")
+    if after is not None:
+        start = next(index + 1 for index, row in enumerate(rows) if row["id"] == after)
+        rows = rows[start:]
+    limit = int(request.url.params["limit"])
+    page = rows[:limit]
+    return httpx.Response(
+        200,
+        json={
+            "data": page,
+            "has_more": len(rows) > len(page),
+            "last_id": page[-1]["id"] if page else None,
+        },
+    )
+
+
 async def _agent_list_with_empty_server(
     tmp_path: Path, arguments: dict[str, object] | None = None
 ) -> str:
@@ -100,9 +121,9 @@ async def test_sys_agent_list_preserves_small_default_then_pages(tmp_path: Path)
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/agents":
-            return httpx.Response(200, json={"data": _agent_rows(large=state["large"])})
+            return _server_page(request, _agent_rows(large=state["large"]))
         if request.url.path == "/v1/sessions":
-            return httpx.Response(200, json={"data": _session_rows(large=False)})
+            return _server_page(request, _session_rows(large=False))
         if request.url.path == "/v1/sessions/conv_caller":
             return httpx.Response(404)
         raise AssertionError(f"unexpected path {request.url.path}")
@@ -119,10 +140,19 @@ async def test_sys_agent_list_preserves_small_default_then_pages(tmp_path: Path)
                 runner_workspace=tmp_path,
             )
         )
+        first_page = json.loads(
+            await execute_tool(
+                tool_name="sys_agent_list",
+                arguments=json.dumps({"limit": 5}),
+                server_client=client,
+                conversation_id="conv_caller",
+                runner_workspace=tmp_path,
+            )
+        )
         later = json.loads(
             await execute_tool(
                 tool_name="sys_agent_list",
-                arguments=json.dumps({"limit": 5, "offset": 5}),
+                arguments=json.dumps({"limit": 5, "cursor": first_page["page"]["next_cursor"]}),
                 server_client=client,
                 conversation_id="conv_caller",
                 runner_workspace=tmp_path,
@@ -144,11 +174,13 @@ async def test_sys_agent_list_preserves_small_default_then_pages(tmp_path: Path)
     assert [row["agent_id"] for row in later["builtins"]] == [
         f"ag_{index:02d}" for index in range(5, 10)
     ]
-    assert later["page"] == {
-        "limit": 5,
-        "offset": 5,
-        "has_more": {"builtins": True, "session_agents": True, "local_configs": True},
+    assert later["page"]["limit"] == 5
+    assert later["page"]["has_more"] == {
+        "builtins": True,
+        "session_agents": True,
+        "local_configs": True,
     }
+    assert "next_cursor" in later["page"]
 
     large = json.loads(large_raw)
     assert len(large_raw) <= 100_000
@@ -180,7 +212,7 @@ async def test_sys_session_list_preserves_small_default_then_pages() -> None:
         if request.url.path == "/v1/sessions/conv_caller":
             return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
         if request.url.path == "/v1/sessions":
-            return httpx.Response(200, json={"data": _session_rows(large=state["large"])})
+            return _server_page(request, _session_rows(large=state["large"]))
         raise AssertionError(f"unexpected path {request.url.path}")
 
     async with httpx.AsyncClient(
@@ -194,10 +226,18 @@ async def test_sys_session_list_preserves_small_default_then_pages() -> None:
                 conversation_id="conv_caller",
             )
         )
+        first_page = json.loads(
+            await execute_tool(
+                tool_name="sys_session_list",
+                arguments=json.dumps({"limit": 5}),
+                server_client=client,
+                conversation_id="conv_caller",
+            )
+        )
         later = json.loads(
             await execute_tool(
                 tool_name="sys_session_list",
-                arguments=json.dumps({"limit": 5, "offset": 5}),
+                arguments=json.dumps({"limit": 5, "cursor": first_page["page"]["next_cursor"]}),
                 server_client=client,
                 conversation_id="conv_caller",
             )
@@ -218,11 +258,9 @@ async def test_sys_session_list_preserves_small_default_then_pages() -> None:
         f"conv_{index:02d}" for index in range(5, 10)
     ]
     assert later["sub_agents"] == [child]
-    assert later["page"] == {
-        "limit": 5,
-        "offset": 5,
-        "has_more": {"sessions": True},
-    }
+    assert later["page"]["limit"] == 5
+    assert later["page"]["has_more"] == {"sessions": True}
+    assert "next_cursor" in later["page"]
 
     large = json.loads(large_raw)
     assert len(large_raw) <= 100_000
@@ -230,6 +268,58 @@ async def test_sys_session_list_preserves_small_default_then_pages() -> None:
     assert 0 < len(large["sessions"]) < _ROW_COUNT
     assert large["page"]["limit"] == len(large["sessions"])
     assert large["page"]["has_more"] == {"sessions": True}
+
+
+@pytest.mark.asyncio
+async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
+    """The tool forwards the opaque continuation into the server's cursor API."""
+    rows = [
+        {
+            "id": f"conv_{index:04d}",
+            "agent_id": f"ag_{index:04d}",
+            "agent_name": "researcher",
+            "title": f"Session {index}",
+            "status": "idle",
+            "runner_id": None,
+            "parent_session_id": None,
+        }
+        for index in range(1_001)
+    ]
+    received_afters: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_caller/child_sessions":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
+        if request.url.path == "/v1/sessions":
+            received_afters.append(request.url.params.get("after"))
+            return _server_page(request, rows)
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        first = json.loads(
+            await execute_tool(
+                tool_name="sys_session_list",
+                arguments=json.dumps({"limit": 100}),
+                server_client=client,
+                conversation_id="conv_caller",
+            )
+        )
+        second = json.loads(
+            await execute_tool(
+                tool_name="sys_session_list",
+                arguments=json.dumps({"limit": 100, "cursor": first["page"]["next_cursor"]}),
+                server_client=client,
+                conversation_id="conv_caller",
+            )
+        )
+
+    assert first["sessions"][0]["session_id"] == "conv_0000"
+    assert second["sessions"][0]["session_id"] == "conv_0100"
+    assert received_afters == [None, "conv_0099"]
 
 
 @pytest.mark.asyncio
@@ -305,14 +395,19 @@ async def test_sys_agent_list_pages_local_configs_beyond_server_fetch_limit(
             encoding="utf-8",
         )
 
-    result = json.loads(
-        await _agent_list_with_empty_server(tmp_path, {"limit": 100, "offset": 1_000})
-    )
+    cursor: str | None = None
+    for _ in range(11):
+        arguments: dict[str, object] = {"limit": 100}
+        if cursor is not None:
+            arguments["cursor"] = cursor
+        result = json.loads(await _agent_list_with_empty_server(tmp_path, arguments))
+        cursor = result["page"].get("next_cursor")
+        if cursor is None:
+            break
 
     assert [row["name"] for row in result["local_configs"]] == ["local-1000"]
     assert result["page"] == {
         "limit": 100,
-        "offset": 1_000,
         "has_more": {"builtins": False, "session_agents": False, "local_configs": False},
     }
 
@@ -322,7 +417,7 @@ async def test_sys_agent_list_pages_local_configs_beyond_server_fetch_limit(
     [
         ("sys_agent_list", {"limit": 0}, "'limit' must be an integer between 1 and 100"),
         ("sys_agent_list", {"limit": None}, "'limit' must be an integer between 1 and 100"),
-        ("sys_session_list", {"offset": -1}, "'offset' must be a non-negative integer"),
+        ("sys_session_list", {"cursor": "not-a-cursor"}, "invalid pagination cursor"),
     ],
 )
 @pytest.mark.asyncio

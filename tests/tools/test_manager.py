@@ -668,7 +668,7 @@ def test_agent_read_tools_registered_for_every_agent() -> None:
     list_schema = next(
         s for s in mgr.get_tool_schemas() if s["function"]["name"] == "sys_agent_list"
     )
-    assert set(list_schema["function"]["parameters"]["properties"]) == {"limit", "offset"}
+    assert set(list_schema["function"]["parameters"]["properties"]) == {"limit", "cursor"}
 
 
 # ── MCP integration ──────────────────────────────────────
