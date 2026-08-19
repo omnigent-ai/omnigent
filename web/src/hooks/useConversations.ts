@@ -46,7 +46,7 @@ import {
   listProjects as apiListProjects,
   type ProjectConfig,
   renameProject as apiRenameProject,
-  updateProjectConfig as apiUpdateProjectConfig,
+  updateProjectSettings as apiUpdateProjectSettings,
 } from "@/lib/projectsApi";
 import { releaseConversation, useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
@@ -1849,6 +1849,23 @@ export function useCreateProject() {
   });
 }
 
+async function migrateLegacyProjectMembers(oldName: string, projectId: string): Promise<void> {
+  const memberIds = await fetchAllProjectSessionIds(oldName);
+  await Promise.all(
+    memberIds.map(async (sid) => {
+      const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sid)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_id: projectId,
+          labels: { [PROJECT_LABEL_KEY]: "" },
+        }),
+      });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    }),
+  );
+}
+
 /**
  * Rename a project. A first-class project renames its row via
  * `PATCH /v1/projects/{id}`; a label-only folder (`id === null`) is promoted on
@@ -1887,22 +1904,7 @@ export function useRenameProject() {
       // omni_project label; re-file each onto project_id and clear that label so
       // the rename is coherent for both membership representations and nothing
       // is left behind in an oldName folder.
-      const memberIds = await fetchAllProjectSessionIds(oldName);
-      await Promise.all(
-        memberIds.map(async (sid) => {
-          const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sid)}`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              project_id: projectId,
-              labels: { [PROJECT_LABEL_KEY]: "" },
-            }),
-          });
-          // Surface a failed re-file: a resolved-but-4xx/5xx response would
-          // otherwise report success while leaving members behind.
-          if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-        }),
-      );
+      await migrateLegacyProjectMembers(oldName, projectId);
     },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
@@ -1929,27 +1931,34 @@ export function useProjectConfig(id: string | null) {
 }
 
 /**
- * Replace a project's stored `config` defaults (`PATCH /v1/projects/{id}`).
- * A label-only folder (`id === null`) is promoted on demand — a row created
- * under its name — so its defaults can be stored, mirroring `useRenameProject`.
- * Passing `config: {}` clears the stored defaults.
+ * Update a project's name and stored defaults together. A label-only folder is
+ * promoted on demand, and a rename migrates any members still using its legacy
+ * label onto the first-class project id.
  */
 export function useUpdateProjectConfig() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async ({
       id,
-      name,
+      oldName,
+      newName,
       config,
     }: {
       id: string | null;
-      name: string;
+      oldName: string;
+      newName: string;
       config: ProjectConfig;
     }) => {
-      const projectId = id ?? (await apiCreateProject(name)).id;
-      return apiUpdateProjectConfig(projectId, config);
+      const project =
+        id === null
+          ? await apiCreateProject(newName, config)
+          : await apiUpdateProjectSettings(id, newName, config);
+      if (newName !== oldName) {
+        await migrateLegacyProjectMembers(oldName, project.id);
+      }
+      return project;
     },
-    onSuccess: (project) => {
+    onSuccess: (project, { id, oldName, newName }) => {
       // Seed the fresh config into the cache (not just invalidate) so the
       // composer's prefill reads the just-saved defaults on the very next visit
       // — the prefill settles once and would otherwise latch onto the stale
@@ -1963,10 +1972,15 @@ export function useUpdateProjectConfig() {
       queryClient.setQueryData<ProjectSummary[]>(["projects"], (prev) => {
         if (!prev) return prev;
         const summary = { id: project.id, name: project.name };
-        return prev.some((p) => p.name === project.name)
-          ? prev.map((p) => (p.name === project.name ? summary : p))
+        return prev.some((p) => p.id === id || p.name === oldName)
+          ? prev.map((p) => (p.id === id || p.name === oldName ? summary : p))
           : [...prev, summary];
       });
+      if (newName !== oldName) {
+        void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+        void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+        void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+      }
       void queryClient.invalidateQueries({ queryKey: ["project-config"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },
