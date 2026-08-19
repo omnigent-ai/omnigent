@@ -1740,3 +1740,181 @@ async def test_unwritable_target_reports_an_error_not_a_crash(
         assert "error" in resp.json()
     finally:
         locked.chmod(0o700)
+
+
+@pytest.mark.asyncio
+async def test_baseline_sha_scopes_changes_to_session_lifetime(
+    tmp_path: Path,
+) -> None:
+    """Files committed before the baseline SHA are excluded from /changes.
+
+    When the server provides a ``git_head_sha``, the runner stores it and
+    passes it to ``list_changed_files`` as ``baseline_sha``. Only files
+    that differ from that baseline (committed + uncommitted after it)
+    should appear.
+    """
+    env = _git_env()
+
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+
+    # Pre-existing file committed before the session starts.
+    (ws / "old_file.py").write_text("# old")
+    subprocess.run(["git", "add", "old_file.py"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "old commit"],
+        cwd=ws,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+    # Record the HEAD SHA — this is the session baseline.
+    baseline = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ws,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout.strip()
+
+    # New file created during the session (uncommitted).
+    (ws / "new_file.py").write_text("# new")
+
+    session_id = "conv_baseline_test"
+
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(ws),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    assert os_env is not None
+    reg = SessionResourceRegistry()
+    reg._primary_envs[session_id] = os_env
+
+    session_response = httpx.Response(
+        200,
+        json={
+            "id": session_id,
+            "agent_id": "agent_1",
+            "status": "idle",
+            "created_at": 1000,
+            "workspace": str(ws),
+            "git_head_sha": baseline,
+        },
+    )
+
+    async def _mock_transport(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/v1/sessions/{session_id}":
+            return session_response
+        return httpx.Response(404)
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_mock_transport),
+        base_url="http://fake-server",
+    )
+
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=ws,
+        server_client=server_client,
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        resp = await client.get(
+            f"/v1/sessions/{session_id}/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        paths = [e["path"] for e in body["data"]]
+        assert "new_file.py" in paths, (
+            f"Expected 'new_file.py' (post-baseline) in changes but got {paths}"
+        )
+        assert "old_file.py" not in paths, (
+            "old_file.py was committed before the baseline and should not appear"
+        )
+
+
+@pytest.mark.asyncio
+async def test_stale_baseline_sha_falls_back_to_git_status(
+    tmp_path: Path,
+) -> None:
+    """An unreachable baseline SHA degrades to full git status.
+
+    If the baseline SHA is no longer in the repo (e.g. after a rebase or gc),
+    the endpoint should still return results via the git-status fallback
+    instead of failing with a 500 error.
+    """
+    env = _git_env()
+
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "init"],
+        cwd=ws,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+    (ws / "change.py").write_text("# changed")
+
+    session_id = "conv_stale_baseline"
+    fake_sha = "0" * 40
+
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(ws),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    assert os_env is not None
+    reg = SessionResourceRegistry()
+    reg._primary_envs[session_id] = os_env
+
+    session_response = httpx.Response(
+        200,
+        json={
+            "id": session_id,
+            "agent_id": "agent_1",
+            "status": "idle",
+            "created_at": 1000,
+            "workspace": str(ws),
+            "git_head_sha": fake_sha,
+        },
+    )
+
+    async def _mock_transport(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/v1/sessions/{session_id}":
+            return session_response
+        return httpx.Response(404)
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_mock_transport),
+        base_url="http://fake-server",
+    )
+
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=ws,
+        server_client=server_client,
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        resp = await client.get(
+            f"/v1/sessions/{session_id}/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        paths = [e["path"] for e in body["data"]]
+        assert "change.py" in paths, (
+            f"Expected 'change.py' in fallback git-status results but got {paths}"
+        )

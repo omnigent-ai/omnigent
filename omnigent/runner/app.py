@@ -2542,7 +2542,9 @@ def create_runner_app(
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
                     raw_git_head_sha = body.get("git_head_sha")
-                    if isinstance(raw_git_head_sha, str) and raw_git_head_sha:
+                    if isinstance(raw_git_head_sha, str) and _GIT_SHA_RE.fullmatch(
+                        raw_git_head_sha
+                    ):
                         git_head_sha = raw_git_head_sha
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
@@ -2605,6 +2607,12 @@ def create_runner_app(
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
+        if session_id not in _session_git_head_sha:
+            if snapshot.git_head_sha:
+                _session_git_head_sha[session_id] = snapshot.git_head_sha
+            else:
+                resolved = _resolve_git_head_from_workspace(snapshot.workspace)
+                _session_git_head_sha[session_id] = resolved
         if envelope.sub_agent_name:
             _session_sub_agent_names[session_id] = envelope.sub_agent_name
         _session_init_envelopes[session_id] = (time.monotonic(), envelope)
@@ -6021,6 +6029,7 @@ def create_runner_app(
             )
             from omnigent.runtime.prompt import build_instructions, git_baseline_instruction
 
+            await _ensure_session_registered(conv)
             framework_instructions: list[str] = []
             baseline = _session_git_head_sha.get(conv)
             if baseline:

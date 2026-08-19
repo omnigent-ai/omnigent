@@ -1021,7 +1021,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         (HEAD vs working tree) to produce the full delta since the baseline.
         """
         _GIT_STATUS_TO_OP = {"A": "created", "M": "modified", "D": "deleted"}
-        argv = ["git", "diff", "--name-status", "--no-renames", baseline_sha]
+        argv = ["git", "diff", "--name-status", "--no-renames", "--end-of-options", baseline_sha]
         started = time.monotonic()
         try:
             result = subprocess.run(
@@ -1112,7 +1112,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         self, baseline_sha: str
     ) -> dict[str, tuple[int | None, int | None]]:
         """Like _run_git_numstat but diffs against *baseline_sha*."""
-        argv = ["git", "diff", "--numstat", "--no-renames", baseline_sha]
+        argv = ["git", "diff", "--numstat", "--no-renames", "--end-of-options", baseline_sha]
         try:
             result = subprocess.run(
                 argv,
