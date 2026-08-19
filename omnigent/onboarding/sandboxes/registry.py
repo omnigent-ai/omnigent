@@ -129,6 +129,18 @@ def _builtin_contribution() -> SandboxProviderContribution:
                 name="lakebox",
                 launcher_class="omnigent.onboarding.sandboxes.lakebox:LakeboxLauncher",
             ),
+            # OSS Databricks Sandbox provider, built entirely on the public
+            # `databricks sandbox` CLI. Distinct from `lakebox`, whose
+            # launcher module ships only in the internal build and is
+            # therefore filtered out of this table by
+            # `_provider_module_available` in an OSS install.
+            "databricks": SandboxProviderMetadata(
+                name="databricks",
+                launcher_class=(
+                    "omnigent.onboarding.sandboxes.databricks_sandbox:DatabricksSandboxLauncher"
+                ),
+                managed_token_ttl_s=7 * 24 * 3600,
+            ),
             "modal": SandboxProviderMetadata(
                 name="modal",
                 launcher_class="omnigent.onboarding.sandboxes.modal:ModalSandboxLauncher",
