@@ -3518,6 +3518,7 @@ def test_parse_codex_gateway_error_5xx_not_fatal():
     assert error is not None
     assert error.code == 503
     assert error.fatal is False
+    assert "auth likely" not in error.detail()
 
 
 def test_note_stderr_gateway_error_records_into_health_slot():

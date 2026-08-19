@@ -195,10 +195,8 @@ class _CodexGatewayError:
         reason = f" {self.reason}" if self.reason else ""
         target = f" for {model}" if model else ""
         where = f" at {self.url}" if self.url else ""
-        return (
-            f"gateway returned {self.code}{reason}{target}{where} "
-            "(auth likely expired/misconfigured)"
-        )
+        hint = " (auth likely expired/misconfigured)" if self.fatal else ""
+        return f"gateway returned {self.code}{reason}{target}{where}{hint}"
 
 
 def _parse_codex_gateway_error(line: str) -> _CodexGatewayError | None:
