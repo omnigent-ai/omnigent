@@ -19,10 +19,15 @@ _logger = logging.getLogger("omnigent.runner.background_titles.claude_native")
 
 async def generate_background_title(context: BackgroundTitleContext) -> str | None:
     """Generate a title with an isolated Claude Code print-mode process."""
+    from omnigent._platform import resolve_cli_binary
     from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.claude_native import (
         build_native_claude_terminal_env,
         resolve_native_claude_config,
+    )
+    from omnigent.claude_native_bridge import (
+        ClaudeNativeHookInterpreterMismatchError,
+        validate_claude_hook_interpreter_compatibility,
     )
     from omnigent.runner.native.orchestration import _claude_terminal_env_unset
 
@@ -60,6 +65,24 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
 
     command, launch_args = resolve_claude_launch("claude", args)
+    if command == "claude":
+        # Mirrors the check in _auto_create_claude_terminal: this bare
+        # "claude" is resolved against this process's PATH by
+        # create_subprocess_exec's env=... below, so validate the same
+        # binary that will actually run. Degrades to a skipped title
+        # (like the config-resolution fallback above) rather than raising,
+        # since a background title is best-effort, not session-critical.
+        resolved_claude = resolve_cli_binary("claude")
+        if resolved_claude is not None:
+            try:
+                validate_claude_hook_interpreter_compatibility(resolved_claude)
+            except ClaudeNativeHookInterpreterMismatchError:
+                _logger.warning(
+                    "background Claude Code title skipped: %s is Windows-native "
+                    "under WSL and cannot run Omnigent's hook command",
+                    resolved_claude,
+                )
+                return None
     env = dict(os.environ)
     env.update(build_native_claude_terminal_env(claude_config))
     for name in _claude_terminal_env_unset(claude_config):

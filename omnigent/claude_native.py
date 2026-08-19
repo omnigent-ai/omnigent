@@ -86,12 +86,14 @@ from omnigent.claude_model_vocabulary import (
 )
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
+    ClaudeNativeHookInterpreterMismatchError,
     augment_claude_args,
     bridge_dir_for_bridge_id,
     prepare_bridge_dir,
     read_active_session_id,
     read_user_effort_level,
     url_component,
+    validate_claude_hook_interpreter_compatibility,
 )
 from omnigent.claude_native_forwarder import (
     reset_transcript_forward_state,
@@ -4809,11 +4811,16 @@ def _preflight_local_tools(command: str) -> None:
     :raises click.ClickException: If ``command`` or ``tmux`` is not
         available on the local ``PATH``.
     """
-    if shutil.which(command) is None:
+    resolved_command = shutil.which(command)
+    if resolved_command is None:
         raise click.ClickException(
             f"Claude Code CLI command {command!r} was not found on local PATH. "
             "--server selects the Omnigent server only; Claude still runs locally."
         )
+    try:
+        validate_claude_hook_interpreter_compatibility(resolved_command)
+    except ClaudeNativeHookInterpreterMismatchError as exc:
+        raise click.ClickException(str(exc)) from exc
     if shutil.which("tmux") is None:
         raise click.ClickException(
             "tmux was not found on local PATH. The native Claude wrapper "

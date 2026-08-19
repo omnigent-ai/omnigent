@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib import error, request
 
-from omnigent._platform import stable_user_id
+from omnigent._platform import is_wsl, stable_user_id
 from omnigent.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.claude_native_status import CONTEXT_RAW_FILE
@@ -251,6 +251,88 @@ _TERMINAL_FAILURE_TAIL_CHARS = 800
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
+
+
+class ClaudeNativeHookInterpreterMismatchError(RuntimeError):
+    """Raised when a Windows Claude CLI cannot execute WSL hook commands."""
+
+
+#: Bytes read from a candidate executable to tell a genuine POSIX binary
+#: (ELF) or interpreter script (shebang) apart from a Windows PE executable
+#: that merely lacks a recognized extension. 4 bytes covers both signatures.
+_EXECUTABLE_MAGIC_READ_LEN = 4
+
+
+def _read_executable_head(path: str) -> bytes:
+    """Read the first few bytes of *path*, or ``b""`` if it can't be read.
+
+    :param path: Filesystem path to peek at.
+    :returns: Up to :data:`_EXECUTABLE_MAGIC_READ_LEN` bytes, or ``b""`` on
+        any I/O failure (missing file, permission, not a regular file).
+    """
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(_EXECUTABLE_MAGIC_READ_LEN)
+    except OSError:
+        return b""
+
+
+def _windows_native_claude_error(claude_path: str) -> ClaudeNativeHookInterpreterMismatchError:
+    """Build the actionable error for a Windows-native Claude CLI under WSL.
+
+    :param claude_path: The rejected executable path, as given by the caller.
+    :returns: The error to raise, not yet raised.
+    """
+    return ClaudeNativeHookInterpreterMismatchError(
+        "Claude Code executable "
+        f"{claude_path!r} is Windows-native, but Omnigent is running under WSL. "
+        "Claude Code cannot run Omnigent's WSL Python hook command from its Windows shell. "
+        "Install @anthropic-ai/claude-code from WSL (for example, `npm install -g "
+        "@anthropic-ai/claude-code`) so a WSL-native `claude` binary wins PATH resolution, "
+        "then retry."
+    )
+
+
+def validate_claude_hook_interpreter_compatibility(
+    claude_path: str,
+    *,
+    wsl: bool | None = None,
+    read_head: Callable[[str], bytes] | None = None,
+) -> None:
+    """Reject the known WSL runner / Windows-native Claude CLI mismatch.
+
+    Claude Code runs hooks through its own shell. A Windows-native CLI launched
+    from WSL cannot resolve Omnigent's WSL Python path embedded in those hooks,
+    so allowing this combination only produces an opaque readiness timeout.
+
+    A ``.exe``/``.cmd``/``.bat``/``.ps1`` extension is always Windows-native,
+    regardless of where it lives. An extensionless binary under ``/mnt/<drive>/``
+    is ambiguous on its own -- that mount is also where a perfectly runnable
+    Linux ELF binary or shebang script lives when a project is checked out on
+    a Windows-mounted drive (e.g. a repo-local ``node_modules/.bin/claude``) --
+    so that case is rejected only when the file's own magic bytes fail to
+    confirm it as a POSIX executable (no ``#!`` shebang, no ELF header), which
+    is what an extensionless Windows PE binary looks like.
+
+    :param claude_path: Resolved executable path that will launch Claude Code.
+    :param wsl: Test seam; ``None`` detects the current runtime.
+    :param read_head: Test seam for reading *claude_path*'s leading bytes;
+        ``None`` reads the real file.
+    :raises ClaudeNativeHookInterpreterMismatchError: If a WSL runner would
+        launch a Windows-native Claude executable.
+    """
+    if not (is_wsl() if wsl is None else wsl):
+        return
+    normalized_path = claude_path.replace("\\", "/")
+    path_lower = normalized_path.lower()
+    if Path(path_lower).suffix in {".exe", ".cmd", ".bat", ".ps1"}:
+        raise _windows_native_claude_error(claude_path)
+    if not re.match(r"^/mnt/[a-z](?:/|$)", path_lower):
+        return
+    head = (read_head or _read_executable_head)(claude_path)
+    if head.startswith((b"#!", b"\x7fELF")):
+        return
+    raise _windows_native_claude_error(claude_path)
 
 
 def _absolute_syntactic_path(path: Path) -> Path:

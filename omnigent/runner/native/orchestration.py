@@ -42,7 +42,7 @@ import click
 import httpx
 from fastapi.responses import JSONResponse, Response
 
-from omnigent._platform import IS_WINDOWS
+from omnigent._platform import IS_WINDOWS, resolve_cli_binary
 from omnigent.entities.session_resources import (
     SessionResourceView,
     session_resource_view_to_dict,
@@ -5671,12 +5671,15 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
         e.g. ``ImportError("Native Codex requires the 'codex' CLI on PATH.")``.
     :param runtime_name: Human-readable runtime name, e.g. ``"Codex"``.
     :returns: ``{"code": ..., "message": ...}`` payload for SSE and
-        JSON error responses. The message is a client-safe string naming
-        the runner's log file; the raw cause is logged there for operators,
-        not surfaced to the caller.
+        JSON error responses. Known actionable configuration errors surface
+        their safe message directly; other causes point to the runner log.
     """
     _logger.warning("Native %s terminal start failed: %s", runtime_name, exc, exc_info=exc)
-    if IS_WINDOWS:
+    from omnigent.claude_native_bridge import ClaudeNativeHookInterpreterMismatchError
+
+    if isinstance(exc, ClaudeNativeHookInterpreterMismatchError):
+        message = str(exc)
+    elif IS_WINDOWS:
         # Native terminals are tmux/PTY-based and disabled on Windows by design.
         # Give the client an actionable message instead of a log pointer.
         message = (
@@ -6094,6 +6097,7 @@ async def _auto_create_claude_terminal(
         augment_claude_args,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
+        validate_claude_hook_interpreter_compatibility,
     )
     from omnigent.claude_native_forwarder import reset_transcript_forward_state
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -6551,6 +6555,17 @@ async def _auto_create_claude_terminal(
     # command/args to wrap the same fully-augmented Claude launch on this
     # managed-host path. Identity by default. See omnigent.claude_launcher.
     launch_command, launch_args = resolve_claude_launch("claude", list(claude_args))
+    # Validate the binary this terminal will actually spawn. When no launcher
+    # plugin rewrote the command, that's a bare "claude" resolved by tmux's
+    # pane shell (or, on the sandboxed branch, by omnigent.inner.terminal's own
+    # shutil.which(self.command)) against this process's inherited PATH --
+    # NOT against OMNIGENT_CLAUDE_PATH, which this launch path never reads.
+    # Passing that env var here would validate a binary other than the one
+    # that actually runs, silently defeating the check in both directions.
+    if launch_command == "claude":
+        resolved_claude = resolve_cli_binary("claude")
+        if resolved_claude is not None:
+            validate_claude_hook_interpreter_compatibility(resolved_claude)
 
     claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
 
