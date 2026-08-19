@@ -3349,16 +3349,20 @@ class _ConnectSpy:
         """
         self._exceptions = exceptions
         self.call_count = 0
+        # kwargs of each production connect() call, aligned with call_count —
+        # lets tests assert handshake parameters like open_timeout.
+        self.kwargs_log: list[dict[str, object]] = []
 
     def __call__(self, url: str, **kwargs: object) -> _HandshakeFailingConnect | _AcceptingConnect:
         """Return an async-CM scripting the handshake for this call.
 
         :param url: Tunnel URL passed by production (ignored).
-        :param kwargs: Connect kwargs passed by production (ignored).
+        :param kwargs: Connect kwargs passed by production (recorded).
         :returns: A context manager whose ``__aenter__`` raises the
             queued exception, or completes the handshake for a ``None``
             entry.
         """
+        self.kwargs_log.append(dict(kwargs))
         exc = self._exceptions[min(self.call_count, len(self._exceptions) - 1)]
         self.call_count += 1
         if exc is None or isinstance(exc, int):
@@ -3991,6 +3995,97 @@ async def test_remote_host_retries_connection_refused_past_threshold(
 
     # 5 = 4 retried refusals (past the threshold of 3) + the ending cancel.
     assert spy.call_count == 5
+
+
+async def test_reconnect_after_successful_connect_uses_shorter_open_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconnects hand websockets a shorter open_timeout than the first attempt.
+
+    A transient tunnel drop used to inherit the ~10 s cold-start open timeout
+    for every re-upgrade, stacking with backoff on top and stretching recovery
+    well past the blip itself (#4980). The FIRST attempt must keep the
+    cold-server-tolerant default; only a host that has completed an upgrade
+    once may reconnect on the short timeout.
+    """
+    import omnigent.host.connect as connect_mod
+
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    # The accepted connect sends a real hello; skip its slow CLI probes.
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    # attempt 1 accepts then drops (marks the host ever-connected); attempt 2
+    # is the reconnect; CancelledError ends the loop there.
+    spy = _ConnectSpy([None, asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+    # Skip the one-time capability probes: their harness/gateway discovery
+    # shells out and is irrelevant to the handshake parameters under test.
+    host._capabilities_initialized = True
+
+    await host.run()
+
+    assert spy.call_count == 2
+    assert spy.kwargs_log[0]["open_timeout"] == connect_mod._INITIAL_OPEN_TIMEOUT_S
+    assert spy.kwargs_log[1]["open_timeout"] == connect_mod._RECONNECT_OPEN_TIMEOUT_S
+    assert connect_mod._RECONNECT_OPEN_TIMEOUT_S < connect_mod._INITIAL_OPEN_TIMEOUT_S
+
+
+def test_backoff_cap_tracks_connection_history() -> None:
+    """The backoff ceiling reads the host's connection history.
+
+    A never-connected host retries against the full 10 s cap (guards a host
+    hammering an unreachable server); once an upgrade has succeeded, further
+    backoff is capped at the shorter recovery leash (#4980).
+    """
+    import omnigent.host.connect as connect_mod
+
+    assert (
+        connect_mod._reconnect_backoff_cap(False) == connect_mod._RECONNECT_CAP_S
+    )
+    assert (
+        connect_mod._reconnect_backoff_cap(True)
+        == connect_mod._RECONNECT_CAP_AFTER_CONNECT_S
+    )
+    assert (
+        connect_mod._RECONNECT_CAP_AFTER_CONNECT_S < connect_mod._RECONNECT_CAP_S
+    )
+
+
+async def test_run_backoff_uses_connected_history_after_first_upgrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run()'s backoff update consults the connected-history cap after success.
+
+    Wires _reconnect_backoff_cap into the live loop: once attempt 1 completes
+    an upgrade, every subsequent backoff cap lookup must report the
+    ever-connected history.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", dict)
+    seen: list[bool] = []
+
+    def _record(ever_connected: bool) -> float:
+        seen.append(ever_connected)
+        return 0.0
+
+    monkeypatch.setattr("omnigent.host.connect._reconnect_backoff_cap", _record)
+    # attempt 1 accepts then drops; attempts 2-3 fail with a retryable 503
+    # (each failing the backoff update); attempt 4 cancels out of run().
+    spy = _ConnectSpy([None, _invalid_status(503), _invalid_status(503), asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+    # Skip the one-time capability probes (see the open_timeout test above).
+    host._capabilities_initialized = True
+
+    await host.run()
+
+    assert spy.call_count == 4
+    # Attempt 1's abrupt drop is classified as an ingress recycle (remote
+    # server, "no close frame") and takes the prompt-reconnect path, which
+    # resets backoff without consulting the cap. The two 503s take the
+    # backoff path; the cancel never updates backoff. Every cap lookup
+    # follows the successful first upgrade.
+    assert seen == [True, True]
 
 
 async def test_accepted_connect_resets_loopback_refused_streak(

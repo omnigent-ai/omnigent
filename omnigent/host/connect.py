@@ -328,6 +328,37 @@ def _connection_refused(exc: BaseException) -> bool:
 _RECONNECT_BASE_S = 0.5
 _RECONNECT_CAP_S = 10.0
 _RECONNECT_JITTER = 0.5
+# WebSocket open timeouts for the tunnel handshake. The INITIAL connect keeps
+# the 10 s library default: a cold server (or a slow TLS handshake through the
+# Apps ingress) legitimately takes seconds to answer a first upgrade. Once a
+# host has connected at least once, the server has proven it serves this host —
+# a healthy server answers the re-upgrade well inside 5 s, and one that doesn't
+# fails fast so the reconnect loop retries promptly instead of hanging ~10 s
+# per attempt. Recovery from a transient blip then costs one short timeout,
+# not two stacked ~10 s budgets (#4980).
+_INITIAL_OPEN_TIMEOUT_S = 10.0
+_RECONNECT_OPEN_TIMEOUT_S = 5.0
+
+# Backoff ceiling once the host has connected at least once (see
+# _reconnect_backoff_cap).
+_RECONNECT_CAP_AFTER_CONNECT_S = 5.0
+
+
+def _reconnect_backoff_cap(ever_connected: bool) -> float:
+    """The reconnect backoff ceiling for this host's connection history.
+
+    The full 10 s cap guards a host hammering a server it has never reached.
+    A previously connected host knows the endpoint is real, so its retries
+    stay on a shorter leash — a transient interruption should not need the
+    full cold-start budget to recover — while remaining bounded against
+    hammering during a real outage.
+
+    :param ever_connected: Whether this host has completed an upgrade once.
+    :returns: The backoff ceiling in seconds.
+    """
+    return _RECONNECT_CAP_AFTER_CONNECT_S if ever_connected else _RECONNECT_CAP_S
+
+
 # Consecutive connection-refused failures against a loopback server before the
 # host exits (~5 minutes at the backoff cap). Refused on loopback means no
 # process listens on the port — the local server is gone, not unreachable.
@@ -2766,7 +2797,7 @@ class HostProcess:
                     else:
                         backoff = min(
                             backoff * 2 * (1 + random.random() * _RECONNECT_JITTER),
-                            _RECONNECT_CAP_S,
+                            _reconnect_backoff_cap(self._ever_connected),
                         )
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
@@ -2839,6 +2870,14 @@ class HostProcess:
                 url,
                 additional_headers=headers,
                 max_size=100 * 1024 * 1024,
+                # Reconnects (a previously connected host) use the short open
+                # timeout above; only the very first attempt keeps the
+                # cold-server-tolerant default.
+                open_timeout=(
+                    _RECONNECT_OPEN_TIMEOUT_S
+                    if self._ever_connected
+                    else _INITIAL_OPEN_TIMEOUT_S
+                ),
                 ssl=ssl_ctx,
                 # Align the host->server tunnel's protocol keepalive to the same
                 # 90 s app-level budget as the runner tunnel (not the 20 s library
