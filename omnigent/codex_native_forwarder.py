@@ -192,14 +192,10 @@ _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
     }
 )
 
-# Turn-error surfacing. A failed Codex turn arrives as ``turn/completed``
-# (or ``turn/failed``) with ``turn.status == "failed"`` and a ``turn.error``
-# object ``{message, codexErrorInfo?, additionalDetails?}``; keying status off
-# the method alone mapped such turns to ``idle`` — a "silent success". The
-# forwarder inspects ``turn.status``/``turn.error``, forces ``failed``, and
-# surfaces the reason. As a fallback it also catches an ``error`` ThreadItem in
-# ``turn.items``: both shapes exist in the app-server type system and the wire
-# shape varies by version, so detecting either keeps the fix robust.
+# Turn-error surfacing. Codex reports failures through a standalone ``error``
+# notification and on terminal turn boundaries via ``turn.error`` / failed
+# status. The forwarder handles both, plus the older ``error`` ThreadItem
+# fallback, so every non-retrying failure reaches the session UI.
 #
 # ``codexErrorInfo`` is the app-server's structured classification (e.g.
 # ``unauthorized``, ``usage_limit_exceeded``); auth-class values get a re-auth
@@ -1001,6 +997,15 @@ def _terminal_error_from_turn(params: _JsonObject) -> _CodexTerminalError | None
     if not isinstance(payload, dict):
         payload = _error_item_from_turn(turn)
     if payload is None:
+        return None
+    message = _error_payload_message(payload)
+    return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
+
+
+def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalError | None:
+    """Return the failure carried by Codex's standalone ``error`` notification."""
+    payload = params.get("error")
+    if not isinstance(payload, dict):
         return None
     message = _error_payload_message(payload)
     return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
@@ -2985,6 +2990,31 @@ async def _maybe_handle_turn_event(
     :param forwarder_state: Optional forwarder state.
     :returns: ``True`` when this event was handled.
     """
+    if method == "error":
+        if params.get("willRetry") is True:
+            _logger.info(
+                "Codex forwarder observed retryable turn error: turn_id=%s",
+                _turn_id_from_payload(params),
+            )
+            return True
+        if delta_coalescer is not None:
+            await delta_coalescer.flush()
+        error = _terminal_error_from_notification(params)
+        if error is None:
+            _logger.warning("Codex forwarder ignored malformed error notification")
+            return True
+        await _post_turn_status_edge(
+            client,
+            session_id,
+            _CodexTurnStatusEdge(
+                status="failed",
+                turn_id=_turn_id_from_payload(params),
+                source="error",
+                error=error,
+            ),
+        )
+        await usage_coalescer.flush()
+        return True
     if method == "turn/started":
         if delta_coalescer is not None:
             await delta_coalescer.flush()

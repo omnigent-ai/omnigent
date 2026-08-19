@@ -3701,6 +3701,40 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(useChatStore.getState().sessionStatus).toBe("waiting");
     });
 
+    it("surfaces one terminal error per native response", () => {
+      useChatStore.setState({ blocks: [] });
+      const error = {
+        code: "codex_turn_error",
+        message: "You've hit your usage limit.",
+      };
+
+      handleSessionEvent({
+        type: "session_status",
+        conversationId: "conv_abc",
+        status: "failed",
+        responseId: "codex_turn_1",
+        error,
+      });
+      handleSessionEvent({
+        type: "session_status",
+        conversationId: "conv_abc",
+        status: "failed",
+        responseId: "codex_turn_1",
+        error,
+      });
+      handleSessionEvent({
+        type: "session_status",
+        conversationId: "conv_abc",
+        status: "failed",
+        responseId: "codex_turn_2",
+        error,
+      });
+
+      const errors = useChatStore.getState().blocks.filter((block) => block.type === "error");
+      expect(errors).toHaveLength(2);
+      expect(errors.map((block) => block.ctx.responseId)).toEqual(["codex_turn_1", "codex_turn_2"]);
+    });
+
     it("idle clears local streaming when no active response will send response_end", () => {
       useChatStore.setState({
         status: "streaming",

@@ -5400,26 +5400,36 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             patch.pendingUserMessages = [];
           }
         }
-        // Surface the error inline when the harness reports a terminal failure
-        // with a structured error payload (e.g. token expiration on startup).
-        // `response.failed` / `response.error` handle mid-turn failures, but
-        // startup failures only emit `session.status: failed` — nothing
-        // converts that into a visible ErrorBlock. Synthesize one here so the
-        // user sees the message without having to reload.
-        if (
-          event.status === "failed" &&
-          event.error != null &&
-          !s.blocks.some((b) => b.type === "error")
-        ) {
+        // Surface terminal-native failures carried only by session status.
+        // Deduplicate repeated status edges for one response, but preserve the
+        // same failure on later turns so each rejected prompt has a visible error.
+        const statusError = event.error;
+        const hasMatchingStatusError =
+          statusError != null &&
+          s.blocks.some(
+            (block) =>
+              block.type === "error" &&
+              block.ctx.responseId === (event.responseId ?? "") &&
+              block.code === statusError.code &&
+              block.message === statusError.message,
+          );
+        if (event.status === "failed" && statusError != null && !hasMatchingStatusError) {
           patch.blocks = [
             ...s.blocks,
             {
               type: "error",
-              ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
-              message: event.error.message,
+              ctx: {
+                agent: null,
+                depth: 0,
+                turn: 0,
+                timestamp: 0,
+                responseId: event.responseId ?? "",
+                itemId: null,
+              },
+              message: statusError.message,
               source: "",
-              code: event.error.code,
-              ...structuredErrorFields(event.error),
+              code: statusError.code,
+              ...structuredErrorFields(statusError),
             } satisfies ErrorBlock,
           ];
         }

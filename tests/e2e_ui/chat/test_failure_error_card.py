@@ -17,10 +17,31 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.conftest import _server_state, seed_committed_turn
+
+
+def _publish_native_status(
+    base_url: str,
+    session_id: str,
+    status: str,
+    *,
+    response_id: str,
+    output: str | None = None,
+) -> None:
+    """Publish the status payload used by native harness forwarders."""
+    data: dict[str, object] = {"status": status, "response_id": response_id}
+    if output is not None:
+        data["output"] = output
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        json={"type": "external_session_status", "data": data},
+        timeout=10.0,
+    )
+    response.raise_for_status()
 
 
 def _seed_error_item(session_id: str, *, code: str, message: str) -> None:
@@ -82,6 +103,43 @@ def test_unclassified_failure_renders_english_headline_not_raw_code(
     expect(pill).to_contain_text("The agent's terminal exited unexpectedly", timeout=15_000)
     # ...and the raw enum is not surfaced as the headline.
     expect(pill).not_to_contain_text("Error · required_terminal_exited", timeout=15_000)
+
+
+def test_live_native_failure_status_surfaces_each_turn(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Each failed native response renders its status-carried error message."""
+    base_url, session_id = seeded_session
+    message = "You've hit your usage limit."
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=15_000)
+
+    _publish_native_status(base_url, session_id, "running", response_id="codex_turn_1")
+    _publish_native_status(
+        base_url,
+        session_id,
+        "failed",
+        response_id="codex_turn_1",
+        output=message,
+    )
+    pills = page.get_by_test_id("error-pill")
+    expect(pills).to_have_count(1, timeout=15_000)
+
+    _publish_native_status(base_url, session_id, "running", response_id="codex_turn_2")
+    _publish_native_status(
+        base_url,
+        session_id,
+        "failed",
+        response_id="codex_turn_2",
+        output=message,
+    )
+    expect(pills).to_have_count(2, timeout=15_000)
+
+    second_pill = pills.nth(1)
+    second_pill.locator('button[aria-expanded="false"]').click()
+    expect(second_pill.get_by_test_id("error-message-content")).to_contain_text(message)
 
 
 def test_persisted_failure_expands_retries_and_dismisses_locally(
