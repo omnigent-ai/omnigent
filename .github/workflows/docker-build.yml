@@ -5,9 +5,9 @@
 # with the GHA layer cache and runs a `omnigent --help` CLI smoke. It never pushes.
 #
 # Scope: the server target exercises the shared builder stage (Python deps +
-# web SPA build) that all four published variants inherit, so it catches the
-# common breakage without paying for the host/openshell/kubernetes variants or
-# the emulated arm64 leg.
+# web SPA build) that all five published variants inherit, so it catches the
+# common breakage without paying for the host/provider variants or the emulated
+# arm64 leg.
 #
 # Blocking merge-gate check: "Docker build" is in the REQUIRED list in
 # .github/scripts/merge-ready/required.sh. Because of the paths filter below it
