@@ -168,15 +168,11 @@ def _build_usage_report(
             if conv.agent_id is None:
                 continue
             usage = load_session_usage(conv.id, conversation_store)
-            primary_harness = (
-                _resolve_session_harness(conv) if include_page_details else None
-            )
+            primary_harness = _resolve_session_harness(conv) if include_page_details else None
             other_harnesses = None
             if include_page_details:
                 tree = load_session_tree(conv.id, conversation_store)
-                other_harnesses = _collect_other_harnesses(
-                    primary_harness, tree, conv.id
-                )
+                other_harnesses = _collect_other_harnesses(primary_harness, tree, conv.id)
             sessions.append(
                 SessionUsage(
                     id=conv.id,
