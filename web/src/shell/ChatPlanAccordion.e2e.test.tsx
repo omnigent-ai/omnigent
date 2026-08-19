@@ -12,11 +12,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { ChatPlanAccordion } from "./ChatPlanAccordion";
 
-type Todo = {
+interface Todo {
   content: string;
   status: "pending" | "in_progress" | "completed";
   activeForm: string;
-};
+}
 
 // Mirrors how the live app populates the slice: both the snapshot-bind and the
 // `session.todos` SSE handler write `todos` onto the active conversation
