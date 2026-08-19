@@ -10,7 +10,7 @@
  * Sections:
  *
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
- *   Workspace panel default for new chats, and UI/code font controls.
+ *   default session view, Workspace panel default, and UI/code font controls.
  * - **Git** — Git behavior, e.g. the default base branch pre-filled when
  *   naming a new worktree branch in the composer.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
@@ -45,6 +45,7 @@ import {
   KeyRoundIcon,
   LaptopMinimalIcon,
   LogOutIcon,
+  MessagesSquareIcon,
   MinusIcon,
   MonitorIcon,
   MoonIcon,
@@ -52,6 +53,7 @@ import {
   PanelRightIcon,
   PlusIcon,
   SunIcon,
+  TerminalIcon,
   Trash2Icon,
   UserCogIcon,
 } from "lucide-react";
@@ -137,6 +139,12 @@ import {
   writeWorkspacePanelDefault,
   type WorkspacePanelDefault,
 } from "@/lib/workspacePanelPreferences";
+import {
+  type DefaultSessionView,
+  readDefaultSessionView,
+  SESSION_VIEW_DEFAULT,
+  writeDefaultSessionView,
+} from "@/lib/sessionViewPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import {
   DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
@@ -283,6 +291,15 @@ const workspacePanelCards: {
 }[] = [
   { value: "open", label: "Open", icon: PanelRightIcon },
   { value: "collapsed", label: "Collapsed", icon: PanelRightCloseIcon },
+];
+
+const sessionViewCards: {
+  value: DefaultSessionView;
+  label: string;
+  icon: typeof TerminalIcon;
+}[] = [
+  { value: "chat", label: "Chat", icon: MessagesSquareIcon },
+  { value: "terminal", label: "Terminal", icon: TerminalIcon },
 ];
 
 /**
@@ -572,6 +589,35 @@ function WorkspacePanelDefaultControl() {
   );
 }
 
+function DefaultSessionViewControl() {
+  const [value, setValue] = useState(() => readDefaultSessionView());
+  const labelId = useId();
+  const choose = useCallback((next: DefaultSessionView) => {
+    setValue(next);
+    writeDefaultSessionView(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Default session view"
+      helper="Choose whether sessions with a terminal initially open in Chat or Terminal. A session's choice in this tab still takes priority."
+    >
+      <CardRadioGroup<DefaultSessionView>
+        labelledBy={labelId}
+        value={value}
+        onSelect={choose}
+        className="grid grid-cols-2 gap-3"
+        cardClassName="items-center gap-2 p-4"
+        items={sessionViewCards.map((card) => ({
+          value: card.value,
+          testId: `default-session-view-${card.value}`,
+          body: iconCardBody(card.icon, card.label),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
 function ColorThemeControl() {
   // Render each chip in the currently-resolved mode so it matches the app now.
   const { resolvedTheme } = useTheme();
@@ -845,6 +891,7 @@ function AppearanceSection() {
     applyCustomTheme(DEFAULT_CUSTOM_THEME);
 
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
+    writeDefaultSessionView(SESSION_VIEW_DEFAULT);
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
@@ -869,6 +916,7 @@ function AppearanceSection() {
           "omnigent:ui-theme-palette",
           "omnigent:custom-theme",
           "omnigent:default-workspace-panel",
+          "omnigent:default-session-view",
           "omnigent:hide-unconfigured-harnesses",
         ]) {
           window.localStorage.removeItem(key);
@@ -911,6 +959,8 @@ function AppearanceSection() {
         {!isEmbedded && <ColorThemeControl />}
 
         <WorkspacePanelDefaultControl />
+
+        <DefaultSessionViewControl />
 
         <HideUnconfiguredHarnessesControl />
 

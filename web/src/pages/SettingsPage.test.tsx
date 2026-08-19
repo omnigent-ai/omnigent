@@ -299,6 +299,24 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("terminal-theme-dark")).toHaveAttribute("aria-checked", "false");
   });
 
+  it("persists the default session view and preserves chat when unset", () => {
+    renderPage("/settings/appearance");
+
+    expect(screen.getByRole("radiogroup", { name: "Default session view" })).toBeInTheDocument();
+    expect(screen.getByTestId("default-session-view-chat")).toHaveAttribute("aria-checked", "true");
+    expect(localStorage.getItem("omnigent:default-session-view")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("default-session-view-terminal"));
+    expect(screen.getByTestId("default-session-view-terminal")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-session-view")).toBe("terminal");
+
+    fireEvent.click(screen.getByTestId("default-session-view-chat"));
+    expect(localStorage.getItem("omnigent:default-session-view")).toBeNull();
+  });
+
   it("reflects a stored light terminal theme on mount", () => {
     localStorage.setItem("omnigent:terminal-theme", "light");
     renderPage("/settings/appearance");
@@ -455,6 +473,7 @@ describe("SettingsPage", () => {
     mocks.theme = "dark";
     fireEvent.click(screen.getByTestId("theme-dark"));
     fireEvent.click(screen.getByTestId("terminal-theme-dark"));
+    fireEvent.click(screen.getByTestId("default-session-view-terminal"));
     fireEvent.change(screen.getByTestId("color-theme-select") as HTMLSelectElement, {
       target: { value: "github" },
     });
@@ -500,6 +519,8 @@ describe("SettingsPage", () => {
 
     // Terminal theme, workspace panel, and harness visibility are restored.
     expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("default-session-view-chat")).toHaveAttribute("aria-checked", "true");
+    expect(localStorage.getItem("omnigent:default-session-view")).toBeNull();
     expect(screen.getByTestId("workspace-panel-default-open")).toHaveAttribute(
       "aria-checked",
       "true",
