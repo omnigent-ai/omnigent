@@ -2126,9 +2126,17 @@ def main() -> None:
         # and recovery advice would contradict the crash screen's reassurance.
         # `handle_crash` renders the UX and we exit with code 1 (SystemExit
         # does NOT re-trigger sys.excepthook, so there's no double render).
+        from omnigent.client_compat import client_skew_message
         from omnigent.crash_handler import handle_crash
 
         log_cli_error_hint(exc)
+        # A stale sibling `omnigent-client` fails deep in a lazy import; that
+        # is an install-sync problem, not a bug — show the fix, not a crash
+        # report + bug-filing prompt.
+        skew = client_skew_message(exc)
+        if skew is not None:
+            click.echo(skew, err=True)
+            raise SystemExit(1) from exc
         handle_crash(exc)
         raise SystemExit(1) from exc
 
