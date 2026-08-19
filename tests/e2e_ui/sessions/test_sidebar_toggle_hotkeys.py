@@ -1,9 +1,10 @@
-"""E2E: ⌘⌥[ / ⌘⌥] toggle the left and right sidebars from the app shell.
+"""E2E: global keyboard shortcuts toggle the app shell's sidebars.
 
 Covers ``useSidebarToggleHotkeys`` (``web/src/hooks/useSidebarToggleHotkeys.ts``),
 wired in ``AppShell``: a window-level keydown listener flips the left
 (Conversations) sidebar on ⌘/Ctrl + ⌥/Alt + ``[`` and the right (Workspace)
-rail on ⌘/Ctrl + ⌥/Alt + ``]``. The hook matches the physical ``e.code``
+rail on ⌘/Ctrl + ``B`` or legacy ⌘/Ctrl + ⌥/Alt + ``]``. Bracket shortcuts
+match the physical ``e.code``
 (``BracketLeft`` / ``BracketRight``) rather than the character, because ⌥ on
 macOS turns ``[``/``]`` into ``“``/``‘`` — only a code match survives the
 modifier. CI runs Linux chromium, so this presses the ``Control+Alt`` chord
@@ -30,11 +31,16 @@ and always has content (the Agents tab is unconditional).
 
 from __future__ import annotations
 
+import re
+
+import httpx
 from playwright.sync_api import Page, expect
 
 _COMPOSER = "Ask the agent anything…"
 _LEFT_CHORD = "Control+Alt+BracketLeft"
-_RIGHT_CHORD = "Control+Alt+BracketRight"
+_RIGHT_CHORD = "Control+KeyB"
+_LEGACY_RIGHT_CHORD = "Control+Alt+BracketRight"
+_EDITOR_PATH = "workspace_shortcut.py"
 
 # The left sidebar stays mounted when collapsed (it animates to width 0), so
 # its open-state reads off ``data-collapsed`` rather than presence. The right
@@ -47,7 +53,7 @@ def test_sidebar_toggle_hotkeys(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """⌘⌥[ flips the Conversations sidebar; ⌘⌥] flips the Workspace rail."""
+    """⌘⌥[ flips Conversations; ⌘B and legacy ⌘⌥] flip Workspace."""
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -79,11 +85,59 @@ def test_sidebar_toggle_hotkeys(
     page.keyboard.press(_LEFT_CHORD)
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
 
-    # ⌘⌥] collapses the Workspace rail (unmounts it via the shared
+    # ⌘B collapses the Workspace rail (unmounts it via the shared
     # toggleRightPanel path) ...
     page.keyboard.press(_RIGHT_CHORD)
     expect(workspace).to_have_count(0)
 
-    # ... and ⌘⌥] again brings it back.
+    # ... and ⌘B again brings it back.
     page.keyboard.press(_RIGHT_CHORD)
     expect(workspace).to_be_visible()
+
+    # The old chord remains a supported alias in both directions.
+    page.keyboard.press(_LEGACY_RIGHT_CHORD)
+    expect(workspace).to_have_count(0)
+    page.keyboard.press(_LEGACY_RIGHT_CHORD)
+    expect(workspace).to_be_visible()
+
+
+def test_workspace_shortcut_from_terminal_and_file_editor(
+    page: Page,
+    terminal_session: tuple[str, str],
+) -> None:
+    """Ctrl+B wins over real Monaco and xterm keyboard handlers."""
+    base_url, session_id = terminal_session
+    response = httpx.put(
+        f"{base_url}/v1/sessions/{session_id}"
+        f"/resources/environments/default/filesystem/{_EDITOR_PATH}",
+        json={"content": "answer = 42\n", "encoding": "utf-8"},
+        timeout=10.0,
+    )
+    response.raise_for_status()
+
+    page.goto(f"{base_url}/c/{session_id}?file={_EDITOR_PATH}")
+    workspace = page.get_by_role("complementary", name="Workspace")
+    editor = workspace.locator(".monaco-editor")
+    expect(editor).to_be_visible(timeout=30_000)
+
+    # Monaco owns its hidden textarea and normally handles Ctrl+B itself.
+    editor.click()
+    assert editor.evaluate("el => el.contains(document.activeElement)")
+    page.keyboard.press(_RIGHT_CHORD)
+    expect(workspace).to_have_count(0)
+    page.keyboard.press(_RIGHT_CHORD)
+    expect(editor).to_be_visible(timeout=30_000)
+
+    # Launch an actual shell, then repeat the chord from xterm's focused input.
+    workspace.get_by_role("button", name="Open new").click()
+    page.get_by_role("menuitem", name=re.compile("Shell")).click()
+    terminal = workspace.get_by_test_id("terminal-view").last
+    expect(terminal).to_have_attribute("data-state", "connected", timeout=60_000)
+    terminal.locator("textarea.xterm-helper-textarea").focus()
+    page.keyboard.press(_RIGHT_CHORD)
+    expect(workspace).to_have_count(0)
+    page.keyboard.press(_RIGHT_CHORD)
+    expect(workspace).to_be_visible()
+    expect(workspace.get_by_test_id("terminal-view").last).to_have_attribute(
+        "data-state", "connected", timeout=20_000
+    )
