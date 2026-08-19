@@ -1747,6 +1747,18 @@ def _config_flag_is_true(value: object) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes"}
 
 
+def _set_openai_agents_reasoning_item_id_policy_env(
+    env: dict[str, str],
+    value: object | None,
+) -> None:
+    """Validate and encode the OpenAI Agents SDK reasoning replay policy."""
+    if value is None:
+        return
+    if not isinstance(value, str) or value not in {"preserve", "omit"}:
+        raise ValueError("reasoning_item_id_policy must be 'preserve', 'omit', or unset")
+    env["HARNESS_OPENAI_AGENTS_REASONING_ITEM_ID_POLICY"] = value
+
+
 def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     """
     Build the env-var dict the openai-agents harness wrap reads.
@@ -1754,7 +1766,7 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     Maps spec.executor fields → the ``HARNESS_OPENAI_AGENTS_*``
     env vars defined in
     ``omnigent/inner/openai_agents_sdk_harness.py``. Threads
-    model + auth + use_responses.
+    model + auth + Responses replay settings.
 
     Auth resolution order (highest priority first):
 
@@ -1782,6 +1794,10 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
     model = _resolve_spec_model(spec)
     if model is not None:
         env["HARNESS_OPENAI_AGENTS_MODEL"] = model
+    _set_openai_agents_reasoning_item_id_policy_env(
+        env,
+        spec.executor.config.get("reasoning_item_id_policy"),
+    )
 
     # ── Auth resolution ────────────────────────────────────────────────
     # Priority: generic provider → spec.executor.auth → global config auth →
