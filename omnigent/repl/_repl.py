@@ -1910,10 +1910,15 @@ class _SessionsChatReplAdapter:
                     file=sys.stderr,
                     flush=True,
                 )
-            session = await self._client.sessions.bind_runner(
-                self._session_id,
-                runner_id=self._runner_id,
-            )
+            try:
+                session = await self._client.sessions.bind_runner(
+                    self._session_id,
+                    runner_id=self._runner_id,
+                )
+            except OmnigentError as exc:
+                session = await self._reconcile_runner_after_bind_failure(exc)
+                if session is None:
+                    raise
             self._hydrate_from_session_snapshot(session)
             self._clear_runner_recovery_error()
             if _dbg:
@@ -1922,6 +1927,36 @@ class _SessionsChatReplAdapter:
                     file=sys.stderr,
                     flush=True,
                 )
+
+    async def _reconcile_runner_after_bind_failure(self, exc: OmnigentError) -> Session | None:
+        """
+        Adopt the server's live runner after a stale-runner bind failure.
+
+        A dead runner that the server has relaunched under a new id leaves
+        the cached ``_runner_id`` stale, so the bind 400s forever. Re-read
+        the snapshot and rebind onto the runner the server now reports.
+
+        Only when the server owns relaunch (``runner_recover is None``); a
+        client-owned runner is driven by ``_recover_runner_if_needed``.
+
+        :param exc: The bind failure to recover from.
+        :returns: The rebind snapshot, or ``None`` to re-raise *exc*.
+        """
+        if self._runner_recover is not None:
+            return None
+        if not self._is_terminal_runner_recovery_error(exc):
+            return None
+        if self._session_id is None:
+            return None
+        snapshot = await self._client.sessions.get(self._session_id)
+        live_runner_id = snapshot.runner_id
+        if not live_runner_id or live_runner_id == self._runner_id:
+            return None
+        self._runner_id = live_runner_id
+        return await self._client.sessions.bind_runner(
+            self._session_id,
+            runner_id=live_runner_id,
+        )
 
     def _clear_runner_recovery_error(self) -> None:
         """
