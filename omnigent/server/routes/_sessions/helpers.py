@@ -285,6 +285,7 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
     PINNED_LABEL_KEY,
+    WORKTREE_KEPT_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
 )
@@ -8362,6 +8363,172 @@ async def _remove_session_worktree_best_effort(
         )
 
 
+async def _cleanup_worktree_on_archive(
+    *,
+    session_id: str,
+    workspace: str | None,
+    git_branch: str | None,
+    host_id: str | None,
+    conversation_store: ConversationStore,
+    host_registry: HostRegistry | None,
+) -> None:
+    """
+    Remove a session's git worktree on archive — but only when provably safe.
+
+    A worktree is removed (with its branch) only when every check passes:
+    no other live session shares it, the host is reachable and reports a
+    clean tree, no commits exist beyond every remote, and the branch is
+    merged into the default branch. Anything else keeps the worktree and
+    records why on the session's ``omnigent.worktree_kept`` label so the
+    Archived page can show it. Never raises — archiving must not fail
+    over cleanup.
+
+    :param session_id: The conversation being archived.
+    :param workspace: The session's workspace (the worktree path).
+    :param git_branch: Branch checked out in the worktree; the cleanup
+        gate — a session without one was never worktree-created.
+    :param host_id: Host that owns the worktree.
+    :param conversation_store: Store for the in-use check and labels.
+    :param host_registry: Registry for reaching the owning host.
+    """
+    from omnigent.server.routes._host_worktree import (
+        WorktreeProxyError,
+        inspect_worktree_on_host,
+        remove_worktree_on_host,
+    )
+
+    async def _kept(value: str) -> None:
+        """Record why the worktree was kept, best-effort.
+
+        :param value: JSON label value.
+        """
+        try:
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                session_id,
+                {WORKTREE_KEPT_LABEL_KEY: value},
+            )
+        except SQLAlchemyError:
+            _logger.warning(
+                "Failed to record worktree-kept label on session %s",
+                session_id,
+                exc_info=True,
+            )
+
+    if not workspace or not git_branch or not host_id or host_registry is None:
+        return
+
+    # Another live session in the same worktree? Keep it regardless of
+    # cleanliness — removing would pull the working directory out from
+    # under that session (#5028). Archived sessions don't count: they no
+    # longer run anything, and the last one out cleans up.
+    others = await asyncio.to_thread(
+        conversation_store.list_conversations,
+        limit=100000,
+        include_archived=False,
+    )
+    in_use = any(
+        c.id != session_id and c.host_id == host_id and c.workspace == workspace
+        for c in others.data
+    )
+    if in_use:
+        _logger.info(
+            "Keeping worktree %s on archive of session %s: still in use by another session",
+            workspace,
+            session_id,
+        )
+        await _kept(json.dumps({"reason": "in_use"}))
+        return
+
+    host_conn = host_registry.get(host_id)
+    if host_conn is None:
+        _logger.info(
+            "Keeping worktree %s on archive of session %s: host %s offline",
+            workspace,
+            session_id,
+            host_id,
+        )
+        await _kept(json.dumps({"reason": "host_offline"}))
+        return
+
+    try:
+        inspection = await inspect_worktree_on_host(
+            host_registry=host_registry,
+            host_conn=host_conn,
+            worktree_path=workspace,
+            branch=git_branch,
+        )
+    except WorktreeProxyError:
+        # An old host that doesn't know the frame, a dead connection, a
+        # failed git check — all read as "cannot verify", so keep.
+        _logger.info(
+            "Keeping worktree %s on archive of session %s: inspection failed",
+            workspace,
+            session_id,
+            exc_info=True,
+        )
+        await _kept(json.dumps({"reason": "unknown"}))
+        return
+
+    safe = (
+        inspection.dirty_files == 0
+        and inspection.unpushed_commits == 0
+        and inspection.merged is True
+    )
+    if not safe:
+        _logger.info(
+            "Keeping worktree %s on archive of session %s: dirty=%d unpushed=%d merged=%s",
+            workspace,
+            session_id,
+            inspection.dirty_files,
+            inspection.unpushed_commits,
+            inspection.merged,
+        )
+        await _kept(
+            json.dumps(
+                {
+                    "dirty_files": inspection.dirty_files,
+                    "unpushed_commits": inspection.unpushed_commits,
+                    "merged": inspection.merged,
+                    "default_ref": inspection.default_ref,
+                }
+            )
+        )
+        return
+
+    try:
+        await remove_worktree_on_host(
+            host_registry=host_registry,
+            host_conn=host_conn,
+            worktree_path=workspace,
+            branch=git_branch,
+            delete_branch=True,
+        )
+    except WorktreeProxyError:
+        # Removal of a verified-safe worktree failing is a nuisance, not
+        # a data risk — log and leave the directory in place.
+        _logger.warning(
+            "Failed to remove verified-safe worktree %s on archive of session %s",
+            workspace,
+            session_id,
+            exc_info=True,
+        )
+        return
+    _logger.info(
+        "Removed worktree %s (branch %s) on archive of session %s",
+        workspace,
+        git_branch,
+        session_id,
+    )
+    # Clear a stale kept-note from a previous archive, when one exists
+    # (labels are upsert-only, so overwrite with the empty string the UI
+    # ignores — and only when set, to avoid a junk empty label on every
+    # cleanly-removed worktree).
+    current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if current is not None and WORKTREE_KEPT_LABEL_KEY in current.labels:
+        await _kept("")
+
+
 def _resolve_subagent_spec(
     *,
     agent: Agent,
@@ -8762,6 +8929,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     if ARCHIVED_AT_LABEL_KEY in labels:
         raise OmnigentError(
             f"label {ARCHIVED_AT_LABEL_KEY!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # The archive-time worktree cleanup owns this key: a client-seeded
+    # value would fake a "worktree kept — …" note the server never
+    # wrote, or mask a real one the user should see.
+    if WORKTREE_KEPT_LABEL_KEY in labels:
+        raise OmnigentError(
+            f"label {WORKTREE_KEPT_LABEL_KEY!r} is server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
     # Pins are per-user: the client may only write the bare canonical
