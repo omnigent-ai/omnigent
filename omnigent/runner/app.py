@@ -3997,6 +3997,16 @@ def create_runner_app(
         status: str,
         error: Mapping[str, object] | None = None,
     ) -> None:
+        # Pull this session's pane watchers back to their base poll interval
+        # before anything is dispatched. Every turn-start path publishes
+        # ``running`` here first, including the streaming branch that never
+        # reaches ``_run_turn_bg``. It runs BEFORE the harness suppression
+        # below on purpose: the harnesses whose status edge is terminal-owned
+        # are precisely the ones that inject through the bridge from the
+        # harness process, so their watcher gets no other signal that a turn
+        # began and a quiesced one would keep reporting ``idle`` into the turn.
+        if status == "running":
+            resource_registry.wake_session_terminal_watchers(conv_id)
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
         ):

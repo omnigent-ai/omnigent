@@ -75,6 +75,32 @@ HERMES_NATIVE_TERMINAL_ROLE = "hermes-native"
 # (the REPL exited or crashed) instead of rejecting the attach.
 OMNIGENT_REPL_TERMINAL_ROLE = "omnigent-repl"
 
+# Terminal roles whose pane watcher is responsible for keeping session status
+# current. Most derive both edges from pane activity. Claude-native instead
+# lets its status-file poller own the edges once active; that poller rides the
+# same watcher tick and the pane remains its fallback.
+#
+# Deliberately excludes codex-native and antigravity-native: their watcher runs
+# with status emission off (a forwarder / RPC read driver owns their edges), and
+# excludes generic and auxiliary panes, whose watcher only drives the activity
+# badge and exit detection.
+#
+# Read in two places that must agree: the watcher's status gate, and
+# :meth:`SessionResourceRegistry.wake_session_terminal_watchers`, which pulls
+# exactly these panes back to base rate at turn start.
+PTY_STATUS_OWNING_TERMINAL_ROLES = frozenset(
+    {
+        CLAUDE_NATIVE_TERMINAL_ROLE,
+        PI_NATIVE_TERMINAL_ROLE,
+        CURSOR_NATIVE_TERMINAL_ROLE,
+        KIRO_NATIVE_TERMINAL_ROLE,
+        GOOSE_NATIVE_TERMINAL_ROLE,
+        QWEN_NATIVE_TERMINAL_ROLE,
+        KIMI_NATIVE_TERMINAL_ROLE,
+        HERMES_NATIVE_TERMINAL_ROLE,
+    }
+)
+
 _IS_ALIVE_CACHE_TTL_S = 2.0
 _IS_ALIVE_CACHE_MAX = 256
 
@@ -445,6 +471,41 @@ class SessionResourceRegistry:
         :param publisher: Callable receiving a :class:`TerminalExitEvent`.
         """
         self._terminal_exit_publisher = publisher
+
+    def wake_session_terminal_watchers(self, session_id: str) -> None:
+        """Pull this session's status-driving pane watchers back to base rate.
+
+        Native harnesses inject a turn through the bridge, from the harness
+        process — not through :meth:`TerminalInstance.send` in the runner — so
+        the pane watcher gets no in-process signal that a turn is starting.
+        For the roles in :data:`PTY_STATUS_OWNING_TERMINAL_ROLES`, either the
+        pane diff or an out-of-band poller riding the same tick drives status.
+        A quiesced watcher must therefore resume promptly when a turn starts.
+        The runner calls this as it begins dispatching, the earliest point it
+        knows output is coming.
+
+        Scoped to those roles on purpose. A generic or auxiliary pane's watcher
+        drives only the activity badge and exit detection, and a session turn
+        implies nothing about whether that pane will produce output — waking it
+        would put it on high-rate polling for an unrelated turn, which is the
+        cost this whole change exists to remove.
+
+        Safe to call for any session: one with no terminals, no matching role,
+        or no running watcher is unaffected.
+
+        :param session_id: Session/conversation identifier, e.g.
+            ``"conv_abc123"``.
+        :returns: None.
+        """
+        registry = self._terminal_registry
+        if registry is None:
+            return
+        for entry in registry.list_for_conversation(session_id):
+            resource_id = terminal_resource_id(entry.terminal_name, entry.session_key)
+            with self._lock:
+                role = self._terminal_roles.get((session_id, resource_id))
+            if role in PTY_STATUS_OWNING_TERMINAL_ROLES:
+                entry.instance.wake_idle_watcher(expect_output=True)
 
     async def wait_for_terminal_exit_cleanup(self) -> None:
         """Await the scheduled terminal-exit cleanup to completion so its
@@ -1121,15 +1182,12 @@ class SessionResourceRegistry:
         aligned with the underlying tmux process. No-op when no publisher
         is installed (e.g. embedded/test runners).
 
-        For the claude-native *agent* terminal (``resource_role`` ==
-        :data:`CLAUDE_NATIVE_TERMINAL_ROLE` or
-        :data:`PI_NATIVE_TERMINAL_ROLE`) the same watcher also drives the
-        session's working status: pane activity → ``running`` and a short
-        quiescence → ``idle``, emitted via the session-status publisher.
-        This PTY-derived status catches cases lifecycle hooks can miss
-        because it observes the terminal directly. The status edges are
-        gated to these roles so a side shell's output never flips the
-        session's status.
+        For a terminal whose ``resource_role`` is in
+        :data:`PTY_STATUS_OWNING_TERMINAL_ROLES`, the watcher also keeps the
+        session's working status current. Most roles derive it from pane
+        activity and quiescence. Claude-native gives an active status-file
+        poller sole ownership and uses pane-derived edges only as fallback.
+        A side shell's output can therefore never flip session status.
 
         :param session_id: Session/conversation identifier.
         :param terminal_name: Terminal name from the agent spec.
@@ -1148,30 +1206,9 @@ class SessionResourceRegistry:
         exit_publisher = self._terminal_exit_publisher
         # Status edges are derived only from native agent terminals — a
         # generic shell's output must not move the session's working status.
-        emit_status = status_publisher is not None and resource_role in {
-            CLAUDE_NATIVE_TERMINAL_ROLE,
-            PI_NATIVE_TERMINAL_ROLE,
-            # cursor-native has no forwarder/hook (run_turn returns immediately
-            # after the paste), so — like pi/claude — the PTY watcher is its only
-            # status source. Without this the web "Working…" badge never clears.
-            CURSOR_NATIVE_TERMINAL_ROLE,
-            KIRO_NATIVE_TERMINAL_ROLE,
-            # goose-native injects then returns (its forwarder only mirrors the
-            # transcript, not status), so the PTY watcher is its status source too.
-            GOOSE_NATIVE_TERMINAL_ROLE,
-            # qwen-native appends then returns (its forwarder only mirrors the
-            # JSON event transcript, not status), so the PTY watcher is its
-            # status source too.
-            QWEN_NATIVE_TERMINAL_ROLE,
-            # kimi-native also has no forwarder/hook (the injection run_turn
-            # returns right after the tmux paste), so the PTY watcher is its
-            # only running/idle status source — same as cursor/pi/claude.
-            KIMI_NATIVE_TERMINAL_ROLE,
-            # hermes-native injects then returns (its forwarder only mirrors the
-            # SQLite transcript, not status), so the PTY watcher is its status
-            # source too.
-            HERMES_NATIVE_TERMINAL_ROLE,
-        }
+        emit_status = (
+            status_publisher is not None and resource_role in PTY_STATUS_OWNING_TERMINAL_ROLES
+        )
         if activity_publisher is None and not emit_status and exit_publisher is None:
             return
         resource_id = terminal_resource_id(terminal_name, session_key)
@@ -1211,9 +1248,9 @@ class SessionResourceRegistry:
         # claude-native additionally reads Claude's own ``sessions/<pid>.json``
         # status (present since Claude Code v2.1.139): it flips on the real
         # turn edge and knows when a dialog owns the input, neither of which
-        # the PTY frame-diff can see. It supplements the PTY watcher rather
-        # than replacing it — the file is written only on a value *change*, so
-        # it cannot be trusted to re-assert a status it already holds. Built
+        # the PTY frame-diff can see. Once resolved it replaces the PTY as the
+        # status publisher while continuing to ride the watcher tick; before
+        # resolution or after retirement the pane remains the fallback. Built
         # only for the claude-native role; other native roles stay PTY-only.
         status_poller = (
             self._build_claude_native_status_poller(
@@ -1340,6 +1377,9 @@ class SessionResourceRegistry:
             on_idle=_on_idle,
             on_exit=_on_exit,
             on_tick=_on_tick if status_poller is not None else None,
+            idle_poll_backoff_allowed=(
+                (lambda: not _file_owns_status()) if status_poller is not None else None
+            ),
             idle_threshold_s=_CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS,
             poll_interval_s=_CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS,
             replace=replace,

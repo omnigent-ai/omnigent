@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import os
 import re
@@ -273,8 +274,8 @@ def _tmux_session_persistence_commands() -> list[list[str]]:
     server — present after the inner process exits, so the socket stays usable
     and the pane's last output stays capturable for diagnostics. The idle
     watcher then reports the exit deterministically by detecting the dead pane
-    (see :meth:`TerminalInstance._pane_is_dead`) instead of racing the server's
-    disappearance. ``exit-empty off`` is belt-and-suspenders for the case where
+    (see :meth:`TerminalInstance._capture_pane_state_or_none`) instead of racing
+    the server's disappearance. ``exit-empty off`` is belt-and-suspenders for the case where
     the session is removed without the server being explicitly killed. Both use
     ``-q`` so a tmux too old to know the option does not fail launch;
     :meth:`TerminalInstance.close` still tears the server down unconditionally
@@ -383,6 +384,32 @@ def _tmux_status_option_commands() -> list[list[str]]:
 _IDLE_THRESHOLD_SECONDS = 10.0
 _IDLE_POLL_INTERVAL_SECONDS = 1.0
 
+# Idle backoff for the threaded watcher. Once a pane has been unchanged for at
+# least its idle threshold — i.e. the idle edge has already fired — each
+# further quiet tick doubles the interval up to a ceiling, so a terminal that
+# nobody is using stops forking tmux several times a second. Growth is gated on
+# post-idle quiescence precisely so backoff can never bring an idle edge
+# forward: the detector measures wall-clock, not ticks, and a pane that is
+# still working changes every tick and holds the interval at its base.
+#
+# The ceiling is the lesser of ten base intervals and
+# :data:`_IDLE_POLL_MAX_INTERVAL_SECONDS`, so the fast claude-native watcher
+# (0.2s) settles at 2s and generic terminals (1s) settle at 5s.
+_IDLE_POLL_BACKOFF_FACTOR = 2.0
+_IDLE_POLL_BACKOFF_MAX_MULTIPLE = 10.0
+_IDLE_POLL_MAX_INTERVAL_SECONDS = 5.0
+
+# How long after a wake the watcher stays pinned at its base interval. A wake
+# says output is coming, not that it has arrived: the runner wakes the pane's
+# watcher when it starts dispatching a turn, and spec resolution, harness
+# dispatch and injection can outlast the idle threshold. Without the grace the
+# watcher would ramp back up during setup and miss the output it was woken for.
+_IDLE_POLL_WAKE_GRACE_SECONDS = 15.0
+
+# Set to a falsy value to pin the watcher at its base interval, restoring the
+# pre-backoff polling rate without a rollback.
+_IDLE_POLL_BACKOFF_ENV_VAR = "OMNIGENT_TERMINAL_IDLE_POLL_BACKOFF"
+
 # When a web client interacts with the terminal (attach/detach, focus
 # in/out, mouse, keystroke, resize — all stamped via
 # ``TerminalInstance.note_client_interaction``), the TUI repaints in
@@ -426,6 +453,34 @@ _IDLE_MARKER_THRESHOLD_SECONDS: float = _IDLE_THRESHOLD_SECONDS
 # that can outlast a single Python frame; it normally returns in <50ms.
 _IDLE_WATCHER_JOIN_TIMEOUT_S = 1.0
 
+
+def _idle_poll_backoff_enabled() -> bool:
+    """
+    Report whether the threaded watcher may back off when a pane goes quiet.
+
+    :returns: ``True`` unless :envvar:`OMNIGENT_TERMINAL_IDLE_POLL_BACKOFF` is
+        set to a falsy value (``"0"``, ``"false"``, ``"no"``, ``"off"``).
+    """
+    raw = os.environ.get(_IDLE_POLL_BACKOFF_ENV_VAR)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _next_idle_poll_interval(current: float, base: float) -> float:
+    """
+    Grow a quiet watcher's poll interval one step toward its ceiling.
+
+    :param current: The interval used for the tick that just ran, e.g. ``0.4``.
+    :param base: The watcher's configured base interval, e.g. ``0.2``.
+    :returns: The interval to use for the next tick, capped at the lesser of
+        :data:`_IDLE_POLL_BACKOFF_MAX_MULTIPLE` base intervals and
+        :data:`_IDLE_POLL_MAX_INTERVAL_SECONDS`.
+    """
+    ceiling = min(base * _IDLE_POLL_BACKOFF_MAX_MULTIPLE, _IDLE_POLL_MAX_INTERVAL_SECONDS)
+    return min(current * _IDLE_POLL_BACKOFF_FACTOR, max(ceiling, base))
+
+
 # tmux's client→server protocol rejects any single command larger than
 # its 16KB imsg cap — the client exits non-zero with "command too long".
 # Literal text typed via ``send-keys -l`` is therefore chunked so each
@@ -433,6 +488,78 @@ _IDLE_WATCHER_JOIN_TIMEOUT_S = 1.0
 # (1024 chars ≤ 4KB packed). tmux writes each invocation's bytes to the
 # pane in submission order, so the program sees one contiguous stream.
 _SEND_KEYS_LITERAL_CHARS_PER_CALL = 1024
+
+
+class _WakeSignal:
+    """
+    Cross-thread wake for the threaded idle watcher.
+
+    Couples the wake and its *reason* under one lock. They started out as a
+    :class:`threading.Event` plus a separate ``bool``, which meant a wake's
+    reason and its event could be observed and cleared independently: a turn
+    wake landing between another wake's ``clear`` and the reason read had its
+    two halves consumed by different ticks. Reasoning about that required
+    enumerating interleavings, which is the tell that the state wanted to be
+    one object.
+
+    Two properties the watcher depends on, both structural here rather than
+    argued:
+
+    1. :meth:`consume` returns the pending flag and its reason atomically, so
+       a wake can never be split.
+    2. A wake raised after :meth:`consume` returns stays pending for the next
+       call. Nothing is dropped — a wake the watcher has not observed is never
+       cleared, so at worst it is serviced one base interval late.
+    """
+
+    def __init__(self) -> None:
+        """Start with no wake pending."""
+        self._condition = threading.Condition()
+        self._pending = False
+        self._expects_output = False
+
+    def wake(self, *, expect_output: bool) -> None:
+        """
+        Raise a wake, optionally marking that output is expected to follow.
+
+        ``expect_output`` latches: if any wake still pending when the watcher
+        consumes expected output, the consumed wake does too. A turn-start
+        wake therefore cannot be downgraded by a client interaction racing it.
+
+        :param expect_output: Whether agent output is expected but has not
+            arrived yet, which earns the consumer a grace window.
+        :returns: None.
+        """
+        with self._condition:
+            self._pending = True
+            self._expects_output = self._expects_output or expect_output
+            self._condition.notify_all()
+
+    def consume(self, timeout: float) -> tuple[bool, bool]:
+        """
+        Wait for a wake and take it, clearing both halves together.
+
+        The wait is predicate-looped via :meth:`threading.Condition.wait_for`
+        against a monotonic deadline, not a bare ``wait``. A bare one may
+        return before its timeout without a wake pending, and the caller reads
+        that as "the poll interval elapsed" — so a spurious return would cut a
+        backed-off sleep short and fork tmux early, which is the cost the
+        backoff exists to avoid.
+
+        :param timeout: Longest time to wait in seconds. Values at or below
+            zero poll without blocking, which is how the watcher checks for a
+            wake while already at its base interval.
+        :returns: ``(was_woken, expects_output)``. ``expects_output`` is only
+            ever ``True`` alongside ``was_woken``.
+        """
+        with self._condition:
+            if timeout > 0:
+                self._condition.wait_for(lambda: self._pending, timeout)
+            woken = self._pending
+            expects_output = self._expects_output
+            self._pending = False
+            self._expects_output = False
+            return woken, expects_output
 
 
 class _IdleDetector:
@@ -493,6 +620,24 @@ class _IdleDetector:
         # PTY produced output" signal that powers the web activity badge,
         # without any client PTY attach.
         self.changed_this_tick: bool = False
+
+    @property
+    def idle_notified(self) -> bool:
+        """
+        Report whether this idle episode has already delivered its edge.
+
+        The threaded watcher reads this to decide when it may lengthen its
+        poll interval. Deriving the answer from the detector rather than
+        re-timing quiescence in the loop keeps the two from drifting: the
+        loop's clock starts when the watcher starts, the detector's when it
+        takes its first snapshot, and a loop-side timer would therefore
+        allow a backoff step one tick before the edge it is supposed to
+        follow.
+
+        :returns: ``True`` once either track has fired for the current
+            episode; ``False`` again after new output mutates the pane.
+        """
+        return self._idle_notified
 
     def tick(self, snapshot: str, suppress_activity: bool = False) -> bool:
         """
@@ -714,6 +859,37 @@ def _apply_utf8_locale_default(env: dict[str, str]) -> None:
 def _tmux_available() -> bool:
     """Check if tmux is installed."""
     return shutil.which("tmux") is not None
+
+
+@functools.lru_cache(maxsize=8)
+def _tmux_executable_for_path(path_env: str) -> str:
+    """
+    Resolve tmux against one ``PATH`` value.
+
+    :param path_env: The ``PATH`` the lookup applies to. It is the cache key,
+        not an input to the search — :func:`shutil.which` reads the
+        environment itself — so a changed ``PATH`` resolves afresh instead of
+        returning a stale binary.
+    :returns: Absolute tmux path, or the bare name ``"tmux"``.
+    """
+    del path_env
+    return shutil.which("tmux") or "tmux"
+
+
+def _tmux_executable() -> str:
+    """
+    Resolve the tmux binary, caching per ``PATH``.
+
+    Spawning tmux with the bare name makes ``execvp`` walk ``PATH``, so a
+    single invocation costs one ``execve`` per directory it probes before the
+    hit — three wasted ``ENOENT`` calls on a typical developer ``PATH``. The
+    idle watcher runs this several times a second per terminal, so resolving
+    the absolute path up front removes most of the exec traffic outright.
+
+    :returns: Absolute tmux path, or the bare name ``"tmux"`` when it is not
+        on ``PATH`` (so the resulting failure reads the same as before).
+    """
+    return _tmux_executable_for_path(os.environ.get("PATH", ""))
 
 
 def _process_alive(pid: int) -> bool:
@@ -992,6 +1168,12 @@ class TerminalInstance:
     # under ``_idle_stop_event``.
     _idle_thread: threading.Thread | None = field(default=None, repr=False)
     _idle_stop_event: threading.Event | None = field(default=None, repr=False)
+    # Cuts short a backed-off poll sleep. Set whenever something that is about
+    # to change the pane happens on another thread — the runner typing a turn
+    # into it, a web client interacting with it, or the close path — so a quiet
+    # watcher returns to its base interval immediately instead of discovering
+    # the change up to a full backed-off interval later.
+    _idle_wake_signal: _WakeSignal | None = field(default=None, repr=False)
     # Monotonic timestamp of the last client interaction observed on this
     # terminal's web attach (keystroke / focus / mouse / resize / connect /
     # disconnect — see :meth:`note_client_interaction`). The idle watcher
@@ -1031,6 +1213,39 @@ class TerminalInstance:
         :returns: None.
         """
         self._last_client_interaction_at = time.monotonic()
+        # No grace: a client interaction is a one-off repaint, not the start of
+        # agent work, so it only needs the watcher to look once at base rate.
+        self.wake_idle_watcher()
+
+    def wake_idle_watcher(self, *, expect_output: bool = False) -> None:
+        """Pull a backed-off idle watcher back to its base poll interval.
+
+        Called from whichever thread is about to make the pane change — the
+        runner dispatching a turn into it, the attach bridge forwarding a
+        keystroke, or the close path. A watcher polling at its base interval
+        is unaffected; only the extra backoff sleep is cut short, so a burst
+        of wakes can never poll tmux faster than the base rate.
+
+        Thread-safety is :class:`_WakeSignal`'s: the wake and its reason are
+        raised together under its lock, so a wake can be posted from any
+        thread without racing the watcher's read. A wake that arrives while
+        the watcher is mid-tick stays pending and shortens the following
+        sleep — it is never dropped, only serviced up to one base interval
+        later.
+
+        :param expect_output: ``True`` when agent output is expected to follow
+            but has not arrived yet (a turn being dispatched), which also pins
+            the base interval for :data:`_IDLE_POLL_WAKE_GRACE_SECONDS` so the
+            watcher cannot ramp back up while the turn is still starting. The
+            grace is released as soon as the pane actually changes, so it costs
+            a full window only when the expected output never comes. ``False``
+            (the default) requests a single prompt look and no grace — right
+            for client interactions, which repaint once and then stop.
+        :returns: None.
+        """
+        wake_signal = self._idle_wake_signal
+        if wake_signal is not None:
+            wake_signal.wake(expect_output=expect_output)
 
     def last_pane_text(self) -> str | None:
         """Return the last visible pane text captured for diagnostics.
@@ -1053,7 +1268,8 @@ class TerminalInstance:
         """Return the inner process's exit code, if the pane has died.
 
         Captured from tmux ``#{pane_dead_status}`` when a dead pane is first
-        observed (see :meth:`_pane_is_dead` / :meth:`_pane_is_dead_async`).
+        observed (see :meth:`_capture_pane_state_or_none` and
+        :meth:`_pane_is_dead_async`).
         Only meaningful for terminals launched with ``keep_alive_after_exit``
         (``remain-on-exit``); ``None`` otherwise or before exit.
         """
@@ -1086,9 +1302,9 @@ class TerminalInstance:
         differently across machines.
 
         :returns: Base argv for subprocess calls, e.g.
-            ``["tmux", "-S", "/tmp/.../tmux.sock", "-f", "/dev/null"]``.
+            ``["/usr/bin/tmux", "-S", "/tmp/.../tmux.sock", "-f", "/dev/null"]``.
         """
-        return ["tmux", "-S", str(self.socket_path), "-f", _TMUX_CONFIG_PATH]
+        return [_tmux_executable(), "-S", str(self.socket_path), "-f", _TMUX_CONFIG_PATH]
 
     async def set_conversation_link(self, conversation_link: str | None) -> None:
         """
@@ -1277,6 +1493,9 @@ class TerminalInstance:
         if not self.running:
             return {"error": "Terminal is not running"}
 
+        # The pane is about to repaint, so pull a quiesced watcher back to its
+        # base interval before the output arrives rather than after.
+        self.wake_idle_watcher()
         try:
             if text:
                 for start in range(0, len(text), _SEND_KEYS_LITERAL_CHARS_PER_CALL):
@@ -1538,6 +1757,7 @@ class TerminalInstance:
         on_activity: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
         on_tick: Callable[[], None] | None = None,
+        idle_poll_backoff_allowed: Callable[[], bool] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
         replace: bool = False,
@@ -1582,6 +1802,10 @@ class TerminalInstance:
             status source — e.g. the claude-native watcher reading Claude's
             ``sessions/<pid>.json`` — on the same cadence without a second
             thread. Same non-blocking contract as *on_idle*.
+        :param idle_poll_backoff_allowed: Optional predicate evaluated after
+            *on_tick* on each live-pane poll. Returning ``False`` pins the
+            watcher to its base interval. ``None`` always permits backoff.
+            Must not block the polling daemon thread for long.
         :param idle_threshold_s: Per-watcher diff-track idle threshold in
             seconds passed to :class:`_IdleDetector`, e.g. ``1.0`` for the
             claude-native status watcher. ``None`` uses the module
@@ -1608,15 +1832,20 @@ class TerminalInstance:
                 return
             self._stop_idle_watcher_thread()
         stop_event = threading.Event()
+        # A fresh signal per watcher, so a wake raised while none was running
+        # cannot hand this one a grace window it never asked for.
+        wake_signal = _WakeSignal()
         self._idle_stop_event = stop_event
+        self._idle_wake_signal = wake_signal
         self._idle_thread = threading.Thread(
             target=self._idle_watch_loop_threaded,
-            args=(stop_event,),
+            args=(stop_event, wake_signal),
             kwargs={
                 "on_idle": on_idle,
                 "on_activity": on_activity,
                 "on_exit": on_exit,
                 "on_tick": on_tick,
+                "idle_poll_backoff_allowed": idle_poll_backoff_allowed,
                 "idle_threshold_s": idle_threshold_s,
                 "poll_interval_s": poll_interval_s,
             },
@@ -1628,11 +1857,13 @@ class TerminalInstance:
     def _idle_watch_loop_threaded(
         self,
         stop_event: threading.Event,
+        wake_signal: _WakeSignal | None = None,
         *,
         on_idle: Callable[[], None] | None = None,
         on_activity: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
         on_tick: Callable[[], None] | None = None,
+        idle_poll_backoff_allowed: Callable[[], bool] | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
     ) -> None:
@@ -1645,10 +1876,22 @@ class TerminalInstance:
         ``False`` (close path), and exits silently if ``tmux
         capture-pane`` fails (server likely gone).
 
+        A pane that has been unchanged for at least its idle threshold —
+        so the idle edge has already fired — doubles its poll interval on
+        each further quiet tick up to a ceiling, and drops straight back to
+        the base interval on any pane change or explicit wake. Backoff can
+        therefore only ever make the idle→running edge late; it can never
+        bring an idle edge forward, because a working pane changes every
+        tick and never reaches the growth branch.
+
         :param stop_event: Event the close path sets to signal
             shutdown. Doubles as the poll-interval sleep via
             :meth:`Event.wait` so the join window is bounded by
             one poll interval, not the full sleep.
+        :param wake_signal: Signal raised by :meth:`wake_idle_watcher` to
+            cut short the extra backoff sleep, carrying whether output is
+            expected. ``None`` disables early wake-up (the watcher still backs
+            off and still stops promptly).
         :param on_idle: Optional idle-edge callback (see
             :meth:`start_idle_watcher_thread`); skipped when ``None``.
         :param on_activity: Optional pane-changed callback; fired each
@@ -1658,6 +1901,10 @@ class TerminalInstance:
         :param on_tick: Optional per-tick callback fired every poll after
             the exit check (see :meth:`start_idle_watcher_thread`); skipped
             when ``None``.
+        :param idle_poll_backoff_allowed: Optional predicate controlling
+            whether a quiet watcher may grow its interval. Evaluated after
+            *on_tick*, so a state source driven there can pin this poll and
+            later polls to the base cadence.
         :param idle_threshold_s: Per-watcher diff-track idle threshold in
             seconds forwarded to :class:`_IdleDetector`, e.g. ``1.0``.
             ``None`` uses the module default.
@@ -1666,23 +1913,51 @@ class TerminalInstance:
             :data:`_IDLE_POLL_INTERVAL_SECONDS`.
         """
         detector = _IdleDetector(idle_threshold_s=idle_threshold_s)
-        interval = poll_interval_s if poll_interval_s is not None else _IDLE_POLL_INTERVAL_SECONDS
+        base_interval = (
+            poll_interval_s if poll_interval_s is not None else _IDLE_POLL_INTERVAL_SECONDS
+        )
+        backoff_enabled = _idle_poll_backoff_enabled()
+        interval = base_interval
+        # Monotonic time before which backoff may not resume. Only a wake that
+        # expects output arms it: the work producing that output (turn setup,
+        # harness dispatch, injection) can outlast the idle threshold, and
+        # without the grace the watcher would ramp back up and miss the very
+        # output it was woken for. Released the moment the pane changes, so a
+        # normal turn pays a few extra captures rather than the whole window.
+        hold_base_until = 0.0
         while self.running:
-            # ``Event.wait`` doubles as the poll-interval sleep, so
-            # ``stop_event.set()`` from :meth:`close` returns within
-            # one tick instead of waiting out the full interval.
-            if stop_event.wait(interval):
+            should_stop, woken, expects_output = self._wait_next_idle_tick(
+                stop_event, wake_signal, interval, base_interval
+            )
+            if should_stop:
                 return
+            if woken:
+                # Something that changes the pane just happened elsewhere (a
+                # turn being dispatched, a client interacting). Client-driven
+                # repaints are deliberately not counted as activity, so the
+                # change path below would not reset the interval on its own.
+                if interval != base_interval:
+                    logger.debug(
+                        "terminal %s:%s idle watcher woken; poll %.2fs -> %.2fs",
+                        self.name,
+                        self.session_key,
+                        interval,
+                        base_interval,
+                    )
+                interval = base_interval
+                if expects_output:
+                    hold_base_until = time.monotonic() + _IDLE_POLL_WAKE_GRACE_SECONDS
             if not self.running:
                 return
-            snapshot = self._capture_pane_for_idle_or_none()
-            if snapshot is None:
+            capture = self._capture_pane_state_or_none()
+            if capture is None:
                 self.running = False
                 if on_exit is not None:
                     self._fire_watch_callback(on_exit, "exit")
                 return
+            pane_dead, snapshot = capture
             self._remember_pane_snapshot(snapshot)
-            if self._pane_is_dead():
+            if pane_dead:
                 # The inner CLI exited but remain-on-exit kept the server, so
                 # capture-pane still succeeds (the snapshot above is the final
                 # frame, now remembered for diagnostics). Report the exit
@@ -1707,10 +1982,53 @@ class TerminalInstance:
             # is a client-driven repaint (attach/detach reflow, focus,
             # mouse, keystroke — stamped via note_client_interaction), not
             # agent output, so the detector discounts it.
+            now = time.monotonic()
             suppress = (
-                time.monotonic() - self._last_client_interaction_at
+                now - self._last_client_interaction_at
             ) < _CLIENT_INTERACTION_WINDOW_SECONDS
             idle_fired = detector.tick(snapshot, suppress_activity=suppress)
+            # Backoff follows the detector's own idle state rather than a
+            # second quiescence timer in this loop: the two baselines start
+            # one tick apart (the loop's at watcher start, the detector's at
+            # its first snapshot), and a loop-side timer would let the
+            # interval grow one tick before the idle edge it must follow.
+            if detector.changed_this_tick:
+                if interval != base_interval:
+                    logger.debug(
+                        "terminal %s:%s pane changed; poll %.2fs -> %.2fs",
+                        self.name,
+                        self.session_key,
+                        interval,
+                        base_interval,
+                    )
+                interval = base_interval
+                # The output the grace was holding out for arrived, so the
+                # grace has served its purpose. The idle threshold governs from
+                # here — backoff still cannot resume until the edge fires.
+                hold_base_until = 0.0
+            elif not backoff_enabled or (
+                idle_poll_backoff_allowed is not None and not idle_poll_backoff_allowed()
+            ):
+                if interval != base_interval:
+                    logger.debug(
+                        "terminal %s:%s idle backoff suppressed; poll %.2fs -> %.2fs",
+                        self.name,
+                        self.session_key,
+                        interval,
+                        base_interval,
+                    )
+                interval = base_interval
+            elif detector.idle_notified and now >= hold_base_until:
+                grown = _next_idle_poll_interval(interval, base_interval)
+                if grown != interval:
+                    logger.debug(
+                        "terminal %s:%s pane quiescent; poll %.2fs -> %.2fs",
+                        self.name,
+                        self.session_key,
+                        interval,
+                        grown,
+                    )
+                interval = grown
             # Activity edge first: a tick can both change the pane and
             # (much later) cross the idle threshold, but never both in
             # the same tick — a change resets the idle timer.
@@ -1727,44 +2045,86 @@ class TerminalInstance:
             ):
                 return
 
-    def _capture_pane_for_idle_or_none(self) -> str | None:
+    def _wait_next_idle_tick(
+        self,
+        stop_event: threading.Event,
+        wake_signal: _WakeSignal | None,
+        interval: float,
+        base_interval: float,
+    ) -> tuple[bool, bool, bool]:
         """
-        Capture the pane for an idle tick, or signal "tmux gone".
+        Sleep until the next watcher tick, honouring stop and wake signals.
 
-        :returns: Pane bytes from ``tmux capture-pane -p -e``, or
-            ``None`` when the tmux subprocess raised — the
-            threaded loop reads ``None`` as "stop watching, the
-            server is no longer there".
-        """
-        try:
-            return self._tmux_output_sync("capture-pane", "-t", self.tmux_target, "-p", "-e")
-        except RuntimeError:
-            return None
+        Split in two so a burst of wakes cannot become a burst of tmux
+        subprocesses: the first *base_interval* is a floor that only
+        ``stop_event`` interrupts, and only the extra backoff beyond it is
+        cut short by ``wake_signal``. Polling therefore never exceeds the
+        watcher's configured base rate, however often a client interacts with
+        the pane. The close path sets ``stop_event`` and raises a wake, so
+        teardown never waits out a backed-off sleep.
 
-    def _pane_is_dead(self) -> bool:
+        The wake and its reason are taken together by
+        :meth:`_WakeSignal.consume`, so they cannot be split across ticks, and
+        a wake raised while the tick body runs stays pending for the next
+        sleep rather than being dropped.
+
+        :param stop_event: Set by the close path to end the watcher.
+        :param wake_signal: Signal cutting the backoff short, or ``None``.
+        :param interval: Total seconds to wait, e.g. ``1.6``.
+        :param base_interval: Un-interruptible floor, e.g. ``0.2``.
+        :returns: ``(should_stop, was_woken, expects_output)``.
         """
-        Report whether the pane's process exited while tmux kept the pane.
+        if stop_event.wait(min(interval, base_interval)):
+            return True, False, False
+        remaining = interval - base_interval
+        if wake_signal is None:
+            if remaining > 0 and stop_event.wait(remaining):
+                return True, False, False
+            return stop_event.is_set(), False, False
+        woken, expects_output = wake_signal.consume(remaining)
+        return stop_event.is_set(), woken, expects_output
+
+    def _capture_pane_state_or_none(self) -> tuple[bool, str] | None:
+        """
+        Capture the pane and its liveness for an idle tick, or signal "tmux gone".
+
+        Both facts come from a single tmux command sequence. Two invocations
+        would be two fork+execs per tick per terminal — the dominant cost of
+        the watcher at fan-out — and would also read the pane and its liveness
+        at different instants, so a pane that died in between reported a
+        snapshot that did not match the verdict.
 
         With ``remain-on-exit on`` (see
         :func:`_tmux_session_persistence_commands`) the private server survives
         the inner CLI's exit, so a *dead pane* — not a vanished server — is how
-        a normal or early exit now presents. The threaded idle watcher uses this
-        to report the exit deterministically once ``capture-pane`` still
-        succeeds against the surviving server.
+        a normal or early exit presents, and ``capture-pane`` keeps succeeding
+        against the surviving server. ``#{pane_dead}`` is what distinguishes
+        that frozen final frame from a genuinely idle agent.
 
-        :returns: ``True`` when tmux reports ``#{pane_dead}`` as ``1``.
-            ``False`` when the pane is live, or when the probe itself fails
-            (server already gone) — the caller's capture step already handles
-            the vanished-server path.
+        :returns: ``(pane_dead, pane_bytes)`` where *pane_bytes* is the output
+            of ``capture-pane -p -e``, or ``None`` when the tmux subprocess
+            raised — the threaded loop reads ``None`` as "stop watching, the
+            server is no longer there".
         """
         try:
             out = self._tmux_output_sync(
-                "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead} #{pane_dead_status}"
+                "list-panes",
+                "-t",
+                self.tmux_target,
+                "-F",
+                "#{pane_dead} #{pane_dead_status}",
+                ";",
+                "capture-pane",
+                "-t",
+                self.tmux_target,
+                "-p",
+                "-e",
             )
         except RuntimeError:
-            return False
-        self._remember_exit_status(out)
-        return out.split()[:1] == ["1"]
+            return None
+        dead_fields, _, snapshot = out.partition("\n")
+        self._remember_exit_status(dead_fields)
+        return dead_fields.split()[:1] == ["1"], snapshot
 
     def pane_pid_sync(self) -> int | None:
         """Return the pid of the pane's foreground process, or ``None``.
@@ -1826,15 +2186,23 @@ class TerminalInstance:
         timeout the thread keeps running, but it's a daemon — it
         will exit when the process does, and the next iteration's
         ``self.running`` check will short-circuit it anyway.
+
+        Both signals fire: the stop event ends the loop, and a wake cuts short
+        a backed-off sleep so a quiesced watcher exits as promptly as a busy
+        one instead of lingering for its full interval.
         """
         thread = self._idle_thread
         stop_event = self._idle_stop_event
+        wake_signal = self._idle_wake_signal
         if thread is None:
             return
         self._idle_thread = None
         self._idle_stop_event = None
+        self._idle_wake_signal = None
         if stop_event is not None:
             stop_event.set()
+        if wake_signal is not None:
+            wake_signal.wake(expect_output=False)
         if thread.is_alive():
             thread.join(timeout=_IDLE_WATCHER_JOIN_TIMEOUT_S)
 
@@ -1886,7 +2254,7 @@ class TerminalInstance:
 
     async def _pane_is_dead_async(self) -> bool:
         """
-        Async sibling of :meth:`_pane_is_dead` for the asyncio idle watcher.
+        Async dead-pane probe for the asyncio idle watcher.
 
         :returns: ``True`` when tmux reports ``#{pane_dead}`` as ``1``;
             ``False`` when the pane is live or the probe fails (server gone,

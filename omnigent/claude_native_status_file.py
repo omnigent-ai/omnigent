@@ -252,12 +252,11 @@ def read_session_status(path: Path) -> SessionStatus | None:
     )
 
 
-# Attempts to resolve the file before giving up and leaving the PTY
-# watcher authoritative for the session's lifetime. At the claude-native
-# poll cadence (~0.2s) this is a few seconds — long enough for a booting
-# Claude to write its file and for the first hook to report the session
-# id, short enough that an old Claude (pre-v2.1.139, no file) or a broken
-# config dir falls back promptly without scanning forever.
+# Ticks spent resolving the file before leaving the PTY watcher authoritative
+# for the session's lifetime. Forty ticks are ~8s at the 0.2s base cadence and
+# up to ~66s once a quiet pre-resolution pane backs off. That gives booting
+# Claude time to publish its session id while still bounding scans for old
+# Claude versions (pre-v2.1.139) or a broken config directory.
 _MAX_RESOLVE_ATTEMPTS = 40
 
 
