@@ -167,7 +167,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
       </button>
       <ul className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-1">
         <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
-        {children.map((child) => (
+        {sortSiblingsByActivity(children).map((child) => (
           <SubagentRow
             key={child.id}
             child={child}
@@ -218,6 +218,57 @@ function ViewModeToggle({
       </Button>
     </div>
   );
+}
+
+// Ordering priority for sibling agents in the rail; lower sorts first.
+// The rail's job is to surface what needs the user *now*, so agents
+// parked on a prompt ("awaiting") lead, then live work
+// ("working"/"launching"), then quiet ("idle"/"other"), with settled
+// rows ("done"/"failed") sinking to the bottom — otherwise active
+// agents get buried among finished ones (#1410). The done-vs-failed
+// order is deliberate but minor; flip if failures should read louder.
+// ``disconnected`` sorts with the settled rows: the runner is gone, so
+// the row is as inert as a finished one, but it is not a genuine
+// failure — it sits just above ``failed``.
+const ACTIVITY_SORT_RANK: Record<AgentActivity, number> = {
+  awaiting: 0,
+  working: 1,
+  launching: 2,
+  idle: 3,
+  other: 4,
+  done: 5,
+  disconnected: 6,
+  failed: 7,
+};
+
+/**
+ * Order a sibling list of child sessions so attention-needing and live
+ * agents rise above settled (done/failed) ones.
+ *
+ * Within one activity, ties break by ``created_at`` descending (newest
+ * child first), with the original index as a final fallback. Both keys
+ * are immutable, so the order is fully deterministic and never
+ * reshuffles on a ``TREE_POLL_MS`` re-poll. Returns a new array; the
+ * input is not mutated.
+ *
+ * @param children - One sibling group (the root's direct children, or
+ *   any row's grandchildren).
+ * @returns A new, priority-ordered array of the same children.
+ */
+export function sortSiblingsByActivity(children: ChildSessionInfo[]): ChildSessionInfo[] {
+  return children
+    .map((child, index) => ({
+      child,
+      index,
+      rank: ACTIVITY_SORT_RANK[childStatus(child).activity],
+    }))
+    .sort(
+      (a, b) =>
+        a.rank - b.rank ||
+        (b.child.created_at ?? 0) - (a.child.created_at ?? 0) ||
+        a.index - b.index,
+    )
+    .map((entry) => entry.child);
 }
 
 // Quiet states show only an indicator — the word lives in the tooltip — so the
@@ -683,7 +734,7 @@ function SubagentRow({
         </Link>
       </li>
       {!collapsed &&
-        grandchildren.map((grandchild) => (
+        sortSiblingsByActivity(grandchildren).map((grandchild) => (
           <SubagentRow
             key={grandchild.id}
             child={grandchild}
