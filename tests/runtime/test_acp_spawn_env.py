@@ -126,6 +126,41 @@ def test_send_model_flag_forwarded(_isolate_config: Path) -> None:
     assert env["HARNESS_ACP_SEND_MODEL"] == "1"
 
 
+def test_terminal_delegation_absent_unless_opted_in(_isolate_config: Path) -> None:
+    """
+    ``HARNESS_ACP_TERMINAL`` is set only for agents that declared it.
+
+    **What breaks if this fails**: every existing ACP agent starts delegating
+    shell execution to Omnigent the moment this ships, changing how they run
+    commands without anyone opting in.
+    """
+    _write_acp_config(
+        _isolate_config,
+        [
+            {"name": "Plain", "command": "plain acp"},
+            {"name": "Mediated", "command": "mediated acp", "terminal_delegation": True},
+        ],
+    )
+    plain = _build_acp_spawn_env(_make_spec(harness="acp:plain"), cwd=None, workdir=None)
+    assert "HARNESS_ACP_TERMINAL" not in plain
+
+    mediated = _build_acp_spawn_env(_make_spec(harness="acp:mediated"), cwd=None, workdir=None)
+    assert mediated["HARNESS_ACP_TERMINAL"] == "1"
+
+
+def test_embedded_agent_forwards_terminal_delegation() -> None:
+    """An embedded one-shot agent carries the opt-in too (remote-server path)."""
+    env = _build_acp_spawn_env(
+        _make_spec(
+            harness="acp:embedded",
+            acp_agent={"name": "E", "command": "e acp", "terminal_delegation": True},
+        ),
+        cwd=None,
+        workdir=None,
+    )
+    assert env["HARNESS_ACP_TERMINAL"] == "1"
+
+
 def test_omnigent_mcp_flag_forwarded(_isolate_config: Path) -> None:
     _write_acp_config(_isolate_config)
     env = _build_acp_spawn_env(_make_spec(harness="acp:openclaw"))

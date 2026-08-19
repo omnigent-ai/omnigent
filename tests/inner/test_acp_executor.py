@@ -631,6 +631,133 @@ async def test_model_override_falls_back_to_request_when_no_option_echoed() -> N
 
 
 # ---------------------------------------------------------------------------
+# terminal delegation (agent → client shell mediation)
+# ---------------------------------------------------------------------------
+
+
+def _os_env() -> OSEnvSpec:
+    """A minimal non-fork os_env, which is what enables delegation."""
+    return OSEnvSpec(
+        type="caller_process",
+        cwd=None,
+        sandbox=OSEnvSandboxSpec(type="none"),
+        fork=False,
+    )
+
+
+class _Deny:
+    action = "POLICY_ACTION_DENY"
+
+
+def test_terminal_capability_tracks_os_env() -> None:
+    """
+    ``terminal`` needs both the per-agent opt-in and an os_env to execute with.
+
+    Opt-in matters for compatibility: honouring the capability changes how a
+    compliant agent runs *every* command, so it must not switch on for the ACP
+    agents that already work (goose, kilocode, qwen, grok) just because the
+    harness always supplies a default os_env.
+
+    **What breaks if this fails**: advertising without an OSEnvironment makes the
+    agent delegate shell to a client that cannot run it, so every command fails;
+    advertising without the opt-in silently changes execution for every existing
+    ACP agent.
+    """
+    opted_in = AcpAgentConfig(command="x", terminal_delegation=True)
+    default = AcpAgentConfig(command="x")
+    # Needs BOTH the opt-in and an os_env to execute with.
+    assert AcpExecutor(opted_in)._terminal_delegation is False
+    assert AcpExecutor(default, os_env=_os_env())._terminal_delegation is False
+    assert AcpExecutor(opted_in, os_env=_os_env())._terminal_delegation is True
+
+
+@pytest.mark.asyncio
+async def test_terminal_create_denied_by_policy_never_executes() -> None:
+    """
+    A DENY verdict stops the command running and reports a failed exit.
+
+    This is the whole point of mediation: the agent asked us to run something, so
+    policy decides — not the agent's own permission mode.
+
+    **What breaks if this fails**: a DENY-ed shell command executes anyway,
+    meaning omnigent's policy engine is advisory for delegated shell.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x", terminal_delegation=True), os_env=_os_env())
+    ex._policy_evaluator = AsyncMock(return_value=_Deny())
+    shell = AsyncMock()
+    ex._os_environment = type("E", (), {"shell": shell})()  # type: ignore[assignment]
+
+    result = await ex._handle_terminal_create({"command": "rm", "args": ["-rf", "/"]})
+
+    shell.assert_not_awaited()
+    out = await ex._handle_terminal_output(result)
+    assert out["exitStatus"]["exitCode"] == 126
+    assert "denied by policy" in out["output"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_create_allowed_runs_through_os_environment() -> None:
+    """
+    An allowed command executes via the OSEnvironment (so the sandbox applies).
+
+    **What breaks if this fails**: delegated commands bypass the spec's sandbox
+    read/write roots, or don't run at all and the agent sees empty output.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x", terminal_delegation=True), os_env=_os_env())
+    shell = AsyncMock(return_value={"stdout": "hi", "stderr": "", "exit_code": 0})
+    ex._os_environment = type("E", (), {"shell": shell})()  # type: ignore[assignment]
+
+    created = await ex._handle_terminal_create({"command": "echo", "args": ["hi"]})
+    shell.assert_awaited_once_with("echo hi")
+
+    assert (await ex._handle_terminal_wait(created))["exitCode"] == 0
+    assert (await ex._handle_terminal_output(created))["output"] == "hi"
+    # Release drops the record; a second release must not raise.
+    await ex._handle_terminal_release(created)
+    await ex._handle_terminal_release(created)
+
+
+@pytest.mark.asyncio
+async def test_terminal_stderr_is_folded_into_output() -> None:
+    """Both streams reach the agent — stderr alone would otherwise be invisible."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", terminal_delegation=True), os_env=_os_env())
+    ex._os_environment = type(  # type: ignore[assignment]
+        "E", (), {"shell": AsyncMock(return_value={"stdout": "o", "stderr": "e", "exit_code": 2})}
+    )()
+    created = await ex._handle_terminal_create({"command": "x"})
+    out = await ex._handle_terminal_output(created)
+    assert out["output"] == "o\ne"
+    assert out["exitStatus"]["exitCode"] == 2
+
+
+@pytest.mark.asyncio
+async def test_terminal_methods_unsupported_without_delegation() -> None:
+    """
+    With no os_env, ``terminal/*`` is answered ``method not found`` — unchanged.
+
+    **What breaks if this fails**: agents that would have used their own shell
+    start delegating to a client that can't execute, regressing every existing
+    ACP agent that runs without an os_env.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    sent: list[dict] = []
+    ex._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await ex._respond_to_agent_request(
+        {"id": 7, "method": "terminal/create", "params": {"command": "echo hi"}}
+    )
+    assert sent[0]["error"]["code"] == -32601
+
+
+@pytest.mark.asyncio
+async def test_terminal_unknown_id_is_an_error() -> None:
+    """An unknown terminalId must fail loudly, not report empty output."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", terminal_delegation=True), os_env=_os_env())
+    with pytest.raises(acp_executor_module._AcpRequestError):
+        await ex._handle_terminal_output({"terminalId": "nope"})
+
+
+# ---------------------------------------------------------------------------
 # interrupt → session/cancel
 # ---------------------------------------------------------------------------
 

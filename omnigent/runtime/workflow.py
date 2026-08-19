@@ -1626,6 +1626,9 @@ def _build_acp_spawn_env(
         model = embedded.get("model")
         if model is not None and not isinstance(model, str):
             raise ValueError("executor acp_agent model must be a string or null")
+        terminal_delegation = embedded.get("terminal_delegation", False)
+        if not isinstance(terminal_delegation, bool):
+            raise ValueError("executor acp_agent terminal_delegation must be a boolean")
         agent = AcpAgentEntry(
             slug=slug or "agent",
             name=name.strip(),
@@ -1634,6 +1637,7 @@ def _build_acp_spawn_env(
             session_id_mode=session_id_mode,
             send_model=send_model,
             omnigent_mcp=omnigent_mcp,
+            terminal_delegation=terminal_delegation,
             env_passthrough=parse_env_passthrough(embedded.get("env_passthrough")),
         )
     else:
@@ -1649,6 +1653,10 @@ def _build_acp_spawn_env(
         if agent.send_model:
             env["HARNESS_ACP_SEND_MODEL"] = "1"
         env["HARNESS_ACP_OMNIGENT_MCP"] = "1" if agent.omnigent_mcp else "0"
+        if agent.terminal_delegation:
+            # Only set when opted in, so an agent that never declared it keeps
+            # running its own shell exactly as before.
+            env["HARNESS_ACP_TERMINAL"] = "1"
         if agent.env_passthrough:
             # Names only; the harness reads each value from its own environment.
             env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(agent.env_passthrough)

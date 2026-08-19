@@ -179,6 +179,12 @@ class AcpAgentConfig:
     :param omnigent_mcp: Expose Omnigent's builtin tools to the agent via
         ``session/new.mcpServers`` (the shared ``serve-mcp`` relay). On by
         default; the global ``OMNIGENT_ACP_MCP=0`` kill switch also disables it.
+    :param terminal_delegation: Advertise ``clientCapabilities.terminal`` so the
+        agent delegates shell execution to Omnigent (gated by TOOL_CALL policy,
+        run through the OSEnvironment) instead of executing it itself. **Off by
+        default**: honouring the capability changes how a compliant agent runs
+        every command, so each agent opts in once verified. Requires an os_env —
+        without one there is nothing to execute with.
     :param env_passthrough: Environment variable *names* this agent may read at
         spawn, e.g. ``("XAI_API_KEY",)``. The spawn env is deny-by-default and
         this executor drives an arbitrary agent, so it cannot infer the family
@@ -193,6 +199,7 @@ class AcpAgentConfig:
     session_id_mode: str = "server"
     send_model_in_session_new: bool = False
     omnigent_mcp: bool = True
+    terminal_delegation: bool = False
     env_passthrough: tuple[str, ...] = ()
 
 
@@ -296,7 +303,20 @@ class AcpExecutor(Executor):
         # an os_env is configured and it isn't a ``fork`` env — a forked env
         # operates on a *copied* tree whose path diverges from the agent's cwd.
         self._fs_delegation: bool = os_env is not None and not bool(getattr(os_env, "fork", False))
+        # Advertise ``clientCapabilities.terminal`` only when the agent opted in
+        # *and* an os_env can execute. Delegation puts every command through the
+        # TOOL_CALL policy + elicitation gate and the spec's sandbox rather than
+        # trusting the agent to ask — but it also changes how a compliant agent
+        # runs commands, so it stays opt-in per agent rather than flipping on for
+        # every already-working ACP agent at once.
+        self._terminal_delegation: bool = self._fs_delegation and bool(config.terminal_delegation)
         self._os_environment: OSEnvironment | None = None
+        # Completed delegated commands, keyed by the id we handed the agent.
+        # ``OSEnvironment.shell`` runs to completion, so a terminal is created
+        # already-exited; ``terminal/output`` and ``terminal/wait_for_exit`` then
+        # serve the stored record.
+        self._terminals: dict[str, _AcpJsonObject] = {}
+        self._terminal_seq: int = 0
 
         # Session config options the agent advertises (``mode``, ``model``, …)
         # and the live model value, both learned from ``config_option_update``.
@@ -626,7 +646,7 @@ class AcpExecutor(Executor):
                             "readTextFile": self._fs_delegation,
                             "writeTextFile": self._fs_delegation,
                         },
-                        "terminal": False,
+                        "terminal": self._terminal_delegation,
                     },
                 },
                 timeout=_INIT_TIMEOUT_SECONDS,
@@ -704,6 +724,9 @@ class AcpExecutor(Executor):
         - ``fs/read_text_file`` / ``fs/write_text_file`` — when fs delegation is
           advertised, execute through the Omnigent OSEnvironment so the spec's
           sandbox read/write roots are enforced. Off → never arrive.
+        - ``terminal/*`` — when terminal delegation is advertised, run the command
+          ourselves after the same policy + elicitation gate. This is the one path
+          that governs an agent's shell use without relying on the agent to ask.
         - anything else — reply with JSON-RPC ``method not found`` so the agent
           fails loudly rather than acting on empty data.
         """
@@ -722,6 +745,14 @@ class AcpExecutor(Executor):
                 result = await self._handle_fs_read(params)
             elif method == "fs/write_text_file" and self._fs_delegation:
                 result = await self._handle_fs_write(params)
+            elif method == "terminal/create" and self._terminal_delegation:
+                result = await self._handle_terminal_create(params)
+            elif method == "terminal/output" and self._terminal_delegation:
+                result = await self._handle_terminal_output(params)
+            elif method == "terminal/wait_for_exit" and self._terminal_delegation:
+                result = await self._handle_terminal_wait(params)
+            elif method in ("terminal/release", "terminal/kill") and self._terminal_delegation:
+                result = await self._handle_terminal_release(params)
             else:
                 error = {
                     "code": -32601,
@@ -752,6 +783,106 @@ class AcpExecutor(Executor):
                 raise _AcpRequestError(-32603, "omnigent: no os_env for fs delegation")
             self._os_environment = env
         return self._os_environment
+
+    # ------------------------------------------------------------------
+    # Terminal delegation (agent → client, when terminal capability advertised)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _terminal_command(params: _AcpJsonObject) -> str:
+        """Join ACP ``{command, args?}`` into one shell command string.
+
+        :raises _AcpRequestError: When ``command`` is missing or not a string.
+        """
+        command = params.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise _AcpRequestError(-32602, "terminal/create requires a string 'command'")
+        args = params.get("args")
+        if isinstance(args, list) and args:
+            return shlex.join([command, *[str(a) for a in args]])
+        return command
+
+    async def _handle_terminal_create(self, params: _AcpJsonObject) -> _AcpJsonObject:
+        """Serve ACP ``terminal/create`` — the tool-mediation gate for shell.
+
+        The command runs through :meth:`_authorize` first, so a DENY verdict (or a
+        refused approval card) means it never executes. Execution then goes
+        through :meth:`OSEnvironment.shell`, inheriting the spec's sandbox.
+
+        A denial is reported as a *failed command* (exit 126 + explanation) rather
+        than a JSON-RPC error: the agent reads it as an ordinary tool failure and
+        can adapt, instead of treating the transport as broken and retrying.
+        """
+        command = self._terminal_command(params)
+        self._terminal_seq += 1
+        terminal_id = f"omnigent-term-{self._terminal_seq}"
+
+        if not await self._authorize("Run shell command", {"command": command}):
+            logger.info("acp[%s] terminal/create denied: %s", self._config.name, command)
+            self._terminals[terminal_id] = {
+                "output": "omnigent: command denied by policy",
+                "exitCode": 126,
+            }
+            return {"terminalId": terminal_id}
+
+        env = await self._ensure_os_environment()
+        result = await env.shell(command)
+        if "error" in result:
+            raise _AcpRequestError(-32603, str(result["error"]))
+        stdout = str(result.get("stdout", ""))
+        stderr = str(result.get("stderr", ""))
+        output = stdout + (("\n" if stdout and stderr else "") + stderr if stderr else "")
+        if result.get("timed_out"):
+            output = f"{output}\nomnigent: command timed out".lstrip("\n")
+        exit_code = result.get("exit_code")
+        self._terminals[terminal_id] = {
+            "output": output,
+            "exitCode": exit_code if isinstance(exit_code, int) else 0,
+        }
+        logger.info(
+            "acp[%s] terminal/create executed by omnigent (exit=%s): %s",
+            self._config.name,
+            exit_code,
+            command,
+        )
+        return {"terminalId": terminal_id}
+
+    def _terminal_record(self, params: _AcpJsonObject) -> _AcpJsonObject:
+        """Look up a stored terminal by ``terminalId``.
+
+        :raises _AcpRequestError: When the id is unknown — better a loud error
+            than silently reporting empty output for a command that ran.
+        """
+        terminal_id = params.get("terminalId")
+        record = self._terminals.get(terminal_id) if isinstance(terminal_id, str) else None
+        if record is None:
+            raise _AcpRequestError(-32602, f"unknown terminalId {terminal_id!r}")
+        return record
+
+    async def _handle_terminal_output(self, params: _AcpJsonObject) -> _AcpJsonObject:
+        """Serve ACP ``terminal/output`` from the stored command result."""
+        record = self._terminal_record(params)
+        return {
+            "output": record["output"],
+            "truncated": False,
+            "exitStatus": {"exitCode": record["exitCode"]},
+        }
+
+    async def _handle_terminal_wait(self, params: _AcpJsonObject) -> _AcpJsonObject:
+        """Serve ACP ``terminal/wait_for_exit`` — already exited when created."""
+        return {"exitCode": self._terminal_record(params)["exitCode"]}
+
+    async def _handle_terminal_release(self, params: _AcpJsonObject) -> _AcpJsonObject:
+        """Serve ACP ``terminal/release`` / ``terminal/kill`` by dropping the record.
+
+        The command has already run to completion, so there is nothing to kill;
+        releasing just frees the stored output. Unknown ids are tolerated here so
+        a duplicate release can't fail a turn.
+        """
+        terminal_id = params.get("terminalId")
+        if isinstance(terminal_id, str):
+            self._terminals.pop(terminal_id, None)
+        return {}
 
     async def _handle_fs_read(self, params: _AcpJsonObject) -> _AcpJsonObject:
         """Serve an ACP ``fs/read_text_file`` by reading through the OSEnvironment.
@@ -846,6 +977,19 @@ class AcpExecutor(Executor):
         operation the adapter installs both, so destructive actions are gated.
         """
         tool_name, tool_input = self._extract_tool_call(params)
+        return await self._authorize(tool_name, tool_input)
+
+    async def _authorize(self, tool_name: str, tool_input: _AcpJsonObject) -> bool:
+        """Run one tool through TOOL_CALL policy, then human-consent elicitation.
+
+        Shared by the agent's own ``session/request_permission`` and by the
+        delegated ``terminal/*`` handlers, so a command the agent would have run
+        silently is gated identically to one it asked about.
+
+        :param tool_name: Display name for the policy verdict and approval card.
+        :param tool_input: Tool arguments the policy inspects.
+        :returns: ``True`` to proceed.
+        """
         handler = getattr(self, "_elicitation_handler", None)
         policy_eval = getattr(self, "_policy_evaluator", None)
 
