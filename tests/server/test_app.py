@@ -1439,6 +1439,56 @@ def test_ensure_default_polly_agent_repairs_stale_cache(
     assert repaired != "STALE CACHED SPEC"
 
 
+def test_ensure_default_polly_agent_repairs_lost_bundle_blob(
+    seed_stores: _SeedStores,
+) -> None:
+    """
+    A matching-hash re-seed restores a bundle blob lost from the store.
+
+    The matching-hash fast path trusts the artifact store without
+    checking the blob is present. If the row survives but the bundle is
+    gone (artifacts pruned, or the DB restored without the matching
+    store), every restart re-computes the same hash, matches the stored
+    ``bundle_location``, and returns without re-``put``-ing — so boot can
+    never self-heal and each session launch raises ``failed to load
+    agent spec``. The seeder must re-``put`` on the matching path when
+    the store is missing the blob. Without the fix this test fails: the
+    blob stays absent and the reload raises ``KeyError``.
+    """
+    server_app._ensure_default_polly_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    agent = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert agent is not None
+    assert seed_stores.artifact_store.exists(agent.bundle_location)
+
+    # Lose the blob while the row survives, and drop the local cache so
+    # nothing masks the missing bundle at load time.
+    seed_stores.artifact_store.delete(agent.bundle_location)
+    seed_stores.agent_cache.evict(agent.id)
+    assert not seed_stores.artifact_store.exists(agent.bundle_location)
+
+    # Re-seed: source unchanged → hash matches the row (the fast path).
+    server_app._ensure_default_polly_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    # The fast path re-put the lost bundle: the store has it again and a
+    # fresh load succeeds instead of raising.
+    assert seed_stores.artifact_store.exists(agent.bundle_location)
+    reloaded = seed_stores.agent_cache.load(agent.id, agent.bundle_location)
+    assert reloaded.spec is not None
+    # Row untouched on the matching path: same location, no version bump.
+    still = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert still is not None
+    assert still.bundle_location == agent.bundle_location
+    assert still.version == agent.version
+
+
 def test_tar_gz_dir_is_order_independent(tmp_path: Path) -> None:
     """
     Same content, different file-creation order → identical bundle bytes.

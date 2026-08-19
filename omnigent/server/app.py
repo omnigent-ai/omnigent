@@ -442,8 +442,10 @@ def _ensure_builtin_agent(
       update the row in place (keeps the ``agent_id`` stable so task
       history isn't cascade-deleted; bumps ``version`` so the runner's
       version-keyed spec cache re-fetches), then warm-swap the cache.
-    - **Row exists, content hash matches** → evict the local cache so
-      the next load re-fetches from ``bundle_location``, then return.
+    - **Row exists, content hash matches** → re-``put`` the bundle if
+      the artifact store is missing the blob (self-heals a lost
+      bundle), evict the local cache so the next load re-fetches from
+      ``bundle_location``, then return.
 
     The evict on the matching-hash path matters because
     :meth:`AgentCache.load` is keyed by ``agent_id`` and trusts its
@@ -474,7 +476,12 @@ def _ensure_builtin_agent(
         # Sha-segment compare: legacy rows keep an ``ag_``-prefixed left
         # segment (physical artifact key); only the sha encodes content.
         if existing.bundle_location.rsplit("/", 1)[-1] == bundle_hash:
-            # Row current; evict so a lagging replica's stale cache reloads the bundle.
+            # Row current, but the blob can be gone while the row survives
+            # (pruned artifacts, or DB restored without the store). Re-put from
+            # the in-hand bytes so boot self-heals instead of failing launches.
+            if not artifact_store.exists(new_loc):
+                artifact_store.put(new_loc, bundle_bytes)
+            # Evict so a lagging replica's stale cache reloads the bundle.
             agent_cache.evict(existing.id)
             return
         artifact_store.put(new_loc, bundle_bytes)
