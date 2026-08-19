@@ -253,6 +253,14 @@ _INVOCATION_SETTINGS_FILE = "claude-settings.json"
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
 
 
+class ClaudePromptTimeout(RuntimeError):
+    """Claude Code's input box did not render before delivery timed out."""
+
+
+class TmuxSessionNotAdvertised(RuntimeError):
+    """The bridge's tmux target was not advertised before the deadline."""
+
+
 def _absolute_syntactic_path(path: Path) -> Path:
     """
     Return an absolute path without following symlinks.
@@ -3827,7 +3835,7 @@ def _wait_for_claude_prompt_ready(
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param timeout_s: Seconds to wait for the prompt, e.g. ``30.0``.
     :returns: None.
-    :raises RuntimeError: If the prompt never renders within
+    :raises ClaudePromptTimeout: If the prompt never renders within
         *timeout_s* (Claude failed to boot). The message carries a poll
         count, how many of those polls saw an empty capture, and the tail
         of the last non-empty capture the loop actually observed (see
@@ -3864,7 +3872,7 @@ def _wait_for_claude_prompt_ready(
     # session is alive but capture-pane came back blank); non-empty captures
     # with no box point at Claude never rendering the prompt (a boot crash,
     # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
-    raise RuntimeError(
+    raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {timeout_s}s "
         f"(input prompt never rendered in {polls} polls, "
         f"{empty_polls} empty captures). The message was not delivered."
@@ -3920,7 +3928,7 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
     :param bridge_dir: Bridge directory path.
     :param timeout_s: Seconds to wait, e.g. ``30.0``.
     :returns: ``{"socket_path": ..., "tmux_target": ...}``.
-    :raises RuntimeError: If the file never appears with valid
+    :raises TmuxSessionNotAdvertised: If the file never appears with valid
         ``socket_path`` and ``tmux_target`` fields.
     """
     deadline = time.monotonic() + timeout_s
@@ -3932,7 +3940,7 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
         if isinstance(socket_path, str) and isinstance(tmux_target, str):
             return {"socket_path": socket_path, "tmux_target": tmux_target}
         time.sleep(0.05)
-    raise RuntimeError(
+    raise TmuxSessionNotAdvertised(
         "Claude terminal tmux target is not advertised yet. Wait for the "
         "terminal to launch before sending messages from the web UI."
     )
