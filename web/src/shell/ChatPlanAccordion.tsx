@@ -37,7 +37,7 @@ export function ChatPlanAccordion({ className }: { className?: string }) {
           </span>
           <ChevronDownIcon className="ml-auto size-4 shrink-0 transition-transform group-open:rotate-180" />
         </summary>
-        {/* Cap the expanded list at 100px so a long plan can't swallow the
+        {/* Cap the expanded list at 150px so a long plan can't swallow the
             chat; it scrolls internally past the cap. */}
         <div className="max-h-[150px] overflow-y-auto border-t border-border">
           <TodoPanel frameless />
