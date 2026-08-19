@@ -30,6 +30,7 @@ from omnigent.llms.types import (
     ResponseStreamEvent,
 )
 from omnigent.reasoning_effort import OPENAI_EFFORTS, validate_effort_or_llm_error
+from omnigent.runtime import telemetry
 from omnigent.runtime.llm_retry import classify_llm_error
 from omnigent.spec.types import RetryPolicy
 
@@ -293,27 +294,36 @@ async def _execute_with_retry(
                 raise classified from exc
             last_error = classified
             if attempt + 1 < total_tries:
-                await _backoff_sleep(attempt, retry_config)
+                delay = retry_config.compute_backoff_delay(retry_index=attempt + 1)
+                telemetry.record_llm_retry(
+                    attempt=attempt + 1,
+                    max_attempts=total_tries,
+                    error_type=type(classified).__name__,
+                    error_message=str(classified),
+                    backoff_seconds=delay,
+                )
+                await _backoff_sleep(delay, total_tries, attempt)
 
     assert last_error is not None
     raise last_error
 
 
 async def _backoff_sleep(
+    delay: float,
+    total_tries: int,
     attempt: int,
-    config: RetryPolicy,
 ) -> None:
     """
-    Sleep with exponential backoff and jitter.
+    Sleep with the precomputed backoff delay.
 
-    Uses ``asyncio.sleep`` for non-blocking backoff.
+    The delay is computed by the caller once so the same value reaches
+    both the ``gen_ai.retry`` span event and the actual sleep.
+    Recomputing here would re-apply jitter and the event would lie.
 
-    :param attempt: Zero-based attempt index (0 = first
-        attempt).
-    :param config: Retry policy with backoff parameters.
+    :param delay: Precomputed sleep duration in seconds.
+    :param total_tries: Total attempts allowed (for the log line).
+    :param attempt: Zero-based attempt index that just failed.
     """
-    delay = config.compute_backoff_delay(retry_index=attempt + 1)
-    total_tries = config.max_retries + 1
     _logger.info(
         "LLM retry %d/%d after %.1fs",
         attempt + 2,
