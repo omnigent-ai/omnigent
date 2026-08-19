@@ -5,6 +5,7 @@ import {
   type SessionListWireItem,
   collectConversationIds,
   filtersFromConversationQueryKey,
+  insertItemsIntoPages,
   mergeItemsIntoPages,
   nullsToUndefined,
   removeIdsFromPages,
@@ -407,6 +408,88 @@ describe("removeIdsFromPages", () => {
     expect(after!.pages[0].data).toEqual([]);
     expect(after!.pages[0].first_id).toBeNull();
     expect(after!.pages[0].last_id).toBeNull();
+  });
+});
+
+describe("insertItemsIntoPages", () => {
+  it("places a newly-visible session at its sorted position and moves the cursor", () => {
+    const before = data([conv("a", { updated_at: 30 }), conv("b", { updated_at: 10 })]);
+
+    const { data: after, inserted } = insertItemsIntoPages(
+      before,
+      [{ id: "fresh", updated_at: 20 }],
+      DEFAULT_FILTERS,
+    );
+
+    // Descending updated_at is the list's own order, so the row lands where
+    // a refetch would have put it — no round-trip, no visible resort later.
+    expect(after!.pages[0].data.map((r) => r.id)).toEqual(["a", "fresh", "b"]);
+    expect(inserted).toEqual(new Set(["fresh"]));
+    // Cursors bound the loaded window; a newest-first row moves first_id.
+    const { data: atTop } = insertItemsIntoPages(
+      before,
+      [{ id: "newest", updated_at: 99 }],
+      DEFAULT_FILTERS,
+    );
+    expect(atTop!.pages[0].first_id).toBe("newest");
+  });
+
+  it("leaves a row that sorts onto an unloaded page to the server", () => {
+    const before: ConversationsInfiniteData = {
+      pages: [
+        { data: [conv("a", { updated_at: 30 })], first_id: "a", last_id: "a", has_more: true },
+      ],
+      pageParams: [undefined],
+    };
+
+    const { data: after, inserted } = insertItemsIntoPages(
+      before,
+      [{ id: "older", updated_at: 5 }],
+      DEFAULT_FILTERS,
+    );
+
+    // Appending it would render it above rows the next page will bring in.
+    expect(after).toBe(before);
+    expect(inserted.size).toBe(0);
+  });
+
+  it("keeps rows the list itself would exclude out of the cache", () => {
+    const before = data([conv("a", { updated_at: 30 })]);
+
+    // Sub-agent children (the endpoint lists kind=default) and archived rows
+    // (in a non-archived list) are absent because they don't belong, not
+    // because the cache is behind.
+    const { inserted: child } = insertItemsIntoPages(
+      before,
+      [{ id: "kid", updated_at: 99, parent_session_id: "a" }],
+      DEFAULT_FILTERS,
+    );
+    const { inserted: archived } = insertItemsIntoPages(
+      before,
+      [{ id: "old", updated_at: 99, archived: true }],
+      DEFAULT_FILTERS,
+    );
+
+    expect(child.size).toBe(0);
+    expect(archived.size).toBe(0);
+  });
+
+  it("never guesses membership for a search list", () => {
+    const before = data([conv("a", { updated_at: 30 })]);
+
+    // The server matches titles AND item content, so whether a row belongs in
+    // a search list isn't decidable here.
+    const { data: after, inserted } = insertItemsIntoPages(
+      before,
+      [{ id: "fresh", updated_at: 99 }],
+      {
+        searchQuery: "deploy",
+        includeArchived: false,
+      },
+    );
+
+    expect(after).toBe(before);
+    expect(inserted.size).toBe(0);
   });
 });
 

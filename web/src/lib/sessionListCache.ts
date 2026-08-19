@@ -270,6 +270,70 @@ export function mergeItemsIntoPages(
 }
 
 /**
+ * Splice rows the cache has never seen into one infinite query's first page.
+ *
+ * A pushed row for an id absent from every page is a session that just became
+ * visible to this user (created here or in another tab, forked, shared). The
+ * frame carries the same full row `GET /v1/sessions` would return, so the
+ * client can place it directly instead of round-tripping a list refetch —
+ * which is both slower and, on a deployment whose list is served by an
+ * asynchronously-updated search index, still missing the row.
+ *
+ * Placement mirrors the list's own shape: sessions are sorted by `updated_at`
+ * descending and sub-agent children are excluded (the endpoint lists
+ * `kind=default`). A row older than the first page's last entry belongs on a
+ * page that isn't loaded, so it is left for the caller's refetch rather than
+ * rendered out of order.
+ *
+ * @param data - The cached infinite data, or `undefined` for an unfetched
+ *   query.
+ * @param items - Wire items whose ids are absent from every cached page.
+ * @param filters - Canonical filters for this conversations query.
+ * @returns The (possibly identical) data and the ids actually placed.
+ */
+export function insertItemsIntoPages(
+  data: ConversationsInfiniteData | undefined,
+  items: SessionListWireItem[],
+  filters: ConversationListFilters,
+): { data: ConversationsInfiniteData | undefined; inserted: Set<string> } {
+  const inserted = new Set<string>();
+  // A search list's membership is decided by the server (it matches titles and
+  // item content), so a row that isn't in it may or may not belong.
+  if (!data || items.length === 0 || filters.searchQuery !== "") return { data, inserted };
+  let rows = data.pages[0]?.data;
+  if (rows === undefined) return { data, inserted };
+  for (const item of items) {
+    // Sorting needs `updated_at`; a wire item without one can't be placed.
+    if (item.parent_session_id != null || item.updated_at === undefined) continue;
+    const updatedAt = item.updated_at;
+    const row = { object: "conversation", ...item } as Conversation;
+    if (violatesKnownMembership(row, filters)) continue;
+    let at = rows.findIndex((existing) => existing.updated_at < updatedAt);
+    if (at === -1) {
+      // Older than every loaded row: it belongs after the first page, which is
+      // only the end of the list when nothing follows it.
+      if (data.pages.length > 1 || data.pages[0]!.has_more) continue;
+      at = rows.length;
+    }
+    rows = [...rows.slice(0, at), row, ...rows.slice(at)];
+    inserted.add(row.id);
+  }
+  if (inserted.size === 0) return { data, inserted };
+  // Cursors bound the loaded window, so they follow the rows: `last_id` is the
+  // `after=` anchor the next page is fetched from.
+  const pages = [
+    {
+      ...data.pages[0]!,
+      data: rows,
+      first_id: rows[0]?.id ?? null,
+      last_id: rows[rows.length - 1]?.id ?? null,
+    },
+    ...data.pages.slice(1),
+  ];
+  return { data: { ...data, pages }, inserted };
+}
+
+/**
  * Drop rows with the given ids from one infinite query's cached pages.
  *
  * Page cursors are recomputed from the surviving rows: `last_id` of the
