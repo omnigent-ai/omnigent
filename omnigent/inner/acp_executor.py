@@ -332,9 +332,11 @@ class AcpExecutor(Executor):
         self._image_supported: bool = False
         self._system_prompt_sent: bool = False
 
-        # ACP toolCallId → tool name, so a later tool_call_update can close the
-        # right tool card with the name from the originating tool_call.
+        # ACP toolCallId → tool name / rawInput from the originating tool_call, so
+        # a later tool_call_update can close the right tool card, and a permission
+        # request that names only the id can still say what is about to run.
         self._tool_names: dict[str, str] = {}
+        self._tool_inputs: dict[str, _AcpJsonObject] = {}
 
         # Context-window size (tokens) reported via ``usage_update``; surfaced by
         # :meth:`max_context_tokens` so the UI context meter fills.
@@ -798,21 +800,35 @@ class AcpExecutor(Executor):
     # Permission (session/request_permission) → policy + elicitation
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _extract_tool_call(params: _AcpJsonObject) -> tuple[str, _AcpJsonObject]:
+    def _extract_tool_call(self, params: _AcpJsonObject) -> tuple[str, _AcpJsonObject]:
         """Pull ``(tool_name, tool_input)`` from a ``session/request_permission``.
 
         ACP's ``toolCall`` carries a human ``title`` (e.g. ``"shell"``), a
-        ``kind`` (e.g. ``"execute"``), and a ``rawInput`` dict. We prefer the
-        title, else the kind. (Vendor-specific ``_meta`` tool names — e.g.
-        Goose's ``_meta.goose.toolCall.toolName`` — are not read here; ``title``
-        is the portable name every ACP agent supplies.)
+        ``kind`` (e.g. ``"execute"``), and a ``rawInput`` dict; prefer the title,
+        else the kind. An agent may instead send the request bare, carrying only
+        ``toolCallId``, so fall back to what the originating ``tool_call`` update
+        reported for that id — it always arrives first. Without that fallback a
+        bare request degrades to ``"tool"`` with no arguments, so the approval
+        card cannot say what is about to run and no TOOL_CALL policy rule can
+        match it (rules gate on the tool name, then read its arguments).
+
+        (Vendor-specific ``_meta`` tool names — e.g. Goose's
+        ``_meta.goose.toolCall.toolName`` — are not read here; ``title`` is the
+        portable name and ``toolCallId`` the portable correlation.)
         """
         tool_call = params.get("toolCall") or {}
-        name = tool_call.get("title") or tool_call.get("kind") or "tool"
+        call_id = tool_call.get("toolCallId")
+        call_id = call_id if isinstance(call_id, str) else None
+        name = (
+            tool_call.get("title")
+            or tool_call.get("kind")
+            or (self._tool_names.get(call_id) if call_id else None)
+            or "tool"
+        )
         args = tool_call.get("rawInput")
         if not isinstance(args, dict):
-            args = {}
+            cached = self._tool_inputs.get(call_id) if call_id else None
+            args = cached if isinstance(cached, dict) else {}
         return str(name), args
 
     async def _decide_permission(self, params: _AcpJsonObject) -> bool:
@@ -1069,6 +1085,7 @@ class AcpExecutor(Executor):
             args = raw_input if isinstance(raw_input, dict) else {}
             if isinstance(call_id, str) and call_id:
                 self._tool_names[call_id] = str(name)
+                self._tool_inputs[call_id] = args
                 events.append(
                     ToolCallRequest(name=str(name), args=args, metadata={"call_id": call_id})
                 )
@@ -1080,6 +1097,7 @@ class AcpExecutor(Executor):
                 _TOOL_STATUS_FAILED,
             ):
                 name = self._tool_names.pop(call_id, "tool")
+                self._tool_inputs.pop(call_id, None)
                 events.append(
                     ToolCallComplete(
                         name=name,

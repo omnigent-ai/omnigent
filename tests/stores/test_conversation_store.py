@@ -4475,6 +4475,28 @@ def test_get_session_connectivity_reports_needs_workspace_for_fork(
     assert result[plain.id].needs_workspace is False
 
 
+def test_get_session_connectivity_reports_imported(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    The import-source label surfaces as ``imported=True``.
+
+    An imported transcript carries the ``omnigent.import.source`` label and
+    has no live executor, so ``get_session_connectivity`` must report
+    ``imported=True`` — the flag that makes ``_bulk_session_liveness`` mark
+    the unbound import offline so the open view offers the resume picker
+    instead of treating it as a reachable in-process session.
+    """
+    imported = conversation_store.create_conversation()
+    conversation_store.set_labels(imported.id, {"omnigent.import.source": "claude"})
+    plain = conversation_store.create_conversation()
+
+    result = conversation_store.get_session_connectivity([imported.id, plain.id])
+
+    assert result[imported.id].imported is True
+    assert result[plain.id].imported is False
+
+
 def test_get_session_connectivity_empty_input_skips_query(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

@@ -1785,12 +1785,13 @@ def create_app(
                 host_version = host_versions.get(conn.host_id)
             if conn.runner_id is None:
                 # No runner binding: an in-process executor (or a session
-                # not yet dispatched) is reachable — EXCEPT an unbound fork
-                # of a session that had a working directory, which must
-                # rebind a host + directory first. Reporting it offline
-                # routes the first message into the directory picker instead
-                # of dropping it against a runner that can't start.
-                runner_online = not conn.needs_workspace
+                # not yet dispatched) is reachable — EXCEPT sessions that have
+                # no executor to reach and must launch a runner on a host
+                # first: an unbound fork (needs a workspace) or an imported
+                # transcript (no live executor anywhere). Reporting those
+                # offline routes the first message into the resume picker
+                # instead of dropping it against a runner that can't start.
+                runner_online = not (conn.needs_workspace or conn.imported)
             else:
                 # Strict: reachable only if the runner tunnel is up. No
                 # host-relaunch optimism — host state lives in host_online.

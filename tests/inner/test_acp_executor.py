@@ -127,7 +127,8 @@ async def test_session_new_client_mode_generates_and_sends_id() -> None:
 
 
 def test_extract_tool_call_prefers_title() -> None:
-    name, args = AcpExecutor._extract_tool_call(
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    name, args = ex._extract_tool_call(
         {"toolCall": {"title": "shell", "kind": "execute", "rawInput": {"command": "ls"}}}
     )
     assert name == "shell"
@@ -135,9 +136,58 @@ def test_extract_tool_call_prefers_title() -> None:
 
 
 def test_extract_tool_call_falls_back_to_kind() -> None:
-    name, args = AcpExecutor._extract_tool_call({"toolCall": {"kind": "read"}})
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    name, args = ex._extract_tool_call({"toolCall": {"kind": "read"}})
     assert name == "read"
     assert args == {}
+
+
+def test_extract_tool_call_recovers_a_bare_permission_request() -> None:
+    """A request naming only ``toolCallId`` resolves via the originating tool_call.
+
+    An agent may ask permission without repeating the tool: Devin sends no
+    ``title`` / ``kind`` / ``rawInput``, only the id it already announced. The
+    ``tool_call`` update always arrives first, so its name and arguments are
+    still on hand.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "toolu_01",
+            "title": "Ran command",
+            "kind": "execute",
+            "rawInput": {"command": "rm -rf build"},
+        }
+    )
+    name, args = ex._extract_tool_call(
+        {
+            "toolCall": {
+                "toolCallId": "toolu_01",
+                "_meta": {"vendor/editableCommand": "rm -rf build"},
+            }
+        }
+    )
+    assert name == "Ran command"
+    assert args == {"command": "rm -rf build"}
+
+
+def test_extract_tool_call_prefers_the_request_over_the_cache() -> None:
+    """A request that carries its own title/rawInput wins; the cache is a fallback."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "stale", "rawInput": {"a": 1}}
+    )
+    name, args = ex._extract_tool_call(
+        {"toolCall": {"toolCallId": "c1", "title": "shell", "rawInput": {"command": "ls"}}}
+    )
+    assert (name, args) == ("shell", {"command": "ls"})
+
+
+def test_extract_tool_call_unknown_id_degrades_to_tool() -> None:
+    """An id we never saw announced still yields the safe generic fallback."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    assert ex._extract_tool_call({"toolCall": {"toolCallId": "never-announced"}}) == ("tool", {})
 
 
 def test_permission_outcome_allow_prefers_once() -> None:
@@ -209,6 +259,31 @@ def test_tool_call_and_update_emit_cards() -> None:
     assert comp.name == "shell" and comp.status is ToolCallStatus.SUCCESS
     assert comp.metadata == {"call_id": "c1"}
     assert "c1" not in ex._tool_names  # popped
+
+
+def test_tool_call_caches_release_on_completion() -> None:
+    """Both id-keyed caches drop the entry when the call closes.
+
+    They exist only to bridge a tool_call to its permission request and closing
+    update, so a long session must not accumulate one entry per tool call.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "c1",
+            "title": "shell",
+            "rawInput": {"command": "ls"},
+        }
+    )
+    assert ex._tool_names == {"c1": "shell"}
+    assert ex._tool_inputs == {"c1": {"command": "ls"}}
+
+    ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed"}
+    )
+    assert ex._tool_names == {}
+    assert ex._tool_inputs == {}
 
 
 def test_tool_call_update_failed_maps_to_error() -> None:
@@ -322,6 +397,63 @@ async def test_decide_permission_ask_without_handler_fails_closed() -> None:
 
     ex._policy_evaluator = AsyncMock(return_value=_V())
     assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is False
+
+
+def _seed_tool_call(ex: AcpExecutor) -> dict[str, object]:
+    """Announce a ``tool_call``, then return the bare permission params for it.
+
+    Mirrors the real frame order for an agent that asks permission without
+    repeating the tool: ``tool_call`` (with the name + command) → then
+    ``session/request_permission`` carrying only the id.
+    """
+    ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "toolu_01",
+            "title": "Ran command",
+            "kind": "execute",
+            "rawInput": {"command": "rm -rf build"},
+        }
+    )
+    return {"toolCall": {"toolCallId": "toolu_01"}}
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_policy_sees_the_real_tool_call() -> None:
+    """The TOOL_CALL policy is evaluated against the resolved name + arguments.
+
+    Rules gate on the tool name and then read its arguments (the destructive-shell
+    builtin reads ``arguments["command"]``), so a bare request evaluated as
+    ``{"name": "tool", "arguments": {}}`` matches nothing — a "deny ``rm -rf``"
+    policy would sit silent while the command ran.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = _seed_tool_call(ex)
+
+    class _V:
+        action = "POLICY_ACTION_DENY"
+
+    ex._policy_evaluator = AsyncMock(return_value=_V())
+    assert await ex._decide_permission(params) is False
+    ex._policy_evaluator.assert_awaited_once_with(
+        "PHASE_TOOL_CALL",
+        {"name": "Ran command", "arguments": {"command": "rm -rf build"}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_card_names_the_tool() -> None:
+    """The approval card describes the call instead of an unnamed "tool".
+
+    The elicitation handler renders ``<tool_name>(<args>)``, so these two values
+    are literally what the user reads before approving.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = _seed_tool_call(ex)
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    assert await ex._decide_permission(params) is True
+    ex._elicitation_handler.assert_awaited_once_with("Ran command", {"command": "rm -rf build"})
 
 
 # ---------------------------------------------------------------------------

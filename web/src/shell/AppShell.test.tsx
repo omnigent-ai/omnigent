@@ -171,9 +171,6 @@ vi.mock("@/components/blocks/TerminalView", () => ({
     <div data-testid="terminal-view-stub">{terminalId}</div>
   ),
 }));
-vi.mock("./TodoPanel", () => ({
-  TodoPanel: () => <div data-testid="todo-panel" />,
-}));
 vi.mock("./FilesPanelDrawer", () => ({
   FilesPanelDrawer: ({ open, flatView }: { open: boolean; flatView: boolean }) => (
     <div
@@ -518,12 +515,9 @@ beforeEach(() => {
   // choice carries across sessions. Clear it so a stored preference from one
   // test can't change another test's default scope.
   localStorage.clear();
-  // The Tasks tab/drawer gates on chatStore.todos; reset so a populated
-  // todo list from one test doesn't leak into the next.
   // Reset terminal-first startup signals so one test's terminalPending /
   // failed status can't leak into another's terminalStartingUp.
   useChatStore.setState({
-    todos: [],
     terminalPending: false,
     sessionStatus: "idle",
     status: "idle",
@@ -2141,10 +2135,10 @@ describe("Right workspace card visibility", () => {
   });
 
   it("keeps the card mounted with Agents as the only tab for a minimal agent", () => {
-    // A no-os_env agent (available: false) with no shells and no todos
+    // A no-os_env agent (available: false) with no shells
     // still has the unconditional Agents tab (the panel lists at least
     // the main agent), so the card mounts, the Agents tab is selected
-    // by the fallback, and Files/Shells/Tasks are absent. An unmounted
+    // by the fallback, and Files/Shells are absent. An unmounted
     // card here means the always-visible Agents rule regressed.
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
@@ -2557,7 +2551,7 @@ describe("AppShell URL sync — file param", () => {
   });
 
   it("restores the file viewer into the desktop rail on a ?file= reload", () => {
-    // Regression (E2E reload-persistence): the Subagents/Terminals/Todos
+    // Regression (E2E reload-persistence): the Subagents/Terminals
     // panels are checked before the file viewer in the rail content
     // precedence. A ?file= reload must pull the rail to Files so the inline
     // viewer renders instead of another panel shadowing it.
@@ -2932,25 +2926,17 @@ describe("Mobile session menu", () => {
       isLoading: false,
       error: null,
     });
-    useChatStore.setState({
-      todos: [
-        { content: "do a thing", status: "completed", activeForm: "doing a thing" },
-        { content: "do another", status: "pending", activeForm: "doing another" },
-      ],
-    });
-
     renderShell("/c/conv_native");
     openSessionMenu();
 
     // Mirror of the desktop rail's tab strip for a native-wrapper session:
-    // Files · Agents · Tasks. Shells is absent because the only terminal is
+    // Files · Agents. Shells is absent because the only terminal is
     // the vendor pane (the pill's Terminal view — excluded from the shell
     // inventory) and the mocked agent declares no terminals. An unexpected
     // Shells entry means the vendor pane leaked into the inventory.
     expect(screen.getByRole("menuitem", { name: /^Files$/i })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: /Shells/i })).toBeNull();
     expect(screen.getByRole("menuitem", { name: /Agents/i })).toBeInTheDocument();
-    expect(screen.getByRole("menuitem", { name: /Tasks/i })).toBeInTheDocument();
   });
 
   it("keeps the Terminals entry in terminal-first SDK sessions (no native wrapper)", () => {
@@ -3101,67 +3087,8 @@ describe("Mobile session menu", () => {
     expect(drawer).toHaveAttribute("data-flat-view", "true");
   });
 
-  it("opens the Tasks drawer for a claude-native session with todos", () => {
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([
-      {
-        id: "conv_native",
-        permission_level: null,
-        labels: { "omnigent.wrapper": "claude-code-native-ui" },
-      },
-    ]);
-    useChatStore.setState({
-      todos: [{ content: "build the thing", status: "in_progress", activeForm: "building" }],
-    });
-
-    renderShell("/c/conv_native");
-
-    expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "closed");
-    expect(screen.queryByTestId("todo-panel")).toBeNull();
-
-    openSessionMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: /Tasks/i }));
-
-    // Failure: openTodosPanel didn't set todosPanelOpen, or the Tasks entry
-    // was gated out despite isClaudeNative + a non-empty todo list.
-    expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "open");
-    expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
-  });
-
-  it.each([
-    ["codex-native", "conv_codex", "codex-native-ui"],
-    ["pi-native", "conv_pi", "pi-native-ui"],
-  ])("opens the Tasks drawer for a %s session with todos", (_harness, id, wrapper) => {
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([
-      {
-        id,
-        permission_level: null,
-        labels: { "omnigent.wrapper": wrapper },
-      },
-    ]);
-    useChatStore.setState({
-      todos: [{ content: "Locate CLI parser", status: "in_progress", activeForm: "Locating" }],
-    });
-
-    renderShell(`/c/${id}`);
-    expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "closed");
-
-    openSessionMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: /Tasks/i }));
-
-    expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "open");
-    expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
-  });
-
   it("keeps the FAB with only the Agents entry for a minimal agent", () => {
-    // available:false → no files; no shells, no todos, no debug. The
+    // available:false → no files; no shells, no debug. The
     // Agents entry is unconditional (badge = 1, the main agent), so the
     // FAB still renders with exactly that entry. A missing FAB means
     // the always-visible Agents rule regressed on mobile.

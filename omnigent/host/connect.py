@@ -128,6 +128,7 @@ from omnigent.runner.transports.ws_tunnel.limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from omnigent.suspend_watch import watch_for_resume
 from omnigent.tls import client_ssl_context
 from omnigent.version import VERSION
 
@@ -328,6 +329,9 @@ def _connection_refused(exc: BaseException) -> bool:
 _RECONNECT_BASE_S = 0.5
 _RECONNECT_CAP_S = 10.0
 _RECONNECT_JITTER = 0.5
+# Fresh hosts get a short auth-retry window for Databricks OAuth refreshes.
+# Established hosts retry auth failures indefinitely to preserve sessions.
+_MAX_CONSECUTIVE_AUTH_ERRORS = 3
 # Consecutive connection-refused failures against a loopback server before the
 # host exits (~5 minutes at the backoff cap). Refused on loopback means no
 # process listens on the port — the local server is gone, not unreachable.
@@ -834,9 +838,7 @@ class HostProcess:
         self._capabilities_initialized = False
         # Consecutive login-page redirects; reset by a successful upgrade.
         self._login_redirect_streak = 0
-        # Consecutive 401/403 upgrade rejections on an already-connected host;
-        # reset by a successful upgrade. Gates the once-per-episode terminal
-        # notice so a VPN outage doesn't spam stderr on every retry.
+        # Reset by a successful upgrade or non-auth error; bounds fresh-host refresh retries.
         self._auth_retry_streak = 0
         # Consecutive connection-refused connect failures; reset by an accepted
         # upgrade or any non-refused error. Fatal past a bounded streak only
@@ -897,6 +899,15 @@ class HostProcess:
         # Strong refs to in-flight frame tasks (create_task results are
         # otherwise GC-able); each discards itself on completion.
         self._frame_tasks: set[asyncio.Task[None]] = set()
+        # Background watcher that force-drops a stale tunnel on wake from system
+        # suspend (laptop sleep) so the reconnect loop reattaches at once
+        # instead of waiting out the ~90s keepalive timeout. See run() /
+        # _on_resume_from_suspend.
+        self._suspend_task: asyncio.Task[None] | None = None
+        # Set by _on_resume_from_suspend when it aborts a live tunnel after a
+        # detected resume; read+cleared in run()'s reconnect handler to force a
+        # prompt reconnect (skip the backoff).
+        self._woke_from_suspend = False
 
     def _tracked_runner_pids(self) -> set[int]:
         """PIDs of runners this host spawned and still tracks directly.
@@ -1235,21 +1246,16 @@ class HostProcess:
         """
         if status in _RETRYABLE_UPGRADE_STATUSES or not (400 <= status < 500):
             return None
-        if status in (401, 403) and self._ever_connected:
-            # A host that already completed an upgrade proved its credentials
-            # and authorization are valid, so a later 401/403 is almost always
-            # a network-path artifact — a dropped VPN whose corporate proxy
-            # answers the upgrade with 401/403 before it reaches the server.
-            # Retry forever (mirrors the login-redirect path) so a live host
-            # with running sessions survives the outage and resumes when the
-            # path recovers, instead of exiting and forcing a manual restart.
+        if status in (401, 403):
+            # Fresh hosts can race OAuth refresh; connected hosts preserve active sessions.
             self._auth_retry_streak += 1
-            cause = (
-                f"Connection refused (HTTP {status}): the host tunnel was "
-                "rejected after it had already connected."
+            cause = f"Connection refused (HTTP {status}): the host tunnel was rejected."
+            should_retry = self._ever_connected or (
+                self._auth_retry_streak < _MAX_CONSECUTIVE_AUTH_ERRORS
             )
-            _logger.warning("%s Retrying — check your VPN/network.", cause)
-            if self._auth_retry_streak == 1:
+            if should_retry:
+                _logger.warning("%s Retrying — check your VPN/network.", cause)
+            if should_retry and self._auth_retry_streak == 1:
                 # The warning above lands only in the CLI log file; print once
                 # per outage so a foreground `omnigent host` isn't silent.
                 print(
@@ -1259,19 +1265,20 @@ class HostProcess:
                     file=sys.stderr,
                     flush=True,
                 )
-            return None
+            if should_retry:
+                return None
         if status == 401:
             return HostConnectError(
-                "Authentication failed (HTTP 401): the server rejected the "
-                "supplied credentials. "
+                "Authentication failed (HTTP 401): the server rejected the supplied "
+                f"credentials across {_MAX_CONSECUTIVE_AUTH_ERRORS} consecutive attempts. "
                 + self._credentials_fix_hint()
                 + " "
                 + self._login_fix_hint()
             )
         if status == 403:
             return HostConnectError(
-                "Connection refused (HTTP 403): the credentials authenticated, "
-                "but the server did not accept the host tunnel. Either your "
+                "Connection refused (HTTP 403): the server repeatedly rejected the host "
+                "tunnel. Either your "
                 "identity is not authorized to register a host on this server, "
                 "or the server is running a build that predates the host API "
                 "(the /v1/hosts tunnel route). Confirm you have access and that "
@@ -2637,6 +2644,12 @@ class HostProcess:
         self._reaper_task = asyncio.create_task(
             self._orphan_reaper_loop(), name="host-orphan-reaper"
         )
+        # Detect wake from system suspend (laptop sleep) and force-drop the
+        # then-dead tunnel so the reconnect loop reattaches within seconds
+        # instead of waiting out the ~90s keepalive ping timeout.
+        self._suspend_task = asyncio.create_task(
+            watch_for_resume(self._on_resume_from_suspend), name="host-suspend-watch"
+        )
         # Warm the runner zygote now: start() blocks on its one-time import
         # of the runner graph (~1-2s), which otherwise lands inside the first
         # session launch of the daemon's life. Best-effort — a failure
@@ -2668,6 +2681,11 @@ class HostProcess:
                         # riding out a messy restart isn't killed by
                         # redirects accumulated across unrelated errors.
                         self._login_redirect_streak = 0
+                    if not (
+                        isinstance(exc, InvalidStatus) and exc.response.status_code in (401, 403)
+                    ):
+                        # Keep the refresh window limited to consecutive auth rejections.
+                        self._auth_retry_streak = 0
                     # Refused on loopback is decisive: nothing listens on the
                     # port and no network path can heal it, so bound the
                     # retries. Remote refusals retry forever (outages recover).
@@ -2747,16 +2765,29 @@ class HostProcess:
                     # A silent-connect streak overrides the recycle fast path:
                     # prompt reconnects are for endpoints that answer.
                     silent_churn = self._silent_connect_streak >= _SILENT_CONNECT_ESCALATE_ATTEMPTS
-                    recycle = (
-                        explicit_recycle
-                        or (ingress_recycle and not _url_is_loopback(self._server_url))
-                    ) and not silent_churn
+                    # A resume from system suspend (laptop wake) always reconnects
+                    # promptly: _on_resume_from_suspend already aborted the dead
+                    # tunnel, but the abrupt "no close frame" that abort produces
+                    # counts as a benign recycle only on a REMOTE server — a local
+                    # server would otherwise ride the escalating backoff. OR woke in
+                    # outside the silent-churn gate so wake never takes the slow path.
+                    woke = self._woke_from_suspend
+                    self._woke_from_suspend = False
+                    recycle = woke or (
+                        (
+                            explicit_recycle
+                            or (ingress_recycle and not _url_is_loopback(self._server_url))
+                        )
+                        and not silent_churn
+                    )
                     wait_s = _RECONNECT_BASE_S if recycle else backoff
                     _logger.warning(
                         "Host tunnel disconnected: %s. Reconnecting in %.1fs%s",
                         exc,
                         wait_s,
-                        " (recycle — prompt reconnect)" if recycle else "",
+                        " (resumed from suspend — prompt reconnect)"
+                        if woke
+                        else (" (recycle — prompt reconnect)" if recycle else ""),
                     )
                     await asyncio.sleep(wait_s)
                     import random
@@ -2778,6 +2809,11 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._reaper_task
                 self._reaper_task = None
+            if self._suspend_task is not None:
+                self._suspend_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._suspend_task
+                self._suspend_task = None
             if self._zygote_prestart_task is not None:
                 self._zygote_prestart_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -2799,6 +2835,43 @@ class HostProcess:
                 with contextlib.suppress(Exception):
                     self._zygote.stop()
                 self._zygote = None
+
+    def _on_resume_from_suspend(self, gap_s: float) -> None:
+        """Force-drop the tunnel after a detected wake from system suspend.
+
+        On laptop sleep the WebSocket becomes a half-open socket the server
+        already dropped; without this the reconnect loop waits out the ~90s
+        keepalive ping timeout (:data:`TUNNEL_KEEPALIVE_PING_TIMEOUT_S`),
+        leaving the host — and every session it owns — offline that whole
+        time. Aborting the transport makes :meth:`_serve_frames`' ``recv``
+        raise ``ConnectionClosed`` now, and the flag makes :meth:`run` skip the
+        backoff so the reconnect is prompt.
+
+        No-op when no connection is live (e.g. the wake landed during a
+        reconnect backoff): there is nothing to abort, and the pending backoff
+        sleep's deadline is already past so it reconnects immediately anyway.
+        The flag is only set when a live tunnel was actually aborted, so a
+        wake-during-backoff never triggers a spurious prompt reconnect.
+
+        Runs synchronously on the event loop (invoked by the suspend watcher),
+        so reading ``self._ws`` and aborting is atomic w.r.t. ``_serve_frames``
+        — no lock needed.
+
+        :param gap_s: Approximate seconds the machine was asleep (for logging).
+        :returns: None.
+        """
+        ws = self._ws
+        if ws is None:
+            return
+        self._woke_from_suspend = True
+        _logger.info(
+            "Resumed from suspend (~%.0fs); dropping stale host tunnel to reconnect",
+            gap_s,
+        )
+        transport = getattr(ws, "transport", None)
+        if transport is not None:
+            with contextlib.suppress(Exception):
+                transport.abort()
 
     def _cleanup_runners(self) -> None:
         """Terminate all live runners on shutdown.

@@ -13,7 +13,6 @@ const RAIL_TABS: readonly RightRailTab[] = [
   "changes",
   "subagents",
   "terminals",
-  "todos",
   "browser",
 ];
 
@@ -22,7 +21,7 @@ export interface SessionWorkspaceState {
   open?: boolean;
   /** User-chosen rail width (px) for this session. */
   widthPx?: number;
-  /** The selected rail tab (Files / Changes / Agents / Shells / Tasks). */
+  /** The selected rail tab (Files / Changes / Agents / Shells). */
   rightRailTab?: RightRailTab;
   /** Ordered list of open file tabs. */
   openFiles?: string[];

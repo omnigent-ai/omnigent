@@ -2074,6 +2074,43 @@ def test_normalize_content_blocks_strips_filename_from_input_image() -> None:
     assert result is not blocks
 
 
+def test_normalize_responses_items_wraps_string_assistant_content() -> None:
+    """String content must become blocks before the chat converter sees it.
+
+    A plain string is legal Responses-API content, but ``items_to_messages``
+    iterates content expecting blocks — so it walks the string character by
+    character and indexes each one, raising ``string indices must be integers,
+    not 'str'``. Since history is replayed, one such item breaks every later
+    turn in the conversation.
+    """
+    items = [
+        {"type": "message", "role": "assistant", "content": "I'll explore the repo."},
+        {"type": "message", "role": "user", "content": "go ahead"},
+    ]
+
+    result = _normalize_responses_items_for_chat(items)
+
+    assert result[0]["content"] == [{"type": "output_text", "text": "I'll explore the repo."}]
+    # User strings reach a different converter branch that accepts them, and
+    # callers rely on them staying strings.
+    assert result[1]["content"] == "go ahead"
+
+
+def test_normalize_responses_items_leaves_block_content_alone() -> None:
+    """Content that is already a block list is untouched."""
+    items = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi"}],
+        }
+    ]
+
+    result = _normalize_responses_items_for_chat(items)
+
+    assert result[0]["content"] == [{"type": "output_text", "text": "hi"}]
+
+
 def test_normalize_content_blocks_preserves_input_image_detail_for_http_url() -> None:
     """Supported ``input_image.detail`` survives metadata sanitization for URLs."""
     blocks = [

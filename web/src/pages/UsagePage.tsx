@@ -78,6 +78,7 @@ export function UsagePage() {
   const [customStart, setCustomStart] = useState(() => daysAgoIso(30));
   const [customEnd, setCustomEnd] = useState(todayIso);
 
+  const today = todayIso();
   const { since, until } = rangeToWindow(rangeKey, customStart, customEnd);
 
   const filteredCosts = useMemo(
@@ -126,14 +127,25 @@ export function UsagePage() {
             <input
               type="date"
               value={customStart}
-              onChange={(e) => setCustomStart(e.target.value)}
+              max={customEnd < today ? customEnd : today}
+              onChange={(e) => {
+                const v = e.target.value;
+                setCustomStart(v);
+                if (v > customEnd) setCustomEnd(v);
+              }}
               className="rounded-md border border-border bg-background px-2 py-1 text-sm"
             />
             <span className="text-muted-foreground">to</span>
             <input
               type="date"
               value={customEnd}
-              onChange={(e) => setCustomEnd(e.target.value)}
+              min={customStart}
+              max={today}
+              onChange={(e) => {
+                const v = e.target.value;
+                setCustomEnd(v);
+                if (v < customStart) setCustomStart(v);
+              }}
               className="rounded-md border border-border bg-background px-2 py-1 text-sm"
             />
           </div>

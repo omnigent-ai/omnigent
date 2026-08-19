@@ -31,9 +31,6 @@ vi.mock("./InlineTerminalsSection", () => ({
 vi.mock("./SubagentsPanel", () => ({
   SubagentsPanel: () => <div data-testid="subagents-stub" />,
 }));
-vi.mock("./TodoPanel", () => ({
-  TodoPanel: () => <div data-testid="todos-stub" />,
-}));
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
   BrowserPane: ({ conversationId }: { conversationId: string }) => (
     <div data-testid="browser-pane-stub">{conversationId}</div>
@@ -115,9 +112,6 @@ function renderWorkspace(
         terminalsLength={0}
         subagentsWorking={0}
         agentCount={1}
-        todosSupported={false}
-        todosCompleted={0}
-        todosTotal={0}
         rootSessionId={null}
         selectedFilePath={overrides.selectedFilePath ?? null}
         openFiles={overrides.openFiles ?? []}
