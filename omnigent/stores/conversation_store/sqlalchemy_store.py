@@ -3005,6 +3005,28 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
+    def count_conversations_by_host_id(self, host_id: str) -> int:
+        """
+        Return how many conversations are bound to ``host_id``.
+
+        One indexed ``COUNT(*)`` on the metadata table, so it stays correct and
+        cheap regardless of how many sessions the installation holds.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4"``.
+        :returns: Number of conversations whose ``host_id`` matches.
+        """
+        with self._session("count_conversations_by_host_id") as session:
+            return int(
+                session.execute(
+                    select(func.count())
+                    .select_from(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.host_id == host_id,
+                    )
+                ).scalar_one()
+            )
+
     def list_conversations_by_runner_id(
         self,
         runner_id: str,

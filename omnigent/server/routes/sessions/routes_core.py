@@ -422,23 +422,21 @@ def register_core_routes(
                         and host_is_live(host)
                     ]
                     if candidates:
-                        sessions = await asyncio.to_thread(
-                            conversation_store.list_conversations,
-                            limit=1000,
-                            kind=None,
-                        )
                         cap = sandbox_config.max_sessions_per_lease or 10
-                        adopted = next(
-                            (
-                                host
-                                for host in candidates
-                                if sum(
-                                    session.host_id == host.host_id for session in sessions.data
-                                )
-                                < cap
-                            ),
-                            None,
-                        )
+                        # Count per candidate rather than paging the whole
+                        # conversation table: a listing capped at N rows
+                        # undercounts once the installation has more than N
+                        # sessions, so a lease already at capacity looks free
+                        # and gets over-subscribed.
+                        adopted = None
+                        for host in candidates:
+                            bound = await asyncio.to_thread(
+                                conversation_store.count_conversations_by_host_id,
+                                host.host_id,
+                            )
+                            if bound < cap:
+                                adopted = host
+                                break
                     if adopted is not None:
                         launcher = sandbox_config.launcher_factory()
                         if not isinstance(launcher, CodaProvider):

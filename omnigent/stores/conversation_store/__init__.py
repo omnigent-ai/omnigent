@@ -1298,6 +1298,27 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def count_conversations_by_host_id(self, host_id: str) -> int:
+        """
+        Return how many conversations are bound to ``host_id``.
+
+        Used by shared-host lifecycle decisions (capacity checks before
+        adopting a host, and the "is this host still in use?" check before
+        terminating one). Those callers only need a count, so they must not
+        page the whole conversation table: a listing capped at N rows silently
+        undercounts once the installation has more than N sessions, and the
+        host is then torn down while sessions are still bound to it.
+
+        Implementations must be read-after-write consistent with
+        :meth:`set_host_id`, because a host is adopted seconds before this
+        count is consulted again.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4"``.
+        :returns: Number of conversations whose ``host_id`` matches.
+        """
+        ...
+
+    @abstractmethod
     def list_conversations_by_runner_id(
         self,
         runner_id: str,

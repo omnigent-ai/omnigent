@@ -2569,6 +2569,41 @@ def test_create_conversation_git_branch_defaults_none(
     assert fetched.git_branch is None
 
 
+def test_count_conversations_by_host_id(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """Counting by host must be exact and must not depend on a listing page.
+
+    Shared-host lifecycle decisions ask "how many sessions are on this host?"
+    before adopting it (capacity) and before terminating it (still in use?).
+    Deriving that from ``list_conversations(limit=N)`` undercounts once the
+    installation holds more than N sessions, which over-subscribes a full lease
+    and tears down a host that still has sessions bound to it.
+    """
+    host_a = "292dfcdf8a31f1319b469f4fa179ac6b"
+    host_b = "392dfcdf8a31f1319b469f4fa179ac6b"
+    _register_host(db_uri, host_a)
+    _register_host(db_uri, host_b)
+
+    assert conversation_store.count_conversations_by_host_id(host_a) == 0
+
+    for _ in range(3):
+        conv = conversation_store.create_conversation(workspace="/w")
+        conversation_store.set_host_id(conv.id, host_a)
+    on_b = conversation_store.create_conversation(workspace="/w")
+    conversation_store.set_host_id(on_b.id, host_b)
+    # An unbound session must not be attributed to any host.
+    conversation_store.create_conversation(workspace="/w")
+
+    assert conversation_store.count_conversations_by_host_id(host_a) == 3
+    assert conversation_store.count_conversations_by_host_id(host_b) == 1
+    # A well-formed id that no session uses counts zero.
+    assert (
+        conversation_store.count_conversations_by_host_id("492dfcdf8a31f1319b469f4fa179ac6b") == 0
+    )
+
+
 def test_set_host_id(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,
