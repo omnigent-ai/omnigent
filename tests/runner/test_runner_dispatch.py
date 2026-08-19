@@ -2610,6 +2610,29 @@ async def test_runner_read_inbox_continues_after_malformed_terminal_idle_item() 
     assert session_inbox.empty()
 
 
+@pytest.mark.asyncio
+async def test_async_inbox_dispatch_does_not_create_unused_harness_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct async-inbox dispatch must not allocate an unused HTTP client."""
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    def unexpected_client(*args: object, **kwargs: object) -> None:
+        raise AssertionError("async-inbox dispatch created an unused HTTP client")
+
+    monkeypatch.setattr(tool_dispatch.httpx, "AsyncClient", unexpected_client)
+
+    output = await execute_tool(
+        tool_name="sys_read_inbox",
+        arguments="{}",
+        session_inbox=asyncio.Queue(),
+        harness_client=None,
+    )
+
+    assert output == "Inbox is empty — no completed tasks."
+
+
 @pytest.mark.parametrize(
     ("arguments", "expected_error"),
     [
