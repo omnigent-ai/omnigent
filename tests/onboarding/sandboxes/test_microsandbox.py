@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import sys
+import time
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -99,6 +101,61 @@ class _FakeExecHandle:
         self.killed = True
 
 
+class _FakeExecSink:
+    """Fake stdin pipe: echoes each write back as a prefixed stdout event."""
+
+    def __init__(self, handle: _FakeBridgeHandle) -> None:
+        self._handle = handle
+        self.closed = False
+
+    async def write(self, data: bytes) -> None:
+        self._handle.stdin_chunks.append(data)
+        await self._handle.events.put(_FakeExecEvent("stdout", data=b"guest:" + data))
+
+    async def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        # Stdin EOF ends the fake bridge, like the real one after SHUT_WR.
+        await self._handle.events.put(_FakeExecEvent("exited", code=0))
+        await self._handle.events.put(None)
+
+
+class _FakeBridgeHandle:
+    """Stand-in for a piped-stdin ``exec_stream`` handle (the guest bridge)."""
+
+    def __init__(self) -> None:
+        # None is the end-of-stream sentinel.
+        self.events: asyncio.Queue[_FakeExecEvent | None] = asyncio.Queue()
+        self.stdin_chunks: list[bytes] = []
+        self.killed = False
+        self._sink = _FakeExecSink(self)
+
+    def take_stdin(self) -> _FakeExecSink:
+        return self._sink
+
+    def __aiter__(self) -> _FakeBridgeHandle:
+        return self
+
+    async def __anext__(self) -> _FakeExecEvent:
+        event = await self.events.get()
+        if event is None:
+            raise StopAsyncIteration
+        return event
+
+    async def kill(self) -> None:
+        self.killed = True
+        await self.events.put(None)
+
+
+class _FakeStdin:
+    """Stand-in for ``microsandbox.Stdin`` (pipe mode only)."""
+
+    @staticmethod
+    def pipe() -> str:
+        return "pipe"
+
+
 class _FakeFs:
     """Recording stand-in for ``sandbox.fs``."""
 
@@ -128,6 +185,9 @@ class _FakeSandbox:
         # Events handed to the next shell_stream call.
         self.stream_events: list[_FakeExecEvent] = []
         self.stream_handles: list[_FakeExecHandle] = []
+        # (cmd, args, stdin) per exec_stream call, and the handles vended.
+        self.exec_calls: list[tuple[str, list[str], object]] = []
+        self.bridge_handles: list[_FakeBridgeHandle] = []
         self.touches = 0
         self.killed = False
 
@@ -157,6 +217,19 @@ class _FakeSandbox:
         self.shell_calls.append(_ShellCall(script=script, tty=tty, env=env))
         handle = _FakeExecHandle(self.stream_events)
         self.stream_handles.append(handle)
+        return handle
+
+    async def exec_stream(
+        self,
+        cmd: str,
+        args: list[str] | None = None,
+        *,
+        stdin: object = None,
+        **kwargs: object,
+    ) -> _FakeBridgeHandle:
+        self.exec_calls.append((cmd, list(args or []), stdin))
+        handle = _FakeBridgeHandle()
+        self.bridge_handles.append(handle)
         return handle
 
     async def touch(self) -> None:
@@ -343,6 +416,7 @@ def _install_fake_microsandbox(monkeypatch: pytest.MonkeyPatch) -> _FakeMicrosan
     fake.Destination = _FakeDestination  # type: ignore[attr-defined]
     fake.DestGroup = _FakeDestGroup  # type: ignore[attr-defined]
     fake.Protocol = _FakeProtocol  # type: ignore[attr-defined]
+    fake.Stdin = _FakeStdin  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "microsandbox", fake)
     return state
 
@@ -927,6 +1001,14 @@ def test_is_running_reports_status(fake_microsandbox: _FakeMicrosandboxState) ->
     assert launcher.is_running("ms-gone") is False
 
 
+def test_is_running_without_sdk_reports_unqueryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing SDK means the runtime cannot be queried - None, not a raise."""
+    monkeypatch.setitem(sys.modules, "microsandbox", None)
+    assert MicrosandboxSandboxLauncher().is_running("ms-1") is None
+
+
 def test_keep_alive_touches_idle_timer_softly(
     fake_microsandbox: _FakeMicrosandboxState,
 ) -> None:
@@ -968,109 +1050,130 @@ def test_attach_missing_sandbox_fails_with_create_hint(
 # ── forward_local_port ──────────────────────────────────────
 
 
-def test_forward_local_port_rejected_on_public_only(
+def _free_port() -> int:
+    """Grab an ephemeral local port."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def test_forward_local_port_bridges_host_connection_into_guest(
     fake_microsandbox: _FakeMicrosandboxState,
 ) -> None:
-    """public-only blocks guest-to-host traffic, so the relay cannot work."""
+    """
+    The forward binds the LOCAL port (``ssh -L`` semantics) and pipes each
+    accepted connection into a per-connection guest bridge exec dialing the
+    guest's loopback - bytes sent from the host come back through the fake
+    guest's echo.
+    """
+    launcher = MicrosandboxSandboxLauncher()
+    sandbox_id = _provisioned(fake_microsandbox, launcher)
+    sandbox = fake_microsandbox.sandboxes[sandbox_id]
+    sandbox.shell_queue.append((0, "", ""))  # command -v python3
+    port = _free_port()
+
+    with launcher.forward_local_port(sandbox_id, port):
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
+            conn.settimeout(10)
+            conn.sendall(b"ping")
+            conn.shutdown(socket.SHUT_WR)
+            received = b""
+            while chunk := conn.recv(65536):
+                received += chunk
+    assert received == b"guest:ping"
+
+    [(cmd, args, stdin)] = sandbox.exec_calls
+    assert cmd == "python3"
+    assert args[0] == "-c"
+    assert "127.0.0.1" in args[1]  # the bridge dials the guest's loopback
+    assert args[-1] == str(port)
+    assert stdin == "pipe"
+    [handle] = sandbox.bridge_handles
+    assert handle.stdin_chunks == [b"ping"]
+
+
+def test_forward_local_port_requires_guest_python3(
+    fake_microsandbox: _FakeMicrosandboxState,
+) -> None:
+    """A guest image without python3 fails with the actionable message."""
+    launcher = MicrosandboxSandboxLauncher()
+    sandbox_id = _provisioned(fake_microsandbox, launcher)
+    sandbox = fake_microsandbox.sandboxes[sandbox_id]
+    sandbox.shell_queue.append((1, "", ""))  # command -v python3 → missing
+
+    with pytest.raises(click.ClickException, match="python3"):
+        with launcher.forward_local_port(sandbox_id, 8022):
+            pass
+
+
+def test_forward_local_port_rejects_busy_local_port(
+    fake_microsandbox: _FakeMicrosandboxState,
+) -> None:
+    """An already-bound local port fails loud, naming the port."""
+    launcher = MicrosandboxSandboxLauncher()
+    sandbox_id = _provisioned(fake_microsandbox, launcher)
+    sandbox = fake_microsandbox.sandboxes[sandbox_id]
+    sandbox.shell_queue.append((0, "", ""))  # command -v python3
+
+    with socket.socket() as blocker:
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        port = blocker.getsockname()[1]
+        with pytest.raises(click.ClickException, match=f"localhost:{port}"):
+            with launcher.forward_local_port(sandbox_id, port):
+                pass
+
+
+def test_forward_local_port_teardown_kills_live_bridges(
+    fake_microsandbox: _FakeMicrosandboxState,
+) -> None:
+    """
+    Closing the forward cancels connections still in flight and kills their
+    guest bridges - no orphaned execs, no lingering local listener.
+    """
+    launcher = MicrosandboxSandboxLauncher()
+    sandbox_id = _provisioned(fake_microsandbox, launcher)
+    sandbox = fake_microsandbox.sandboxes[sandbox_id]
+    sandbox.shell_queue.append((0, "", ""))  # command -v python3
+    port = _free_port()
+
+    with launcher.forward_local_port(sandbox_id, port):
+        conn = socket.create_connection(("127.0.0.1", port), timeout=10)
+        conn.sendall(b"still-open")
+        # Wait for the bytes to land in a guest bridge before tearing down.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not any(
+            handle.stdin_chunks for handle in sandbox.bridge_handles
+        ):
+            time.sleep(0.01)
+
+    [handle] = sandbox.bridge_handles
+    assert handle.stdin_chunks == [b"still-open"]
+    assert handle.killed is True
+    with pytest.raises(OSError):
+        socket.create_connection(("127.0.0.1", port), timeout=1)
+    conn.close()
+
+
+def test_forward_local_port_works_under_public_only(
+    fake_microsandbox: _FakeMicrosandboxState,
+) -> None:
+    """
+    The bridge rides the SDK exec channel, not guest egress, so even the
+    most restrictive network mode supports the forward.
+    """
     launcher = MicrosandboxSandboxLauncher(network="public-only")
-    with pytest.raises(click.ClickException, match="public-only"):
-        launcher.forward_local_port("ms-1", 8022)
-
-
-def test_forward_local_port_runs_and_tears_down_relay(
-    fake_microsandbox: _FakeMicrosandboxState,
-) -> None:
-    """
-    The forward ships the relay script into the guest, starts it under
-    nohup, waits for its ready line, and kills it (removing the script)
-    on exit.
-    """
-    launcher = MicrosandboxSandboxLauncher()
     sandbox_id = _provisioned(fake_microsandbox, launcher)
     sandbox = fake_microsandbox.sandboxes[sandbox_id]
     sandbox.shell_queue.append((0, "", ""))  # command -v python3
-    sandbox.shell_queue.append((0, "4242\n", ""))  # nohup start → pid
-    sandbox.shell_queue.append((0, "", ""))  # grep relay-ready
+    port = _free_port()
 
-    with launcher.forward_local_port(sandbox_id, 8022):
-        [(script_path, script)] = sandbox.fs.written
-        # Per-forward random suffix: concurrent forwards must not share paths.
-        assert script_path.startswith("/tmp/oa-relay-8022-")
-        assert script_path.endswith(".py")
-        assert b"8022" in script
-        assert b"host.microsandbox.internal" in script
-
-    teardown = sandbox.shell_calls[-1].script
-    assert "kill 4242" in teardown
-    assert script_path in teardown
-
-
-def test_forward_local_port_cleans_up_on_garbled_pid(
-    fake_microsandbox: _FakeMicrosandboxState,
-) -> None:
-    """
-    A garbled pid echo still fails loud, but cleanup falls back to killing
-    the relay by script path - a started relay must never be orphaned.
-    """
-    launcher = MicrosandboxSandboxLauncher()
-    sandbox_id = _provisioned(fake_microsandbox, launcher)
-    sandbox = fake_microsandbox.sandboxes[sandbox_id]
-    sandbox.shell_queue.append((0, "", ""))  # command -v python3
-    sandbox.shell_queue.append((0, "oops\n", ""))  # nohup start → garbage
-
-    with pytest.raises(click.ClickException, match="could not start"):
-        with launcher.forward_local_port(sandbox_id, 8022):
-            pass
-
-    teardown = sandbox.shell_calls[-1].script
-    assert "pkill -f" in teardown
-    [(script_path, _script)] = sandbox.fs.written
-    assert script_path in teardown
-
-
-def test_forward_local_port_fails_when_relay_never_ready(
-    fake_microsandbox: _FakeMicrosandboxState, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A relay that never prints its ready line fails loud with the log tail."""
-    monkeypatch.setattr(msmod, "_RELAY_READY_TIMEOUT_S", 0.05)
-    launcher = MicrosandboxSandboxLauncher()
-    sandbox_id = _provisioned(fake_microsandbox, launcher)
-    sandbox = fake_microsandbox.sandboxes[sandbox_id]
-    sandbox.shell_queue.append((0, "", ""))  # command -v python3
-    sandbox.shell_queue.append((0, "4242\n", ""))  # nohup start → pid
-    # Probes report "still starting" (rc 3, one per poll) until the deadline;
-    # the log-tail cat then reports the crash.
-    sandbox.shell_queue.append((3, "", ""))
-    sandbox.shell_queue.append((3, "", ""))
-    sandbox.shell_queue.append((0, "Traceback: boom", ""))
-
-    with pytest.raises(click.ClickException, match="Traceback: boom"):
-        with launcher.forward_local_port(sandbox_id, 8022):
-            pass
-
-
-def test_forward_local_port_fails_fast_when_relay_dies(
-    fake_microsandbox: _FakeMicrosandboxState,
-) -> None:
-    """
-    A relay that dies at startup (e.g. EADDRINUSE) fails on the FIRST probe
-    with the log tail - not after burning the whole readiness timeout.
-    """
-    launcher = MicrosandboxSandboxLauncher()
-    sandbox_id = _provisioned(fake_microsandbox, launcher)
-    sandbox = fake_microsandbox.sandboxes[sandbox_id]
-    sandbox.shell_queue.append((0, "", ""))  # command -v python3
-    sandbox.shell_queue.append((0, "4242\n", ""))  # nohup start → pid
-    sandbox.shell_queue.append((4, "", ""))  # probe: process dead
-    sandbox.shell_queue.append((0, "OSError: [Errno 98] EADDRINUSE", ""))  # log tail
-
-    with pytest.raises(click.ClickException, match=r"died at startup.*EADDRINUSE"):
-        with launcher.forward_local_port(sandbox_id, 8022):
-            pass
-
-    # One spawn, one probe, one log read, one teardown - no 15s poll loop.
-    probes = [c for c in sandbox.shell_calls if "relay-ready" in c.script]
-    assert len(probes) == 1
+    with launcher.forward_local_port(sandbox_id, port):
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
+            conn.settimeout(10)
+            conn.sendall(b"hi")
+            conn.shutdown(socket.SHUT_WR)
+            assert conn.recv(65536) == b"guest:hi"
 
 
 # ── misc ────────────────────────────────────────────────────

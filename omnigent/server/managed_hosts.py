@@ -2010,7 +2010,7 @@ def _resolve_microsandbox_host_ports(raw: dict[str, object], server_url: str) ->
     any operator-listed ``sandbox.microsandbox.host_ports`` (e.g. a local LLM
     gateway). Only the launcher's managed path receives this list - the CLI
     bootstrap constructs the launcher without one and keeps full host access
-    (its OAuth relay port isn't known at creation time).
+    (a locally self-hosted server's port isn't known at creation time).
 
     :param raw: The raw ``sandbox`` mapping.
     :param server_url: The validated ``sandbox.server_url`` value.
@@ -2021,12 +2021,16 @@ def _resolve_microsandbox_host_ports(raw: dict[str, object], server_url: str) ->
     from urllib.parse import urlsplit
 
     split = urlsplit(server_url.strip())
-    server_port = split.port or {"http": 80, "https": 443}.get(split.scheme or "")
+    server_port = split.port
     if server_port is None:
+        server_port = {"http": 80, "https": 443}.get(split.scheme or "")
+    # `not` also rejects an explicit :0, which would otherwise pass through
+    # as a nonsensical allow-rule.
+    if not server_port:
         raise ValueError(
-            "server config 'sandbox.server_url' must carry a resolvable port "
-            "for the microsandbox provider (an explicit :port, or an "
-            "http/https scheme)"
+            "server config 'sandbox.server_url' must carry a resolvable "
+            "non-zero port for the microsandbox provider (an explicit :port, "
+            "or an http/https scheme)"
         )
     ports = [server_port]
     section = _parse_provider_section(raw, "microsandbox")

@@ -23,8 +23,8 @@ Platform traits that shape this launcher:
 - **Guest-to-host networking.** The guest reaches the machine running the
   server at ``host.microsandbox.internal`` - the default network policy here
   is public egress plus a host allow-rule so a locally self-hosted server's
-  ``server_url`` is reachable, and ``forward_local_port`` rides the same path
-  via an in-guest relay.
+  ``server_url`` is reachable. ``forward_local_port`` does NOT ride this
+  path: it pipes host connections inward over the SDK's exec channel.
 
 Concurrency model: the SDK is async-only; omnigent calls launcher methods
 synchronously (the server marshals them off its event loop via
@@ -41,9 +41,7 @@ import contextlib
 import os
 import platform
 import secrets
-import shlex
 import threading
-import time
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
@@ -114,53 +112,47 @@ _RUN_TIMEOUT_S: float = 600.0
 _TERMINATE_TIMEOUT_S: float = 120.0
 _CONNECT_TIMEOUT_S: float = 60.0
 
-# How long forward_local_port waits for the in-guest relay to report its
-# listener bound before giving up.
-_RELAY_READY_TIMEOUT_S: float = 15.0
+# In-guest half of forward_local_port, spawned once per accepted host
+# connection with stdin/stdout piped over the SDK exec channel: dials the
+# guest's loopback at argv[1] and shuttles stdin→socket / socket→stdout
+# (unbuffered os.write). Needs guest python3.
+_BRIDGE_SCRIPT = """\
+import os
+import socket
+import sys
+import threading
 
-# In-guest TCP relay backing forward_local_port: listens on the guest's
-# loopback and pipes every connection to the same port on the host machine
-# (host.microsandbox.internal). Formatted with the port; needs guest python3.
-_RELAY_SCRIPT = """\
-import asyncio
-
-PORT = {port}
-TARGET = "host.microsandbox.internal"
+sock = socket.create_connection(("127.0.0.1", int(sys.argv[1])), 10)
 
 
-async def _pipe(reader, writer):
+def _drain():
+    # Socket → stdout; on server EOF/reset the response bytes have already
+    # been written (os.write is unbuffered), so end the whole bridge.
+    while True:
+        try:
+            data = sock.recv(65536)
+        except OSError:
+            data = b""
+        if not data:
+            os._exit(0)
+        os.write(1, data)
+
+
+# Non-daemon: keeps the process alive draining the response after stdin EOF.
+threading.Thread(target=_drain).start()
+while True:
+    data = os.read(0, 65536)
+    if not data:
+        break
     try:
-        while True:
-            data = await reader.read(65536)
-            if not data:
-                break
-            writer.write(data)
-            await writer.drain()
+        sock.sendall(data)
     except OSError:
-        pass
-    finally:
-        writer.close()
-
-
-async def _handle(reader, writer):
-    try:
-        target_reader, target_writer = await asyncio.open_connection(TARGET, PORT)
-    except OSError:
-        writer.close()
-        return
-    await asyncio.gather(
-        _pipe(reader, target_writer), _pipe(target_reader, writer), return_exceptions=True
-    )
-
-
-async def _main():
-    server = await asyncio.start_server(_handle, "127.0.0.1", PORT)
-    print("relay-ready", flush=True)
-    async with server:
-        await server.serve_forever()
-
-
-asyncio.run(_main())
+        os._exit(0)
+# Stdin EOF = the host-side connection closed its write half.
+try:
+    sock.shutdown(socket.SHUT_WR)
+except OSError:
+    pass
 """
 
 
@@ -259,6 +251,62 @@ def _echo_lines(stream: str, *, err: bool = False) -> None:
     for line in stream.splitlines():
         if line.strip():
             click.echo(line, err=err)
+
+
+async def _pipe_host_to_guest(
+    reader: asyncio.StreamReader, sink: microsandbox_sdk.ExecSink
+) -> None:
+    """Pump local-connection bytes into the guest bridge's stdin."""
+    try:
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            await sink.write(data)
+    finally:
+        # EOF (or a dead bridge) - half-close so the bridge sees stdin end.
+        with contextlib.suppress(Exception):
+            await sink.close()
+
+
+async def _pipe_guest_to_host(
+    handle: microsandbox_sdk.ExecHandle, writer: asyncio.StreamWriter, sandbox_id: str
+) -> None:
+    """
+    Pump guest bridge stdout back to the local connection.
+
+    A bridge that dies without ever answering (e.g. nothing listening on the
+    guest port) gets its stderr tail echoed - the local client only sees a
+    bare reset otherwise.
+    """
+    answered = False
+    diagnostics = b""
+    exit_code: int | None = None
+    try:
+        async for event in handle:
+            event_type = getattr(event, "event_type", None)
+            if event_type == "stdout":
+                data = getattr(event, "data", None) or b""
+                if data:
+                    answered = True
+                    writer.write(data)
+                    await writer.drain()
+            elif event_type == "stderr":
+                diagnostics += getattr(event, "data", None) or b""
+            elif event_type == "exited":
+                code = getattr(event, "code", None)
+                exit_code = 0 if code is None else int(code)
+    finally:
+        # Half-close toward the local client so it sees the response end.
+        with contextlib.suppress(Exception):
+            writer.write_eof()
+        if exit_code not in (0, None) and not answered:
+            tail = diagnostics.decode("utf-8", "replace").strip()[-200:]
+            click.echo(
+                f"  → port-forward bridge into microsandbox '{sandbox_id}' failed"
+                + (f": {tail}" if tail else ""),
+                err=True,
+            )
 
 
 class _MicrosandboxRemoteProcess(RemoteProcess):
@@ -393,9 +441,9 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
     # Public PyPI is reachable from the local wheel build; ambient uv config
     # applies.
     wheel_build_index_url: ClassVar[str | None] = None
-    # forward_local_port bridges via an in-guest relay to
-    # host.microsandbox.internal (see forward_local_port), so the in-sandbox
-    # App OAuth flow works under the default "host" network mode.
+    # forward_local_port pipes host connections into the guest over the SDK
+    # exec channel (see forward_local_port), so the in-sandbox App OAuth flow
+    # works under every network mode.
     supports_local_port_forward: ClassVar[bool] = True
     # Stopped/drained sandboxes keep their writable layer and restart in
     # place, so the server's managed-host wake path may revive them.
@@ -434,10 +482,10 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
         :param host_ports: Under the ``host`` network mode, restrict
             guest-to-host traffic to these TCP ports (e.g. the omnigent
             server port plus an LLM-gateway port). ``None`` allows every
-            host port - required for the CLI bootstrap, whose OAuth relay
-            port isn't known at creation time; the server's managed path
-            always passes an explicit list so untrusted agents cannot
-            reach unrelated host-local services.
+            host port - the CLI bootstrap uses it because a locally
+            self-hosted server's port isn't known at creation time; the
+            server's managed path always passes an explicit list so
+            untrusted agents cannot reach unrelated host-local services.
         :raises click.ClickException: When *network* is not a recognized mode.
         """
         if network is not None and network not in NETWORK_MODES:
@@ -502,8 +550,7 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
 
         ``host`` keeps microsandbox's public-egress-only posture and adds
         guest-to-host allow-rules (``host.microsandbox.internal``), so hosts
-        can dial back to a server on this machine and
-        :meth:`forward_local_port` can relay. Loopback / private-LAN /
+        can dial back to a server on this machine. Loopback / private-LAN /
         metadata destinations stay blocked, and when ``host_ports`` is set
         the host rules are scoped to just those TCP ports.
         """
@@ -976,9 +1023,13 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
 
         :param sandbox_id: The sandbox to inspect.
         :returns: ``True`` when running, ``False`` when stopped / drained /
-            missing, or ``None`` when the runtime cannot be queried.
+            missing, or ``None`` when the runtime cannot be queried (the SDK
+            missing included - this probe reports rather than raises).
         """
-        _ensure_sdk()
+        try:
+            _ensure_sdk()
+        except click.ClickException:
+            return None
 
         async def _do() -> bool:
             import microsandbox as msb
@@ -998,103 +1049,105 @@ class MicrosandboxSandboxLauncher(SandboxLauncher):
         self, sandbox_id: str, port: int
     ) -> contextlib.AbstractContextManager[None]:
         """
-        Forward ``localhost:<port>`` on the local machine into the sandbox.
+        Forward ``localhost:<port>`` on the local machine into the sandbox
+        (``ssh -L`` semantics).
 
-        Implemented with an in-guest relay: a small python3 process inside
-        the guest listens on ``127.0.0.1:<port>`` and pipes each connection
-        to ``host.microsandbox.internal:<port>`` - the local machine, where
-        the real listener is already bound. Requires the guest image to
-        provide ``python3`` (the official host image does) and a network mode
-        that allows guest-to-host traffic (``host`` / ``all``).
+        The local machine listens on ``localhost:<port>``; each accepted
+        connection spawns a small python3 bridge inside the guest - its
+        stdin/stdout piped over the SDK exec channel - that dials the guest's
+        ``127.0.0.1:<port>``, where the in-sandbox listener (e.g. the
+        ``omnigent login`` OAuth callback server) is bound. Riding the exec
+        channel means every network mode works; the guest image must provide
+        ``python3`` (the official host image does).
 
         :param sandbox_id: Target sandbox.
         :param port: Local + guest loopback port to bridge, e.g. ``8022``.
-        :returns: Context manager holding the relay open.
-        :raises click.ClickException: When the network mode blocks host
-            traffic, python3 is missing in the guest, or the relay fails to
-            come up.
+        :returns: Context manager holding the forward open.
+        :raises click.ClickException: When python3 is missing in the guest or
+            the local port cannot be bound.
         """
-        if self._network_mode == "public-only":
-            raise click.ClickException(
-                "forward_local_port needs guest-to-host networking, but the "
-                "microsandbox network mode is 'public-only' - use 'host' (the "
-                "default) or 'all'."
-            )
-        return self._relay_forward(sandbox_id, port)
+        return self._bridge_forward(sandbox_id, port)
 
     @contextlib.contextmanager
-    def _relay_forward(self, sandbox_id: str, port: int) -> Generator[None, None, None]:
-        """Run the in-guest relay for :meth:`forward_local_port`."""
-        # Per-forward random paths: two concurrent forwards for the same
-        # port must not share script/log/readiness state.
-        run_tag = f"oa-relay-{port}-{secrets.token_hex(4)}"
-        script_path = f"/tmp/{run_tag}.py"
-        log_path = f"/tmp/{run_tag}.log"
-        self.run(sandbox_id, "command -v python3 >/dev/null")
+    def _bridge_forward(self, sandbox_id: str, port: int) -> Generator[None, None, None]:
+        """Run the host-side listener for :meth:`forward_local_port`."""
+        probe = self.run(sandbox_id, "command -v python3 >/dev/null", check=False)
+        if probe.returncode != 0:
+            raise click.ClickException(
+                f"forward_local_port needs python3 inside microsandbox "
+                f"'{sandbox_id}' for its connection bridge, but the guest "
+                "image does not provide it."
+            )
 
-        async def _ship() -> None:
-            sandbox = await self._aconnect(sandbox_id)
-            await sandbox.fs.write(script_path, _RELAY_SCRIPT.format(port=port).encode())
+        # Tasks serving accepted connections; cancelled (killing their guest
+        # bridges) when the forward closes.
+        conn_tasks: set[asyncio.Task[None]] = set()
+
+        async def _serve_connection(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            task = asyncio.current_task()
+            assert task is not None  # stream handlers always run as a task
+            conn_tasks.add(task)
+            handle: microsandbox_sdk.ExecHandle | None = None
+            try:
+                import microsandbox as msb
+
+                sandbox = await self._aconnect(sandbox_id)
+                handle = await sandbox.exec_stream(
+                    "python3", ["-c", _BRIDGE_SCRIPT, str(port)], stdin=msb.Stdin.pipe()
+                )
+                sink = handle.take_stdin()
+                assert sink is not None  # stdin was piped just above
+                await asyncio.gather(
+                    _pipe_host_to_guest(reader, sink),
+                    _pipe_guest_to_host(handle, writer, sandbox_id),
+                    return_exceptions=True,
+                )
+            finally:
+                conn_tasks.discard(task)
+                if handle is not None:
+                    with contextlib.suppress(Exception):
+                        await handle.kill()
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
+
+        async def _start() -> asyncio.Server:
+            # "localhost", not 127.0.0.1: browsers may resolve the OAuth
+            # redirect's localhost to ::1, so bind every loopback family.
+            return await asyncio.start_server(_serve_connection, "localhost", port)
 
         try:
-            _run(_ship(), timeout=_RUN_TIMEOUT_S)
+            server = _run(_start(), timeout=_CONNECT_TIMEOUT_S)
         except click.ClickException:
             raise
+        except OSError as exc:
+            raise click.ClickException(
+                f"could not bind localhost:{port} for the microsandbox port forward: {exc}"
+            ) from exc
         except Exception as exc:
             raise click.ClickException(
-                f"Could not ship the port-forward relay into microsandbox '{sandbox_id}': {exc}"
+                f"could not start the port forward into microsandbox '{sandbox_id}': {exc}"
             ) from exc
-        started = self.run(
-            sandbox_id,
-            f"nohup python3 {shlex.quote(script_path)} > {shlex.quote(log_path)} "
-            "2>&1 < /dev/null & echo $!",
-        )
-        # Kill by recorded pid, or by script path if the echo was garbled.
-        # Teardown is best-effort and must not mask the body's exception.
-        pid = started.stdout.strip().splitlines()[-1] if started.stdout.strip() else ""
         try:
-            if not pid.isdigit():
-                raise click.ClickException(
-                    f"could not start the port-forward relay in microsandbox '{sandbox_id}'"
-                )
-            deadline = time.monotonic() + _RELAY_READY_TIMEOUT_S
-            while True:
-                # Three-way probe: 0 = ready, 3 = still starting, 4 = the
-                # relay died (e.g. EADDRINUSE) - fail fast on death instead
-                # of burning the whole readiness timeout.
-                probe = self.run(
-                    sandbox_id,
-                    f"if grep -q relay-ready {shlex.quote(log_path)}; then exit 0; "
-                    f"elif kill -0 {pid} 2>/dev/null; then exit 3; else exit 4; fi",
-                    check=False,
-                )
-                if probe.returncode == 0:
-                    break
-                if probe.returncode == 4 or time.monotonic() > deadline:
-                    tail = self.run(
-                        sandbox_id, f"cat {shlex.quote(log_path)}", check=False
-                    ).stdout[-400:]
-                    reason = "died at startup" if probe.returncode == 4 else "did not come up"
-                    raise click.ClickException(
-                        f"port-forward relay {reason} in microsandbox "
-                        f"'{sandbox_id}'" + (f" - {tail.strip()}" if tail.strip() else "")
-                    )
-                time.sleep(0.2)
             yield
         finally:
-            kill_cmd = (
-                f"kill {pid} 2>/dev/null; "
-                if pid.isdigit()
-                else f"pkill -f {shlex.quote(script_path)} 2>/dev/null; "
-            )
+
+            async def _stop() -> None:
+                server.close()
+                # Cancel live connections BEFORE wait_closed: since 3.12 it
+                # waits for handlers, which only end when cancelled.
+                for task in list(conn_tasks):
+                    task.cancel()
+                await asyncio.gather(*list(conn_tasks), return_exceptions=True)
+                await server.wait_closed()
+
+            # Teardown is best-effort and must not mask the body's exception.
             try:
-                self.run(
-                    sandbox_id,
-                    f"{kill_cmd}rm -f {shlex.quote(script_path)} {shlex.quote(log_path)}",
-                    check=False,
-                )
-            except click.ClickException as exc:
-                click.echo(f"  → port-forward relay cleanup failed: {exc.message}", err=True)
+                _run(_stop(), timeout=_TERMINATE_TIMEOUT_S)
+            except Exception as exc:
+                click.echo(f"  → port-forward teardown failed: {exc}", err=True)
 
     def wheel_install_command(self, remote_tgz_path: str) -> str:
         """

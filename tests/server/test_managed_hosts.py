@@ -1319,6 +1319,7 @@ def test_parse_valid_microsandbox_config_builds_parameterized_factory(
         }
     )
     assert cfg is not None
+    cfg = cfg.default
     assert cfg.server_url == "http://host.microsandbox.internal:8799"
     assert cfg.token_ttl_s == MICROSANDBOX_MANAGED_TOKEN_TTL_S
     assert cfg.managed_launch_supported is True
@@ -1348,6 +1349,7 @@ def test_parse_microsandbox_without_section_defaults(
         {"provider": "microsandbox", "server_url": "http://host.microsandbox.internal:8799"}
     )
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_microsandbox_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -1370,6 +1372,7 @@ def test_parse_microsandbox_derives_scheme_default_port(
         {"provider": "microsandbox", "server_url": "https://omnigent.example.com"}
     )
     assert cfg is not None
+    cfg = cfg.default
     fake = FakeSandboxLauncher()
     install_fake_microsandbox_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
@@ -1651,6 +1654,11 @@ def test_parse_microsandbox_derives_scheme_default_port(
                 "microsandbox": {"host_ports": [0]},
             },
             "sandbox.microsandbox.host_ports",
+        ),
+        # An explicit :0 port cannot become a host allow-rule.
+        (
+            {"provider": "microsandbox", "server_url": "https://s:0"},
+            "non-zero port",
         ),
         # openshell section present but malformed.
         (

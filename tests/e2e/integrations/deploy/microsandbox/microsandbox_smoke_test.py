@@ -8,13 +8,14 @@ against a live local microVM to validate the primitives the managed-host /
 CLI-bootstrap flows rely on: prepare -> provision -> run (incl. the non-zero
 exit path and stderr surfacing) -> put + read-back -> stream_exec (combined
 output + exit code) -> exec_foreground (TTY) -> keep_alive -> is_running ->
-forward_local_port (an in-guest connection reaching a local listener) ->
-stop + resume in place -> attach -> terminate (idempotent). Edge conditions
-(split UTF-8, close-retry, relay races) live in the unit suite; the
-interactive in-sandbox OAuth login is not driven here.
+forward_local_port (a HOST-side client reaching an in-guest listener, the
+``ssh -L`` direction the OAuth bootstrap needs) -> stop + resume in place ->
+attach -> terminate (idempotent). Edge conditions (split UTF-8, close-retry,
+bridge teardown) live in the unit suite; the interactive in-sandbox OAuth
+login is not driven here.
 
 By default it boots from ``python:alpine`` (small, has the python3 the
-port-forward relay needs), so it needs NO pre-built omnigent host image - it
+port-forward bridge needs), so it needs NO pre-built omnigent host image - it
 validates the launcher's SDK wiring in isolation. Pass
 ``--image ghcr.io/omnigent-ai/omnigent-host:latest`` to smoke the real host
 image too.
@@ -30,10 +31,10 @@ Exit code 0 = every primitive worked; 1 = a check failed; 2 = setup error.
 from __future__ import annotations
 
 import argparse
+import shlex
 import socket
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 
@@ -64,26 +65,18 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _serve_once(port: int, payload: bytes) -> threading.Thread:
-    """Run a one-shot local TCP server answering *payload* to any connection."""
+# One-shot in-guest TCP server: binds the guest loopback, answers a single
+# connection with a prefixed echo, exits. Formatted with the port.
+_GUEST_SERVER = """\
+import socket
 
-    def _serve() -> None:
-        with socket.socket() as server:
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind(("127.0.0.1", port))
-            server.listen(1)
-            server.settimeout(30)
-            try:
-                conn, _addr = server.accept()
-            except TimeoutError:
-                return
-            with conn:
-                conn.recv(1024)
-                conn.sendall(payload)
-
-    thread = threading.Thread(target=_serve, daemon=True)
-    thread.start()
-    return thread
+server = socket.create_server(("127.0.0.1", {port}))
+print("guest-listening", flush=True)
+conn, _addr = server.accept()
+data = conn.recv(1024)
+conn.sendall(b"pong-from-guest:" + data)
+conn.close()
+"""
 
 
 def _stop_sandbox(sandbox_id: str) -> None:
@@ -103,7 +96,7 @@ def main() -> int:
         "--image",
         default="python:alpine",
         help="OCI image to boot (default: python:alpine - small and carries "
-        "the python3 the port-forward relay needs; pass the omnigent host "
+        "the python3 the port-forward bridge needs; pass the omnigent host "
         "image to smoke the real thing).",
     )
     parser.add_argument("--keep", action="store_true", help="don't terminate at the end")
@@ -160,20 +153,33 @@ def main() -> int:
         launcher.keep_alive(sandbox_id)
         _check(failures, launcher.is_running(sandbox_id) is True, "is_running True while up")
 
-        print("==> forward_local_port (guest -> local listener)")
+        print("==> forward_local_port (host client -> in-guest listener)")
+        # The direction the OAuth bootstrap needs (ssh -L semantics): the
+        # listener runs INSIDE the guest, the client connects on the host.
         port = _free_port()
-        _serve_once(port, b"pong-from-host")
-        with launcher.forward_local_port(sandbox_id, port):
-            result = launcher.run(
-                sandbox_id,
-                "python3 -c \"import socket; s=socket.create_connection(('127.0.0.1',"
-                f" {port}), 10); s.sendall(b'ping'); print(s.recv(64).decode())\"",
-                check=False,
-            )
+        guest_script = _GUEST_SERVER.format(port=port)
+        listener = launcher.stream_exec(sandbox_id, f"python3 -c {shlex.quote(guest_script)}")
+        for line in listener.lines:
+            if "guest-listening" in line:
+                break
+        received = b""
+        try:
+            with launcher.forward_local_port(sandbox_id, port):
+                with socket.create_connection(("127.0.0.1", port), timeout=15) as conn:
+                    conn.settimeout(15)
+                    conn.sendall(b"ping-from-host")
+                    conn.shutdown(socket.SHUT_WR)
+                    while True:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        received += chunk
+        finally:
+            listener.close()
         _check(
             failures,
-            "pong-from-host" in result.stdout,
-            "guest reaches the local listener through the relay",
+            received == b"pong-from-guest:ping-from-host",
+            "host client reaches the in-guest listener through the forward",
         )
 
         print("==> stop + resume in place")
