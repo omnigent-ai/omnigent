@@ -22,7 +22,17 @@ const THUMB_PX = 56;
 const TRACK_TOP_PX = 64;
 const TRACK_BOTTOM_PX = 12;
 
-export function TranscriptScrollbar({ scroller }: { scroller: Scroller | null }) {
+export function TranscriptScrollbar({
+  scroller,
+  // Top inset of the track. Defaults to clearing the floating ChatHeader; when
+  // the Plan accordion is pinned above, the scroll container already starts
+  // below the header, so the caller passes a small inset instead — otherwise
+  // the thumb can't reach the top of the (already-cleared) viewport.
+  topInset = TRACK_TOP_PX,
+}: {
+  scroller: Scroller | null;
+  topInset?: number;
+}) {
   const [offset, setOffset] = useState(0);
   const [scrollable, setScrollable] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -34,8 +44,8 @@ export function TranscriptScrollbar({ scroller }: { scroller: Scroller | null })
 
   /** Usable thumb travel: the track minus the thumb's own height. */
   const travelOf = useCallback(
-    (node: HTMLElement) => node.clientHeight - TRACK_TOP_PX - TRACK_BOTTOM_PX - THUMB_PX,
-    [],
+    (node: HTMLElement) => node.clientHeight - topInset - TRACK_BOTTOM_PX - THUMB_PX,
+    [topInset],
   );
 
   useEffect(() => {
@@ -107,7 +117,7 @@ export function TranscriptScrollbar({ scroller }: { scroller: Scroller | null })
       aria-hidden
       data-testid="transcript-scrollbar"
       className="pointer-events-none absolute right-1 z-10 w-3"
-      style={{ top: TRACK_TOP_PX, bottom: TRACK_BOTTOM_PX }}
+      style={{ top: topInset, bottom: TRACK_BOTTOM_PX }}
     >
       <div
         data-testid="transcript-scrollbar-thumb"
