@@ -91,9 +91,7 @@ def _setup_usage_page(page: Page, live_server: str) -> None:
 
     page.route("**/v1/usage", handle_usage)
     page.goto(f"{live_server}/usage")
-    expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible(
-        timeout=30_000
-    )
+    expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible(timeout=30_000)
 
 
 def test_custom_date_inputs_have_max_today(page: Page, live_server: str) -> None:
@@ -111,9 +109,7 @@ def test_custom_date_inputs_have_max_today(page: Page, live_server: str) -> None
     assert start_max is not None and start_max <= today_str
 
 
-def test_custom_date_end_auto_adjusts_when_start_exceeds_end(
-    page: Page, live_server: str
-) -> None:
+def test_custom_date_end_auto_adjusts_when_start_exceeds_end(page: Page, live_server: str) -> None:
     """Setting start after end auto-corrects the end date forward."""
     _setup_usage_page(page, live_server)
 
