@@ -361,7 +361,7 @@ def test_in_progress_tool_update_emits_nothing() -> None:
 @pytest.mark.asyncio
 async def test_decide_permission_allows_with_no_gates() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
-    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is True
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
 
 
 @pytest.mark.asyncio
@@ -372,7 +372,7 @@ async def test_decide_permission_denies_on_policy_deny() -> None:
         action = "POLICY_ACTION_DENY"
 
     ex._policy_evaluator = AsyncMock(return_value=_V())
-    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is False
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (False, None)
 
 
 @pytest.mark.asyncio
@@ -384,7 +384,7 @@ async def test_decide_permission_ask_defers_to_elicitation() -> None:
 
     ex._policy_evaluator = AsyncMock(return_value=_V())
     ex._elicitation_handler = AsyncMock(return_value=True)
-    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is True
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (True, None)
     ex._elicitation_handler.assert_awaited_once()
 
 
@@ -396,7 +396,7 @@ async def test_decide_permission_ask_without_handler_fails_closed() -> None:
         action = "POLICY_ACTION_ASK"
 
     ex._policy_evaluator = AsyncMock(return_value=_V())
-    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is False
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) == (False, None)
 
 
 def _seed_tool_call(ex: AcpExecutor) -> dict[str, object]:
@@ -434,7 +434,7 @@ async def test_decide_permission_policy_sees_the_real_tool_call() -> None:
         action = "POLICY_ACTION_DENY"
 
     ex._policy_evaluator = AsyncMock(return_value=_V())
-    assert await ex._decide_permission(params) is False
+    assert await ex._decide_permission(params) == (False, None)
     ex._policy_evaluator.assert_awaited_once_with(
         "PHASE_TOOL_CALL",
         {"name": "Ran command", "arguments": {"command": "rm -rf build"}},
@@ -452,8 +452,185 @@ async def test_decide_permission_card_names_the_tool() -> None:
     params = _seed_tool_call(ex)
     ex._elicitation_handler = AsyncMock(return_value=True)
 
-    assert await ex._decide_permission(params) is True
+    assert await ex._decide_permission(params) == (True, None)
     ex._elicitation_handler.assert_awaited_once_with("Ran command", {"command": "rm -rf build"})
+
+
+# ---------------------------------------------------------------------------
+# Scoped approval: the agent's own permission options
+# ---------------------------------------------------------------------------
+
+
+def _agent_options() -> list[dict[str, str]]:
+    """Devin-shaped options: allow-once, two scoped always-allows, and a reject.
+
+    Order is the agent's own — narrowest first — and is preserved on the card so
+    the least-privilege choice leads.
+    """
+    return [
+        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+        {
+            "optionId": "allow_session",
+            "name": "Yes, allow `ls` commands (this session)",
+            "kind": "allow_always",
+        },
+        {
+            "optionId": "allow_always_global",
+            "name": "Yes, always allow `ls` commands in all projects",
+            "kind": "allow_always",
+        },
+        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+    ]
+
+
+def test_acp_executor_accepts_the_choice_bridge() -> None:
+    """The attribute the adapter installs by name exists, and starts unwired.
+
+    The executor half of a cross-layer contract: the adapter gates its install on
+    this attribute (see ``tests/runtime/harnesses/test_executor_adapter.py``), so a
+    rename here would silently disable scoped approval.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    assert ex._elicitation_choice_handler is None
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_offers_the_agents_own_scopes() -> None:
+    """The card gets every option the agent offered, in the agent's order.
+
+    **What breaks if this fails**: the user is back to Approve/Reject and each
+    grant is once-scoped, so the same command class re-prompts indefinitely.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {
+        "toolCall": {"title": "shell", "rawInput": {"command": "ls"}},
+        "options": _agent_options(),
+    }
+    ex._elicitation_choice_handler = AsyncMock(
+        return_value="Yes, allow `ls` commands (this session)"
+    )
+
+    assert await ex._decide_permission(params) == (True, "allow_session")
+    ex._elicitation_choice_handler.assert_awaited_once_with(
+        "shell",
+        {"command": "ls"},
+        [
+            "Allow",
+            "Yes, allow `ls` commands (this session)",
+            "Yes, always allow `ls` commands in all projects",
+            "Reject",
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_scoped_choice_reaches_the_agent_as_that_option() -> None:
+    """End of the chain: the agent is told the exact scope the user picked.
+
+    Mirrors the call site (``_decide_permission`` then ``_permission_outcome``),
+    because the scope only takes effect if it survives into the reply — the agent
+    is what honors it and stops asking.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {"toolCall": {"title": "shell"}, "options": _agent_options()}
+    ex._elicitation_choice_handler = AsyncMock(
+        return_value="Yes, allow `ls` commands (this session)"
+    )
+
+    allow, option_id = await ex._decide_permission(params)
+    assert ex._permission_outcome(params, allow=allow, option_id=option_id) == {
+        "outcome": {"outcome": "selected", "optionId": "allow_session"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_choice_reject_denies() -> None:
+    """Picking the agent's own reject option denies, and names that option."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {"toolCall": {"title": "shell"}, "options": _agent_options()}
+    ex._elicitation_choice_handler = AsyncMock(return_value="Reject")
+
+    assert await ex._decide_permission(params) == (False, "reject_once")
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_choice_declined_denies() -> None:
+    """A dismissed / timed-out choice card denies, with no scope."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {"toolCall": {"title": "shell"}, "options": _agent_options()}
+    ex._elicitation_choice_handler = AsyncMock(return_value=None)
+
+    assert await ex._decide_permission(params) == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_choice_not_offered_denies() -> None:
+    """A label the agent never offered fails closed rather than guessing."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {"toolCall": {"title": "shell"}, "options": _agent_options()}
+    ex._elicitation_choice_handler = AsyncMock(return_value="Yes, do whatever you like")
+
+    assert await ex._decide_permission(params) == (False, None)
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_needs_a_reject_option_for_a_choice_card() -> None:
+    """Without a reject option the binary card is used instead.
+
+    A choice card replaces Approve/Reject with the agent's options, so offering
+    only allow-shaped ones would leave the user no way to say no.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {
+        "toolCall": {"title": "shell"},
+        "options": [
+            {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+            {"optionId": "allow_session", "name": "Allow this session", "kind": "allow_always"},
+        ],
+    }
+    ex._elicitation_choice_handler = AsyncMock(return_value="Allow this session")
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    assert await ex._decide_permission(params) == (True, None)
+    ex._elicitation_choice_handler.assert_not_awaited()
+    ex._elicitation_handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_falls_back_on_duplicate_labels() -> None:
+    """Two options sharing a label are ambiguous, since the reply names the label."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    params = {
+        "toolCall": {"title": "shell"},
+        "options": [
+            {"optionId": "a1", "name": "Allow", "kind": "allow_once"},
+            {"optionId": "a2", "name": "Allow", "kind": "allow_always"},
+            {"optionId": "r1", "name": "Reject", "kind": "reject_once"},
+        ],
+    }
+    ex._elicitation_choice_handler = AsyncMock(return_value="Allow")
+    ex._elicitation_handler = AsyncMock(return_value=True)
+
+    assert await ex._decide_permission(params) == (True, None)
+    ex._elicitation_choice_handler.assert_not_awaited()
+
+
+def test_permission_outcome_honors_a_chosen_scope() -> None:
+    """A user-picked option is echoed verbatim, overriding the once-scoped default."""
+    params = {"options": _agent_options()}
+    out = AcpExecutor._permission_outcome(params, allow=True, option_id="allow_session")
+    assert out == {"outcome": {"outcome": "selected", "optionId": "allow_session"}}
+
+
+def test_permission_outcome_ignores_an_unoffered_scope() -> None:
+    """An id the agent didn't offer is never echoed; the safe default applies.
+
+    Guards against sending the agent an option it can't honor — or a broader one
+    than it advertised — if a stale or hand-crafted id ever reaches here.
+    """
+    params = {"options": _agent_options()}
+    out = AcpExecutor._permission_outcome(params, allow=True, option_id="made_up")
+    assert out == {"outcome": {"outcome": "selected", "optionId": "allow_once"}}
 
 
 # ---------------------------------------------------------------------------
