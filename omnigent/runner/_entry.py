@@ -787,6 +787,9 @@ class _ManagedMintTokenFactory:
         self._server_url = server_url
         self._binding_token = binding_token
         self._proxy_bearer = proxy_bearer
+        # Set once the host bearer has been dropped after a 401/403, so the
+        # retry-without-it happens at most once per factory.
+        self._proxy_bearer_retired = False
         self._cached_token: str | None = None
         self._cached_expires_at = 0.0
         self.declined = False
@@ -831,11 +834,28 @@ class _ManagedMintTokenFactory:
                     return None
                 return self._still_valid_cached_token(now)
             if response.status_code in (401, 403):
-                # The proxy bearer is expired or invalid. If we have never
-                # successfully minted, there is no self-sustaining refresh
-                # loop to fall back to — signal proxy_auth_failed so the
-                # caller can try SDK/OIDC instead of looping on a dead bearer.
-                if self._cached_token is None:
+                # The proxy bearer is expired or invalid.
+                #
+                # The host's initial SP bearer is captured once at construction
+                # and has its own, shorter, lifetime than the session. Once it
+                # expires, every mint 401s. Retry ONCE without it: the minted
+                # owner JWT is the credential the mint endpoint actually
+                # authenticates, so dropping the dead proxy bearer turns the
+                # factory into a self-sustaining refresh loop instead of
+                # wedging the runner for the rest of the session.
+                if self._proxy_bearer is not None and not self._proxy_bearer_retired:
+                    self._proxy_bearer_retired = True
+                    _logger.info(
+                        "managed mint rejected the host bearer; retiring it and "
+                        "re-minting with the runner's own credential"
+                    )
+                    self._proxy_bearer = None
+                    return self()
+                # No proxy bearer left to drop. Without a still-valid cached
+                # token there is no self-sustaining loop to fall back to, so
+                # signal proxy_auth_failed and let the caller try SDK/OIDC
+                # rather than looping on a dead credential.
+                if self._still_valid_cached_token(now) is None:
                     self.proxy_auth_failed = True
                     return None
             return self._still_valid_cached_token(now)
