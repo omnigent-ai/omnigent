@@ -22,7 +22,10 @@ export function ChatPlanAccordion({ className }: { className?: string }) {
     // Full-width layout row with side gutters; the card centers on the chat
     // column so it lines up with the message thread below.
     <div className={cn("shrink-0 px-3 md:px-4", className)}>
-      <details className="group mx-auto max-w-3xl overflow-hidden rounded-xl border border-accent-foreground/20 bg-card shadow-sm mb-1">
+      <details
+        data-testid="plan-tracker"
+        className="group mx-auto max-w-3xl overflow-hidden rounded-xl border border-accent-foreground/20 bg-card shadow-sm mb-1"
+      >
         <summary className="flex cursor-pointer list-none select-none items-center gap-2 bg-accent px-3 py-2 text-ui font-medium text-accent-foreground [&::-webkit-details-marker]:hidden">
           <ListTodoIcon className="size-4 shrink-0" />
           <span>Plan</span>
