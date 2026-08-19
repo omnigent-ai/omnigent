@@ -15,6 +15,7 @@ from omnigent.claude_native_bridge import (
     SWITCH_MODEL_DIALOG_HINT,
     inject_slash_command,
     inject_user_message,
+    is_auth_slash_command,
     read_active_session_id,
     read_claude_status_model,
     read_launch_model,
@@ -146,6 +147,23 @@ class ClaudeNativeExecutor(Executor):
         text = _latest_user_text(messages, self._bridge_dir)
         if not text:
             yield ExecutorError(message="Claude native turn had no user text to send")
+            return
+        if is_auth_slash_command(text):
+            # Claude Code's sign-in flow is an interactive TUI handoff the
+            # bridge cannot drive, so /login is escaped into plain text and
+            # reaches the model as a prompt. An expired login answers it with
+            # "Login expired · Please run /login" — a loop. Point at the host
+            # command that does re-authenticate instead of typing anything.
+            # `omni setup` covers both directions: its harness menu signs in
+            # (`claude auth login --claudeai`) and signs out (`claude auth
+            # logout`), so one pointer serves /login and /logout alike.
+            yield ExecutorError(
+                message=(
+                    "Claude Code's sign-in runs in its own terminal, so /login and "
+                    "/logout do nothing from the web chat. Run omni setup on the host "
+                    "to sign in again — or to sign out — then retry."
+                )
+            )
             return
         from omnigent.runtime import telemetry
 
