@@ -1589,18 +1589,23 @@ async def _forward_available_subagents(
 
         # Quiescence-based status. Sub-agent transcripts don't carry
         # an explicit "done" record (Claude doesn't expose one), so
-        # we infer "running" from item flow and "idle" from quiet
-        # time. The dedupe on ``last_status`` avoids spamming the
-        # cache on every tick when nothing changed.
+        # we infer "running" from item flow and quiescence from quiet
+        # time. The quiescence edge posts as "quiesced" — a BADGE
+        # signal only: any >5s transcript gap (a long Bash, a slow
+        # WebFetch, a stalled tool) used to post "idle", which the
+        # runner consumed as an authoritative terminal completion,
+        # latching the inbox entry delivered and discarding the sub-
+        # agent's real result (#4988). The dedupe on
+        # ``last_status`` avoids spamming the cache on every tick.
         desired_status: str | None = None
         if had_item:
             desired_status = "running"
         elif (
             new_entry.last_activity_ts is not None
             and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
-            and new_entry.last_status != "idle"
+            and new_entry.last_status != "quiesced"
         ):
-            desired_status = "idle"
+            desired_status = "quiesced"
         if desired_status is not None and desired_status != new_entry.last_status:
             retry_key = f"subagent_status:{entry.child_conversation_id}"
             if status_retry_tracker.retry_delay_s(retry_key) is None:
