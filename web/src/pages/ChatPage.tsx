@@ -2282,7 +2282,10 @@ function MainAgentSurface({
 
 function HydratingPlaceholder() {
   return (
-    <div className="flex flex-1 items-center justify-center gap-2 text-muted-foreground text-ui">
+    <div
+      data-testid="hydrating-placeholder"
+      className="flex flex-1 items-center justify-center gap-2 text-muted-foreground text-ui"
+    >
       <Loader2Icon className="size-4 animate-spin" />
       Loading conversation…
     </div>
