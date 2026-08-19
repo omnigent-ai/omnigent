@@ -803,6 +803,61 @@ async def test_health_unbound_fork_of_coding_session_reads_offline(
     assert sessions[chat_fork.id]["runner_online"] is True
 
 
+@pytest.mark.asyncio
+async def test_health_unbound_imported_session_reads_offline(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """
+    An unbound imported transcript reads offline; a plain session online.
+
+    Both are unbound (no runner, no host). The ``omnigent.import.source``
+    label is the difference: an import has no live executor anywhere, so it
+    must launch a runner on a host first and reads ``runner_online: false``
+    (routing the open view to the resume picker). A plain unbound session
+    resumes in-process and stays online. Regression guard for the
+    ``imported`` branch of ``_bulk_session_liveness``.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    host_store = HostStore(db_uri)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+
+    imported = conversation_store.create_conversation()
+    conversation_store.set_labels(imported.id, {"omnigent.import.source": "claude"})
+    plain = conversation_store.create_conversation()
+
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        host_store=host_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+    )
+    ids = f"{imported.id},{plain.id}"
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get(f"/health?session_ids={ids}")
+
+    assert resp.status_code == 200
+    sessions = resp.json()["sessions"]
+    # Imported → offline (needs a host). A True here means the unbound branch
+    # ignored the import marker (the pre-fix behavior).
+    assert sessions[imported.id]["runner_online"] is False
+    # Plain unbound session → reachable in-process.
+    assert sessions[plain.id]["runner_online"] is True
+
+
 @dataclass(frozen=True)
 class _SeedStores:
     """

@@ -979,6 +979,27 @@ const BACKGROUND_FLUSH_COOLDOWN_MS = 5_000;
 const backgroundFlushInFlight = new Set<string>();
 const backgroundFlushCooldownUntil = new Map<string, number>();
 
+// Failure-scoped backoff for the silent sticky-apply PATCHes (effort/model): if
+// the backend errors they never persist and would re-fire on every rebind, so a
+// failure pauses them and the next success resumes. Reset in initChatStore.
+const STICKY_APPLY_BACKOFF_MS = 30_000;
+let stickyApplyBackoffUntil = 0;
+
+// Silent sticky applies pause for a cooldown after any failure — treated as a
+// transient backend-wide hiccup (a 404 here means the permission check didn't
+// succeed, a flaky permission service, not that the session is gone), so one
+// failure pauses every session. Explicit /model and /effort picks aren't gated.
+function stickyApplyBlocked(): boolean {
+  return Date.now() < stickyApplyBackoffUntil;
+}
+
+// Arm on failure only; the gate reopens by time, never on a success. During an
+// outage the ~10% of requests that succeed must not flap the gate open and leak
+// a fresh apply each time.
+function armStickyApplyBackoff(): void {
+  stickyApplyBackoffUntil = Date.now() + STICKY_APPLY_BACKOFF_MS;
+}
+
 // Remembers each File's successful upload so a retry reuses the server-assigned
 // file_id instead of re-uploading the blob (which would orphan the prior one).
 // Retries re-send the same File objects — background flush re-queues them on a
@@ -1112,6 +1133,7 @@ export function initChatStore(client: QueryClient): void {
   workspaceInvalidationTimers.clear();
   backgroundFlushInFlight.clear();
   backgroundFlushCooldownUntil.clear();
+  stickyApplyBackoffUntil = 0;
   // Drop every live conversation: their streams must not outlive the app (or,
   // in tests, leak into the next case).
   conversationRegistry.clear();
@@ -1547,12 +1569,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(selfAuthor !== null ? { author: selfAuthor } : {}),
         },
       ],
-      // A new turn supersedes the prior turn's background-shell tally: the
-      // "N background tasks still running" label must give way to "Working…" the
-      // moment the user sends, not linger until the next status edge. The
-      // count is sticky (see the `session_status` handler) precisely so a
-      // trailing idle can't wipe it, so it has to be cleared explicitly here.
-      backgroundTaskCount: 0,
+      // A new turn does NOT supersede the background-shell tally: shells
+      // launched in an earlier turn keep running across the turn boundary, so
+      // the composer pill must stay lit alongside the "Working…" shimmer rather
+      // than blink off the moment the user sends. The count is sticky (see the
+      // `session_status` handler) and the next Stop hook re-reports it
+      // authoritatively. Only the parked-dialog reason clears — a fresh send is
+      // not parked on a dialog.
       blockedOn: null,
     }));
 
@@ -3074,22 +3097,29 @@ async function bindStream(
       !routingOn &&
       nativeModelFamily !== null &&
       session.modelOverride == null &&
-      compatibleStickyModel != null;
+      compatibleStickyModel != null &&
+      // While cooling down we skip the PATCH, so don't let the /model readout
+      // claim an override the server won't have — effectiveSessionOverride stays
+      // null, matching the un-persisted server truth.
+      !stickyApplyBlocked();
     const effectiveSessionOverride =
       session.modelOverride ?? (willApplyStickyModel ? compatibleStickyModel : null);
     if (
       !isSubAgentSession &&
       canApplyEffort &&
       session.reasoningEffort == null &&
-      stickyEffort != null
+      stickyEffort != null &&
+      !stickyApplyBlocked()
     ) {
       updateSession(id, { reasoningEffort: stickyEffort }).catch((err: unknown) => {
+        armStickyApplyBackoff();
         console.warn(`Failed to apply sticky effort=${stickyEffort} to session ${id}:`, err);
       });
     }
     if (willApplyStickyModel) {
       updateSession(id, { modelOverride: compatibleStickyModel, silent: true }).catch(
         (err: unknown) => {
+          armStickyApplyBackoff();
           console.warn(
             `Failed to apply sticky model=${compatibleStickyModel} to session ${id}:`,
             err,
@@ -4923,9 +4953,10 @@ async function refetchRunnerBackedSessionState(
     }
   }
   setterFor(conversationId)(statePatch);
-  if (stickyModel != null && !alreadyApplied) {
+  if (stickyModel != null && !alreadyApplied && !stickyApplyBlocked()) {
     updateSession(conversationId, { modelOverride: stickyModel, silent: true }).catch(
       (err: unknown) => {
+        armStickyApplyBackoff();
         console.warn(
           `Failed to apply delayed sticky model=${stickyModel} to session ${conversationId}:`,
           err,
@@ -5278,11 +5309,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // after it appeared. So: an explicit count is authoritative (a Stop
         // hook's `0` clears it, so a finished shell drops the indicator on the
         // next turn end; a positive count sets it); `undefined` leaves it
-        // untouched; and a new turn (`running`) or a failure clears it —
-        // mirroring the server's `_publish_status`.
+        // untouched. A new `running` turn does NOT clear it — background shells
+        // outlive turn boundaries, so the pill stays lit alongside the "Working…"
+        // shimmer and the next Stop hook re-reports authoritatively. Only a
+        // failure clears it (a dead session may never post another count to drop
+        // a stale tally). Mirrors the server's `_publish_status`.
         if (event.backgroundTaskCount !== undefined) {
           patch.backgroundTaskCount = event.backgroundTaskCount;
-        } else if (event.status === "running" || event.status === "failed") {
+        } else if (event.status === "failed") {
           patch.backgroundTaskCount = 0;
         }
         if (event.responseId !== undefined && event.status === "running") {
