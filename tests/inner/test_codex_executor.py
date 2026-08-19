@@ -3575,6 +3575,7 @@ def test_app_server_run_turn_fails_fast_on_gateway_auth_error():
             side_effect=[
                 {"result": {"thread": {"id": "thread-1"}}},
                 {"result": {"turn": {"id": "turn-1"}}},
+                {"result": {}},
             ]
         )
 
@@ -3609,6 +3610,10 @@ def test_app_server_run_turn_fails_fast_on_gateway_auth_error():
         assert "databricks-gpt-5" in message
         assert "wedged LLM" not in message
         assert errors[-1].retryable is False
+        session._request.assert_any_await(
+            "turn/interrupt",
+            {"threadId": "thread-1", "turnId": "turn-1"},
+        )
         native_forwarder_health.clear()
 
     _run(_t())

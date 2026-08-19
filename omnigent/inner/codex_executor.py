@@ -2631,6 +2631,10 @@ class _CodexAppServerSession:
                     event_task.cancel()
                     with suppress(BaseException):
                         await event_task
+                    try:
+                        await asyncio.wait_for(self.interrupt_turn(), timeout=0.5)
+                    except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
+                        logger.debug("Codex auth-failure turn interrupt failed: %s", exc)
                     yield ExecutorError(
                         message=fatal_gateway_error.detail(model=model), retryable=False
                     )
