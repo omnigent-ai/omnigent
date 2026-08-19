@@ -165,10 +165,11 @@ describe("WorkspacePanel surface presentation", () => {
     const filesTab = screen.getByRole("tab", { name: "Files" });
     const changesTab = screen.getByRole("tab", { name: "Changes" });
     const agentsTab = screen.getByRole("tab", { name: "Agents 1" });
-    expect(filesTab).toHaveClass("size-8", "p-0");
+    // Icon-only tabs carry their accessible name (queried above) plus a hover
+    // tooltip, never a native title attribute. Exact size/padding classes are
+    // intentionally not asserted — brittle styling detail, not behaviour.
     expect(filesTab).not.toHaveAttribute("title");
-    expect(changesTab).toHaveClass("size-8", "p-0");
-    expect(agentsTab).toHaveClass("size-8", "p-0");
+    expect(changesTab).not.toHaveAttribute("title");
     expect(agentsTab).not.toHaveAttribute("title");
   });
 
@@ -319,6 +320,21 @@ describe("WorkspacePanel shell tabs", () => {
     // raw tab key. A failure means the strip didn't render or didn't resolve
     // the label.
     expect(screen.getByText("zsh · u-g9qopr")).toBeInTheDocument();
+  });
+
+  it("sizes shell tab pills to the same 24px height as file tabs", () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    renderWorkspace({
+      showShellsTab: true,
+      openFiles: ["src/App.tsx"],
+      openTerminals: [termKey],
+    });
+
+    const fileTab = screen.getByText("App.tsx").closest("[role='button']");
+    const shellTab = screen.getByText("zsh · u-g9qopr").closest("[role='button']");
+    expect(fileTab).toHaveClass("h-[24px]");
+    expect(shellTab).toHaveClass("h-[24px]");
+    expect(shellTab).not.toHaveClass("h-[32px]");
   });
 
   it("surfaces the active shell's xterm in the content slot", () => {

@@ -99,6 +99,15 @@ _LLM_NAME_TOKENS = ("claude", "gpt", "codex", "gemini", "llama", "qwen", "kimi")
 # Chat-capable endpoint tasks ("llm/v1/chat"); embeddings/rerankers don't match.
 _LLM_TASK_TOKENS = ("chat", "completion")
 
+# DATABRICKS-PATCH(model-services-scoped-listing): scope + page the Unity
+# Catalog model-services listing. Mirrors
+# ``databricks_model_discovery._MODEL_SERVICES_PARENT`` /
+# ``_MODEL_SERVICES_MAX_RESULTS`` — including the parameter *name*, so both
+# callers of this endpoint ask for a page size the API actually honors.
+_MODEL_SERVICES_PARENT = "schemas/system.ai"
+_MODEL_SERVICES_MAX_RESULTS = 100
+_MODEL_SERVICES_MAX_PAGES = 100
+
 _ProviderHarness: TypeAlias = Literal[
     "claude-sdk",
     "codex",
@@ -1222,16 +1231,61 @@ def fetch_databricks_model_service_entries(
     :returns: LLM model-service entries with normalized wire metadata.
     :raises httpx.HTTPError: On transport or HTTP failures.
     """
+    # DATABRICKS-PATCH(model-services-scoped-listing)
+    # The listing must be scoped to the `system.ai` schema and paged. Unscoped,
+    # the endpoint walks the WHOLE metastore and returns one page of whatever
+    # schemas sort first — on a busy workspace that is a slice of unrelated user
+    # schemas with a `next_page_token` this call never followed, so a workspace
+    # serving 53 Databricks models reported 2 and zero Claude entries. Same
+    # scoping `databricks_model_discovery._list_model_service_ids` already uses.
+    services: list[object] = []
+    page_token: str | None = None
+    seen_tokens: set[str] = set()
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
-        resp = client.get(
-            f"{workspace_url.rstrip('/')}/api/2.1/unity-catalog/model-services",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-    services = payload.get("model_services") if isinstance(payload, dict) else None
+        for _ in range(_MODEL_SERVICES_MAX_PAGES):
+            params = {
+                "parent": _MODEL_SERVICES_PARENT,
+                "max_results": str(_MODEL_SERVICES_MAX_RESULTS),
+            }
+            if page_token is not None:
+                params["page_token"] = page_token
+            resp = client.get(
+                f"{workspace_url.rstrip('/')}/api/2.1/unity-catalog/model-services",
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            page = payload.get("model_services") if isinstance(payload, dict) else None
+            if isinstance(page, list):
+                services.extend(page)
+            raw_next = payload.get("next_page_token") if isinstance(payload, dict) else None
+            if not isinstance(raw_next, str) or not raw_next:
+                break
+            if raw_next in seen_tokens:
+                # A repeated token means the endpoint is looping. Keep the pages
+                # already collected instead of raising (which is what the
+                # sibling ``_list_model_service_ids`` does): every caller here
+                # treats an exception as "no listing" and falls back to the
+                # bundled catalog's retired ``databricks-`` ids, so failing loud
+                # would reintroduce the 501 this patch exists to remove. A
+                # partial ``system.ai`` list still launches.
+                _logger.warning(
+                    "Databricks model-services pagination repeated a page token; "
+                    "returning the %d entries collected so far",
+                    len(services),
+                )
+                break
+            seen_tokens.add(raw_next)
+            page_token = raw_next
+        else:
+            _logger.warning(
+                "Databricks model-services listing truncated after %d pages; "
+                "the model list may be incomplete",
+                _MODEL_SERVICES_MAX_PAGES,
+            )
     models: list[ModelEntry] = []
-    for service in services if isinstance(services, list) else []:
+    for service in services:
         if not isinstance(service, dict):
             continue
         raw_name = service.get("name")

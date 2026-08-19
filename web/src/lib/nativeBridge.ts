@@ -223,6 +223,13 @@ export interface HostIdentity {
 export interface HostActionResult {
   ok: boolean;
   error?: string;
+  /**
+   * True when the failure was an authentication/sign-in problem — e.g. the
+   * server needs a Databricks/OIDC login the desktop couldn't complete
+   * headlessly — so the UI can offer a sign-in/retry affordance rather than a
+   * generic error. Set by the desktop's `omnigent:host-control` handler.
+   */
+  authError?: boolean;
 }
 
 export type UpdateMode = "none" | "manual" | "start" | "default";

@@ -979,6 +979,27 @@ const BACKGROUND_FLUSH_COOLDOWN_MS = 5_000;
 const backgroundFlushInFlight = new Set<string>();
 const backgroundFlushCooldownUntil = new Map<string, number>();
 
+// Failure-scoped backoff for the silent sticky-apply PATCHes (effort/model): if
+// the backend errors they never persist and would re-fire on every rebind, so a
+// failure pauses them and the next success resumes. Reset in initChatStore.
+const STICKY_APPLY_BACKOFF_MS = 30_000;
+let stickyApplyBackoffUntil = 0;
+
+// Silent sticky applies pause for a cooldown after any failure — treated as a
+// transient backend-wide hiccup (a 404 here means the permission check didn't
+// succeed, a flaky permission service, not that the session is gone), so one
+// failure pauses every session. Explicit /model and /effort picks aren't gated.
+function stickyApplyBlocked(): boolean {
+  return Date.now() < stickyApplyBackoffUntil;
+}
+
+// Arm on failure only; the gate reopens by time, never on a success. During an
+// outage the ~10% of requests that succeed must not flap the gate open and leak
+// a fresh apply each time.
+function armStickyApplyBackoff(): void {
+  stickyApplyBackoffUntil = Date.now() + STICKY_APPLY_BACKOFF_MS;
+}
+
 // Remembers each File's successful upload so a retry reuses the server-assigned
 // file_id instead of re-uploading the blob (which would orphan the prior one).
 // Retries re-send the same File objects — background flush re-queues them on a
@@ -1112,6 +1133,7 @@ export function initChatStore(client: QueryClient): void {
   workspaceInvalidationTimers.clear();
   backgroundFlushInFlight.clear();
   backgroundFlushCooldownUntil.clear();
+  stickyApplyBackoffUntil = 0;
   // Drop every live conversation: their streams must not outlive the app (or,
   // in tests, leak into the next case).
   conversationRegistry.clear();
@@ -3074,22 +3096,29 @@ async function bindStream(
       !routingOn &&
       nativeModelFamily !== null &&
       session.modelOverride == null &&
-      compatibleStickyModel != null;
+      compatibleStickyModel != null &&
+      // While cooling down we skip the PATCH, so don't let the /model readout
+      // claim an override the server won't have — effectiveSessionOverride stays
+      // null, matching the un-persisted server truth.
+      !stickyApplyBlocked();
     const effectiveSessionOverride =
       session.modelOverride ?? (willApplyStickyModel ? compatibleStickyModel : null);
     if (
       !isSubAgentSession &&
       canApplyEffort &&
       session.reasoningEffort == null &&
-      stickyEffort != null
+      stickyEffort != null &&
+      !stickyApplyBlocked()
     ) {
       updateSession(id, { reasoningEffort: stickyEffort }).catch((err: unknown) => {
+        armStickyApplyBackoff();
         console.warn(`Failed to apply sticky effort=${stickyEffort} to session ${id}:`, err);
       });
     }
     if (willApplyStickyModel) {
       updateSession(id, { modelOverride: compatibleStickyModel, silent: true }).catch(
         (err: unknown) => {
+          armStickyApplyBackoff();
           console.warn(
             `Failed to apply sticky model=${compatibleStickyModel} to session ${id}:`,
             err,
@@ -4923,9 +4952,10 @@ async function refetchRunnerBackedSessionState(
     }
   }
   setterFor(conversationId)(statePatch);
-  if (stickyModel != null && !alreadyApplied) {
+  if (stickyModel != null && !alreadyApplied && !stickyApplyBlocked()) {
     updateSession(conversationId, { modelOverride: stickyModel, silent: true }).catch(
       (err: unknown) => {
+        armStickyApplyBackoff();
         console.warn(
           `Failed to apply delayed sticky model=${stickyModel} to session ${conversationId}:`,
           err,

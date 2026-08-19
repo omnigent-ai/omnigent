@@ -70,7 +70,7 @@ from omnigent.inner import _proc, ui
 from omnigent.integration_daemon import IntegrationDaemon
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
-from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR, data_dir
+from omnigent.process_logging import LOG_LEVEL_ENV_VAR, LOG_TO_STDERR_ENV_VAR, data_dir, env_truthy
 
 if TYPE_CHECKING:
     import socket
@@ -1930,6 +1930,44 @@ def _warn_deprecated_harness_path_env_vars() -> None:
         )
 
 
+REQUIRE_WRAPPER_ENV = "OMNIGENT_REQUIRE_WRAPPER"
+WRAPPER_COMMAND_ENV = "OMNIGENT_WRAPPER_COMMAND"
+WRAPPER_BYPASS_ENV = "OMNIGENT_WRAPPER_BYPASS"
+
+
+def _wrapper_guard_error(env: Mapping[str, str], prog: str) -> str | None:
+    """Return the block message when a naked ``omni`` call is refused, else ``None``.
+
+    A deployment that wraps the CLI (e.g. ``isaac omni``) sets
+    ``OMNIGENT_REQUIRE_WRAPPER`` so direct calls are refused; the wrapper sets
+    ``OMNIGENT_WRAPPER_BYPASS`` around its own invocation to pass through, and
+    ``OMNIGENT_WRAPPER_COMMAND`` names the command to suggest instead.
+    """
+    if not env_truthy(env.get(REQUIRE_WRAPPER_ENV)):
+        return None
+    if env_truthy(env.get(WRAPPER_BYPASS_ENV)):
+        return None
+    redirect = (env.get(WRAPPER_COMMAND_ENV) or "").strip()
+    if redirect:
+        detail = f"Use `{redirect}` instead, or set {WRAPPER_BYPASS_ENV}=1 to run it directly."
+    else:
+        detail = f"Set {WRAPPER_BYPASS_ENV}=1 to run it directly."
+    return f"Error: running `{prog}` directly is disabled in this environment.\n{detail}"
+
+
+def _enforce_wrapper_guard() -> None:
+    """Exit early when a naked ``omni``/``omnigent`` call is blocked by an operator."""
+    # argv[0] is the console-script name (``omni``/``omnigent``); ``python -m
+    # omnigent`` reports ``__main__.py``, so fall back to the canonical name.
+    prog = os.path.basename(sys.argv[0])
+    if not prog or prog == "__main__.py":
+        prog = "omnigent"
+    message = _wrapper_guard_error(os.environ, prog)
+    if message is not None:
+        click.echo(message, err=True)
+        raise SystemExit(2)
+
+
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.
@@ -1960,6 +1998,11 @@ def main() -> None:
     from omnigent.crash_handler import install_crash_handler
 
     install_crash_handler(app_name="omnigent", repo="omnigent-ai/omnigent")
+
+    # Operators can force all use through a wrapper (e.g. `isaac omni`) by
+    # setting OMNIGENT_REQUIRE_WRAPPER; the wrapper sets OMNIGENT_WRAPPER_BYPASS
+    # to pass through. Refuse naked calls before any work happens.
+    _enforce_wrapper_guard()
 
     cwd = os.getcwd()
     if cwd not in sys.path:

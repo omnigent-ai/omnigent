@@ -2326,15 +2326,21 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
           tab's left edge lines up with the inline shimmer's. */}
       <div className={cn("mx-auto w-full px-4", CHAT_COLUMN_WIDTH)}>
         {showShimmer && (
-          // Tab shape (rounded top, no bottom border, composer-matching bg) so
-          // its flat bottom edge merges into the chat box. aria-hidden: the
-          // sr-only span above owns the announcement, so the rotating label
-          // here stays silent to screen readers. Collapses to sr-only when at
-          // the bottom (`!visible`) — the inline shimmer paints there instead.
+          // Tab shape (rounded top, no bottom border) so its flat bottom edge
+          // merges into the composer. bg-card-solid, not bg-card: in dark mode
+          // bg-card is a translucent glass surface (the `.dark .bg-card` frosted
+          // backdrop-blur), so the tab read as a see-through pill floating over
+          // the transcript. The opaque solid keeps it readable and, by not
+          // matching the glass rule, lets `border-b-0` actually merge — that
+          // rule's `border` shorthand would otherwise re-add a bottom edge.
+          // aria-hidden: the sr-only span above owns the announcement, so the
+          // rotating label here stays silent to screen readers. Collapses to
+          // sr-only when at the bottom (`!visible`) — the inline shimmer paints
+          // there instead.
           <div
             aria-hidden="true"
             className={cn(
-              "flex w-fit items-center gap-1.5 rounded-t-lg border border-b-0 border-border bg-card px-3 pt-1 pb-1.5",
+              "flex w-fit items-center gap-1.5 rounded-t-lg border border-b-0 border-border bg-card-solid px-3 pt-1 pb-1.5",
               !visible && "sr-only",
             )}
           >
