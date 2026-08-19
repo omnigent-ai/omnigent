@@ -2182,16 +2182,20 @@ export function NewChatLandingScreen() {
   // Project driving this visit, when the sidebar's per-project "new session"
   // pencil landed here with a `?project=` query param. Empty otherwise.
   const projectParam = searchParams.get("project") ?? "";
+  // Project pencil visits must not restore host/workspace/agent from a prior
+  // general New-session draft — those slots belong to the project's stored
+  // defaults (or the composer's generic fallbacks). Message/files still restore.
+  const restoreLocationDraft = projectParam === "";
   // Seeded from the persisted last pick so a returning user starts on the
   // agent they used last; validated against the live list in
   // effectiveAgentId below (a stale id falls back to the default). A
   // project-driven visit defers to the project-prefill effect instead
   // (which falls back to the same last pick).
-  const [pickedAgentId, setPickedAgentId] = useState<string | null>(
-    () => landingDraft?.pickedAgentId ?? (projectParam !== "" ? null : readLastAgentId()),
+  const [pickedAgentId, setPickedAgentId] = useState<string | null>(() =>
+    restoreLocationDraft ? (landingDraft?.pickedAgentId ?? readLastAgentId()) : null,
   );
-  const [selectedHostId, setSelectedHostId] = useState<string | null>(
-    () => landingDraft?.selectedHostId ?? null,
+  const [selectedHostId, setSelectedHostId] = useState<string | null>(() =>
+    restoreLocationDraft ? (landingDraft?.selectedHostId ?? null) : null,
   );
   // Sessions on the selected host — fetched only when a host is selected,
   // to avoid registering hundreds of sessions into the health poll at idle.
@@ -2199,8 +2203,8 @@ export function NewChatLandingScreen() {
   // True when the user picked the sandbox option instead of a connected
   // host — the server provisions a sandbox host at create time
   // (host_type: "managed"), so no host_id or workspace is sent.
-  const [sandboxSelected, setSandboxSelected] = useState(
-    () => landingDraft?.sandboxSelected ?? false,
+  const [sandboxSelected, setSandboxSelected] = useState(() =>
+    restoreLocationDraft ? (landingDraft?.sandboxSelected ?? false) : false,
   );
   // Provider the sandbox pick launches on. Seeded to the sticky last pick (or
   // the first offered row) once the picker rows load; null both before that
@@ -2266,14 +2270,18 @@ export function NewChatLandingScreen() {
   // Sandbox repository inputs — composed into the managed create's
   // `workspace` string (`<url>[#<branch>]`); both blank = empty
   // server-created workspace.
-  const [sandboxRepoUrl, setSandboxRepoUrl] = useState<string>(
-    () => landingDraft?.sandboxRepoUrl ?? "",
+  const [sandboxRepoUrl, setSandboxRepoUrl] = useState<string>(() =>
+    restoreLocationDraft ? (landingDraft?.sandboxRepoUrl ?? "") : "",
   );
-  const [sandboxRepoBranch, setSandboxRepoBranch] = useState<string>(
-    () => landingDraft?.sandboxRepoBranch ?? "",
+  const [sandboxRepoBranch, setSandboxRepoBranch] = useState<string>(() =>
+    restoreLocationDraft ? (landingDraft?.sandboxRepoBranch ?? "") : "",
   );
-  const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
-  const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
+  const [workspace, setWorkspace] = useState<string>(() =>
+    restoreLocationDraft ? (landingDraft?.workspace ?? "") : "",
+  );
+  const [branchName, setBranchName] = useState<string>(() =>
+    restoreLocationDraft ? (landingDraft?.branchName ?? "") : "",
+  );
   // The base branch auto-fills from the configured default (Settings › Git)
   // when the user names a worktree branch, and is left alone once the user
   // touches it — clearing the branch name re-arms the auto-fill (see the effect
@@ -2289,8 +2297,8 @@ export function NewChatLandingScreen() {
   // at. When `branchName` still equals this, the session starts directly in
   // that worktree (no git opts). Editing the field away from it means the user
   // wants a *new* worktree off that name.
-  const [prefilledBranch, setPrefilledBranch] = useState<string>(
-    () => landingDraft?.prefilledBranch ?? "",
+  const [prefilledBranch, setPrefilledBranch] = useState<string>(() =>
+    restoreLocationDraft ? (landingDraft?.prefilledBranch ?? "") : "",
   );
   // Project to file the new session under. Empty = unfiled. Stamped as the
   // `omni_project` label at create (so the row is filed from its first sidebar
