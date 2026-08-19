@@ -289,10 +289,20 @@ class MessageData(BaseModel):
         return self
 
 
+#: Max characters for a mechanically-synthesized seed title (the collapsed
+#: first user message). Well under the ``VARCHAR(768)`` column.
+MAX_CONVERSATION_TITLE_CHARS = 150
+
+#: Tighter cap for LLM-generated titles (background inference and the
+#: current-agent auto-rename API). Rejecting long model output nudges the
+#: model toward the short, 2-5 word titles the inference prompt asks for.
+MAX_LLM_TITLE_CHARS = 60
+
+
 def synthesize_conversation_title(
     content: list[dict[str, Any]],
     *,
-    limit: int = 60,
+    limit: int = MAX_CONVERSATION_TITLE_CHARS,
 ) -> str | None:
     """
     Derive a one-line conversation title from message content blocks.

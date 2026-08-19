@@ -10,7 +10,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from omnigent.entities.conversation import synthesize_conversation_title
+from omnigent.entities.conversation import (
+    MAX_LLM_TITLE_CHARS,
+    synthesize_conversation_title,
+)
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import background_title_generators
 from omnigent.stores.conversation_store import ConversationStore
@@ -56,7 +59,7 @@ def normalize_background_title(value: str | None) -> str | None:
     first_line = next((line.strip() for line in value.splitlines() if line.strip()), "")
     title = " ".join(first_line.strip(_TITLE_WRAPPERS).split())
     title = _TRAILING_PUNCTUATION.sub("", title).strip()
-    if len(title) < 2 or len(title) > 60:
+    if len(title) < 2 or len(title) > MAX_LLM_TITLE_CHARS:
         return None
     return title
 

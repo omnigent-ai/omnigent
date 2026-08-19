@@ -84,7 +84,10 @@ def test_to_api_dict_exposes_interrupted_assistant_marker() -> None:
         ([], None),
         ([{"type": "input_file", "file_id": "file_123"}], None),
         ([{"type": "input_text", "text": "   \n  "}], None),
-        ([{"type": "input_text", "text": "a" * 100}], "a" * 59 + "…"),
+        # Under the 150-char default cap: kept in full, no ellipsis.
+        ([{"type": "input_text", "text": "a" * 100}], "a" * 100),
+        # Over the cap: truncated to 149 chars + ellipsis.
+        ([{"type": "input_text", "text": "a" * 200}], "a" * 149 + "…"),
         # claude-native attachment marker (claude_native_executor
         # prepends "[Attached: <path>]\n\n<text>") — the marker line is
         # dropped so the title is the user's text, not a temp-file path.

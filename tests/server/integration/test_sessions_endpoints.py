@@ -7047,7 +7047,7 @@ async def test_external_user_message_seeds_title_on_claude_native_session(
     untitled session. The transcript forwarder's first
     ``external_conversation_item`` user-message POST must trigger
     the generic ``_seed_missing_title_from_user_message`` path and
-    populate the title with the standard first-60-char synthesis.
+    populate the title with the standard first-message synthesis.
     This pins the integration of that helper with the external-
     conversation-item route for the claude-native label combination,
     so a future refactor of either side can't silently break the
@@ -7090,7 +7090,7 @@ async def test_external_user_message_seeds_title_on_claude_native_session(
     snap = await client.get(f"/v1/sessions/{session['id']}")
     assert snap.status_code == 200
     # The synthesized title equals the first message when it already fits
-    # the first-60-char budget. If this is empty or unchanged from None,
+    # the synthesis char budget. If this is empty or unchanged from None,
     # the generic seed path didn't fire on the external_conversation_item
     # route for claude-native labels.
     assert snap.json()["title"] == first_message, (
