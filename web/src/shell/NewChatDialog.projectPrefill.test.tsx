@@ -15,7 +15,7 @@ import { useProjectConfig, useProjects } from "@/hooks/useConversations";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
-import { NewChatLandingScreen } from "./NewChatDialog";
+import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
 
 // A `?project=` visit prefills the composer from the project's STORED config
 // (host / working directory / agent / worktree). A field the config leaves
@@ -147,6 +147,7 @@ async function submitAndReadBody(): Promise<Record<string, unknown>> {
 }
 
 beforeEach(() => {
+  resetLandingDraft();
   navigateMock.mockReset();
   vi.mocked(authenticatedFetch).mockReset();
   searchParams = new URLSearchParams("project=Alpha");
@@ -177,6 +178,63 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen project prefill", () => {
+  it("applies project defaults after restoring an unfiled draft", async () => {
+    searchParams = new URLSearchParams();
+    setProjectConfig({});
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "keep this draft" },
+    });
+    const file = new File(["data"], "draft.txt", { type: "text/plain" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [file] },
+    });
+
+    cleanup();
+    searchParams = new URLSearchParams("project=Alpha");
+    vi.mocked(useHosts).mockReturnValue({
+      data: [host(), host({ host_id: "host_2", name: "build-box" })],
+    } as ReturnType<typeof useHosts>);
+    setProjectConfig({ host_id: "host_2", workspace: REPO, agent_id: "ag_other" });
+    renderLanding();
+
+    expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
+      "keep this draft",
+    );
+    expect(screen.getByText("draft.txt")).toBeTruthy();
+    const body = await submitAndReadBody();
+    expect(body.host_id).toBe("host_2");
+    expect(body.workspace).toBe(REPO);
+    expect(body.agent_id).toBe("ag_other");
+  });
+
+  it("preserves launch choices when restoring a draft for the same project", async () => {
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+
+    cleanup();
+    vi.mocked(useHosts).mockReturnValue({
+      data: [host(), host({ host_id: "host_2", name: "build-box" })],
+    } as ReturnType<typeof useHosts>);
+    setProjectConfig({
+      host_id: "host_2",
+      workspace: "/Users/corey/projects/alpha-updated",
+      agent_id: "ag_hello",
+    });
+    renderLanding();
+
+    const body = await submitAndReadBody();
+    expect(body.host_id).toBe("host_1");
+    expect(body.workspace).toBe(REPO);
+    expect(body.agent_id).toBe("ag_other");
+  });
+
   it("seeds host / workspace / agent from the stored config", async () => {
     setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
     renderLanding();

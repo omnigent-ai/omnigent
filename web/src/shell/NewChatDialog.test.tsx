@@ -2394,6 +2394,53 @@ describe("NewChatLandingScreen", () => {
     expect("git" in body).toBe(false);
   });
 
+  it("drops sandbox launch state restored from another project", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const first = renderLanding(
+      { managed_sandboxes_enabled: true, sandbox_provider: "daytona" },
+      "/?project=Beta",
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "Daytona Sandbox",
+      ),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "https://github.com/org/beta" },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-branch-input"), {
+      target: { value: "beta-branch" },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "keep sandbox draft" },
+    });
+    first.unmount();
+
+    renderLanding(
+      { managed_sandboxes_enabled: true, sandbox_provider: "modal" },
+      "/?project=Alpha",
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "Modal Sandbox",
+      ),
+    );
+    expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
+      "keep sandbox draft",
+    );
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.workspace).toBeUndefined();
+    expect(body.sandbox_provider).toBe("modal");
+  });
+
   it("carries the picked provider in the managed create when several are offered", async () => {
     // A multi-provider server renders one row per provider. Picking the
     // second (non-default) row must ride into the POST as sandbox_provider,
@@ -4277,6 +4324,23 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     openPicker();
     expect(screen.getByTestId(SMART_ROUTING_ROW)).toHaveAttribute("data-active", "true");
     expect(screen.getByTestId("new-chat-landing-agent-a1")).not.toHaveAttribute("data-active");
+  });
+
+  it("drops Smart Routing restored from another project", async () => {
+    const first = renderLanding({ smart_routing_enabled: true }, "/?project=Beta");
+    selectSmartRoutingHarness();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "keep routing draft" },
+    });
+    first.unmount();
+
+    renderLanding({ smart_routing_enabled: true }, "/?project=Alpha");
+    expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
+      "keep routing draft",
+    );
+    const { body } = await submitAndReadBody();
+    expect(body.harness_override).toBeUndefined();
+    expect(body.smart_routing_message).toBeUndefined();
   });
 
   it.each([
