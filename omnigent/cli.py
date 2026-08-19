@@ -5615,9 +5615,10 @@ def debby(run_args: tuple[str, ...]) -> None:
     """Launch debby, the bundled two-headed brainstorming agent.
 
     Shorthand for ``omnigent run`` on the packaged debby agent. Debby fans
-    every question out to both a Claude and a GPT sub-agent, so a Claude
-    and an OpenAI provider must both be configured. All ``run`` options are
-    accepted and forwarded.
+    every question out to both a Claude and a GPT sub-agent, running on the
+    claude-sdk and codex harnesses, so a provider for each must be configured
+    (``omnigent setup``) — a single Databricks workspace serves both. All
+    ``run`` options are accepted and forwarded.
 
     \b
     Examples:
