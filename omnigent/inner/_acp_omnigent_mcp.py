@@ -149,6 +149,19 @@ class OmnigentAcpMcp:
             self._cleanup()
             return []
 
+    def lent_server_names(self) -> set[str]:
+        """Return the set of MCP server names Omnigent lent to the agent.
+
+        Empty if the relay hasn't started yet or failed. Names are extracted
+        from the ACP servers list and lowercased for case-insensitive comparison
+        when parsing agent-reported server names.
+        """
+        if self._acp_servers is None:
+            return set()
+        return {
+            server.get("name", "").lower() for server in self._acp_servers if server.get("name")
+        }
+
     def close(self) -> None:
         """Tear down the relay HTTP server and remove the bridge dir."""
         self._cleanup()

@@ -357,6 +357,10 @@ class AcpExecutor(Executor):
         # :meth:`close`). ``_omnigent_tools`` is captured each turn for the relay.
         self._mcp = OmnigentAcpMcp(label=config.name)
         self._omnigent_tools: list[ToolSpec] = []
+        # Track lent MCP server names (case-insensitive) and which unlent servers
+        # have been warned about to suppress repeated warnings per session.
+        self._lent_mcp_servers: set[str] = set()
+        self._warned_unlent_servers: set[str] = set()
 
     # ------------------------------------------------------------------
     # Low-level ACP transport
@@ -689,6 +693,10 @@ class AcpExecutor(Executor):
                 "ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
         self._session_id = session_id
+        # Capture the lent MCP server names for comparison against agent-reported servers.
+        self._lent_mcp_servers = self._mcp.lent_server_names()
+        # Reset warned servers on a fresh session.
+        self._warned_unlent_servers = set()
         return self._session_id
 
     # ------------------------------------------------------------------
@@ -1058,6 +1066,84 @@ class AcpExecutor(Executor):
                 out[omni_key] = value
         return out or None
 
+    @staticmethod
+    def _extract_mcp_server_names_from_output(notification: _AcpJsonObject) -> set[str]:
+        """Try to extract MCP server names from a vendor notification envelope.
+
+        Reads the output notification from the `params` field of a JSON-RPC envelope
+        and looks for common patterns that indicate MCP server activity. Currently
+        detects the Devin-style "MCP: <name>" and "Connecting to MCP server
+        '<name>'" patterns in output notifications. Returns an empty set if
+        no servers are recognized, which is safe (no false positives → no false
+        warnings). Vendor-prefixed notifications are inherently vendor-specific,
+        so a best-effort extraction is appropriate here.
+
+        Note: Name-based comparison (checking if a reported server name matches a
+        lent server name) has a known false negative: if an agent has a persisted
+        MCP server also called "omnigent" (e.g., from a stale bridge dir), it would
+        be silently treated as lent when it is not. This is acceptable because such
+        collisions are rare and the primary goal is observability of the common case.
+        """
+        servers: set[str] = set()
+        # Extract params from the JSON-RPC envelope.
+        params = notification.get("params") or {}
+        if not isinstance(params, dict):
+            return servers
+        # Check for output notification with channel or message that mentions MCP servers.
+        channel = params.get("channel") or ""
+        message = params.get("message") or ""
+        text = f"{channel} {message}".lower()
+
+        # Pattern: "MCP: <name>" or "mcp: <name>".
+        if "mcp:" in text:
+            # Extract words after "mcp:" — typically "MCP: github" or "MCP: safe".
+            parts = text.split("mcp:")
+            for part in parts[1:]:
+                # Take the first word after "MCP:" as the server name.
+                words = part.strip().split()
+                if words:
+                    name = words[0]
+                    # Filter out unlikely server names (too short, non-alphanumeric).
+                    if len(name) > 1 and name.replace("_", "").replace("-", "").isalnum():
+                        servers.add(name)
+
+        # Pattern: "Connecting to MCP server '<name>'".
+        if "connecting to mcp server" in text:
+            # Find quoted names: look for text between single quotes.
+            import re
+
+            matches = re.findall(r"mcp server\s+['\"]([^'\"]+)['\"]", text)
+            servers.update(m.lower() for m in matches if m)
+        return servers
+
+    def _check_unlent_mcp_servers(self, notification: _AcpJsonObject) -> None:
+        """Warn when the agent reports MCP servers Omnigent didn't lend.
+
+        Extracts server names from vendor notifications, compares against the
+        lent servers, and logs a warning once per session for any unlent servers.
+        This is observability only: does not block or fail the turn. Handles
+        unknown/vendor notifications defensively — no-op if extraction fails.
+        """
+        # Ignore non-vendor notifications and non-output notifications.
+        method = notification.get("method", "")
+        if not method.startswith("_"):
+            return
+        # Try to extract server names from the notification payload.
+        reported_servers = self._extract_mcp_server_names_from_output(notification)
+        if not reported_servers:
+            return
+        # Warn about unlent servers once per session.
+        unlent = reported_servers - self._lent_mcp_servers
+        for server in unlent:
+            if server not in self._warned_unlent_servers:
+                self._warned_unlent_servers.add(server)
+                logger.warning(
+                    "acp[%s] agent loaded unlent MCP server '%s' (omnigent policy does not "
+                    "govern this server's tools)",
+                    self._config.name,
+                    server,
+                )
+
     def _handle_session_update(self, update: _AcpJsonObject) -> list[ExecutorEvent]:
         """Translate one ``session/update`` payload into ExecutorEvents.
 
@@ -1291,14 +1377,19 @@ class AcpExecutor(Executor):
             prompt_blocks.append({"type": "text", "text": user_text})
         prompt_blocks.extend(image_blocks)
 
-        # Drain stale items from a prior turn; answer any leftover server request.
+        # Drain stale items from a prior turn; answer any leftover server request and
+        # check for unlent MCP servers (vendor notifications that don't require a response).
         while not self._queue.empty():
             try:
                 stale = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            if isinstance(stale, dict) and stale.get("id") is not None and stale.get("method"):
-                await self._respond_to_agent_request(stale)
+            if isinstance(stale, dict):
+                if stale.get("id") is not None and stale.get("method"):
+                    await self._respond_to_agent_request(stale)
+                else:
+                    # Vendor notifications (no id) — check for unlent MCP servers.
+                    self._check_unlent_mcp_servers(stale)
 
         self._rpc_id += 1
         req_id = self._rpc_id
@@ -1366,6 +1457,11 @@ class AcpExecutor(Executor):
                 # Server-initiated request (session/request_permission / fs/*):
                 # routes through policy + elicitation. Blocks while the human decides.
                 await self._respond_to_agent_request(notification)
+            else:
+                # Vendor notifications (method starts with "_"): check for unlent MCP
+                # servers and warn once per session. Unknown notifications are
+                # harmlessly ignored.
+                self._check_unlent_mcp_servers(notification)
 
             # Inbound message = progress; reset the idle deadline.
             deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS

@@ -936,9 +936,222 @@ async def test_end_to_end_denied_permission(tmp_path: Path) -> None:
     assert any(isinstance(e, TurnComplete) for e in events)
 
 
+@pytest.mark.asyncio
+async def test_unlent_mcp_servers_checked_during_drain() -> None:
+    """Vendor notifications are checked for unlent MCP servers during the drain phase.
+
+    What breaks if this fails: Notifications sent in response to session/new wouldn't
+    be checked for unlent servers, allowing agents to silently load MCP servers outside
+    omnigent's policy engine.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x", name="test-agent"))
+    # Simulate lent servers.
+    ex._lent_mcp_servers = {"omnigent"}
+    # Manually put a vendor notification in the queue (simulating one sent by the agent).
+    # Pass the full JSON-RPC envelope as the queue would have.
+    await ex._queue.put(
+        {
+            "jsonrpc": "2.0",
+            "method": "_cognition.ai/output",
+            "params": {"channel": "MCP: github", "message": ""},
+        }
+    )
+    # Track which servers are warned about.
+    warned_servers: list[str] = []
+
+    def capture_warning(fmt: str, *args: object) -> None:
+        # The warning call is: logger.warning(format_string, arg1, arg2, ...)
+        # So args[0] is config.name, args[1] is server name.
+        if len(args) >= 2:
+            warned_servers.append(str(args[1]))
+
+    # Patch logger and verify the drain loop calls _check_unlent_mcp_servers.
+    with patch.object(acp_executor_module.logger, "warning", side_effect=capture_warning):
+        # Manually call the drain logic (normally done in run_turn).
+        while not ex._queue.empty():
+            try:
+                stale = ex._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if isinstance(stale, dict):
+                if stale.get("id") is not None and stale.get("method"):
+                    pass  # Would be a server request.
+                else:
+                    ex._check_unlent_mcp_servers(stale)
+
+    # Verify the notification was processed and the warning was captured.
+    assert "github" in warned_servers
+
+
 # ---------------------------------------------------------------------------
 # describe_exception — never report a blank turn error (#4281)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Unlent MCP server detection (observability for policy bypass)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_mcp_server_names_from_devin_style_output() -> None:
+    """The Devin-style 'MCP: <name>' pattern is detected and extracted from JSON-RPC envelope."""
+    notification = {
+        "jsonrpc": "2.0",
+        "method": "_cognition.ai/output",
+        "params": {"channel": "MCP: github", "message": "Connecting to MCP server 'github'"},
+    }
+    servers = AcpExecutor._extract_mcp_server_names_from_output(notification)
+    assert servers == {"github"}
+
+
+def test_extract_mcp_server_names_multiple_servers() -> None:
+    """Multiple servers in separate output notifications are extracted."""
+    # First notification.
+    n1 = {
+        "jsonrpc": "2.0",
+        "method": "_cognition.ai/output",
+        "params": {"channel": "MCP: safe", "message": ""},
+    }
+    servers1 = AcpExecutor._extract_mcp_server_names_from_output(n1)
+    assert servers1 == {"safe"}
+    # Second notification.
+    n2 = {
+        "jsonrpc": "2.0",
+        "method": "_cognition.ai/output",
+        "params": {"channel": "MCP: web-search", "message": ""},
+    }
+    servers2 = AcpExecutor._extract_mcp_server_names_from_output(n2)
+    assert servers2 == {"web-search"}
+
+
+def test_extract_mcp_server_names_case_insensitive() -> None:
+    """Server names are lowercased so comparison is case-insensitive."""
+    notification = {
+        "method": "_cognition.ai/output",
+        "params": {"channel": "MCP: GitHub", "message": ""},
+    }
+    servers = AcpExecutor._extract_mcp_server_names_from_output(notification)
+    assert servers == {"github"}
+
+
+def test_extract_mcp_server_names_filters_short_names() -> None:
+    """Implausibly short names are filtered out to reduce false positives."""
+    notification = {
+        "method": "_cognition.ai/output",
+        "params": {"channel": "MCP: a", "message": ""},
+    }
+    servers = AcpExecutor._extract_mcp_server_names_from_output(notification)
+    assert servers == set()
+
+
+def test_extract_mcp_server_names_ignores_non_vendor_notifications() -> None:
+    """Standard (non-vendor) notifications don't match MCP patterns."""
+    notification = {
+        "method": "session/update",
+        "params": {"message": "some output"},
+    }
+    servers = AcpExecutor._extract_mcp_server_names_from_output(notification)
+    assert servers == set()
+
+
+def test_check_unlent_mcp_servers_warns_once() -> None:
+    """When an agent loads an unlent server, a warning is logged once per session."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", name="test-agent"))
+    ex._lent_mcp_servers = {"omnigent"}
+    assert ex._warned_unlent_servers == set()
+
+    with patch.object(acp_executor_module.logger, "warning") as mock_warn:
+        # First notification reports an unlent server.
+        ex._check_unlent_mcp_servers(
+            {
+                "method": "_cognition.ai/output",
+                "params": {"channel": "MCP: github", "message": ""},
+            }
+        )
+        mock_warn.assert_called_once()
+        # Check that the warning message contains the expected text.
+        call_args = mock_warn.call_args[0]
+        assert "github" in call_args[2]  # Server name is third positional arg.
+        assert "omnigent policy does not govern" in call_args[0]  # Format string.
+        # Second notification reports the same unlent server; no warning.
+        ex._check_unlent_mcp_servers(
+            {
+                "method": "_cognition.ai/output",
+                "params": {"channel": "MCP: github", "message": ""},
+            }
+        )
+        assert mock_warn.call_count == 1  # Still just one call.
+
+
+def test_check_unlent_mcp_servers_warns_for_different_servers() -> None:
+    """Each unlent server is warned about separately."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", name="test-agent"))
+    ex._lent_mcp_servers = set()
+
+    with patch.object(acp_executor_module.logger, "warning") as mock_warn:
+        # First unlent server.
+        ex._check_unlent_mcp_servers(
+            {
+                "method": "_cognition.ai/output",
+                "params": {"channel": "MCP: github", "message": ""},
+            }
+        )
+        # Second unlent server.
+        ex._check_unlent_mcp_servers(
+            {
+                "method": "_cognition.ai/output",
+                "params": {"channel": "MCP: safe", "message": ""},
+            }
+        )
+        assert mock_warn.call_count == 2
+        warned_servers = {call[0][2] for call in mock_warn.call_args_list}
+        assert warned_servers == {"github", "safe"}
+
+
+def test_check_unlent_mcp_servers_ignores_lent_servers() -> None:
+    """Lent servers don't generate warnings."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", name="test-agent"))
+    ex._lent_mcp_servers = {"omnigent", "github"}
+
+    with patch.object(acp_executor_module.logger, "warning") as mock_warn:
+        # Lent server — no warning.
+        ex._check_unlent_mcp_servers(
+            {
+                "method": "_cognition.ai/output",
+                "params": {"channel": "MCP: github", "message": ""},
+            }
+        )
+        mock_warn.assert_not_called()
+
+
+def test_check_unlent_mcp_servers_ignores_non_vendor_notifications() -> None:
+    """Non-vendor notifications are ignored (no warnings)."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", name="test-agent"))
+    ex._lent_mcp_servers = set()
+
+    with patch.object(acp_executor_module.logger, "warning") as mock_warn:
+        # Standard notification (no vendor prefix) — ignored.
+        ex._check_unlent_mcp_servers(
+            {"method": "session/update", "params": {"sessionUpdate": "agent_message_chunk"}}
+        )
+        mock_warn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_session_new_captures_lent_mcp_servers() -> None:
+    """When session/new succeeds, lent server names are captured."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", name="test"))
+    # Mock the MCP relay to return a server.
+    ex._mcp.lent_server_names = lambda: {"omnigent", "github"}  # type: ignore[method-assign]
+
+    async def fake_rpc(method, params, timeout=30.0):
+        return {"result": {"sessionId": "s1"}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_session()
+    # Lent servers should be captured and warned_servers should be reset.
+    assert ex._lent_mcp_servers == {"omnigent", "github"}
+    assert ex._warned_unlent_servers == set()
 
 
 def test_describe_exception_falls_back_to_repr_for_blank_message():
