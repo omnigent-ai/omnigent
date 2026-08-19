@@ -93,6 +93,29 @@ _ENV_OPENCODE_CONFIG_DENYLIST = frozenset(
     }
 )
 
+# Operator escape hatch for the runner→server hop: comma-separated EXTRA env
+# var *names* to forward. The host already honors this same list when building
+# the runner subprocess environment (omnigent.host.connect forwards both the
+# named vars and this control var), but without re-honoring it here the
+# hardcoded families above drop the names again before ``opencode serve`` —
+# and every session shell inheriting from it — can see them, so gh/acli-style
+# credentials (GH_TOKEN, GH_CONFIG_DIR, ...) never reach a dispatched
+# opencode-native session (#4916). (Literal, not an import of
+# host.connect.RUNNER_ENV_PASSTHROUGH_ENV_VAR: the host module is the outer
+# layer and shouldn't be dragged into the app-server's import graph.)
+_RUNNER_ENV_PASSTHROUGH_ENV_VAR = "OMNIGENT_RUNNER_ENV_PASSTHROUGH"
+
+
+def _runner_passthrough_keys(env: Mapping[str, str]) -> frozenset[str]:
+    """Env-var names the operator listed in ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``.
+
+    Whitespace-padded and empty list entries are tolerated, matching how the
+    host-side parser in ``omnigent.host.connect`` reads the same value.
+    """
+    return frozenset(
+        name.strip() for name in env.get(_RUNNER_ENV_PASSTHROUGH_ENV_VAR, "").split(",") if name.strip()
+    )
+
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")
 # Strip ANSI escape sequences from ``opencode models`` output.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -334,7 +357,10 @@ def filtered_server_env(
 
     Per-session XDG dirs isolate OpenCode's state from the user's global
     config; ``OPENCODE_SERVER_PASSWORD`` secures the loopback server. Only
-    provider/proxy env from the parent is passed through.
+    provider/proxy env from the parent is passed through, plus any names the
+    operator listed in ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` (still subject to
+    the OpenCode-config denylist, so per-session isolation cannot be opted out
+    of by listing a denylisted name).
 
     :param bridge_dir: Native OpenCode bridge directory.
     :param auth_secret: Server password for basic auth.
@@ -342,12 +368,18 @@ def filtered_server_env(
     :returns: The environment mapping for the server subprocess.
     """
     env: dict[str, str] = {}
+    extra_keys = _runner_passthrough_keys(os.environ)
     for key, value in os.environ.items():
         if key in _ENV_OPENCODE_CONFIG_DENYLIST:
             # Never inherit the parent's global OpenCode config — the
-            # per-session XDG dirs are the only config source.
+            # per-session XDG dirs are the only config source. Checked first
+            # so isolation wins even when the operator listed the name.
             continue
-        if key in _ENV_PASSTHROUGH_KEYS or key.startswith(_ENV_PASSTHROUGH_PREFIXES):
+        if (
+            key in _ENV_PASSTHROUGH_KEYS
+            or key in extra_keys
+            or key.startswith(_ENV_PASSTHROUGH_PREFIXES)
+        ):
             env[key] = value
     env.update(extra_env or {})
     env["XDG_DATA_HOME"] = str(xdg_data_home_for_bridge_dir(bridge_dir))

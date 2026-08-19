@@ -126,6 +126,43 @@ def test_filtered_server_env_drops_global_opencode_config(
     assert env["XDG_CONFIG_HOME"] == str(tmp_path / "xdg-config")
 
 
+def test_filtered_server_env_honors_runner_env_passthrough_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Names listed in OMNIGENT_RUNNER_ENV_PASSTHROUGH survive this hop.
+
+    The host honors the same list when building the runner's environment
+    (``omnigent.host.connect._build_runner_env`` forwards both the listed
+    vars and the control var itself). Without re-honoring it here, the
+    hardcoded provider-prefix families strip the names again before
+    ``opencode serve`` — and every session shell inheriting from it — sees
+    them, so gh/acli-style credentials never reach a dispatched
+    opencode-native session (#4916).
+    """
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "GH_TOKEN, GH_CONFIG_DIR,,")
+    monkeypatch.setenv("GH_TOKEN", "ghp-token")
+    monkeypatch.setenv("GH_CONFIG_DIR", "/opt/gh-config")
+    monkeypatch.setenv("STILL_UNRELATED", "nope")
+    env = filtered_server_env(bridge_dir=tmp_path, auth_secret="pw")
+    assert env["GH_TOKEN"] == "ghp-token"
+    assert env["GH_CONFIG_DIR"] == "/opt/gh-config"
+    # Only the listed names escape the filter; everything else still drops.
+    assert "STILL_UNRELATED" not in env
+    # The control var itself carries names, not secrets, and the server has no
+    # use for it — it stays filtered out unless the operator lists it.
+    assert "OMNIGENT_RUNNER_ENV_PASSTHROUGH" not in env
+
+
+def test_filtered_server_env_denylist_beats_runner_passthrough(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Listing a denylisted name does not defeat per-session XDG isolation."""
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "OPENCODE_CONFIG")
+    monkeypatch.setenv("OPENCODE_CONFIG", "/home/user/.config/opencode/opencode.json")
+    env = filtered_server_env(bridge_dir=tmp_path, auth_secret="pw")
+    assert "OPENCODE_CONFIG" not in env
+
+
 def _server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> OpenCodeNativeServer:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
     return OpenCodeNativeServer(
