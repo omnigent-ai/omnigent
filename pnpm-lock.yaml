@@ -205,6 +205,9 @@ importers:
       '@tiptap/starter-kit':
         specifier: 3.23.4
         version: 3.23.4
+      '@xterm/addon-clipboard':
+        specifier: 0.2.0
+        version: 0.2.0
       '@xterm/addon-fit':
         specifier: ^0.11.0
         version: 0.11.0
@@ -4123,6 +4126,9 @@ packages:
     resolution: {integrity: sha512-KRYzxepc14G/CEpEGc3Yn+JKaAeT63smlDr+vjB8jRfgTBBI9wRj/nkQEO+ucV8p8I9bfKLWp37uHgFrbntPvw==}
     engines: {node: '>=10.0.0'}
 
+  '@xterm/addon-clipboard@0.2.0':
+    resolution: {integrity: sha512-Dl31BCtBhLaUEECUbEiVcCLvLBbaeGYdT7NofB8OJkGTD3MWgBsaLjXvfGAD4tQNHhm6mbKyYkR7XD8kiZsdNg==}
+
   '@xterm/addon-fit@0.11.0':
     resolution: {integrity: sha512-jYcgT6xtVYhnhgxh3QgYDnnNMYTcf8ElbxxFzX0IZo+vabQqSPAjC3c1wJrKB5E19VwQei89QCiZZP86DCPF7g==}
 
@@ -5947,6 +5953,9 @@ packages:
 
   jose@6.2.3:
     resolution: {integrity: sha512-YYVDInQKFJfR/xa3ojUTl8c2KoTwiL1R5Wg9YCydwH0x0B9grbzlg5HC7mMjCtUJjbQ/YnGEZIhI5tCgfTb4Hw==}
+
+  js-base64@3.9.2:
+    resolution: {integrity: sha512-6zayE8QlUdiweYI6cETD/XBSqFcoCUlufn/29PJR99r82x1yDnIprRca0YvAYpAW+ez0GuQkVBC6xG5QkD7OjA==}
 
   js-cookie@3.0.8:
     resolution: {integrity: sha512-yeJd4aNAdYZQjaon2bpD/Gb0B/omw7HQOsynXXcOiWVCacbBcPlgn8S/d1X6blFSaHao7ozqtW7NZW19xpCtIw==}
@@ -13043,6 +13052,10 @@ snapshots:
 
   '@xmldom/xmldom@0.8.13': {}
 
+  '@xterm/addon-clipboard@0.2.0':
+    dependencies:
+      js-base64: 3.9.2
+
   '@xterm/addon-fit@0.11.0': {}
 
   '@xterm/addon-web-links@0.12.0': {}
@@ -15160,6 +15173,8 @@ snapshots:
   jiti@2.7.0: {}
 
   jose@6.2.3: {}
+
+  js-base64@3.9.2: {}
 
   js-cookie@3.0.8: {}
 

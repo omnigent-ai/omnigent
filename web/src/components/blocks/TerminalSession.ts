@@ -9,6 +9,7 @@
 //   - Client → server: binary frames for keystrokes (`term.onData`);
 //     text frames for JSON control messages (currently only resize).
 
+import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -519,6 +520,12 @@ export class TerminalSession {
     // Turn bare URLs in terminal output into clickable links. Without
     // this addon xterm renders URLs as plain text.
     this.term.loadAddon(new WebLinksAddon(openTerminalLink));
+    // TUIs copy through the terminal with OSC 52 (opencode's "copy", vim's
+    // "+ register, tmux set-clipboard) — the app has no system clipboard
+    // access, so it asks the terminal to write it. Without this addon xterm
+    // silently drops the sequence and in-terminal copy never reaches the
+    // user's clipboard (reads surface as a browser permission prompt).
+    this.term.loadAddon(new ClipboardAddon());
     this.term.open(container);
     // Load the GPU renderer after open() (it needs the mounted canvas).
     // Falls back to the DOM renderer when WebGL is unavailable.
