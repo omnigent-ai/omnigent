@@ -156,6 +156,85 @@ def test_archive_session_removes_row_without_stop_event(
     assert stop_events == [], f"archive must not send a stop_session event, sent {stop_events}"
 
 
+def _assert_archived(base_url: str, session_id: str) -> None:
+    """Poll the store until *session_id* reports ``archived: true``.
+
+    Proves the archive is durable rather than a client-side cache splice a
+    refetch would resurrect. Polls because the list refetch that unmounts the
+    row can land marginally before the snapshot reflects the flag.
+
+    :param base_url: Spawned server base URL.
+    :param session_id: The session expected to be archived.
+    :raises AssertionError: If the flag never flips within the deadline.
+    """
+    deadline = time.monotonic() + 15.0
+    archived = None
+    while time.monotonic() < deadline:
+        snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+        if snapshot.status_code == 200:
+            archived = snapshot.json()["archived"]
+            if archived is True:
+                return
+        time.sleep(0.25)
+    raise AssertionError(f"archived session should report archived=true, got {archived}")
+
+
+def test_archive_key_in_row_menu(page: Page, seeded_session: tuple[str, str]) -> None:
+    """ "A" archives the row whose action menu is open.
+
+    The kebab's Archive item advertises the letter, matching the session
+    menus in Claude Code. Radix would otherwise swallow a bare letter as
+    typeahead, so this exercises the real key path in a real browser — the
+    part a jsdom test can only approximate.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` for a pre-created
+        runner-bound session.
+    """
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+
+    row = _row(page, session_id)
+    expect(row).to_be_visible()
+
+    # Hover first so the desktop hover-revealed kebab trigger is interactable.
+    row.hover()
+    row.get_by_test_id("conversation-actions").click()
+    archive_item = page.get_by_test_id("archive-conversation")
+    expect(archive_item).to_be_visible()
+    # The hint that makes the shortcut discoverable without this test.
+    expect(archive_item).to_contain_text("A")
+
+    page.keyboard.press("a")
+
+    expect(page.locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
+    _assert_archived(base_url, session_id)
+
+
+def test_archive_chord_on_the_open_session(page: Page, seeded_session: tuple[str, str]) -> None:
+    """Ctrl/Cmd+Alt+A archives the session currently on screen.
+
+    The keyboard route that needs no menu at all. Bound on the always-mounted
+    session list rather than the row, so it keeps working when the row's
+    section is collapsed or its page hasn't loaded.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` for a pre-created
+        runner-bound session.
+    """
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(_row(page, session_id)).to_be_visible()
+
+    page.keyboard.press("Control+Alt+KeyA")
+
+    expect(page.locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
+    # Archiving the active session redirects home so the user isn't stranded
+    # on a stale URL with no sidebar row to navigate from.
+    page.wait_for_url(f"{base_url}/", timeout=15_000)
+    _assert_archived(base_url, session_id)
+
+
 def test_archiving_spinner_stays_until_row_leaves(
     seeded_session: tuple[str, str],
 ) -> None:
