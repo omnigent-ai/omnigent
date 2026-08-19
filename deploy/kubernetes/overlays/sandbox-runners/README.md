@@ -8,7 +8,7 @@ the base server deployment.
 
 ## Launch model: entrypoint-as-host
 
-The runner is launched as a **batch/v1 Job** (one Pod, `backoffLimit: 0`). The
+The runner is launched as a **batch/v1 Job** (one Pod, `backoffLimit: 6`). The
 Job's child Pod runs `omnigent host` as its container command. An **init
 container** prepares the workspace (`mkdir` + optional `git clone`); the **main
 container** then runs `omnigent host` under a tiny PID-1 reaper. The host
