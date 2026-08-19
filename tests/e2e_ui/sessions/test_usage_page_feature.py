@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+from datetime import datetime, timedelta, timezone
 
 from playwright.sync_api import Page, Route, expect
 
@@ -100,7 +100,7 @@ def test_custom_date_inputs_have_max_today(page: Page, live_server: str) -> None
 
     page.get_by_role("button", name="Custom").click()
 
-    today_str = date.today().isoformat()
+    today_str = datetime.now(tz=timezone.utc).date().isoformat()
     start_input = page.locator('input[type="date"]').first
     end_input = page.locator('input[type="date"]').last
 
@@ -118,7 +118,7 @@ def test_custom_date_end_auto_adjusts_when_start_exceeds_end(page: Page, live_se
     start_input = page.locator('input[type="date"]').first
     end_input = page.locator('input[type="date"]').last
 
-    today = date.today()
+    today = datetime.now(tz=timezone.utc).date()
     new_start = today.isoformat()
     yesterday = (today - timedelta(days=1)).isoformat()
 
