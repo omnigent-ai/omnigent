@@ -57,6 +57,7 @@ from omnigent.runner.app import (
     _KiroNativeLaunchConfig,
     _load_claude_launch_metadata,
     _log_terminal_lookup_miss,
+    _native_terminal_start_error_payload,
     _PiNativeLaunchConfig,
     _publish_native_terminal_start_error,
     _publish_terminal_pending,
@@ -1778,6 +1779,26 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
         },
     ]
     assert all(p.session_id == "415c9954e2fe4b9276083a4d2c66f689" for p in published)
+
+
+def test_native_terminal_start_error_payload_surfaces_tmux_launch_stderr(
+    pinned_runner_log: Path,
+) -> None:
+    """
+    ``tmux launch failed …`` stderr is included in the client-facing message.
+
+    Issue #4442: without the real tmux text, an ``invalid option:
+    allow-passthrough`` (or any other tmux reject) collapses into a generic
+    "see the runner log" string that users cannot diagnose.
+
+    :param pinned_runner_log: The log path the message must still name.
+    """
+    cause = "tmux launch failed (rc=1): invalid option: allow-passthrough"
+    error = _native_terminal_start_error_payload(RuntimeError(cause), "Cursor")
+    assert error["code"] == "native_terminal_start_failed"
+    assert cause in error["message"]
+    assert "Native Cursor terminal failed to start:" in error["message"]
+    assert str(pinned_runner_log) in error["message"]
 
 
 def test_terminal_lookup_miss_log_explains_stopped_registered_terminal(

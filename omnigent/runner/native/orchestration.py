@@ -5671,9 +5671,11 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
         e.g. ``ImportError("Native Codex requires the 'codex' CLI on PATH.")``.
     :param runtime_name: Human-readable runtime name, e.g. ``"Codex"``.
     :returns: ``{"code": ..., "message": ...}`` payload for SSE and
-        JSON error responses. The message is a client-safe string naming
-        the runner's log file; the raw cause is logged there for operators,
-        not surfaced to the caller.
+        JSON error responses. The message names the runner's log file.
+        Most causes stay log-only (CLI-missing text can embed paths), but
+        ``tmux launch failed …`` stderr is included so hosts with an old
+        or misconfigured tmux get a self-diagnosing client error (issue
+        #4442) without opening the runner log.
     """
     _logger.warning("Native %s terminal start failed: %s", runtime_name, exc, exc_info=exc)
     if IS_WINDOWS:
@@ -5686,10 +5688,20 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
         )
     else:
         log_reference = process_log_reference("runner")
-        message = (
-            f"Native {runtime_name} terminal failed to start; "
-            f"see the runner log for details: {log_reference}"
-        )
+        cause = str(exc).strip()
+        if cause.startswith("tmux launch failed"):
+            # Surface the real tmux stderr: without it, allow-passthrough /
+            # socket / binary failures collapse into an undiagnosable
+            # "see the runner log" message.
+            message = (
+                f"Native {runtime_name} terminal failed to start: {cause}; "
+                f"see the runner log for details: {log_reference}"
+            )
+        else:
+            message = (
+                f"Native {runtime_name} terminal failed to start; "
+                f"see the runner log for details: {log_reference}"
+            )
     return {"code": _NATIVE_TERMINAL_START_FAILED_CODE, "message": message}
 
 
