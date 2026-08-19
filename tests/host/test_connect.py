@@ -4709,3 +4709,37 @@ async def test_run_reconnects_promptly_after_suspend(
     # The disconnect was attributed to the resume, and the flag was consumed.
     assert any("resumed from suspend" in r.message for r in caplog.records)
     assert host._woke_from_suspend is False
+
+
+def test_post_connect_auth_rejection_escalates_without_going_fatal(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A 401/403 AFTER the host has connected retries forever (never fatal),
+    but a sustained streak escalates the operator message from a transient-
+    network hint to a re-auth prompt that names ``omnigent login`` — so a
+    permanently-rejected credential surfaces instead of looping silently.
+    """
+    from omnigent.host.connect import _AUTH_REJECT_ESCALATE_ATTEMPTS
+
+    host = _make_host_process()
+    host._ever_connected = True
+
+    # First rejection: retryable (None), framed as a transient network blip.
+    assert host._classify_http_status(403) is None
+    first = capsys.readouterr().err
+    assert "network dropped" in first
+    assert "omnigent login" not in first
+
+    # Streak climbs toward — but not to — the escalation threshold: stays quiet
+    # so a brief VPN outage never raises a false re-auth alarm.
+    for _ in range(2, _AUTH_REJECT_ESCALATE_ATTEMPTS):
+        assert host._classify_http_status(403) is None
+    assert "omnigent login" not in capsys.readouterr().err
+
+    # Crossing the threshold escalates — names the real remedy — and is STILL
+    # retryable (no fatal error, so a recoverable daemon is never killed).
+    assert host._classify_http_status(403) is None
+    escalated = capsys.readouterr().err
+    assert "omnigent login http://localhost:8000" in escalated
+    assert "no longer a transient network blip" in escalated
+    assert host._auth_retry_streak == _AUTH_REJECT_ESCALATE_ATTEMPTS
