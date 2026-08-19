@@ -169,9 +169,10 @@ describe("ChatHeader — workspace pane alignment", () => {
     });
     const header = container.querySelector("header");
     const breadcrumb = screen.getByRole("navigation", { name: "Conversation" });
+    const title = breadcrumb.parentElement;
 
     expect(header).toHaveClass("md:grid", "md:grid-cols-[1fr_auto_1fr]");
-    expect(breadcrumb).toHaveClass("md:col-start-2", "md:justify-self-center");
+    expect(title).toHaveClass("md:col-start-2", "md:justify-self-center");
   });
 });
 

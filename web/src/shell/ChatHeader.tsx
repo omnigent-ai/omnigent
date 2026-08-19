@@ -31,6 +31,7 @@ import { cn } from "@/lib/utils";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { ViewModeToggle } from "./ViewModeToggle";
 import { useCallback, useEffect, useRef } from "react";
+import { ChatHeaderServerPicker } from "./ChatHeaderServerPicker";
 
 /**
  * Gating flags + handlers for the mobile-only session-menu FAB (the
@@ -227,6 +228,7 @@ export function ChatHeader({
     }, 400);
   }, [isMobile, onOpenSidebar, cancelPeek]);
   useEffect(() => cancelPeek, [cancelPeek]);
+  const showConversationBreadcrumb = Boolean(conversationId && (conversationTitle || titleLinkTo));
   return (
     <header
       className={cn(
@@ -286,17 +288,19 @@ export function ChatHeader({
 
       {/* Conversation breadcrumb (see ConversationBreadcrumb). The desktop
           grid centers it over the chat independently of either sidebar. */}
-      {conversationId && (conversationTitle || titleLinkTo) && (
-        <ConversationBreadcrumb
-          conversationTitle={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
-          projectName={projectName}
-          titleLinkTo={titleLinkTo}
-          isChildSession={isChildSession}
-          boundAgent={boundAgent}
-          wrapperLabel={wrapperLabel}
-          className="min-w-0 flex-1 pr-1 md:col-start-2 md:row-start-1 md:justify-self-center md:pr-0"
-        />
-      )}
+      <div className="flex min-w-0 flex-1 items-center pr-1 md:col-start-2 md:row-start-1 md:max-w-full md:justify-self-center md:pr-0">
+        {showConversationBreadcrumb && (
+          <ConversationBreadcrumb
+            conversationTitle={conversationTitle ?? UNTITLED_CONVERSATION_LABEL}
+            projectName={projectName}
+            titleLinkTo={titleLinkTo}
+            isChildSession={isChildSession}
+            boundAgent={boundAgent}
+            wrapperLabel={wrapperLabel}
+          />
+        )}
+        <ChatHeaderServerPicker showBrand={!showConversationBreadcrumb} />
+      </div>
 
       <div className="ml-auto flex shrink-0 items-center gap-2 md:col-start-3 md:row-start-1 md:ml-0 md:justify-self-end">
         {/* Other users currently viewing this session (presence).

@@ -177,7 +177,6 @@ import {
   sortByUpdatedAtDesc,
   writeLegacyPinnedConversationIds,
 } from "./sidebarNav";
-import { SidebarServerPicker } from "./SidebarServerPicker";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
 // Positioning for a row's trailing session-state badge. On desktop it shares
@@ -988,12 +987,6 @@ export function Sidebar({
               getVisibleIdsRef={getVisibleIdsRef}
             />
           </nav>
-
-          {/* Desktop server picker, pinned below the scrolling session list.
-          Self-hiding: renders nothing outside the Electron shell (see
-          SidebarServerPicker), so browsers keep an unchanged sidebar that ends
-          with the list. */}
-          <SidebarServerPicker />
         </>
       )}
     </aside>
