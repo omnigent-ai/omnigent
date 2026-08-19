@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from playwright.sync_api import Page, Route, expect
 
@@ -77,6 +78,7 @@ def test_session_table_shows_other_harnesses_badge(
 ) -> None:
     """A session with sub-agent harnesses shows a '+N' badge."""
     _stub_server_info(page, usage_page=True)
+    now = int(time.time())
     report = json.dumps(
         {
             "cost_today": 1.50,
@@ -87,8 +89,8 @@ def test_session_table_shows_other_harnesses_badge(
             "sessions": [
                 {
                     "id": "conv_abc",
-                    "created_at": 1700000000,
-                    "updated_at": 1700000100,
+                    "created_at": now - 3600,
+                    "updated_at": now,
                     "title": "Multi-harness session",
                     "cost_usd": 1.50,
                     "models": {"claude-opus-4-8": 1.50},
