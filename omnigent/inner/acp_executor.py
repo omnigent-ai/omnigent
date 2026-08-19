@@ -103,6 +103,7 @@ _ACP_RESOURCE_NOT_FOUND_CODE = -32002
 # ACP protocol constants (JSON-RPC 2.0 method names).
 _AGENT_METHOD_INITIALIZE = "initialize"
 _AGENT_METHOD_SESSION_NEW = "session/new"
+_AGENT_METHOD_SESSION_LOAD = "session/load"
 _AGENT_METHOD_SESSION_PROMPT = "session/prompt"
 
 # Notification sent *from* the agent to the client (streaming progress).
@@ -330,7 +331,11 @@ class AcpExecutor(Executor):
         self._session_id: str | None = None
         self._initialized: bool = False
         self._image_supported: bool = False
+        self._load_session_supported: bool = False
         self._system_prompt_sent: bool = False
+        # Set to True when the subprocess starts; flipped to False after _ensure_session()
+        # succeeds. Used to distinguish a fresh process from a reused session.
+        self._fresh_process: bool = True
 
         # ACP toolCallId → tool name / rawInput from the originating tool_call, so
         # a later tool_call_update can close the right tool card, and a permission
@@ -369,9 +374,11 @@ class AcpExecutor(Executor):
         response or tool-output line can't hit the default 64 KiB per-line cap.
         """
         # Reset handshake state: this may be a restart after the previous
-        # subprocess died. ``_initialized`` is a one-way latch.
+        # subprocess died. ``_initialized`` is a one-way latch; the ``_fresh_process``
+        # flag marks that a new attempt to create/load a session is needed.
         self._initialized = False
         self._image_supported = False
+        self._fresh_process = True
         env = self._build_spawn_env()
         launch_path, argv = self._sandbox_launch(tuple(env.keys()))
         _STREAM_LIMIT = 16 * 1024 * 1024
@@ -639,23 +646,71 @@ class AcpExecutor(Executor):
             message = resp["error"].get("message", resp["error"])
             self._warn_initialize_failed(str(message))
             raise RuntimeError(f"ACP initialize failed: {message}")
-        prompt_caps = (
-            (resp.get("result") or {}).get("agentCapabilities", {}).get("promptCapabilities", {})
-        )
+        result = resp.get("result") or {}
+        agent_caps = result.get("agentCapabilities", {})
+        prompt_caps = agent_caps.get("promptCapabilities", {})
         self._image_supported = bool(prompt_caps.get("image"))
+        self._load_session_supported = bool(agent_caps.get("loadSession"))
         self._initialized = True
 
     async def _ensure_session(self) -> str:
-        """Create (or reuse) an ACP session, returning the session id.
+        """Create, load, or reuse an ACP session, returning the session id.
 
-        In ``server`` mode we send only ``cwd`` + ``mcpServers`` and adopt the id
-        the agent returns. In ``client`` mode we generate the id and send it.
-        ``mcpServers`` carries Omnigent's builtin tools (via the shared serve-mcp
-        relay) unless disabled — see :class:`OmnigentAcpMcp`.
+        On a fresh process (after a respawn), if the agent advertises
+        ``agentCapabilities.loadSession``, loads the prior session; otherwise creates
+        a new one. In ``server`` mode we send only ``cwd`` + ``mcpServers`` and
+        adopt the id the agent returns. In ``client`` mode we generate the id and
+        send it. ``mcpServers`` carries Omnigent's builtin tools (via the shared
+        serve-mcp relay) unless disabled — see :class:`OmnigentAcpMcp`.
         """
-        if self._session_id is not None:
+        # On a fresh process, try to load a prior session if the capability exists.
+        # When loading succeeds, we reuse the existing session state (including
+        # _system_prompt_sent), so the system prompt and prior history are not
+        # replayed again in run_turn().
+        if self._fresh_process and self._session_id is not None and self._load_session_supported:
+            params: _AcpJsonObject = {"sessionId": self._session_id}
+            resp = await self._rpc(
+                _AGENT_METHOD_SESSION_LOAD, params, timeout=_INIT_TIMEOUT_SECONDS
+            )
+            if "error" in resp:
+                message = resp["error"].get("message", resp["error"])
+                logger.debug(
+                    "acp[%s] session/load %s failed (%s); falling back to session/new",
+                    self._config.name,
+                    self._session_id,
+                    message,
+                )
+                # Load failed: clear the prior session and reset the prompt state so
+                # history is replayed when we create a new session below. The new
+                # session is truly fresh and must not inherit _system_prompt_sent=True
+                # from the failed load attempt.
+                self._session_id = None
+                self._system_prompt_sent = False
+                # Fall through to session/new below.
+            else:
+                # Load succeeded; mark process as no longer fresh and return the session id.
+                # Note: _system_prompt_sent is NOT reset because the loaded session already
+                # has the system prompt and prior context.
+                self._fresh_process = False
+                return self._session_id
+
+        # If we already have a session id but it's not fresh (e.g., a reused connection),
+        # try to reuse it. If the agent hasn't loaded it yet, the prompt will fail with
+        # "Session not found", triggering a reset and fallback to session/new.
+        if self._session_id is not None and not self._fresh_process:
             return self._session_id
 
+        # Reaching here means we are creating a genuinely new, empty session:
+        # no prior session, or a fresh process that could not reuse one (no
+        # ``loadSession`` capability, or a load that failed above). Reset the
+        # prompt/session state so ``run_turn`` replays the system prompt + prior
+        # history. Without this, a respawned agent WITHOUT ``loadSession`` keeps
+        # ``_system_prompt_sent=True`` from before the respawn and comes up with
+        # no context — the regression the load-failure branch alone did not cover.
+        self._session_id = None
+        self._system_prompt_sent = False
+
+        # Create a new session.
         params: _AcpJsonObject = {
             "cwd": self._cwd,
             # ACP requires this field even when no per-session MCP servers are
@@ -689,6 +744,7 @@ class AcpExecutor(Executor):
                 "ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
         self._session_id = session_id
+        self._fresh_process = False
         return self._session_id
 
     # ------------------------------------------------------------------
@@ -1331,6 +1387,7 @@ class AcpExecutor(Executor):
                     response = fut.result()
                 except Exception as exc:  # noqa: BLE001
                     self._session_id = None
+                    self._fresh_process = True
                     self._system_prompt_sent = False
                     yield ExecutorError(message=f"ACP process error: {exc}", retryable=True)
                     return
@@ -1338,6 +1395,7 @@ class AcpExecutor(Executor):
                     error_msg = response["error"].get("message", "Unknown ACP error")
                     if "Session not found" in error_msg:
                         self._session_id = None
+                        self._fresh_process = True
                         self._system_prompt_sent = False
                     yield ExecutorError(message=error_msg, retryable=True)
                     return

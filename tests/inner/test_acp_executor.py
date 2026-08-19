@@ -65,7 +65,43 @@ def test_handles_tools_internally_and_streaming() -> None:
 
 
 # ---------------------------------------------------------------------------
-# session/new shapes (server- vs client-assigned id, optional model)
+# initialize: captures agentCapabilities.loadSession
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_initialize_captures_load_session_capability() -> None:
+    """The initialize handshake captures whether the agent supports session/load."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    assert ex._load_session_supported is False
+
+    async def fake_rpc_no_load(method, params, timeout=30.0):
+        return {"result": {"agentCapabilities": {"promptCapabilities": {"image": False}}}}
+
+    ex._rpc = fake_rpc_no_load  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    assert ex._load_session_supported is False
+
+    ex._initialized = False  # Reset to test again
+    ex2 = AcpExecutor(AcpAgentConfig(command="x"))
+
+    async def fake_rpc_with_load(method, params, timeout=30.0):
+        return {
+            "result": {
+                "agentCapabilities": {
+                    "promptCapabilities": {"image": False},
+                    "loadSession": True,
+                }
+            }
+        }
+
+    ex2._rpc = fake_rpc_with_load  # type: ignore[assignment]
+    await ex2._ensure_initialized()
+    assert ex2._load_session_supported is True
+
+
+# ---------------------------------------------------------------------------
+# session/new and session/load shapes
 # ---------------------------------------------------------------------------
 
 
@@ -119,6 +155,100 @@ async def test_session_new_client_mode_generates_and_sends_id() -> None:
     sid = await ex._ensure_session()
     assert sid == sent["sessionId"] and sid  # our generated id is used
     assert sent["model"] == "m1"  # model sent because send_model_in_session_new
+
+
+@pytest.mark.asyncio
+async def test_session_load_on_fresh_process_with_capability() -> None:
+    """When a process restarts, session/load restores a prior session if supported.
+
+    If the agent advertises loadSession, a fresh process loads the prior session
+    instead of creating a new one. This is what breaks the text-prefix replay
+    fallback and enables warm-resume.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._load_session_supported = True
+    ex._session_id = "prior-sess-123"
+    ex._fresh_process = True
+
+    calls: list[tuple[str, dict]] = []
+
+    async def capture_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {"result": {}}
+
+    ex._rpc = capture_rpc  # type: ignore[assignment]
+    sid = await ex._ensure_session()
+
+    # Should have called session/load with the prior id.
+    assert calls[0][0] == "session/load"
+    assert calls[0][1]["sessionId"] == "prior-sess-123"
+    # Session id unchanged.
+    assert sid == "prior-sess-123"
+    # Process no longer fresh.
+    assert ex._fresh_process is False
+
+
+@pytest.mark.asyncio
+async def test_session_load_falls_back_to_session_new_on_failure() -> None:
+    """If session/load fails, fall back to session/new.
+
+    What breaks if this fails: when a prior session is lost on the agent's side
+    (e.g., agent restart cleared it), we fail the whole turn instead of creating
+    a new session and recovering the conversation via text replay.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._load_session_supported = True
+    ex._session_id = "prior-sess-123"
+    ex._fresh_process = True
+
+    calls: list[tuple[str, dict]] = []
+
+    async def capture_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        if method == "session/load":
+            return {"error": {"code": -32603, "message": "Session not found"}}
+        # session/new succeeds
+        return {"result": {"sessionId": "new-sess-456"}}
+
+    ex._rpc = capture_rpc  # type: ignore[assignment]
+    sid = await ex._ensure_session()
+
+    # Called session/load first, then session/new.
+    assert len(calls) == 2
+    assert calls[0][0] == "session/load"
+    assert calls[1][0] == "session/new"
+    # New session id returned.
+    assert sid == "new-sess-456"
+    assert ex._session_id == "new-sess-456"
+
+
+@pytest.mark.asyncio
+async def test_session_load_not_called_without_capability() -> None:
+    """When loadSession is not advertised, always create new sessions.
+
+    What breaks if this fails: agents without loadSession support are still
+    offered warm-resume (broken), or we fail instead of falling back to
+    text-prefix replay (regression for Goose / Qwen).
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._load_session_supported = False
+    ex._session_id = "prior-sess-123"
+    ex._fresh_process = True
+
+    calls: list[tuple[str, dict]] = []
+
+    async def capture_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {"result": {"sessionId": "new-sess-456"}}
+
+    ex._rpc = capture_rpc  # type: ignore[assignment]
+    sid = await ex._ensure_session()
+
+    # Should have called session/new, not session/load.
+    assert len(calls) == 1
+    assert calls[0][0] == "session/new"
+    # New session id returned.
+    assert sid == "new-sess-456"
 
 
 # ---------------------------------------------------------------------------
@@ -731,7 +861,10 @@ for line in sys.stdin:
     if method == "initialize":
         send({"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": 1,
-            "agentCapabilities": {"promptCapabilities": {"image": False}},
+            "agentCapabilities": {
+                "promptCapabilities": {"image": False},
+                "loadSession": True,
+            },
         }})
     elif method == "session/new":
         send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "fake-session-1"}})
@@ -909,6 +1042,227 @@ async def test_acp_session_new_omnigent_mcp_disabled_per_agent() -> None:
     ex._rpc = fake_rpc  # type: ignore[assignment]
     await ex._ensure_session()
     assert captured["params"]["mcpServers"] == []
+
+
+# A stateful ACP agent that supports session/load: stores session data on disk
+# (via an env var pointing to a temp file) and can restore it when asked.
+# Used to test warm-resume across process boundaries.
+_FAKE_ACP_AGENT_WITH_SESSION_LOAD = r"""
+import sys, json, os
+
+# Read sessions from a shared file; env var must be set by the test.
+sessions_file = os.environ.get("FAKE_AGENT_SESSIONS_FILE")
+if not sessions_file:
+    print("FAKE_AGENT_SESSIONS_FILE not set", file=sys.stderr)
+    sys.exit(1)
+
+def load_sessions():
+    try:
+        with open(sessions_file, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_sessions(sessions):
+    with open(sessions_file, "w") as f:
+        json.dump(sessions, f)
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+def update(sid, upd):
+    send({"jsonrpc": "2.0", "method": "session/update",
+          "params": {"sessionId": sid, "update": upd}})
+
+def chunk(sid, kind, text):
+    update(sid, {"sessionUpdate": kind, "content": {"type": "text", "text": text}})
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid, method = msg.get("id"), msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "promptCapabilities": {"image": False},
+                "loadSession": True,
+            },
+        }})
+    elif method == "session/new":
+        sid = "restored-session-2"
+        sessions = load_sessions()
+        sessions[sid] = {"turn_count": 0}
+        save_sessions(sessions)
+        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": sid}})
+    elif method == "session/load":
+        sid = msg["params"]["sessionId"]
+        sessions = load_sessions()
+        if sid in sessions:
+            # Session found; restore it.
+            send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": sid}})
+        else:
+            # Session not found.
+            send({"jsonrpc": "2.0", "id": mid, "error": {
+                "code": -32603, "message": "Session not found"
+            }})
+    elif method == "session/prompt":
+        sid = msg["params"]["sessionId"]
+        sessions = load_sessions()
+        if sid not in sessions:
+            sessions[sid] = {"turn_count": 0}
+        sessions[sid]["turn_count"] += 1
+        save_sessions(sessions)
+        # Stream a response.
+        chunk(sid, "agent_message_chunk", f"Turn {sessions[sid]['turn_count']}")
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15},
+        }})
+"""
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_session_load_warm_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """session/load is called on process restart; history replay is bypassed.
+
+    What breaks if this fails: agents with loadSession support don't get
+    warm-resume (session lost on respawn), or the history prefix is sent even
+    after loading the session (duplicate context).
+    """
+    agent_path = tmp_path / "stateful_acp_agent.py"
+    agent_path.write_text(_FAKE_ACP_AGENT_WITH_SESSION_LOAD)
+    command = shlex.join([sys.executable, str(agent_path)])
+
+    # Set the sessions file location for the agent.
+    sessions_file = tmp_path / "sessions.json"
+    monkeypatch.setenv("FAKE_AGENT_SESSIONS_FILE", str(sessions_file))
+
+    # Pass the env var through to the agent subprocess.
+    ex = AcpExecutor(
+        AcpAgentConfig(
+            command=command,
+            name="Stateful",
+            env_passthrough=("FAKE_AGENT_SESSIONS_FILE",),
+        )
+    )
+
+    # First turn.
+    events1 = []
+    try:
+        async for ev in ex.run_turn([{"role": "user", "content": "first"}], [], ""):
+            if isinstance(ev, TextChunk):
+                events1.append(ev.text)
+    finally:
+        pass  # Don't close yet; keep the session alive.
+
+    text1 = "".join(events1)
+    assert "Turn 1" in text1
+
+    # Manually respawn the process (simulate agent restart / model change).
+    if ex._proc:
+        ex._proc.kill()
+        await ex._proc.wait()
+    ex._proc = None
+
+    # Second turn: session/load should restore the session, not create a new one.
+    events2 = []
+    try:
+        async for ev in ex.run_turn(
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "Turn 1"},
+                {"role": "user", "content": "second"},
+            ],
+            [],
+            "",
+        ):
+            if isinstance(ev, TextChunk):
+                events2.append(ev.text)
+    finally:
+        await ex.close()
+
+    text2 = "".join(events2)
+    # Without warm-resume, this would be "Turn 1" (new session).
+    # With warm-resume, it's "Turn 2" (loaded session restored).
+    assert "Turn 2" in text2
+
+
+@pytest.mark.asyncio
+async def test_session_load_failure_resets_prompt_state() -> None:
+    """When session/load fails, _system_prompt_sent is reset so history replays.
+
+    What breaks if this fails: a failed session/load leaves _system_prompt_sent=True,
+    so the text-prefix history is never sent with the fallback session/new.
+    This silently loses context because the new session is truly fresh but doesn't
+    receive the replay that rebuilds it.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._load_session_supported = True
+    ex._session_id = "prior-sess"
+    ex._fresh_process = True
+    ex._system_prompt_sent = True  # Simulate prior state
+
+    calls: list[tuple[str, dict]] = []
+
+    async def capture_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        if method == "session/load":
+            return {"error": {"code": -32603, "message": "Session not found"}}
+        # session/new succeeds with a new id
+        return {"result": {"sessionId": "new-sess"}}
+
+    ex._rpc = capture_rpc  # type: ignore[assignment]
+    sid = await ex._ensure_session()
+
+    # Verify the call sequence.
+    assert calls[0][0] == "session/load"
+    assert calls[1][0] == "session/new"
+
+    # After load fails, _system_prompt_sent must be reset so history replay occurs.
+    assert ex._system_prompt_sent is False, (
+        "Failed load must reset _system_prompt_sent so history is replayed"
+    )
+    # New session is created and returned.
+    assert sid == "new-sess"
+    assert ex._session_id == "new-sess"
+
+
+@pytest.mark.asyncio
+async def test_no_capability_respawn_resets_prompt_state() -> None:
+    """A respawned agent WITHOUT loadSession resets _system_prompt_sent so context replays.
+
+    What breaks if this fails: the regression for existing ACP agents (Goose /
+    kilocode / Qwen). On respawn, the no-capability path skips both the load
+    branch and the reuse-return and creates a fresh session/new; if
+    _system_prompt_sent stayed True from before the respawn, run_turn computes
+    fresh_session=False and replays neither the system prompt nor history, so the
+    agent comes up with no context.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._load_session_supported = False  # existing agent: no warm-resume
+    ex._session_id = "prior-sess"  # had a session before the respawn
+    ex._fresh_process = True  # respawned
+    ex._system_prompt_sent = True  # set on the pre-respawn turn
+
+    async def capture_rpc(method, params, timeout=30.0):
+        assert method == "session/new"  # never attempts load without the capability
+        return {"result": {"sessionId": "new-sess"}}
+
+    ex._rpc = capture_rpc  # type: ignore[assignment]
+    sid = await ex._ensure_session()
+
+    assert sid == "new-sess"
+    assert ex._session_id == "new-sess"
+    # The fresh session must be treated as fresh so run_turn replays context.
+    assert ex._system_prompt_sent is False, (
+        "no-capability respawn must reset _system_prompt_sent so history replays"
+    )
 
 
 @pytest.mark.asyncio
