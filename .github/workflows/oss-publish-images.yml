@@ -184,16 +184,21 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Store the BuildKit layer cache as a dedicated GHCR image tag rather
+          # than in the 10 GB Actions cache pool, which the Docker layers alone
+          # (`mode=max`, three multi-arch builds) can fill on their own, evicting
+          # every other workflow's caches. A registry cache does not count
+          # against that pool and has no 7-day eviction.
+          cache-from: type=registry,ref=ghcr.io/omnigent-ai/omnigent-server:buildcache
+          cache-to: type=registry,ref=ghcr.io/omnigent-ai/omnigent-server:buildcache,mode=max
           provenance: false
           sbom: true
 
       # Host image: same Dockerfile, `host` target, also multi-arch (amd64 +
       # arm64). The harness CLIs it bakes in all ship arm64 — claude-code and
       # codex publish linux-arm64 npm binaries, pi is pure-JS. Runs after the
-      # server build so it reuses the shared builder-stage layers from the gha
-      # cache (cached per platform).
+      # server build so it reuses the shared builder-stage layers: read the
+      # server buildcache too, and write its own so host-specific layers cache.
       - name: Build and push host image
         id: build-host
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
@@ -204,15 +209,18 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tags.outputs.host_tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=registry,ref=ghcr.io/omnigent-ai/omnigent-host:buildcache
+            type=registry,ref=ghcr.io/omnigent-ai/omnigent-server:buildcache
+          cache-to: type=registry,ref=ghcr.io/omnigent-ai/omnigent-host:buildcache,mode=max
           provenance: false
           sbom: true
 
       # OpenShell server variant: the default server image plus the
       # openshell SDK extra (OMNIGENT_EXTRAS=openshell). Used by the
-      # deploy/kubernetes/overlays/openshell kustomize overlay. Reuses
-      # the shared builder-stage layers from the gha cache.
+      # deploy/kubernetes/overlays/openshell kustomize overlay. Reads the
+      # server buildcache to reuse the shared builder-stage layers, and writes
+      # its own for the openshell-specific layers.
       - name: Build and push openshell server image
         id: build-openshell
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
@@ -224,8 +232,10 @@ jobs:
           tags: ${{ steps.tags.outputs.openshell_tags }}
           build-args: |
             OMNIGENT_EXTRAS=openshell
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=registry,ref=ghcr.io/omnigent-ai/omnigent-server-openshell:buildcache
+            type=registry,ref=ghcr.io/omnigent-ai/omnigent-server:buildcache
+          cache-to: type=registry,ref=ghcr.io/omnigent-ai/omnigent-server-openshell:buildcache,mode=max
           provenance: false
           sbom: true
 
