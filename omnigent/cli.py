@@ -2750,9 +2750,15 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
         # Remote / explicit ``--server`` mode: the daemon connects to a server
         # we don't own and can't restart, so the config-signature / heal /
         # "re-run" semantics below don't apply (auth posture is the remote's
-        # concern; its own reconnect loop covers transient tunnel drops). Keep
-        # the original PID-liveness reuse so a live daemon for the URL is
-        # reused as-is.
+        # concern; its own reconnect loop covers transient tunnel drops).
+        # PID-liveness alone still reuses a ZOMBIE — a daemon whose tunnel
+        # never came up (dead server URL) sits reconnect-looping forever, and
+        # every later `omnigent start` reports "already running" while the
+        # host reads offline (#4986). Give it the same short reconnect grace
+        # the local path uses, then tear it down and respawn.
+        if background and not _daemon_tunnel_recovers(existing):
+            _terminate_host_unit(existing, reason="host tunnel not online")
+            return _DaemonReuseDecision(reuse=False, config_changed=False)
         return _DaemonReuseDecision(reuse=True, config_changed=False)
 
     if not background:
@@ -7828,6 +7834,11 @@ def _prompt_stop_local_server() -> None:
 # server URL, missing credentials) leaves nothing on the terminal, so we wait
 # this long and surface its log instead of falsely reporting success.
 _BACKGROUND_HOST_GRACE_S = 2.0
+# How long a freshly spawned remote daemon gets for its tunnel to register
+# before `omnigent start` declares failure (connect + register + first
+# heartbeat; generous enough for a slow TLS handshake, short enough to fail
+# fast against a dead URL).
+_BACKGROUND_HOST_ONLINE_WAIT_S = 15.0
 
 
 def _confirm_background_host_alive(record: _HostDaemonRecord) -> None:
@@ -7901,6 +7912,21 @@ def _run_background_host(
         headline = _cli_style("Host daemon already running", fg="yellow", bold=True)
     else:
         _confirm_background_host_alive(record)
+        if record.mode != "local":
+            # A live daemon against an unreachable server is a false success:
+            # the process reconnect-loops forever and the host never registers
+            # (#4986). Wait for the tunnel, then roll the fresh daemon back so
+            # a failed start never requires `omnigent stop` before retrying.
+            if not _daemon_tunnel_recovers(record, grace_s=_BACKGROUND_HOST_ONLINE_WAIT_S):
+                _terminate_host_unit(record, reason="host tunnel never came online")
+                from omnigent._runner_startup import format_runner_log_tail
+
+                log_path = Path(record.log_path) if record.log_path else None
+                raise click.ClickException(
+                    f"The host daemon could not reach {target} — the server is "
+                    "unreachable or rejected the connection."
+                    f"{format_runner_log_tail(log_path)}"
+                )
         headline = _cli_style("Started the host daemon in the background", fg="green", bold=True)
     click.echo(f"{headline} (pid {record.pid}).")
     if record.mode == "local":
