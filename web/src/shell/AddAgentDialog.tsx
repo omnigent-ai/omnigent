@@ -10,7 +10,11 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { AgentCard } from "@/components/AgentCard";
-import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import {
+  useAvailableAgents,
+  prefetchAvailableAgentDetails,
+  type AvailableAgent,
+} from "@/hooks/useAvailableAgents";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 import { createSession } from "@/lib/sessionsApi";
 
@@ -52,20 +56,41 @@ export function AddAgentDialog({
   const agentList = agents ?? [];
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [name, setName] = useState("");
+  // null means "untouched" — the input shows the selected agent's declared
+  // model. Once the user types (including clearing it to ""), their value
+  // wins. Forwarded as ``model_override``; empty → harness default.
+  const [model, setModel] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const selectedAgent = agentList.find((a) => a.id === selectedAgentId) ?? null;
+  const modelValue = model ?? selectedAgent?.model ?? "";
+
+  // Session-discovered rows reach the catalog with only scan data; their
+  // declared model (plus description and harness glyph) arrives via this
+  // enrichment. One row at a time, driven by hover / focus / selection, so
+  // opening the dialog doesn't fan out a GET per discovered agent.
+  function enrichAgent(agent: AvailableAgent): void {
+    void prefetchAvailableAgentDetails(agent, queryClient);
+  }
 
   function selectAgent(agentId: string): void {
     setSelectedAgentId(agentId);
+    // Back to following the newly picked agent's declared model.
+    setModel(null);
     setError(null);
+    // Selection is the path that must enrich: the Model input pre-fills from
+    // the picked agent's declared model, which a session-discovered row only
+    // carries once this fetch lands.
+    const picked = agentList.find((a) => a.id === agentId);
+    if (picked) enrichAgent(picked);
   }
 
   function handleOpenChange(next: boolean): void {
     if (!next) {
       setSelectedAgentId(null);
       setName("");
+      setModel(null);
       setError(null);
       setSubmitting(false);
     }
@@ -79,6 +104,7 @@ export function AddAgentDialog({
       setError("Enter a name for the agent.");
       return;
     }
+    const trimmedModel = modelValue.trim();
     const title = `${UI_ADDED_TITLE_PREFIX}:${selectedAgent.name}:${trimmed}`;
     setSubmitting(true);
     setError(null);
@@ -87,6 +113,9 @@ export function AddAgentDialog({
         parentSessionId,
         subAgentName: null,
         title,
+        // Empty model sends `model_override: null`, which the server reads
+        // the same as an absent field — no override, harness default.
+        modelOverride: trimmedModel || null,
       });
       // Refresh the rail so the new child appears immediately, then jump
       // into it for the first message.
@@ -124,35 +153,70 @@ export function AddAgentDialog({
               </p>
             ) : (
               agentList.map((agent) => (
-                <AgentCard
+                // Pointer/keyboard landing on a row enriches that row alone,
+                // so its details are ready before the user picks it.
+                <div
                   key={agent.id}
-                  agent={agent}
-                  selected={agent.id === selectedAgentId}
-                  onSelect={() => selectAgent(agent.id)}
-                  hover
-                />
+                  onMouseEnter={() => enrichAgent(agent)}
+                  onFocus={() => enrichAgent(agent)}
+                >
+                  <AgentCard
+                    agent={agent}
+                    selected={agent.id === selectedAgentId}
+                    onSelect={() => selectAgent(agent.id)}
+                    hover
+                  />
+                </div>
               ))
             )}
           </div>
 
           {selectedAgent !== null && (
-            <div className="flex flex-col gap-1.5">
-              <label htmlFor="add-agent-name" className="text-sm font-medium text-muted-foreground">
-                Name
-              </label>
-              {/* Raw input matching NewChatDialog's "Name" field for a
+            <>
+              <div className="flex flex-col gap-1.5">
+                <label
+                  htmlFor="add-agent-name"
+                  className="text-sm font-medium text-muted-foreground"
+                >
+                  Name
+                </label>
+                {/* Raw input matching NewChatDialog's "Name" field for a
                   consistent look (rounded-md + border-tint focus, no
                   heavy ring). */}
-              <input
-                id="add-agent-name"
-                data-testid="add-agent-name-input"
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="Name this agent"
-                className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
-              />
-            </div>
+                <input
+                  id="add-agent-name"
+                  data-testid="add-agent-name-input"
+                  type="text"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="Name this agent"
+                  className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
+                />
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <label
+                  htmlFor="add-agent-model"
+                  className="text-sm font-medium text-muted-foreground"
+                >
+                  Model
+                </label>
+                {/* Pre-filled from the agent's declared default (llm.model).
+                  Empty → harness default. Raw input matching the Name field
+                  for a consistent look. A richer dropdown picker backed by
+                  a models-list endpoint is a documented follow-up. */}
+                <input
+                  id="add-agent-model"
+                  data-testid="add-agent-model-input"
+                  type="text"
+                  value={modelValue}
+                  onChange={(e) => setModel(e.target.value)}
+                  placeholder="Harness default"
+                  className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
+                />
+              </div>
+            </>
+
           )}
 
           {error !== null && (

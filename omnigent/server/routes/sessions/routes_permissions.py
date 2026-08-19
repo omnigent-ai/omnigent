@@ -391,6 +391,10 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
     # Harness/kind for the UI; None until the spec loads (mirrors the
     # GET /v1/agents catalog so both endpoints report it consistently).
     harness: str | None = None
+    # Resolved default model, same source as the GET /v1/agents catalog.
+    # Session-discovered agents reach the Add Agent picker through this
+    # endpoint, so without it their model input can never pre-fill.
+    model: str | None = None
     # Prefer the stored entity's description; fall back to the spec's
     # top-level description when the stored value is unset (single-file
     # YAML agents don't persist it at registration today). Lets the
@@ -402,6 +406,10 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
                 agent.id, agent.bundle_location, expand_env=agent.session_id is None
             )
             harness = loaded.spec.executor.harness_kind
+            # spec.llm is None only when no model is declared anywhere;
+            # the parser syncs executor.model into it.
+            if loaded.spec.llm is not None:
+                model = loaded.spec.llm.model
             if description is None:
                 description = loaded.spec.description
             # Declared terminal names, in spec order — the Web UI
@@ -453,6 +461,7 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
         created_at=agent.created_at,
         updated_at=agent.updated_at,
         harness=harness,
+        model=model,
         mcp_servers=mcp_servers,
         mcp_servers_editable=(
             agent.session_id is not None and not (harness or "").endswith("-native")

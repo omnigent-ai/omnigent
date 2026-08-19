@@ -2780,6 +2780,7 @@ export function NewChatLandingScreen() {
             display_name: pendingAgent.name,
             description: pendingAgent.description ?? null,
             harness: pendingAgent.harness ?? null,
+            model: pendingAgent.model ?? null,
             skills: [],
           } satisfies AvailableAgent)
         : agentList.find((a) => a.id === effectiveAgentId),
