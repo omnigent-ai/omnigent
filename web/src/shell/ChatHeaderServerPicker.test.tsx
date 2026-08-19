@@ -5,11 +5,13 @@ import { ChatHeaderServerPicker } from "./ChatHeaderServerPicker";
 const getServerPicker = vi.fn();
 const switchServer = vi.fn();
 const openServerSetup = vi.fn();
+const connectWebServer = vi.fn();
 
-vi.mock("@/lib/nativeBridge", () => ({
+vi.mock("@/lib/serverPicker", () => ({
   getServerPicker: () => getServerPicker(),
-  switchServer: (url: string) => switchServer(url),
+  switchServer: (url: string, runtime: string) => switchServer(url, runtime),
   openServerSetup: () => openServerSetup(),
+  connectWebServer: (url: string) => connectWebServer(url),
 }));
 
 async function openMenu() {
@@ -22,12 +24,13 @@ beforeEach(() => {
   getServerPicker.mockReset();
   switchServer.mockReset();
   openServerSetup.mockReset();
+  connectWebServer.mockReset();
 });
 
 afterEach(cleanup);
 
 describe("ChatHeaderServerPicker", () => {
-  it("renders nothing outside the Electron shell", async () => {
+  it("renders nothing when the runtime has no server picker", async () => {
     getServerPicker.mockResolvedValue(null);
     const { container } = render(<ChatHeaderServerPicker />);
 
@@ -39,6 +42,7 @@ describe("ChatHeaderServerPicker", () => {
     getServerPicker.mockResolvedValue({
       currentOrigin: "http://localhost:8000",
       recentServers: ["http://localhost:8000/", "https://other.example.com/"],
+      runtime: "desktop",
     });
     render(<ChatHeaderServerPicker />);
 
@@ -52,32 +56,56 @@ describe("ChatHeaderServerPicker", () => {
     getServerPicker.mockResolvedValue({
       currentOrigin: "http://localhost:8000",
       recentServers: [],
+      runtime: "web",
     });
     render(<ChatHeaderServerPicker showBrand />);
 
     expect(await screen.findByText("Omnigent")).toBeInTheDocument();
   });
 
-  it("switches servers and opens setup", async () => {
+  it("switches servers and opens desktop setup", async () => {
     getServerPicker.mockResolvedValue({
       currentOrigin: "http://localhost:8000",
       recentServers: ["https://other.example.com/"],
+      runtime: "desktop",
     });
     render(<ChatHeaderServerPicker />);
 
     await openMenu();
     fireEvent.click(await screen.findByText("other.example.com"));
-    await waitFor(() => expect(switchServer).toHaveBeenCalledWith("https://other.example.com/"));
+    await waitFor(() =>
+      expect(switchServer).toHaveBeenCalledWith("https://other.example.com/", "desktop"),
+    );
 
     await openMenu();
     fireEvent.click(await screen.findByText("Connect to new server…"));
     await waitFor(() => expect(openServerSetup).toHaveBeenCalled());
   });
 
-  it("falls back to raw server strings that are not URLs", async () => {
+  it("opens a URL dialog and connects in the web runtime", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://localhost:8000/",
+      recentServers: [],
+      runtime: "web",
+    });
+    render(<ChatHeaderServerPicker />);
+
+    await openMenu();
+    fireEvent.click(await screen.findByText("Connect to new server…"));
+    fireEvent.change(await screen.findByLabelText("Server URL"), {
+      target: { value: "localhost:6771" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+
+    expect(connectWebServer).toHaveBeenCalledWith("localhost:6771");
+    expect(openServerSetup).not.toHaveBeenCalled();
+  });
+
+  it("falls back to raw desktop server strings that are not URLs", async () => {
     getServerPicker.mockResolvedValue({
       currentOrigin: "not-a-url",
       recentServers: ["also-not-a-url"],
+      runtime: "desktop",
     });
     render(<ChatHeaderServerPicker />);
 
