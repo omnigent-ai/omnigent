@@ -657,6 +657,35 @@ def supervise_host_command(command: str) -> str:
     )
 
 
+def rotate_host_log_command(log_path: str) -> str:
+    """
+    Keep the outgoing host log by moving it aside before a launch truncates it.
+
+    Every launch redirects with ``>``, which truncates. When the server
+    relaunches a host that is already unhealthy, that truncation lands *before*
+    the new attempt writes anything — so the previous host's log, including
+    whatever it said as it failed, is destroyed by the very attempt sent to
+    recover it. The launch that overwrote the evidence then reports only its own
+    error, and the original cause is unrecoverable.
+
+    Rotating to a single ``.prev`` generation keeps that last log while bounding
+    growth at two files, which matters because the log usually lives on a
+    RAM-backed ``/tmp``: an append-only log would charge unbounded memory
+    against the sandbox instead.
+
+    Always succeeds, so a caller may chain it with ``;`` ahead of the launch —
+    a missing log (first launch) is the normal case, not an error.
+
+    :param log_path: Log the launch is about to truncate, e.g.
+        ``"/tmp/omnigent-host.log"``.
+    :returns: A POSIX ``sh`` fragment ending in ``;``, safe to prefix to a
+        launch command.
+    """
+    quoted = shlex.quote(log_path)
+    prev = shlex.quote(f"{log_path}.prev")
+    return f"{{ [ -f {quoted} ] && mv -f {quoted} {prev}; }} 2>/dev/null || :;"
+
+
 class SandboxExecTransport(SandboxLifecycle):
     """
     Exec-transport primitives for providers that exec into a running sandbox.
@@ -701,6 +730,10 @@ class SandboxExecTransport(SandboxLifecycle):
         return (e.g. OpenShell) override this to hold the exec stream open
         instead — they supervise too, just without the detach.
 
+        The outgoing log is rotated to ``.prev`` first
+        (:func:`rotate_host_log_command`) so relaunching an unhealthy host does
+        not destroy the log explaining why it was unhealthy.
+
         :param sandbox_id: Target sandbox.
         :param command: Shell command to background, e.g.
             ``"ENV=val omnigent host --server https://…"``.
@@ -711,6 +744,7 @@ class SandboxExecTransport(SandboxLifecycle):
         """
         return self.run(
             sandbox_id,
+            f"{rotate_host_log_command(log_path)} "
             f"setsid nohup sh -c {shlex.quote(supervise_host_command(command))} "
             f"> {log_path} 2>&1 < /dev/null & echo launched",
         )

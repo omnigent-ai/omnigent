@@ -24,6 +24,7 @@ from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     SandboxLauncher,
     render_host_config_write_command,
+    rotate_host_log_command,
     supervise_host_command,
 )
 
@@ -77,12 +78,74 @@ def test_run_background_wraps_command_in_sh_c() -> None:
 
     [cmd] = launcher.commands
     assert cmd == (
+        f"{rotate_host_log_command('/tmp/omnigent-host.log')} "
         f"setsid nohup sh -c {shlex.quote(supervise_host_command(_HOST_LAUNCH))} "
         "> /tmp/omnigent-host.log 2>&1 < /dev/null & echo launched"
     )
     # The env prefix stays attached to the launch inside the quoted script, so
     # the inner shell re-applies it on every supervised restart attempt.
     assert _HOST_LAUNCH in cmd
+
+
+def test_rotate_host_log_command_keeps_the_previous_log(tmp_path: Path) -> None:
+    """
+    A relaunch must not destroy the log explaining why the last host died.
+
+    The launch redirects with ``>``, which truncates before the new attempt
+    writes anything. Relaunching an unhealthy host therefore erased the previous
+    host's log — including its failure — and the relaunch then reported only its
+    own error, leaving the original cause unrecoverable.
+
+    Regression: a managed host dropped its tunnel, the server relaunched it, and
+    the relaunch truncated the only record of the disconnect. The incident could
+    not be root-caused because the recovery attempt destroyed the evidence.
+    """
+    log = tmp_path / "omnigent-host.log"
+    log.write_text("the previous host's dying words\n")
+
+    # Rotate, then truncate exactly as run_background does.
+    subprocess.run(
+        f"{rotate_host_log_command(str(log))} printf 'new host\\n' > {shlex.quote(str(log))}",
+        shell=True,
+        check=True,
+    )
+
+    assert log.read_text() == "new host\n"
+    assert (tmp_path / "omnigent-host.log.prev").read_text() == (
+        "the previous host's dying words\n"
+    )
+
+
+def test_rotate_host_log_command_succeeds_on_the_first_launch(tmp_path: Path) -> None:
+    """
+    No log yet is the normal first-launch case, not an error.
+
+    The fragment is chained ahead of the launch, so a non-zero exit here would
+    be a spurious failure on every fresh sandbox.
+    """
+    missing = tmp_path / "absent.log"
+
+    result = subprocess.run(rotate_host_log_command(str(missing)) + " :", shell=True, check=False)
+
+    assert result.returncode == 0
+    assert not (tmp_path / "absent.log.prev").exists()
+
+
+def test_rotate_host_log_command_bounds_growth_at_one_generation(tmp_path: Path) -> None:
+    """
+    Rotation keeps one generation, never an unbounded chain.
+
+    The log usually lives on a RAM-backed ``/tmp``, so an append-only log (or a
+    growing ``.prev.prev…`` chain) would charge unbounded memory against the
+    sandbox it is meant to help debug.
+    """
+    log = tmp_path / "omnigent-host.log"
+    for generation in ("first", "second", "third"):
+        log.write_text(f"{generation}\n")
+        subprocess.run(rotate_host_log_command(str(log)) + " :", shell=True, check=True)
+
+    assert (tmp_path / "omnigent-host.log.prev").read_text() == "third\n"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["omnigent-host.log.prev"]
 
 
 @pytest.mark.parametrize(
