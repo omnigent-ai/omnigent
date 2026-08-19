@@ -729,10 +729,11 @@ def _usage_event(input_tokens: int, context_window: int = 200_000) -> dict[str, 
         "params": {
             "threadId": "thread_123",
             "tokenUsage": {
+                "modelContextWindow": context_window,
                 "total": {
                     "inputTokens": input_tokens,
-                    "contextWindow": context_window,
                 },
+                "last": {"inputTokens": input_tokens},
             },
         },
     }

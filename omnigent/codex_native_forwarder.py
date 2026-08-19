@@ -6278,7 +6278,9 @@ def _session_usage_data_from_params(params: _JsonObject) -> dict[str, int] | Non
     if not isinstance(total, dict):
         return None
     cumulative_input_tokens = total.get("inputTokens")
-    context_window = total.get("contextWindow")
+    context_window = token_usage.get("modelContextWindow")
+    if context_window is None:
+        context_window = total.get("contextWindow")
     output_tokens = total.get("outputTokens")
     cached_input_tokens = total.get("cachedInputTokens")
     data: dict[str, int] = {}
