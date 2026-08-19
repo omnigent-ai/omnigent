@@ -285,7 +285,7 @@ export function mergeItemsIntoPages(
  */
 export function removeIdsFromPages(
   data: ConversationsInfiniteData | undefined,
-  ids: Set<string>,
+  ids: ReadonlySet<string>,
 ): { data: ConversationsInfiniteData | undefined; removed: boolean } {
   if (!data || ids.size === 0) return { data, removed: false };
   let changed = false;

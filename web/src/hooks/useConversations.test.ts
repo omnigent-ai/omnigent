@@ -1323,10 +1323,30 @@ describe("useStopSession invalidation", () => {
 });
 
 describe("useBulkArchiveConversations", () => {
+  function archivedResponse(id: string, updated_at: number) {
+    return mockResponse({
+      id,
+      object: "conversation",
+      title: id,
+      created_at: 0,
+      updated_at,
+      archived: true,
+      labels: {},
+    });
+  }
+
   function renderBulkArchiveHook() {
     const queryClient = new QueryClient({
       defaultOptions: { mutations: { retry: false } },
     });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([
+        conversation({ id: "conv_a" }),
+        conversation({ id: "conv_b" }),
+        conversation({ id: "conv_keep" }),
+      ]),
+    );
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
@@ -1334,30 +1354,12 @@ describe("useBulkArchiveConversations", () => {
     return { queryClient, invalidateSpy, rendered };
   }
 
-  it("PATCHes each session and invalidates the list on success", async () => {
+  it("PATCHes each session and overlays the archive in place, never invalidating the list", async () => {
     fetchMock
-      .mockResolvedValueOnce(
-        mockResponse({
-          id: "conv_a",
-          object: "conversation",
-          title: "A",
-          created_at: 0,
-          updated_at: 10,
-          labels: {},
-        }),
-      )
-      .mockResolvedValueOnce(
-        mockResponse({
-          id: "conv_b",
-          object: "conversation",
-          title: "B",
-          created_at: 0,
-          updated_at: 11,
-          labels: {},
-        }),
-      );
+      .mockResolvedValueOnce(archivedResponse("conv_a", 10))
+      .mockResolvedValueOnce(archivedResponse("conv_b", 11));
 
-    const { invalidateSpy, rendered } = renderBulkArchiveHook();
+    const { queryClient, invalidateSpy, rendered } = renderBulkArchiveHook();
     rendered.result.current.mutate({ ids: ["conv_a", "conv_b"], archived: true });
     await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
 
@@ -1366,24 +1368,32 @@ describe("useBulkArchiveConversations", () => {
       expect(init.method).toBe("PATCH");
       expect(JSON.parse(init.body as string)).toEqual({ archived: true });
     }
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+
+    // The optimistic overlay already spliced the archived rows out of the
+    // non-archived list and recomputed its page cursors, so the selection
+    // leaves the sidebar without waiting on the network.
+    const data = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    expect(data!.pages[0].data.map((c) => c.id)).toEqual(["conv_keep"]);
+    expect(data!.pages[0].first_id).toBe("conv_keep");
+    expect(data!.pages[0].last_id).toBe("conv_keep");
+
+    // Like the single-row hook, the conversations lists are never
+    // invalidated: an immediate refetch races the server's async search
+    // reindex and can resurrect the just-archived rows. Only the DB-direct
+    // project lists refresh (archiving a project's last live member
+    // empties its folder).
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["archived-project-names"] });
   });
 
-  it("throws with failed ids when some archives fail", async () => {
+  it("keeps the overlay for succeeded rows when some archives fail", async () => {
     fetchMock
-      .mockResolvedValueOnce(
-        mockResponse({
-          id: "conv_a",
-          object: "conversation",
-          title: "A",
-          created_at: 0,
-          updated_at: 10,
-          labels: {},
-        }),
-      )
+      .mockResolvedValueOnce(archivedResponse("conv_a", 10))
       .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
 
-    const { rendered } = renderBulkArchiveHook();
+    const { queryClient, rendered } = renderBulkArchiveHook();
     rendered.result.current.mutate({ ids: ["conv_a", "conv_b"], archived: true });
     await waitFor(() => expect(rendered.result.current.isError).toBe(true));
 
@@ -1391,9 +1401,16 @@ describe("useBulkArchiveConversations", () => {
     expect(rendered.result.current.error).toMatchObject({
       message: "Failed to archive 1 of 2 conversations",
       failed: ["conv_b"],
-      succeeded: [],
+      succeeded: ["conv_a"],
       total: 2,
     });
+
+    // The wholesale rollback restores every row, then the overlay is
+    // re-applied to just the succeeded ones — their PATCHes landed
+    // server-side, so conv_a stays archived out of the list while the
+    // failed conv_b returns.
+    const data = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    expect(data!.pages[0].data.map((c) => c.id)).toEqual(["conv_b", "conv_keep"]);
   });
 });
 
@@ -2023,34 +2040,181 @@ describe("useMoveToProject", () => {
 });
 
 describe("useArchiveConversation", () => {
-  it("PATCHes archived and invalidates both the conversations and projects queries", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({
-        id: "conv_a",
-        object: "conversation",
-        title: "A",
-        created_at: 0,
-        updated_at: 10,
-        labels: { omni_project: "Sprint 42" },
-      }),
-    );
+  const ARCHIVE_RESPONSE = {
+    id: "conv_a",
+    object: "conversation",
+    title: "A",
+    created_at: 0,
+    updated_at: 10,
+    archived: true,
+    labels: { omni_project: "Sprint 42" },
+  };
+
+  function seedArchiveCaches() {
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    // Every cache the row renders from: the non-archived sidebar variant,
+    // the includeArchived variant, its project folder, the pinned sibling
+    // cache, and the pinned-row backfill.
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_a" }), conversation({ id: "conv_keep" })]),
+    );
+    queryClient.setQueryData(
+      ["conversations", "", true],
+      infinitePage([conversation({ id: "conv_a" }), conversation({ id: "conv_keep" })]),
+    );
+    queryClient.setQueryData(
+      ["project-sessions", "Sprint 42"],
+      infinitePage([conversation({ id: "conv_a" }), conversation({ id: "conv_sibling" })]),
+    );
+    queryClient.setQueryData(["conversation-backfill", "conv_a"], conversation({ id: "conv_a" }));
+    queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, {
+      conversations: [conversation({ id: "conv_a" }), conversation({ id: "conv_pin_other" })],
+      filterHonored: true,
+    });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
+    return { queryClient, invalidateSpy, wrapper };
+  }
+
+  function expectArchiveOverlay(queryClient: QueryClient) {
+    // Non-archived list + folder: the row is spliced out (cursors
+    // recomputed) so the sidebar row disappears on the next frame.
+    const base = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    expect(base!.pages[0].data.map((c) => c.id)).toEqual(["conv_keep"]);
+    expect(base!.pages[0].first_id).toBe("conv_keep");
+    const folder = queryClient.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "Sprint 42",
+    ]);
+    expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_sibling"]);
+    // includeArchived list: the row stays (the archived view must still
+    // find it) but flagged, so the sidebar's client-side `archived !==
+    // true` filter peels it out of the visible sections.
+    const withArchived = queryClient.getQueryData<ConversationsInfiniteData>([
+      "conversations",
+      "",
+      true,
+    ]);
+    expect(withArchived!.pages[0].data.find((c) => c.id === "conv_a")!.archived).toBe(true);
+    // The pinned sibling cache holds its own row copies; the flag flip is
+    // what drops an archived pinned session from the Pinned section...
+    const pinned = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
+    expect(pinned!.conversations.find((c) => c.id === "conv_a")!.archived).toBe(true);
+    // ...and the still-fresh backfill can't resurrect the pre-flip row.
+    expect(
+      queryClient.getQueryData<Conversation>(["conversation-backfill", "conv_a"])!.archived,
+    ).toBe(true);
+  }
+
+  it("overlays the archive before the server responds, then refreshes only DB-direct lists", async () => {
+    let resolveFetch: (r: Response) => void = () => {};
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveFetch = resolve;
+      }),
+    );
+    const { queryClient, invalidateSpy, wrapper } = seedArchiveCaches();
     const { result } = renderHook(() => useArchiveConversation(), { wrapper });
 
     result.current.mutate({ id: "conv_a", archived: true });
+
+    // The overlay lands from onMutate — before the PATCH resolves. This is
+    // what makes the sidebar row vanish on click instead of after the
+    // network round-trip.
+    await waitFor(() => {
+      const base = queryClient.getQueryData<ConversationsInfiniteData>([
+        "conversations",
+        "",
+        false,
+      ]);
+      expect(base!.pages[0].data.map((c) => c.id)).toEqual(["conv_keep"]);
+    });
+    expectArchiveOverlay(queryClient);
+
+    resolveFetch(mockResponse(ARCHIVE_RESPONSE));
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_a");
     expect(init.method).toBe("PATCH");
     expect(JSON.parse(init.body as string)).toEqual({ archived: true });
-    // Projects must refresh too: archiving the last live member of a project
-    // removes its folder; unarchiving restores it.
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+
+    // The conversations lists are patched by the overlay and converge via
+    // the session-updates stream — invalidating them here would race the
+    // server's async search reindex and resurrect the row. Only the
+    // DB-direct project lists refresh: archiving the last live member of
+    // a project removes its folder.
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["archived-project-names"] });
+    // Nothing reverts the overlay after success.
+    expectArchiveOverlay(queryClient);
+  });
+
+  it("restores every cache when the PATCH fails", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+    const { queryClient, wrapper } = seedArchiveCaches();
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+    // The restored row carries no failure state of its own (it unmounted
+    // when the overlay dropped it), so the toast is the only signal the
+    // user gets that the archive didn't land.
+    const toasts: string[] = [];
+    window.addEventListener("omnigent:toast", (e) => {
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    });
+
+    result.current.mutate({ id: "conv_a", archived: true });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect(toasts).toEqual(["Couldn't archive the session — it's back in the sidebar."]);
+
+    // Wholesale rollback: the row is back in the non-archived list and its
+    // folder, and unflagged everywhere else — the pre-click state.
+    const base = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    expect(base!.pages[0].data.map((c) => c.id)).toEqual(["conv_a", "conv_keep"]);
+    const folder = queryClient.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "Sprint 42",
+    ]);
+    expect(folder!.pages[0].data.map((c) => c.id)).toEqual(["conv_a", "conv_sibling"]);
+    const withArchived = queryClient.getQueryData<ConversationsInfiniteData>([
+      "conversations",
+      "",
+      true,
+    ]);
+    expect(withArchived!.pages[0].data.find((c) => c.id === "conv_a")!.archived).toBeFalsy();
+    const pinned = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
+    expect(pinned!.conversations.find((c) => c.id === "conv_a")!.archived).toBeFalsy();
+    expect(
+      queryClient.getQueryData<Conversation>(["conversation-backfill", "conv_a"])!.archived,
+    ).toBeFalsy();
+  });
+
+  it("flips the flag back on unarchive so the row re-enters the sidebar", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...ARCHIVE_RESPONSE, archived: false }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    // Unarchive starts from the archived view's world: the row lives in
+    // the includeArchived cache, flagged.
+    queryClient.setQueryData(
+      ["conversations", "", true],
+      infinitePage([conversation({ id: "conv_a", archived: true })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+
+    result.current.mutate({ id: "conv_a", archived: false });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // The includeArchived cache flips in place — the sidebar renders from
+    // it filtered by `archived !== true`, so the row re-enters instantly.
+    // Lists the row isn't cached in (folders, searches) converge via the
+    // session-updates stream; the overlay can't sort it in locally.
+    const data = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", true]);
+    expect(data!.pages[0].data.find((c) => c.id === "conv_a")!.archived).toBe(false);
   });
 });
 
