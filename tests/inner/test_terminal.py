@@ -78,6 +78,61 @@ def test_resolve_terminal_transport_precedence(
     )
 
 
+def _write_mouse_config(config_home: Path, value: str | None) -> None:
+    """Write ``terminal.mouse: <value>`` into a scratch config.yaml.
+
+    :param config_home: Directory used as ``OMNIGENT_CONFIG_HOME``.
+    :param value: Mouse value to persist, or ``None`` to write a config with
+        no ``terminal`` table.
+    """
+    body = "" if value is None else f"terminal:\n  mouse: {value}\n"
+    (config_home / "config.yaml").write_text(body, encoding="utf-8")
+
+
+_MOUSE_ON_COMMAND = ["set-option", "-g", "mouse", "on"]
+
+
+def test_terminal_mouse_enabled_reads_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``terminal.mouse`` opts out of tmux mouse mode; anything else keeps it on."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+
+    # No config file, or a config with no terminal table → mouse stays on.
+    assert terminal_mod._terminal_mouse_enabled() is True
+    _write_mouse_config(tmp_path, None)
+    assert terminal_mod._terminal_mouse_enabled() is True
+
+    # Falsy values opt OUT. off/false/no parse as YAML booleans (normalized by
+    # the reader); a quoted "0" exercises the raw-string alias path.
+    for value in ("off", "false", "no", "Off", "FALSE", '"0"'):
+        _write_mouse_config(tmp_path, value)
+        assert terminal_mod._terminal_mouse_enabled() is False, value
+
+    # Truthy / unrecognized values keep mouse mode on, so a typo can't silently
+    # strip mouse-driven scroll from the web terminal.
+    for value in ("on", "true", "yes", "garbage"):
+        _write_mouse_config(tmp_path, value)
+        assert terminal_mod._terminal_mouse_enabled() is True, value
+
+
+def test_tmux_input_option_commands_gate_mouse(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The ``mouse on`` command is emitted only when mouse mode is enabled."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+
+    # Default (no config): mouse mode is on and the command is emitted.
+    assert _MOUSE_ON_COMMAND in terminal_mod._tmux_input_option_commands(10000)
+
+    # Opted out: the mouse command is dropped but the other input options stay.
+    _write_mouse_config(tmp_path, "off")
+    commands = terminal_mod._tmux_input_option_commands(10000)
+    assert _MOUSE_ON_COMMAND not in commands
+    assert ["set-option", "-g", "history-limit", "10000"] in commands
+    assert ["set-option", "-g", "focus-events", "on"] in commands
+
+
 @dataclass
 class _SuccessfulProcess:
     """
