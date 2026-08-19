@@ -79,12 +79,16 @@ _FATAL_SERVER_CLOSE_CODES = {4001, 4002, 4004, 4500}
 # (not 401) when a previously-valid token expires while the machine is
 # offline or sleeping. A fresh token from the factory is obtained and the
 # connection is retried with normal backoff. After
-# _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS consecutive rejections the runner
-# gives up — a genuinely-forbidden runner must not busy-reconnect forever.
+# _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS consecutive rejections a runner that
+# never upgraded gives up — a genuinely-forbidden runner must not
+# busy-reconnect forever.
 _REFRESHABLE_HTTP_STATUSES = {401, 403}
-# Maximum consecutive HTTP 401/403 rejections before the runner exits.
-# A single rejection is almost certainly an expired token; a persistent
-# streak means the credentials can't be fixed and we should fail loud.
+# Maximum consecutive HTTP 401/403 rejections before a runner that has NEVER
+# completed an upgrade exits. A runner that HAS served this tunnel is exempt:
+# it already proved its credentials, so a later 401/403 is almost always a
+# network-path artifact (a dropped VPN whose proxy answers the upgrade before
+# it reaches the server) and exiting would kill every conversation on the
+# runner. Mirrors the host tunnel's status classification.
 _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS = 3
 # Routine server-initiated recycles, NOT errors: 1012 "service restart" and
 # 1001 "going away" (and a 502 upgrade rejection) are how the Databricks Apps
@@ -426,7 +430,10 @@ async def serve_tunnel(
                 http_status = _websocket_http_status(exc)
                 if http_status is not None and http_status in _REFRESHABLE_HTTP_STATUSES:
                     http_auth_rejection_streak += 1
-                    if http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS:
+                    if (
+                        not ever_connected
+                        and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+                    ):
                         login_hint = (
                             f"run `databricks auth login --host {server_url}` to re-authenticate"
                             if server_url
@@ -443,9 +450,20 @@ async def serve_tunnel(
                     # already guarded against transient factory errors (OSError etc.),
                     # so we don't call the factory directly here.
                     _invalidate_auth_token_factory(auth_token_factory)
-                    _logger.info("HTTP %d; invalidated auth token, retrying", http_status)
                     retry_reason = f"HTTP {http_status}; retrying with refreshed token"
-                    delay_s = _INITIAL_RECONNECT_DELAY_S
+                    if ever_connected:
+                        # Escalate the backoff rather than resetting it: a rejection
+                        # that outlives the token refresh is a network path answering
+                        # the upgrade, and the base delay would retry every ~0.5s for
+                        # the whole outage.
+                        _logger.warning(
+                            "HTTP %d after a successful upgrade; retrying — "
+                            "check VPN/network connectivity",
+                            http_status,
+                        )
+                    else:
+                        _logger.info("HTTP %d; invalidated auth token, retrying", http_status)
+                        delay_s = _INITIAL_RECONNECT_DELAY_S
                 else:
                     close_code = _websocket_close_code(exc)
                     if close_code in _FATAL_SERVER_CLOSE_CODES:

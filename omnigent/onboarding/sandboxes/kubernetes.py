@@ -3,15 +3,15 @@ Kubernetes sandbox launcher.
 
 Implements the managed-launch subset of
 :class:`~omnigent.onboarding.sandboxes.base.SandboxLauncher` for an
-agent-runner Pod spawned on demand in a Kubernetes cluster. This module ships
+agent-runner Job spawned on demand in a Kubernetes cluster. This module ships
 in the OSS build; the official ``kubernetes`` Python client is an optional
 dependency (``pip install 'omnigent[kubernetes]'``) imported lazily, so the
 provider can be listed and the module probed without it.
 
-The model is **entrypoint-as-host**: the Pod's container command IS
+The model is **entrypoint-as-host**: the Job's Pod template container command IS
 ``omnigent host``. :meth:`~KubernetesSandboxLauncher.provision` only RESERVES
-the Pod name (no Pod yet); :meth:`~KubernetesSandboxLauncher.start_host` then
-creates the Pod — an init container prepares the workspace (``mkdir`` + optional
+the Job name (no Job yet); :meth:`~KubernetesSandboxLauncher.start_host` then
+creates the Job — an init container prepares the workspace (``mkdir`` + optional
 ``git clone``) and the main container runs the host under a tiny PID-1 reaper,
 which dials back over the existing managed launch-token tunnel. Because the host
 is never started by ``exec``-ing into an already-running container, this launcher
@@ -20,7 +20,7 @@ needs no ``pods/exec`` rights and no exec transport — it implements only
 
 Platform notes that shape this launcher:
 
-- **Token via Secret.** The launch token rides a per-Pod Kubernetes Secret
+- **Token via Secret.** The launch token rides a per-Job Kubernetes Secret
   referenced by ``secretKeyRef`` — never the Pod spec, an exec request URI, or
   any audit-logged surface. Harness LLM credentials ride a pre-created Secret
   projected via ``envFrom`` (``sandbox.kubernetes.secret_name``).
@@ -181,10 +181,22 @@ _POD_READY_POLL_S: float = 2.0
 _POD_READY_REQUEST_TIMEOUT_S: float = 10.0
 
 # terminate() retries a transient (timeout/connection) delete a few times before
-# giving up best-effort: Kubernetes Pods have no platform lifetime cap, so a
-# delete that never lands orphans a running, credential-bearing Pod.
-_POD_DELETE_MAX_ATTEMPTS: int = 3
-_POD_DELETE_BACKOFF_S: float = 1.0
+# giving up best-effort — a delete that never lands orphans a running,
+# credential-bearing Job until activeDeadlineSeconds expires.
+_DELETE_MAX_ATTEMPTS: int = 3
+_DELETE_BACKOFF_S: float = 1.0
+
+# Job-level retry budget (lifetime, shared across init AND main containers).
+# Under OnFailure the kubelet restart counter is monotonic for the Pod's whole
+# life, so init-container retries (e.g. transient git clone failures) consume
+# from the same pool as host-container crashes.  6 leaves headroom for a couple
+# of init retries while still surfacing a persistently crashing host promptly.
+_JOB_BACKOFF_LIMIT: int = 6
+
+# Hard lifetime cap for a Job (seconds).  Prevents indefinitely-running
+# sandboxes when no explicit terminate arrives.  7 days matches the managed
+# launch-token TTL.
+_JOB_ACTIVE_DEADLINE_S: int = 7 * 24 * 3600
 
 # Lines of container log tail surfaced in a start-failure message (e.g. the git
 # clone error from the init container).
@@ -346,15 +358,16 @@ def _resolve_pod_resources(resources: dict[str, object] | None) -> dict[str, dic
 
 def _new_pod_name(label: str) -> str:
     """
-    Derive a DNS-label-safe Pod name from a human label.
+    Derive a DNS-label-safe Job/Pod name from a human label.
 
     Lowercase, non-``[a-z0-9-]`` runs collapse to ``-``, leading/trailing ``-``
     stripped, empty falls back to ``host``, truncated to keep the full name
-    within the 63-char DNS label limit, and a 6-hex random suffix guarantees
-    uniqueness across relaunches of the same session.
+    within the 63-char DNS label limit (also the Kubernetes label-value limit,
+    since the Job name becomes a ``job-name`` label on its child Pod), and a
+    6-hex random suffix guarantees uniqueness across relaunches.
 
     :param label: Human-readable label, e.g. ``"managed-a1b2c3d4"``.
-    :returns: A Pod name like ``"omnigent-managed-a1b2c3d4-1a2b3c"``.
+    :returns: A name like ``"omnigent-managed-a1b2c3d4-1a2b3c"``.
     """
     base = re.sub(r"[^a-z0-9-]+", "-", label.lower()).strip("-")
     base = re.sub(r"-+", "-", base) or "host"
@@ -368,7 +381,7 @@ def _is_valid_label_value(value: str) -> bool:
     Valid means 1–63 characters, starting and ending alphanumeric, using only
     ``[A-Za-z0-9._-]`` in between (case-sensitive). The agent classifier is
     echoed only when this holds — it is never coerced, because two distinct
-    names must never collapse to one value (see :func:`build_pod_manifest`).
+    names must never collapse to one value (see :func:`build_job_manifest`).
 
     :param value: The raw string, e.g. a server-resolved agent name.
     :returns: ``True`` when *value* may be stamped verbatim.
@@ -376,15 +389,19 @@ def _is_valid_label_value(value: str) -> bool:
     return len(value) <= _LABEL_VALUE_MAX_LEN and _LABEL_VALUE_RE.fullmatch(value) is not None
 
 
-def _token_secret_name(pod_name: str) -> str:
+def _token_secret_name(job_name: str) -> str:
     """
-    Name of the per-Pod launch-token Secret for *pod_name*.
+    Name of the per-Job launch-token Secret for *job_name*.
 
-    :param pod_name: The Pod name (≤63 chars), so the ``-token`` suffix keeps
+    Named after the Job (not the Pod) so the Secret identity is stable across
+    ``restartPolicy: OnFailure`` container restarts — the same Pod restarts in
+    place and the ``secretKeyRef`` keeps resolving.
+
+    :param job_name: The Job name (≤63 chars), so the ``-token`` suffix keeps
         the Secret within the 253-char DNS subdomain limit.
     :returns: The Secret name, e.g. ``"omnigent-managed-a1b2c3d4-1a2b3c-token"``.
     """
-    return f"{pod_name}-token"
+    return f"{job_name}-token"
 
 
 def _render_workspace_prep_command(
@@ -485,9 +502,9 @@ def build_token_secret_manifest(
     }
 
 
-def build_pod_manifest(
+def build_job_manifest(
     *,
-    pod_name: str,
+    job_name: str,
     namespace: str,
     image: str,
     service_account: str,
@@ -507,13 +524,36 @@ def build_pod_manifest(
     pvc_mounts: Sequence[Mapping[str, object]] | None = None,
     secret_mounts: Sequence[Mapping[str, object]] | None = None,
     agent_name: str | None = None,
+    backoff_limit: int = _JOB_BACKOFF_LIMIT,
+    active_deadline_seconds: int = _JOB_ACTIVE_DEADLINE_S,
 ) -> dict[str, object]:
     """
-    Build the sandbox Pod manifest as a plain dict.
+    Build the sandbox Job manifest as a plain dict.
 
     Pure: no SDK import, no I/O — the manifest is a literal dict the caller
-    hands to ``create_namespaced_pod``, which makes it the primary unit-test
-    surface for every security / lifecycle decision baked into a sandbox Pod.
+    hands to ``create_namespaced_job``, which makes it the primary unit-test
+    surface for every security / lifecycle decision baked into a sandbox Job.
+
+    The Pod template is wrapped in a ``batch/v1 Job`` with
+    ``restartPolicy: OnFailure`` so the kubelet automatically restarts a
+    crashed host container with exponential backoff (10 s, 20 s, 40 s, …
+    capped at 5 min).  The Job's ``backoffLimit`` caps the total retry count,
+    and ``activeDeadlineSeconds`` enforces a hard lifetime.  Because
+    ``OnFailure`` restarts the SAME Pod in place, the Pod name is stable
+    across retries — the token Secret ``secretKeyRef`` keeps resolving and the
+    ``sandbox_id`` tracking in the managed-host machinery is unaffected.
+
+    The host's existing WebSocket reconnect logic (exponential backoff in
+    ``omnigent/host/connect.py``) re-registers the tunnel automatically after
+    a container restart.  Combined with the runner's durable conversation
+    checkpointing, an incomplete turn is auto-recovered on session re-init.
+
+    No liveness probe is added: the PID-1 reaper propagates the child's exit
+    status (``_REAPER_SRC``), so a crashed host exits the container and
+    ``OnFailure`` restarts it.  A ``pgrep``-based probe would match the
+    reaper's own argv (which contains ``omnigent host``), making it unable to
+    detect a dead child — and it would also require ``procps`` in the image,
+    which custom operator images may omit.
 
     The encoded design:
 
@@ -521,8 +561,8 @@ def build_pod_manifest(
       and clones the repository; the **main container**
       (:data:`_CONTAINER_NAME`) runs ``omnigent host`` under the PID-1 reaper.
       Both share the writable-HOME ``emptyDir``.
-    - ``restartPolicy: Never`` — a crashed host should not silently restart with
-      a stale launch token; the managed machinery provisions a replacement.
+    - ``restartPolicy: OnFailure`` — a crashed host is automatically restarted
+      by the kubelet within the Job's ``backoffLimit``.
     - ``automountServiceAccountToken: false`` — a compromised agent cannot reach
       the API with the runner SA.
     - The launch token is referenced via ``secretKeyRef`` (never in the spec);
@@ -546,14 +586,14 @@ def build_pod_manifest(
       ~1 min), so the in-sandbox consumer must re-read the file each use — a
       value cached at start defeats the rotation.
 
-    :param pod_name: DNS-label-safe Pod name (see :func:`_new_pod_name`).
-    :param namespace: Namespace the Pod is created in.
+    :param job_name: DNS-label-safe Job name (see :func:`_new_pod_name`).
+    :param namespace: Namespace the Job is created in.
     :param image: Host image reference to run.
     :param service_account: ServiceAccount the Pod runs as.
     :param host_id: Server-chosen host identity, injected as literal env.
     :param host_name: Server-chosen host display name, injected as literal env.
     :param server_url: URL the host dials back to (baked into the host command).
-    :param token_secret_name: Per-Pod Secret holding the launch token, projected
+    :param token_secret_name: Per-Job Secret holding the launch token, projected
         via ``secretKeyRef``.
     :param harness_secret: Name of the harness-credentials Secret projected via
         ``envFrom``, or ``None`` for none.
@@ -585,7 +625,10 @@ def build_pod_manifest(
         ``None``/empty → omit fail-safe): the value selects which credential an
         admission policy injects, so it must equal the agent name exactly rather
         than be coerced into a collision with a different name.
-    :returns: The Pod manifest dict.
+    :param backoff_limit: Maximum container restart attempts before the Job
+        is marked Failed.
+    :param active_deadline_seconds: Hard lifetime cap for the Job.
+    :returns: The Job manifest dict.
     """
     pod_resources = _resolve_pod_resources(resources)
     container_security = {
@@ -706,8 +749,8 @@ def build_pod_manifest(
     if harness_secret:
         host_container["envFrom"] = [{"secretRef": {"name": harness_secret}}]
 
-    spec: dict[str, object] = {
-        "restartPolicy": "Never",
+    pod_spec: dict[str, object] = {
+        "restartPolicy": "OnFailure",
         "automountServiceAccountToken": False,
         "serviceAccountName": service_account,
         # amd64 default first so existing deployments keep their placement; an
@@ -726,6 +769,7 @@ def build_pod_manifest(
         "initContainers": [init_container],
         "containers": [host_container],
     }
+
     # Reserved pair first (never overridable). The classifier is echo-or-omit:
     # never coerced, since a lossy collision would map two agents onto one
     # credential an admission policy injects.
@@ -737,20 +781,27 @@ def build_pod_manifest(
             # Warned, not silent: the resolve upstream already logged this agent
             # as classified, so a quiet drop would contradict it.
             _logger.warning(
-                "agent %r is not a valid %s value; runner Pod %s stays unclassified",
+                "agent %r is not a valid %s value; runner Job %s stays unclassified",
                 agent_name,
                 _AGENT_LABEL,
-                pod_name,
+                job_name,
             )
     return {
-        "apiVersion": "v1",
-        "kind": "Pod",
+        "apiVersion": "batch/v1",
+        "kind": "Job",
         "metadata": {
-            "name": pod_name,
+            "name": job_name,
             "namespace": namespace,
             "labels": labels,
         },
-        "spec": spec,
+        "spec": {
+            "backoffLimit": backoff_limit,
+            "activeDeadlineSeconds": active_deadline_seconds,
+            "template": {
+                "metadata": {"labels": labels},
+                "spec": pod_spec,
+            },
+        },
     }
 
 
@@ -789,7 +840,7 @@ def _format_api_error(action: str, name: str, exc: k8s_client.ApiException) -> s
     if getattr(exc, "status", None) == 403:
         message += (
             " — the server ServiceAccount likely lacks the sandbox-manager Role "
-            "(pods, secrets); apply "
+            "(jobs, pods, secrets); apply "
             "`kubectl apply -k deploy/kubernetes/overlays/sandbox-runners/`."
         )
     return message
@@ -827,9 +878,15 @@ def _terminal_failure(pod: object) -> tuple[str, str] | None:
     failed, or ``None`` — so the start wait fast-fails instead of polling to the
     deadline.
 
-    An init container that exited non-zero (e.g. the clone failed) wedges a
-    ``restartPolicy: Never`` Pod forever; the host container terminating at all
-    means the host died before coming online. Both are terminal.
+    Under ``restartPolicy: OnFailure`` the kubelet retries failed containers
+    with exponential backoff, so a single non-zero exit is NOT terminal.  We
+    only report terminal failure when:
+
+    - The **Pod phase** is ``Failed`` (the Job controller gave up after
+      exhausting ``backoffLimit``), OR
+    - The host container is in ``CrashLoopBackOff`` (the kubelet is still
+      retrying, but the container is crash-looping and unlikely to self-heal
+      during the launch window).
 
     :param pod: A ``V1Pod`` read from the API.
     :returns: The failed container name + summary, or ``None``.
@@ -837,21 +894,41 @@ def _terminal_failure(pod: object) -> tuple[str, str] | None:
     status = getattr(pod, "status", None)
     if status is None:
         return None
-    for cs in getattr(status, "init_container_statuses", None) or []:
-        terminated = getattr(getattr(cs, "state", None), "terminated", None)
-        if terminated is not None and getattr(terminated, "exit_code", 0) != 0:
-            reason = getattr(terminated, "reason", None) or "Error"
-            return getattr(cs, "name", _INIT_CONTAINER_NAME), (
-                f"workspace prep failed (exit {terminated.exit_code}, {reason})"
-            )
+    phase = getattr(status, "phase", None)
+
+    # Pod phase Failed means the Job exhausted its backoffLimit — genuinely
+    # terminal regardless of which container caused it.
+    if phase == "Failed":
+        for cs in getattr(status, "init_container_statuses", None) or []:
+            terminated = getattr(getattr(cs, "state", None), "terminated", None)
+            if terminated is not None and getattr(terminated, "exit_code", 0) != 0:
+                reason = getattr(terminated, "reason", None) or "Error"
+                return getattr(cs, "name", _INIT_CONTAINER_NAME), (
+                    f"workspace prep failed (exit {terminated.exit_code}, {reason})"
+                )
+        for cs in getattr(status, "container_statuses", None) or []:
+            terminated = getattr(getattr(cs, "state", None), "terminated", None)
+            if terminated is not None:
+                code = getattr(terminated, "exit_code", "?")
+                reason = getattr(terminated, "reason", None) or "Terminated"
+                return getattr(cs, "name", _CONTAINER_NAME), (
+                    f"host container exited before coming online (exit {code}, {reason})"
+                )
+        return _CONTAINER_NAME, "entered terminal phase 'Failed'"
+
+    # Host container in CrashLoopBackOff while the Pod is still Running —
+    # the kubelet is retrying but the host is crash-looping.
     for cs in getattr(status, "container_statuses", None) or []:
-        terminated = getattr(getattr(cs, "state", None), "terminated", None)
-        if terminated is not None:
-            code = getattr(terminated, "exit_code", "?")
-            reason = getattr(terminated, "reason", None) or "Terminated"
-            return getattr(cs, "name", _CONTAINER_NAME), (
-                f"host container exited before coming online (exit {code}, {reason})"
-            )
+        waiting = getattr(getattr(cs, "state", None), "waiting", None)
+        if waiting is not None:
+            wr = getattr(waiting, "reason", None)
+            if wr == "CrashLoopBackOff":
+                restart_count = getattr(cs, "restart_count", "?")
+                return getattr(cs, "name", _CONTAINER_NAME), (
+                    f"host container is crash-looping "
+                    f"(restarts: {restart_count}, CrashLoopBackOff)"
+                )
+
     return None
 
 
@@ -900,13 +977,16 @@ def _current_wait_reason(pod: object) -> str | None:
 
 class KubernetesSandboxLauncher(SandboxHostLauncher):
     """
-    :class:`SandboxLauncher` for on-demand Kubernetes Pods.
+    :class:`SandboxLauncher` for on-demand Kubernetes Jobs.
 
-    Server-managed only and entrypoint-as-host: :meth:`provision` reserves a Pod
-    name, :meth:`start_host` creates a per-Pod token Secret and a Pod whose init
-    container prepares the workspace and whose main container runs
-    ``omnigent host``, and :meth:`terminate` deletes both. All transport rides the
-    official ``kubernetes`` client's ``CoreV1Api`` built into an isolated
+    Server-managed only and entrypoint-as-host: :meth:`provision` reserves a Job
+    name, :meth:`start_host` creates a per-Job token Secret and a Job whose Pod
+    template's init container prepares the workspace and whose main container runs
+    ``omnigent host``, and :meth:`terminate` deletes both.  The Job uses
+    ``restartPolicy: OnFailure`` so the kubelet automatically restarts a crashed
+    host container, providing automatic failover within the Job's
+    ``backoffLimit``.  All transport rides the official ``kubernetes`` client's
+    ``CoreV1Api`` and ``BatchV1Api`` built into an isolated
     :class:`~kubernetes.client.Configuration` (no global client-state mutation),
     preferring in-cluster ServiceAccount config and falling back to a kubeconfig.
     """
@@ -940,32 +1020,13 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         secret_mounts: Sequence[Mapping[str, object]] | None = None,
     ) -> None:
         """
-        Initialize the launcher.
+        Store provider config for lazy use by :meth:`start_host` / :meth:`terminate`.
 
-        :param image: Host image reference — the ``sandbox.kubernetes.image``
-            config. ``None`` resolves :data:`HOST_IMAGE_ENV_VAR` then
-            :data:`~omnigent.onboarding.sandboxes.base.DEFAULT_HOST_IMAGE`.
-        :param namespace: Namespace to create Pods in. ``None`` resolves
-            :data:`NAMESPACE_ENV_VAR` then :data:`_DEFAULT_NAMESPACE`.
-        :param env: Names of server-process environment variables to inject as
-            literal env. ``None`` resolves :data:`SANDBOX_ENV_PASSTHROUGH_ENV_VAR`.
-        :param secret_name: Kubernetes Secret to project via ``envFrom``.
-            ``None`` resolves :data:`SANDBOX_SECRET_ENV_VAR` then no Secret.
-        :param node_selector: Extra node selector labels merged with a default
-            ``kubernetes.io/arch: amd64``; a ``kubernetes.io/arch`` entry here
-            overrides the default (e.g. ``arm64``).
-        :param service_account: ServiceAccount Pods run as. ``None`` resolves
-            :data:`SERVICE_ACCOUNT_ENV_VAR` then :data:`_DEFAULT_SERVICE_ACCOUNT`.
-        :param kubeconfig: Kubeconfig path for the out-of-cluster fallback.
-            ``None`` resolves :data:`KUBECONFIG_ENV_VAR` then the ambient config.
-        :param in_cluster: Force the config source: ``True`` in-cluster only,
-            ``False`` kubeconfig only, ``None`` to try in-cluster then fall back.
-        :param resources: ``sandbox.kubernetes.resources`` block, or ``None``
-            for the built-in defaults.
-        :param pvc_mounts: Normalized ``sandbox.kubernetes.pvc_mounts`` entries
-            (validated at parse time), or ``None`` for none.
-        :param secret_mounts: Normalized ``sandbox.kubernetes.secret_mounts``
-            entries (validated at parse time), or ``None`` for none.
+        No Kubernetes client is created here — the ``ApiClient`` and its two
+        typed wrappers are built on first use by :meth:`_load_clients` so that
+        constructing the launcher is always safe (no cluster reachability
+        required) and so tests can inject fakes before the real client is
+        created.
         """
         self._image_ref = image
         self._namespace = namespace
@@ -979,26 +1040,21 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._pvc_mounts = list(pvc_mounts) if pvc_mounts else None
         self._secret_mounts = list(secret_mounts) if secret_mounts else None
         self._core: k8s_client.CoreV1Api | None = None
+        self._batch: k8s_client.BatchV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
 
     # ── config / clients ────────────────────────────────────
 
-    def _load_core(self) -> k8s_client.CoreV1Api:
+    def _load_clients(self) -> tuple[k8s_client.CoreV1Api, k8s_client.BatchV1Api]:
         """
-        Return the (lazily built) ``CoreV1Api``, loading cluster config into an
-        isolated :class:`~kubernetes.client.Configuration`.
+        Return the (lazily built) ``CoreV1Api`` and ``BatchV1Api``, loading
+        cluster config into an isolated :class:`~kubernetes.client.Configuration`.
 
-        The config never mutates the client library's global default: a fresh
-        ``Configuration`` is created, in-cluster ServiceAccount config (primary)
-        or a kubeconfig (fallback) is loaded into it, and an ``ApiClient`` is
-        built around that instance. With ``in_cluster`` unset the in-cluster
-        path is tried first and a ``ConfigException`` falls through to kubeconfig.
-
-        :returns: The cached ``CoreV1Api`` bound to the isolated config.
+        :returns: The cached ``(CoreV1Api, BatchV1Api)`` bound to the isolated config.
         :raises click.ClickException: When neither config source is available.
         """
-        if self._core is not None:
-            return self._core
+        if self._core is not None and self._batch is not None:
+            return self._core, self._batch
         from kubernetes import client, config
 
         cfg = client.Configuration()
@@ -1022,20 +1078,28 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             ) from exc
         self._api_client = client.ApiClient(cfg)
         self._core = client.CoreV1Api(self._api_client)
-        return self._core
+        self._batch = client.BatchV1Api(self._api_client)
+        return self._core, self._batch
+
+    def _load_core(self) -> k8s_client.CoreV1Api:
+        """Return the cached ``CoreV1Api``."""
+        core, _ = self._load_clients()
+        return core
+
+    def _load_batch(self) -> k8s_client.BatchV1Api:
+        """Return the cached ``BatchV1Api``."""
+        _, batch = self._load_clients()
+        return batch
 
     def _close_clients(self) -> None:
         """
         Close the cached ``ApiClient`` (its urllib3 ``PoolManager``) and drop
         the cached handles.
-
-        A fresh launcher is built per managed op, so an unclosed pool leaks
-        sockets. Idempotent and best-effort: a close error is swallowed so it
-        can never mask the operation's result. The next ``_load_core`` rebuilds.
         """
         api_client = self._api_client
         self._api_client = None
         self._core = None
+        self._batch = None
         if api_client is not None:
             with contextlib.suppress(Exception):
                 api_client.close()
@@ -1176,16 +1240,16 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
 
     def provision(self, name: str) -> str:
         """
-        Reserve a Pod name for a managed launch — no Pod is created here.
+        Reserve a Job name for a managed launch — no Job is created here.
 
-        Entrypoint-as-host: the Pod (which boots running ``omnigent host``) is
-        materialized by :meth:`start_host`, not here. ``provision`` only mints
-        the DNS-label-safe Pod name, so the server can register the launch token
-        against it BEFORE the Pod exists — closing the host dial-back race by
-        construction.
+        Entrypoint-as-host: the Job (whose Pod boots running ``omnigent host``)
+        is materialized by :meth:`start_host`, not here. ``provision`` only
+        mints the DNS-label-safe name, so the server can register the launch
+        token against it BEFORE the Job exists — closing the host dial-back
+        race by construction.
 
         :param name: Human-readable label, e.g. ``"managed-a1b2c3d4"``.
-        :returns: The reserved Pod name (see :func:`_new_pod_name`).
+        :returns: The reserved Job name (see :func:`_new_pod_name`).
         """
         return _new_pod_name(name)
 
@@ -1205,21 +1269,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
         """
-        Create the token Secret + runner Pod and wait for the host to start.
+        Create the token Secret + runner Job and wait for the host to start.
 
-        The entrypoint-as-host override of
-        :meth:`~omnigent.onboarding.sandboxes.base.SandboxLauncher.start_host`
-        (there is no exec bootstrap): the Pod's init container creates
-        ``<HOME>/workspace`` and clones the repository (when requested), and its
-        main container runs ``omnigent host``, which dials back over the
-        launch-token tunnel. Because the launcher controls ``HOME``
-        (:data:`_HOME_DIR`), the workspace path is known without asking the
-        sandbox. The pod-start wait fast-fails (with the container log tail) on a
-        Pod that can't schedule, pull, or clone, BEFORE the shared online poll —
-        so the failure reason survives the cleanup that deletes the Pod.
-
-        :param sandbox_id: The Pod name from :meth:`provision`.
-        :param token: The raw launch token, delivered via the per-Pod Secret.
+        :param sandbox_id: The Job name from :meth:`provision`.
+        :param token: The raw launch token, delivered via the per-Job Secret.
         :param host_id: Server-chosen host identity.
         :param host_name: Server-chosen host display name.
         :param server_url: URL the host dials back to.
@@ -1230,12 +1283,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             content the init container merges in before the host starts, or
             ``None``.
         :param agent_name: Server-resolved built-in agent name the session runs,
-            stamped as the Pod's ``omnigent.ai/agent`` classifier, or ``None`` to
-            leave the runner unclassified. Threaded only because this provider
-            declares ``classifies_runner_by_agent``.
+            stamped as the Job's ``omnigent.ai/agent`` classifier, or ``None`` to
+            leave the runner unclassified.
         :param on_stage: Progress observer; invoked with ``"starting"``.
-        :returns: The absolute in-sandbox workspace path (the cloned repository
-            directory when *repo_url* is set).
+        :returns: The absolute in-sandbox workspace path.
         :raises click.ClickException: When creation fails or the host does not
             start in time.
         """
@@ -1252,16 +1303,14 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         if on_stage is not None:
             on_stage("starting")
         core = self._load_core()
+        batch = self._load_batch()
         click.echo(
-            f"▸ Creating Kubernetes pod '{sandbox_id}' in namespace '{namespace}' from {image}"
+            f"▸ Creating Kubernetes job '{sandbox_id}' in namespace '{namespace}' from {image}"
         )
         try:
             try:
-                # Build the (side-effect-free) manifest first: it validates
-                # host_config placement and can raise, so nothing should have
-                # been created in the cluster yet when it does.
-                manifest = build_pod_manifest(
-                    pod_name=sandbox_id,
+                manifest = build_job_manifest(
+                    job_name=sandbox_id,
                     namespace=namespace,
                     image=image,
                     service_account=self._resolve_service_account(),
@@ -1282,10 +1331,8 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     secret_mounts=self._secret_mounts,
                     agent_name=agent_name,
                 )
-                # Secret before Pod so the Pod's secretKeyRef resolves
-                # immediately — a Pod referencing a missing Secret would sit in
-                # CreateContainerConfigError (which the start wait treats as
-                # terminal).
+                # Secret before Job so the Pod's secretKeyRef resolves
+                # immediately.
                 core.create_namespaced_secret(
                     namespace,
                     build_token_secret_manifest(
@@ -1293,52 +1340,87 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     ),
                     _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
                 )
-                core.create_namespaced_pod(
+                batch.create_namespaced_job(
                     namespace, manifest, _request_timeout=_POD_READY_REQUEST_TIMEOUT_S
                 )
             except (ApiException, HTTPError) as exc:
-                # Tear down whatever landed (a created Secret, or a Pod the
-                # apiserver accepted before the response failed) so a failed
-                # create never leaks the token Secret or a running Pod.
                 self._best_effort_delete(namespace, sandbox_id, secret_name)
                 if isinstance(exc, ApiException):
                     raise click.ClickException(
-                        _format_api_error("create sandbox pod", sandbox_id, exc)
+                        _format_api_error("create sandbox job", sandbox_id, exc)
                     ) from exc
                 raise click.ClickException(
-                    f"timed out creating Kubernetes pod '{sandbox_id}' ({_api_reason(exc)})"
+                    f"timed out creating Kubernetes job '{sandbox_id}' ({_api_reason(exc)})"
                 ) from exc
 
             try:
                 self._wait_for_pod_running(namespace, sandbox_id)
             except BaseException:
-                # Readiness failed (Unschedulable, ImagePull, clone error, …):
-                # the host will never come online, so reap the Pod + Secret and
-                # re-raise the diagnosed reason.
                 self._best_effort_delete(namespace, sandbox_id, secret_name)
                 raise
         finally:
-            # start_host is the launcher's only API work on the launch path
-            # (the online wait that follows polls the host store), so release
-            # the connection pool here on both paths.
             self._close_clients()
-        click.echo(f"  → pod '{sandbox_id}' is starting the host")
+        click.echo(f"  → job '{sandbox_id}' is starting the host")
         return clone_dir or workspace
 
-    def _wait_for_pod_running(self, namespace: str, pod_name: str) -> None:
+    def _find_job_pod(self, namespace: str, job_name: str) -> str | None:
         """
-        Block until the Pod's main container is running, fast-failing on
-        genuinely terminal states.
+        Find the active Pod spawned by a Job using the ``job-name`` label.
 
-        ``phase == Running`` means every init container succeeded and the host
-        container started — the handoff point to the shared online poll. The
-        wait is patient on recoverable conditions (Pending / Unschedulable /
-        ImagePull*, transient read errors) and fast-fails on terminal ones (Pod
-        ``Failed``, a container terminated, non-self-healing config/image
-        errors), surfacing recent events + the failed container's log tail.
+        Filters out Pods with a ``deletionTimestamp`` (being torn down) and
+        prefers a running Pod over a pending one when a replacement exists.
+        Re-raises 401/403 so RBAC misconfigurations surface immediately
+        instead of masquerading as a 90s timeout.
 
-        :param namespace: Namespace the Pod lives in.
-        :param pod_name: The Pod to wait on.
+        :param namespace: Namespace the Job lives in.
+        :param job_name: The Job whose child Pod to find.
+        :returns: The Pod name, or ``None`` when no child Pod exists yet.
+        :raises click.ClickException: On a 401/403 from the apiserver.
+        """
+        from kubernetes.client.rest import ApiException
+        from urllib3.exceptions import HTTPError
+
+        try:
+            pod_list = self._load_core().list_namespaced_pod(
+                namespace,
+                label_selector=f"job-name={job_name}",
+                _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+            )
+        except ApiException as exc:
+            if getattr(exc, "status", None) in (401, 403):
+                raise click.ClickException(
+                    _format_api_error("list sandbox pods", job_name, exc)
+                ) from exc
+            return None
+        except HTTPError:
+            return None
+        items = getattr(pod_list, "items", None) or []
+        # Filter out Pods being deleted and prefer the one most likely alive.
+        alive = [
+            p
+            for p in items
+            if not getattr(getattr(p, "metadata", None), "deletion_timestamp", None)
+        ]
+        if not alive:
+            return None
+        # Prefer a Running Pod over Pending/other when a replacement exists.
+        for p in alive:
+            if _pod_phase(p) == "Running":
+                return getattr(getattr(p, "metadata", None), "name", None)
+        return getattr(getattr(alive[0], "metadata", None), "name", None)
+
+    def _wait_for_pod_running(self, namespace: str, job_name: str) -> None:
+        """
+        Block until the Job's child Pod's main container is running,
+        fast-failing on genuinely terminal states.
+
+        Finds the Job's child Pod via the ``job-name`` label selector, then
+        polls it.  ``phase == Running`` means every init container succeeded
+        and the host container started — the handoff point to the shared
+        online poll.
+
+        :param namespace: Namespace the Job lives in.
+        :param job_name: The Job whose child Pod to wait on.
         :raises click.ClickException: On a terminal state or timeout.
         """
         from kubernetes.client.rest import ApiException
@@ -1347,19 +1429,35 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         core = self._load_core()
         deadline = time.monotonic() + _POD_READY_TIMEOUT_S
         last_reason: str | None = None
+        pod_name: str | None = None
         while True:
+            # Discover the child Pod if we haven't yet.
+            if pod_name is None:
+                pod_name = self._find_job_pod(namespace, job_name)
+                if pod_name is None:
+                    if time.monotonic() >= deadline:
+                        raise click.ClickException(
+                            f"Kubernetes sandbox job '{job_name}' did not create a "
+                            f"child pod within {_POD_READY_TIMEOUT_S}s."
+                        )
+                    time.sleep(_POD_READY_POLL_S)
+                    continue
+
             try:
                 pod = core.read_namespaced_pod(
                     pod_name, namespace, _request_timeout=_POD_READY_REQUEST_TIMEOUT_S
                 )
             except ApiException as exc:
-                # A definite client rejection (RBAC / Pod gone) fails fast; a
-                # transient apiserver hiccup (5xx / 429) is polled until the
-                # deadline.
-                if exc.status in (401, 403, 404):
+                if getattr(exc, "status", None) in (401, 403):
                     raise click.ClickException(
                         _format_api_error("read sandbox pod", pod_name, exc)
                     ) from exc
+                if getattr(exc, "status", None) == 404:
+                    # Under OnFailure the Job may replace the Pod (eviction,
+                    # preemption, node drain) — re-discover instead of failing.
+                    pod_name = None
+                    time.sleep(_POD_READY_POLL_S)
+                    continue
                 last_reason = _api_reason(exc)
                 if time.monotonic() >= deadline:
                     raise click.ClickException(
@@ -1386,9 +1484,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 time.sleep(_POD_READY_POLL_S)
                 continue
 
-            phase = _pod_phase(pod)
-            if phase == "Running":
-                return
+            # Check for terminal failure BEFORE accepting Running — a
+            # crash-looping host container stays in phase Running under
+            # OnFailure, so phase alone is not proof of liveness.
             failure = _terminal_failure(pod)
             if failure is not None:
                 container, summary = failure
@@ -1397,15 +1495,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                         namespace, pod_name, summary, log_container=container
                     )
                 )
-            if phase == "Failed":
-                raise click.ClickException(
-                    self._pod_failure_message(
-                        namespace,
-                        pod_name,
-                        "entered terminal phase 'Failed' before the host started",
-                        log_container=_CONTAINER_NAME,
-                    )
-                )
+            phase = _pod_phase(pod)
+            if phase == "Running":
+                return
             fatal = _fatal_waiting_reason(pod)
             if fatal is not None:
                 raise click.ClickException(
@@ -1513,36 +1605,39 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             return ""
         return log
 
-    def _best_effort_delete(self, namespace: str, pod_name: str, secret_name: str) -> None:
+    def _best_effort_delete(self, namespace: str, job_name: str, secret_name: str) -> None:
         """
-        Delete a Pod and its token Secret, swallowing (and logging) any failure.
-
-        Used to reap a partially-created or failed-to-start launch: the cleanup
-        must not mask the original error, so a delete that itself errors only
-        warns. A 404 means the object is already gone.
+        Delete a Job (cascading to its Pods) and its token Secret, swallowing
+        any failure.
 
         :param namespace: Namespace the objects live in.
-        :param pod_name: The Pod to delete.
+        :param job_name: The Job to delete.
         :param secret_name: The token Secret to delete.
         """
         from kubernetes.client.rest import ApiException
         from urllib3.exceptions import HTTPError
 
         core = self._load_core()
+        batch = self._load_batch()
 
         def _warn(kind: str, detail: str) -> None:
             click.echo(
-                f"  → warning: could not clean up {kind} for '{pod_name}': {detail}",
+                f"  → warning: could not clean up {kind} for '{job_name}': {detail}",
                 err=True,
             )
 
+        from kubernetes import client as k8s
+
+        # propagationPolicy=Foreground cascades delete to the Job's child Pods.
+        delete_opts = k8s.V1DeleteOptions(propagation_policy="Foreground")
+
         deletes: tuple[tuple[str, Callable[[], object]], ...] = (
             (
-                "pod",
-                lambda: core.delete_namespaced_pod(
-                    pod_name,
+                "job",
+                lambda: batch.delete_namespaced_job(
+                    job_name,
                     namespace,
-                    grace_period_seconds=0,
+                    body=delete_opts,
                     _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
                 ),
             ),
@@ -1559,38 +1654,65 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             try:
                 delete()
             except ApiException as exc:
-                if getattr(exc, "status", None) != 404:
+                if getattr(exc, "status", None) == 404:
+                    if kind == "job":
+                        # No Job exists — try deleting a bare Pod left by the
+                        # pre-Job launcher so in-flight sandboxes are cleaned up.
+                        with contextlib.suppress(ApiException, HTTPError):
+                            core.delete_namespaced_pod(
+                                job_name,
+                                namespace,
+                                _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+                            )
+                else:
                     _warn(kind, _api_reason(exc))
             except HTTPError as exc:
                 _warn(kind, _api_reason(exc))
 
     def terminate(self, sandbox_id: str) -> None:
         """
-        Delete a sandbox Pod and its token Secret, releasing compute.
+        Delete a sandbox Job (cascading to its Pods) and its token Secret,
+        releasing compute.
 
-        Idempotent: an object that no longer exists (404) is success. Kubernetes
-        Pods have no platform lifetime cap, so a transient timeout/connection
-        error is retried a few bounded times before giving up best-effort — a
-        straggler keeps its managed-by/role labels for a cluster GC sweep.
+        Idempotent: an object that no longer exists (404) is success. A
+        transient timeout/connection error is retried a few bounded times
+        before giving up best-effort.
 
-        :param sandbox_id: The Pod to delete.
+        :param sandbox_id: The Job to delete.
         :raises click.ClickException: On an API delete failure other than
-            not-found (a urllib3 timeout/connection error is logged best-effort,
-            not raised — managed teardown must not hang on a stalled apiserver).
+            not-found.
         """
         _ensure_sdk()
+        from kubernetes import client as k8s
 
         namespace = self._resolve_namespace()
         secret_name = _token_secret_name(sandbox_id)
+        delete_opts = k8s.V1DeleteOptions(propagation_policy="Foreground")
+        # Delete all resources independently — a failure on one (e.g. a 403
+        # on jobs:delete during a Role rollout) must not skip the others, or the
+        # token Secret leaks with a valid launch token for up to 7 days.
+        first_error: click.ClickException | None = None
         try:
             for kind, name, delete in (
+                (
+                    "job",
+                    sandbox_id,
+                    lambda: self._load_batch().delete_namespaced_job(
+                        sandbox_id,
+                        namespace,
+                        body=delete_opts,
+                        _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+                    ),
+                ),
+                # Fall back to deleting a bare Pod left by the pre-Job
+                # launcher. Child Pods are named <job>-<rand5> so this only
+                # targets pre-migration bare Pods whose name IS sandbox_id.
                 (
                     "pod",
                     sandbox_id,
                     lambda: self._load_core().delete_namespaced_pod(
                         sandbox_id,
                         namespace,
-                        grace_period_seconds=0,
                         _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
                     ),
                 ),
@@ -1604,11 +1726,15 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     ),
                 ),
             ):
-                self._delete_with_retry(kind, name, delete)
+                try:
+                    self._delete_with_retry(kind, name, delete)
+                except click.ClickException as exc:
+                    if first_error is None:
+                        first_error = exc
         finally:
-            # terminate() is the launcher's last op for a sandbox (a fresh
-            # launcher is built per managed op) — release the connection pool.
             self._close_clients()
+        if first_error is not None:
+            raise first_error
 
     def _delete_with_retry(self, kind: str, name: str, delete: Callable[[], object]) -> None:
         """
@@ -1624,7 +1750,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         from urllib3.exceptions import HTTPError
 
         reason = ""
-        for attempt in range(_POD_DELETE_MAX_ATTEMPTS):
+        for attempt in range(_DELETE_MAX_ATTEMPTS):
             try:
                 delete()
                 return
@@ -1634,11 +1760,11 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 raise click.ClickException(_format_api_error(f"delete {kind}", name, exc)) from exc
             except HTTPError as exc:
                 reason = _api_reason(exc)
-            if attempt + 1 < _POD_DELETE_MAX_ATTEMPTS:
-                time.sleep(_POD_DELETE_BACKOFF_S)
+            if attempt + 1 < _DELETE_MAX_ATTEMPTS:
+                time.sleep(_DELETE_BACKOFF_S)
         click.echo(
             f"  → warning: could not delete Kubernetes {kind} '{name}' after "
-            f"{_POD_DELETE_MAX_ATTEMPTS} attempts ({reason}); it may still exist "
+            f"{_DELETE_MAX_ATTEMPTS} attempts ({reason}); it may still exist "
             "and carries the omnigent managed-by/role labels for GC.",
             err=True,
         )

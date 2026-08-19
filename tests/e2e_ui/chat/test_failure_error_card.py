@@ -1,11 +1,12 @@
-"""Failure error cards render as clear English, not a raw code + log blob.
+"""Failure error pills render as clear English, not a raw code + log blob.
 
 A harness launch/turn failure persists an ``error`` transcript item. Before,
 the chat rendered it as ``Error · <code>`` over the raw message. Now the
-banner leads with a human headline: a classified failure shows its friendly
-title, and an unclassified one still maps its ``code`` to a plain-English
-sentence (mirror of ``describe_failure_code`` /
-``FAILURE_CODE_DESCRIPTIONS``) rather than exposing the enum.
+failure renders as a centered pill leading with a human headline: a
+classified failure shows its friendly title, and an unclassified one still
+maps its ``code`` to a plain-English sentence (mirror of
+``describe_failure_code`` / ``FAILURE_CODE_DESCRIPTIONS``) rather than
+exposing the enum. The pill expands in place to the message and diagnostics.
 
 Seeds the error item straight into the store (like ``seed_committed_turn``)
 so the assertion is on transcript hydration + rendering, deterministic and
@@ -75,11 +76,11 @@ def test_unclassified_failure_renders_english_headline_not_raw_code(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    alert = page.get_by_role("alert")
+    pill = page.get_by_test_id("error-pill")
     # The friendly, code-derived headline is shown...
-    expect(alert).to_contain_text("The agent's terminal exited unexpectedly", timeout=15_000)
+    expect(pill).to_contain_text("The agent's terminal exited unexpectedly", timeout=15_000)
     # ...and the raw enum is not surfaced as the headline.
-    expect(alert).not_to_contain_text("Error · required_terminal_exited", timeout=15_000)
+    expect(pill).not_to_contain_text("Error · required_terminal_exited", timeout=15_000)
 
 
 def test_persisted_failure_expands_retries_and_dismisses_locally(
@@ -125,39 +126,50 @@ def test_persisted_failure_expands_retries_and_dismisses_locally(
     page.route(f"**/v1/sessions/{session_id}/events", _recover)
     page.goto(f"{base_url}/c/{session_id}")
 
-    alert = page.get_by_role("alert")
-    expect(alert).to_be_visible(timeout=15_000)
-    headline = alert.get_by_role(
+    pill = page.get_by_test_id("error-pill")
+    expect(pill).to_be_visible(timeout=15_000)
+    headline = pill.get_by_role(
         "button", name="The agent's terminal exited unexpectedly", exact=False
     )
     expect(headline).to_have_attribute("aria-expanded", "false")
-    expect(alert.get_by_test_id("error-message-content")).to_have_count(0)
+    expect(pill.get_by_test_id("error-message-content")).to_have_count(0)
 
     headline.focus()
     page.keyboard.press("Enter")
     expect(headline).to_have_attribute("aria-expanded", "true")
-    expect(alert.get_by_role("heading", name="Message")).to_be_visible()
-    expect(alert.get_by_test_id("error-message-content")).to_contain_text(
+    expect(pill.get_by_role("heading", name="Message")).to_be_visible()
+    expect(pill.get_by_test_id("error-message-content")).to_contain_text(
         "Required terminal exited unexpectedly"
     )
 
-    alert.get_by_role("button", name="View diagnostics").click()
-    tabs = alert.get_by_role("tablist", name="Diagnostic sections")
+    # Clicking inside the expanded message body must not collapse the pill.
+    pill.get_by_test_id("error-message-content").click()
+    expect(headline).to_have_attribute("aria-expanded", "true")
+
+    # Clicking pill padding (outside any button) toggles expansion.
+    pill.click(position={"x": 3, "y": 3})
+    expect(headline).to_have_attribute("aria-expanded", "false")
+    pill.click(position={"x": 3, "y": 3})
+    expect(headline).to_have_attribute("aria-expanded", "true")
+
+    pill.get_by_role("button", name="View diagnostics").click()
+    tabs = pill.get_by_role("tablist", name="Diagnostic sections")
     expect(tabs).to_be_visible()
     terminal_tab = tabs.get_by_role("tab", name="Terminal")
     expect(terminal_tab).to_have_attribute("aria-selected", "true")
-    expect(alert.get_by_test_id("error-diagnostics-content")).to_contain_text("exit_code: 1")
+    expect(pill.get_by_test_id("error-diagnostics-content")).to_contain_text("exit_code: 1")
     tabs.get_by_role("tab", name="Last captured output").click()
-    expect(alert.get_by_test_id("error-diagnostics-content")).to_contain_text(
+    expect(pill.get_by_test_id("error-diagnostics-content")).to_contain_text(
         "fatal: runner unavailable"
     )
 
-    alert.get_by_role("button", name="Retry").click()
-    expect(alert).to_have_count(0)
+    # Retry triggers recovery and removes the pill rather than expanding it.
+    pill.get_by_role("button", name="Retry").click()
+    expect(pill).to_have_count(0)
     assert retry_payloads == [{"type": "retry_session", "data": {}}]
 
     page.reload()
-    alert = page.get_by_role("alert")
-    expect(alert).to_be_visible(timeout=15_000)
-    alert.get_by_role("button", name="Dismiss error").click()
-    expect(alert).to_have_count(0)
+    pill = page.get_by_test_id("error-pill")
+    expect(pill).to_be_visible(timeout=15_000)
+    pill.get_by_role("button", name="Dismiss error message").click()
+    expect(pill).to_have_count(0)

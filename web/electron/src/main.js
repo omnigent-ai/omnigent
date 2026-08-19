@@ -1056,7 +1056,18 @@ function createWindow(targetUrl, opts = {}) {
     // .drag-strip). Other platforms keep their native frame — `hiddenInset`
     // is macOS-only and a frameless window without `titleBarOverlay` would
     // lose its window controls there.
-    ...(process.platform === "darwin" ? { titleBarStyle: "hiddenInset" } : {}),
+    ...(process.platform === "darwin"
+      ? {
+          titleBarStyle: "hiddenInset",
+          // Drop the native traffic lights ~4px from their hiddenInset default so
+          // they center in the 2.25rem (36px) title-bar strip, level with the
+          // Search/Settings/toggle cluster and the chat-header icons (both
+          // centered there — see the [data-electron-mac] rules in index.css).
+          // x:19 preserves hiddenInset's horizontal inset; y centers the ~14px
+          // controls ((36-14)/2 ≈ 11). Adjust y by ±1 if it reads off on device.
+          trafficLightPosition: { x: 16, y: 17 },
+        }
+      : {}),
     webPreferences: {
       // Security: the SPA is remote/untrusted relative to the shell, so we
       // keep Node out of the renderer and isolate the preload's context.
@@ -2521,7 +2532,7 @@ function registerIpc() {
       // Ensure the CLI is authenticated for a remote server first (local needs
       // none) — otherwise the host connect would just fail on a 401.
       const auth = await serverManager.ensureServerAuth(cliPath, serverUrl);
-      if (!auth.ok) result = { ok: false, error: auth.error };
+      if (!auth.ok) result = { ok: false, error: auth.error, authError: auth.authError };
       else if (action === "start")
         result = await serverManager.ensureHostConnected(cliPath, serverUrl);
       else result = await serverManager.restartHost(cliPath, serverUrl);
