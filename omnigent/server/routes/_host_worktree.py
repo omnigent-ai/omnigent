@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 from omnigent.host.frames import (
     HostCreateWorktreeFrame,
+    HostInspectWorktreeFrame,
     HostListWorktreesFrame,
     HostRemoveWorktreeFrame,
     encode_host_frame,
@@ -78,6 +79,29 @@ class CreatedWorktree:
 
     worktree_path: str
     branch: str
+
+
+@dataclass(frozen=True)
+class WorktreeInspection:
+    """
+    Server-side view of a host worktree inspection.
+
+    :param dirty_files: Modified tracked files plus untracked files in
+        the worktree, e.g. ``3``.
+    :param unpushed_commits: Commits on the branch unreachable from
+        every remote-tracking ref (every commit when the repo has no
+        remotes).
+    :param merged: Whether the branch is an ancestor of the default
+        branch. ``None`` when the host could not determine it —
+        callers must treat that as not-merged.
+    :param default_ref: The ref ``merged`` was checked against, e.g.
+        ``"origin/main"``. ``None`` when unresolved.
+    """
+
+    dirty_files: int
+    unpushed_commits: int
+    merged: bool | None
+    default_ref: str | None
 
 
 async def _await_host_worktree_result(
@@ -229,6 +253,68 @@ async def remove_worktree_on_host(
         raise WorktreeProxyError(
             f"worktree removal failed: {result.get('error') or 'host reported no detail'}"
         )
+
+
+async def inspect_worktree_on_host(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    worktree_path: str,
+    branch: str,
+) -> WorktreeInspection:
+    """
+    Send a ``host.inspect_worktree`` frame and await the result.
+
+    Used by archive-time cleanup to decide whether a worktree is safe to
+    remove. Every failure path raises — the caller must treat a failed
+    check as "keep the worktree", never as an all-clear.
+
+    :param host_registry: Server-side registry; used to enqueue the
+        outbound frame on the host's send queue.
+    :param host_conn: Live host connection that owns the worktree.
+    :param worktree_path: Absolute path of the worktree to inspect on
+        the host, e.g. ``"/Users/alice/myrepo-worktrees/feature-login"``.
+    :param branch: Branch checked out in the worktree, e.g.
+        ``"feature/login"``.
+    :returns: The inspection facts.
+    :raises WorktreeHostUnavailableError: If the host connection drops
+        or doesn't respond within :data:`_WORKTREE_TIMEOUT_S` (an older
+        host that doesn't know the frame never replies, landing here).
+    :raises WorktreeProxyError: If the host reports an inspection
+        failure or returns an incomplete result.
+    """
+    request_id = secrets.token_hex(8)
+    frame = encode_host_frame(
+        HostInspectWorktreeFrame(
+            request_id=request_id,
+            worktree_path=worktree_path,
+            branch=branch,
+        )
+    )
+    result = await _await_host_worktree_result(
+        host_registry=host_registry,
+        host_conn=host_conn,
+        pending=host_conn.pending_inspect_worktrees,
+        request_id=request_id,
+        frame=frame,
+        op="worktree inspection",
+    )
+    if result.get("status") != "ok":
+        raise WorktreeProxyError(
+            f"worktree inspection failed: {result.get('error') or 'host reported no detail'}"
+        )
+    dirty_files = result.get("dirty_files")
+    unpushed_commits = result.get("unpushed_commits")
+    if not isinstance(dirty_files, int) or not isinstance(unpushed_commits, int):
+        raise WorktreeProxyError("host returned an incomplete worktree inspection")
+    merged = result.get("merged")
+    default_ref = result.get("default_ref")
+    return WorktreeInspection(
+        dirty_files=dirty_files,
+        unpushed_commits=unpushed_commits,
+        merged=merged if isinstance(merged, bool) else None,
+        default_ref=default_ref if isinstance(default_ref, str) else None,
+    )
 
 
 async def list_worktrees_on_host(

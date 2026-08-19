@@ -19,6 +19,8 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostInspectWorktreeFrame,
+    HostInspectWorktreeResultFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
@@ -1137,6 +1139,86 @@ def test_list_worktrees_result_frame_rejects_non_list() -> None:
     )
     with pytest.raises(ValueError, match="worktrees"):
         decode_host_frame(bad)
+
+
+# ── host.inspect_worktree frames ────────────────────────
+
+
+def test_inspect_worktree_frame_round_trip() -> None:
+    """Verify HostInspectWorktreeFrame survives encode → decode.
+
+    A garbled worktree_path or branch would inspect the wrong worktree
+    and could make an unsafe removal read as safe.
+    """
+    original = HostInspectWorktreeFrame(
+        request_id="req_wt_in_1",
+        worktree_path="/Users/alice/myrepo-worktrees/feature-login",
+        branch="feature/login",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostInspectWorktreeFrame)
+    assert decoded == original
+
+
+def test_inspect_worktree_frame_non_str_branch_raises() -> None:
+    """A non-string branch is rejected, not coerced."""
+    bad = (
+        '{"kind": "host.inspect_worktree", "request_id": "r", "worktree_path": "/x", "branch": 42}'
+    )
+    with pytest.raises(ValueError, match="branch"):
+        decode_host_frame(bad)
+
+
+def test_inspect_worktree_result_frame_round_trip() -> None:
+    """Verify HostInspectWorktreeResultFrame survives encode → decode.
+
+    The counts and the merged flag drive the server's remove-vs-keep
+    decision on archive; a dropped field must not silently coerce.
+    """
+    original = HostInspectWorktreeResultFrame(
+        request_id="req_wt_in_1",
+        status="ok",
+        dirty_files=2,
+        unpushed_commits=3,
+        merged=False,
+        default_ref="origin/main",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostInspectWorktreeResultFrame)
+    assert decoded == original
+
+
+def test_inspect_worktree_result_frame_unknown_merged_round_trip() -> None:
+    """``merged=None`` (no resolvable default branch) must survive the wire.
+
+    'Cannot determine' is a distinct outcome from 'not merged' — the
+    server keeps the worktree either way, but conflating them would
+    misreport why.
+    """
+    original = HostInspectWorktreeResultFrame(
+        request_id="req_wt_in_1",
+        status="ok",
+        dirty_files=0,
+        unpushed_commits=0,
+        merged=None,
+        default_ref=None,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostInspectWorktreeResultFrame)
+    assert decoded == original
+
+
+def test_inspect_worktree_result_frame_failure_round_trip() -> None:
+    """A failed inspection carries its error and null fields."""
+    original = HostInspectWorktreeResultFrame(
+        request_id="req_wt_in_1",
+        status="failed",
+        error="worktree path does not exist: /x",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostInspectWorktreeResultFrame)
+    assert decoded.dirty_files is None
+    assert decoded.error == "worktree path does not exist: /x"
 
 
 # ── host.create_dir frames ──────────────────────────────

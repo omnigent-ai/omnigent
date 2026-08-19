@@ -62,6 +62,13 @@ class HostFrameKind(str, Enum):
     REMOVE_WORKTREE_RESULT = "host.remove_worktree_result"
     LIST_WORKTREES = "host.list_worktrees"
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
+    # Server -> host: inspect a worktree for work removal would lose
+    # (dirty files, unpushed commits, unmerged branch). Distinct frame
+    # from remove_worktree so an older host that doesn't know it IGNORES
+    # it (no result -> the server keeps the worktree) instead of
+    # executing a removal it wasn't asked to double-check.
+    INSPECT_WORKTREE = "host.inspect_worktree"
+    INSPECT_WORKTREE_RESULT = "host.inspect_worktree_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
     INSTALL_HARNESS = "host.install_harness"
@@ -622,6 +629,55 @@ class HostCreateDirResultFrame:
 
 
 @dataclass
+class HostInspectWorktreeFrame:
+    """Request frame asking the host to inspect a worktree.
+
+    ``branch`` is required (not optional like remove's): the inspection
+    exists to judge whether the BRANCH's commits are safe, so a request
+    without it is meaningless.
+
+    :param request_id: Unique request identifier for correlation.
+    :param worktree_path: Absolute path of the worktree to inspect, e.g.
+        ``"/Users/alice/myrepo-worktrees/feature-login"``.
+    :param branch: Branch checked out in the worktree, e.g.
+        ``"feature/login"``.
+    """
+
+    request_id: str
+    worktree_path: str
+    branch: str
+
+
+@dataclass
+class HostInspectWorktreeResultFrame:
+    """Result frame returned by the host after inspecting a worktree.
+
+    Count fields are ``None`` on failure. ``merged`` is tri-state even
+    on success: ``None`` means no default branch ref could be resolved
+    (cannot determine), which callers must treat as not-merged.
+
+    :param request_id: Correlation id from the request frame.
+    :param status: ``"ok"`` or ``"failed"``.
+    :param dirty_files: Modified tracked + untracked files, e.g. ``3``.
+    :param unpushed_commits: Commits on the branch unreachable from all
+        remote-tracking refs (every commit when the repo has no remotes).
+    :param merged: Whether the branch is an ancestor of the default
+        branch; ``None`` when undeterminable.
+    :param default_ref: Ref ``merged`` was checked against, e.g.
+        ``"origin/main"``; ``None`` when unresolved.
+    :param error: Error message when status is ``"failed"``.
+    """
+
+    request_id: str
+    status: str
+    dirty_files: int | None = None
+    unpushed_commits: int | None = None
+    merged: bool | None = None
+    default_ref: str | None = None
+    error: str | None = None
+
+
+@dataclass
 class HostInstallHarnessFrame:
     """Server → host: install a harness CLI on the host.
 
@@ -885,6 +941,8 @@ HostFrame = (
     | HostRemoveWorktreeResultFrame
     | HostListWorktreesFrame
     | HostListWorktreesResultFrame
+    | HostInspectWorktreeFrame
+    | HostInspectWorktreeResultFrame
     | HostCreateDirFrame
     | HostCreateDirResultFrame
     | HostInstallHarnessFrame
@@ -1139,6 +1197,28 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostInspectWorktreeFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.INSPECT_WORKTREE.value,
+                "request_id": frame.request_id,
+                "worktree_path": frame.worktree_path,
+                "branch": frame.branch,
+            }
+        )
+    if isinstance(frame, HostInspectWorktreeResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.INSPECT_WORKTREE_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "dirty_files": frame.dirty_files,
+                "unpushed_commits": frame.unpushed_commits,
+                "merged": frame.merged,
+                "default_ref": frame.default_ref,
+                "error": frame.error,
+            }
+        )
     if isinstance(frame, HostCreateDirFrame):
         return _encode_payload(
             {
@@ -1362,6 +1442,10 @@ def _decode_known_host_frame(
             return _decode_list_worktrees(msg)
         case HostFrameKind.LIST_WORKTREES_RESULT:
             return _decode_list_worktrees_result(msg)
+        case HostFrameKind.INSPECT_WORKTREE:
+            return _decode_inspect_worktree(msg)
+        case HostFrameKind.INSPECT_WORKTREE_RESULT:
+            return _decode_inspect_worktree_result(msg)
         case HostFrameKind.CREATE_DIR:
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
@@ -1711,6 +1795,71 @@ def _decode_list_worktrees_result(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         worktrees=raw,
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_inspect_worktree(msg: _JsonObject) -> HostInspectWorktreeFrame:
+    """Decode a host.inspect_worktree request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.inspect_worktree frame.
+    """
+    return HostInspectWorktreeFrame(
+        request_id=_required_str(msg, "request_id"),
+        worktree_path=_required_str(msg, "worktree_path"),
+        branch=_required_str(msg, "branch"),
+    )
+
+
+def _optional_nullable_int(msg: _JsonObject, field: str) -> int | None:
+    """Read an optional int field that may be null; reject other types.
+
+    ``bool`` is an ``int`` subclass, so it must be excluded explicitly —
+    a wire bug sending ``true`` for a count must not read as ``1``.
+
+    :param msg: Decoded frame object.
+    :param field: Field name to read.
+    :returns: The int value, or ``None`` when absent/null.
+    :raises ValueError: If the field is present but not an int or null.
+    """
+    value = msg.get(field)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"frame field must be an int or null: {field!r}")
+    return value
+
+
+def _optional_nullable_bool(msg: _JsonObject, field: str) -> bool | None:
+    """Read an optional bool field that may be null; reject other types.
+
+    :param msg: Decoded frame object.
+    :param field: Field name to read.
+    :returns: The bool value, or ``None`` when absent/null.
+    :raises ValueError: If the field is present but not a bool or null.
+    """
+    value = msg.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f"frame field must be a bool or null: {field!r}")
+    return value
+
+
+def _decode_inspect_worktree_result(msg: _JsonObject) -> HostInspectWorktreeResultFrame:
+    """Decode a host.inspect_worktree_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.inspect_worktree_result frame.
+    """
+    return HostInspectWorktreeResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        dirty_files=_optional_nullable_int(msg, "dirty_files"),
+        unpushed_commits=_optional_nullable_int(msg, "unpushed_commits"),
+        merged=_optional_nullable_bool(msg, "merged"),
+        default_ref=_optional_nullable_str(msg, "default_ref"),
         error=_optional_nullable_str(msg, "error"),
     )
 

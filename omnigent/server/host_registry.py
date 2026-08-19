@@ -224,6 +224,9 @@ class HostConnection:
         in-flight ``host.remove_worktree`` requests. Resolved when
         the host sends ``host.remove_worktree_result``. Values
         carry ``status`` and ``error``.
+    :param pending_inspect_worktrees: Per-``request_id`` futures for
+        in-flight ``host.inspect_worktree`` safety checks (archive-time
+        cleanup). Same ``Any`` typing rationale as ``pending_stats``.
     :param pending_create_dirs: Per-``request_id`` futures for
         in-flight ``host.create_dir`` requests. Resolved when the
         host sends ``host.create_dir_result``. Values carry the
@@ -288,6 +291,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_remove_worktrees: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_inspect_worktrees: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
     pending_list_worktrees: dict[str, asyncio.Future[dict[str, Any]]] = field(
