@@ -6,6 +6,7 @@ import base64
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1004,7 +1005,7 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
             # Re-invoke run_launcher via an INLINE python -c script
             # rather than re-running the launcher tempfile. Reason:
             # bwrap mounts ``/tmp`` as a fresh tmpfs, so the host's
-            # ``/tmp/omnigent-sandbox-*.py`` written by
+            # ``/tmp/omnigent-sandbox-*`` script written by
             # ``create_exec_launcher`` is invisible inside the wrap.
             # ``python -c '<inline>'`` doesn't need a script file in
             # the sandbox view — the inline string travels through
@@ -1107,23 +1108,58 @@ def run_launcher(encoded_sandbox: str, target_path: str, argv: list[str]) -> int
         cleanup_private_tmpdir(tmpdir)
 
 
-def create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
+def _launcher_inline_source(target_path: str, sandbox: SandboxPolicy) -> str:
+    """Build the ``python -c`` program the exec launcher runs.
+
+    basicConfig so ``run_launcher``'s INFO records reach stderr; the
+    project root goes on ``sys.path`` so the import works from any cwd.
+    """
     encoded = _encode_json_arg(sandbox.to_jsonable())
-    fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".py")
-    project_root = repr(str(_project_root()))
-    encoded_literal = repr(encoded)
-    target_literal = repr(target_path)
-    # basicConfig so ``run_launcher``'s INFO records reach stderr.
-    script = (
-        f"#!{sys.executable}\n"
-        "import logging\n"
-        "import sys\n"
-        f"sys.path.insert(0, {project_root})\n"
-        "logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stderr)\n"
-        "from omnigent.inner.sandbox import run_launcher\n"
-        "if __name__ == '__main__':\n"
-        f"    raise SystemExit(run_launcher({encoded_literal}, {target_literal}, sys.argv[1:]))\n"
+    return (
+        "import logging, sys; "
+        f"sys.path.insert(0, {str(_project_root())!r}); "
+        "logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stderr); "
+        "from omnigent.inner.sandbox import run_launcher; "
+        f"raise SystemExit(run_launcher({encoded!r}, {target_path!r}, sys.argv[1:]))"
     )
+
+
+def create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
+    """Write an executable launcher that runs ``target_path`` inside ``sandbox``.
+
+    Callers hand the returned path to spawners that ``execve`` it
+    directly (the Claude Agent SDK, tmux, the ACP/qwen/kimi/goose/pi
+    executors), so the file must be executable by the kernel on its
+    own.
+
+    :param target_path: The real binary the launcher ultimately spawns.
+    :param sandbox: Policy baked into the launcher and applied before the spawn.
+    :returns: Path to the launcher script; the caller owns deleting it.
+    :raises OSError: If the running interpreter cannot be named in the
+        launcher, which would produce an unrunnable script.
+    """
+    inline = _launcher_inline_source(target_path, sandbox)
+    interpreter = sys.executable
+    if not interpreter:
+        raise OSError(
+            "Cannot build the sandbox exec launcher: sys.executable is empty, so "
+            "the launcher has no interpreter to invoke. Run omnigent under a "
+            "regular Python installation, or disable the CLI sandbox wrap."
+        )
+
+    if os.name == "nt":
+        # No shebang support; Windows resolves ``.py`` through PATHEXT.
+        fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".py")
+        script = f"{inline}\n"
+    else:
+        # ``/bin/sh`` is the only interpreter guaranteed to be a native
+        # executable. Naming ``sys.executable`` in a shebang instead
+        # breaks whenever it is a wrapper script, sits behind a path
+        # too long for the kernel's shebang buffer, or contains spaces —
+        # each of which surfaces as an opaque ENOEXEC from the spawner.
+        fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".sh")
+        script = f'#!/bin/sh\nexec {shlex.quote(interpreter)} -c {shlex.quote(inline)} "$@"\n'
+
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(script)
     os.chmod(path, 0o755)
