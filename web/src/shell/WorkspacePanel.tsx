@@ -481,7 +481,7 @@ function RailTerminalView({
     );
   }
   return (
-    <div key={terminal.id} className="flex h-full min-h-0 flex-col p-2">
+    <div key={terminal.id} className="flex h-full min-h-0 flex-col">
       <TerminalView
         sessionId={conversationId}
         terminalId={terminal.id}
