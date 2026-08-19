@@ -933,6 +933,15 @@ class SysSessionCreateTool(Tool):
                                 "agent's default."
                             ),
                         },
+                        "reasoning_effort": {
+                            "type": "string",
+                            "description": (
+                                "Optional reasoning-effort override for "
+                                "the child session, e.g. 'low', 'medium', "
+                                "or 'high'. Set at session creation; omit "
+                                "to use the agent's default."
+                            ),
+                        },
                     },
                     # Only the always-optional fields are listed in
                     # ``required`` (none): the agent_id-vs-config_path

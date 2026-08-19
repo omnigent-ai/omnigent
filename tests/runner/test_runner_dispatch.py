@@ -6272,6 +6272,81 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sys_session_create_threads_model_and_reasoning_effort() -> None:
+    """
+    ``sys_session_create(agent_id=...)`` forwards a caller-supplied
+    ``model`` and ``reasoning_effort`` into the create body as
+    ``model_override`` / ``reasoning_effort``.
+
+    The server persists both on the child row for spawn/model resolution.
+    Without this a parent that launches an existing agent by id is pinned
+    to that agent's default model and effort, so cheap fan-out probes
+    cannot be routed to a smaller/cheaper tier (issue #2080).
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    captured: dict[str, Any] = {}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured.update(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_child", "agent_id": "ag_x"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": "ag_x",
+                    "model": "databricks-claude-haiku-4-5",
+                    "reasoning_effort": "low",
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert captured["model_override"] == "databricks-claude-haiku-4-5"
+    assert captured["reasoning_effort"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_omits_reasoning_effort_when_absent() -> None:
+    """
+    An unset ``reasoning_effort`` is left out of the create body entirely,
+    so the server applies the agent default rather than persisting an
+    empty override.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    captured: dict[str, Any] = {}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured.update(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_child", "agent_id": "ag_x"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert "reasoning_effort" not in captured
+    assert "model_override" not in captured
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "arguments",
     [
