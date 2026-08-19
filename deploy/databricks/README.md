@@ -272,7 +272,23 @@ uv run python deploy/databricks/deploy.py --skip-build --allow-dirty ...
 
 # API-only deploy (drops the SPA from the main wheel).
 uv run python deploy/databricks/deploy.py --skip-web-ui ...
+
+# No-OpenTelemetry deploy: runs `python app.py` instead of under
+# opentelemetry-instrument, drops OTEL_TRACES_SAMPLER, and drops the platform
+# telemetry_export_destinations. Use for workspaces with no OTel collector /
+# UC OTel tables -- otherwise every span export fails DEADLINE_EXCEEDED to
+# localhost:4317. Selects the `prod-no-otel` DAB target (same workspace/state
+# as `prod`).
+uv run python deploy/databricks/deploy.py --no-otel ...
 ```
+
+> [!NOTE]
+> `--no-otel` auto-switches the default `--target prod` to `prod-no-otel`.
+> If you deploy to a custom `--target`, add the OTel-off variable overrides
+> (`app_command`, `app_env`, `otel_export_destinations`) to that target too
+> — see the `prod-no-otel` block in `databricks.yml` for the template. The
+> deploy warns when `--no-otel` is paired with a target that lacks those
+> overrides, since OTel then stays on.
 
 ## Troubleshooting
 

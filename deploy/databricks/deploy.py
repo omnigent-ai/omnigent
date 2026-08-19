@@ -597,6 +597,30 @@ def _assert_clean_tree(skip: bool) -> None:
     _log(f"clean tree at origin/main {head[:12]}")
 
 
+# Variables a target must override for --no-otel to actually take effect;
+# `prod-no-otel` in databricks.yml is the reference implementation.
+_OTEL_OFF_VARS = ("app_command", "app_env", "otel_export_destinations")
+
+
+def _target_overrides_otel_vars(target: str) -> bool | None:
+    """Whether ``target`` overrides every OTel-off variable in databricks.yml.
+
+    Returns ``None`` when the bundle can't be inspected (no PyYAML, unreadable
+    or malformed file) so callers warn rather than assert either way.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return None
+    try:
+        bundle = yaml.safe_load((_deploy_dir() / "databricks.yml").read_text())
+    except (OSError, yaml.YAMLError):
+        return None
+    targets = (bundle or {}).get("targets") or {}
+    variables = (targets.get(target) or {}).get("variables") or {}
+    return all(name in variables for name in _OTEL_OFF_VARS)
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -646,6 +670,17 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Comma-separated deployment-wide release features, e.g. "
             "'usage_page'. Empty keeps every release feature off."
+        ),
+    )
+    parser.add_argument(
+        "--no-otel",
+        action="store_true",
+        help=(
+            "Deploy without OpenTelemetry: run 'python app.py' instead of "
+            "under opentelemetry-instrument, drop OTEL_TRACES_SAMPLER, and "
+            "drop the platform telemetry_export_destinations. Use for "
+            "workspaces with no OTel collector / UC OTel tables — otherwise "
+            "span exports fail DEADLINE_EXCEEDED to localhost:4317."
         ),
     )
     parser.add_argument(
@@ -715,7 +750,24 @@ def _parse_args() -> argparse.Namespace:
             "known commit on main."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    # --no-otel selects the tracer-off DAB target (same workspace + state as
+    # `prod`, OTel variables overridden off). Only auto-switch the default
+    # target so an explicit --target still wins — but then the flag is a no-op
+    # unless that target defines the OTel-off overrides itself, so say so
+    # instead of silently deploying with OTel on.
+    if args.no_otel:
+        if args.target == "prod":
+            args.target = "prod-no-otel"
+        elif _target_overrides_otel_vars(args.target) is not True:
+            _log(
+                f"warning: --no-otel has no effect on --target {args.target!r}: it "
+                f"only swaps the default 'prod' target for 'prod-no-otel'. That "
+                f"target does not override {', '.join(_OTEL_OFF_VARS)}, so OTel "
+                "stays ON for this deploy — copy the overrides from the "
+                "prod-no-otel block in databricks.yml, or drop --target."
+            )
+    return args
 
 
 def _clear_env_vars() -> None:
