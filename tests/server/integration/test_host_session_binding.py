@@ -715,7 +715,7 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
     # The launch failed at host start; the parked message reports the
     # recorded launch failure, not a generic "no runner bound".
     assert message_resp.status_code == 503, message_resp.text
-    assert "managed sandbox failed to launch" in message_resp.text
+    assert "The session failed to launch" in message_resp.text
     assert "host startup failed" in message_resp.text
 
     # A later message hits the retained failure record immediately.
@@ -730,7 +730,7 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
         },
     )
     assert late_resp.status_code == 503, late_resp.text
-    assert "managed sandbox failed to launch" in late_resp.text
+    assert "The session failed to launch" in late_resp.text
 
     # The failed launch tore the sandbox down (launch_managed_host's
     # cleanup path), so nothing leaks until the provider lifetime cap.

@@ -4457,6 +4457,7 @@ async def _launch_runner_on_host_impl(
     conversation_store: ConversationStore,
     host_registry: HostRegistry,
     host_conn: HostConnection,
+    binding_token: str | None = None,
 ) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
@@ -4474,20 +4475,26 @@ async def _launch_runner_on_host_impl(
     :param conversation_store: Store for updating ``runner_id``.
     :param host_registry: In-memory ``HostRegistry``.
     :param host_conn: The live ``HostConnection`` for the host.
-    :returns: The :class:`_HostLaunchAttempt` — the new runner id plus any
-        structured refusal from the host.
+    :param binding_token: Pre-established binding token whose derived
+        runner id the caller already wrote to the session row (the
+        create route binds atomically before its background launch).
+        ``None`` mints a fresh token and rebinds the row here.
+    :returns: The :class:`_HostLaunchAttempt` — the runner id for this
+        attempt plus any structured refusal from the host.
     """
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
 
-    binding_token = secrets.token_urlsafe(32)
-    new_runner_id = token_bound_runner_id(binding_token)
-
-    await asyncio.to_thread(
-        conversation_store.replace_runner_id,
-        conv.id,
-        new_runner_id,
-    )
+    if binding_token is None:
+        binding_token = secrets.token_urlsafe(32)
+        new_runner_id = token_bound_runner_id(binding_token)
+        await asyncio.to_thread(
+            conversation_store.replace_runner_id,
+            conv.id,
+            new_runner_id,
+        )
+    else:
+        new_runner_id = token_bound_runner_id(binding_token)
 
     # Pull workspace from the session row — populated and validated
     # at session create per designs/SESSION_WORKSPACE_SELECTION.md.
@@ -4719,12 +4726,12 @@ async def _await_settled_managed_launch(launch: ManagedLaunch) -> None:
         )
     except asyncio.TimeoutError:
         raise OmnigentError(
-            "The session's managed sandbox is still provisioning; try again shortly",
+            "The session is still launching; try again shortly",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         ) from None
     if launch.error is not None:
         raise OmnigentError(
-            f"The session's managed sandbox failed to launch: {launch.error}",
+            f"The session failed to launch: {launch.error}",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         )
 

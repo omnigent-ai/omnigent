@@ -441,20 +441,27 @@ def register_core_routes(
 
         # Host launch: if a host is targeted (caller-supplied or
         # managed) and no runner is bound yet, authorize (caller must
-        # own the host AND the session), atomically bind, then launch.
-        # Same authorization path as POST /v1/hosts/{host_id}/runners.
+        # own the host AND the session), atomically bind, then hand the
+        # slow work — optional git worktree creation plus the launch
+        # round-trip — to a background task. Worktree checkout alone
+        # can take many seconds (a `git fetch` even longer), and the
+        # web UI can't navigate to the session until this POST
+        # returns, so none of it may block the 201. A message racing
+        # the launch rendezvouses on the tracker entry registered
+        # here (see post_event); the session page shows the normal
+        # runner-starting state meanwhile. Same authorization path as
+        # POST /v1/hosts/{host_id}/runners.
         if launch_host_id is not None and resp.runner_id is None:
             host_registry = getattr(request.app.state, "host_registry", None)
             host_store_inst = getattr(request.app.state, "host_store", None)
             if host_registry is not None and host_store_inst is not None:
-                from omnigent.host.frames import (
-                    HostLaunchRunnerFrame,
-                    encode_host_frame,
-                )
                 from omnigent.runner.identity import token_bound_runner_id
                 from omnigent.server.routes._host_launch import resolve_host_launch
 
-                target = await asyncio.to_thread(
+                # Auth + host-online checks stay synchronous so an
+                # unauthorized or offline host is still an immediate
+                # 4xx on the create itself.
+                await asyncio.to_thread(
                     resolve_host_launch,
                     user_id=user_id,
                     host_id=launch_host_id,
@@ -464,7 +471,6 @@ def register_core_routes(
                     conversation_store=conversation_store,
                     permission_store=permission_store,
                 )
-                conn = target.conn
                 binding_token = secrets.token_urlsafe(32)
                 runner_id = token_bound_runner_id(binding_token)
                 # Atomic bind (WHERE runner_id IS NULL) closes the TOCTOU.
@@ -478,62 +484,36 @@ def register_core_routes(
                         f"Session {resp.id!r} already has a runner bound",
                         code=ErrorCode.CONFLICT,
                     )
-                # host_id and workspace were already written by
-                # _create_session_from_existing_agent; we only need
-                # to set runner_id atomically (above) and send the
-                # launch frame.
-                request_id = secrets.token_hex(8)
-                future: asyncio.Future[dict[str, str | None]] = (
-                    asyncio.get_running_loop().create_future()
-                )
-                conn.pending_launches[request_id] = future
                 if resp.workspace is None:  # pragma: no cover — schema guards
                     raise OmnigentError(
                         "session has host_id but no workspace; "
                         "schema constraint should have prevented this",
                         code=ErrorCode.INTERNAL_ERROR,
                     )
-                launch_frame = encode_host_frame(
-                    HostLaunchRunnerFrame(
-                        request_id=request_id,
-                        binding_token=binding_token,
-                        workspace=resp.workspace,
+                launch_tracker = getattr(request.app.state, "managed_launches", None)
+                if launch_tracker is not None:
+                    launch_tracker.begin(resp.id)
+                host_launch_task = asyncio.create_task(
+                    _run_host_bound_launch(
                         session_id=resp.id,
-                        # Already canonical (see _resolve_harness); lets
-                        # the host refuse an unconfigured harness before
-                        # spawning. None (agent not resolvable) skips the
-                        # host-side check.
-                        harness=resp.harness,
+                        host_id=launch_host_id,
+                        workspace=resp.workspace,
+                        # create-mode git options only; an existing
+                        # worktree is already bound as the workspace.
+                        git=(
+                            body.git
+                            if body.git is not None and not body.git.existing_worktree
+                            else None
+                        ),
+                        binding_token=binding_token,
+                        terminal_first=_terminal_first_create,
+                        tracker=launch_tracker,
+                        conversation_store=conversation_store,
+                        host_registry=host_registry,
                     )
                 )
-                host_registry.send_text(conn, launch_frame)
-                try:
-                    launch_result = await asyncio.wait_for(future, timeout=30.0)
-                except asyncio.TimeoutError:
-                    conn.pending_launches.pop(request_id, None)
-                    launch_result = {"status": "failed", "error": "host launch timed out"}
-                if launch_result.get("status") == "failed":
-                    # Lenient on every create-time launch failure, including
-                    # an unconfigured harness: the picker's readiness data
-                    # can be stale (the user may have run `omnigent setup`
-                    # since the host last connected), so we never block the
-                    # create. The session opens with the binding intact; the
-                    # first message drives the real runner start, and if the
-                    # host still refuses there, that path consults the daemon
-                    # and persists a transcript error (see post_event's
-                    # relaunch branch). No create-time harness gating.
-                    _logger.warning(
-                        "Host %s failed to launch runner for session %s: %s",
-                        launch_host_id,
-                        resp.id,
-                        launch_result.get("error"),
-                    )
-                    # The runner never booted, so its pending=False clear
-                    # will never fire. Clear the spin-up flag here so a
-                    # failed launch doesn't strand the Terminal-pill
-                    # spinner. No-op when we never set it.
-                    if _terminal_first_create:
-                        _publish_terminal_pending(resp.id, False)
+                _managed_launch_tasks.add(host_launch_task)
+                host_launch_task.add_done_callback(_managed_launch_tasks.discard)
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
 

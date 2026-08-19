@@ -314,6 +314,7 @@ from omnigent.server.schemas import (
     SessionCreateMetadata,
     SessionCreateRequest,
     SessionEventInput,
+    SessionGitOptions,
     SessionListItem,
     SessionModelEvent,
     SessionResponse,
@@ -2840,6 +2841,191 @@ async def _bind_and_launch_managed_runner(
             return
     tracker.finish(session_id)
     _publish_sandbox_status(session_id, "ready")
+
+
+async def _run_host_bound_launch(
+    *,
+    session_id: str,
+    host_id: str,
+    workspace: str,
+    git: SessionGitOptions | None,
+    binding_token: str,
+    terminal_first: bool,
+    tracker: ManagedLaunchTracker | None,
+    conversation_store: ConversationStore,
+    host_registry: HostRegistry,
+) -> None:
+    """
+    Finish a host-bound session create in the background.
+
+    ``POST /v1/sessions`` with a ``host_id`` returns as soon as the row
+    exists and a runner id is atomically bound; this task carries the
+    slow remainder — creating the git worktree on the host (when the
+    create asked for one), re-pointing the session row at it, and the
+    ``host.launch_runner`` round-trip — so the web UI can navigate to
+    the session immediately. A message racing this task rendezvouses on
+    *tracker* (see post_event).
+
+    Failure semantics mirror the previously synchronous create:
+
+    - Worktree failure is fatal — the tracker records the host's reason
+      (e.g. "branch already exists") and a waiting or later message
+      surfaces it.
+    - Launch failure is lenient — logged, the terminal spin-up flag is
+      cleared, and the tracker settles successfully; the first message
+      drives the real relaunch through the host (post_event's relaunch
+      branch), exactly as before.
+    - A session deleted mid-worktree-creation is detected at the row
+      update and the fresh worktree is removed best-effort.
+
+    :param session_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :param host_id: Host to create the worktree / launch the runner on.
+    :param workspace: Boundary-validated workspace from the create —
+        the source repo when *git* is set, the final workspace
+        otherwise.
+    :param git: Create-mode git options (a worktree to create), or
+        ``None`` when the create named no new branch.
+    :param binding_token: Binding token whose derived runner id the
+        create route already wrote to the session row.
+    :param terminal_first: Whether the create marked the terminal
+        spin-up flag (host-launched terminal-first session) — cleared
+        here on failure so the Terminal pill spinner isn't stranded.
+    :param tracker: The app's launch tracker; the create registered
+        this session's entry. ``None`` in minimal test wirings.
+    :param conversation_store: Store holding the session row.
+    :param host_registry: Live host tunnels.
+    """
+    from omnigent.server.routes._host_worktree import (
+        WorktreeProxyError,
+        create_worktree_on_host,
+        remove_worktree_on_host,
+    )
+
+    def _settle_ok() -> None:
+        if tracker is not None:
+            tracker.finish(session_id)
+
+    def _settle_failed(reason: str) -> None:
+        if terminal_first:
+            _publish_terminal_pending(session_id, False)
+        if tracker is not None:
+            tracker.fail(session_id, reason)
+
+    try:
+        if git is not None:
+            host_conn = host_registry.get(host_id)
+            if host_conn is None:
+                _settle_failed(
+                    f"host went offline before the worktree for branch "
+                    f"{git.branch_name!r} could be created"
+                )
+                return
+            try:
+                created = await create_worktree_on_host(
+                    host_registry=host_registry,
+                    host_conn=host_conn,
+                    repo_path=workspace,
+                    branch_name=git.branch_name,
+                    base_branch=git.base_branch,
+                )
+            except WorktreeProxyError as exc:
+                _logger.warning(
+                    "Worktree creation failed for session %s: %s",
+                    session_id,
+                    exc.message,
+                )
+                _settle_failed(exc.message)
+                return
+            try:
+                await asyncio.to_thread(
+                    conversation_store.set_host_id,
+                    session_id,
+                    host_id,
+                    created.worktree_path,
+                    created.branch,
+                )
+            except ConversationNotFoundError:
+                # Deleted while the worktree was being created — the
+                # delete flow couldn't see the worktree yet, so the
+                # orphan is cleaned up here.
+                _logger.info(
+                    "Session %s was deleted during worktree creation; removing %s",
+                    session_id,
+                    created.worktree_path,
+                )
+                try:
+                    await remove_worktree_on_host(
+                        host_registry=host_registry,
+                        host_conn=host_conn,
+                        worktree_path=created.worktree_path,
+                        branch=created.branch,
+                        delete_branch=True,
+                    )
+                except WorktreeProxyError:
+                    _logger.warning(
+                        "Failed to remove orphan worktree %s for deleted session %s",
+                        created.worktree_path,
+                        session_id,
+                        exc_info=True,
+                    )
+                _settle_ok()
+                return
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            _settle_ok()
+            return
+        # Re-fetch the connection: the worktree step may have outlived
+        # the tunnel the create validated.
+        host_conn = host_registry.get(host_id)
+        if host_conn is None:
+            # Lenient, like a refused create-time launch: keep the
+            # binding; the first message relaunches through the host.
+            _logger.warning(
+                "Host %s went offline before launching runner for session %s",
+                host_id,
+                session_id,
+            )
+            if terminal_first:
+                _publish_terminal_pending(session_id, False)
+            _settle_ok()
+            return
+        attempt = await _launch_runner_on_host(
+            conv,
+            conversation_store,
+            host_registry,
+            host_conn,
+            binding_token=binding_token,
+        )
+        if attempt.error is not None or attempt.error_code is not None:
+            # Lenient on every create-time launch failure, including an
+            # unconfigured harness: the picker's readiness data can be
+            # stale (the user may have run `omnigent setup` since the
+            # host last connected). The session keeps its binding; the
+            # first message drives the real runner start, and if the
+            # host still refuses there, that path consults the daemon
+            # and persists a transcript error (see post_event's
+            # relaunch branch). No create-time harness gating.
+            _logger.warning(
+                "Host %s failed to launch runner for session %s: %s",
+                host_id,
+                session_id,
+                attempt.error,
+            )
+            # The runner never booted, so its pending=False clear will
+            # never fire. Clear the spin-up flag so a failed launch
+            # doesn't strand the Terminal-pill spinner.
+            if terminal_first:
+                _publish_terminal_pending(session_id, False)
+        _settle_ok()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # A background failure has no HTTP response to land on; settle
+        # the tracker so a rendezvousing message reports it instead of
+        # timing out.
+        _logger.exception("Background host launch failed for session %s", session_id)
+        _settle_failed(f"session launch failed: {exc}")
 
 
 async def _maybe_relaunch_managed_sandbox(
@@ -7861,39 +8047,30 @@ async def _create_session_from_existing_agent(
         )
 
     # Git worktree options (optional). Two modes on body.git:
-    #  - create (default): make a worktree; it becomes the stored
-    #    workspace and its branch is recorded.
+    #  - create (default): a worktree will be created in the BACKGROUND
+    #    launch task after this create returns (worktree checkout can
+    #    take many seconds and must not block the 201 the web UI waits
+    #    on before navigating). The row is created with the source repo
+    #    as workspace; the launch task re-points it at the worktree and
+    #    records the branch once the host reports success. Only the
+    #    branch NAME is validated here so a bad name is still a
+    #    synchronous 4xx.
     #  - bind (existing_worktree): workspace already IS the worktree;
     #    record its branch only, create nothing.
     git_branch: str | None = None
-    # Set to the created worktree path ONLY when Omnigent creates one.
-    # Gates create-rollback: an existing worktree bound via
-    # existing_worktree must never be force-removed on failure — it is
-    # the user's, not an Omnigent orphan.
-    created_worktree_path: str | None = None
     if body.git is not None:
-        if body.git.existing_worktree:
-            # Starting in a pre-existing worktree: no worktree is created, but
-            # record its branch so the sidebar shows it and the opt-in delete
-            # flow can offer to remove it. Validate the name (the host never
-            # runs git for this path, so the server is the only gate).
-            from omnigent.host.git_worktree import WorktreeError, validate_branch_name
+        from omnigent.host.git_worktree import WorktreeError, validate_branch_name
 
-            try:
-                validate_branch_name(body.git.branch_name)
-            except WorktreeError as exc:
-                raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
+        try:
+            validate_branch_name(body.git.branch_name)
+        except WorktreeError as exc:
+            raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
+        if body.git.existing_worktree:
+            # Starting in a pre-existing worktree: record its branch so
+            # the sidebar shows it and the opt-in delete flow can offer
+            # to remove it. The host never runs git for this path, so
+            # the server is the only gate.
             git_branch = body.git.branch_name
-        else:
-            created_worktree = await _create_session_worktree(
-                host_id=body.host_id,
-                source_repo=canonical_workspace,
-                git=body.git,
-                request=request,
-            )
-            canonical_workspace = created_worktree.worktree_path
-            git_branch = created_worktree.branch
-            created_worktree_path = created_worktree.worktree_path
 
     # Native-terminal pass-through args.
     #
@@ -7939,41 +8116,18 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
-    try:
-        conv = conversation_store.create_conversation(
-            agent_id=agent.id,
-            title=body.title,
-            parent_conversation_id=body.parent_session_id,
-            runner_id=inherited_runner_id,
-            kind="sub_agent" if body.parent_session_id else "default",
-            sub_agent_name=body.sub_agent_name,
-            host_id=body.host_id,
-            workspace=canonical_workspace,
-            git_branch=git_branch,
-            terminal_launch_args=validated_launch_args,
-        )
-    except Exception:
-        # Broad catch is intentional: ANY create_conversation failure
-        # (integrity error, name clash, ...) must trigger orphan-worktree
-        # cleanup before the error propagates. We re-raise unchanged
-        # below, so nothing is swallowed. Gate on created_worktree_path,
-        # NOT git_branch: only a worktree Omnigent created here may be
-        # force-removed. An existing worktree bound via workspace_branch
-        # also sets git_branch but is the user's — never destroy it.
-        if (
-            created_worktree_path is not None
-            and body.host_id is not None
-            and git_branch is not None
-        ):
-            await _remove_session_worktree_best_effort(
-                host_id=body.host_id,
-                worktree_path=created_worktree_path,
-                branch=git_branch,
-                delete_branch=True,
-                request=request,
-                reason="create-rollback",
-            )
-        raise
+    conv = conversation_store.create_conversation(
+        agent_id=agent.id,
+        title=body.title,
+        parent_conversation_id=body.parent_session_id,
+        runner_id=inherited_runner_id,
+        kind="sub_agent" if body.parent_session_id else "default",
+        sub_agent_name=body.sub_agent_name,
+        host_id=body.host_id,
+        workspace=canonical_workspace,
+        git_branch=git_branch,
+        terminal_launch_args=validated_launch_args,
+    )
 
     # The create request has no conv id in its URL, so the path-based
     # FastAPI hook can't tag it — stamp the minted id so the create span
@@ -9275,6 +9429,7 @@ __all__ = [
     "_register_policy_elicitation",
     "_relay_runner_stream",
     "_resolve_elicitation",
+    "_run_host_bound_launch",
     "_run_managed_launch",
     "_run_managed_wake",
     "_runner_reject_detail",

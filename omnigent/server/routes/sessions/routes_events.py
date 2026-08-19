@@ -1307,21 +1307,25 @@ def register_events_routes(
             conv = conv_after_wake
             _runner_needs_session_init = True
         runner_client = await _get_runner_client(session_id, runner_router)
-        # Managed-launch rendezvous: a ``host_type="managed"`` create
-        # returns before the sandbox exists, so the first message (the
+        # Launch rendezvous: a create can return before its background
+        # launch finishes — a ``host_type="managed"`` create before the
+        # sandbox exists, a host-bound create before its worktree is
+        # created and the runner spawned — so the first message (the
         # Web UI auto-sends the composer prompt right after navigate)
-        # can land while the background provision is still running.
-        # Instead of failing with "no runner bound", wait for the
-        # launch to settle: success leaves the session host-bound with
-        # its runner tunnel already up (the background task awaits
-        # it), failure surfaces the recorded reason.
-        if runner_client is None and conv.host_id is None:
-            _managed_tracker = getattr(request.app.state, "managed_launches", None)
-            _managed_launch = (
-                _managed_tracker.get(session_id) if _managed_tracker is not None else None
+        # can land while that background work is still running.
+        # Instead of failing with "no runner bound" (or, worse for a
+        # host-bound create, relaunching into the pre-worktree
+        # workspace), wait for the launch to settle: success leaves
+        # the session bound (the host-bound path then takes the normal
+        # runner-connect grace below), failure surfaces the recorded
+        # reason.
+        if runner_client is None:
+            _launch_tracker = getattr(request.app.state, "managed_launches", None)
+            _pending_launch = (
+                _launch_tracker.get(session_id) if _launch_tracker is not None else None
             )
-            if _managed_launch is not None:
-                await _await_settled_managed_launch(_managed_launch)
+            if _pending_launch is not None:
+                await _await_settled_managed_launch(_pending_launch)
                 # The launch bound host_id / workspace / runner_id to
                 # the row after this handler's fetch — re-read so the
                 # resolution below sees the bound runner.
