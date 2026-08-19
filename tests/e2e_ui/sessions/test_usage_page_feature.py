@@ -107,7 +107,11 @@ def test_session_table_shows_other_harnesses_badge(
     page.route("**/v1/usage", handle_usage)
     page.goto(f"{live_server}/usage")
 
-    expect(page.get_by_text("claude-sdk")).to_be_visible(timeout=30_000)
-    badge = page.get_by_text("+2")
+    table = page.locator("table")
+    expect(table).to_be_visible(timeout=30_000)
+    row = table.locator("tr", has_text="Multi-harness session")
+    expect(row).to_be_visible()
+    expect(row.get_by_text("claude-sdk")).to_be_visible()
+    badge = row.get_by_text("+2")
     expect(badge).to_be_visible()
     expect(badge).to_have_attribute("title", "antigravity, openai-agents")
