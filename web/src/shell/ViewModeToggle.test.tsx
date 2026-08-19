@@ -70,8 +70,15 @@ describe("ViewModeToggle", () => {
     expect(terminalSegment()).toBeVisible();
   });
 
-  it("renders nothing for a non-terminal-first session", () => {
-    const { container } = renderToggle(makeCtx({ isTerminalFirst: false }));
+  it("renders for a non-terminal-first session when a terminal is available", () => {
+    renderToggle(makeCtx({ isTerminalFirst: false, terminalsAvailable: true }));
+    expect(screen.getByRole("group", { name: /switch between chat and terminal/i })).toBeVisible();
+  });
+
+  it("renders nothing when a non-terminal-first session has no terminal", () => {
+    const { container } = renderToggle(
+      makeCtx({ isTerminalFirst: false, terminalsAvailable: false }),
+    );
     expect(container).toBeEmptyDOMElement();
   });
 
