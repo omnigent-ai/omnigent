@@ -488,12 +488,23 @@ def out_of_parent_family(
     from omnigent.runner.subagent_routing import (
         auto_harness_session,
         harness_family,
+        routing_class_from_snapshot,
         subagent_routing_enabled,
     )
 
     if parent is None or conv is None:
         return False
     if not subagent_routing_enabled(getattr(parent, "subagent_routing_override", None)):
+        return False
+    # Same predicate as the child-create gate: confinement belongs to a
+    # pinned Smart Routing parent, so a parent that merely has the subagent
+    # switch on routes a cross-family pane like any other.
+    parent_class = routing_class_from_snapshot(
+        cost_control_mode=getattr(parent, "cost_control_mode_override", None),
+        harness_override=getattr(parent, "harness_override", None),
+        labels=getattr(parent, "labels", None),
+    )
+    if not parent_class.routing_enabled or parent_class.auto_harness:
         return False
     if auto_harness_session(conv, parent):
         return False
