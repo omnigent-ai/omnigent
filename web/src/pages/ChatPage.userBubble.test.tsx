@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { FileViewerContext } from "@/shell/FileViewerContext";
+import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { BubbleView } from "./ChatPage";
 
 // UserBubble renders its text through the same markdown renderer as the
@@ -23,6 +24,7 @@ function userBubble(text: string, overrides: Partial<Extract<Bubble, { kind: "us
   return {
     kind: "user" as const,
     itemId: "u1",
+    responseId: "turn_user_1",
     content: [{ type: "input_text" as const, text }],
     ...overrides,
   };
@@ -255,6 +257,53 @@ describe("UserBubble copy button", () => {
       }),
     );
     expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+  });
+});
+
+describe("per-message fork actions", () => {
+  function renderForkableBubble(bubble: Bubble, openForkDialog = vi.fn()) {
+    render(
+      <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BubbleView bubble={bubble} />
+        </FileViewerContext.Provider>
+      </ForkDialogContextProvider>,
+    );
+    return openForkDialog;
+  }
+
+  it("opens a fork from a user message using that message's response id", () => {
+    const openForkDialog = renderForkableBubble(
+      userBubble("fork this prompt", { responseId: "turn_user_distinct" }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Fork from here" }));
+
+    expect(openForkDialog).toHaveBeenCalledWith({ upToResponseId: "turn_user_distinct" });
+  });
+
+  it("passes through an imported response id shared with the assistant reply", () => {
+    const openForkDialog = renderForkableBubble(
+      userBubble("imported prompt", { responseId: "imported_shared_turn" }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Fork from here" }));
+
+    expect(openForkDialog).toHaveBeenCalledWith({ upToResponseId: "imported_shared_turn" });
+  });
+
+  it("does not offer a fork before an optimistic message has a server anchor", () => {
+    renderForkableBubble(userBubble("still pending", { responseId: "" }));
+
+    expect(screen.queryByRole("button", { name: "Fork from here" })).toBeNull();
+  });
+
+  it("still forks an assistant response using the assistant response id", () => {
+    const openForkDialog = renderForkableBubble(assistantBubble("completed"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Fork from here" }));
+
+    expect(openForkDialog).toHaveBeenCalledWith({ upToResponseId: "codex_turn_123" });
   });
 });
 

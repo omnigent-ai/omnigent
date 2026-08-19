@@ -62,6 +62,60 @@ function mkExec(name: string, callId: string): ToolExecution {
 }
 
 describe("buildBubbles — bubble grouping", () => {
+  it("preserves a hydrated user message's response id as its fork anchor", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "msg_user",
+        response_id: "turn_user_123",
+        type: "message",
+        role: "user",
+        status: "completed",
+        content: [{ type: "input_text", text: "Try this approach" }],
+      } as ConversationItem,
+      {
+        id: "msg_assistant",
+        response_id: "resp_assistant_456",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "Here is the result" }],
+      } as ConversationItem,
+    ];
+
+    const user = buildBubbles(itemsToBlocks(items), null)[0] as Extract<Bubble, { kind: "user" }>;
+
+    expect(user.responseId).toBe("turn_user_123");
+  });
+
+  it("preserves a shared imported response id on both user and assistant bubbles", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "imported_user",
+        response_id: "imported_turn_1",
+        type: "message",
+        role: "user",
+        status: "completed",
+        content: [{ type: "input_text", text: "Imported prompt" }],
+      } as ConversationItem,
+      {
+        id: "imported_assistant",
+        response_id: "imported_turn_1",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "Imported reply" }],
+      } as ConversationItem,
+    ];
+
+    const [user, assistant] = buildBubbles(itemsToBlocks(items), null) as [
+      Extract<Bubble, { kind: "user" }>,
+      Extract<Bubble, { kind: "assistant" }>,
+    ];
+
+    expect(user.responseId).toBe("imported_turn_1");
+    expect(assistant.responseId).toBe("imported_turn_1");
+  });
+
   it("UserMessageBlock + TextDone in same response → [user, assistant{ items: [text] }]", () => {
     const blocks: AnyBlock[] = [
       {
@@ -2870,11 +2924,25 @@ describe("bubblesEqual — React.memo comparator", () => {
     // a hydrated author would not repaint over an optimistic unattributed
     // bubble of the same itemId/content.
     const content: MessageContentBlock[] = [{ type: "input_text", text: "Hello" }];
-    const alice: Bubble = { kind: "user", itemId: "u1", content, createdBy: "alice@example.com" };
-    const bob: Bubble = { kind: "user", itemId: "u1", content, createdBy: "bob@example.com" };
-    const none: Bubble = { kind: "user", itemId: "u1", content };
+    const alice: Bubble = {
+      kind: "user",
+      itemId: "u1",
+      responseId: "turn_1",
+      content,
+      createdBy: "alice@example.com",
+    };
+    const bob: Bubble = {
+      kind: "user",
+      itemId: "u1",
+      responseId: "turn_1",
+      content,
+      createdBy: "bob@example.com",
+    };
+    const none: Bubble = { kind: "user", itemId: "u1", responseId: "turn_1", content };
+    const otherResponse: Bubble = { ...alice, responseId: "turn_2" };
     expect(bubblesEqual(alice, bob)).toBe(false);
     expect(bubblesEqual(none, alice)).toBe(false);
+    expect(bubblesEqual(alice, otherResponse)).toBe(false);
     expect(bubblesEqual(alice, alice)).toBe(true);
   });
 });
