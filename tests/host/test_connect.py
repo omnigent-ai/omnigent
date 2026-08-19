@@ -3773,43 +3773,41 @@ async def test_connected_host_auth_rejection_prints_notice_once(
     assert err.count(f"HTTP {status}") == 1
 
 
-async def test_fresh_host_still_fails_loud_on_auth_rejection(
+@pytest.mark.parametrize("status", [401, 403])
+async def test_fresh_host_retries_auth_rejection_before_failing_loud(
     monkeypatch: pytest.MonkeyPatch,
+    status: int,
 ) -> None:
-    """A never-connected host still fails loud on 401/403.
+    """A never-connected host retries auth errors before failing loud.
 
-    The connected-host retry keys on a prior successful upgrade. A host
-    that has NEVER connected and is rejected with 401/403 is genuinely
-    unauthenticated / unauthorized — it must still raise HostConnectError
-    on the first attempt (→ exit 1 with the fix printed), not loop.
+    Databricks OAuth can refresh after daemon start but before a later
+    tunnel upgrade. The host gets a few attempts, then still raises a
+    clear credential failure instead of looping forever.
     """
-    spy = _ConnectSpy([_invalid_status(403)])
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    spy = _ConnectSpy([_invalid_status(status)])
     _patch_connect(monkeypatch, spy)
     host = _host()
 
     with pytest.raises(HostConnectError):
         await host.run()
 
-    # Exactly one attempt → no silent retry for the fresh-host case.
-    assert spy.call_count == 1
+    assert spy.call_count == 3
 
 
 @pytest.mark.parametrize(
     "status,expected",
     [
-        (401, "HTTP 401"),
-        (403, "HTTP 403"),
         (404, "permanent"),
     ],
 )
 async def test_run_fails_loud_on_permanent_4xx(
     monkeypatch: pytest.MonkeyPatch, status: int, expected: str
 ) -> None:
-    """A permanent 4xx upgrade rejection fails loud on the first attempt.
+    """A non-auth permanent 4xx upgrade rejection fails loud immediately.
 
-    401/403/other-4xx mean unauthenticated / unauthorized / wrong-or-old
-    server — reconnecting can never succeed, so run() must raise
-    HostConnectError immediately rather than backing off.
+    A wrong or old server cannot recover through reconnecting, so run()
+    must raise HostConnectError rather than backing off.
     """
     spy = _ConnectSpy([_invalid_status(status)])
     _patch_connect(monkeypatch, spy)
@@ -3820,8 +3818,6 @@ async def test_run_fails_loud_on_permanent_4xx(
 
     # Message identifies the specific permanent failure.
     assert expected in str(excinfo.value)
-    # Exactly one attempt → no silent reconnect/backoff. If >1, the 4xx
-    # was misclassified as transient and the loop kept retrying.
     assert spy.call_count == 1
 
 
@@ -3838,6 +3834,7 @@ async def test_auth_rejection_suggests_omnigent_login(
     server URL, so the user can copy-paste it.
     """
     server_url = "https://app.example.databricks.com"
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
     spy = _ConnectSpy([_invalid_status(status)])
     _patch_connect(monkeypatch, spy)
     host = _host(server_url=server_url)

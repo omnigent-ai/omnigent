@@ -2971,11 +2971,13 @@ def _claim_foreground_daemon_record(
     """
     conflict = _live_daemon_conflict(record)
     if conflict is not None:
+        # server_url is None in local mode; "" makes the hint say --server "".
+        stop_command = _host_stop_command(conflict.server_url or "")
         raise click.ClickException(
             "A host daemon is already running for this server "
             f"(pid={conflict.pid}, target={conflict.target}). "
-            "Run `omnigent host status` to inspect it or "
-            "`omnigent host stop --server ...` to stop it first."
+            f"Run `omnigent host status` to inspect it or `{stop_command}` "
+            "to stop it first."
         )
     previous = _find_daemon_record(record.target)
     if previous is not None and not _pid_alive(previous.pid):
@@ -3159,9 +3161,10 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     today. A non-200 answer that carries the Databricks edge signature
     (302 to the workspace OAuth page, or a DatabricksRealm 401) means
     the run would otherwise die much later with an opaque "non-JSON
-    response (status=302)" traceback from the session-create call. On a
-    TTY we run the same flow ``omnigent login`` would and continue;
-    headless invocations get the exact command to run instead.
+    response (status=302)" traceback from the session-create call. First,
+    it asks the SDK for a fresh workspace token; only then does a TTY run
+    the same flow ``omnigent login`` would, while headless invocations get
+    the exact command to run instead.
 
     Non-Databricks postures are deliberately left alone: local accounts
     servers auto-authenticate downstream (magic-link redeem), and
@@ -3181,6 +3184,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     import httpx as _httpx
 
     from omnigent.chat import _remote_headers
+    from omnigent.cli_auth import load_databricks_org_id, store_databricks_auth
 
     try:
         probe = _httpx.get(
@@ -3197,6 +3201,13 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     workspace_host = _databricks_workspace_login_target(server, probe)
     if workspace_host is None:
         return
+    org_id = load_databricks_org_id(server)
+    token = _databricks_workspace_token(workspace_host)
+    if token is not None:
+        refreshed_probe = _verify_databricks_server_token(server, token, org_id)
+        if refreshed_probe.status_code == 200:
+            store_databricks_auth(server, workspace_host, org_id=org_id)
+            return
     login_cmd = f"omnigent login {server}"
     if non_interactive or not sys.stdin.isatty():
         raise click.ClickException(
@@ -3204,11 +3215,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
             f"HTTP {probe.status_code}). Run `{login_cmd}` and retry."
         )
     click.echo(f"Not signed in to {server} — running `{login_cmd}` first.")
-    # Recover the ``?o=`` selector from a prior login record so a re-login
-    # still targets the right workspace.
-    from omnigent.cli_auth import load_databricks_org_id
-
-    _databricks_login(server, workspace_host, org_id=load_databricks_org_id(server))
+    _databricks_login(server, workspace_host, org_id=org_id)
 
 
 def _ensure_backend(server: str | None) -> str:
@@ -5735,6 +5742,7 @@ def import_session_command(
     import httpx
 
     from omnigent.chat import _remote_headers
+    from omnigent.conversation_browser import conversation_url
     from omnigent.session_import import (
         ImportSource,
         SessionImportNotFoundError,
@@ -5840,13 +5848,17 @@ def import_session_command(
             )
             continue
         imported_count += 1
+        # Surface the browser URL, not the bare id, so the user can open the
+        # imported session straight into the web (where it offers the resume
+        # picker). Maps a Databricks API base to its workspace SPA link.
+        session_link = conversation_url(base_url, session_id)
         if is_batch:
             click.echo(
                 f"Imported {item_count} item(s) from {current_source_session_id} "
-                f"into {session_id}."
+                f"into {session_link}"
             )
         else:
-            click.echo(f"Imported {item_count} item(s) into {session_id}.")
+            click.echo(f"Imported {item_count} item(s) into {session_link}")
 
     if is_batch:
         click.echo(f"\nImported: {imported_count}")
@@ -10960,7 +10972,7 @@ def _databricks_workspace_token(workspace_host: str) -> str | None:
     try:
         auth, _host = _resolve_databricks_auth(host=workspace_host)
         return auth.current_token()
-    except (DatabricksAuthError, ValueError):
+    except (DatabricksAuthError, ImportError, ValueError):
         return None
 
 

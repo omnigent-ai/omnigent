@@ -328,6 +328,9 @@ def _connection_refused(exc: BaseException) -> bool:
 _RECONNECT_BASE_S = 0.5
 _RECONNECT_CAP_S = 10.0
 _RECONNECT_JITTER = 0.5
+# Fresh hosts get a short auth-retry window for Databricks OAuth refreshes.
+# Established hosts retry auth failures indefinitely to preserve sessions.
+_MAX_CONSECUTIVE_AUTH_ERRORS = 3
 # Consecutive connection-refused failures against a loopback server before the
 # host exits (~5 minutes at the backoff cap). Refused on loopback means no
 # process listens on the port — the local server is gone, not unreachable.
@@ -834,9 +837,7 @@ class HostProcess:
         self._capabilities_initialized = False
         # Consecutive login-page redirects; reset by a successful upgrade.
         self._login_redirect_streak = 0
-        # Consecutive 401/403 upgrade rejections on an already-connected host;
-        # reset by a successful upgrade. Gates the once-per-episode terminal
-        # notice so a VPN outage doesn't spam stderr on every retry.
+        # Reset by a successful upgrade or non-auth error; bounds fresh-host refresh retries.
         self._auth_retry_streak = 0
         # Consecutive connection-refused connect failures; reset by an accepted
         # upgrade or any non-refused error. Fatal past a bounded streak only
@@ -1235,21 +1236,16 @@ class HostProcess:
         """
         if status in _RETRYABLE_UPGRADE_STATUSES or not (400 <= status < 500):
             return None
-        if status in (401, 403) and self._ever_connected:
-            # A host that already completed an upgrade proved its credentials
-            # and authorization are valid, so a later 401/403 is almost always
-            # a network-path artifact — a dropped VPN whose corporate proxy
-            # answers the upgrade with 401/403 before it reaches the server.
-            # Retry forever (mirrors the login-redirect path) so a live host
-            # with running sessions survives the outage and resumes when the
-            # path recovers, instead of exiting and forcing a manual restart.
+        if status in (401, 403):
+            # Fresh hosts can race OAuth refresh; connected hosts preserve active sessions.
             self._auth_retry_streak += 1
-            cause = (
-                f"Connection refused (HTTP {status}): the host tunnel was "
-                "rejected after it had already connected."
+            cause = f"Connection refused (HTTP {status}): the host tunnel was rejected."
+            should_retry = self._ever_connected or (
+                self._auth_retry_streak < _MAX_CONSECUTIVE_AUTH_ERRORS
             )
-            _logger.warning("%s Retrying — check your VPN/network.", cause)
-            if self._auth_retry_streak == 1:
+            if should_retry:
+                _logger.warning("%s Retrying — check your VPN/network.", cause)
+            if should_retry and self._auth_retry_streak == 1:
                 # The warning above lands only in the CLI log file; print once
                 # per outage so a foreground `omnigent host` isn't silent.
                 print(
@@ -1259,19 +1255,20 @@ class HostProcess:
                     file=sys.stderr,
                     flush=True,
                 )
-            return None
+            if should_retry:
+                return None
         if status == 401:
             return HostConnectError(
-                "Authentication failed (HTTP 401): the server rejected the "
-                "supplied credentials. "
+                "Authentication failed (HTTP 401): the server rejected the supplied "
+                f"credentials across {_MAX_CONSECUTIVE_AUTH_ERRORS} consecutive attempts. "
                 + self._credentials_fix_hint()
                 + " "
                 + self._login_fix_hint()
             )
         if status == 403:
             return HostConnectError(
-                "Connection refused (HTTP 403): the credentials authenticated, "
-                "but the server did not accept the host tunnel. Either your "
+                "Connection refused (HTTP 403): the server repeatedly rejected the host "
+                "tunnel. Either your "
                 "identity is not authorized to register a host on this server, "
                 "or the server is running a build that predates the host API "
                 "(the /v1/hosts tunnel route). Confirm you have access and that "
@@ -2668,6 +2665,11 @@ class HostProcess:
                         # riding out a messy restart isn't killed by
                         # redirects accumulated across unrelated errors.
                         self._login_redirect_streak = 0
+                    if not (
+                        isinstance(exc, InvalidStatus) and exc.response.status_code in (401, 403)
+                    ):
+                        # Keep the refresh window limited to consecutive auth rejections.
+                        self._auth_retry_streak = 0
                     # Refused on loopback is decisive: nothing listens on the
                     # port and no network path can heal it, so bound the
                     # retries. Remote refusals retry forever (outages recover).
