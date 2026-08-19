@@ -47,12 +47,25 @@ describe("partitionAgentsByKind", () => {
 });
 
 describe("isAcpHarnessAgent", () => {
+  it("trusts the server's acpHarness flag, so an unknown ACP harness still groups right", () => {
+    // The whole point of the catalog-derived flag: a builtin ACP row added to
+    // ACP_CLI_HARNESSES with an id this frontend has never seen must land under
+    // "Harnesses" without any frontend change.
+    expect(isAcpHarnessAgent({ harness: "some-future-acp-cli", acpHarness: true })).toBe(true);
+    // And the server's "no" wins over the id heuristic.
+    expect(isAcpHarnessAgent({ harness: "acp:legacy", acpHarness: false })).toBe(false);
+  });
+
   it("recognizes configured acp:<slug> agents and builtin ACP CLI harnesses", () => {
     // NewChatDialog routes these into the "Harnesses" group (beside the native
     // CLIs), not "Agents" — they select a harness to run, not a composed agent.
     expect(isAcpHarnessAgent({ harness: "acp:devin" })).toBe(true);
     expect(isAcpHarnessAgent({ harness: "acp:kilocode" })).toBe(true);
     expect(isAcpHarnessAgent({ harness: "grok" })).toBe(true);
+    // Bare builtin ACP CLI ids: a seeded `devin` agent carries
+    // `harness: "devin"`, not `acp:devin`. This is the older-server fallback
+    // path (no `acpHarness` flag), which the legacy id set still covers.
+    expect(isAcpHarnessAgent({ harness: "devin" })).toBe(true);
   });
 
   it("does not misclassify composed agents, native harnesses, or missing harness", () => {

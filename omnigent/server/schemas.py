@@ -2440,6 +2440,7 @@ class SessionUsage(BaseModel):
     cost_usd: float = 0.0
     models: dict[str, float] = Field(default_factory=dict)
     harness: str | None = None
+    other_harnesses: list[str] | None = None
     llm_model: str | None = None
     agent_name: str | None = None
 

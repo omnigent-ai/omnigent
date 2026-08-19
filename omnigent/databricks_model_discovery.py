@@ -31,6 +31,11 @@ _HTTP_TIMEOUT_S = 10.0
 #: a model the same way no matter which listing answered.
 _CATALOG_SPELLINGS: tuple[str, ...] = ("databricks-", _SYSTEM_MODEL_PREFIX)
 
+# DATABRICKS-PATCH(codex-live-model-discovery)
+#: ``gpt-5-6-sol`` → ``("gpt", "5", "6", "sol")``. Mirrors
+#: ``codex_model_vocabulary._GPT_ID_RE`` without reaching into its privates.
+_GPT_VERSIONED_ID_RE = re.compile(r"^(gpt|codex)-(\d+)-(\d+)(?:-([a-z0-9]+))?$")
+
 
 def _bare_model_id(model_id: str) -> str:
     """Strip the catalog spelling so ids compare across vocabularies."""
@@ -310,3 +315,86 @@ def discover_databricks_claude_models(
         token,
         transport=transport,
     ).families
+
+
+# DATABRICKS-PATCH(codex-live-model-discovery)
+def discover_databricks_codex_models(
+    workspace_url: str,
+    token: str,
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> tuple[str, ...]:
+    """Discover every codex-compatible model a Databricks workspace serves.
+
+    Unity Catalog model services is the only listing that reports what the
+    codex Responses route will serve, so ids are ``system.ai.`` by
+    construction — unlike the Claude catalog above, which also has a legacy
+    gateway listing to merge in.
+
+    :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
+    :param token: Workspace bearer token.
+    :param transport: Optional HTTP transport used by tests.
+    :returns: Codex-servable model ids, best default first, e.g.
+        ``("system.ai.gpt-5-6-sol", "system.ai.gpt-5-5")``. An empty tuple is
+        authoritative: the listing answered and exposes no codex model.
+    :raises httpx.HTTPError: When the listing cannot be read.
+    :raises ValueError: When the listing is malformed.
+    """
+    from omnigent.model_override import is_codex_compatible_model
+
+    headers = {"Authorization": f"Bearer {token}"}
+    with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
+        model_ids = _list_model_service_ids(client, workspace_url, headers)
+    codex_ids = [model_id for model_id in model_ids if is_codex_compatible_model(model_id)]
+    return tuple(sorted(codex_ids, key=_codex_preference_rank, reverse=True))
+
+
+def _codex_preference_rank(model_id: str) -> tuple[int, int, int, int, str]:
+    """Order codex-servable ids so the best launch default sorts first.
+
+    The listing says what a workspace *can* serve, not which to start on, and a
+    name sort has no opinion either (it ranks ``kimi-k3`` over every GPT).
+    Tiers, highest first: the owned curated codex catalog in its declared
+    cheapest-safe-first order; then versioned ``gpt``/``codex`` ids, newest
+    generation first and untiered ahead of a same-generation tier; then the
+    rest by name, for determinism.
+
+    :param model_id: A servable id, e.g. ``"system.ai.gpt-5-6-sol"``.
+    :returns: A sort key; compare descending.
+    """
+    from omnigent.codex_model_vocabulary import comparable_model_id
+    from omnigent.model_fallbacks import static_model_fallback
+    from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
+
+    bare = comparable_model_id(model_id)
+    curated = static_model_fallback(SUBSCRIPTION_KIND, "codex")
+    order = [comparable_model_id(m) for m in (curated.model_ids if curated else ())]
+    if bare in order:
+        # Negated so the earliest curated entry sorts highest under reverse=True.
+        return (2, -order.index(bare), 0, 0, "")
+    match = _GPT_VERSIONED_ID_RE.match(bare)
+    if match is None:
+        return (0, 0, 0, 0, bare)
+    _family, major, minor, tier = match.groups()
+    return (1, int(major), int(minor), 0 if tier else 1, tier or "")
+
+
+def select_servable_model(requested: str, servable: Iterable[str]) -> str | None:
+    """Resolve *requested* against the ids a workspace actually serves.
+
+    Compared on the bare id, so a request naming the legacy ``databricks-``
+    spelling resolves to the ``system.ai.`` id serving that same model — only
+    the served spelling is routable.
+
+    :param requested: Model id in either vocabulary, e.g.
+        ``"databricks-gpt-5-6-luna"``.
+    :param servable: Ids the workspace serves, e.g. the result of
+        :func:`discover_databricks_codex_models`.
+    :returns: The servable id for *requested*, or ``None`` when the workspace
+        serves no such model.
+    """
+    wanted = _bare_model_id(requested)
+    for model_id in servable:
+        if _bare_model_id(model_id) == wanted:
+            return model_id
+    return None

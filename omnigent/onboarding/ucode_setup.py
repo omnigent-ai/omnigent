@@ -12,11 +12,12 @@ from omnigent.onboarding.databricks_config import normalize_workspace_url
 from omnigent.onboarding.ucode_state import read_ucode_state
 
 _UCODE_AGENT_NAMES: tuple[str, ...] = ("claude", "codex", "pi")
-# Pin to the ``main`` branch (not a SHA) so setup always tracks the latest
-# ucode. A branch ref is mutable, so uvx would otherwise serve a stale cached
-# build of an older ``main`` commit; ``--refresh-package ucode`` defeats that
-# cache and forces re-resolution of the branch HEAD on every run.
-_UCODE_GIT_REF = "main"
+# Pin ucode to a fixed commit so setup is reproducible, rather than tracking
+# ucode's ``main`` HEAD (a mutable ref that can move under us between runs and
+# break setup unexpectedly). A full SHA is immutable, so uvx caches the built
+# wheel by ref and reuses it across runs — no ``--refresh-package`` needed to
+# defeat a mutable branch's stale cache.
+_UCODE_GIT_REF = "94271a78c7139220b7333bcae91e522f95ef3af3"
 _UCODE_UVX_SOURCE = f"git+https://github.com/databricks/ucode@{_UCODE_GIT_REF}"
 
 
@@ -50,8 +51,8 @@ def build_ucode_configure_command(
     """Build the ``ucode configure`` command Omnigent runs.
 
     :param ucode_command: Command prefix that invokes ucode, e.g.
-        ``("/usr/bin/ucode",)`` or ``("uvx", "--refresh-package", "ucode",
-        "--from", "git+https://github.com/databricks/ucode@main", "ucode")``.
+        ``("/usr/bin/ucode",)`` or ``("uvx", "--from",
+        "git+https://github.com/databricks/ucode@<sha>", "ucode")``.
     :param workspace_urls: Workspace URLs to configure. Must be non-empty.
     :param agents: ucode agent names to configure non-interactively,
         e.g. ``("claude", "codex", "pi")``.
@@ -126,22 +127,22 @@ def ucode_workspace_exists(workspace_url: str) -> bool:
 def find_ucode_command() -> list[str]:
     """Return a command prefix that invokes ``ucode``.
 
-    Prefers an ephemeral ``uvx`` run pinned to ucode's ``main`` branch so
-    setup always uses the latest ucode rather than whatever (possibly stale)
-    ``ucode`` the user installed long ago. A locally-installed binary is used
-    only as a last resort when ``uvx`` is unavailable. This ordering matters:
-    an old persistently-installed ``ucode`` predates options like
+    Prefers an ephemeral ``uvx`` run pinned to a fixed ucode commit, so setup
+    uses a known-good ucode rather than whatever (possibly stale) ``ucode`` the
+    user installed long ago. A locally-installed binary is used only as a last
+    resort when ``uvx`` is unavailable. This ordering matters: an old
+    persistently-installed ``ucode`` predates options like
     ``configure --workspaces`` and would otherwise win and break setup.
 
     :returns: Command prefix, e.g.
-        ``["uvx", "--refresh-package", "ucode", "--from",
-        "git+https://github.com/databricks/ucode@main", "ucode"]`` or, when
+        ``["uvx", "--from",
+        "git+https://github.com/databricks/ucode@<sha>", "ucode"]`` or, when
         ``uvx`` is absent, ``["/usr/bin/ucode"]``.
     :raises click.ClickException: If neither ``uvx`` nor ``ucode`` is on PATH.
     """
     uvx = shutil.which("uvx")
     if uvx is not None:
-        return [uvx, "--refresh-package", "ucode", "--from", _UCODE_UVX_SOURCE, "ucode"]
+        return [uvx, "--from", _UCODE_UVX_SOURCE, "ucode"]
 
     ucode = shutil.which("ucode")
     if ucode is None:

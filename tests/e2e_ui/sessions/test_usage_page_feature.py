@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from playwright.sync_api import Page, Route, expect
 
@@ -69,3 +70,51 @@ def test_usage_page_route_and_navigation_are_available_when_feature_is_on(
     expect(page.get_by_test_id("usage-nav")).to_be_visible(timeout=30_000)
     expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible()
     expect(page.get_by_text("$0.00", exact=True)).to_be_visible()
+
+
+def test_session_table_shows_other_harnesses_badge(
+    page: Page,
+    live_server: str,
+) -> None:
+    """A session with sub-agent harnesses shows a '+N' badge."""
+    _stub_server_info(page, usage_page=True)
+    now = int(time.time())
+    report = json.dumps(
+        {
+            "cost_today": 1.50,
+            "cost_last_7d": 1.50,
+            "cost_last_30d": 1.50,
+            "total_cost_usd": 1.50,
+            "daily_costs": [],
+            "sessions": [
+                {
+                    "id": "conv_abc",
+                    "created_at": now - 3600,
+                    "updated_at": now,
+                    "title": "Multi-harness session",
+                    "cost_usd": 1.50,
+                    "models": {"claude-opus-4-8": 1.50},
+                    "harness": "claude-sdk",
+                    "other_harnesses": ["antigravity", "openai-agents"],
+                    "llm_model": "claude-opus-4-8",
+                    "agent_name": None,
+                },
+            ],
+        }
+    )
+
+    def handle_usage(route: Route) -> None:
+        route.fulfill(status=200, content_type="application/json", body=report)
+
+    page.route("**/v1/usage", handle_usage)
+    page.goto(f"{live_server}/usage")
+
+    expect(page.get_by_test_id("usage-nav")).to_be_visible(timeout=30_000)
+    expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible()
+
+    row = page.locator("table tr", has_text="Multi-harness session")
+    expect(row).to_be_visible(timeout=10_000)
+    expect(row.get_by_text("claude-sdk")).to_be_visible()
+    badge = row.get_by_text("+2")
+    expect(badge).to_be_visible()
+    expect(badge).to_have_attribute("title", "antigravity, openai-agents")

@@ -26,27 +26,33 @@ export const BUILTIN_AGENTS = new Set([
   "debby",
 ]);
 
-// Builtin ACP CLI harness ids (mirrors ACP_CLI_HARNESSES on the server). Like
-// the native harnesses, these are harness-backed picks — not composed agents —
-// so the picker groups them under "Harnesses ▸ More", beside OpenCode/Cursor.
-// User-configured ACP agents carry an `acp:<slug>` harness; a builtin ACP CLI
-// harness carries a bare id.
-export const ACP_CLI_HARNESS_IDS = new Set<string>(["grok"]);
+// Fallback only: builtin ACP CLI harness ids for servers whose harness catalog
+// doesn't report `capabilities.integration_mode`. NOT the source of truth — a
+// new builtin ACP row needs no entry here, because `useAvailableAgents` stamps
+// `acpHarness` from the server catalog (see {@link isAcpHarnessAgent}).
+const LEGACY_ACP_CLI_HARNESS_IDS = new Set<string>(["devin", "grok"]);
 
 /**
- * Whether an agent is backed by the generic ACP harness — a configured
- * `acp:<slug>` agent (e.g. Devin, Kilocode) or a builtin ACP CLI harness
- * (e.g. Grok). These belong in the picker's "Harnesses" group with the native
+ * Whether an agent is backed by the generic ACP harness — a user-configured
+ * `acp:<slug>` agent (e.g. Kilocode) or a builtin ACP CLI harness (e.g. Devin,
+ * Grok Build). These belong in the picker's "Harnesses" group with the native
  * CLIs: selecting one runs a harness, not a composed agent.
  *
- * @param agent - Agent to classify (only its `harness` is read).
+ * Prefers the server's own answer (`acpHarness`, derived from the harness
+ * catalog's `integration_mode`) so this frontend recognizes ACP harnesses it
+ * has never heard of; the `acp:` prefix and the legacy id set are the
+ * older-server fallback.
+ *
+ * @param agent - Agent to classify (only `harness` / `acpHarness` are read).
  */
 export function isAcpHarnessAgent(
-  agent: Pick<AvailableAgent, "harness"> | null | undefined,
+  agent: Pick<AvailableAgent, "harness" | "acpHarness"> | null | undefined,
 ): boolean {
-  const harness = agent?.harness;
+  if (agent == null) return false;
+  if (agent.acpHarness !== undefined) return agent.acpHarness;
+  const harness = agent.harness;
   if (harness == null) return false;
-  return harness.startsWith("acp:") || ACP_CLI_HARNESS_IDS.has(harness);
+  return harness.startsWith("acp:") || LEGACY_ACP_CLI_HARNESS_IDS.has(harness);
 }
 
 // Preferred display order for the built-in group. The server returns

@@ -2989,6 +2989,10 @@ def test_profile_gateway_resolves_databricks_default_model() -> None:
     Failure means pi falls back to its own host default — an
     Anthropic-direct id the Databricks AI gateway rejects, surfacing as a
     model error on the agent's first turn.
+
+    Live discovery is stubbed unavailable so the resolver drops to the bundled
+    catalog (its documented last resort); the discovery-first path is covered
+    by ``test_profile_gateway_uses_discovered_model``.
     """
     with (
         patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
@@ -2998,9 +3002,42 @@ def test_profile_gateway_resolves_databricks_default_model() -> None:
         ),
     ):
         executor = PiExecutor(gateway=True)
-    assert _run(executor._resolve_model(ExecutorConfig(model=None))) == (
-        "catalog-databricks-claude-default"
-    )
+    with patch(
+        "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+        side_effect=RuntimeError("live listing unavailable"),
+    ):
+        assert _run(executor._resolve_model(ExecutorConfig(model=None))) == (
+            "catalog-databricks-claude-default"
+        )
+
+
+def test_profile_gateway_uses_discovered_model() -> None:
+    """Unset model resolves to the workspace's live Claude model, not the catalog.
+
+    ``_resolve_model`` prefers the live Unity Catalog listing (via the shared
+    claude-sdk resolver, walking ``opus > sonnet > haiku > fable``) over the
+    bundled ``databricks-*`` catalog default.
+    """
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+    ):
+        executor = PiExecutor(gateway=True)
+    with (
+        patch(
+            "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+            return_value=SimpleNamespace(host="https://h.example.com", token="tok"),
+        ),
+        patch(
+            "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+            return_value=SimpleNamespace(families={"opus": "system.ai.claude-opus-5"}),
+        ),
+    ):
+        resolved = _run(executor._resolve_model(ExecutorConfig(model=None)))
+    assert resolved == "system.ai.claude-opus-5"
 
 
 def test_catalog_default_is_registered_in_models_json() -> None:
@@ -3011,6 +3048,11 @@ def test_catalog_default_is_registered_in_models_json() -> None:
         patch(
             "omnigent.inner.pi_executor._read_databrickscfg",
             return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+        # Live discovery unavailable → the bundled catalog default is used.
+        patch(
+            "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+            side_effect=RuntimeError("live listing unavailable"),
         ),
         patch(
             "omnigent.model_catalog.resolve_catalog_model",

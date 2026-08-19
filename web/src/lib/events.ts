@@ -573,8 +573,8 @@ export interface SessionAgentChangedEvent {
  * Each todo item has:
  * - `content`: the task description string
  * - `status`: `"pending"` | `"in_progress"` | `"completed"`
- * - `activeForm`: present-continuous form of the task (e.g. `"Running tests"`).
- *   Shown by the TodoPanel under in-progress items when distinct from `content`.
+ * - `activeForm`: present-continuous form of the task (e.g. `"Running tests"`),
+ *   the present-continuous label for an in-progress item when distinct from `content`.
  */
 export interface SessionTodosEvent {
   type: "session_todos";

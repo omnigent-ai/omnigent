@@ -2,6 +2,7 @@ import type * as IdentityModule from "@/lib/identity";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ChatStoreModule from "@/store/chatStore";
+import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -43,6 +44,12 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
+import {
+  controlHost,
+  getHostIdentity,
+  isElectronShell,
+  onHostStatusChanged,
+} from "@/lib/nativeBridge";
 import { writeHideUnconfiguredHarnesses } from "@/lib/harnessVisibilityPreferences";
 import { setPendingInitialPrompt } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -52,6 +59,16 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
   authenticatedFetch: vi.fn(),
+}));
+// Desktop bridge: default to the browser/jsdom world (isElectronShell → false),
+// so existing tests are unaffected; the "Run on this machine" suite opts into
+// the desktop shell by overriding these per-test.
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridgeModule>()),
+  isElectronShell: vi.fn(() => false),
+  getHostIdentity: vi.fn(async () => null),
+  onHostStatusChanged: vi.fn(() => () => {}),
+  controlHost: vi.fn(async () => ({ ok: false })),
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
@@ -868,6 +885,71 @@ function closeMenu(): void {
 function saveConfig(): void {
   fireEvent.click(screen.getByTestId("new-chat-landing-config-save"));
 }
+
+describe("Run on this machine (desktop host enrollment)", () => {
+  beforeEach(() => {
+    setupLandingMocks();
+    // No hosts connected yet → the picker offers the one-click connect.
+    mockHosts([]);
+    // Pretend we're in the desktop shell with the CLI installed, so
+    // `showConnectThisMachine` is true and the affordance renders.
+    vi.mocked(isElectronShell).mockReturnValue(true);
+    vi.mocked(getHostIdentity).mockResolvedValue({ cliInstalled: true, hostId: "this-machine" });
+    vi.mocked(onHostStatusChanged).mockReturnValue(() => {});
+    // Call history persists across tests in this file (no global clearMocks), so
+    // reset controlHost so per-test call-count assertions start from zero.
+    vi.mocked(controlHost).mockClear();
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    // Restore the browser default so these overrides don't leak into the other
+    // describe blocks (which assume no desktop shell).
+    vi.mocked(isElectronShell).mockReturnValue(false);
+  });
+
+  // Open the host chip menu and click "Run on this machine". Selecting the item
+  // arms `pendingConnectRef`; the menu closing then runs `connectThisMachine`.
+  async function clickRunOnThisMachine() {
+    const chip = await screen.findByTestId("new-chat-landing-host-chip");
+    fireEvent.pointerDown(chip, { button: 0 });
+    fireEvent.click(chip);
+    const item = await screen.findByTestId("new-chat-landing-run-on-this-machine");
+    fireEvent.click(item);
+  }
+
+  it("surfaces an auth failure (with a retry) instead of silently returning to No hosts", async () => {
+    vi.mocked(controlHost).mockResolvedValue({
+      ok: false,
+      authError: true,
+      error:
+        "Sign-in required — run `omnigent login https://app.example.com` in a terminal, then try again.",
+    });
+    renderLanding();
+    await clickRunOnThisMachine();
+
+    const err = await screen.findByTestId("new-chat-landing-connect-error");
+    expect(err.textContent).toContain("Sign-in required");
+    expect(screen.getByTestId("new-chat-landing-connect-error-retry")).toBeTruthy();
+    expect(vi.mocked(controlHost)).toHaveBeenCalledWith("start");
+  });
+
+  it("re-invokes the connect when Try again is clicked", async () => {
+    vi.mocked(controlHost).mockResolvedValue({
+      ok: false,
+      authError: true,
+      error: "Sign-in required.",
+    });
+    renderLanding();
+    await clickRunOnThisMachine();
+    await screen.findByTestId("new-chat-landing-connect-error");
+
+    // Clear the initial connect's call, then assert the retry re-invokes it.
+    vi.mocked(controlHost).mockClear();
+    fireEvent.click(screen.getByTestId("new-chat-landing-connect-error-retry"));
+    await waitFor(() => expect(vi.mocked(controlHost)).toHaveBeenCalledWith("start"));
+  });
+});
 
 describe("NewChatLandingScreen", () => {
   beforeEach(setupLandingMocks);

@@ -1,12 +1,19 @@
-"""Working indicator behavior when background shells outlive a turn.
+"""Working indicator behavior when background tasks run alongside a turn.
 
-A claude-native turn can settle to ``idle`` while background shells keep
-running. The forwarder reports that as ``external_session_status: idle``
-carrying a positive ``background_task_count``. The turn has ended, so the
-composer's ``background-task-pill`` names the shells instead of the
-"Working…" shimmer (which would misread as the agent still thinking).
+The "Working…" shimmer and the ``background-task-pill`` are independent
+surfaces, and the background-shell tally is sticky across turn boundaries
+(shells outlive the turn that launched them):
 
-Both tests drive the real status edges through the Sessions events route
+* Turn actively ``running`` with a lingering shell → BOTH show: the shimmer
+  reports the live turn and the pill counts the shell.
+* Turn genuinely ended (``idle``) with a shell still running → only the pill
+  shows; a "Working…" shimmer there would misread as the agent still thinking.
+
+(A claude-native turn-end ``waiting`` is normalized to ``idle`` server-side —
+see ``_background_task_delivery_status`` — so the client's "working + shell"
+state is the ``running`` case above, not ``waiting``.)
+
+All tests drive the real status edges through the Sessions events route
 (the same path the claude-native forwarder posts to), so they are
 deterministic — no live LLM turn, whose timing and the openai-agents
 executor's handling of a blocked mock would make the assertions flaky.
@@ -93,18 +100,54 @@ def test_background_task_indicator_label_lifecycle(
     expect(working).to_have_count(0)
 
     # 2. A new turn starts (the `running` edge a composer send produces): the
-    #    fresh turn supersedes the tally, so the pill gives way to the rotating
-    #    working shimmer (e.g. "Working…", "Cooking…"). Accept any label in the
-    #    pool — which one shows depends on the wall-clock bucket the turn lands
-    #    on.
+    #    background shell outlives the turn boundary, so the pill STAYS lit and
+    #    the rotating "Working…" shimmer lights up beside it — both surfaces at
+    #    once. Accept any label in the pool — which one shows depends on the
+    #    wall-clock bucket the turn lands on.
     _publish_status(base_url, session_id, "running")
     expect(working).to_contain_text(_WORKING_LABEL_RE, timeout=15_000)
-    expect(pill).to_have_count(0)
+    expect(pill).to_contain_text("2 background tasks")
 
     # 3. The turn ends with the background shell finished: an authoritative
-    #    Stop-hook `0` clears the tally, so the indicator goes out.
+    #    Stop-hook `0` clears the tally, so both surfaces go out.
     _publish_status(base_url, session_id, "idle", background_task_count=0)
     expect(working).to_have_count(0, timeout=15_000)
+    expect(pill).to_have_count(0)
+
+
+def test_working_shimmer_and_pill_coexist_while_running(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A ``running`` turn with a lingering shell shows the shimmer AND the pill.
+
+    Background shells outlive turn boundaries, so when a new turn goes
+    ``running`` the tally persists: the "Working…" shimmer lights for the live
+    turn and the pill keeps counting the shell. The two are independent
+    surfaces and must show side by side — the regression this guards is the
+    pill blinking off the moment the working shimmer appears.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server
+        fixture.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    working = page.locator(_WORKING)
+    pill = page.locator(_PILL)
+    page.goto(f"{base_url}/c/{session_id}")
+
+    # A prior turn ended with a background shell: idle + a positive count lights
+    # the pill (turn over, no shimmer yet).
+    _publish_status(base_url, session_id, "idle", background_task_count=2)
+    expect(pill).to_contain_text("2 background tasks", timeout=15_000)
+    expect(working).to_have_count(0)
+
+    # A new turn starts: the shell outlives the boundary, so both light up —
+    # the shimmer for the live turn, the pill for the still-running shell.
+    _publish_status(base_url, session_id, "running")
+    expect(working).to_contain_text(_WORKING_LABEL_RE, timeout=15_000)
+    expect(pill).to_contain_text("2 background tasks")
 
 
 def test_sidebar_spinner_ignores_background_tasks(

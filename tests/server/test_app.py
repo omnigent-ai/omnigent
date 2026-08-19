@@ -803,6 +803,61 @@ async def test_health_unbound_fork_of_coding_session_reads_offline(
     assert sessions[chat_fork.id]["runner_online"] is True
 
 
+@pytest.mark.asyncio
+async def test_health_unbound_imported_session_reads_offline(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """
+    An unbound imported transcript reads offline; a plain session online.
+
+    Both are unbound (no runner, no host). The ``omnigent.import.source``
+    label is the difference: an import has no live executor anywhere, so it
+    must launch a runner on a host first and reads ``runner_online: false``
+    (routing the open view to the resume picker). A plain unbound session
+    resumes in-process and stays online. Regression guard for the
+    ``imported`` branch of ``_bulk_session_liveness``.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    host_store = HostStore(db_uri)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+
+    imported = conversation_store.create_conversation()
+    conversation_store.set_labels(imported.id, {"omnigent.import.source": "claude"})
+    plain = conversation_store.create_conversation()
+
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        host_store=host_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+    )
+    ids = f"{imported.id},{plain.id}"
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get(f"/health?session_ids={ids}")
+
+    assert resp.status_code == 200
+    sessions = resp.json()["sessions"]
+    # Imported → offline (needs a host). A True here means the unbound branch
+    # ignored the import marker (the pre-fix behavior).
+    assert sessions[imported.id]["runner_online"] is False
+    # Plain unbound session → reachable in-process.
+    assert sessions[plain.id]["runner_online"] is True
+
+
 @dataclass(frozen=True)
 class _SeedStores:
     """
@@ -1043,6 +1098,55 @@ def test_ensure_default_acp_agents_seeds_installed_builtin_cli(
         assert seed_stores.agent_store.get_by_name(key) is not None, (
             f"installed builtin ACP CLI {key!r} was not seeded"
         )
+
+
+def test_ensure_default_acp_agents_configured_agent_beats_same_slug_builtin(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A configured agent whose slug is a builtin row id keeps its own command.
+
+    ``AcpAgentEntry(name="Devin")`` slugifies to ``devin``, which is also a
+    catalog row id, so both sources seed the same :func:`builtin_agent_id`. The
+    row must be skipped rather than seeded second and overwriting the user's
+    entry — while an unrelated row (``grok``) still seeds alongside.
+
+    **What breaks if this fails**: picking "Devin" in the web picker silently
+    runs the fixed row argv (account-default model) instead of the command the
+    user configured, e.g. ``devin acp --model swe-1-7-medium``.
+    """
+    import io
+    import tarfile
+
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+    from omnigent.spec import load
+
+    entry = AcpAgentEntry(slug="devin", name="Devin", command="devin acp --model swe-1-7-medium")
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [entry])
+    # Both vendor CLIs are installed, so the devin row would otherwise seed too.
+    monkeypatch.setattr(
+        "omnigent._platform.resolve_cli_binary", lambda _b, **k: "/usr/local/bin/x"
+    )
+
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    seeded = seed_stores.agent_store.get_by_name("devin")
+    assert seeded is not None
+    assert seeded.id == builtin_agent_id("devin"), "both sources key the same id"
+    assert seed_stores.agent_store.get_by_name("grok") is not None, (
+        "a non-colliding builtin row must still seed"
+    )
+
+    # Presence is not enough — assert the surviving row launches the *configured*
+    # harness, since the bug was an overwrite that kept the name and lost the spec.
+    bundle = seed_stores.artifact_store.get(seeded.bundle_location)
+    assert bundle is not None
+    dest = tmp_path / "seeded"
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tf:
+        tf.extractall(dest, filter="data")
+    assert load(dest).executor.config["harness"] == "acp:devin"
 
 
 def test_ensure_default_acp_agents_noop_when_nothing_set_up(
