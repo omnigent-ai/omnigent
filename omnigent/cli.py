@@ -10853,15 +10853,26 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
             "The Databricks CLI is required to log in to a workspace. "
             "Install it first: https://docs.databricks.com/dev-tools/cli/install.html"
         )
+    # Pass --profile so the CLI doesn't stall on its interactive profile-name
+    # prompt. The derived name reuses an existing profile for this host, else
+    # the workspace's DNS label — the same default the prompt would have shown.
+    # Token resolution stays host-keyed (see _databricks_workspace_token), so
+    # naming the cfg section here doesn't couple resolution to the name.
+    from omnigent.onboarding.setup import (
+        _derive_workspace_profile_name,
+        _existing_profile_hosts,
+    )
+
+    profile = _derive_workspace_profile_name(workspace_host, _existing_profile_hosts())
     login_host = _host_with_org(workspace_host, org_id)
     click.echo(f"Opening browser to log in to {login_host} ...")
     result = subprocess.run(
-        [databricks_bin, "auth", "login", "--host", login_host],
+        [databricks_bin, "auth", "login", "--host", login_host, "--profile", profile],
         check=False,
     )
     if result.returncode != 0:
         raise click.ClickException(
-            f"`databricks auth login --host {login_host}` failed "
+            f"`databricks auth login --host {login_host} --profile {profile}` failed "
             f"(exit {result.returncode}). If the workspace is unreachable from "
             "this machine (VPN / IP access lists), resolve that and retry."
         )

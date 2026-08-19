@@ -106,6 +106,7 @@ def _patch_login_env(
     fake_httpx: _FakeHttpx,
     sdk_installed: bool = True,
     cached_tokens: list[str | None] | None = None,
+    existing_profiles: dict[str, str] | None = None,
 ) -> list[str]:
     """Patch the login command's collaborators for a scripted run.
 
@@ -116,11 +117,20 @@ def _patch_login_env(
         results, e.g. ``[None, "tok"]`` for "no cached grant, then a
         token after ``databricks auth login`` runs". Defaults to a
         cached token on first try.
+    :param existing_profiles: ``{profile_name: host}`` the profile-name
+        derivation sees in ``~/.databrickscfg``. Defaults to empty, so the
+        derived ``--profile`` falls back to the workspace's DNS label.
     :returns: A list capturing each ``subprocess.run`` argv (the
         ``databricks auth login`` invocations).
     """
 
     monkeypatch.setattr(httpx, "get", fake_httpx.get)
+    # Derivation shells out to `databricks auth profiles` via the setup module
+    # (not cli's subprocess), so stub it here for a deterministic profile name.
+    monkeypatch.setattr(
+        "omnigent.onboarding.setup._existing_profile_hosts",
+        lambda: dict(existing_profiles or {}),
+    )
     # URL normalization has its own probe + dedicated tests; identity here
     # keeps each login test's scripted response sequence aligned with the
     # login body's own requests.
@@ -245,8 +255,10 @@ def test_login_runs_databricks_auth_login_when_no_cached_grant(
 ) -> None:
     """No cached host-keyed grant → ``databricks auth login --host <ws>`` runs.
 
-    The login is host-keyed (no ``--profile`` / profile name anywhere);
-    after it succeeds the token resolves and the record is stored.
+    ``--profile`` is passed with the derived default name (the workspace's DNS
+    label here, since no existing profile matches) so the Databricks CLI never
+    stalls on its interactive profile-name prompt. Token resolution stays
+    host-keyed, so naming the cfg section does not couple resolution to it.
     """
     from omnigent.cli_auth import load_databricks_workspace_host
 
@@ -266,11 +278,37 @@ def test_login_runs_databricks_auth_login_when_no_cached_grant(
     result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
 
     assert result.exit_code == 0, result.output
-    # Exactly one browser login, host-keyed, with no profile flag — a
-    # `--profile` here would recreate the named-profile coupling this
-    # flow exists to remove.
-    assert login_calls == [f"auth login --host {_WORKSPACE}"]
+    # Exactly one browser login, carrying the derived --profile so the CLI
+    # doesn't prompt. No existing profile matches, so the name is the DNS label.
+    assert login_calls == [f"auth login --host {_WORKSPACE} --profile example"]
     assert load_databricks_workspace_host(_APPS_URL) == _WORKSPACE
+
+
+def test_login_reuses_existing_profile_name_for_workspace(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """An existing ``~/.databrickscfg`` profile for the host is reused by name.
+
+    Rather than a fresh DNS-label profile, ``databricks auth login`` targets the
+    section the user already has for this workspace, so no duplicate is created.
+    """
+    fake = _FakeHttpx(
+        responses=[
+            _response(302, headers={"location": _APPS_REDIRECT}),
+            _response(200, body={"user_id": "alice@example.com"}),
+        ]
+    )
+    login_calls = _patch_login_env(
+        monkeypatch,
+        fake_httpx=fake,
+        cached_tokens=[None, "tok-fresh"],
+        existing_profiles={"my-ws": _WORKSPACE},
+    )
+
+    result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
+
+    assert result.exit_code == 0, result.output
+    assert login_calls == [f"auth login --host {_WORKSPACE} --profile my-ws"]
 
 
 def test_login_fails_loud_when_app_rejects_workspace_token(
@@ -354,7 +392,7 @@ def test_login_stale_cached_grant_triggers_fresh_login_and_retry(
     assert result.exit_code == 0, result.output
     # Exactly one forced re-login — a second rejection must fail loud,
     # not loop the browser flow.
-    assert login_calls == [f"auth login --host {_WORKSPACE}"]
+    assert login_calls == [f"auth login --host {_WORKSPACE} --profile example"]
     # The retry verify presented the freshly minted token, not the stale one.
     assert fake.requests[-1]["authorization"] == "Bearer tok-fresh"
     assert load_databricks_workspace_host(_APPS_URL) == _WORKSPACE
@@ -389,7 +427,7 @@ def test_foreign_subprocess_calls_stay_out_of_the_login_recorder(
     result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
 
     assert result.exit_code == 0, result.output
-    assert login_calls == [f"auth login --host {_WORKSPACE}"]
+    assert login_calls == [f"auth login --host {_WORKSPACE} --profile example"]
     # Delegated to the real runner rather than stubbed out from under it.
     assert probe.returncode == 0
     assert b"git version" in probe.stdout
@@ -478,7 +516,7 @@ def test_login_threads_org_id_through_workspace_login_and_verify(
 
     assert result.exit_code == 0, result.output
     # The browser login carries the selector so the profile is workspace-scoped.
-    assert login_calls == [f"auth login --host {_WORKSPACE}/?o={_ORG_ID}"]
+    assert login_calls == [f"auth login --host {_WORKSPACE}/?o={_ORG_ID} --profile example"]
     # The verify request routes to the workspace via ?o= (and used the token).
     assert fake.requests[-1]["params"] == {"o": _ORG_ID}
     assert fake.requests[-1]["authorization"] == "Bearer tok-fresh"
