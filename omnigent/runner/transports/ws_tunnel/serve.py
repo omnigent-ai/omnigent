@@ -53,6 +53,7 @@ from omnigent.runner.transports.ws_tunnel.limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from omnigent.suspend_watch import watch_for_resume
 from omnigent.tls import client_ssl_context
 
 _logger = logging.getLogger(__name__)
@@ -354,6 +355,15 @@ async def serve_tunnel(
         login_redirect_streak = 0
         http_auth_rejection_streak = 0
 
+    # Set by the per-connection suspend watcher (in _serve_tunnel_once) when it
+    # aborts the live tunnel after a wake from system suspend. Read at the
+    # bottom of the loop to force a prompt reconnect (skip the backoff).
+    woke_from_suspend = False
+
+    def _note_resume_from_suspend() -> None:
+        nonlocal woke_from_suspend
+        woke_from_suspend = True
+
     while True:
         if shutdown_event is not None and shutdown_event.is_set():
             # A shutdown requested between reconnect attempts (no live
@@ -380,6 +390,7 @@ async def serve_tunnel(
                 shutdown_event=shutdown_event,
                 on_graceful_shutdown=on_graceful_shutdown,
                 on_connected=_mark_connected,
+                on_resume_note=_note_resume_from_suspend,
                 direct_attach_port=direct_attach_port,
                 direct_attach_token=direct_attach_token,
                 **activity_kwargs,
@@ -491,6 +502,15 @@ async def serve_tunnel(
                         retry_reason = str(exc)
         except (ConnectionError, OSError, ValueError) as exc:
             retry_reason = str(exc)
+        if woke_from_suspend:
+            # A wake from system suspend already aborted the live tunnel (see
+            # _serve_tunnel_once's watcher). The abrupt close would otherwise
+            # ride the escalating backoff; force a prompt reconnect at the base
+            # delay, like a server recycle, so the session reattaches at once.
+            woke_from_suspend = False
+            delay_s = _INITIAL_RECONNECT_DELAY_S
+            recycle = True
+            retry_reason = "resumed from system suspend; reconnecting promptly"
         jittered = delay_s * (
             1.0 + random.uniform(-_RECONNECT_JITTER_FRACTION, _RECONNECT_JITTER_FRACTION)
         )
@@ -652,6 +672,7 @@ async def _serve_tunnel_once(
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
     on_connected: Callable[[], None] | None = None,
+    on_resume_note: Callable[[], None] | None = None,
     direct_attach_port: int | None = None,
     direct_attach_token: str | None = None,
 ) -> None:
@@ -681,6 +702,10 @@ async def _serve_tunnel_once(
     :param on_connected: Optional sync callback fired once the WS
         upgrade is accepted. ``serve_tunnel`` uses it to distinguish a
         runner that has authenticated from one that never has.
+    :param on_resume_note: Optional sync callback fired when a wake from
+        system suspend is detected on this connection (just before the dead
+        socket is aborted). ``serve_tunnel`` uses it to force a prompt
+        reconnect instead of the escalating backoff.
     :returns: None.
     """
     import websockets
@@ -742,6 +767,32 @@ async def _serve_tunnel_once(
             direct_attach_token=direct_attach_token,
         )
         _logger.info("runner %s connected to %s", runner_id, tunnel_url)
+
+        def _on_resume_from_suspend(gap_s: float) -> None:
+            # Wake from system suspend: this socket is now half-open (the server
+            # already dropped it), so abort it to make the read below raise at
+            # once instead of waiting out the ~90s keepalive timeout;
+            # serve_tunnel then reconnects promptly. Skip during a graceful
+            # idle-reaper drain — aborting mid-drain would turn the clean
+            # end-of-stream close into an abrupt runner_disconnected.
+            if shutdown_event is not None and shutdown_event.is_set():
+                return
+            _logger.info(
+                "runner %s resumed from suspend (~%.0fs); dropping tunnel to reconnect",
+                runner_id,
+                gap_s,
+            )
+            if on_resume_note is not None:
+                on_resume_note()
+            transport = getattr(ws, "transport", None)
+            if transport is not None:
+                with contextlib.suppress(Exception):
+                    transport.abort()
+
+        suspend_task = asyncio.create_task(
+            watch_for_resume(_on_resume_from_suspend),
+            name=f"runner-suspend-watch:{runner_id}",
+        )
         try:
             if shutdown_event is None:
                 async for raw in ws:
@@ -820,6 +871,9 @@ async def _serve_tunnel_once(
                     with contextlib.suppress(asyncio.CancelledError):
                         await shutdown_wait
         finally:
+            suspend_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await suspend_task
             await _cancel_dispatch_tasks(dispatch_tasks)
             await _cancel_ws_channels(ws_channels)
 

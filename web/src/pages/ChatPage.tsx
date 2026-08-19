@@ -146,6 +146,7 @@ import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRe
 import {
   type LivenessRow,
   type SessionLiveness,
+  IMPORT_SOURCE_LABEL_KEY,
   livenessRowFromSession,
   useSessionLiveness,
 } from "@/hooks/useSessionLiveness";
@@ -195,6 +196,7 @@ import {
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
+import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
@@ -1069,6 +1071,28 @@ export function ChatPage() {
     forkSourceId,
     workspace: activeSession?.workspace ?? activeConv?.workspace ?? null,
   });
+  // An unbound session (no host, no runner — e.g. an imported one) routes the
+  // offline guard to the directory picker (bind + launch a runner on a chosen
+  // machine) instead of the terminal reconnect dead-end — but only when that
+  // resume would actually work. The picker calls launch_runner, which requires
+  // the caller to OWN the session (a shared non-owner 404s), and — for imports —
+  // only harnesses that reconstruct context from the omnigent transcript carry
+  // onto a chosen host (kimi can't resume at all; kiro/qwen resume from a local
+  // file that lives on the original machine). Everything else falls through to
+  // the reconnect path rather than a picker that would fail or start blank.
+  // See unboundSessionResumableInApp. The picker itself handles the no-online-
+  // host case, so we don't gate on host availability here.
+  const importSource =
+    activeSession?.labels?.[IMPORT_SOURCE_LABEL_KEY] ??
+    activeConv?.labels?.[IMPORT_SOURCE_LABEL_KEY] ??
+    null;
+  const canResumeOnLocalHost = unboundSessionResumableInApp({
+    unbound:
+      (activeSession?.hostId ?? activeConv?.host_id ?? null) === null &&
+      (activeSession?.runnerId ?? activeConv?.runner_id ?? null) === null,
+    isOwner: isOwnerLevel(activeSession?.permissionLevel ?? activeConv?.permission_level ?? null),
+    importSource,
+  });
 
   // Author labels show only once a session is shared. A non-owner viewer
   // already implies a share; the owner needs the grant list (manage-only,
@@ -1116,6 +1140,10 @@ export function ChatPage() {
         permission_level: activeSession?.permissionLevel ?? activeConv.permission_level,
         host_resumable: activeSession?.hostResumable ?? false,
         kind: activeSession?.kind,
+        // Skip the cold-boot grace for imports (nothing is booting) so the
+        // resume picker shows at once. Snapshot labels win; sidebar row is the
+        // fallback for an off-page session.
+        imported: Boolean((activeSession?.labels ?? activeConv.labels)?.[IMPORT_SOURCE_LABEL_KEY]),
       }
     : livenessRowFromSession(activeSession);
   // Host-switch launch marker; see the store field. Keeps this surface's
@@ -1175,7 +1203,7 @@ export function ChatPage() {
     // the bind. Pin the prompt to THIS session so it replays here, never
     // into a session the user may switch to first; carry any attachments
     // so the replay sends the same payload.
-    if (urlConvId && runnerOnline === false && isUnboundFork) {
+    if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
       setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [] });
       setResumeDirDialogOpen(true);
       return;
@@ -1211,7 +1239,7 @@ export function ChatPage() {
     if (!agentId) return;
     // Slash commands aren't replayed (an edge), but still route an unbound
     // coding clone to the directory picker so it isn't a dead end.
-    if (urlConvId && runnerOnline === false && isUnboundFork) {
+    if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
       setResumeDirDialogOpen(true);
       return;
     }
@@ -1285,9 +1313,10 @@ export function ChatPage() {
       onStop={onStop}
       onShowReconnectHelp={() => {
         // Route the banner to the SAME dialog typing a message would: an
-        // unbound coding clone opens the directory picker (bind + launch),
-        // everything else gets the reconnect dialog.
-        if (isUnboundFork) setResumeDirDialogOpen(true);
+        // unbound coding clone or a host-less session the caller can resume
+        // in-app opens the directory picker (bind + launch), everything else
+        // gets the reconnect dialog.
+        if (isUnboundFork || canResumeOnLocalHost) setResumeDirDialogOpen(true);
         else setReconnectDialogOpen(true);
       }}
       agents={visibleAgents}
@@ -1348,12 +1377,19 @@ export function ChatPage() {
         sourceHostId={activeSession?.hostId}
         sourceGitBranch={activeSession?.gitBranch}
       />
-      {isUnboundFork && forkSourceId && (
+      {((isUnboundFork && forkSourceId) || canResumeOnLocalHost) && (
         <ResumeWithDirectoryDialog
           open={resumeDirDialogOpen}
           onOpenChange={setResumeDirDialogOpen}
           sessionId={urlConvId}
-          sourceSessionId={forkSourceId}
+          // Fork clone prefills from its source; a host-less session has none
+          // and prefills from its own recorded host/workspace/branch instead.
+          sourceSessionId={isUnboundFork ? forkSourceId : null}
+          prefill={{
+            hostId: activeSession?.hostId ?? null,
+            workspace: activeSession?.workspace ?? null,
+            gitBranch: activeSession?.gitBranch ?? null,
+          }}
           serverUrl={getCliServerUrl()}
           wrapper={activeConv?.labels?.["omnigent.wrapper"]}
         />
@@ -1707,6 +1743,11 @@ function MainAgentSurface({
   // staring at a fresh session during a slow MCP boot sees the startup band
   // instead of a bare "What should we work on?" empty state.
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
+  // Session publishes a task list — pins the collapsible Plan accordion above
+  // the thread. When set, the accordion (a solid bar) clears the floating
+  // header and occludes scrolled content, so the viewport drops its top fade
+  // and reserves only a small gap instead of the full header clearance.
+  const hasTasks = useChatStore((s) => s.todos.length > 0);
   // Render the inline terminal whenever the user has opted in via the
   // connection pill. The terminal surface owns its no-terminal state,
   // including stopped/resumable sessions, and the connection indicator
@@ -1991,6 +2032,13 @@ function MainAgentSurface({
       {terminalSurfaces}
       {!showTerminal && (
         <>
+          {/* Task tracker pinned above the thread. Sibling of the viewport (not
+          an overlay) so it shrinks the scroll area rather than covering
+          messages. mt clears the floating header (h-14 mobile / h-12 desktop).
+          Self-hides with no tasks. ponytail: header offset is the web height;
+          native shells (data-ios/android) size their header via CSS vars — not
+          tuned here. */}
+          <ChatPlanAccordion className="mt-14 md:mt-12" />
           {/* Wrapper div gives us a ref to scope the SelectionPopup to the
           conversation area without requiring Conversation to forward refs. */}
           <div
@@ -1999,8 +2047,10 @@ function MainAgentSurface({
           >
             {/* chat-scroll-fade masks the viewport's top edge so scrolling
             content dissolves into the canvas before reaching the
-            ChatHeader overlay's controls (geometry in index.css). */}
-            <Conversation className="chat-scroll-fade flex-1">
+            ChatHeader overlay's controls (geometry in index.css). Dropped
+            when the Plan accordion is pinned above — its solid bar already
+            occludes content scrolling past the viewport's top edge. */}
+            <Conversation className={cn(!hasTasks && "chat-scroll-fade", "flex-1")}>
               {/* Override ConversationContent's default spacing so the thread keeps
               16px side gutters and consecutive agent turns read as one thread.
               The left inset grows *continuously* as the conversation area
@@ -2019,7 +2069,11 @@ function MainAgentSurface({
               <ConversationContent
                 scrollClassName="transcript-hide-native-scrollbar"
                 className={cn(
-                  "chat-conversation-content mx-auto w-full gap-4 px-4 pt-20 pb-6",
+                  "chat-conversation-content mx-auto w-full gap-4 px-4 pb-6",
+                  // pt-20 reserves the floating-header clearance + fade band.
+                  // With the Plan accordion pinned above, the header is already
+                  // cleared, so only a small gap below the accordion is needed.
+                  hasTasks ? "pt-4" : "pt-20",
                   "md:pl-[clamp(1rem,(54rem-100cqi)*0.5+1rem,1.5rem)]",
                   CHAT_COLUMN_WIDTH,
                 )}
@@ -2115,7 +2169,12 @@ function MainAgentSurface({
                 Always mounted — including for an empty new conversation — so
                 a fast first send cannot become the captured initial anchor.
                 Last child so it measures everything above it. */}
-                <LatestTurnSpacer scrollElement={scroller?.el ?? null} />
+                <LatestTurnSpacer
+                  scrollElement={scroller?.el ?? null}
+                  // Match the reduced pt-4 top inset so a framed turn rests just
+                  // below the Plan accordion, not under the (now absent) fade band.
+                  topGapPx={hasTasks ? 16 : undefined}
+                />
               </ConversationContent>
               <ConversationScrollButton />
               <UserMessageNavConnected
@@ -2128,8 +2187,10 @@ function MainAgentSurface({
             </Conversation>
             {/* Constant-height scrollbar. Sibling of Conversation for the same
             reason as JumpToTopButton — outside the chat-scroll-fade mask, which
-            would otherwise dissolve it against the header. */}
-            <TranscriptScrollbar scroller={scroller} />
+            would otherwise dissolve it against the header. With the Plan
+            accordion pinned above, this container already starts below the
+            header, so the track drops its header-clearing top inset. */}
+            <TranscriptScrollbar scroller={scroller} topInset={hasTasks ? 12 : undefined} />
             {/* Hover the top edge to reveal a pill that loads all older history and
             scrolls to the first message. Rendered here (a wrapper sibling of
             Conversation) rather than inside it so it escapes the chat-scroll-fade
@@ -2554,8 +2615,14 @@ const MAX_RESERVED_VIEWPORT_FRACTION = 1 / 3;
  */
 export function LatestTurnSpacer({
   scrollElement,
+  // Gap left above the pinned anchor. Defaults to clearing the top fade band;
+  // with the Plan accordion pinned above (fade dropped, container already below
+  // the header), the caller passes the small content inset so a framed turn
+  // rests just below the accordion instead of 80px lower.
+  topGapPx = PINNED_ANCHOR_TOP_GAP_PX,
 }: {
   scrollElement?: HTMLElement | null;
+  topGapPx?: number;
 } = {}) {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef: React.RefObject<HTMLElement>;
@@ -2621,14 +2688,11 @@ export function LatestTurnSpacer({
     const viewport = scrollEl.clientHeight;
     const next = Math.max(
       0,
-      Math.min(
-        viewport - anchorToEnd - PINNED_ANCHOR_TOP_GAP_PX,
-        viewport * MAX_RESERVED_VIEWPORT_FRACTION,
-      ),
+      Math.min(viewport - anchorToEnd - topGapPx, viewport * MAX_RESERVED_VIEWPORT_FRACTION),
     );
     const current = Number.parseFloat(spacerEl.style.height) || 0;
     if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
-  }, [ctx.scrollRef, scrollElement]);
+  }, [ctx.scrollRef, scrollElement, topGapPx]);
 
   useLayoutEffect(() => {
     measure();
@@ -5906,6 +5970,35 @@ export function isUnboundCodingFork(params: {
   workspace: string | null | undefined;
 }): boolean {
   return params.forkSourceId !== null && !params.workspace;
+}
+
+// Import sources whose resume reconstructs conversation context from the
+// omnigent-stored transcript, so it carries onto any chosen host. Kimi has no
+// resume path (blank context regardless of host); kiro/qwen resume only from a
+// local recording file that exists on the original machine, so a different host
+// starts blank. The in-app resume picker is restricted to this portable set.
+const HOST_PORTABLE_IMPORT_SOURCES = new Set(["claude", "codex", "pi", "opencode"]);
+
+/**
+ * Whether an unbound session may be resumed in-app via the "Resume on a machine"
+ * picker. The picker calls `launch_runner`, which requires the caller to OWN the
+ * session, and — for imported sessions — only reconstructs context for
+ * host-portable harnesses. Non-owners (who would 404) and kimi/kiro/qwen imports
+ * (which would launch with no context) are excluded so they route to the
+ * terminal reconnect path instead of a picker that fails or starts blank.
+ *
+ * @param unbound - Session has no host and no runner.
+ * @param isOwner - Caller holds owner level on the session.
+ * @param importSource - `omnigent.import.source` label, or null for non-imports
+ *   (e.g. an unbound fork, which is host-portable and owned by its creator).
+ */
+export function unboundSessionResumableInApp(params: {
+  unbound: boolean;
+  isOwner: boolean;
+  importSource: string | null | undefined;
+}): boolean {
+  if (!params.unbound || !params.isOwner) return false;
+  return params.importSource == null || HOST_PORTABLE_IMPORT_SOURCES.has(params.importSource);
 }
 
 const EFFORT_LEVELS = ["low", "medium", "high"] as const;

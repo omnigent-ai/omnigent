@@ -1826,6 +1826,46 @@ def test_ensure_backend_databricks_preflight_skips_when_authenticated(
     assert result == "https://myapp-1234.aws.databricksapps.com"
 
 
+def test_databricks_preflight_silent_sdk_refresh_skips_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh SDK token recovers an expired Databricks Apps session silently."""
+    import httpx
+
+    responses = iter([_databricks_probe_response(302), _databricks_probe_response(200)])
+    requests: list[dict[str, object]] = []
+    stored: list[tuple[str, str, str | None]] = []
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer expired"},
+    )
+
+    def _get(url: str, **kwargs: object) -> object:
+        requests.append(kwargs)
+        return next(responses)
+
+    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(cli, "_databricks_workspace_token", lambda workspace: "fresh-token")
+    monkeypatch.setattr(cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("login"))
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: "123")
+
+    def _store(
+        server: str,
+        workspace: str,
+        user_id: str | None = None,
+        org_id: str | None = None,
+    ) -> None:
+        stored.append((server, workspace, org_id))
+
+    monkeypatch.setattr("omnigent.cli_auth.store_databricks_auth", _store)
+
+    cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert requests[1]["headers"] == {"Authorization": "Bearer fresh-token"}
+    assert requests[1]["params"] == {"o": "123"}
+    assert stored == [(_HOST_DATABRICKS_SERVER, "https://example.databricks.com", "123")]
+
+
 # ── Foreground ``host`` auth pre-flight ─────────────────────────────
 #
 # ``host`` runs the same Databricks sign-in pre-flight ``run`` does before

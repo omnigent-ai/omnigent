@@ -45,6 +45,9 @@ spec:
     # them out of band (kubectl edit, sealed-secrets, external-secrets), and
     # selfHeal must not revert those edits. Without this, selfHeal
     # continuously overwrites live credentials with the placeholder.
+    #
+    # The pointer targets /data, not /stringData, because ArgoCD normalizes
+    # stringData into base64 /data on the live object before diffing.
     - group: ""
       kind: Secret
       name: omnigent-secrets
