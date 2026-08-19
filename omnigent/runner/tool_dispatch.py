@@ -1957,9 +1957,11 @@ async def _execute_subagent_tool(
                 harness=child_harness,
             )
 
-        # Retry loop for auto-ordinal names: a 409 means another runner
-        # (or a restart race) already created a child with this ordinal.
-        # Bump the ordinal and retry with a fresh name.
+        # Best-effort retry for auto-ordinal name collisions: a 409 means
+        # another runner (or a restart race) already created a child with
+        # this ordinal. Bump and retry. Not watertight — the server's
+        # (parent, title) check is SELECT-then-INSERT with no DB unique
+        # constraint, so truly concurrent creates can still race past it.
         _max_ordinal_retries = 5 if _auto_ordinal else 0
         for _ordinal_attempt in range(_max_ordinal_retries + 1):
             resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)

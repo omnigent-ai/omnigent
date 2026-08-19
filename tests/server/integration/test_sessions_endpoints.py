@@ -8671,3 +8671,33 @@ async def test_message_forward_rejection_surfaces_failed_with_reason(
         assert "harness_spawn_failed" in last_error["message"], last_error
     finally:
         await fake_runner.aclose()
+
+
+async def test_create_child_session_duplicate_title_returns_409(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /v1/sessions returns 409 when a child with the same title already exists."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+
+    resp1 = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "title": "researcher:researcher-1",
+        },
+    )
+    assert resp1.status_code == 201, resp1.text
+
+    resp2 = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "title": "researcher:researcher-1",
+        },
+    )
+    assert resp2.status_code == 409, (
+        f"expected 409 on duplicate child title, got {resp2.status_code}: {resp2.text}"
+    )
