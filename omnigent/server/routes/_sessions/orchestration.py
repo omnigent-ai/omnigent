@@ -8298,6 +8298,15 @@ def _create_session_from_bundle(
     )
     assert spec.name is not None
 
+    if metadata.reasoning_effort is None:
+        # Request metadata is a per-session override; otherwise inherit the
+        # validated bundle default before artifact and session persistence.
+        _, reasoning_effort = validate_session_model_metadata(
+            model_override=None,
+            reasoning_effort=spec.llm.extra.get("reasoning_effort") if spec.llm else None,
+        )
+        metadata = metadata.model_copy(update={"reasoning_effort": reasoning_effort})
+
     agent_id = generate_agent_id()
     agent_bundle_location = bundle_location(agent_id, bundle_bytes)
     try:
