@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.conftest import _server_state, seed_committed_turn
@@ -175,9 +176,11 @@ def test_persisted_failure_expands_retries_and_dismisses_locally(
     expect(pill).to_have_count(0)
 
 
+@pytest.mark.parametrize("viewport_width", [1440, 2400])
 def test_error_row_divider_spans_the_chat_column(
     page: Page,
     seeded_session: tuple[str, str],
+    viewport_width: int,
 ) -> None:
     """The banner's dashed rule spans the full chat column, not just the pill.
 
@@ -185,12 +188,16 @@ def test_error_row_divider_spans_the_chat_column(
     defaults to ``w-fit``, so an error-only bubble once clipped the rule to
     the 560px pill (~592px) instead of the column. Widths are compared
     against a long-text assistant turn measured in the same viewport — no
-    hardcoded pixel values. The viewport is set wide so the column reaches
-    its ``max-w-3xl`` cap: at the default 1280px the side panels squeeze the
-    column below the pill's width, which masks the shrink-wrap.
+    hardcoded pixel values. Runs at two widths since the column is
+    responsive below its ``max-w-3xl`` cap: 2400px lets the column reach
+    the cap (where the shrink-wrap shows — the pill fits inside it), while
+    1440px squeezes the column below the pill's width (``max-w-full`` caps
+    the pill either way) and locks the invariant against a wrapper that
+    narrows the row below the column.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :param viewport_width: Browser width in CSS pixels for this run.
     :returns: None.
     """
     base_url, session_id = seeded_session
@@ -209,7 +216,7 @@ def test_error_row_divider_spans_the_chat_column(
         message="Required terminal exited unexpectedly; the runtime is no longer available.",
     )
 
-    page.set_viewport_size({"width": 1920, "height": 1080})
+    page.set_viewport_size({"width": viewport_width, "height": 1080})
     page.goto(f"{base_url}/c/{session_id}")
     pill = page.get_by_test_id("error-pill")
     expect(pill).to_be_visible(timeout=15_000)
