@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES, AcpCliHarness
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES, HERMES_MIN_VERSION, AcpCliHarness
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_install_spec import HarnessInstallSpec
 from omnigent.harness_plugins import (
@@ -33,7 +33,7 @@ from omnigent.harness_plugins import (
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.onboarding.harness_install import ui_setup_steps
 from omnigent.runtime.workflow import _build_acp_cli_spawn_env
-from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ExecutorSpec, LLMConfig
 
 _FAKE_ROW = AcpCliHarness(
     install=HarnessInstallSpec(
@@ -53,6 +53,8 @@ def _spec(
     os_env: OSEnvSpec | None = None,
     *,
     permission_mode: str | None = None,
+    model: str | None = None,
+    skills_filter: str | list[str] = "all",
 ) -> AgentSpec:
     config: dict[str, object] = {"harness": harness}
     if permission_mode is not None:
@@ -61,7 +63,9 @@ def _spec(
         spec_version=1,
         name=f"test-{harness}",
         instructions="Test agent.",
-        executor=ExecutorSpec(type="omnigent", config=config),
+        executor=ExecutorSpec(type="omnigent", config=config, model=model),
+        llm=LLMConfig(model=model) if model is not None else None,
+        skills_filter=skills_filter,
         os_env=os_env,
     )
 
@@ -133,10 +137,213 @@ def test_runner_dispatch_routes_catalog_rows(monkeypatch: pytest.MonkeyPatch) ->
     assert shlex.split(env["HARNESS_ACP_COMMAND"])[-2:] == ["agent", "stdio"]
 
 
+def test_runner_dispatch_passes_session_context_to_hermes_acp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent.runner.app import _build_spawn_env_from_spec
+
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://server.example")
+    monkeypatch.setattr(
+        "omnigent.hermes_native_bridge.bridge_dir_for_session_id",
+        lambda session_id: bridge_dir if session_id == "conv_runner" else None,
+    )
+    monkeypatch.setattr(
+        "omnigent.hermes_native_bridge.write_policy_hook_config",
+        lambda path, _server_url, _session_id, **_kwargs: path / "home",
+    )
+
+    env = _build_spawn_env_from_spec(
+        _spec("hermes-acp"),
+        "hermes-acp",
+        session_id="conv_runner",
+    )
+
+    assert env is not None
+    assert env["HERMES_HOME"] == str(bridge_dir / "home")
+
+
 def test_fake_row_login_command() -> None:
     assert _FAKE_ROW.login_command == "fakecli login --device"
     assert _FAKE_ROW.label == "Fake CLI"
     assert _FAKE_ROW.binary == "fakecli"
+
+
+def test_hermes_acp_is_a_catalog_row_without_replacing_batch_hermes() -> None:
+    row = ACP_CLI_HARNESSES["hermes-acp"]
+
+    assert row.args == ("acp", "--accept-hooks")
+    assert row.binary == "hermes"
+    assert HERMES_MIN_VERSION == "0.19.1"
+    assert row.install.min_version == HERMES_MIN_VERSION
+    assert row.policy_hook_authoritative is True
+    assert harness_modules()["hermes-acp"] == "omnigent.inner.acp_harness"
+    assert harness_modules()["hermes"] == "omnigent.inner.hermes_harness"
+
+
+def test_hermes_acp_spawn_env_prepares_policy_home_and_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[Path, str, str, str | None, bool]] = []
+    bridge_dir = tmp_path / "bridge"
+    hermes_home = bridge_dir / "hermes_home"
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://server.example")
+    monkeypatch.setenv("OMNIGENT_HERMES_MANAGED_DIR", "/etc/omnigent/hermes-managed")
+    monkeypatch.setattr(
+        "omnigent.hermes_native_bridge.bridge_dir_for_session_id",
+        lambda session_id: bridge_dir,
+    )
+
+    def _write_policy_hook_config(
+        path: Path,
+        server_url: str,
+        session_id: str,
+        *,
+        model: str | None = None,
+        include_omnigent_mcp: bool = True,
+    ) -> Path:
+        calls.append((path, server_url, session_id, model, include_omnigent_mcp))
+        return hermes_home
+
+    monkeypatch.setattr(
+        "omnigent.hermes_native_bridge.write_policy_hook_config",
+        _write_policy_hook_config,
+    )
+
+    env = _build_acp_cli_spawn_env(
+        _spec(
+            "hermes-acp",
+            os_env=OSEnvSpec(),
+            model="hermes-model",
+        ),
+        harness="hermes-acp",
+        session_id="conv_123",
+    )
+
+    assert calls == [(bridge_dir, "https://server.example", "conv_123", "hermes-model", False)]
+    assert env["HERMES_HOME"] == str(hermes_home)
+    assert env["HERMES_MANAGED_DIR"] == "/etc/omnigent/hermes-managed"
+    assert env["HERMES_ACP_SKIP_CONFIGURED_MCP"] == "1"
+    assert env["HARNESS_ACP_POLICY_HOOK_AUTHORITATIVE"] == "1"
+    assert "HARNESS_ACP_SESSION_NEW_EXTRAS" not in env
+    sandbox = json.loads(env["HARNESS_ACP_OS_ENV"])["sandbox"]
+    assert sandbox["type"] == OSEnvSandboxSpec().type
+    assert set(sandbox["env_passthrough"]) >= {
+        "HERMES_HOME",
+        "HERMES_MANAGED_DIR",
+        "HERMES_ACP_SKIP_CONFIGURED_MCP",
+        "_OMNIGENT_SERVER_URL",
+        "_OMNIGENT_SESSION_ID",
+    }
+
+
+def test_hermes_managed_dir_reaches_the_filtered_acp_child(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The managed wrapper carries the policy context into the ACP child."""
+    from omnigent.inner.acp_harness import _build_acp_executor
+
+    monkeypatch.setenv("OMNIGENT_HERMES_MANAGED_DIR", "/etc/omnigent/hermes-managed")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://server.example")
+    monkeypatch.setattr(
+        "omnigent.hermes_native_bridge.bridge_dir_for_session_id",
+        lambda _session_id: tmp_path / "bridge",
+    )
+    monkeypatch.setattr(
+        "omnigent.hermes_native_bridge.write_policy_hook_config",
+        lambda bridge_dir, _server_url, _session_id, **_kwargs: bridge_dir / "home",
+    )
+
+    wrapper_env = _build_acp_cli_spawn_env(
+        _spec("hermes-acp"),
+        harness="hermes-acp",
+        session_id="conv_managed",
+    )
+    for name, value in wrapper_env.items():
+        monkeypatch.setenv(name, value)
+
+    child_env = _build_acp_executor()._build_spawn_env()
+
+    assert child_env["_OMNIGENT_SERVER_URL"] == "https://server.example"
+    assert child_env["_OMNIGENT_SESSION_ID"] == "conv_managed"
+    assert child_env["HERMES_ACP_SKIP_CONFIGURED_MCP"] == "1"
+
+
+@pytest.mark.parametrize("model", ["databricks-hermes", "databricks/hermes"])
+def test_hermes_acp_does_not_write_gateway_model_into_vendor_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    model: str,
+) -> None:
+    captured: list[str | None] = []
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://server.example")
+    monkeypatch.setattr(
+        "omnigent.hermes_native_bridge.bridge_dir_for_session_id",
+        lambda _session_id: tmp_path / "bridge",
+    )
+
+    def _write(
+        bridge_dir: Path,
+        _server_url: str,
+        _session_id: str,
+        *,
+        model: str | None = None,
+        include_omnigent_mcp: bool = True,
+    ) -> Path:
+        assert include_omnigent_mcp is False
+        captured.append(model)
+        return bridge_dir / "home"
+
+    monkeypatch.setattr("omnigent.hermes_native_bridge.write_policy_hook_config", _write)
+
+    _build_acp_cli_spawn_env(
+        _spec("hermes-acp", model=model),
+        harness="hermes-acp",
+        session_id="conv_gateway_model",
+    )
+
+    assert captured == [None]
+
+
+@pytest.mark.parametrize("skills_filter", [["safe-skill"], []])
+def test_hermes_acp_rejects_restrictive_skill_filter_before_writing_home(
+    monkeypatch: pytest.MonkeyPatch,
+    skills_filter: list[str],
+) -> None:
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://server.example")
+    called = False
+
+    def _unexpected_write(*_args: object, **_kwargs: object) -> Path:
+        nonlocal called
+        called = True
+        return Path("/unused")
+
+    monkeypatch.setattr(
+        "omnigent.hermes_native_bridge.write_policy_hook_config",
+        _unexpected_write,
+    )
+
+    with pytest.raises(RuntimeError, match="does not support restrictive skills_filter"):
+        _build_acp_cli_spawn_env(
+            _spec("hermes-acp", skills_filter=skills_filter),
+            harness="hermes-acp",
+            session_id="conv_123",
+        )
+
+    assert called is False
+
+
+def test_hermes_acp_spawn_env_requires_session_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RUNNER_SERVER_URL", raising=False)
+
+    with pytest.raises(RuntimeError, match="session id and RUNNER_SERVER_URL"):
+        _build_acp_cli_spawn_env(_spec("hermes-acp"), harness="hermes-acp")
 
 
 # ---------------------------------------------------------------------------
@@ -188,10 +395,28 @@ def test_catalog_row_is_fully_registered(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", sorted(ACP_CLI_HARNESSES))
-def test_catalog_row_spawn_env_builds(name: str) -> None:
+def test_catalog_row_spawn_env_builds(
+    name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     """The shared builder produces a launchable command for every real row."""
     row = ACP_CLI_HARNESSES[name]
-    env = _build_acp_cli_spawn_env(_spec(name), harness=name)
+    if name == "hermes-acp":
+        monkeypatch.setenv("RUNNER_SERVER_URL", "https://server.example")
+        monkeypatch.setattr(
+            "omnigent.hermes_native_bridge.bridge_dir_for_session_id",
+            lambda _session_id: tmp_path / "bridge",
+        )
+        monkeypatch.setattr(
+            "omnigent.hermes_native_bridge.write_policy_hook_config",
+            lambda bridge_dir, _server_url, _session_id, **_kwargs: bridge_dir / "home",
+        )
+    env = _build_acp_cli_spawn_env(
+        _spec(name),
+        harness=name,
+        session_id="conv_catalog",
+    )
     argv = shlex.split(env["HARNESS_ACP_COMMAND"])
     assert argv[0], "argv[0] must resolve to a non-empty binary"
     if row.args:
