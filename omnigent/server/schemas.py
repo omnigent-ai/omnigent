@@ -2055,6 +2055,9 @@ class SessionResponse(BaseModel):
     model_override: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
+    # Stored as a server-owned label to avoid widening the conversation row for
+    # a routing preference.  False is the safe compatibility default.
+    databricks_kimi_routing_enabled: bool = False
     context_window: int | None = None
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
@@ -2196,6 +2199,7 @@ class UpdateSessionRequest(BaseModel):
     permission_mode: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
+    databricks_kimi_routing_enabled: bool | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None

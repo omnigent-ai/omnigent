@@ -167,6 +167,7 @@ interface SessionResponseWire {
   cost_control_mode_override?: "on" | "off" | null;
   /** Sub-agent routing switch; `null`/absent reads the same as `"off"` (Default). */
   subagent_routing_override?: "on" | "off" | null;
+  databricks_kimi_routing_enabled?: boolean;
   context_window?: number | null;
   last_total_tokens?: number | null;
   total_cost_usd?: number | null;
@@ -329,6 +330,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     modelOverride: wire.model_override,
     costControlModeOverride: wire.cost_control_mode_override,
     subagentRoutingOverride: wire.subagent_routing_override,
+    databricksKimiRoutingEnabled: wire.databricks_kimi_routing_enabled ?? false,
     contextWindow: wire.context_window,
     lastTotalTokens: wire.last_total_tokens,
     totalCostUsd: wire.total_cost_usd,
@@ -795,6 +797,7 @@ export async function updateSession(
     claudePermissionMode?: string;
     costControlModeOverride?: "on" | "off" | null;
     subagentRoutingOverride?: "on" | "off" | null;
+    databricksKimiRoutingEnabled?: boolean;
     runnerId?: string;
     silent?: boolean;
     labels?: Record<string, string>;
@@ -818,6 +821,9 @@ export async function updateSession(
   }
   if ("subagentRoutingOverride" in updates) {
     body.subagent_routing_override = updates.subagentRoutingOverride ?? null;
+  }
+  if ("databricksKimiRoutingEnabled" in updates) {
+    body.databricks_kimi_routing_enabled = updates.databricksKimiRoutingEnabled ?? false;
   }
   if (updates.runnerId !== undefined) {
     body.runner_id = updates.runnerId;

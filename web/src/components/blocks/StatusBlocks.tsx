@@ -31,6 +31,7 @@ import { shortModelName } from "@/components/CostRoutingControl";
 import { copyText } from "@/lib/clipboard";
 import {
   type RoutingDecisionExtras,
+  codexSubscriptionRouteLabel,
   harnessDisplayLabel,
   subagentScopeLabel,
 } from "@/lib/routingDecision";
@@ -611,8 +612,21 @@ export function RoutingDecisionCard({
   agent,
   routing,
 }: RoutingDecisionCardProps) {
-  const { harness, scope, decisionId, rawModel, attemptedOverride, routerSource } = routing ?? {};
+  const {
+    harness,
+    scope,
+    decisionId,
+    rawModel,
+    attemptedOverride,
+    routerSource,
+    reasoningEffort,
+    displayLabel,
+  } = routing ?? {};
   const short = shortModelName(model);
+  // New cards carry the server's canonical label. Older cards keep a safe,
+  // deterministic local fallback while their stored fields remain sufficient.
+  const routeLabel =
+    displayLabel ?? codexSubscriptionRouteLabel(model, routerSource, reasoningEffort);
   const rawShort = rawPickName(model, rawModel);
   const attemptedShort = attemptedPickName(model, attemptedOverride);
   const scopeLabel = subagentScopeLabel(scope, agent);
@@ -632,6 +646,7 @@ export function RoutingDecisionCard({
           ...(rawModel ? { raw_model: rawModel } : {}),
           ...(attemptedOverride ? { attempted_override: attemptedOverride } : {}),
           ...(routerSource ? { router_source: routerSource } : {}),
+          ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
         },
         null,
         2,
@@ -647,6 +662,7 @@ export function RoutingDecisionCard({
       rawModel,
       attemptedOverride,
       routerSource,
+      reasoningEffort,
     ],
   );
   return (
@@ -724,7 +740,7 @@ export function RoutingDecisionCard({
             !rawShort && !attemptedShort && "ml-auto",
           )}
         >
-          {short}
+          {routeLabel ?? short}
         </span>
       </div>
       {rationale.length > 0 && (

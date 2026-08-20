@@ -333,6 +333,7 @@ class SubagentRouteRequest:
     fork: bool = False
     parent_model: str | None = None
     requested_model: str | None = None
+    requested_effort: str | None = None
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> SubagentRouteRequest:
@@ -349,6 +350,7 @@ class SubagentRouteRequest:
         prompt = payload.get("prompt")
         parent_model = payload.get("parent_model")
         requested_model = payload.get("requested_model")
+        requested_effort = payload.get("requested_effort")
         return cls(
             harness=harness.strip(),
             task_name=task_name[:_TASK_NAME_CAP] if isinstance(task_name, str) else "",
@@ -357,6 +359,11 @@ class SubagentRouteRequest:
             parent_model=parent_model if isinstance(parent_model, str) and parent_model else None,
             requested_model=(
                 requested_model if isinstance(requested_model, str) and requested_model else None
+            ),
+            requested_effort=(
+                requested_effort
+                if isinstance(requested_effort, str) and requested_effort
+                else None
             ),
         )
 
@@ -393,6 +400,7 @@ class SubagentRouteDecision:
     raw_model: str | None = None
     decision_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     router_source: str | None = None
+    reasoning_effort: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         """Serialize to the frozen response shape.
@@ -407,6 +415,7 @@ class SubagentRouteDecision:
             "rationale": self.rationale,
             "decision_id": self.decision_id,
             "router_source": self.router_source,
+            "reasoning_effort": self.reasoning_effort,
         }
 
     @classmethod
@@ -429,6 +438,7 @@ class SubagentRouteDecision:
             raw_model=_opt_str(payload.get("raw_model")),
             decision_id=decision_id if isinstance(decision_id, str) else str(uuid.uuid4()),
             router_source=_opt_str(payload.get("router_source")),
+            reasoning_effort=_opt_str(payload.get("reasoning_effort")),
         )
 
 
@@ -451,6 +461,8 @@ def decision_record(
     # recording; an ask it happened to match is just the model, and stays out
     # of the field.
     attempted = None if _requested_match(req, model) else req.requested_model
+    from omnigent.server.smart_routing import codex_subscription_display_label
+
     return RoutingDecisionData(
         model=model,
         applied=decision.action in ("rewrite", "redirect"),
@@ -462,6 +474,10 @@ def decision_record(
         scope=_SCOPE,
         attempted_override=attempted,
         router_source=decision.router_source,
+        reasoning_effort=decision.reasoning_effort,
+        display_label=codex_subscription_display_label(
+            model, decision.router_source, decision.reasoning_effort
+        ),
     )
 
 
@@ -852,6 +868,11 @@ def _decision_from_result(
 ) -> SubagentRouteDecision:
     model = result.model
     rationale = getattr(result, "rationale", "") or ""
+    effort = (
+        None
+        if req.requested_effort is not None
+        else _opt_str(getattr(result, "reasoning_effort", None))
+    )
     # Only report a raw pick that actually differs from the resolved model, so
     # the raw_model field means "the router asked for something else". A
     # prefix-only spelling difference is the same arm, not a substitution.
@@ -887,12 +908,14 @@ def _decision_from_result(
                 rationale=(rationale or "Router kept the parent model") + note,
                 model=model,
                 raw_model=raw_model,
+                reasoning_effort=effort,
             )
         return SubagentRouteDecision(
             action="rewrite",
             rationale=(rationale or f"Router selected {model}") + note,
             model=model,
             raw_model=raw_model,
+            reasoning_effort=effort,
         )
     return SubagentRouteDecision(
         action="redirect",
@@ -900,6 +923,7 @@ def _decision_from_result(
         model=model,
         harness=target,
         raw_model=raw_model,
+        reasoning_effort=effort,
     )
 
 

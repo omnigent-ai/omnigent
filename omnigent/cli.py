@@ -369,6 +369,28 @@ def _build_local_llm_routing_client(
     return LLMRoutingClient(policy_client)
 
 
+def _build_codex_subscription_routing_client() -> Any | None:  # type: ignore[explicit-any]
+    """Build local deterministic routing when Codex owns the OpenAI default."""
+    from omnigent.onboarding.provider_config import (
+        OPENAI_FAMILY,
+        SUBSCRIPTION_KIND,
+        get_default_provider,
+    )
+    from omnigent.onboarding.provider_config import (
+        load_config as load_provider_config,
+    )
+
+    try:
+        provider = get_default_provider(load_provider_config(), OPENAI_FAMILY)
+    except Exception:  # noqa: BLE001 — malformed setup leaves routing unavailable
+        return None
+    if provider is None or provider.kind != SUBSCRIPTION_KIND or provider.cli != "codex":
+        return None
+    from omnigent.server.smart_routing import CodexSubscriptionRoutingClient
+
+    return CodexSubscriptionRoutingClient()
+
+
 def _build_routing_backends(
     cfg: Any,  # type: ignore[explicit-any]  # parsed server config
     server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
@@ -402,11 +424,22 @@ def _build_routing_backends(
     if provider == "none":
         return RoutingBackends()
     external: Any = None  # type: ignore[explicit-any]
+    local = _build_local_llm_routing_client(server_llm)
+    if provider == "codex-subscription":
+        subscription_router = _build_codex_subscription_routing_client()
+        if subscription_router is None:
+            click.echo(
+                "routing.provider=codex-subscription requires Codex to be the configured "
+                "subscription default; retaining the local judge",
+                err=True,
+            )
+        else:
+            local = subscription_router
     if provider == "external":
         external = _build_external_routing_client(routing_cfg, settings, cfg)
     elif not isinstance(routing_cfg, dict):
         external = _build_default_databricks_routing_client(cfg, settings)
-    return RoutingBackends(external=external, local=_build_local_llm_routing_client(server_llm))
+    return RoutingBackends(external=external, local=local)
 
 
 def _server_uvicorn_log_config(

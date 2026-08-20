@@ -26,6 +26,7 @@ from omnigent.server.routing_backend import (
     select_router,
     usable_external,
 )
+from omnigent.server.smart_routing import RoutingResult
 
 _HOST_ID = "aabbccddeeff00112233445566778899"
 
@@ -321,6 +322,7 @@ class _Recording:
         self.error = error
         self.last_error = last_error
         self.calls = 0
+        self.available: dict[str, list[str]] | None = None
 
     async def route(
         self,
@@ -329,6 +331,7 @@ class _Recording:
     ) -> Any:  # type: ignore[explicit-any]  # a RoutingResult stand-in
         """Record the call and answer with the canned verdict (or raise)."""
         self.calls += 1
+        self.available = _available
         if self.error is not None:
             raise self.error
         return self.result
@@ -399,3 +402,41 @@ async def test_route_with_fallback_uses_the_judge_off_the_gateway() -> None:
 
 async def test_route_with_fallback_reports_an_unconfigured_deployment() -> None:
     assert await route_with_fallback(RoutingBackends(), "hi", _MENU, gateway_backed=True) is None
+
+
+@pytest.mark.parametrize(
+    "sol_alias",
+    ["gpt-5.6-sol", "databricks-gpt-5-6-sol", "system.ai.gpt-5-6-sol[1M]"],
+)
+async def test_route_with_fallback_never_offers_normalized_sol_to_automatic_clients(
+    sol_alias: str,
+) -> None:
+    client = _Recording(RoutingResult(model="databricks-gpt-5-5", rationale="safe"))
+    call = await route_with_fallback(
+        RoutingBackends(local=client),
+        "hi",
+        {"codex": [sol_alias, "databricks-gpt-5-5"]},
+        gateway_backed=False,
+    )
+    assert call is not None
+    assert client.available == {"codex": ["databricks-gpt-5-5"]}
+
+
+async def test_route_with_fallback_falls_back_when_external_returns_sol() -> None:
+    external = _Recording(RoutingResult(model="gpt-5.6-sol", rationale="bad"))
+    local = _Recording(RoutingResult(model="databricks-gpt-5-5", rationale="safe"))
+    call = await route_with_fallback(
+        RoutingBackends(external=external, local=local), "hi", _MENU, gateway_backed=True
+    )
+    assert call is not None
+    assert (call.result, call.source, call.client) == (local.result, "oss-llm", local)
+
+
+async def test_route_with_fallback_declines_when_every_backend_returns_sol() -> None:
+    sol = RoutingResult(model="databricks-gpt-5-6-sol", rationale="bad")
+    external, local = _Recording(sol), _Recording(sol)
+    call = await route_with_fallback(
+        RoutingBackends(external=external, local=local), "hi", _MENU, gateway_backed=True
+    )
+    assert call is not None
+    assert call.result is None

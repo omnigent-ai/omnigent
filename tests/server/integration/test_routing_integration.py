@@ -23,8 +23,9 @@ from omnigent.runner.subagent_routing import (
 )
 from omnigent.server.routes._sessions import orchestration as orchestration_module
 from omnigent.server.routes._sessions.common import get_server_host_registry
+from omnigent.server.routing_backend import RoutingBackends
 from omnigent.server.schemas import SessionEventInput
-from omnigent.server.smart_routing import RoutingResult
+from omnigent.server.smart_routing import CodexSubscriptionRoutingClient, RoutingResult
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.server.helpers import (
     FakeCaps,
@@ -93,6 +94,71 @@ def _routing_decisions(conv_store: SqlAlchemyConversationStore, session_id: str)
         for item in conv_store.list_items(session_id).data
         if getattr(item, "type", None) == "routing_decision"
     ]
+
+
+@pytest.mark.parametrize(
+    ("pinned_effort", "expected_card_effort", "expected_label"),
+    [
+        (None, "low", "codex-subscription-gpt-5.6-luna-light"),
+        ("xhigh", None, None),
+        ("ultra", None, None),
+    ],
+)
+async def test_auto_harness_card_preserves_automatic_effort_without_overriding_a_pin(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    pinned_effort: str | None,
+    expected_card_effort: str | None,
+    expected_label: str | None,
+) -> None:
+    """The post-route reload must not turn the router's effort into a user pin."""
+    agent = await create_test_agent(
+        client,
+        name=f"subscription-label-{pinned_effort or 'automatic'}",
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    create_body: dict[str, Any] = {
+        "agent_id": agent["id"],
+        "cost_control_mode_override": "on",
+        "harness_override": "auto",
+    }
+    if pinned_effort is not None:
+        create_body["reasoning_effort"] = pinned_effort
+    created = await client.post("/v1/sessions", json=create_body)
+    assert created.status_code == 201, created.text
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.get_conversation(str(created.json()["id"]))
+    assert conv is not None
+    subscription_router = CodexSubscriptionRoutingClient()
+    caps = FakeCaps(
+        routing_client=subscription_router,
+        routing_backends=RoutingBackends(local=subscription_router),
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "Add a field"}]},
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                conv.id, conv, body, conv_store, runner_client
+            )
+
+    decisions = _routing_decisions(conv_store, conv.id)
+    assert len(decisions) == 1
+    decision = decisions[0].data
+    assert decision.router_source == "codex-subscription"
+    assert decision.model == "gpt-5.6-luna"
+    assert decision.reasoning_effort == expected_card_effort
+    assert decision.display_label == expected_label
+    refreshed = conv_store.get_conversation(conv.id)
+    assert refreshed is not None
+    # ``ultra`` is accepted as an explicit manual pin and normalized to the
+    # Codex wire value. Automatic routing must never make that selection.
+    assert refreshed.reasoning_effort == (
+        "xhigh" if pinned_effort == "ultra" else pinned_effort or "low"
+    )
 
 
 # ── 1. Child spawn: the router wins over ``args.model`` ─────────────
