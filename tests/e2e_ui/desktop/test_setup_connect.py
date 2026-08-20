@@ -148,12 +148,13 @@ def test_shared_url_module_defaults_scheme_in_browser(page: Page) -> None:
     """
     _open_setup_page(page)
 
-    # Remote host → https; the guide's /omnigent suffix is preserved.
+    # Remote host → https root; the main process then probes and appends the
+    # canonical /omnigent workspace mount when this is a Databricks workspace.
     assert (
         page.evaluate(
             "() => window.omnigentUrl.normalizeUrl('dbc-x.cloud.databricks.com/omnigent')"
         )
-        == "https://dbc-x.cloud.databricks.com/omnigent"
+        == "https://dbc-x.cloud.databricks.com/"
     )
     # Loopback stays http for local dev.
     assert (

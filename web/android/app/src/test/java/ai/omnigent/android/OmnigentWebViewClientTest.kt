@@ -66,9 +66,8 @@ class OmnigentWebViewClientTest {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         val client = client(shouldInjectBridgeAtPageReady = false)
 
-        // A post-login landing on the pinned server's root, and the `/omnigent`
-        // mount the CLI records — neither starts with `/ml/omnigents`. Both must
-        // still get the CSS or the workspace switcher stays visible.
+        // A post-login landing on the pinned server's root and a nested app route
+        // both need the CSS or the workspace switcher stays visible.
         client.onPageFinished(webView, "$PINNED_ORIGIN/")
         client.onPageFinished(webView, "$PINNED_ORIGIN/omnigent/c/abc")
 

@@ -4002,9 +4002,9 @@ async def _auto_create_codex_terminal(
         ap_server_url=launch_config.policy_server_url,
         ap_auth_headers=policy_headers,
         bypass_sandbox=launch_config.bypass_sandbox,
-        # Codex 0.146 prompts for project trust before creating a thread.
-        # This TUI runs detached for the web UI, so trust the runner-selected
-        # workspace in the session-private config instead of blocking forever.
+        # Codex can show project-trust and legacy-model migration prompts before
+        # creating a thread. This TUI runs detached for the web UI, so persist
+        # the runner-owned acknowledgements in the private session config.
         trust_project=True,
         **routed_spawn_extras,
     )

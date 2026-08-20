@@ -5351,6 +5351,11 @@ export function Composer({
           }
         }}
       />
+      {/* Background tasks that outlive the turn show as a pill, not the
+          "Working…" shimmer. Sits above the queued/sub-agent trays: those dock
+          onto the composer card with a negative margin, so nothing may come
+          between them and the card. Self-gates to null otherwise. */}
+      <BackgroundTaskPill />
       {/* Queued messages — peeks above the card like the sub-agent tray.
           Lists follow-ups held while the agent is busy; drains FIFO on idle.
           Scope to this conversation so a queue held elsewhere never leaks in. */}
@@ -5378,9 +5383,6 @@ export function Composer({
           Truthy (not just non-null) so an empty label never peeks a
           nameless tray. */}
       {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
-      {/* Background tasks that outlive the turn show as a pill here, not the
-          "Working…" shimmer. Self-gates to null otherwise. */}
-      <BackgroundTaskPill />
       {/* Single rounded container — textarea + action row. No focus-within
           ring; drag-over still lifts an inset ring. dark:bg-card-solid so
           upper trays (queued / sub-agent) don't ghost through glass --card. */}

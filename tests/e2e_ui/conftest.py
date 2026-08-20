@@ -2526,7 +2526,12 @@ def native_claude_plan_session(
                 respawned.wait(timeout=5)
 
 
-def _create_native_codex_session(base_url: str, runner_id: str) -> str:
+def _create_native_codex_session(
+    base_url: str,
+    runner_id: str,
+    *,
+    model: str | None = None,
+) -> str:
     """Register the ``codex-native`` wrapper agent and bind its session.
 
     Reuses the exact terminal-first spec ``omnigent codex`` ships
@@ -2543,10 +2548,12 @@ def _create_native_codex_session(base_url: str, runner_id: str) -> str:
     gateway auth from its own credentials, and pre-accepts the first-run
     trust/onboarding prompts — no CLI client required. ``model=None`` lets the
     configured provider's default model win (matching the seeded codex bundle
-    built via ``_build_native_bundle``).
+    built via ``_build_native_bundle``); tests can pin a specific catalog model
+    to exercise model-specific startup behavior.
 
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.
+    :param model: Optional Codex model to pin in the wrapper spec.
     :returns: The new session/conversation id.
     """
     import json as _json
@@ -2561,7 +2568,7 @@ def _create_native_codex_session(base_url: str, runner_id: str) -> str:
     from omnigent.codex_native import _materialize_codex_agent_spec
 
     with tempfile.TemporaryDirectory() as _tmp:
-        spec_path = _materialize_codex_agent_spec(Path(_tmp), model=None)
+        spec_path = _materialize_codex_agent_spec(Path(_tmp), model=model)
         yaml_text = spec_path.read_text()
 
     buf = io.BytesIO()
@@ -2777,7 +2784,12 @@ class MockedCodexNativeSession:
     sidecar: CodexResponsesSidecar
 
 
-def _write_mock_codex_provider_config(config_home: Path, base_url: str) -> None:
+def _write_mock_codex_provider_config(
+    config_home: Path,
+    base_url: str,
+    *,
+    model: str = "mock-model",
+) -> None:
     """Write provider config that routes native Codex to the sidecar."""
     config_home.mkdir(parents=True, exist_ok=True)
     (config_home / "config.yaml").write_text(
@@ -2791,7 +2803,7 @@ providers:
       api_key: "sk-e2e-mock"
       wire_api: responses
       models:
-        default: mock-model
+        default: {model}
 """,
         encoding="utf-8",
     )
@@ -2821,22 +2833,25 @@ def mocked_native_codex_session(
     if not _codex_cli_supports_mocked_app_server(codex_path):
         pytest.skip("codex CLI >= 0.139.0 is required for mocked app-server e2e")
 
+    fixture_param = getattr(request, "param", None)
+    model = fixture_param if isinstance(fixture_param, str) else "mock-model"
+
     try:
         sidecar_bin = build_sidecar_bin()
     except RuntimeError:
         pytest.skip("cargo is required for Codex parity sidecar")
 
     server_tmp = tmp_path_factory.mktemp("e2e_ui_mocked_codex_server")
-    responses = getattr(
-        request,
-        "param",
-        [
+    responses = (
+        fixture_param
+        if isinstance(fixture_param, list)
+        else [
             [
                 ev_response_created("resp-goal-ui-bootstrap"),
                 ev_assistant_message("msg-goal-ui-bootstrap", "E2E_GOAL_BOOTSTRAP"),
                 ev_completed("resp-goal-ui-bootstrap"),
             ]
-        ],
+        ]
     )
     sidecar = start_codex_responses_sidecar(
         sidecar_bin,
@@ -2867,7 +2882,7 @@ def mocked_native_codex_session(
         encoding="utf-8",
     )
     codex_shim = _write_codex_unknown_version_shim(server_tmp, codex_path)
-    _write_mock_codex_provider_config(config_home, sidecar.base_url)
+    _write_mock_codex_provider_config(config_home, sidecar.base_url, model=model)
 
     port = _find_free_port()
     log_path = server_tmp / "server.log"
@@ -2979,7 +2994,7 @@ def mocked_native_codex_session(
                 f"{runner_log_path.read_text()[-3000:] if runner_log_path.exists() else ''}"
             )
 
-        session_id = _create_native_codex_session(base_url, runner_id)
+        session_id = _create_native_codex_session(base_url, runner_id, model=model)
         yield MockedCodexNativeSession(base_url=base_url, session_id=session_id, sidecar=sidecar)
     finally:
         if session_id is not None:

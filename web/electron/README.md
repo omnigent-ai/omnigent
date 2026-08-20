@@ -638,13 +638,13 @@ server in the desktop app — the way a browser deep link opens a page:
 
 ```
 omnigent://localhost:8000/c/conv_abc              → http://localhost:8000/c/conv_abc
-omnigent://my-workspace.cloud.databricks.com/c/x → https://…/ml/omnigents/c/x
+omnigent://my-workspace.cloud.databricks.com/c/x → https://…/omnigent/c/x
 ```
 
 The link names a server by **host** (with port if non-default) and carries no
 `http`/`https` — the shell infers the scheme with the same rule the setup page
 uses (`http` for loopback, `https` for a remote host), so a deep link and a
-pasted URL can never disagree. The Databricks workspace mount (`/ml/omnigents`)
+pasted URL can never disagree. The Databricks workspace mount (`/omnigent`)
 is **not** in the link; it is server-determined and discovered the same way a
 pasted workspace URL is. v1 accepts only `/c/<session_id>`; other paths are
 ignored.

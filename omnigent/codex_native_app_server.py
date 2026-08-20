@@ -57,6 +57,7 @@ from omnigent.inner.codex_executor import (
     codex_router_session_id,
     codex_routing_hook_skip_reason,
     materialize_codex_provider_config,
+    read_codex_model_catalog,
     write_codex_hooks_file,
 )
 from omnigent.inner.databricks_executor import _databricks_gateway_host
@@ -110,6 +111,7 @@ _MIN_POLICY_HOOK_CODEX_VERSION = (0, 129, 0)
 # (including a version we could not parse) the flag is omitted and the
 # interactive trust prompt may appear instead.
 _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION = (0, 131, 0)
+_MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
 
 
 def _string_object_dict(value: object) -> _JsonObject | None:
@@ -383,6 +385,43 @@ def _sync_codex_developer_instructions(
         document["developer_instructions"] = active
     elif "developer_instructions" in document:
         del document["developer_instructions"]
+    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+
+
+def _codex_model_upgrade_target(catalog: object, model: str) -> str | None:
+    """Return Codex's replacement for *model*, when the catalog declares one."""
+    if not isinstance(catalog, dict):
+        return None
+    models = catalog.get("models")
+    if not isinstance(models, list):
+        return None
+    for entry in models:
+        if not isinstance(entry, dict) or entry.get("slug") != model:
+            continue
+        upgrade = entry.get("upgrade")
+        if not isinstance(upgrade, dict):
+            return None
+        target = upgrade.get("model") or upgrade.get("id")
+        if isinstance(target, str) and target and target != model:
+            return target
+        return None
+    return None
+
+
+def _acknowledge_codex_model_migration(codex_home: Path, model: str, target: str) -> None:
+    """Suppress one model-migration prompt in a private runner-owned config."""
+    config_path = codex_home / "config.toml"
+    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    document = tomlkit.parse(existing) if existing else tomlkit.document()
+    notice = document.get("notice")
+    if notice is None:
+        notice = tomlkit.table()
+        document["notice"] = notice
+    migrations = notice.get("model_migrations")
+    if migrations is None:
+        migrations = tomlkit.table()
+        notice["model_migrations"] = migrations
+    migrations[model] = target
     config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
@@ -920,6 +959,15 @@ class CodexNativeAppServer:
         self.router_hooks_registered = router_bridge_dir is not None and policy_hooks_supported
         routed_spawns = router_bridge_dir is not None
         config_source = _codex_home_config_source_from_env()
+        model_migration_target: str | None = None
+        if self.trust_project and self.pinned_model:
+            catalog = await asyncio.to_thread(
+                read_codex_model_catalog,
+                self.codex_path,
+                config_source,
+                timeout=_MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS,
+            )
+            model_migration_target = _codex_model_upgrade_target(catalog, self.pinned_model)
         # Off the loop: this copies/symlinks a home AND (on a Smart Routing
         # session) shells out to ``codex debug models`` with a 10s timeout. Run
         # inline it stalled every other session sharing this event loop for that
@@ -944,6 +992,12 @@ class CodexNativeAppServer:
         )
         if self.pinned_model:
             _pin_codex_config_model(self.codex_home, self.pinned_model)
+            if model_migration_target is not None:
+                _acknowledge_codex_model_migration(
+                    self.codex_home,
+                    self.pinned_model,
+                    model_migration_target,
+                )
         _sync_codex_developer_instructions(
             self.codex_home,
             self.developer_instructions,
