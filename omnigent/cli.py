@@ -2935,9 +2935,11 @@ def _daemon_owner_is_live(record: _HostDaemonRecord, target: str) -> bool:
     A held record flock is a definitive live owner (the kernel drops it on
     death), so it is the fast positive signal. When the lock is free or can't
     be probed (no ``fcntl``, unreadable), fall back to whether the PID is
-    alive — so a daemon still mid-startup (hasn't grabbed the lock yet) is not
-    reaped. Reaping therefore requires both signals dead: a free lock and a
-    dead PID.
+    alive and still names the recorded daemon (see
+    :func:`_pid_is_recorded_daemon`) — so a daemon still mid-startup (hasn't
+    grabbed the lock yet) is not reaped, while a pid recycled to an unrelated
+    process is. Reaping therefore requires a free lock and a dead-or-foreign
+    PID.
 
     :param record: Existing daemon record for *target*.
     :param target: Normalized daemon target, e.g. ``"local"``.
@@ -2945,7 +2947,7 @@ def _daemon_owner_is_live(record: _HostDaemonRecord, target: str) -> bool:
     """
     if _record_flock_is_held(_daemon_record_path(target)) is True:
         return True
-    return _pid_alive(record.pid)
+    return _pid_is_recorded_daemon(record)
 
 
 def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
@@ -3125,6 +3127,50 @@ def _foreground_daemon_record(
     )
 
 
+_DAEMON_PID_START_TOLERANCE_S = 2.0
+
+
+def _describe_pid(pid: int) -> str:
+    """Name what actually holds *pid* — user and command — for error copy.
+
+    Best-effort: any psutil failure degrades to the bare pid (#5095).
+    """
+    try:
+        import psutil
+
+        proc = psutil.Process(pid)
+        user = proc.username()
+        name = proc.name()
+        return f"pid={pid} ({name}, user {user})"
+    except Exception:  # noqa: BLE001 — diagnostics must never raise
+        return f"pid={pid}"
+
+
+def _pid_is_recorded_daemon(record: _HostDaemonRecord) -> bool:
+    """Whether *record*'s pid still names OUR daemon, not a recycled pid.
+
+    A bare existence check trusts the pid after a reboot: the kernel recycles
+    low pids, and a fresh system daemon can hold the recorded pid forever —
+    the host then refuses to start and ``host stop`` EPERMs trying to kill a
+    root process (#5095). The record's own ``started_at`` is the identity:
+    the pid counts as ours only when the process holding it was created at
+    (within a small tolerance of) the recorded start time. When the creation
+    time cannot be read (access denied), fall back to alive-only — the
+    terminate path's PermissionError handling still catches that case.
+    """
+    if not _pid_alive(record.pid):
+        return False
+    try:
+        import psutil
+
+        created = psutil.Process(record.pid).create_time()
+    except psutil.NoSuchProcess:
+        return False
+    except Exception:  # noqa: BLE001 — unreadable create time: alive-only
+        return True
+    return abs(created - record.started_at) <= _DAEMON_PID_START_TOLERANCE_S
+
+
 def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None:
     """
     Find a live daemon that already serves a foreground record target.
@@ -3136,12 +3182,12 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
     :returns: Conflicting live record, or ``None``.
     """
     existing = _find_daemon_record(record.target)
-    if (
-        existing is not None
-        and existing.pid != record.pid
-        and _daemon_owner_is_live(existing, record.target)
-    ):
-        return existing
+    if existing is not None and existing.pid != record.pid:
+        if _daemon_owner_is_live(existing, record.target):
+            return existing
+        # Dead, or alive but not our daemon (pid recycled after a reboot):
+        # the record is stale, not a conflict — prune it and start normally.
+        _delete_daemon_record(existing)
     if record.mode == "server" and record.server_url is not None:
         local_record = _find_daemon_record(_LOCAL_DAEMON_MARKER)
         if (
@@ -3151,6 +3197,12 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
             and local_record.resolved_server_url == record.server_url.rstrip("/")
         ):
             return local_record
+        if (
+            local_record is not None
+            and local_record.pid != record.pid
+            and not _daemon_owner_is_live(local_record, _LOCAL_DAEMON_MARKER)
+        ):
+            _delete_daemon_record(local_record)
     return None
 
 
@@ -3172,12 +3224,21 @@ def _claim_foreground_daemon_record(
         stop_command = _host_stop_command(conflict.server_url or "")
         raise click.ClickException(
             "A host daemon is already running for this server "
-            f"(pid={conflict.pid}, target={conflict.target}). "
+            f"({_describe_pid(conflict.pid)}, target={conflict.target}). "
             f"Run `{cli_invocation()} host status` to inspect it or `{stop_command}` "
             "to stop it first."
         )
     previous = _find_daemon_record(record.target)
-    if previous is not None and not _pid_alive(previous.pid):
+    if (
+        previous is not None
+        and previous.pid != record.pid
+        and not _pid_is_recorded_daemon(previous)
+    ):
+        # Stale for the same recycled-pid reason as the conflict path: the
+        # recorded pid exists but is not our daemon.
+        _delete_daemon_record(previous)
+        previous = None
+    elif previous is not None and not _pid_alive(previous.pid):
         _delete_daemon_record(previous)
         previous = None
     _write_daemon_record(record)
@@ -9900,7 +9961,17 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
     :param force: Send SIGKILL after the SIGTERM grace period.
     :raises click.ClickException: If the process stays alive.
     """
-    if not _pid_alive(record.pid):
+    if not _pid_is_recorded_daemon(record):
+        if _pid_alive(record.pid):
+            # Alive but not ours — a recycled pid (often another user's
+            # system daemon). Discard the stale record instead of refusing
+            # to start / crashing on stop (#5095).
+            _delete_daemon_record(record)
+            raise click.ClickException(
+                f"Daemon record for {record.target!r} was stale — "
+                f"{_describe_pid(record.pid)} is not an omnigent daemon. "
+                "Record removed; rerun the command."
+            )
         _delete_daemon_record(record)
         return
     if _signal_daemon_pid(record, signal.SIGTERM):
