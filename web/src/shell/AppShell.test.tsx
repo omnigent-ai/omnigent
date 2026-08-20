@@ -1,9 +1,10 @@
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
+import type * as UseConversationsModule from "@/hooks/useConversations";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   MemoryRouter,
   Route,
@@ -19,8 +20,13 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
-vi.mock("@/hooks/useConversations", () => ({
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  // Keep the real module (PROJECT_LABEL_KEY, the mutation hooks) — only the
+  // list/projects queries the header + sidebar read are replaced. useProjects
+  // returns an empty set so the breadcrumb resolves no project folder.
+  ...(await importOriginal<typeof UseConversationsModule>()),
   useConversations: vi.fn(),
+  useProjects: vi.fn(() => ({ data: [] })),
 }));
 
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
@@ -61,9 +67,18 @@ vi.mock("@/hooks/useAgents", () => ({
 }));
 
 vi.mock("./Sidebar", () => ({
-  // Reflect the open prop so tests can assert sidebar collapse/expand.
-  Sidebar: ({ open }: { open: boolean }) => (
-    <div data-testid="sidebar" data-open={open ? "true" : "false"} />
+  // Reflect the open/peek props so tests can assert sidebar collapse/expand and
+  // whether it is peeking (a floating hover card rather than a docked panel).
+  // Rendered as aside.conversations-sidebar like the real one, so the
+  // peek-dismiss logic (which treats that selector as "inside the card") sees
+  // the same shape here as in the app.
+  Sidebar: ({ open, peek }: { open: boolean; peek?: boolean }) => (
+    <aside
+      className="conversations-sidebar"
+      data-testid="sidebar"
+      data-open={open ? "true" : "false"}
+      data-peek={peek ? "true" : "false"}
+    />
   ),
 }));
 vi.mock("./FilesPanel", () => ({
@@ -76,11 +91,17 @@ vi.mock("./FilesPanel", () => ({
   FilesPanel: ({
     onFileSelect,
     flatView,
+    showHidden,
   }: {
     onFileSelect: (path: string) => void;
     flatView: boolean;
+    showHidden: boolean;
   }) => (
-    <div data-testid="files-panel" data-flat-view={String(flatView)}>
+    <div
+      data-testid="files-panel"
+      data-flat-view={String(flatView)}
+      data-show-hidden={String(showHidden)}
+    >
       <button
         type="button"
         aria-label="files: select README.md"
@@ -149,9 +170,6 @@ vi.mock("@/components/blocks/TerminalView", () => ({
   TerminalView: ({ terminalId }: { terminalId: string }) => (
     <div data-testid="terminal-view-stub">{terminalId}</div>
   ),
-}));
-vi.mock("./TodoPanel", () => ({
-  TodoPanel: () => <div data-testid="todo-panel" />,
 }));
 vi.mock("./FilesPanelDrawer", () => ({
   FilesPanelDrawer: ({ open, flatView }: { open: boolean; flatView: boolean }) => (
@@ -284,6 +302,26 @@ function LocationDisplay() {
 }
 
 /**
+ * Route-change buttons standing in for the real Settings button and the
+ * sidebar's Back row, which live in components mocked out here. Navigation is
+ * what AppShell keys the /settings sidebar pin off, so the tests need a real
+ * router transition rather than a re-render.
+ */
+function NavProbe() {
+  const navigate = useNavigate();
+  return (
+    <div>
+      <button type="button" data-testid="nav-settings" onClick={() => navigate("/settings")}>
+        to-settings
+      </button>
+      <button type="button" data-testid="nav-home" onClick={() => navigate("/")}>
+        to-home
+      </button>
+    </div>
+  );
+}
+
+/**
  * Renders the current pathname (the `/c/:conversationId` segment) so a test
  * can detect an unwanted conversation switch — a redirect shows up as a
  * pathname change, which `LocationDisplay` (search params only) can't catch.
@@ -322,6 +360,7 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     server_version: null,
     smart_routing_enabled: false,
     smart_routing_sources: { external: false, oss: false },
+    features: {},
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -354,6 +393,23 @@ function renderShell(path: string, info?: ServerInfo) {
                   <>
                     <TerminalFirstViewProbe />
                     <ForkDialogProbe />
+                    <NavProbe />
+                    <LocationDisplay />
+                  </>
+                }
+              />
+              {/* The settings page itself renders inside the sidebar (its nav
+              replaces the session list), so the body here is irrelevant — what
+              matters is that the route is /settings, which is what AppShell
+              keys the sidebar pin off. The nav-* links stand in for the real
+              Settings button and the sidebar's Back row, both of which live in
+              components mocked out here. */}
+              <Route
+                path="settings"
+                element={
+                  <>
+                    <div>settings</div>
+                    <NavProbe />
                     <LocationDisplay />
                   </>
                 }
@@ -376,6 +432,7 @@ function mockConversations(
     labels?: Record<string, string>;
     host_id?: string | null;
     runner_id?: string | null;
+    workspace?: string | null;
   }[],
 ) {
   useConvMock.mockReturnValue({
@@ -392,6 +449,7 @@ function mockConversations(
             permission_level: c.permission_level,
             host_id: c.host_id ?? null,
             runner_id: c.runner_id ?? null,
+            workspace: c.workspace ?? null,
           })),
           first_id: null,
           last_id: null,
@@ -457,12 +515,9 @@ beforeEach(() => {
   // choice carries across sessions. Clear it so a stored preference from one
   // test can't change another test's default scope.
   localStorage.clear();
-  // The Tasks tab/drawer gates on chatStore.todos; reset so a populated
-  // todo list from one test doesn't leak into the next.
   // Reset terminal-first startup signals so one test's terminalPending /
   // failed status can't leak into another's terminalStartingUp.
   useChatStore.setState({
-    todos: [],
     terminalPending: false,
     sessionStatus: "idle",
     status: "idle",
@@ -1175,6 +1230,112 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
   });
 
+  it("pins the sidebar open on /settings so the Back row is reachable", () => {
+    // The settings nav replaces the session list INSIDE the sidebar, and its
+    // Back row is the only way off the page. Collapsed, that row is clipped and
+    // inert — the user is stranded with no visible exit. Entering /settings must
+    // therefore force the sidebar open.
+    mockConversations([]);
+    renderShell("/settings");
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("refuses to collapse the sidebar while on /settings", () => {
+    // The hotkey (⌘⌥[) and command palette reach the toggle without going
+    // through the title-bar button, so the guard has to live in the handler, not
+    // just in what's rendered. Opening stays allowed; only collapsing is
+    // refused, because collapsing is what removes the exit.
+    mockConversations([]);
+    renderShell("/settings");
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("dismisses a peeking sidebar once the pointer moves elsewhere", async () => {
+    // The card closes itself on its own pointerleave, which only covers a peek
+    // armed from INSIDE it. Armed from the title-bar trigger (outside), a pointer
+    // that never crosses the card leaves it with no pointerenter and therefore no
+    // pointerleave, so the card used to sit open indefinitely.
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    fireEvent.pointerEnter(screen.getByRole("button", { name: /open sidebar/i }));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true"));
+
+    // Pointer over something that is not the card, the trigger, or a popper.
+    fireEvent.pointerMove(screen.getByTestId("url-params"));
+    await waitFor(() =>
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "false"),
+    );
+  });
+
+  it("keeps peeking while the pointer is over the card itself", async () => {
+    // The other half: dismissal must not be so eager that moving onto the card —
+    // the entire point of peeking — closes it.
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    fireEvent.pointerEnter(screen.getByRole("button", { name: /open sidebar/i }));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true"));
+
+    fireEvent.pointerMove(screen.getByTestId("sidebar"));
+    await new Promise((resolve) => {
+      // Past the 200ms dismiss grace, so "still peeking" is a real result.
+      setTimeout(resolve, 350);
+    });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-peek", "true");
+  });
+
+  it("keeps the sidebar pinned open for the whole /settings visit", () => {
+    // Repeated toggles all resolve to open while on the page: collapsing is what
+    // removes the only exit, so the guard refuses that direction throughout.
+    mockConversations([]);
+    renderShell("/settings");
+
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("restores a collapsed sidebar after leaving /settings", () => {
+    // A collapsed sidebar is a preference, and a trip to settings shouldn't
+    // silently undo it. The pin is only needed WHILE on the page — on the way out
+    // the title-bar toggle is back and Back is no longer the only exit — so
+    // restoring here cannot reintroduce the trap.
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    // Collapsed going in (jsdom default).
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    // Into settings: pinned open despite the collapsed preference.
+    fireEvent.click(screen.getByTestId("nav-settings"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+
+    // Back out: the collapsed state the user chose is restored.
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+  });
+
+  it("restores an open sidebar after leaving /settings", () => {
+    // The mirror case: someone who had it open keeps it open, so the restore is
+    // genuinely "put it back", not "always collapse".
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    fireEvent.keyDown(document, { code: "BracketLeft", metaKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+
+    fireEvent.click(screen.getByTestId("nav-settings"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
   it("keeps the sidebar collapsed after exiting full screen if it was collapsed before", () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
@@ -1247,6 +1408,7 @@ describe("Subagents tab", () => {
       {
         id: "conv_child_a",
         title: "researcher:auth",
+        task_summary: null,
         tool: "researcher",
         session_name: "auth",
         current_task_status: "completed" as const,
@@ -1342,6 +1504,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -1352,6 +1515,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_b",
           title: "frontend_engineer:rail",
+          task_summary: null,
           tool: "frontend_engineer",
           session_name: "rail",
           current_task_status: "in_progress",
@@ -1386,6 +1550,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -1396,6 +1561,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_b",
           title: "researcher:api",
+          task_summary: null,
           tool: "researcher",
           session_name: "api",
           current_task_status: "completed",
@@ -1619,6 +1785,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -1666,6 +1833,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -1676,6 +1844,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_b",
           title: "researcher:api",
+          task_summary: null,
           tool: "researcher",
           session_name: "api",
           current_task_status: "in_progress",
@@ -1741,6 +1910,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -1751,6 +1921,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child_b",
           title: "researcher:api",
+          task_summary: null,
           tool: "researcher",
           session_name: "api",
           current_task_status: "completed",
@@ -1787,6 +1958,7 @@ describe("Subagents tab", () => {
         {
           id: "conv_child",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "in_progress",
@@ -1833,6 +2005,45 @@ describe("Subagents tab", () => {
     expect(screen.getByRole("tab", { name: /Files/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /Shells/i })).toBeInTheDocument();
   });
+
+  it("keeps the back-to-parent header link when the parent title is unresolved", () => {
+    // Parent is outside the loaded sidebar window and its snapshot has no
+    // title yet. The header used to hide the whole breadcrumb (and the only
+    // in-header climb-out) until a title resolved. The parent id is enough.
+    mockConversations([]);
+    useSessionMock.mockImplementation((id) => {
+      if (id === "conv_child") {
+        return {
+          session: {
+            id: "conv_child",
+            agentId: "ag_child",
+            agentName: null,
+            runnerId: null,
+            status: "idle",
+            createdAt: 0,
+            title: null,
+            labels: {},
+            items: [],
+            pendingElicitations: [],
+            permissionLevel: 4,
+            parentSessionId: "conv_parent",
+            subAgentName: null,
+            kind: "sub_agent",
+          },
+          isLoading: false,
+          error: null,
+        };
+      }
+      return { session: null, isLoading: false, error: null };
+    });
+
+    renderShell("/c/conv_child");
+
+    expect(screen.getByRole("link", { name: "Back to parent session" })).toHaveAttribute(
+      "href",
+      "/c/conv_parent",
+    );
+  });
 });
 
 describe("FilesPanel visibility", () => {
@@ -1868,6 +2079,39 @@ describe("FilesPanel visibility", () => {
     expect(screen.queryByTestId("files-panel")).toBeNull();
     expect(screen.queryByTestId("files-panel-drawer")).toBeNull();
   });
+
+  it("shows hidden files by default, on load and after a session switch", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_abc", permission_level: null },
+      { id: "conv_xyz", permission_level: null },
+    ]);
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_abc"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route path="c/:conversationId" element={<SessionNavButton to="/c/conv_xyz" />} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-show-hidden", "true");
+
+    // The conversation-switch reset must land on the same default, otherwise
+    // dotfiles would disappear the moment the user moves between sessions.
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-show-hidden", "true");
+  });
 });
 
 describe("Right workspace card visibility", () => {
@@ -1884,19 +2128,17 @@ describe("Right workspace card visibility", () => {
     const panelWidth = Number.parseFloat(panel.style.width);
     const headerGroup = panel.parentElement;
     expect(headerGroup?.querySelector("header")).not.toBeNull();
-    expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe(
-      `${panelWidth + 16}px`,
-    );
+    expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe(`${panelWidth}px`);
 
     fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
     expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe("0px");
   });
 
   it("keeps the card mounted with Agents as the only tab for a minimal agent", () => {
-    // A no-os_env agent (available: false) with no shells and no todos
+    // A no-os_env agent (available: false) with no shells
     // still has the unconditional Agents tab (the panel lists at least
     // the main agent), so the card mounts, the Agents tab is selected
-    // by the fallback, and Files/Shells/Tasks are absent. An unmounted
+    // by the fallback, and Files/Shells are absent. An unmounted
     // card here means the always-visible Agents rule regressed.
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
@@ -2309,7 +2551,7 @@ describe("AppShell URL sync — file param", () => {
   });
 
   it("restores the file viewer into the desktop rail on a ?file= reload", () => {
-    // Regression (E2E reload-persistence): the Subagents/Terminals/Todos
+    // Regression (E2E reload-persistence): the Subagents/Terminals
     // panels are checked before the file viewer in the rail content
     // precedence. A ?file= reload must pull the rail to Files so the inline
     // viewer renders instead of another panel shadowing it.
@@ -2672,6 +2914,7 @@ describe("Mobile session menu", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "completed",
@@ -2683,25 +2926,17 @@ describe("Mobile session menu", () => {
       isLoading: false,
       error: null,
     });
-    useChatStore.setState({
-      todos: [
-        { content: "do a thing", status: "completed", activeForm: "doing a thing" },
-        { content: "do another", status: "pending", activeForm: "doing another" },
-      ],
-    });
-
     renderShell("/c/conv_native");
     openSessionMenu();
 
     // Mirror of the desktop rail's tab strip for a native-wrapper session:
-    // Files · Agents · Tasks. Shells is absent because the only terminal is
+    // Files · Agents. Shells is absent because the only terminal is
     // the vendor pane (the pill's Terminal view — excluded from the shell
     // inventory) and the mocked agent declares no terminals. An unexpected
     // Shells entry means the vendor pane leaked into the inventory.
     expect(screen.getByRole("menuitem", { name: /^Files$/i })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: /Shells/i })).toBeNull();
     expect(screen.getByRole("menuitem", { name: /Agents/i })).toBeInTheDocument();
-    expect(screen.getByRole("menuitem", { name: /Tasks/i })).toBeInTheDocument();
   });
 
   it("keeps the Terminals entry in terminal-first SDK sessions (no native wrapper)", () => {
@@ -2778,6 +3013,7 @@ describe("Mobile session menu", () => {
         {
           id: "conv_child_a",
           title: "researcher:auth",
+          task_summary: null,
           tool: "researcher",
           session_name: "auth",
           current_task_status: "in_progress",
@@ -2851,67 +3087,8 @@ describe("Mobile session menu", () => {
     expect(drawer).toHaveAttribute("data-flat-view", "true");
   });
 
-  it("opens the Tasks drawer for a claude-native session with todos", () => {
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([
-      {
-        id: "conv_native",
-        permission_level: null,
-        labels: { "omnigent.wrapper": "claude-code-native-ui" },
-      },
-    ]);
-    useChatStore.setState({
-      todos: [{ content: "build the thing", status: "in_progress", activeForm: "building" }],
-    });
-
-    renderShell("/c/conv_native");
-
-    expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "closed");
-    expect(screen.queryByTestId("todo-panel")).toBeNull();
-
-    openSessionMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: /Tasks/i }));
-
-    // Failure: openTodosPanel didn't set todosPanelOpen, or the Tasks entry
-    // was gated out despite isClaudeNative + a non-empty todo list.
-    expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "open");
-    expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
-  });
-
-  it.each([
-    ["codex-native", "conv_codex", "codex-native-ui"],
-    ["pi-native", "conv_pi", "pi-native-ui"],
-  ])("opens the Tasks drawer for a %s session with todos", (_harness, id, wrapper) => {
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([
-      {
-        id,
-        permission_level: null,
-        labels: { "omnigent.wrapper": wrapper },
-      },
-    ]);
-    useChatStore.setState({
-      todos: [{ content: "Locate CLI parser", status: "in_progress", activeForm: "Locating" }],
-    });
-
-    renderShell(`/c/${id}`);
-    expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "closed");
-
-    openSessionMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: /Tasks/i }));
-
-    expect(screen.getByTestId("todos-panel-drawer")).toHaveAttribute("data-state", "open");
-    expect(screen.getByTestId("todo-panel")).toBeInTheDocument();
-  });
-
   it("keeps the FAB with only the Agents entry for a minimal agent", () => {
-    // available:false → no files; no shells, no todos, no debug. The
+    // available:false → no files; no shells, no debug. The
     // Agents entry is unconditional (badge = 1, the main agent), so the
     // FAB still renders with exactly that entry. A missing FAB means
     // the always-visible Agents rule regressed on mobile.
@@ -2948,9 +3125,10 @@ describe("AppShell clone/fork action", () => {
     expect(screen.getByTestId("fork-probe")).toHaveAttribute("data-can-fork", "true");
   });
 
-  it("reports canFork=false on a sub-agent (child) session", () => {
-    // The server rejects forking a sub-agent session, so the affordance is
-    // suppressed for children (parentSessionId set on the snapshot).
+  it("exposes canFork on a sub-agent (child) session", () => {
+    // Forking a child is how it gets promoted to a top-level session, so the
+    // affordance must reach children too — they never appear in the sidebar
+    // list, so the loaded snapshot is the only signal the session exists.
     mockConversations([]); // sidebar omits child rows
     useSessionMock.mockReturnValue({
       session: {
@@ -2975,8 +3153,8 @@ describe("AppShell clone/fork action", () => {
 
     renderShell("/c/conv_child");
 
-    // The per-message fork action hides itself off this flag.
-    expect(screen.getByTestId("fork-probe")).toHaveAttribute("data-can-fork", "false");
+    // The per-message fork action shows itself off this flag.
+    expect(screen.getByTestId("fork-probe")).toHaveAttribute("data-can-fork", "true");
   });
 
   it("opens the fork dialog (name suggested from the source title) when clicked", () => {
@@ -3015,6 +3193,47 @@ describe("AppShell clone/fork action", () => {
     const nameInput = screen.getByTestId("fork-session-title-input");
     expect(nameInput).toHaveValue("");
     expect(nameInput).toHaveAttribute("placeholder", "Fork of Auth refactor");
+  });
+
+  it("offers host + directory when forking a child, taken from its parent", () => {
+    // A sub-agent records no workspace or host of its own, so without the
+    // parent's the dialog drops to its no-directory mode and the promoted
+    // session lands unbound — a different, smaller dialog than every other
+    // session's fork.
+    mockConversations([
+      { id: "conv_parent", permission_level: 4, host_id: "host_a", workspace: "/repo" },
+    ]);
+    useSessionMock.mockReturnValue({
+      session: {
+        id: "conv_child",
+        agentId: "ag_x",
+        agentName: null,
+        runnerId: null,
+        status: "idle",
+        createdAt: 0,
+        title: null,
+        labels: {},
+        items: [],
+        pendingElicitations: [],
+        permissionLevel: 4,
+        parentSessionId: "conv_parent",
+        subAgentName: null,
+        kind: "sub_agent",
+        workspace: null,
+        hostId: null,
+      },
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_child");
+    fireEvent.click(screen.getByTestId("fork-probe-open"));
+
+    const dialog = screen.getByTestId("fork-session-dialog");
+    expect(within(dialog).getByText("Host")).toBeInTheDocument();
+    // "Clone" alone is the no-directory form: the fork would be created
+    // unbound instead of started on a host.
+    expect(within(dialog).getByRole("button", { name: "Clone & start" })).toBeInTheDocument();
   });
 });
 

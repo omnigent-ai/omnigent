@@ -223,7 +223,7 @@ async def test_list_builtin_agents_exposes_bundled_skills_from_spec(
 ) -> None:
     """
     ``GET /v1/agents`` reports each agent's bundled skills (name +
-    description) from its spec's ``skills/<name>/SKILL.md`` entries.
+    description) from its spec's ``skills/<dir>/SKILL.md`` entries.
 
     The Web UI's new-session composer builds its "/" suggestions menu
     from this list — before a session exists there is no runner to

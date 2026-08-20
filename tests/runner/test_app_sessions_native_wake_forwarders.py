@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -966,3 +967,67 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         await _drain_forwarder_runs(runs)
+
+
+async def test_forwarder_task_exit_paths_are_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Every forwarder-task exit path leaves an obituary log line.
+
+    A forwarder that stops takes mirroring, status events and the pane
+    busy signal with it, and a silent exit once presented as an hour-long
+    session blackout with nothing to grep for. Cancellation is routine
+    (INFO), an escaped exception is fatal to mirroring (ERROR, carrying
+    the traceback), and an unexpected clean return still warns.
+    """
+    cancelled_id = "0b17aa000000000000000000000000c1"
+    died_id = "0b17aa000000000000000000000000d2"
+    returned_id = "0b17aa000000000000000000000000e3"
+
+    async def _parked() -> None:
+        await asyncio.Event().wait()
+
+    async def _raises() -> None:
+        raise RuntimeError("client construction failed")
+
+    async def _returns() -> None:
+        return None
+
+    try:
+        with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+            parked_task = asyncio.create_task(_parked(), name="claude-forwarder-cancelled")
+            runner_app_mod._register_auto_forwarder_task(cancelled_id, parked_task)
+            await asyncio.sleep(0)
+            parked_task.cancel()
+            await asyncio.wait([parked_task])
+
+            raising_task = asyncio.create_task(_raises(), name="claude-forwarder-died")
+            runner_app_mod._register_auto_forwarder_task(died_id, raising_task)
+            await asyncio.wait([raising_task])
+
+            returning_task = asyncio.create_task(_returns(), name="claude-forwarder-returned")
+            runner_app_mod._register_auto_forwarder_task(returned_id, returning_task)
+            await asyncio.wait([returning_task])
+            # Done callbacks run via call_soon after task completion.
+            await asyncio.sleep(0)
+
+        def _obits(level: int, needle: str) -> list[logging.LogRecord]:
+            return [
+                record
+                for record in caplog.records
+                if record.name == "omnigent.runner.app"
+                and record.levelno == level
+                and needle in record.getMessage()
+            ]
+
+        assert _obits(logging.INFO, "cancelled; session=" + cancelled_id)
+        died = _obits(logging.ERROR, "died; session mirroring is down")
+        assert died and died[0].exc_info is not None, (
+            "a forwarder killed by an escaped exception must log an ERROR "
+            "obituary carrying the traceback"
+        )
+        assert _obits(logging.WARNING, "returned; session mirroring has stopped")
+    finally:
+        for sid in (cancelled_id, died_id, returned_id):
+            runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)

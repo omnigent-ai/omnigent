@@ -142,7 +142,7 @@ repos:
 
       # Fail if routing.proto changed without regenerating the committed
       # bindings (or vice versa). Verify-only, not a fixer: regen needs
-      # grpcio-tools, so CI's `uv sync --extra dev` enforces it (like ktlint).
+      # grpcio-tools, so CI's `uv sync --group lint` enforces it (like ktlint).
       - id: routing-pb2-fresh
         name: routing protobuf bindings are up to date
         language: system

@@ -1718,11 +1718,17 @@ async def _execute_subagent_tool(
 
     # Named mode: (agent, title) spawn-or-continue.
     sub_agent_name = args.get("agent")
-    session_name = args.get("title")
+    llm_title_hint = args.get("title")
     if not isinstance(sub_agent_name, str) or not sub_agent_name:
         return "Error: sys_session_send requires 'agent' (or 'session_id')"
-    if not session_name or not isinstance(session_name, str):
-        return "Error: sys_session_send requires non-empty 'title' string"
+    if llm_title_hint is not None and not isinstance(llm_title_hint, str):
+        llm_title_hint = None
+
+    # When the LLM provides a title that matches an existing child's
+    # session_name (e.g. the structured name from a prior handle), use
+    # it for spawn-or-continue. Otherwise auto-generate a structured
+    # name below.
+    session_name: str | None = llm_title_hint if llm_title_hint else None
 
     # Verify the sub-agent exists in the parent spec.
     if not _has_subagent(sub_agent_name, agent_spec):
@@ -1752,14 +1758,18 @@ async def _execute_subagent_tool(
     if parent_agent_id is None:
         return "Error: cannot resolve parent agent_id for sub-agent dispatch"
 
-    existing = await _find_existing_child_session(
-        server_client=server_client,
-        conversation_id=conversation_id,
-        agent=str(sub_agent_name),
-        title=session_name,
-    )
-    if isinstance(existing, str):
-        return existing
+    # If the LLM provided a title, try to find an existing child.
+    existing: _JsonObject | str | None = None
+    if session_name:
+        existing = await _find_existing_child_session(
+            server_client=server_client,
+            conversation_id=conversation_id,
+            agent=str(sub_agent_name),
+            title=session_name,
+        )
+        if isinstance(existing, str):
+            return existing
+    assert not isinstance(existing, str)
     created_child = False
     child_wrapper_label: str | None = None
     if existing is not None:
@@ -1816,6 +1826,32 @@ async def _execute_subagent_tool(
                 "after completion."
             )
     else:
+        if not session_name:
+            # No title hint — auto-generate a structured session name
+            # (e.g. "researcher-1"). Recover ordinals from existing
+            # children on first spawn after runner restart to avoid
+            # duplicates.
+            _all_children = await _list_child_sessions(
+                server_client=server_client,
+                conversation_id=conversation_id,
+                tool=str(sub_agent_name),
+            )
+            if isinstance(_all_children, str):
+                return (
+                    f"Error: cannot allocate sub-agent name for "
+                    f"{sub_agent_name!r}: failed to list existing "
+                    f"children — {_all_children}"
+                )
+            _runner_app.recover_subagent_ordinals(
+                conversation_id,
+                str(sub_agent_name),
+                _all_children,
+            )
+            ordinal = _runner_app.next_subagent_ordinal(
+                conversation_id,
+                str(sub_agent_name),
+            )
+            session_name = f"{sub_agent_name}-{ordinal}"
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
         # Apply an allowlisted per-dispatch harness override. The sub-agent
         # spec must explicitly opt in via executor.config.allowed_harnesses,
@@ -1990,6 +2026,7 @@ async def _execute_subagent_tool(
 
             session_stream.publish(conversation_id, _evt.model_dump())
 
+    assert session_name is not None
     # Register the child→parent mapping so the runner can fan out the
     # child's status/preview deltas onto the PARENT's stream (the child's
     # own relay isn't running when only the parent is being viewed). The
@@ -6961,6 +6998,53 @@ async def _execute_task_lifecycle_tool(
     )
 
 
+async def _post_session_stop(server_client: httpx.AsyncClient, task_id: str) -> str | None:
+    """Hard-stop one claude-native child through the server."""
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{task_id}/events",
+            json={"type": "stop_session", "data": {}},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        return f"Error: sys_cancel_task stop_session failed: {type(exc).__name__}: {exc}"
+    if resp.status_code >= 400:
+        return (
+            f"Error: sys_cancel_task stop_session returned {resp.status_code}: {resp.text[:200]}"
+        )
+    return None
+
+
+async def _cancel_evicted_claude_native_subagent(
+    task_id: str,
+    *,
+    conversation_id: str,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Stop an owned claude-native child after its work entry was evicted."""
+    if server_client is None:
+        return "Error: sys_cancel_task requires server access for sub-agent tasks"
+    try:
+        resp = await server_client.get(f"/v1/sessions/{task_id}", timeout=10.0)
+    except httpx.HTTPError as exc:
+        return f"Error: sys_cancel_task lookup failed: {type(exc).__name__}: {exc}"
+    if resp.status_code != 200:
+        return f"Error: no in-flight task with task_id {task_id}"
+    snapshot = resp.json()
+    labels = snapshot.get("labels") if isinstance(snapshot, dict) else None
+    if (
+        not isinstance(snapshot, dict)
+        or snapshot.get("parent_session_id") != conversation_id
+        or not isinstance(labels, dict)
+        or labels.get(_SESSION_WRAPPER_LABEL_KEY) != CLAUDE_NATIVE_WRAPPER_VALUE
+    ):
+        return f"Error: no in-flight task with task_id {task_id}"
+    stop_error = await _post_session_stop(server_client, task_id)
+    if stop_error is not None:
+        return stop_error
+    return json.dumps({"cancelled": True, "task_id": task_id, "status": "cancelled"})
+
+
 async def _cancel_subagent_task(
     args: _JsonObject,
     *,
@@ -7003,14 +7087,22 @@ async def _cancel_subagent_task(
     if conversation_id is None:
         return "Error: sys_cancel_task requires conversation_id"
     entry = _runner_app.get_subagent_work(str(task_id))
-    if entry is None or entry.parent_session_id != conversation_id:
+    if entry is None:
+        return await _cancel_evicted_claude_native_subagent(
+            str(task_id),
+            conversation_id=conversation_id,
+            server_client=server_client,
+        )
+    if entry.parent_session_id != conversation_id:
         return f"Error: no in-flight task with task_id {task_id}"
     # A dispatched child sits in ``launching`` until its runtime emits a real
     # busy edge (see ``mark_subagent_work_started``). Cancellation must still
     # route to the child during that window — otherwise cancelling a slow-to-
-    # start sub-agent would silently no-op and leave it running. Only terminal
-    # states (``completed`` / ``failed`` / ``cancelled``) short-circuit here.
-    if entry.status not in ("launching", "running", "waiting"):
+    # start sub-agent would silently no-op and leave it running. A failed
+    # claude-native entry still falls through because its pane may be alive.
+    is_claude_native = entry.wrapper_label == CLAUDE_NATIVE_WRAPPER_VALUE
+    can_stop_failed_claude = is_claude_native and entry.status == "failed"
+    if entry.status not in ("launching", "running", "waiting") and not can_stop_failed_claude:
         return json.dumps(
             {
                 "cancelled": entry.status == "cancelled",
@@ -7023,9 +7115,7 @@ async def _cancel_subagent_task(
 
     # claude-native is the only harness with a runner-side hard-stop; every
     # other harness 204 no-ops on stop_session, so route them to interrupt.
-    event_type = (
-        "stop_session" if entry.wrapper_label == CLAUDE_NATIVE_WRAPPER_VALUE else "interrupt"
-    )
+    event_type = "stop_session" if is_claude_native else "interrupt"
 
     try:
         resp = await server_client.post(

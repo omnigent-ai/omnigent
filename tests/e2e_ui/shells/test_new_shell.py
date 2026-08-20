@@ -85,10 +85,15 @@ def test_new_shell_launches_and_opens(page: Page, terminal_session: tuple[str, s
 
     # The shell's xterm mounts INSIDE the rail (not the main column) and
     # connects. The chat surface is untouched — the composer stays visible.
+    # Assert no VISIBLE main terminal surface: terminal-first sessions keep
+    # a hidden pre-warmed surface mounted (data-visible="false"), which is
+    # not a takeover.
     terminal_view = rail.get_by_test_id("terminal-view")
     expect(terminal_view.last).to_be_visible(timeout=20_000)
     expect(terminal_view.last).to_have_attribute("data-state", "connected", timeout=20_000)
-    expect(page.get_by_test_id("main-terminal-view")).to_have_count(0)
+    expect(page.locator('[data-testid="main-terminal-view"][data-visible="true"]')).to_have_count(
+        0
+    )
     expect(page.get_by_placeholder("Ask the agent anything…")).to_be_visible()
 
     # The tab's x closes the shell — its xterm unmounts and the rail falls

@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { ImageIcon } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
-import { getOmnigentHostConfig, hostFetch } from "@/lib/host";
+import { getOmnigentHostConfig } from "@/lib/host";
+import { authenticatedFetch } from "@/lib/identity";
 import { ZoomableImage } from "@/components/ImageLightbox";
 
 export interface SessionImageProps {
@@ -105,7 +106,11 @@ function loadBlobUrl(path: string): Promise<string> {
   const pending = inFlight.get(path);
   if (pending) return pending;
 
-  const request = hostFetch(path)
+  // Route this host-scoped file-content read through authenticatedFetch (not
+  // hostFetch) so it stamps the slice-key routing header and reaches the replica
+  // holding the session's runner tunnel (the oxlint no-restricted-imports rule
+  // forbids direct hostFetch here for exactly this reason).
+  const request = authenticatedFetch(path)
     .then((res) => (res.ok ? res.blob() : Promise.reject(new Error(`HTTP ${res.status}`))))
     .then((blob) => {
       const url = URL.createObjectURL(blob);

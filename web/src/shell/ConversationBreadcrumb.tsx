@@ -1,0 +1,128 @@
+import { BotIcon, ChevronLeftIcon, FolderIcon } from "lucide-react";
+import { Link } from "@/lib/routing";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
+import { nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
+import type { Agent } from "@/hooks/useAgents";
+import { cn } from "@/lib/utils";
+
+/**
+ * `[folder] / <title> [/ <sub-agent>]` breadcrumb for the active conversation.
+ *
+ * Rendered in the chat header's left slot (ChatHeader). On the macOS shell with
+ * the sidebar collapsed the slot is padded clear of the traffic lights and the
+ * title-bar cluster (see `.traffic-light-clearance` in index.css), so the
+ * breadcrumb stays in the header — truncating within its flex — rather than
+ * overlapping the window controls.
+ *
+ * The caller mounts this when there is a title or a parent route to climb
+ * back to. Segments self-gate: the folder only shows when filed, the
+ * sub-agent only inside a child. The title links back to the parent when
+ * `titleLinkTo` is set (viewing a sub-agent), else it's plain text.
+ */
+export function ConversationBreadcrumb({
+  conversationTitle,
+  projectName,
+  titleLinkTo,
+  isChildSession,
+  boundAgent,
+  wrapperLabel,
+  className,
+}: {
+  /** The conversation's display name. */
+  conversationTitle: string;
+  /** Project the conversation is filed under, or `null` when unfiled. */
+  projectName: string | null;
+  /** Parent-session route the title links to, or `undefined` for plain text. */
+  titleLinkTo?: string;
+  /** Whether the active session is a sub-agent (appends its identity). */
+  isChildSession: boolean;
+  /** The bound agent — names the sub-agent segment. */
+  boundAgent: Agent | undefined;
+  /** The session's `omnigent.wrapper` label — names a native sub-agent's vendor. */
+  wrapperLabel: string | null;
+  /** Extra classes for the context (header vs title-bar strip). */
+  className?: string;
+}) {
+  // A native sub-agent (a Claude Code Task, a Codex collab thread) is bound to
+  // its parent's `<vendor>-native-ui` row, so its agent name is an internal the
+  // server itself hides (`public_agent_name`). Name the product instead,
+  // matching the Agents rail and the composer. Every other sub-agent keeps its
+  // own agent name, which is already human-readable. Only the sub-agent segment
+  // reads this, so it stays behind `isChildSession`.
+  const subAgentName = isChildSession
+    ? (nativeCodingAgentForSubagentWrapper(wrapperLabel)?.displayName ?? boundAgent?.name ?? null)
+    : null;
+  // iOS/Android native chrome already identifies the session. Restore the
+  // compact "< Back" climb-out there; web / Electron keep the parent name.
+  const nativeMobileBack = isIOSShell() || isAndroidShell();
+  return (
+    <nav
+      aria-label="Conversation"
+      className={cn("conversation-breadcrumb flex min-w-0 items-center gap-1.5 text-ui", className)}
+    >
+      {projectName && (
+        <div className="hidden md:flex min-w-0 items-center gap-1.5 text-ui shrink-0">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span
+                className="breadcrumb-folder flex shrink-0 items-center text-muted-foreground opacity-40 hover:opacity-100"
+                aria-label={`Project: ${projectName}`}
+              >
+                <FolderIcon className="size-4" />
+              </span>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" align="start">
+              <div>
+                <span className="font-semibold text-ui">{conversationTitle}</span>
+                <div className="flex gap-1 text-muted-foreground">
+                  <FolderIcon className="size-4" />
+                  {projectName}
+                </div>
+              </div>
+            </TooltipContent>
+          </Tooltip>
+          <span aria-hidden className="shrink-0 text-muted-foreground opacity-40">
+            /
+          </span>
+        </div>
+      )}
+      {titleLinkTo ? (
+        <Link
+          to={titleLinkTo}
+          aria-label="Back to parent session"
+          className={cn(
+            "breadcrumb-parent-link text-muted-foreground hover:text-foreground",
+            nativeMobileBack
+              ? "inline-flex shrink-0 items-center gap-0.5"
+              : "truncate hover:underline",
+          )}
+        >
+          {nativeMobileBack ? (
+            <>
+              <ChevronLeftIcon className="size-4" />
+              <span>Back</span>
+            </>
+          ) : (
+            conversationTitle
+          )}
+        </Link>
+      ) : (
+        <span className="truncate text-foreground">{conversationTitle}</span>
+      )}
+      {isChildSession && (
+        <>
+          <span aria-hidden className="shrink-0 text-muted-foreground opacity-40">
+            /
+          </span>
+          <span className="flex min-w-0 items-center gap-1.5">
+            <BotIcon className="size-4 shrink-0 text-muted-foreground" />
+            <span className="truncate font-semibold text-foreground">
+              {subAgentName ?? "Sub-agent"}
+            </span>
+          </span>
+        </>
+      )}
+    </nav>
+  );
+}

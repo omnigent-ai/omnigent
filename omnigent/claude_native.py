@@ -23,10 +23,17 @@ import sys
 import uuid
 
 from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.llms.adapters._content import redact_binary_payloads
+from omnigent.runtime.tool_result_replay import (
+    blocks_from_parsed_list,
+    image_payloads_in_blocks,
+    strip_unparseable_image_output,
+    tool_result_content_blocks,
+)
 
 # termios/tty are POSIX-only and drive the native (tmux/PTY) Claude terminal,
-# which is disabled on Windows. Guard the import (special-cased by mypy, which
-# type-checks on Linux) so importing this module never crashes the CLI there.
+# which is disabled on Windows. Guard the import so static checking keeps the
+# POSIX path typed without making module import crash the CLI on Windows.
 if sys.platform != "win32":
     import termios
     import tty
@@ -52,6 +59,7 @@ if TYPE_CHECKING:
 import click
 import httpx
 import yaml
+from omnigent_client._http import is_loopback_url
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSocketException
 from websockets.frames import Close
 
@@ -100,6 +108,7 @@ from omnigent.host.daemon_launch import (
     DAEMON_POLL_INTERVAL_S,
     error_text,
     launch_or_reuse_daemon_runner,
+    open_daemon_client,
     wait_for_host_online,
     wait_for_runner_online,
 )
@@ -196,6 +205,11 @@ _DATABRICKS_CODING_AGENT_HEADER = "x-databricks-use-coding-agent-mode: true"
 # UI, so a wrapped terminal must stay pinned to the one session the UI thinks
 # it is showing.
 _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV = "CLAUDE_CODE_DISABLE_AGENT_VIEW"
+# Claude Code's in-TUI feedback surveys ("How is Claude doing this session?",
+# the memory-recollection rating, the transcript-sharing follow-up) render
+# only in the pane, so a web-driven session shows an unanswerable prompt —
+# often with nobody attached to the terminal at all.
+_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -606,6 +620,40 @@ def _managed_claude_model_config() -> ClaudeNativeUcodeConfig | None:
     return None
 
 
+def managed_claude_gateway_signal() -> tuple[str | None, bool]:
+    """Read the AI-Gateway backing Claude Code applies from managed settings.
+
+    Managed settings win at Claude Code's actual launch, so an enterprise file
+    can pin all inference through an AI Gateway even when omnigent's own
+    provider config resolves nothing (a ``subscription`` login). This reports
+    that backing: the managed ``env.ANTHROPIC_BASE_URL`` and whether a
+    credential is delivered, either through a top-level ``apiKeyHelper`` or a
+    truthy ``env.CLAUDE_CODE_USE_GATEWAY``.
+
+    :returns: ``(base_url, has_credential)`` from the first readable managed
+        settings file, or ``(None, False)`` when none is present or parseable.
+    """
+    for path in _CLAUDE_CODE_MANAGED_SETTINGS_PATHS:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_env = payload.get("env")
+        env = raw_env if isinstance(raw_env, dict) else {}
+        raw_base_url = env.get("ANTHROPIC_BASE_URL")
+        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
+        has_helper = bool(payload.get("apiKeyHelper"))
+        use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
+            "",
+            "0",
+            "false",
+        )
+        return base_url or None, has_helper or use_gateway
+    return None, False
+
+
 def claude_native_model_options(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> list[dict[str, object]]:
@@ -675,8 +723,11 @@ def build_native_claude_terminal_env(
     Build env overrides for a native Claude Code terminal process.
 
     Forces MCP Tool Search on so Claude defers MCP tool schemas and
-    loads them on demand, and disables Claude Code's agent view so the
-    terminal stays pinned to the session the Omnigent UI is showing.
+    loads them on demand, disables Claude Code's agent view so the
+    terminal stays pinned to the session the Omnigent UI is showing, and
+    disables the in-TUI feedback surveys, which a web-driven session
+    cannot see or answer (see
+    :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`).
 
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
@@ -687,11 +738,13 @@ def build_native_claude_terminal_env(
     terminal_env = {
         _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV: "true",
         _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV: "1",
+        _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV: "1",
     }
     if claude_config is not None:
         terminal_env.update(claude_config.env)
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
+        terminal_env[_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV] = "1"
     # On the apiKeyHelper path the credential reaches Claude Code via the
     # helper; a raw ANTHROPIC_API_KEY here re-triggers Claude Code's "Detected a
     # custom API key" menu, which hangs tmux delivery. Fail loud if one leaks.
@@ -1480,7 +1533,12 @@ def _fetch_external_session_id_for_redirect(
     if base_url is None:
         return None
     try:
-        with httpx.Client(base_url=base_url, headers=headers, timeout=10.0) as client:
+        with httpx.Client(
+            base_url=base_url,
+            headers=headers,
+            timeout=10.0,
+            trust_env=not is_loopback_url(base_url),
+        ) as client:
             resp = client.get(f"/v1/sessions/{url_component(session_id)}")
         if resp.status_code >= 400:
             return None
@@ -1596,7 +1654,127 @@ def _copy_transcript_with_cwd(
                     payload["cwd"] = current_text
                 if new_session_id is not None and isinstance(payload.get("sessionId"), str):
                     payload["sessionId"] = new_session_id
+                _sanitize_cloned_tool_result_record(payload)
             dst.write(json.dumps(payload, separators=(",", ":")) + "\n")
+
+
+def _sanitize_cloned_tool_result_record(payload: _JsonObject) -> None:
+    """
+    Repair image duplication in one copied transcript record, in place.
+
+    A fork clone byte-copies the source JSONL, so a record written before the
+    ``toolUseResult`` redaction fix would replay its base64 twice on the clone's
+    first ``--resume``. Two routes: content whose payload rehydrates into an
+    image block is normalized and its duplicated metadata repaired; a truncated
+    payload — which cannot rehydrate — is collapsed via
+    :func:`strip_unparseable_image_output` and its metadata rewritten from the
+    collapsed form. That second route is the only case where a record carrying
+    no recoverable payload is still touched.
+
+    :param payload: One decoded transcript record (mutated).
+    :returns: None.
+    """
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return
+    content = message.get("content")
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        inner = block.get("content")
+        if isinstance(inner, str):
+            collapsed = strip_unparseable_image_output(inner)
+            if collapsed != inner:
+                # Truncated (possibly error-prefixed) image payload: the
+                # placeholder replaces it in both content and metadata.
+                collapsed_blocks = tool_result_content_blocks(collapsed).blocks
+                if collapsed_blocks is not None:
+                    block["content"] = collapsed_blocks
+                    payload["toolUseResult"] = _json_safe_tool_use_result(collapsed)
+                    continue
+            rehydrated = tool_result_content_blocks(inner)
+        elif isinstance(inner, list):
+            rehydrated = blocks_from_parsed_list(inner)
+        else:
+            continue
+        blocks = rehydrated.blocks
+        if blocks is None:
+            continue
+        payloads = image_payloads_in_blocks(blocks)
+        if rehydrated.dropped_oversized_image and not payloads:
+            # Normalization dropped the payload for a placeholder, so there is
+            # nothing left to search the metadata for — rewrite both from it.
+            block["content"] = blocks
+            payload["toolUseResult"] = json.dumps(
+                _redact_binary_blocks(blocks), separators=(",", ":")
+            )
+            continue
+        if not payloads:
+            continue
+        block["content"] = blocks
+        _repair_cloned_tool_use_result(payload, blocks, payloads)
+
+
+#: A wrapped payload's line breaks, in every spelling they reach metadata as.
+#: Escape sequences must go as a unit — dropping the backslash alone would leave
+#: a literal ``n`` inside the payload — and the backslash run is variable because
+#: a string literal nested in another escapes each break twice.
+_WRAPPED_LINE_BREAK = re.compile(r"\\+[nrtf]")
+_LITERAL_NOISE = re.compile(r"[\\\s]+")
+
+
+def _carries_any_payload(text: str, payloads: list[str]) -> bool:
+    """
+    Whether *text* still holds one of *payloads*, in any base64 spelling.
+
+    :param text: Serialized metadata to search.
+    :param payloads: Canonical base64 payloads from the structured content.
+    :returns: True when a payload is present wrapped, unpadded, or verbatim.
+    """
+    compact = _LITERAL_NOISE.sub("", _WRAPPED_LINE_BREAK.sub("", text))
+    return any(item in compact or item.rstrip("=") in compact for item in payloads)
+
+
+def _repair_cloned_tool_use_result(
+    payload: _JsonObject,
+    blocks: list[_JsonObject],
+    payloads: list[str],
+) -> None:
+    """
+    Remove a duplicated image payload from a cloned record's metadata.
+
+    Rewritten only when the metadata still carries a payload present in the
+    structured content. Matching is spelling-insensitive: the content blocks hold
+    canonical base64 while the metadata may hold the producer's wrapped or
+    unpadded original, so an exact substring test would miss the duplicate it is
+    meant to find. A redacted passthrough is preferred; when the payload survives
+    that (a JSON string literal wrapping mixed text-plus-image, which structured
+    redaction cannot reach), the canonical redacted block list replaces it.
+
+    :param payload: The transcript record (mutated).
+    :param blocks: The normalized image-bearing content blocks.
+    :param payloads: Base64 payloads present in *blocks*.
+    :returns: None.
+    """
+    tool_use_result = payload.get("toolUseResult")
+    if isinstance(tool_use_result, str):
+        result_text = tool_use_result
+    elif isinstance(tool_use_result, (dict, list)):
+        result_text = json.dumps(tool_use_result)
+    else:
+        return
+    if not _carries_any_payload(result_text, payloads):
+        return
+    if isinstance(tool_use_result, str):
+        candidate: object = _json_safe_tool_use_result(tool_use_result)
+    else:
+        candidate = _redact_binary_blocks(tool_use_result)
+    candidate_text = candidate if isinstance(candidate, str) else json.dumps(candidate)
+    if _carries_any_payload(candidate_text, payloads):
+        candidate = json.dumps(_redact_binary_blocks(blocks), separators=(",", ":"))
+    payload["toolUseResult"] = candidate
 
 
 def _clone_claude_transcript(
@@ -1891,15 +2069,18 @@ def _ucode_config_for_profile(
     env: dict[str, str] = {
         _UCODE_CLAUDE_BASE_URL_ENV: base_url,
         _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV: str(refresh_interval_ms),
+        # This path always launches in gateway mode (CLAUDE_CODE_USE_GATEWAY=1),
+        # in which Claude Code negotiates the anthropic-beta set with the gateway
+        # rather than sending every flag blindly — so we do NOT disable
+        # experimental betas here. Disabling them also turns off MCP tool search
+        # (it rides on ``advanced-tool-use``), which reloads every MCP tool
+        # schema eagerly and inflates the context window. The Databricks gateway
+        # now accepts the flags Claude Code sends under CLAUDE_CODE_USE_GATEWAY=1
+        # (advanced-tool-use / prompt-caching-scope / advisor-tool), so the
+        # earlier ``CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`` workaround for
+        # 400 "invalid beta flag" is no longer needed on this path.
         _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
         _CLAUDE_CODE_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
-        # The gateway allowlists beta flags and 400s the whole request
-        # ("invalid beta flag") on one it does not know, failing the turn
-        # rather than the feature. This env var is the only client-side way to
-        # drop them: the CLI computes ``anthropic-beta`` itself and ignores
-        # ANTHROPIC_CUSTOM_HEADERS. Tool search rides on a rejected flag
-        # (``advanced-tool-use``), so it was never reachable here anyway.
-        _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1",
     }
     # Pin each Claude Code model-tier alias to the corresponding Databricks
     # gateway model ID so that the /model picker natively shows gateway model
@@ -2160,7 +2341,13 @@ def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcode
             _ANTHROPIC_BEDROCK_BASE_URL_ENV: family.base_url,
             _AWS_BEARER_TOKEN_BEDROCK_ENV: token,
             _CLAUDE_CODE_USE_BEDROCK_ENV: "1",
-            _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1",
+            # Disable beta flags gateways reject (400 "invalid beta flag");
+            # skip when CLAUDE_CODE_USE_GATEWAY=1 to keep tool search enabled.
+            **(
+                {_CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1"}
+                if os.environ.get("CLAUDE_CODE_USE_GATEWAY") != "1"
+                else {}
+            ),
         },
         # No apiKeyHelper: Bedrock mode authenticates from the env token above.
         model=family.default_model,
@@ -2975,9 +3162,11 @@ async def _is_terminal_resource_gone(
         f"/v1/sessions/{url_component(session_id)}"
         f"/resources/terminals/{url_component(terminal_id)}"
     )
+    from omnigent.cli_auth import open_server_client
+
     try:
-        async with httpx.AsyncClient(
-            base_url=base_url,
+        async with open_server_client(
+            base_url,
             headers=headers,
             timeout=httpx.Timeout(timeout_s),
         ) as client:
@@ -3077,9 +3266,11 @@ async def _close_claude_terminal(
         f"/v1/sessions/{url_component(session_id)}"
         f"/resources/terminals/{url_component(terminal_id)}"
     )
+    from omnigent.cli_auth import open_server_client
+
     with contextlib.suppress(Exception):
-        async with httpx.AsyncClient(
-            base_url=base_url, headers=headers, timeout=httpx.Timeout(10.0)
+        async with open_server_client(
+            base_url, headers=headers, timeout=httpx.Timeout(10.0)
         ) as client:
             await client.delete(path)
 
@@ -3217,29 +3408,37 @@ async def _prepare_claude_terminal_via_daemon(
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     persist_args = list(_strip_resume_from_claude_args(claude_args))
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    async with open_daemon_client(base_url, headers, host_id, timeout=timeout) as client:
         startup_profiler.mark("daemon prepare http client ready")
         # Resuming an existing session must not re-close its terminal on
         # exit; a fresh launch owns teardown.
         reattached = session_id is not None
+        fresh_session = session_id is None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Claude session requires a session bundle.")
+            # Session creation (POST /v1/sessions, ~2s), daemon tunnel
+            # start (~2s), and host-online polling (~0.2s) are mutually
+            # independent — run all three concurrently so they collapse to
+            # max(session_create, daemon_start) instead of their sum.
             _mark_startup_step(
                 startup_profiler,
-                "creating daemon claude session",
+                "creating daemon claude session and waiting for host online",
                 startup_progress=startup_progress,
                 progress_message="Creating Claude session...",
             )
-            session_id = await _create_claude_session(
-                client,
-                session_bundle,
-                bridge_id=None,
-                terminal_launch_args=persist_args or None,
+            session_id, _ = await asyncio.gather(
+                _create_claude_session(
+                    client,
+                    session_bundle,
+                    bridge_id=None,
+                    terminal_launch_args=persist_args or None,
+                ),
+                wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
             _mark_startup_step(
                 startup_profiler,
-                "daemon claude session created",
+                "daemon claude session created and host online",
                 startup_progress=startup_progress,
             )
         elif persist_args:
@@ -3261,17 +3460,30 @@ async def _prepare_claude_terminal_via_daemon(
                 "resume launch args persisted",
                 startup_progress=startup_progress,
             )
-        _mark_startup_step(
-            startup_profiler,
-            "waiting for host online",
-            startup_progress=startup_progress,
-        )
-        await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
-        _mark_startup_step(
-            startup_profiler,
-            "host online",
-            startup_progress=startup_progress,
-        )
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for host online",
+                startup_progress=startup_progress,
+            )
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+            _mark_startup_step(
+                startup_profiler,
+                "host online",
+                startup_progress=startup_progress,
+            )
+        else:
+            # Resume with no new flags: just wait for the host.
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for host online",
+                startup_progress=startup_progress,
+            )
+            await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
+            _mark_startup_step(
+                startup_profiler,
+                "host online",
+                startup_progress=startup_progress,
+            )
         _mark_startup_step(
             startup_profiler,
             "launching or reusing daemon runner",
@@ -3283,6 +3495,7 @@ async def _prepare_claude_terminal_via_daemon(
             host_id=host_id,
             session_id=session_id,
             workspace=workspace,
+            fresh=fresh_session,
         )
         _mark_startup_step(
             startup_profiler,
@@ -3290,27 +3503,30 @@ async def _prepare_claude_terminal_via_daemon(
             startup_progress=startup_progress,
             detail=f"runner={runner_id}",
         )
-        _mark_startup_step(
-            startup_profiler,
-            "waiting for runner online",
-            startup_progress=startup_progress,
-            progress_message="Waiting for runner...",
-        )
-        await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
-        _mark_startup_step(
-            startup_profiler,
-            "daemon runner online",
-            startup_progress=startup_progress,
-        )
         if reattached:
+            # Resume: runner must be online before we ask it to ensure the
+            # terminal (the POST goes to the runner via the server relay).
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for runner online",
+                startup_progress=startup_progress,
+                progress_message="Waiting for runner...",
+            )
+            await wait_for_runner_online(
+                client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S
+            )
+            _mark_startup_step(
+                startup_profiler,
+                "daemon runner online",
+                startup_progress=startup_progress,
+            )
             # Resume onto an already-online daemon runner reuses it without
             # re-running the session-start auto-create, so a runner whose
             # terminal was torn down (e.g. after a ``-p`` one-shot) comes
             # back terminal-less and the wait below would time out. Ask the
             # runner to ensure the claude terminal: idempotent (returns the
             # live one if present) and otherwise auto-creates it with cold
-            # resume so history is restored. A fresh launch already creates
-            # it on session-start, so this is only needed when reattaching.
+            # resume so history is restored.
             _mark_startup_step(
                 startup_profiler,
                 "ensuring resumed terminal on runner",
@@ -3323,15 +3539,37 @@ async def _prepare_claude_terminal_via_daemon(
                 "resumed terminal ensure requested",
                 startup_progress=startup_progress,
             )
-        _mark_startup_step(
-            startup_profiler,
-            "waiting for claude terminal ready",
-            startup_progress=startup_progress,
-            progress_message="Starting Claude terminal...",
-        )
-        terminal_id = await _wait_for_claude_terminal_ready(
-            client, session_id, timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S
-        )
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for claude terminal ready",
+                startup_progress=startup_progress,
+                progress_message="Starting Claude terminal...",
+            )
+            terminal_id = await _wait_for_claude_terminal_ready(
+                client, session_id, timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S
+            )
+        else:
+            # Fresh launch: the runner auto-creates the terminal on session-start,
+            # so runner-online and terminal-ready are sequential from the runner's
+            # side but independent from the CLI's perspective — the terminal poll
+            # returns None (404) until the runner creates it. Run both concurrently:
+            # wait_for_runner_online provides the fail-fast dead-runner signal;
+            # _wait_for_claude_terminal_ready drives to completion. The gather
+            # propagates any runner failure immediately, cancelling the terminal wait.
+            _mark_startup_step(
+                startup_profiler,
+                "waiting for runner online and claude terminal ready",
+                startup_progress=startup_progress,
+                progress_message="Starting Claude terminal...",
+            )
+            _, terminal_id = await asyncio.gather(
+                wait_for_runner_online(
+                    client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S
+                ),
+                _wait_for_claude_terminal_ready(
+                    client, session_id, timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S
+                ),
+            )
         _mark_startup_step(
             startup_profiler,
             "claude terminal ready",
@@ -3394,12 +3632,16 @@ def _run_with_remote_server(
     :returns: None.
     """
     from omnigent.chat import _bundle_agent, _remote_headers, _server_auth
-    from omnigent.cli import _ensure_host_daemon
     from omnigent.host.identity import load_or_create_host_identity
 
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
+    # This machine's host id keys the WebSocket attach handshake (and its
+    # reconnects) to the replica holding the runner's tunnel. A browser WS can't
+    # set request headers, but the CLI can, so this rides the header — the
+    # builder emits it only on a host-sharded deployment.
+    host_id = load_or_create_host_identity().host_id
     startup_profiler.mark("remote headers resolving")
-    headers = _remote_headers(server_url=base_url)
+    headers = _remote_headers(server_url=base_url, host_id=host_id)
     startup_profiler.mark("remote headers resolved")
     # ``headers`` carries the bearer for the WebSocket attach handshake
     # (refreshed in place by ``_recover``). For HTTP requests we additionally
@@ -3407,7 +3649,7 @@ def _run_with_remote_server(
     # long-lived transcript-forwarder client survives the ~1h Databricks
     # OAuth token TTL.
     startup_profiler.mark("remote auth resolving")
-    forwarder_auth = _server_auth(server_url=base_url)
+    forwarder_auth = _server_auth(server_url=base_url, session_id=None)
     startup_profiler.mark("remote auth resolved")
     prepared: PreparedClaudeTerminal | None = None
     # Bound before the attach call so the ``finally`` can read it even
@@ -3446,22 +3688,6 @@ def _run_with_remote_server(
                     startup_progress=progress,
                 )
 
-            # Ensure the connect daemon is up for this server, then route the
-            # runner launch through it. The runner the daemon spawns brings
-            # up the Claude terminal itself, so the CLI just waits and
-            # attaches.
-            _mark_startup_step(
-                startup_profiler,
-                "ensuring host daemon",
-                startup_progress=progress,
-                progress_message="Connecting to local daemon...",
-            )
-            _ensure_host_daemon(base_url)
-            _mark_startup_step(
-                startup_profiler,
-                "host daemon ready",
-                startup_progress=progress,
-            )
             host_id = load_or_create_host_identity().host_id
             _mark_startup_step(
                 startup_profiler,
@@ -3539,7 +3765,7 @@ def _run_with_remote_server(
             daemon-spawned runner died, the server relaunches it on the
             next message (host-bound auto-relaunch).
             """
-            new_headers = _remote_headers(server_url=base_url)
+            new_headers = _remote_headers(server_url=base_url, host_id=host_id)
             headers.clear()
             headers.update(new_headers)
 
@@ -3621,7 +3847,9 @@ async def _prepare_claude_terminal(
     """
     startup_profiler = startup_profiler or StartupProfiler(name="omnigent claude", enabled=False)
     timeout = httpx.Timeout(30.0, read=120.0)
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(base_url, headers=headers, timeout=timeout) as client:
         startup_profiler.mark("prepare http client ready")
         cold_resume_args: tuple[str, ...] = ()
         # Cold resume = session existed but no live terminal. Even when
@@ -4201,6 +4429,13 @@ def _claude_transcript_record_from_session_item(
     """
     Convert one Omnigent item into one Claude transcript record.
 
+    No ``message.model`` is emitted. An item's wire ``model`` is the
+    Omnigent *agent* name (``MessageData.agent`` serializes under that
+    alias), e.g. ``"claude-native-ui"`` — not a Claude model id. Copying
+    it through made ``--resume`` report "Session model … could not be
+    restored" and silently fall back to another model; omitting it lets
+    Claude keep its configured one.
+
     :param item: Flat Omnigent item dict, e.g.
         ``{"type": "function_call", "name": "Read", ...}``.
     :param session_id: Claude-native session id for the transcript,
@@ -4234,9 +4469,6 @@ def _claude_transcript_record_from_session_item(
                 return None
             record_type = "assistant"
             message = {"role": "assistant", "content": assistant_content}
-            model = item.get("model")
-            if isinstance(model, str) and model:
-                message["model"] = model
         else:
             return None
     elif item_type == "function_call":
@@ -4258,9 +4490,6 @@ def _claude_transcript_record_from_session_item(
                 }
             ],
         }
-        model = item.get("model")
-        if isinstance(model, str) and model:
-            message["model"] = model
     elif item_type == "function_call_output":
         call_id = item.get("call_id")
         if not isinstance(call_id, str) or not call_id:
@@ -4276,13 +4505,14 @@ def _claude_transcript_record_from_session_item(
         # wedging compaction. Collapse only that truncated case to a
         # placeholder, so both the tool_result content and the toolUseResult
         # metadata stay small while intact images still resume as images.
-        output = _strip_unparseable_image_output(output)
+        output = strip_unparseable_image_output(output)
         record_type = "user"
         # Image (and other structured) tool results are persisted as a
         # stringified content-block array. Rehydrate them into real blocks
         # so ``claude --resume`` sends screenshots as images — not as ~250K
         # tokens of base64 text — and the model actually sees them again.
-        content_blocks = _claude_tool_result_content_blocks(output)
+        rehydrated = tool_result_content_blocks(output)
+        content_blocks = rehydrated.blocks
         tool_result_content: str | list[_JsonObject] = (
             content_blocks if content_blocks is not None else output
         )
@@ -4296,7 +4526,9 @@ def _claude_transcript_record_from_session_item(
                 }
             ],
         }
-        extra["toolUseResult"] = _json_safe_tool_use_result(output)
+        extra["toolUseResult"] = _tool_use_result_for_content(
+            output, content_blocks, rehydrated.dropped_oversized_image
+        )
     else:
         return None
     return {
@@ -4475,6 +4707,55 @@ def _json_object_from_string(value: object) -> _JsonObject:
     return _json_object(parsed) or {}
 
 
+def _redact_binary_blocks(value: object) -> object:
+    """
+    Replace inline binary payloads with the ``toolUseResult`` marker.
+
+    :returns: A copy with base64 payloads redacted.
+    """
+    return redact_binary_payloads(value, _tool_use_result_payload_omitted)
+
+
+def _tool_use_result_for_content(
+    output: str,
+    content_blocks: list[_JsonObject] | None,
+    dropped_oversized_image: bool = False,
+) -> str:
+    """
+    Build the ``toolUseResult`` metadata for one rebuilt tool result.
+
+    An image-bearing result uses the redacted block list, so the base64 exists
+    exactly once in the record — in the ``tool_result`` content the model
+    re-sees. A dropped oversized payload uses it too, since the raw passthrough
+    would still carry base64 that shape-keyed redaction cannot reach. Image-free
+    results keep the byte-for-byte passthrough.
+
+    :param output: The persisted tool-result string.
+    :param content_blocks: Rehydrated blocks, or ``None`` when the
+        output is not a recognized block shape.
+    :param dropped_oversized_image: True when normalization replaced an
+        oversized unconvertible image payload with a placeholder.
+    :returns: A JSON-parseable string for the record's
+        ``toolUseResult`` field.
+    """
+    if content_blocks is None:
+        return _json_safe_tool_use_result(output)
+    if image_payloads_in_blocks(content_blocks) or dropped_oversized_image:
+        return json.dumps(_redact_binary_blocks(content_blocks), separators=(",", ":"))
+    return _json_safe_tool_use_result(output)
+
+
+def _tool_use_result_payload_omitted(media_type: str, _payload_length: int) -> str:
+    """
+    Build the marker written over a redacted ``toolUseResult`` payload.
+
+    :param media_type: The block's declared media type, if any.
+    :returns: The replacement text.
+    """
+    label = media_type or "binary"
+    return f"[{label} payload omitted from toolUseResult; kept in the tool_result content]"
+
+
 def _json_safe_tool_use_result(output: str) -> str:
     """
     Return a ``toolUseResult`` value Claude Code can ``JSON.parse``.
@@ -4486,11 +4767,21 @@ def _json_safe_tool_use_result(output: str) -> str:
     before the input prompt renders — so the whole resume fails and the
     first web-UI message is never delivered.
 
-    Outputs that are already JSON (e.g. an image content-block array)
-    pass through verbatim; anything else is wrapped as a JSON string
-    literal so the parse always succeeds. The plain-text output still
-    lives verbatim in the ``tool_result`` content block, so this does
-    not change what the model or the web UI sees.
+    Outputs that are already JSON pass through verbatim; anything else
+    is wrapped as a JSON string literal so the parse always succeeds.
+    The plain-text output still lives verbatim in the ``tool_result``
+    content block, so this does not change what the model or the web UI
+    sees.
+
+    One exception to the verbatim passthrough: inline binary payloads
+    (base64 ``image``/``document``/``file`` blocks and ``data:`` URIs)
+    are replaced with a short marker. The ``tool_result`` content block
+    already carries that payload once — the image the model re-sees — so
+    the metadata copy is pure duplication: a single intact screenshot
+    would otherwise double its ~250K-token base64 in the resumed
+    transcript. Redaction keys on the payload *shape*, so any tool or
+    MCP server returning inline image data is covered; non-binary JSON
+    structure, text, and renderer metadata are preserved.
 
     :param output: The tool result string synthesized for the
         transcript, e.g. ``"<retrieval_status>timeout</...>"`` or
@@ -4499,74 +4790,13 @@ def _json_safe_tool_use_result(output: str) -> str:
         ``toolUseResult`` field.
     """
     try:
-        json.loads(output)
-    except (json.JSONDecodeError, ValueError):
-        return json.dumps(output)
-    return output
-
-
-def _strip_unparseable_image_output(output: str) -> str:
-    """Collapse a truncated/corrupt base64 image tool result to a placeholder.
-
-    Intact image outputs (valid JSON) are returned unchanged so the caller can
-    rehydrate them into real image blocks for ``--resume``. Only a payload that
-    *looks* like an image but no longer parses as JSON — the shape produced when
-    the conversation store clipped it at its byte cap — is replaced with a short
-    placeholder, so the corrupt ~250K-char base64 is never sent as prompt text.
-
-    :param output: The persisted tool-result string.
-    :returns: The original string, or a placeholder JSON array when the output
-        is an unparseable image payload.
-    """
-    stripped = output.lstrip()
-    if stripped[:1] not in ("[", "{") or '"image"' not in output or '"base64"' not in output:
-        return output
-    try:
-        json.loads(output)
-    except (json.JSONDecodeError, ValueError):
-        from omnigent.runtime.prompt import _image_omitted_placeholder
-
-        placeholder = {"type": "text", "text": _image_omitted_placeholder(None)}
-        return json.dumps([placeholder], separators=(",", ":"))
-    return output
-
-
-def _claude_tool_result_content_blocks(output: str) -> list[_JsonObject] | None:
-    """
-    Rehydrate a stringified content-block array into real blocks.
-
-    Tool results that return image content are persisted as a JSON *string*
-    like ``'[{"type":"image","source":{...}}]'``. Passing that string
-    straight into a ``tool_result`` content block makes ``claude --resume``
-    send the base64 to the API as plain text — a single screenshot balloons
-    to ~250K text tokens instead of the ~1.5K an image block costs, which is
-    what pushes a resumed conversation over the context limit.
-
-    Only ``text`` and ``image`` blocks are rehydrated: those are the block
-    types the API accepts inside a ``tool_result``. Anything else (plain
-    text, or a JSON array of some other shape) stays a raw string so the
-    resume request keeps sending exactly what it did before.
-
-    :param output: The persisted tool-result string, e.g.
-        ``'[{"type":"image","source":{"type":"base64","data":"..."}}]'``
-        or plain text like ``"file written"``.
-    :returns: A list of content blocks when *output* parses to a non-empty
-        list of ``text``/``image`` block dicts; ``None`` otherwise, so the
-        caller keeps the raw string as the block content.
-    """
-    try:
         parsed = json.loads(output)
     except (json.JSONDecodeError, ValueError):
-        return None
-    if not isinstance(parsed, list) or not parsed:
-        return None
-    blocks: list[_JsonObject] = []
-    for value in parsed:
-        block = _json_object(value)
-        if block is None or block.get("type") not in ("text", "image"):
-            return None
-        blocks.append(block)
-    return blocks
+        return json.dumps(output)
+    redacted = _redact_binary_blocks(parsed)
+    if redacted != parsed:
+        return json.dumps(redacted, separators=(",", ":"))
+    return output
 
 
 def _preflight_local_tools(command: str) -> None:

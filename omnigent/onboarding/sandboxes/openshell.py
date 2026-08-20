@@ -429,7 +429,7 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         supervisor along with the host, which no in-sandbox loop can survive.
         """
         script = supervise_host_command(command)
-        bg_command = f"{script} > {log_path} 2>&1 < /dev/null"
+        bg_command = f"{script} >> {log_path} 2>&1 < /dev/null"
         self._openshell().exec_background(
             sandbox_id, ["bash", "-lc", bg_command], timeout=_FOREGROUND_TIMEOUT_S
         )

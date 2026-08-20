@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
 import type { Host } from "@/hooks/useHosts";
-import { useHosts } from "@/hooks/useHosts";
+import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
@@ -265,6 +265,14 @@ beforeEach(() => {
   // left behind by an unmounting test doesn't seed the next one.
   resetLandingDraft();
   localStorage.clear();
+  vi.mocked(useHostModelOptions).mockReturnValue({
+    data: [
+      { id: "opus", displayName: "Opus" },
+      { id: "sonnet", displayName: "Sonnet" },
+      { id: "haiku", displayName: "Haiku" },
+    ],
+    isLoading: false,
+  } as unknown as ReturnType<typeof useHostModelOptions>);
   // Seed host_1's recent so the working directory pre-fills deterministically
   // (the create body must carry SEEDED_WORKSPACE through).
   localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [SEEDED_WORKSPACE] }));
@@ -937,6 +945,69 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.terminal_launch_args).toBeUndefined();
   });
 
+  it("posts --dangerously-skip-permissions when the bypass is picked for antigravity-native", async () => {
+    setAgents([
+      agent({ id: "ag_agy", name: "antigravity-native-ui", display_name: "Antigravity" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_agy" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_agy");
+    pickSelectOption("new-chat-landing-config-agy-skip", "Skip permissions");
+    saveConfig();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    // agy's ONLY pre-emptive control, as a bare single token. Claude's
+    // `["--permission-mode", ...]` pair would be rejected by agy, which has no
+    // such flag — so assert the exact spelling, not merely "some args".
+    expect(body.terminal_launch_args).toEqual(["--dangerously-skip-permissions"]);
+  });
+
+  it("omits terminal_launch_args when antigravity-native permissions are left at default", async () => {
+    setAgents([
+      agent({ id: "ag_agy", name: "antigravity-native-ui", display_name: "Antigravity" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_agy" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    // Anchor so the absence check is not vacuous against a malformed body.
+    expect(body.labels?.["omnigent.wrapper"]).toBe("antigravity-native-ui");
+    // Untouched → agy keeps its own request-review prompt.
+    expect(body.terminal_launch_args).toBeUndefined();
+  });
+
+  it("shows a danger banner while the antigravity-native bypass is selected", async () => {
+    setAgents([
+      agent({ id: "ag_agy", name: "antigravity-native-ui", display_name: "Antigravity" }),
+    ]);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_agy");
+    // agy exposes no firing pre-tool hook, so Omnigent cannot re-gate tools
+    // once this is armed — the banner is the only guardrail the user gets.
+    expect(screen.queryByTestId("new-chat-landing-agy-skip-banner")).toBeNull();
+    pickSelectOption("new-chat-landing-config-agy-skip", "Skip permissions");
+    expect(screen.getByTestId("new-chat-landing-agy-skip-banner")).toBeTruthy();
+  });
+
   it("omits model + effort on create when the picker is untouched for claude-native", async () => {
     setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
@@ -982,6 +1053,62 @@ describe("NewChatLandingScreen create flow", () => {
     const body = JSON.parse(init.body as string);
     expect(body.model_override).toBe("opus");
     expect(body.reasoning_effort).toBe("high");
+  });
+
+  it("rides an omni-setup model along to create for pi-native", async () => {
+    setAgents([
+      agent({
+        id: "ag_pi",
+        name: "pi-native-ui",
+        display_name: "Pi",
+        harness: "pi-native",
+      }),
+    ]);
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        {
+          id: "omnigent-openai/system.ai.gpt-5-6-sol",
+          model: "omnigent-openai/system.ai.gpt-5-6-sol",
+          displayName: "GPT 5.6 Sol",
+        },
+        {
+          id: "omnigent/databricks-claude-sonnet-4-6",
+          model: "omnigent/databricks-claude-sonnet-4-6",
+          displayName: "Claude Sonnet 4.6",
+        },
+      ],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useHostModelOptions>);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_pi" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_pi");
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-model"));
+    const fullNameRow = document.querySelector(
+      '[data-model-id="omnigent-openai/system.ai.gpt-5-6-sol"]',
+    );
+    expect(fullNameRow).not.toBeNull();
+    expect(fullNameRow).toHaveAttribute("title", "GPT 5.6 Sol");
+    fireEvent.change(screen.getByTestId("new-chat-landing-config-model-search"), {
+      target: { value: "gpt sol" },
+    });
+    expect(screen.getByText("GPT 5.6 Sol")).toBeInTheDocument();
+    expect(screen.queryByText("Claude Sonnet 4.6")).toBeNull();
+    fireEvent.click(screen.getByText("GPT 5.6 Sol"));
+    saveConfig();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBe("omnigent-openai/system.ai.gpt-5-6-sol");
+    expect(body.reasoning_effort).toBeUndefined();
+    expect(body.labels?.["omnigent.wrapper"]).toBe("pi-native-ui");
   });
 
   it("seeds the model + effort from the last pick for claude-native on a new session", async () => {

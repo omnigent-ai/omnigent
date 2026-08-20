@@ -22,6 +22,12 @@ import { codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences
 const CARD_LIGHT = "#ffffff";
 const CARD_DARK = "#131517";
 
+// WebSocket close codes (RFC 6455 reserves 4xxx).
+// 4400 signals wrong-replica routing: the keyed request reached the wrong
+// replica (the ``?omnigent_slice_key=`` doesn't match where the tunnel lives).
+// Mirrors ``ws_bridge.py`` ``WS_CLOSE_WRONG_REPLICA``.
+export const WS_CLOSE_WRONG_REPLICA = 4400;
+
 /**
  * Return an xterm `ITheme` object matched to the app's light or dark palette.
  */
@@ -664,6 +670,16 @@ export class TerminalSession {
    */
   setTheme(isDark: boolean): void {
     this.term.options.theme = terminalTheme(isDark);
+  }
+
+  /**
+   * Give the terminal keyboard focus. The WS-open handler focuses
+   * automatically, but that call is a browser no-op while the surface is
+   * hidden (a pre-warmed attach behind the chat view), so the view calls
+   * this when the surface is revealed.
+   */
+  focus(): void {
+    this.term.focus();
   }
 
   /**

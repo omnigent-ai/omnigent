@@ -279,3 +279,72 @@ describe("MainTerminalView — native wrapper sessions", () => {
     expect(setView).toHaveBeenCalledWith("chat");
   });
 });
+
+describe("MainTerminalView — persistent hidden mount", () => {
+  it("keeps the terminal mounted (same instance) across a hide/show flip", () => {
+    // ChatPage keeps this surface mounted as a hidden overlay while the
+    // user is in chat. A new data-instance after the round-trip means
+    // the flip tore down the xterm + WS it exists to preserve.
+    const { rerender } = renderView({ terminals: [REPL_TERMINAL] });
+    const view = screen.getByTestId("terminal-view");
+    const instance = view.getAttribute("data-instance");
+    expect(screen.getByTestId("main-terminal-view")).toHaveAttribute("data-visible", "true");
+
+    rerender(
+      <TerminalFirstContextProvider value={makeCtx(false)}>
+        <MainTerminalView
+          conversationId="conv_sdk"
+          initialTerminalKey={null}
+          visible={false}
+          readOnly={false}
+        />
+      </TerminalFirstContextProvider>,
+    );
+    expect(screen.getByTestId("main-terminal-view")).toHaveAttribute("data-visible", "false");
+    expect(screen.getByTestId("terminal-view").getAttribute("data-instance")).toBe(instance);
+
+    rerender(
+      <TerminalFirstContextProvider value={makeCtx(false)}>
+        <MainTerminalView
+          conversationId="conv_sdk"
+          initialTerminalKey={null}
+          visible
+          readOnly={false}
+        />
+      </TerminalFirstContextProvider>,
+    );
+    expect(screen.getByTestId("terminal-view").getAttribute("data-instance")).toBe(instance);
+  });
+
+  it("resets a shell selection to the agent terminal while hidden", () => {
+    // Open on a rail shell, then close the view (AppShell nulls the
+    // target key when the view closes). The old unmount-on-close forgot
+    // the shell selection, so reopening always showed the agent pane —
+    // the persistent mount must reproduce that.
+    const { rerender } = renderView({
+      terminals: [REPL_TERMINAL, BASH_SHELL],
+      initialTerminalKey: "terminal:terminal_bash_s1",
+    });
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute(
+      "data-terminal-id",
+      "terminal_bash_s1",
+    );
+
+    rerender(
+      <TerminalFirstContextProvider value={makeCtx(false)}>
+        <MainTerminalView
+          conversationId="conv_sdk"
+          initialTerminalKey={null}
+          visible={false}
+          readOnly={false}
+        />
+      </TerminalFirstContextProvider>,
+    );
+    // The hidden background attach now targets the agent terminal — the
+    // pane the next open will actually show.
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute(
+      "data-terminal-id",
+      "terminal_tui_main",
+    );
+  });
+});

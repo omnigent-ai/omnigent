@@ -169,9 +169,10 @@ export function AddAgentDialog({
           <Button
             data-testid="add-agent-submit"
             onClick={handleAdd}
-            disabled={selectedAgent === null || !name.trim() || submitting}
+            loading={submitting}
+            disabled={selectedAgent === null || !name.trim()}
           >
-            {submitting ? "Adding…" : "Add"}
+            Add
           </Button>
         </DialogFooter>
       </DialogContent>

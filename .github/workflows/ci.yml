@@ -188,7 +188,7 @@ jobs:
       - name: Install dependencies
         # matrix.extra (e.g. "databricks") adds an extra for lanes that need it;
         # empty for the default lanes.
-        run: uv sync --locked --extra all --extra dev ${{ matrix.extra && format('--extra {0}', matrix.extra) || '' }}
+        run: uv sync --locked --extra all --group test ${{ matrix.extra && format('--extra {0}', matrix.extra) || '' }}
 
       - name: Run pytest
         shell: bash
@@ -266,7 +266,7 @@ jobs:
         with:
           enable-cache: true
       - name: Install dependencies
-        run: uv sync --locked --extra all --extra dev --extra databricks
+        run: uv sync --locked --extra all --group test --extra databricks
       - name: Run store + DB tests against PostgreSQL
         env:
           OMNIGENT_TEST_DB_URI: postgresql+psycopg://postgres:omnigent@localhost:5432/omnigent_root
@@ -314,7 +314,7 @@ jobs:
       - name: Install system MySQL client library
         run: sudo apt-get update -qq && sudo apt-get install -y -q libmysqlclient-dev
       - name: Install dependencies
-        run: uv sync --locked --extra all --extra dev --extra databricks && uv pip install mysqlclient
+        run: uv sync --locked --extra all --group test --extra databricks && uv pip install mysqlclient
       - name: Run store + DB tests against MySQL
         env:
           OMNIGENT_TEST_DB_URI: mysql+mysqldb://root:omnigent@127.0.0.1:3306/omnigent_root
@@ -389,7 +389,7 @@ jobs:
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install dependencies
-        run: uv sync --locked --extra all --extra dev
+        run: uv sync --locked --extra all --group test
 
       - name: Build parity sidecar
         if: steps.sidecar-cache.outputs.cache-hit != 'true'

@@ -163,3 +163,59 @@ export function parseAskUserQuestionPreview(preview: string): AskUserQuestionPay
   if (questions.length === 0) return null;
   return { questions };
 }
+
+/**
+ * Plan markdown from an ExitPlanMode elicitation's ``exit_plan_mode``
+ * extra, or ``null``.
+ *
+ * The server rides the whole ``tool_input`` through verbatim; a usable
+ * plan card needs the ``plan`` markdown string. Anything else falls
+ * back to the binary approval card.
+ */
+export function exitPlanModePlan(raw: Record<string, unknown> | null | undefined): string | null {
+  if (!raw) return null;
+  const plan = raw.plan;
+  return typeof plan === "string" && plan ? plan : null;
+}
+
+/**
+ * Whether an elicitation ASKS THE USER — a question to answer or a plan
+ * to review — rather than requesting approval to run something.
+ *
+ * Answering one is the user's own contribution to the conversation, so
+ * these cards are turn boundaries: the walker splits the assistant
+ * bubble at them, keeping the card outside the "Worked for" fold and
+ * opening a new one for the work that follows the answer. Approval
+ * cards stay part of the turn's work and fold with it.
+ */
+export function isUserInputElicitation(elicitation: {
+  askUserQuestion?: Record<string, unknown> | null;
+  exitPlanMode?: Record<string, unknown> | null;
+  contentPreview: string;
+}): boolean {
+  return userInputElicitationKey(elicitation) !== null;
+}
+
+/**
+ * Stable identity of what a question / plan card asked, or ``null`` when
+ * the elicitation asks for approval instead.
+ *
+ * A card that arrived live and the one history rebuilds from the same
+ * persisted tool call carry different elicitation ids — the live id is
+ * minted per prompt and never persisted — so a merge that sees both
+ * copies pairs them on the questions (or the plan) instead.
+ */
+export function userInputElicitationKey(elicitation: {
+  askUserQuestion?: Record<string, unknown> | null;
+  exitPlanMode?: Record<string, unknown> | null;
+  contentPreview: string;
+}): string | null {
+  const questions =
+    castAskUserQuestionPayload(elicitation.askUserQuestion) ??
+    parseAskUserQuestionPreview(elicitation.contentPreview);
+  if (questions !== null) {
+    return `questions:${JSON.stringify(questions.questions.map((q) => q.question))}`;
+  }
+  const plan = exitPlanModePlan(elicitation.exitPlanMode);
+  return plan === null ? null : `plan:${plan}`;
+}

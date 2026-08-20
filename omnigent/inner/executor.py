@@ -229,6 +229,16 @@ class ToolCallComplete(ExecutorEvent):
 
 
 @dataclass
+class CompactionStarted(ExecutorEvent):
+    """The harness detected that compaction is about to begin.
+
+    Emitted as soon as the compaction signal is received, before the
+    compacted state is available.  Allows clients to show a progress
+    indicator while compaction is in flight.
+    """
+
+
+@dataclass
 class CompactionComplete(ExecutorEvent):
     """The harness compacted its internal context.
 

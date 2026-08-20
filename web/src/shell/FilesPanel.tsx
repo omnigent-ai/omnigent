@@ -12,15 +12,22 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
+import { useSession } from "@/hooks/useSession";
+import { isOwnerLevel } from "@/lib/permissionsApi";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
 import {
+  PathUnreachableError,
+  joinBrowseLocation,
+  relativizeToWorkspace,
   useWorkspaceChangedFiles,
   useWorkspaceAllFiles,
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
+import { BrowseLocationBar } from "./BrowseLocationBar";
+import { CopyPathButton } from "./CopyPathButton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   DropdownMenu,
@@ -107,7 +114,9 @@ function HiddenFilesToggle({
             )}
             onClick={onToggle}
           >
-            {showHidden ? <EyeOffIcon className={iconSize} /> : <EyeIcon className={iconSize} />}
+            {/* The icon shows the current state, not the action: a plain eye
+                means hidden files are visible, a slashed eye means they are not. */}
+            {showHidden ? <EyeIcon className={iconSize} /> : <EyeOffIcon className={iconSize} />}
           </button>
         </TooltipTrigger>
         <TooltipContent side="bottom">{tooltipLabel}</TooltipContent>
@@ -256,13 +265,66 @@ export function FilesPanel({
   const changedQuery = useWorkspaceChangedFiles(conversationId, {
     enabled: true,
   });
-  const allFilesQuery = useWorkspaceAllFiles(conversationId, {
-    enabled: !flatView,
-  });
   const envQuery = useWorkspaceEnvironment(conversationId, {
     enabled: true,
   });
-  const workingDir = envQuery.data?.root ?? null;
+  const workspaceRoot = envQuery.data?.root ?? null;
+  // The picker browses the host's filesystem, the same source the new-session
+  // workspace chip uses.
+  const { session } = useSession(conversationId);
+  // Absolute path currently browsed. Null tracks the workspace root, so the
+  // panel keeps opening there and a session switch never strands the user in
+  // a directory belonging to the session they just left.
+  const [browseLocation, setBrowseLocation] = useState<string | null>(null);
+  const [browseError, setBrowseError] = useState<string | null>(null);
+  useEffect(() => {
+    setBrowseLocation(null);
+    setBrowseError(null);
+  }, [conversationId]);
+  const workingDir = browseLocation ?? workspaceRoot;
+  // The wire form: "" means the workspace root (the historical relative
+  // contract). A location INSIDE the workspace is sent relative to it, and
+  // only a genuinely outside one is sent absolute. That distinction is not
+  // cosmetic: the server gates absolute paths at owner level, so sending an
+  // absolute path for a subfolder would 403 every collaborator browsing the
+  // workspace they can already read.
+  const locationParam = relativizeToWorkspace(browseLocation, workspaceRoot);
+
+  function navigateTo(absolutePath: string) {
+    setBrowseError(null);
+    setBrowseLocation(absolutePath === workspaceRoot ? null : absolutePath);
+  }
+
+  /** Re-root onto a directory of the current tree (double-click to open). */
+  function navigateToChild(relativePath: string) {
+    if (!workingDir) return;
+    navigateTo(`${workingDir.replace(/\/$/, "")}/${relativePath}`);
+  }
+
+  /**
+   * Open a file the TREE named. Tree paths are relative to the browsed
+   * location while the viewer resolves against the workspace root, so an
+   * in-workspace location has to be re-attached — otherwise a file opened
+   * after navigating into a folder is looked for in the wrong place. An
+   * absolute location has no workspace-relative form to hand over, so it is
+   * passed through as before.
+   */
+  function openTreeFile(path: string) {
+    onFileSelect(locationParam.startsWith("/") ? path : joinBrowseLocation(locationParam, path));
+  }
+
+  const allFilesQuery = useWorkspaceAllFiles(conversationId, { enabled: !flatView }, locationParam);
+  // A refused location must say so on the bar. Rendering an empty tree instead
+  // would read as "this directory is empty", which is a different fact.
+  const unreachable =
+    allFilesQuery.error instanceof PathUnreachableError ? allFilesQuery.error : null;
+  const locationError =
+    browseError ??
+    (unreachable
+      ? unreachable.reachableRoots.length > 0
+        ? `${unreachable.message}. Reachable: ${unreachable.reachableRoots.join(", ")}`
+        : unreachable.message
+      : null);
   const changedFiles = changedQuery.data?.data ?? [];
   const hiddenFilesCount = changedFiles.filter((f) =>
     f.path.split("/").some((seg) => seg.startsWith(".")),
@@ -299,6 +361,7 @@ export function FilesPanel({
     {
       enabled: !flatView && debouncedTreeSearch.trim().length > 0,
     },
+    locationParam,
   );
   // Highlight the filters toggle when include/exclude carry a value.
   const treeFiltersActive = treeInclude.trim().length > 0 || treeExclude.trim().length > 0;
@@ -325,7 +388,17 @@ export function FilesPanel({
       {/* Header — single row: [title · workingDir] [eye] [close?] */}
       <div className="flex shrink-0 items-center gap-2 px-3 py-2">
         <span className="shrink-0 font-medium text-ui">Working folder</span>
-        {workingDir && <WorkingDirLabel dir={workingDir} />}
+        {workingDir && workspaceRoot && (
+          <BrowseLocationBar
+            current={workingDir}
+            workspace={workspaceRoot}
+            hostId={session?.hostId ?? null}
+            canBrowseOutside={isOwnerLevel(session?.permissionLevel ?? null)}
+            reach={envQuery.data?.reachable ?? null}
+            onNavigate={navigateTo}
+            error={locationError}
+          />
+        )}
         {servedFromHost && (
           <TooltipProvider>
             <Tooltip>
@@ -345,6 +418,13 @@ export function FilesPanel({
           </TooltipProvider>
         )}
         <div className="ml-auto flex items-center gap-1">
+          {workingDir && (
+            // Its own provider: the header has no TooltipProvider ancestor
+            // (each control here brings one), unlike the file rows.
+            <TooltipProvider>
+              <CopyPathButton path={workingDir} label="Copy folder path" />
+            </TooltipProvider>
+          )}
           <HiddenFilesToggle
             showHidden={showHidden}
             onToggle={() => onShowHiddenChange(!showHidden)}
@@ -473,7 +553,7 @@ export function FilesPanel({
             isLoading={allFilesQuery.isLoading}
             isError={allFilesQuery.isError}
             error={allFilesQuery.error}
-            onFileSelect={onFileSelect}
+            onFileSelect={openTreeFile}
             conversationId={conversationId}
             showHidden={showHidden}
             onShowHidden={() => onShowHiddenChange(true)}
@@ -485,38 +565,11 @@ export function FilesPanel({
             isSearching={treeSearchQuery.isFetching}
             isSearchError={treeSearchQuery.isError}
             searchError={treeSearchQuery.error instanceof Error ? treeSearchQuery.error : null}
+            browseLocation={locationParam}
+            onNavigateDir={navigateToChild}
           />
         )}
       </section>
     </div>
   );
-}
-
-// ---------------------------------------------------------------------------
-// WorkingDirLabel
-// ---------------------------------------------------------------------------
-
-function WorkingDirLabel({ dir }: { dir: string }) {
-  // Outer span participates in the flex row as flex-1 for layout/truncation.
-  // Inner span is the actual tooltip trigger so Radix anchors the popup to
-  // the text's bounding rect (not the full flex-1 width).
-  return (
-    <span className="min-w-0 flex-1 flex items-center overflow-hidden">
-      <TooltipProvider>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span className="inline-block max-w-full truncate font-mono text-sm text-muted-foreground cursor-default">
-              {dirBasename(dir)}
-            </span>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">{dir}</TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
-    </span>
-  );
-}
-
-/** Return the last path segment, handling both POSIX (/) and Windows (\) separators. */
-function dirBasename(path: string): string {
-  return path.split(/[/\\]/).filter(Boolean).pop() ?? path;
 }

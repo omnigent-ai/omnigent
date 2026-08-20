@@ -33,6 +33,29 @@ function createBrowserViewRegistry({
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
   let activeConversationId = null;
+  // When true, the active view is hidden in place (setVisible(false)) so DOM
+  // overlays (dialogs, menus, tooltips, toasts) aren't covered by the native
+  // layer, which always paints above the renderer regardless of z-index. Sticky
+  // across attaches: a view that becomes active while suppressed stays hidden.
+  let overlaySuppressed = false;
+
+  // Apply the current suppress flag to the active view (no-op with none active).
+  function applyActiveVisibility() {
+    if (activeConversationId === null) return;
+    const entry = entries.get(activeConversationId);
+    if (!entry) return;
+    try {
+      entry.view.setVisible(!overlaySuppressed);
+    } catch {
+      /* view destroyed */
+    }
+  }
+
+  function setSuppressed(suppressed) {
+    overlaySuppressed = !!suppressed;
+    applyActiveVisibility();
+    return { ok: true };
+  }
 
   function makeEntry(conversationId, view) {
     const entry = {
@@ -176,6 +199,8 @@ function createBrowserViewRegistry({
       } catch {
         /* host gone */
       }
+      // Honor a live overlay suppression on a just-created active view.
+      applyActiveVisibility();
     }
     // Signal the renderer a view now exists. On a fresh conversation the view is
     // created detached (no host-active-changed fires), so without this the pane
@@ -256,6 +281,8 @@ function createBrowserViewRegistry({
     } catch {
       /* host gone */
     }
+    // A view attaching while an overlay is open must stay hidden (sticky flag).
+    applyActiveVisibility();
     next.boundsController.resync();
     sendToRenderer("browser-host-active-changed", { conversationId });
     return { ok: true };
@@ -316,10 +343,12 @@ function createBrowserViewRegistry({
     getOrCreate,
     openOrNavigate,
     setActive,
+    setSuppressed,
     close,
     closeAll,
     // Introspection
     activeConversationId: () => activeConversationId,
+    isSuppressed: () => overlaySuppressed,
     size: () => entries.size,
     has: (conversationId) => entries.has(conversationId),
     forEach: (fn) => entries.forEach(fn),

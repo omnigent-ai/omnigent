@@ -384,6 +384,18 @@ def register_core_routes(
                 parse_repo_workspace,
             )
 
+            # Like the repo parse below: reject an unconfigured provider on
+            # the POST rather than in the background launch.
+            if (
+                body.sandbox_provider is not None
+                and sandbox_config.for_provider(body.sandbox_provider) is None
+            ):
+                offered = ", ".join(sandbox_config.launchable_providers()) or "none"
+                raise OmnigentError(
+                    f"sandbox provider '{body.sandbox_provider}' is not configured "
+                    f"on this server — available: {offered}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             # A managed workspace is a repository URL (schema-
             # validated) the launch clones inside the sandbox; parse
             # it now so a malformed URL is a synchronous 4xx, not a
@@ -419,6 +431,7 @@ def register_core_routes(
                     host_store=host_store_for_managed,
                     host_registry=getattr(request.app.state, "host_registry", None),
                     tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                    provider=body.sandbox_provider,
                     agent_store=agent_store,
                     agent_id=conv.agent_id if conv is not None else None,
                 )
@@ -1998,6 +2011,13 @@ def register_core_routes(
         from the truncated items instead of resuming the source's full
         native transcript.
 
+        A sub-agent source is allowed, which is how a sub-agent is
+        promoted to a session of its own: the fork is always a fresh
+        top-level conversation (no parent, its own spawn-tree root, its
+        own owner grant), so it appears in the sidebar and outlives the
+        parent. The source keeps running under its parent untouched,
+        and the fork does not adopt the source's own children.
+
         :param request: The incoming FastAPI request (for auth).
         :param source_id: Session/conversation identifier of the
             source session to fork, e.g. ``"conv_abc123"``.
@@ -2007,9 +2027,8 @@ def register_core_routes(
         :raises OmnigentError: 404 if *source_id* does not exist
             or ``body.agent_id`` is not a bindable built-in agent;
             403 if the caller lacks read access; 400 if the source
-            is a sub-agent session, has no agent binding, or
-            ``body.up_to_response_id`` names no response in the
-            source session.
+            has no agent binding, or ``body.up_to_response_id`` names
+            no response in the source session.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -2023,11 +2042,6 @@ def register_core_routes(
                     f"Session not found: {source_id!r}",
                     code=ErrorCode.NOT_FOUND,
                 )
-        if source.kind == "sub_agent":
-            raise OmnigentError(
-                "Cannot fork a sub-agent session — only top-level sessions can be forked.",
-                code=ErrorCode.INVALID_INPUT,
-            )
         if source.agent_id is None:
             raise OmnigentError(
                 "Source session has no agent binding — cannot fork.",
@@ -2113,10 +2127,14 @@ def register_core_routes(
         # the TARGET harness so the clone isn't left in the source's UI mode
         # (e.g. a claude-native source's terminal-first labels would put an
         # SDK clone in terminal mode with a stale interactive terminal).
-        # A same-agent fork leaves the copied labels untouched (None).
+        # A sub-agent source needs the same recompute even without a switch:
+        # its wrapper label marks it as a child with no terminal of its own
+        # (the parent owns the tmux pane), which would strand the top-level
+        # fork in a child's UI mode. A same-agent fork of a top-level source
+        # leaves the copied labels untouched (None).
         presentation_labels = (
             await asyncio.to_thread(_presentation_labels_for_agent, base_agent)
-            if switching_agent
+            if switching_agent or source.kind == "sub_agent"
             else None
         )
 

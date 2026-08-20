@@ -131,7 +131,12 @@ def _normalize_responses_items_for_chat(
     for item in items:
         if item.get("type") == "message":
             raw_content = item.get("content")
-            if isinstance(raw_content, list):
+            if item.get("role") == "assistant" and isinstance(raw_content, str):
+                # The chat converter iterates assistant content expecting
+                # blocks, so a plain string is walked character by character and
+                # each one indexed. User strings take a different branch there.
+                item = {**item, "content": [{"type": "output_text", "text": raw_content}]}
+            elif isinstance(raw_content, list):
                 normalized_content = _normalize_content_blocks_for_chat(raw_content)
                 if normalized_content is not raw_content:
                     item = {**item, "content": normalized_content}
@@ -500,7 +505,12 @@ def _get_openai_async_client(
             **retry_kwargs,
         )
 
-    allow_ambient_databricks = model is None or model.startswith("databricks-")
+    # An unpinned model is not a Databricks signal: it means "use the
+    # provider's default", which run_turn resolves from the model catalog.
+    # Treating it as Databricks-hosted sent credential-less OpenAI agents into
+    # ambient Databricks auth, surfacing an "install databricks-sdk" error at
+    # users who never configured Databricks.
+    allow_ambient_databricks = model is not None and model.startswith("databricks-")
 
     # An explicit Databricks profile is authoritative; model-service names
     # are opaque Unity Catalog identifiers such as catalog.schema.service.
@@ -552,8 +562,9 @@ def _get_openai_async_client(
     # Without an explicit profile, only legacy Databricks model names opt in
     # to ambient Databricks credentials.
     if not profile and not allow_ambient_databricks:
+        target = f"for model {model!r}" if model is not None else "and no model is pinned"
         raise ValueError(
-            f"No provider credentials were configured for model {model!r}. "
+            f"No provider credentials were configured {target}. "
             "Set OPENAI_API_KEY (and optionally OPENAI_BASE_URL), configure a "
             "Databricks profile, or use a 'databricks-' prefixed model name "
             "for legacy automatic Databricks routing."
@@ -1019,7 +1030,9 @@ class OpenAIAgentsSDKExecutor(Executor):
         """Create an OpenAIAgentsSDKExecutor.
 
         :param client: A preconfigured ``openai.AsyncOpenAI`` client.  When
-            ``None`` the executor calls :func:`_get_openai_async_client`.
+            ``None`` the executor calls :func:`_get_openai_async_client` and
+            closes the resulting client when the executor is closed. An
+            injected client remains owned by the caller.
         :param profile: Optional ``~/.databrickscfg`` profile name for the
             Databricks fallback path, e.g. ``"<your-profile>"``.
         :param api_key: Direct OpenAI-compatible API key, e.g.
@@ -1083,6 +1096,7 @@ class OpenAIAgentsSDKExecutor(Executor):
         self._client = (
             _wrap_client_for_reasoning_models(raw_client) if not use_responses else raw_client
         )
+        self._owns_client = client is None
         self._profile = profile
         self._use_responses = use_responses
         self._model_override = model
@@ -1175,6 +1189,12 @@ class OpenAIAgentsSDKExecutor(Executor):
 
     async def close_session(self, session_key: str) -> None:
         self._session_states.pop(session_key, None)
+
+    async def close(self) -> None:
+        """Release session state and the client created by this executor."""
+        self._session_states.clear()
+        if self._owns_client:
+            await self._client.close()
 
     async def interrupt_session(self, session_key: str) -> bool:
         """

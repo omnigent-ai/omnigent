@@ -30,8 +30,10 @@ from __future__ import annotations
 
 import re
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass
 
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.onboarding.provider_config import load_config
 
 # The dedicated top-level config block and the list field inside it.
@@ -183,6 +185,27 @@ def resolve_acp_agent(slug: str, config: dict[str, object] | None = None) -> Acp
         if entry.slug == slug:
             return entry
     return None
+
+
+def shadowed_builtin_acp_rows(entries: Iterable[AcpAgentEntry]) -> frozenset[str]:
+    """Return the builtin ACP CLI row ids claimed by a configured ``acp:`` agent.
+
+    A configured agent named "Devin" slugifies onto ``devin``, which is also a
+    builtin row id (:data:`omnigent.acp_cli_harnesses.ACP_CLI_HARNESSES`), so the
+    two describe the same harness by the same name from different sources. The
+    user's entry is the more specific intent — they wrote the exact command,
+    often with a ``--model`` the fixed row argv cannot carry — so callers that
+    list ACP harnesses skip these rows and keep the configured agent.
+
+    Matches the row id only. An alias-shaped name (``"Grok Build"`` ->
+    ``grok-build``, whose row id is ``grok``) is a genuinely separate harness id
+    with its own command, so it does not shadow the row.
+
+    :param entries: The configured agents, e.g. from :func:`acp_agents`.
+    :returns: Row ids to omit, empty when nothing overlaps.
+    """
+    slugs = {entry.slug for entry in entries}
+    return frozenset(key for key in ACP_CLI_HARNESSES if key in slugs)
 
 
 def acp_agents_settings(entries: list[AcpAgentEntry]) -> dict[str, object]:

@@ -37,7 +37,12 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
-const { normalizeUrl, expandDatabricksWorkspaceUrl } = require("./url");
+const {
+  normalizeUrl,
+  expandDatabricksWorkspaceUrl,
+  fetchServerManifest,
+  PRE_MANIFEST_BASELINE,
+} = require("./url");
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
@@ -557,6 +562,18 @@ function pinWindow(win, origin) {
     // Leaving a server: this window's unread contribution goes with it.
     state.badgeCount = 0;
     updateBadge();
+    // Destroy the window's embedded-browser views. They belong to sessions on
+    // the origin we're leaving, and the navigation tears down the renderer
+    // (setup page / new server) WITHOUT running BrowserPane's unmount detach —
+    // so without this the native WebContentsView keeps painting over the new
+    // page. Skip the initial pin (no prior origin: cold connect, nothing open).
+    if (state.origin != null) {
+      try {
+        state.browserRegistry?.closeAll("server-changed");
+      } catch {
+        /* registry already torn down */
+      }
+    }
   }
   state.origin = origin;
 }
@@ -573,6 +590,34 @@ function pinWindow(win, origin) {
 function setWindowServerUrl(win, serverUrl) {
   const state = windows.get(win);
   if (state) state.serverUrl = serverUrl;
+}
+
+/**
+ * Record the version manifest of the server a window connected to (see
+ * `fetchServerManifest` in src/url.js). Stored per-window because different
+ * windows can be pinned to different servers — and therefore to servers of
+ * different versions — at the same time.
+ *
+ * @param {Electron.BrowserWindow} win
+ * @param {object} manifest A manifest from `fetchServerManifest`.
+ */
+function setWindowServerManifest(win, manifest) {
+  const state = windows.get(win);
+  if (state) state.serverManifest = manifest;
+}
+
+/**
+ * The server manifest for a window, or the pre-manifest baseline when the
+ * window has none yet (no connect has completed, or the server predates the
+ * manifest route). Never null, so callers can read `.manifestVersion`
+ * unconditionally and gate with `>=`.
+ *
+ * @param {Electron.BrowserWindow | null} win
+ * @returns {object} A manifest-shaped object.
+ */
+function windowServerManifest(win) {
+  const state = win ? windows.get(win) : undefined;
+  return state?.serverManifest ?? PRE_MANIFEST_BASELINE;
 }
 
 /**
@@ -1011,7 +1056,18 @@ function createWindow(targetUrl, opts = {}) {
     // .drag-strip). Other platforms keep their native frame — `hiddenInset`
     // is macOS-only and a frameless window without `titleBarOverlay` would
     // lose its window controls there.
-    ...(process.platform === "darwin" ? { titleBarStyle: "hiddenInset" } : {}),
+    ...(process.platform === "darwin"
+      ? {
+          titleBarStyle: "hiddenInset",
+          // Drop the native traffic lights ~4px from their hiddenInset default so
+          // they center in the 2.25rem (36px) title-bar strip, level with the
+          // Search/Settings/toggle cluster and the chat-header icons (both
+          // centered there — see the [data-electron-mac] rules in index.css).
+          // x:19 preserves hiddenInset's horizontal inset; y centers the ~14px
+          // controls ((36-14)/2 ≈ 11). Adjust y by ±1 if it reads off on device.
+          trafficLightPosition: { x: 16, y: 17 },
+        }
+      : {}),
     webPreferences: {
       // Security: the SPA is remote/untrusted relative to the shell, so we
       // keep Node out of the renderer and isolate the preload's context.
@@ -1064,6 +1120,16 @@ function createWindow(targetUrl, opts = {}) {
     browserRegistry: createBrowserRegistryForWindow(win),
   });
   if (destination) {
+    // Learn the server's version alongside the load. Every window that opens
+    // straight onto a server (normal app launch with a saved URL, a deep link,
+    // a new window) comes through here — without this the manifest would only
+    // exist after a fresh setup-page connect. Never awaited and never throws
+    // (see fetchServerManifest), so it cannot delay or fail the load.
+    if (serverUrl) {
+      void fetchServerManifest(serverUrl).then((manifest) => {
+        if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+      });
+    }
     void win.loadURL(destination);
   } else {
     // ?ephemeral=1 only changes the setup page's copy (the window's
@@ -2061,6 +2127,14 @@ function registerIpc() {
       // trusted origin for privileged IPC and permission grants.
       pinWindow(win, new URL(target).origin);
       setWindowServerUrl(win, target);
+      // Learn what this server is before deciding anything version-dependent
+      // about the window. Deliberately NOT awaited ahead of loadURL: the
+      // manifest is advisory, and a slow/absent one must not delay (or block)
+      // connecting. fetchServerManifest never rejects — it resolves to the
+      // pre-manifest baseline — so no catch is needed here.
+      void fetchServerManifest(target).then((manifest) => {
+        if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+      });
       win
         .loadURL(target)
         .then(() => {
@@ -2111,9 +2185,9 @@ function registerIpc() {
     clipboard.writeText(text);
   });
 
-  // SPA title-bar server picker → the sender window's pinned origin plus the
-  // persisted recent-servers list, so the picker can render "current server"
-  // and the switch targets. Foreign pages get null (nothing to fingerprint).
+  // SPA server picker → the sender window's pinned origin plus the persisted
+  // recent-servers list, so the picker can render "current server" and the
+  // switch targets. Foreign pages get null (nothing to fingerprint).
   ipcMain.handle("omnigent:get-server-picker", (event) => {
     if (!isPinnedOriginSender(event)) {
       console.warn("[omnigent] get-server-picker from untrusted sender dropped");
@@ -2125,6 +2199,11 @@ function registerIpc() {
       // isPinnedOriginSender guarantees the sender window is tracked.
       currentOrigin: windows.get(win).origin,
       recentServers: Array.isArray(recents) ? recents.filter((u) => typeof u === "string") : [],
+      // The connected server's manifest, forwarded so the SPA branches on the
+      // same document the shell did rather than re-fetching it (and so an
+      // older shell, which simply omits this field, is detectable as absent —
+      // see nativeBridge's `serverManifest` handling).
+      serverManifest: windowServerManifest(win),
     };
   });
 
@@ -2153,6 +2232,14 @@ function registerIpc() {
     if (win) {
       pinWindow(win, new URL(url).origin);
       setWindowServerUrl(win, url);
+      // Switching servers means a possibly DIFFERENT version: re-read the
+      // manifest so the window never keeps the previous server's answer. Reset
+      // to the baseline first — until the new fetch lands, "unknown" is the
+      // honest state, and stale-but-plausible would be worse than absent.
+      setWindowServerManifest(win, PRE_MANIFEST_BASELINE);
+      void fetchServerManifest(url).then((manifest) => {
+        if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
+      });
       win
         .loadURL(url)
         .then(() => {
@@ -2445,7 +2532,7 @@ function registerIpc() {
       // Ensure the CLI is authenticated for a remote server first (local needs
       // none) — otherwise the host connect would just fail on a 401.
       const auth = await serverManager.ensureServerAuth(cliPath, serverUrl);
-      if (!auth.ok) result = { ok: false, error: auth.error };
+      if (!auth.ok) result = { ok: false, error: auth.error, authError: auth.authError };
       else if (action === "start")
         result = await serverManager.ensureHostConnected(cliPath, serverUrl);
       else result = await serverManager.restartHost(cliPath, serverUrl);

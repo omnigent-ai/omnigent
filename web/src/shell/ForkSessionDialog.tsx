@@ -857,15 +857,10 @@ export function ForkSessionForm({
         <Button
           data-testid="fork-session-submit"
           onClick={handleFork}
-          disabled={submitting || !canSubmit}
+          loading={submitting}
+          disabled={!canSubmit}
         >
-          {submitting
-            ? isCodingSource
-              ? "Starting…"
-              : "Cloning…"
-            : isCodingSource
-              ? "Clone & start"
-              : "Clone"}
+          {isCodingSource ? "Clone & start" : "Clone"}
         </Button>
       </DialogFooter>
     </>
