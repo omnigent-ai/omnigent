@@ -114,7 +114,10 @@ def _format_results(data: dict[str, Any], max_results: int) -> str:
     """
     Format Keenable's ``/v1/search`` JSON response into readable text.
 
-    Keenable returns ``{"results": [{"title", "url", "description", ...}]}``.
+    Keenable returns ``{"results": [{"title", "url", "description",
+    "snippet", ...}]}``. ``snippet`` carries the page text and is the
+    grounding the model needs; ``description`` is only the page's meta
+    description and is empty for most pages, so it is the fallback (#5088).
     The list is sliced to ``max_results`` and rendered as numbered entries.
 
     :param data: The parsed JSON response from Keenable.
@@ -131,6 +134,6 @@ def _format_results(data: dict[str, Any], max_results: int) -> str:
             continue
         title = item.get("title", "")
         url = item.get("url", "")
-        snippet = item.get("description") or ""
+        snippet = item.get("snippet") or item.get("description") or ""
         formatted.append(f"{i + 1}. {title}\n   {url}\n   {snippet}")
     return "\n\n".join(formatted) if formatted else "No results found."

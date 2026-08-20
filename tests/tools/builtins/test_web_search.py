@@ -632,6 +632,59 @@ def test_keenable_backend_via_spec_config(tool_ctx: ToolContext) -> None:
     assert "Web search API for AI agents." in result
 
 
+def test_keenable_renders_snippet_page_text_over_empty_description(
+    tool_ctx: ToolContext,
+) -> None:
+    """
+    The real Keenable response carries the page text in ``snippet``; the meta
+    ``description`` is empty for most pages. Reading ``description`` first
+    rendered every result with a blank third line and left the model nothing
+    to ground on beyond the URL (#5088).
+    """
+    fake_response = MagicMock()
+    fake_response.json.return_value = {
+        "results": [
+            {
+                "title": "Pydantic",
+                "url": "https://docs.pydantic.dev",
+                "description": "",
+                "snippet": "Data validation using Python type hints.",
+            },
+        ],
+    }
+
+    tool = WebSearchTool(
+        config={"search_provider": "keenable"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_keenable.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "pydantic"}), tool_ctx)
+
+    assert "Data validation using Python type hints." in result, (
+        "the snippet's page text must be rendered, not the empty description"
+    )
+
+
+def test_keenable_snippet_falls_back_to_description() -> None:
+    """Results with only a meta description still render it (legacy shape)."""
+    from omnigent.tools.builtins.web_search_keenable import _format_results
+
+    rendered = _format_results(
+        {
+            "results": [
+                {
+                    "title": "Docs",
+                    "url": "https://example.com",
+                    "description": "meta description only",
+                },
+            ],
+        },
+        5,
+    )
+    assert "meta description only" in rendered
+
+
 def test_keenable_keyless_by_default(tool_ctx: ToolContext) -> None:
     """
     Without api_key, Keenable hits the keyless public endpoint and sends
