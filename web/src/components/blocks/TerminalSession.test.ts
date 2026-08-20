@@ -147,6 +147,19 @@ describe("shouldEchoSynchronously", () => {
     expect(shouldEchoSynchronously(SYNC_ECHO_MAX_BYTES + 1, 10)).toBe(false);
     expect(shouldEchoSynchronously(SYNC_ECHO_MAX_BYTES, 10)).toBe(true);
   });
+
+  it("stays async while an IME composition is in flight", () => {
+    // A same-task repaint over an uncommitted preedit is a paint xterm's
+    // composition handling never sees from stock `write`. The chunk here is
+    // otherwise a perfect fast-path candidate, so only `composing` can hold
+    // it back.
+    expect(shouldEchoSynchronously(64, 10, true)).toBe(false);
+    expect(shouldEchoSynchronously(64, 10, false)).toBe(true);
+  });
+
+  it("defaults to not composing so existing callers are unaffected", () => {
+    expect(shouldEchoSynchronously(64, 10)).toBe(true);
+  });
 });
 
 describe("loadWebglRenderer", () => {
@@ -222,6 +235,31 @@ describe("terminalKeyEventPayload", () => {
     expect(
       terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, altKey: true })),
     ).toBeNull();
+  });
+
+  it("claims nothing while an IME composition is in flight", () => {
+    // xterm consults the custom handler BEFORE its own composition check and
+    // returns early when the handler returns false
+    // (`CoreBrowserTerminal._keyDown`), so claiming this key here is the last
+    // word: the IME never sees it and a CSI-u sequence reaches the PTY
+    // mid-conversion.
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, isComposing: true })),
+    ).toBeNull();
+  });
+
+  it("claims nothing for the keyCode 229 composition fallback", () => {
+    // Browsers/IMEs that report the composition only via the legacy keyCode.
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, keyCode: 229 })),
+    ).toBeNull();
+  });
+
+  it("still encodes Shift+Enter once the composition has ended", () => {
+    // The guard must not cost the feature outside composition.
+    expect(
+      terminalKeyEventPayload(keyEvent({ key: "Enter", shiftKey: true, isComposing: false })),
+    ).toBe(SHIFT_ENTER_CSI_U);
   });
 });
 
@@ -627,5 +665,145 @@ describe("TerminalSession", () => {
     const observer = FakeResizeObserver.instances[0];
     expect(observer.observed).toContain(container);
     session.dispose();
+  });
+
+  // IME composition, driven through the real wiring rather than the pure
+  // helpers: these dispatch composition and key events at the textarea xterm
+  // actually listens on, so they also fail if xterm stops routing keydown
+  // through the custom handler, or stops handing us a textarea at all.
+  describe("IME composition", () => {
+    const DECODER = new TextDecoder();
+
+    /** The hidden textarea xterm created for keyboard input. */
+    function textareaOf(container: HTMLElement): HTMLTextAreaElement {
+      const textarea = container.querySelector("textarea");
+      // Not a soft assertion: without it the composition listeners are never
+      // registered and every test below would pass for the wrong reason.
+      expect(textarea).not.toBeNull();
+      return textarea as HTMLTextAreaElement;
+    }
+
+    /**
+     * Binary frames the session sent, decoded back to strings.
+     *
+     * Frames are selected by *not* being a string rather than by `instanceof
+     * Uint8Array`: `TextEncoder` here yields a `Uint8Array` from a different
+     * realm than jsdom's, so `instanceof` is `false` for every keystroke frame
+     * and an `instanceof` filter silently returns nothing at all.
+     */
+    function sentText(socket: { sent: (string | Uint8Array)[] }): string[] {
+      return socket.sent
+        .filter((frame): frame is Uint8Array => typeof frame !== "string")
+        .map((frame) => DECODER.decode(frame));
+    }
+
+    function keydown(init: KeyboardEventInit): KeyboardEvent {
+      return new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
+    }
+
+    it("does not claim Shift+Enter while a composition is in flight", () => {
+      // WHY: xterm consults this handler before its own CompositionHelper and
+      // returns early when we claim the key, so claiming it here skips the
+      // commit that CompositionHelper.keydown would have performed — the
+      // converted text is dropped and CSI-u goes out in its place. Driven
+      // through the real textarea so the test also fails if xterm stops
+      // routing keydown through the custom handler.
+      const { container, socket, session } = makeSession();
+      socket.open();
+      const textarea = textareaOf(container);
+
+      textarea.dispatchEvent(new CompositionEvent("compositionstart"));
+      textarea.dispatchEvent(
+        keydown({ key: "Enter", shiftKey: true, keyCode: 13, isComposing: true }),
+      );
+
+      expect(sentText(socket)).not.toContain(SHIFT_ENTER_CSI_U);
+      session.dispose();
+    });
+
+    it("claims Shift+Enter again once the composition has ended", () => {
+      // WHY: the guard must cost nothing outside composition, and the flag has
+      // to actually clear on compositionend.
+      const { container, socket, session } = makeSession();
+      socket.open();
+      const textarea = textareaOf(container);
+
+      textarea.dispatchEvent(new CompositionEvent("compositionstart"));
+      textarea.dispatchEvent(new CompositionEvent("compositionend", { data: "日本語" }));
+      textarea.dispatchEvent(keydown({ key: "Enter", shiftKey: true, keyCode: 13 }));
+
+      expect(sentText(socket)).toContain(SHIFT_ENTER_CSI_U);
+      session.dispose();
+    });
+
+    /** xterm's private synchronous write, reached the same way the code does. */
+    function writeSyncOf(session: TerminalSession) {
+      const withCore = session as unknown as {
+        term: { _core: { writeSync: (b: Uint8Array) => void } };
+      };
+      // eslint-disable-next-line no-underscore-dangle
+      return withCore.term._core;
+    }
+
+    it("keeps inbound output on the async write path while composing", () => {
+      // WHY: the fast path is a same-task repaint through xterm's private
+      // writeSync, which its composition handling never sees. The chunk is
+      // small and lands right after a keystroke, so only the composition can
+      // hold it back.
+      const { container, socket, session } = makeSession();
+      socket.open();
+      const textarea = textareaOf(container);
+      const writeSpy = vi.spyOn(Terminal.prototype, "write");
+      const syncSpy = vi.spyOn(writeSyncOf(session), "writeSync");
+
+      // Arm the echo window the way a keystroke does, then start composing.
+      // keyCode matters: without it xterm produces no data for the key, onData
+      // never fires, and the window this test depends on is never opened.
+      textarea.dispatchEvent(keydown({ key: "a", keyCode: 65 }));
+      textarea.dispatchEvent(new CompositionEvent("compositionstart"));
+      // Only the inbound frame below should count towards either spy.
+      writeSpy.mockClear();
+      syncSpy.mockClear();
+      socket.emit("message", { data: new Uint8Array([0x61]).buffer });
+
+      expect(syncSpy).not.toHaveBeenCalled();
+      expect(writeSpy).toHaveBeenCalled();
+      session.dispose();
+    });
+
+    it("still takes the fast path for an echo when not composing", () => {
+      // WHY: pins that the test above measures composition rather than a build
+      // where writeSync is simply unavailable — the identical chunk must go
+      // the fast way with no composition in flight.
+      const { container, socket, session } = makeSession();
+      socket.open();
+      const textarea = textareaOf(container);
+      const syncSpy = vi.spyOn(writeSyncOf(session), "writeSync");
+
+      textarea.dispatchEvent(keydown({ key: "a", keyCode: 65 }));
+      syncSpy.mockClear();
+      socket.emit("message", { data: new Uint8Array([0x61]).buffer });
+
+      expect(syncSpy).toHaveBeenCalled();
+      session.dispose();
+    });
+
+    it("stops tracking composition after dispose", () => {
+      // WHY: the listeners share the session's AbortController, so a remount
+      // must not leave a disposed session mutating state from a live textarea.
+      const { container, socket, session } = makeSession();
+      socket.open();
+      const textarea = textareaOf(container);
+      const state = session as unknown as { composing: boolean };
+
+      textarea.dispatchEvent(new CompositionEvent("compositionstart"));
+      expect(state.composing).toBe(true); // listener is live before dispose
+      textarea.dispatchEvent(new CompositionEvent("compositionend"));
+
+      session.dispose();
+      textarea.dispatchEvent(new CompositionEvent("compositionstart"));
+
+      expect(state.composing).toBe(false); // the abort signal removed it
+    });
   });
 });

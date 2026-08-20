@@ -15,6 +15,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
+import { isImeCompositionNativeKeyEvent } from "@/lib/ime";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
@@ -171,11 +172,34 @@ export const SHIFT_ENTER_CSI_U = "\x1b[13;2u";
  * CSI-u while keeping plain Enter and modified Enter variants on xterm's
  * default path.
  *
+ * An event the IME is composing on is never claimed. xterm consults this
+ * handler *before* its own composition handling and returns early when it
+ * claims the event (``CoreBrowserTerminal._keyDown``), so claiming here is the
+ * last word: the key never reaches ``CompositionHelper.keydown``, which would
+ * otherwise have swallowed it or committed the pending text first. The
+ * composed text is dropped and a stray CSI-u sequence reaches the PTY instead.
+ *
+ * The check reads the event's own flags and nothing else, deliberately.
+ * xterm's ``CompositionHelper`` gates on two private fields —
+ * ``_isComposing`` and an ``_isSendingComposition`` that stays set for one
+ * macrotask after ``compositionend`` while the committed text is dispatched —
+ * and mirroring that state machine from the outside gets it wrong in both
+ * directions: a keystroke inside the sending window would be claimed too
+ * eagerly, and a composition that xterm finalizes *without* a
+ * ``compositionend`` (``CompositionHelper.keydown`` does exactly that when a
+ * non-composition key interrupts) would leave a mirrored flag stuck, silently
+ * disabling Shift+Enter. Reading the event only is monotonic: strictly fewer
+ * wrong claims than before, never more, and no state to desynchronise. Keys
+ * that arrive without the flags set — the commit key can report ``keyCode``
+ * 13 — are therefore still claimed; closing that needs xterm's own state and
+ * is left to a follow-up.
+ *
  * :param event: Browser keyboard event from xterm's custom key handler.
  * :returns: CSI-u bytes for Shift+Enter, or ``null`` to let xterm handle
  *     the event normally.
  */
 export function terminalKeyEventPayload(event: KeyboardEvent): string | null {
+  if (isImeCompositionNativeKeyEvent(event)) return null;
   if (
     event.key === "Enter" &&
     event.shiftKey &&
@@ -212,13 +236,35 @@ export const SYNC_ECHO_MAX_BYTES = 2048;
  * can't monopolize the main thread. Mirrors openui's terminal input fast
  * path.
  *
+ * An in-flight IME composition takes the fast path out of play. This is a
+ * same-task repaint that stock xterm never performs, so xterm's composition
+ * handling — which keeps the uncommitted preedit in a ``.composition-view``
+ * overlay repositioned from ``onRender`` — has never been exercised against
+ * it. That is the argument for standing down here, not a claim that the
+ * overlay is provably torn: reported IME corruption in this pane tracks
+ * exactly the window this function gates, and the async queue is the only
+ * write path xterm itself uses. Deferring while composing costs a frame of
+ * echo latency on a keystroke that has not been committed yet.
+ *
+ * Note that composition state cannot be derived from *msSinceLastInput*:
+ * ``onData`` stays silent for the whole composition and fires once on commit,
+ * so the timestamp still refers to the keystroke *before* the composition
+ * began — which is exactly why a fast typist stays inside the window and a
+ * slow one falls out of it.
+ *
  * Pure helper — exported for direct unit testing.
  *
  * :param byteLength: Size of the inbound chunk in bytes.
  * :param msSinceLastInput: Milliseconds since the last user keystroke.
+ * :param composing: Whether an IME composition is currently in flight.
  * :returns: ``true`` to take the synchronous echo path.
  */
-export function shouldEchoSynchronously(byteLength: number, msSinceLastInput: number): boolean {
+export function shouldEchoSynchronously(
+  byteLength: number,
+  msSinceLastInput: number,
+  composing = false,
+): boolean {
+  if (composing) return false;
   return msSinceLastInput < SYNC_ECHO_WINDOW_MS && byteLength <= SYNC_ECHO_MAX_BYTES;
 }
 
@@ -444,6 +490,8 @@ export class TerminalSession {
   private readonly dataDispose: { dispose: () => void };
   /** ``performance.now()`` of the last keystroke; gates the echo fast path. */
   private lastUserInputAt = 0;
+  /** Whether an IME composition is in flight; disables the echo fast path. */
+  private composing = false;
   /** Guards {@link dispose} so calling it twice is a safe no-op. */
   private disposed = false;
   /**
@@ -541,6 +589,30 @@ export class TerminalSession {
     // closed" overlay on top of the freshly-connecting terminal.
     this.listenerCtl = new AbortController();
     const { signal } = this.listenerCtl;
+
+    // Follow IME composition to gate the echo fast path (see
+    // {@link writeOutput}) — and only that path, never the key handler, whose
+    // reasoning for reading the event instead is in
+    // {@link terminalKeyEventPayload}. These events fire on the hidden textarea
+    // xterm keeps for keyboard input; subscribing alongside xterm's own
+    // listeners is fine, they are independent. `textarea` is typed optional (it
+    // does not exist before `open()`, called above), so an absent one simply
+    // leaves the fast path as it was.
+    //
+    // This flag is an imperfect mirror of xterm's private composition state,
+    // and it is used only where being wrong is cheap. It can over-report:
+    // xterm also finalizes a composition without emitting `compositionend`
+    // (`CompositionHelper.keydown`, when a non-composition key interrupts),
+    // leaving this `true` until the next one. That costs a frame of echo
+    // latency and nothing else. `blur` is deliberately *not* followed, which
+    // would be the other direction: xterm's blur handler does not finalize the
+    // composition (`CoreBrowserTerminal._handleTextAreaBlur`), so clearing
+    // there would re-arm the fast path under a live preedit.
+    const { textarea } = this.term;
+    if (textarea) {
+      textarea.addEventListener("compositionstart", () => (this.composing = true), { signal });
+      textarea.addEventListener("compositionend", () => (this.composing = false), { signal });
+    }
 
     // Make the browser copy gesture (right-click → Copy and Edit → Copy on
     // every platform, ⌘C on macOS) yield the terminal selection as text.
@@ -733,9 +805,19 @@ export class TerminalSession {
    * future xterm that drops it — falls back to the async public ``write``.
    * Correctness never depends on the private API; it only shaves a frame
    * off the echo when present.
+   *
+   * The same reasoning applies to an IME composition, which also takes the
+   * fast path out of play: correctness should not rest on a private
+   * same-task write that xterm's own composition handling never sees.
    */
   private writeOutput(bytes: Uint8Array): void {
-    if (shouldEchoSynchronously(bytes.length, performance.now() - this.lastUserInputAt)) {
+    if (
+      shouldEchoSynchronously(
+        bytes.length,
+        performance.now() - this.lastUserInputAt,
+        this.composing,
+      )
+    ) {
       // eslint-disable-next-line no-underscore-dangle
       const core = (this.term as unknown as TerminalCore)._core;
       if (typeof core?.writeSync === "function") {
