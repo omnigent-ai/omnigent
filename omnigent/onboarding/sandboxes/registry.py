@@ -144,6 +144,11 @@ def _builtin_contribution() -> SandboxProviderContribution:
                 launcher_class="omnigent.onboarding.sandboxes.daytona:DaytonaSandboxLauncher",
                 managed_token_ttl_s=7 * 24 * 3600,
             ),
+            "sprites": SandboxProviderMetadata(
+                name="sprites",
+                launcher_class="omnigent.onboarding.sandboxes.sprites:SpritesSandboxLauncher",
+                managed_token_ttl_s=7 * 24 * 3600,
+            ),
             "blaxel": SandboxProviderMetadata(
                 name="blaxel",
                 launcher_class="omnigent.onboarding.sandboxes.blaxel:BlaxelSandboxLauncher",

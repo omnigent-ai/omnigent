@@ -40,7 +40,9 @@ class ActivityLease(Protocol):
 ActivityLeaseFactory: TypeAlias = Callable[[str], ActivityLease]
 
 _ACTIVITY_LEASE_FACTORIES: dict[str, ActivityLeaseFactory] = {}
-_BUILTIN_LEASE_MODULES: dict[str, str] = {}
+_BUILTIN_LEASE_MODULES: dict[str, str] = {
+    "sprites": "omnigent.runner.activity_leases.sprites",
+}
 
 
 def register_activity_lease_provider(provider: str, factory: ActivityLeaseFactory) -> None:

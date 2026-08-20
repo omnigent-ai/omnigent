@@ -247,7 +247,11 @@ elif previous:
 """
 
 
-def render_host_config_write_command(host_config: dict[str, object]) -> str:
+def render_host_config_write_command(
+    host_config: dict[str, object],
+    *,
+    python_executable: str = "python3",
+) -> str:
     """
     Build the remote command that installs *host_config* into the
     sandbox's config directory before ``omnigent host`` starts. The directory
@@ -286,12 +290,15 @@ def render_host_config_write_command(host_config: dict[str, object]) -> str:
     :param host_config: The validated ``sandbox.host_config`` mapping
         (see :func:`omnigent.server.managed_hosts.parse_sandbox_config`),
         or ``{}`` to only remove previously injected entries.
+    :param python_executable: Python interpreter available in the sandbox.
+        Providers with an isolated host environment can point this at that
+        environment so the script sees Omnigent's PyYAML dependency.
     :returns: A ``python3 -c '<script>'`` shell command, safe to pass to
         :meth:`SandboxLauncher.run` or embed in a larger shell script.
     """
     payload = base64.b64encode(json.dumps(host_config).encode()).decode()
     script = _HOST_CONFIG_WRITE_SCRIPT.replace("__PAYLOAD__", repr(payload))
-    return f"python3 -c {shlex.quote(script)}"
+    return f"{shlex.quote(python_executable)} -c {shlex.quote(script)}"
 
 
 class SandboxCapabilityError(click.ClickException, _sandbox_types.SandboxError):
