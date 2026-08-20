@@ -4058,10 +4058,10 @@ export function NewChatLandingScreen() {
       if (!smartRoutingHarnessSelected) {
         const launchedOptions = createdHarnessOptions({
           harness: selectedNativeHarness,
-          supportsPermissionMode,
-          supportsApprovalMode,
-          supportsCursorMode,
-          supportsAgySkipPermissions,
+          supportsPermissionMode: agentSupportsPermissionMode,
+          supportsApprovalMode: agentSupportsApprovalMode,
+          supportsCursorMode: agentSupportsCursorMode,
+          supportsAgySkipPermissions: agentSupportsAgySkip,
           supportsModelPicker: agentSupportsModelPicker || nativeAgent?.harness === "codex-native",
           permissionMode,
           approvalMode,
@@ -4069,7 +4069,7 @@ export function NewChatLandingScreen() {
           agySkipMode,
           pickedModel,
           pickedEffort,
-          smartRoutingEligible,
+          smartRoutingEligible: effectiveAgentId !== PENDING_AGENT_ID && smartRoutingEligible,
           costControlMode,
         });
         if (launchedOptions !== null) {
