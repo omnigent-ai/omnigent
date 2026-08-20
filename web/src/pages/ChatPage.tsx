@@ -3862,6 +3862,14 @@ function AssistantBubble({
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
   const isWide =
     hasElicitation || containsMarkdownTable(bubble.items) || containsDisplayMath(bubble.items);
+  // An error banner's dashed rule spans the full chat column: MessageContent
+  // is w-fit, so without w-full an error-only bubble shrink-wraps the 560px
+  // pill and the rule clips to it instead of reaching the column edges.
+  const hasError = bubble.items.some((it) => it.kind === "error");
+  // A bubble carrying an error but no prose stands alone as a thread-level
+  // element — the hover footer's timestamp/actions belong to assistant text,
+  // not to the error.
+  const errorOnly = hasError && !markdownText;
 
   return (
     <>
@@ -3876,7 +3884,7 @@ function AssistantBubble({
             collapsed the row's trailing hairline (a flex-1 span) to zero
             and stopped its click target short of the column. Keeping the
             cap lands the hairline where an answered turn's does. */}
-        <MessageContent className={isWide || foldOnly ? "w-full" : undefined}>
+        <MessageContent className={isWide || foldOnly || hasError ? "w-full" : undefined}>
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}
@@ -3903,9 +3911,11 @@ function AssistantBubble({
             the user can see, and hanging them off a collapsed row spaced
             consecutive rows unevenly depending on hidden narration. Also
             skipped when there is neither a timestamp nor actions to show.
+            Also skipped on an error-only bubble: the banner stands alone as
+            a thread-level element, so no timestamp/actions hang off it.
             40%-visible on touch (no hover), hover/focus-reveal on desktop.
             Order matches the design target: actions, then timestamp. */}
-        {!foldOnly && (ts || markdownText) && (
+        {!foldOnly && !errorOnly && (ts || markdownText) && (
           <div className="flex items-center gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
             {markdownText && (
               <MessageActions>
