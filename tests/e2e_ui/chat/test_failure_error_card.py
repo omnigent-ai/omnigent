@@ -19,7 +19,7 @@ import json
 
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import _server_state
+from tests.e2e_ui.conftest import _server_state, seed_committed_turn
 
 
 def _seed_error_item(session_id: str, *, code: str, message: str) -> None:
@@ -173,3 +173,66 @@ def test_persisted_failure_expands_retries_and_dismisses_locally(
     expect(pill).to_be_visible(timeout=15_000)
     pill.get_by_role("button", name="Dismiss error message").click()
     expect(pill).to_have_count(0)
+
+
+def test_error_row_divider_spans_the_chat_column(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The banner's dashed rule spans the full chat column, not just the pill.
+
+    Regression net for the error-only shrink-wrap: ``MessageContent``
+    defaults to ``w-fit``, so an error-only bubble once clipped the rule to
+    the 560px pill (~592px) instead of the column. Widths are compared
+    against a long-text assistant turn measured in the same viewport — no
+    hardcoded pixel values. The viewport is set wide so the column reaches
+    its ``max-w-3xl`` cap: at the default 1280px the side panels squeeze the
+    column below the pill's width, which masks the shrink-wrap.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    seed_committed_turn(
+        session_id,
+        prompt="Write something long.",
+        reply=(
+            "A long assistant answer that stretches the chat column to its full "
+            "width regardless of the viewport size. " * 12
+        ),
+        response_id="resp_geometry_long",
+    )
+    _seed_error_item(
+        session_id,
+        code="required_terminal_exited",
+        message="Required terminal exited unexpectedly; the runtime is no longer available.",
+    )
+
+    page.set_viewport_size({"width": 1920, "height": 1080})
+    page.goto(f"{base_url}/c/{session_id}")
+    pill = page.get_by_test_id("error-pill")
+    expect(pill).to_be_visible(timeout=15_000)
+
+    widths = page.evaluate(
+        """() => {
+          const pill = document.querySelector('[data-testid="error-pill"]');
+          const row = pill.parentElement;
+          const divider = row.querySelector('span[aria-hidden="true"]');
+          const bubbles = [...document.querySelectorAll('[data-testid="message-bubble"]')];
+          const textBubble = bubbles.find((b) =>
+            b.textContent.includes('stretches the chat column'));
+          return {
+            row: row.getBoundingClientRect().width,
+            divider: divider.getBoundingClientRect().width,
+            textTurn: textBubble.firstElementChild.getBoundingClientRect().width,
+          };
+        }"""
+    )
+    assert abs(widths["row"] - widths["textTurn"]) <= 2, (
+        f"error row spans {widths['row']:.0f}px but the chat column spans "
+        f"{widths['textTurn']:.0f}px — the banner shrink-wrapped the pill"
+    )
+    assert abs(widths["divider"] - widths["row"]) <= 1, (
+        f"dashed rule spans {widths['divider']:.0f}px of its {widths['row']:.0f}px row"
+    )
