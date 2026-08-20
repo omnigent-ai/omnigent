@@ -398,6 +398,51 @@ async def test_decide_permission_ask_without_handler_fails_closed() -> None:
     ex._policy_evaluator = AsyncMock(return_value=_V())
     assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is False
 
+@pytest.mark.asyncio
+async def test_decide_permission_bypass_mode_skips_elicitation_not_policy() -> None:
+    """bypassPermissions skips the human card but never the TOOL_CALL policy.
+
+    A headless ACP agent (polled sub-agent, scheduled task, ``omni run -p``)
+    parks forever on an elicitation nobody answers; the permission mode is the
+    same opt-out the other harness families offer. A policy DENY must still
+    block — the mode removes the human prompt, not governance (#5052).
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x", permission_mode="bypassPermissions"))
+
+    class _Ask:
+        action = "POLICY_ACTION_ASK"
+
+    class _Deny:
+        action = "POLICY_ACTION_DENY"
+
+    ex._policy_evaluator = AsyncMock(return_value=_Ask())
+    ex._elicitation_handler = AsyncMock(return_value=False)
+    # Policy ASK + no-gates default both allow WITHOUT consulting the card…
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is True
+    ex._elicitation_handler.assert_not_awaited()
+    # …while a hard DENY still denies.
+    ex._policy_evaluator = AsyncMock(return_value=_Deny())
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is False
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_auto_mode_matches_bypass() -> None:
+    """``auto`` (cursor semantics — its default exists for headless workers)
+    skips the card exactly like bypassPermissions."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", permission_mode="auto"))
+    ex._elicitation_handler = AsyncMock(return_value=False)
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is True
+    ex._elicitation_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_unknown_mode_still_asks() -> None:
+    """Any other value (and unset) keeps today's always-ask behavior."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", permission_mode="default"))
+    ex._elicitation_handler = AsyncMock(return_value=False)
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is False
+    ex._elicitation_handler.assert_awaited_once()
+
 
 def _seed_tool_call(ex: AcpExecutor) -> dict[str, object]:
     """Announce a ``tool_call``, then return the bare permission params for it.

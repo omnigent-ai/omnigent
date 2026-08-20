@@ -57,6 +57,7 @@ _ENV_MODEL = "HARNESS_ACP_MODEL"
 _ENV_SESSION_ID_MODE = "HARNESS_ACP_SESSION_ID_MODE"
 _ENV_SEND_MODEL = "HARNESS_ACP_SEND_MODEL"
 _ENV_OMNIGENT_MCP = "HARNESS_ACP_OMNIGENT_MCP"
+_ENV_PERMISSION_MODE = "HARNESS_ACP_PERMISSION_MODE"
 _ENV_CWD = "HARNESS_ACP_CWD"
 _ENV_OS_ENV = "HARNESS_ACP_OS_ENV"
 _ENV_ENV_PASSTHROUGH = "HARNESS_ACP_ENV_PASSTHROUGH"
@@ -136,6 +137,7 @@ def _build_acp_executor() -> Executor:
         send_model_in_session_new=send_model,
         omnigent_mcp=omnigent_mcp,
         env_passthrough=_env_passthrough_names(),
+        permission_mode=os.environ.get(_ENV_PERMISSION_MODE, "").strip() or None,
     )
     return AcpExecutor(config=config, cwd=cwd, os_env=_resolve_os_env())
 

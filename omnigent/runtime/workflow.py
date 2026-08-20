@@ -1549,6 +1549,10 @@ def _build_acp_cli_spawn_env(
         "HARNESS_ACP_COMMAND": shlex.join([executable, *row.args]),
         "HARNESS_ACP_NAME": row.label,
     }
+    # Permission mode: see _build_acp_spawn_env (#5052).
+    permission_mode = spec.executor.config.get("permission_mode")
+    if permission_mode is not None:
+        env["HARNESS_ACP_PERMISSION_MODE"] = str(permission_mode)
     # Session workspace (selected working folder). ``None`` lets the wrap fall
     # back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_ACP_CWD.
     if cwd is not None:
@@ -1661,6 +1665,13 @@ def _build_acp_spawn_env(
     # else: no agent configured — leave HARNESS_ACP_COMMAND unset so the wrap
     # raises a clear request-time error pointing the user at `omnigent setup`.
 
+    # Permission mode: the same ``executor.config.permission_mode`` knob the
+    # other harness families read. ``bypassPermissions`` / ``auto`` skip the
+    # per-tool human approval card in the executor (TOOL_CALL policy still
+    # applies); unset keeps today's always-ask behavior (#5052).
+    permission_mode = spec.executor.config.get("permission_mode") if isinstance(cfg, dict) else None
+    if permission_mode is not None:
+        env["HARNESS_ACP_PERMISSION_MODE"] = str(permission_mode)
     # Session workspace (selected working folder). ``None`` lets the acp
     # harness fall back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_ACP_CWD.
     if cwd is not None:
