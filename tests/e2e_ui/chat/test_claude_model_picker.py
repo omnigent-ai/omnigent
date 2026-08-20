@@ -674,7 +674,9 @@ def test_claude_native_permission_mode_switch_persists(
     expect(perm).to_be_visible()
     perm.click()
 
-    page.get_by_role("option", name="Auto", exact=True).click()
+    # Located by data attribute, not accessible name: each option renders its
+    # label and description together, so the name is never the bare label.
+    page.locator('[role="option"][data-permission-mode="auto"]').click()
 
     # Save commits the draft and fires the PATCH.
     with page.expect_response(

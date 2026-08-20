@@ -6494,7 +6494,11 @@ function SessionConfigModal({
                 </SelectTrigger>
                 <SelectContent position="popper" align="start">
                   {CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES.map((mode) => (
-                    <SelectItem key={mode.value} value={mode.value}>
+                    <SelectItem
+                      key={mode.value}
+                      value={mode.value}
+                      data-permission-mode={mode.value}
+                    >
                       <span className="flex flex-col items-start">
                         <span>{mode.label}</span>
                         <span className="text-muted-foreground text-xs">{mode.description}</span>
