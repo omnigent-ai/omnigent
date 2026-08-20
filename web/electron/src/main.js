@@ -40,6 +40,7 @@ const { registerLocalhostCors } = require("./localhost_cors");
 const {
   normalizeUrl,
   expandDatabricksWorkspaceUrl,
+  stripApiMountFromServerUrl,
   fetchServerManifest,
   PRE_MANIFEST_BASELINE,
 } = require("./url");
@@ -1082,7 +1083,10 @@ function createWindow(targetUrl, opts = {}) {
   });
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
-  const saved = loadSettings().server_url;
+  // A saved server_url that is the CLI's API endpoint
+  // (``<ws>/api/2.0/omnigent``) would navigate the window to a raw 401 JSON
+  // body with no way back; strip the API mount to the workspace root at boot.
+  const saved = stripApiMountFromServerUrl(loadSettings().server_url);
   // serverUrl: the window's server IDENTITY for host/server CLI commands
   // (``omnigent host --server``, ``omnigent login``, ``serverAuthed``) — the
   // origin or origin+mount, WITHOUT the conversation path. Prefer an explicit

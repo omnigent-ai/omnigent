@@ -10,6 +10,7 @@ const {
   defaultSchemeFor,
   normalizeUrl,
   isPlainHttpRemote,
+  stripApiMountFromServerUrl,
   expandDatabricksWorkspaceUrl,
   WORKSPACE_UI_PATH,
   fetchServerManifest,
@@ -105,6 +106,46 @@ describe("isPlainHttpRemote", () => {
     assert.equal(isPlainHttpRemote("https://example.databricks.com"), false);
     assert.equal(isPlainHttpRemote(""), false);
     assert.equal(isPlainHttpRemote("ht tp://nope"), false);
+  });
+});
+
+describe("stripApiMountFromServerUrl", () => {
+  it("strips a trailing /api/2.0/omnigent to the workspace root", () => {
+    assert.equal(
+      stripApiMountFromServerUrl("https://ws.cloud.databricks.com/api/2.0/omnigent"),
+      "https://ws.cloud.databricks.com",
+    );
+  });
+
+  it("handles the trailing-slash variant", () => {
+    assert.equal(
+      stripApiMountFromServerUrl("https://ws.cloud.databricks.com/api/2.0/omnigent/"),
+      "https://ws.cloud.databricks.com",
+    );
+  });
+
+  it("leaves a URL already at the workspace root unchanged", () => {
+    assert.equal(
+      stripApiMountFromServerUrl("https://ws.cloud.databricks.com"),
+      "https://ws.cloud.databricks.com",
+    );
+    assert.equal(
+      stripApiMountFromServerUrl("https://ws.cloud.databricks.com/"),
+      "https://ws.cloud.databricks.com/",
+    );
+  });
+
+  it("leaves an unrelated mount (e.g. the SPA path) unchanged", () => {
+    assert.equal(
+      stripApiMountFromServerUrl("https://ws.cloud.databricks.com/ml/omnigents"),
+      "https://ws.cloud.databricks.com/ml/omnigents",
+    );
+  });
+
+  it("returns empty/undefined/invalid input unchanged", () => {
+    assert.equal(stripApiMountFromServerUrl(""), "");
+    assert.equal(stripApiMountFromServerUrl(undefined), undefined);
+    assert.equal(stripApiMountFromServerUrl("not a url"), "not a url");
   });
 });
 

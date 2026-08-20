@@ -124,6 +124,43 @@
   const DATABRICKS_APPS_HOST_SUFFIX = "databricksapps.com";
 
   /**
+   * Path the Omnigent API is mounted at under a Databricks workspace. The CLI
+   * legitimately records ``server: <ws>/api/2.0/omnigent`` in its config, and
+   * that same value can end up persisted as the desktop ``server_url``. A
+   * top-level navigation to the raw API path with no credential answers
+   * ``401 {"...": "Credential was not sent ..."}`` as ``application/json``,
+   * dead-ending the window on the raw error with no way back to SSO.
+   */
+  const API_MOUNT_PATH = "/api/2.0/omnigent";
+
+  /**
+   * Strip a trailing ``/api/2.0/omnigent`` (with or without a trailing slash)
+   * from a saved server URL, leaving the workspace root. Applied at boot before
+   * the window loads its saved ``server_url`` so the shell never navigates to
+   * the raw API endpoint (which 401s into a dead-end JSON body). A URL already
+   * at the root, or carrying any other path, is returned unchanged.
+   *
+   * @param {string} rawUrl A saved server URL (may be undefined/empty/garbage).
+   * @returns {string} The workspace-root URL when the API mount was stripped,
+   *   else the input unchanged.
+   */
+  function stripApiMountFromServerUrl(rawUrl) {
+    if (typeof rawUrl !== "string" || rawUrl === "") return rawUrl;
+    let url;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return rawUrl;
+    }
+    const stripped = url.pathname.replace(/\/api\/2\.0\/omnigent\/?$/, "");
+    if (stripped === url.pathname) return rawUrl;
+    url.pathname = stripped;
+    // An emptied path serializes back to a bare origin (no trailing slash),
+    // matching the workspace-root form the rest of the shell expects.
+    return url.pathname === "" || url.pathname === "/" ? url.origin : url.toString();
+  }
+
+  /**
    * Probe timeout for Databricks workspace detection. Deliberately short: a
    * slow or unreachable host must not stall the connect flow — on timeout we
    * fall back to loading the URL exactly as entered.
@@ -283,6 +320,8 @@
     defaultSchemeFor,
     normalizeUrl,
     isPlainHttpRemote,
+    API_MOUNT_PATH,
+    stripApiMountFromServerUrl,
     WORKSPACE_UI_PATH,
     WORKSPACE_PROBE_TIMEOUT_MS,
     expandDatabricksWorkspaceUrl,
