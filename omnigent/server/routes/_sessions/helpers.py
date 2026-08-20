@@ -7749,6 +7749,8 @@ async def _remove_session_worktree_best_effort(
     delete_branch: bool,
     request: Request,
     reason: str,
+    conversation_store: ConversationStore | None = None,
+    exclude_conversation_id: str | None = None,
 ) -> None:
     """
     Best-effort removal of a session's git worktree.
@@ -7768,12 +7770,44 @@ async def _remove_session_worktree_best_effort(
     :param request: FastAPI request carrying the host registry.
     :param reason: Short label for log lines, e.g.
         ``"create-rollback"`` or ``"session-delete"``.
+    :param conversation_store: Optional store for the shared-worktree guard;
+        when omitted the guard is skipped (legacy callers).
+    :param exclude_conversation_id: The conversation whose deletion triggered
+        this removal; other conversations referencing the same
+        (host, worktree) suppress the removal.
     """
     from omnigent.server.routes._host_worktree import (
         WorktreeProxyError,
         remove_worktree_on_host,
     )
 
+    # Shared-worktree guard: a fork reusing the source's directory or any
+    # sessions attached to the same existing worktree keep their cwd alive —
+    # removing the directory under them wedges their runners (#5028). When
+    # another conversation still references the same (host, path), skip the
+    # removal entirely (the session row deletion proceeds; the worktree stays
+    # for the surviving session). Best-effort like everything here: a store
+    # that can't answer counts as unshared so cleanup never silently stops.
+    if conversation_store is not None and exclude_conversation_id is not None:
+        try:
+            shared = await asyncio.to_thread(
+                conversation_store.count_other_conversations_with_workspace,
+                host_id=host_id,
+                workspace=worktree_path,
+                exclude_conversation_id=exclude_conversation_id,
+            )
+        except NotImplementedError:
+            shared = 0
+        if shared > 0:
+            _logger.info(
+                "Skipping worktree removal (%s) for %s: %d other conversation(s) "
+                "still reference it on host %s",
+                reason,
+                worktree_path,
+                shared,
+                host_id,
+            )
+            return
     host_registry = getattr(request.app.state, "host_registry", None)
     if host_registry is None:
         return

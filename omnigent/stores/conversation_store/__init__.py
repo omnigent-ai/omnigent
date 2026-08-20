@@ -1657,6 +1657,29 @@ class ConversationStore(ABC):
         """
         ...
 
+    def count_other_conversations_with_workspace(
+        self,
+        *,
+        host_id: str,
+        workspace: str,
+        exclude_conversation_id: str,
+    ) -> int:
+        """Count conversations OTHER than *exclude_conversation_id* on (*host_id*, *workspace*).
+
+        Sessions can share one worktree directory — a fork reusing the source's
+        worktree, or several sessions attached to an existing worktree via the
+        picker. Delete-time worktree cleanup must not remove a directory another
+        live session still points at (#5028); this count is the "is it shared?"
+        answer. Returns 0 when no other conversation references the pair.
+
+        :param host_id: Host owning the worktree, e.g. ``"host_a1b2..."``.
+        :param workspace: Absolute worktree path, e.g. ``"/w/feature-login"``.
+        :param exclude_conversation_id: The conversation being deleted — its own
+            row must not count as "another session".
+        :returns: Number of other conversations referencing the same pair.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     async def delete_conversation(self, conversation_id: str) -> bool:
         """

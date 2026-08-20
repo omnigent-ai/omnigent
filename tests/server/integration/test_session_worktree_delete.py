@@ -153,6 +153,77 @@ async def test_delete_without_flag_sends_no_remove_worktree(
     assert captured == []
 
 
+async def test_delete_shared_worktree_keeps_directory_until_last_session(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A shared worktree survives session deletes until the LAST referencing
+    session is deleted.
+
+    Two sessions commonly share one directory — a fork reusing the source's
+    worktree, or several sessions attached to the same existing worktree.
+    Deleting one of them must not remove the directory under the other's
+    runner; deleting the final one may (#5028).
+    """
+    captured = await _register_fake_host(app, db_uri)
+    first = _make_worktree_conversation(db_uri)
+    second = _make_worktree_conversation(db_uri)
+    assert first != second
+
+    # Delete the first sharer: no remove frame — the survivor keeps its cwd.
+    resp = await client.delete(f"/v1/sessions/{first}?delete_branch=true")
+    assert resp.status_code == 200
+    assert captured == [], (
+        "worktree removed while another session still references it — "
+        "the surviving session's runner is now wedged on a deleted cwd"
+    )
+
+    # Delete the last sharer: the frame now fires with the shared path.
+    resp = await client.delete(f"/v1/sessions/{second}?delete_branch=true")
+    assert resp.status_code == 200
+    assert len(captured) == 1
+    assert captured[0].worktree_path == "/Users/alice/myrepo-worktrees/feature-login"
+    assert captured[0].delete_branch is True
+
+
+def test_count_other_conversations_with_workspace_excludes_self(db_uri: str) -> None:
+    """The store-level guard query: other sessions on the pair count, self
+    doesn't, and a different path/host never counts."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    mine = _make_worktree_conversation(db_uri)
+    # Same (host, workspace) — a fork reusing the directory.
+    theirs = _make_worktree_conversation(db_uri)
+
+    assert (
+        conv_store.count_other_conversations_with_workspace(
+            host_id=_HOST_ID,
+            workspace="/Users/alice/myrepo-worktrees/feature-login",
+            exclude_conversation_id=mine,
+        )
+        == 1
+    )
+    # Self-exclusion: from the other session's perspective mine counts.
+    assert (
+        conv_store.count_other_conversations_with_workspace(
+            host_id=_HOST_ID,
+            workspace="/Users/alice/myrepo-worktrees/feature-login",
+            exclude_conversation_id=theirs,
+        )
+        == 1
+    )
+    # A different workspace never counts.
+    assert (
+        conv_store.count_other_conversations_with_workspace(
+            host_id=_HOST_ID,
+            workspace="/Users/alice/myrepo-worktrees/somewhere-else",
+            exclude_conversation_id=mine,
+        )
+        == 0
+    )
+
+
 async def test_delete_non_worktree_session_ignores_flag(
     app: FastAPI,
     client: httpx.AsyncClient,

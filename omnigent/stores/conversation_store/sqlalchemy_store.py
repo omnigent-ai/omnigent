@@ -3903,6 +3903,33 @@ class SqlAlchemyConversationStore(ConversationStore):
             raise LookupError(f"conversation not found: {conversation_id!r}")
         return conv
 
+    def count_other_conversations_with_workspace(
+        self,
+        *,
+        host_id: str,
+        workspace: str,
+        exclude_conversation_id: str,
+    ) -> int:
+        """Count other conversations sharing (*host_id*, *workspace*) — see the
+        protocol docstring. One indexed-column query over the metadata table;
+        the conversation being deleted is excluded by id, not deleted first,
+        so the caller can decide BEFORE removing anything (#5028).
+        """
+        from sqlalchemy import func as sa_func
+
+        with self._session("count_other_conversations_with_workspace") as meta_sess:
+            count = meta_sess.scalar(
+                select(sa_func.count())
+                .select_from(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.host_id == host_id,
+                    SqlConversationMetadata.workspace == workspace,
+                    SqlConversationMetadata.id != exclude_conversation_id,
+                )
+            )
+            return int(count or 0)
+
     async def delete_conversation(self, conversation_id: str) -> bool:
         """
         Delete a conversation and all of its descendants, cleaning up
