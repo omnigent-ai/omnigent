@@ -60,6 +60,12 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+from omnigent.server.routes._oauth import (
+    NO_STORE_HEADERS,
+    RATE_LIMITER_MAX_KEYS,
+    SlidingWindowRateLimiter,
+)
+from omnigent.server.routes._oauth import oauth_error as _oauth_error
 from omnigent.server.routes._origin import require_trusted_origin
 
 _logger = logging.getLogger(__name__)
@@ -123,35 +129,40 @@ def mint_delegated_token(
     ttl_seconds: int,
     provider: str,
     *,
-    grant_id: str,
+    grant_id: str | None = None,
     client_id: str,
     jti: str,
     scope: str = DELEGATED_SCOPE,
 ) -> str:
-    """Mint a delegated access token for a device-authorization grant.
+    """Mint a delegated access token for a device or client-credential grant.
 
     Same HS256 shape as
     :func:`omnigent.server.oidc.mint_session_token` (so
     :meth:`UnifiedAuthProvider._check_cookie` validates it unchanged),
-    plus four delegated-only claims:
+    plus the delegated-only claims:
 
     - ``scope`` — restricts the token to the session APIs; the auth
-      layer rejects admin endpoints when this claim is present.
-    - ``grant_id`` — the device grant this token was issued from,
-      checked against the revocation denylist so revoking the grant
-      immediately kills the token.
+      layer confines any token carrying this claim to a fail-closed path
+      allowlist and rejects admin endpoints.
+    - ``grant_id`` — for a device grant, the grant this token was issued
+      from, checked against the revocation denylist so revoking the grant
+      immediately kills the token. Omitted for a client-credentials token,
+      which has no store-backed grant (revocation is by rotation/expiry) —
+      leaving it out is what tells the auth layer to skip the denylist
+      lookup for that token.
     - ``jti`` — unique token id, for audit/log correlation.
     - ``act`` — provenance (RFC 8693 style), ``{"client_id": "<app>"}``,
-      naming the application that obtained the grant so every delegated
-      action is attributable to it.
+      naming the application the token acts on behalf of so every
+      delegated action is attributable to it.
 
     :param user_id: The Omnigent identity the token acts as (``sub``).
     :param cookie_secret: HMAC key for HS256 signing.
     :param ttl_seconds: Token lifetime in seconds (kept short — ≤ 1 h).
     :param provider: Identity provider name (informational claim).
-    :param grant_id: The device grant id.
-    :param client_id: The RFC 8628 client id (the requesting application,
-        e.g. ``"slack"``); recorded in the ``act`` claim for audit.
+    :param grant_id: The device grant id, or ``None`` for a
+        client-credentials token (no ``grant_id`` claim is emitted).
+    :param client_id: The client id (the requesting application, e.g.
+        ``"slack"`` or the machine client); recorded in ``act`` for audit.
     :param jti: Unique token id.
     :param scope: Granted scope; defaults to :data:`DELEGATED_SCOPE`.
     :returns: An HS256-signed JWT string.
@@ -163,16 +174,12 @@ def mint_delegated_token(
         "exp": now + ttl_seconds,
         "provider": provider,
         "scope": scope,
-        "grant_id": grant_id,
         "jti": jti,
         "act": {"client_id": client_id},
     }
+    if grant_id is not None:
+        payload["grant_id"] = grant_id
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
-
-
-def _oauth_error(error: str, status_code: int = 400) -> JSONResponse:
-    """Return an RFC 6749 / 8628 shaped OAuth error response."""
-    return JSONResponse(status_code=status_code, content={"error": error})
 
 
 def _require_browser_origin(request: Request) -> None:
@@ -202,59 +209,8 @@ _AUTHORIZE_RATE_WINDOW_SECONDS = 60  # …per client per this window.
 # Purge expired/dead grants at most this often (piggybacked on authorize
 # so no scheduler is required — keeps the table bounded under load).
 _PURGE_MIN_INTERVAL_SECONDS = 300
-
-
-# Hard cap on distinct keys the limiter tracks at once. Bounds memory even
-# under a spray from many source IPs (e.g. a whole IPv6 /64) — without it a
-# key hit once and never revisited would live forever. When the cap is hit
-# the whole table is swept of aged-out keys; if still full, the limiter
-# fails OPEN for a new key (availability over a soft throttle — the real
-# anti-abuse control in production is the confidential client secret).
-_RATE_LIMITER_MAX_KEYS = 10_000
-
-
-class _SlidingWindowRateLimiter:
-    """Minimal per-key sliding-window limiter (in-memory, single-process).
-
-    Keyed by client IP. Adequate for a single-process socket-mode
-    deployment; a multi-replica server would want a shared store, but the
-    grant table's own single-use/expiry semantics already bound abuse.
-
-    Memory is bounded by :data:`_RATE_LIMITER_MAX_KEYS`: keys are dropped
-    when they age out (on touch) and, when the cap is reached, a full sweep
-    reclaims every aged-out key before admitting a new one.
-    """
-
-    def __init__(self, max_events: int, window_seconds: int, max_keys: int) -> None:
-        self._max = max_events
-        self._window = window_seconds
-        self._max_keys = max_keys
-        self._hits: dict[str, list[float]] = {}
-
-    def _sweep(self, cutoff: float) -> None:
-        """Drop every key whose hits have all aged out."""
-        dead = [k for k, ts in self._hits.items() if not any(t > cutoff for t in ts)]
-        for k in dead:
-            self._hits.pop(k, None)
-
-    def allow(self, key: str, now: float) -> bool:
-        cutoff = now - self._window
-        # New key while at capacity: sweep aged-out keys first; if the table
-        # is still full of live keys, fail open rather than grow unbounded.
-        if key not in self._hits and len(self._hits) >= self._max_keys:
-            self._sweep(cutoff)
-            if len(self._hits) >= self._max_keys:
-                return True
-        hits = [t for t in self._hits.get(key, ()) if t > cutoff]
-        # Opportunistically bound memory: drop keys that fully aged out.
-        if not hits:
-            self._hits.pop(key, None)
-        if len(hits) >= self._max:
-            self._hits[key] = hits
-            return False
-        hits.append(now)
-        self._hits[key] = hits
-        return True
+# The limiter itself lives in routes/_oauth.py: the client-credentials grant
+# throttles its own unauthenticated endpoint with the same primitive.
 
 
 def create_device_auth_router(
@@ -302,8 +258,8 @@ def create_device_auth_router(
         return hmac.compare_digest(presented.encode("utf-8"), client_secret.encode("utf-8"))
 
     router = APIRouter()
-    _rate_limiter = _SlidingWindowRateLimiter(
-        _AUTHORIZE_RATE_MAX, _AUTHORIZE_RATE_WINDOW_SECONDS, _RATE_LIMITER_MAX_KEYS
+    _rate_limiter = SlidingWindowRateLimiter(
+        _AUTHORIZE_RATE_MAX, _AUTHORIZE_RATE_WINDOW_SECONDS, RATE_LIMITER_MAX_KEYS
     )
     # Last time we purged expired grants; gates the opportunistic purge on
     # authorize so the table stays bounded without a separate scheduler.
@@ -385,6 +341,10 @@ def create_device_auth_router(
                 "expires_in": _DEVICE_CODE_TTL_SECONDS,
                 "interval": _POLL_INTERVAL_SECONDS,
             },
+            # RFC 8628 §3.2 carries the bearer device_code and the user_code
+            # here, so this body is as sensitive as a token response and gets
+            # the same no-store treatment.
+            headers=NO_STORE_HEADERS,
         )
 
     # ── Browser consent page ──────────────────────────────────────
@@ -611,6 +571,7 @@ def create_device_auth_router(
                 "token_type": "Bearer",
                 "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
             },
+            headers=NO_STORE_HEADERS,
         )
 
     def _handle_refresh_grant(refresh_token: str) -> Response:
@@ -666,6 +627,7 @@ def create_device_auth_router(
                 "token_type": "Bearer",
                 "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
             },
+            headers=NO_STORE_HEADERS,
         )
 
     # ── Revocation ────────────────────────────────────────────────

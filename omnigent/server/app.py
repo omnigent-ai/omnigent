@@ -2780,12 +2780,17 @@ def create_app(
         # See designs/DEVICE_AUTH.md.
         from omnigent.server.auth import env_var_is_truthy
 
+        # Lets the client-credentials mount below see whether the device grant
+        # already owns /oauth/token. Set inside the branch, not hoisted into the
+        # condition, which would discard this block's isinstance/None narrowing.
+        device_grant_active = False
         if (
             env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
             and isinstance(auth_provider, UnifiedAuthProvider)
             and auth_provider._source == "accounts"
             and permission_store is not None
         ):
+            device_grant_active = True
             from omnigent.server.device_grant_store import DeviceGrantStore
             from omnigent.server.routes.device_auth import create_device_auth_router
 
@@ -2811,6 +2816,40 @@ def create_app(
                     "the server and its trusted client(s) to restrict initiation "
                     "to authorized clients. See designs/DEVICE_AUTH.md.",
                 )
+
+        # Client-credentials grant (RFC 6749 §4.4): a single confidential client
+        # mints a delegated, path-scoped token with no browser in the loop.
+        # Opt-in and default-off — the factory returns None (leaving
+        # POST /oauth/token unrouted) unless a machine client is configured and
+        # its principal passes the admin check. Cookie-based modes only (it
+        # needs the HS256 cookie secret), and it stands down when the device
+        # grant is mounted, which already owns that path.
+        # See designs/CLIENT_CREDENTIALS.md.
+        if isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source in (
+            "oidc",
+            "accounts",
+        ):
+            from omnigent.server.routes.client_credentials import (
+                MachineClientConfig,
+                create_client_credentials_router,
+            )
+
+            if device_grant_active:
+                # The device grant already owns POST /oauth/token, so this grant
+                # stands down. The config is still parsed: from_env raises on a
+                # malformed one, so a deploy error surfaces at startup either
+                # way, and an operator who configured a machine client that
+                # cannot take effect is told rather than left guessing.
+                if MachineClientConfig.from_env() is not None:
+                    _logger.warning(
+                        "client-credentials: a machine client is configured but the "
+                        "device grant owns POST /oauth/token, so the client-credentials "
+                        "grant is inactive. Unset OMNIGENT_DEVICE_GRANT_ENABLED to use it."
+                    )
+            else:
+                machine_router = create_client_credentials_router(auth_provider, permission_store)
+                if machine_router is not None:
+                    app.include_router(machine_router, tags=["oauth"])
 
     # Mount the built web SPA at "/" if a build is present. The SPA is
     # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite
