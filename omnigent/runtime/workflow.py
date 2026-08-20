@@ -1180,6 +1180,34 @@ def _build_claude_sdk_spawn_env(
     if cwd is not None:
         env["HARNESS_CLAUDE_SDK_CWD"] = str(cwd)
 
+    # ── Vertex AI (Claude on Vertex) ───────────────────────────────────
+    # Opt-in via executor.config, mirroring the antigravity harness's
+    # identical vertex/project/location convention (see
+    # _build_antigravity_spawn_env) — authenticated by GCP ADC resolved
+    # in the unsandboxed parent process (VertexAnthropicGatewayShim), not
+    # a spec-declared credential. Mutually exclusive with the
+    # provider/gateway/Databricks auth paths below: Vertex owns the whole
+    # transport, so a spec that also sets executor.auth or a databricks-*
+    # model alongside vertex: true is a config error the inner executor
+    # rejects at construction time (ClaudeSDKExecutor.__init__).
+    config = spec.executor.config
+    if config.get("vertex"):
+        env["HARNESS_CLAUDE_SDK_VERTEX_PROJECT"] = str(config.get("project", ""))
+        location = config.get("location")
+        if location:
+            env["HARNESS_CLAUDE_SDK_VERTEX_LOCATION"] = str(location)
+        _add_claude_sdk_skills_env(env, spec, workdir)
+        os_env_payload = _serialize_os_env(spec.os_env)
+        if os_env_payload is not None:
+            env["HARNESS_CLAUDE_SDK_OS_ENV"] = os_env_payload
+        retry_payload = _serialize_retry_policy(_resolve_retry_policy(spec))
+        if retry_payload is not None:
+            env["HARNESS_CLAUDE_SDK_RETRY_POLICY"] = retry_payload
+        permission_mode = config.get("permission_mode")
+        if permission_mode is not None:
+            env["HARNESS_CLAUDE_SDK_PERMISSION_MODE"] = str(permission_mode)
+        return env
+
     # ── Auth resolution ────────────────────────────────────────────────
     # Priority (highest first):
     # 0. Generic provider — spec.executor.auth: {type: provider, name: X},
