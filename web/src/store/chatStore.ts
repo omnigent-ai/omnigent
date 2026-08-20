@@ -3266,11 +3266,22 @@ async function bindStream(
         content: p.content,
         ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
       });
+      const serverPending = (session.pendingInputs ?? []).map(toPending);
+      const pendingStillOnServer = new Set<string>();
       let candidatePending: PendingUserMessage[];
       if (!hydratePending) {
         candidatePending = state.pendingUserMessages;
+        // A reconnect can miss the consumed event that normally promotes an
+        // optimistic bubble. Preserve server-known entries; allow a posted
+        // entry that already committed to reconcile against the snapshot.
+        const unmatchedServer = serverPending.map((p) => contentKeyOf(p.content));
+        for (const pending of candidatePending) {
+          const i = unmatchedServer.indexOf(contentKeyOf(pending.content));
+          if (i === -1) continue;
+          pendingStillOnServer.add(pending.tempId);
+          unmatchedServer.splice(i, 1);
+        }
       } else {
-        const serverPending = (session.pendingInputs ?? []).map(toPending);
         // One-to-one consumption so two identical queued sends still match
         // pairwise. Content (not text) equality so image-only messages
         // correlate too.
@@ -3300,12 +3311,26 @@ async function bindStream(
       // (The old baseline arithmetic existed only because `switchTo` used to
       // destroy state and restore bubbles from a stash, which could collide
       // with an older identical message in history.)
-      const dedupePending = hydratePending && candidatePending.length > 0;
+      const dedupePending =
+        candidatePending.length > 0 &&
+        (hydratePending ||
+          candidatePending.some(
+            (p) =>
+              !pendingStillOnServer.has(p.tempId) &&
+              (p.posted === true || !p.tempId.startsWith("pend_")),
+          ));
       const committedUserTexts = dedupePending ? committedUserTextsOf(allBlocks) : [];
       const countEndsWith = (texts: string[], suffix: string): number =>
         texts.reduce((n, c) => (c.endsWith(suffix) ? n + 1 : n), 0);
       const snapshotPending: PendingUserMessage[] = dedupePending
         ? candidatePending.filter((p) => {
+            if (
+              !hydratePending &&
+              (pendingStillOnServer.has(p.tempId) ||
+                (p.posted !== true && p.tempId.startsWith("pend_")))
+            ) {
+              return true;
+            }
             const text = messageContentText(p.content);
             if (text === "") return true;
             return countEndsWith(committedUserTexts, text) === 0;
