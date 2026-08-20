@@ -1328,8 +1328,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         content = self._git_show(ref, git_path, norm)
         if content is None and baseline_sha is not None:
             _logger.warning(
-                "Baseline SHA %s is unreachable for get_baseline %r; "
-                "falling back to HEAD",
+                "Baseline SHA %s is unreachable for get_baseline %r; falling back to HEAD",
                 baseline_sha,
                 norm,
             )
