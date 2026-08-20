@@ -31,7 +31,11 @@ accepted by Copilot.
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
+import re
 import subprocess
+from pathlib import Path
 
 from omnigent.errors import OmnigentError
 from omnigent.onboarding.extra_install import extra_install_command
@@ -59,6 +63,57 @@ COPILOT_TOKEN_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 # never lock anyone out of their own token. Classic ``ghp_`` PATs are excluded
 # because Copilot rejects them.
 _GITHUB_TOKEN_PREFIXES = ("github_pat_", "gho_", "ghu_", "ghs_")
+
+# The Copilot CLI's state directory override (the CLI's own convention) and the
+# managed config file inside it that records the logged-in user.
+COPILOT_HOME_ENV_VAR = "COPILOT_HOME"
+_CLI_CONFIG_FILENAME = "config.json"
+_CLI_LOGIN_FIELD = "lastLoggedInUser"
+
+
+def _copilot_cli_config_path() -> Path:
+    """Return the Copilot CLI's managed config file path.
+
+    Honors the CLI's ``COPILOT_HOME`` override; defaults to ``~/.copilot``.
+
+    :returns: Path to ``config.json`` inside the Copilot CLI home.
+    """
+    home = os.environ.get(COPILOT_HOME_ENV_VAR, "").strip()
+    base = Path(home) if home else Path.home() / ".copilot"
+    return base / _CLI_CONFIG_FILENAME
+
+
+def copilot_cli_logged_in() -> bool:
+    """Return whether the Copilot CLI has a logged-in user on this machine.
+
+    With no GitHub token configured anywhere, the SDK leaves the CLI's
+    auto-login on (``use_logged_in_user``) and the runtime authenticates as
+    the user from ``copilot login``; the credential also carries its GitHub
+    host, which makes it the working auth source for GitHub Enterprise
+    data-residency seats (``copilot login --host <tenant>.ghe.com``). The
+    login itself lives in the OS keychain, but the CLI records the identity
+    in its managed ``config.json``; that marker is what this probe reads.
+
+    The file is JSONC (the CLI writes ``//`` line comments), so comment
+    lines are stripped before parsing. Any unreadable or unparseable state
+    reads as "not logged in"; this feeds a readiness probe, never an
+    error path.
+
+    :returns: ``True`` when a logged-in user is recorded.
+    """
+    try:
+        raw = _copilot_cli_config_path().read_text(encoding="utf-8")
+    except OSError:
+        return False
+    cleaned = re.sub(r"^\s*//.*$", "", raw, flags=re.M)
+    try:
+        doc = json.loads(cleaned)
+    except ValueError:
+        return False
+    if not isinstance(doc, dict):
+        return False
+    user = doc.get(_CLI_LOGIN_FIELD)
+    return isinstance(user, dict) and bool(user.get("login"))
 
 
 def gh_cli_github_token(host: str | None = None) -> str | None:

@@ -250,12 +250,19 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         # Copilot runs in-process via the ``github-copilot-sdk`` package (the
         # SDK bundles the CLI binary it drives, so there is no separate binary to
         # gate on) and authenticates against GitHub's Copilot backend with a
-        # GitHub token. So, like cursor, readiness is whether a token is
-        # resolvable — one stored by ``omnigent setup`` (the ``copilot:`` config
-        # block — see :mod:`omnigent.onboarding.copilot_auth`) or inherited from
-        # the environment. A bad / Copilot-less token surfaces at run time.
+        # GitHub token OR the Copilot CLI's own logged-in user: with no token
+        # configured anywhere, the SDK leaves the CLI's auto-login on and the
+        # runtime authenticates as the ``copilot login`` user (the only working
+        # source for GitHub Enterprise data-residency seats, whose stored
+        # credential carries its host). Gating on the token alone therefore
+        # blocks launches that would succeed. Readiness is: a resolvable token
+        # (stored by ``omnigent setup`` in the ``copilot:`` config block, see
+        # :mod:`omnigent.onboarding.copilot_auth`, or inherited from the
+        # environment) or a recorded CLI login. A bad / Copilot-less
+        # credential surfaces at run time.
         from omnigent.onboarding.copilot_auth import (
             COPILOT_TOKEN_ENV_VARS,
+            copilot_cli_logged_in,
             copilot_github_host,
             copilot_github_token_configured,
             gh_cli_github_token,
@@ -264,6 +271,12 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         if copilot_github_token_configured() or any(
             os.environ.get(var) for var in COPILOT_TOKEN_ENV_VARS
         ):
+            return True
+        # The Copilot CLI's own ``copilot login`` is a usable credential too;
+        # its stored login carries the GitHub host, which makes it the working
+        # source on Enterprise data-residency seats. Checked first because it
+        # is a local file read, not a subprocess.
+        if copilot_cli_logged_in():
             return True
         # A ``gh auth login`` session is a usable Copilot credential, so a
         # logged-in user is ready without pasting a token into setup.

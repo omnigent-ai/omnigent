@@ -27,6 +27,21 @@ export const BRAIN_HARNESS_LABELS: Record<string, string> = {
   copilot: "Copilot",
 };
 
+/** The SDK copilot harness id, as the brain-harness map spells it. */
+export const COPILOT_HARNESS_ID = "copilot";
+
+/**
+ * Whether an agent's (or a drafted) brain harness is the copilot one, which
+ * carries its own Model/Effort knobs: the catalog is the Copilot backend's,
+ * resolved by the host, rather than a client-side list. Keyed on the harness
+ * an agent runs on, not a registry capability: copilot is an SDK harness
+ * reachable from any agent. Matches the canonical spelling only, the same
+ * gate the brain-harness map applies.
+ */
+export function isCopilotHarness(harness: string | null | undefined): boolean {
+  return harness === COPILOT_HARNESS_ID;
+}
+
 /** One raw setup step from the server's ``/v1/harnesses`` catalog. */
 export interface SetupStepWire {
   kind: string;

@@ -2361,6 +2361,24 @@ class HostProcess:
                 models=pi_models,
             )
 
+        if harness == "copilot":
+            try:
+                from omnigent.copilot_models import copilot_model_options
+
+                models = await copilot_model_options()
+            except Exception:
+                _logger.exception("Failed to resolve pre-launch Copilot model options")
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve Copilot model options",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=models,
+            )
+
         if harness != "claude-native":
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,

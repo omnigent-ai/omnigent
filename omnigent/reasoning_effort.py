@@ -28,10 +28,12 @@ CODEX_EFFORTS = OPENAI_EFFORTS
 OPENAI_AGENTS_EFFORTS = OPENAI_EFFORTS
 GEMINI_EFFORTS = frozenset({"low", "medium", "high"})
 ANTIGRAVITY_EFFORTS = GEMINI_EFFORTS
-# The GitHub Copilot SDK's ``create_session(reasoning_effort=...)`` accepts
-# exactly these levels (``copilot.session.ReasoningEffort`` literal); per-model
-# support is gated by the Copilot backend (``list_models()``).
-COPILOT_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+# The full effort ladder the GitHub Copilot CLI accepts
+# (``--reasoning-effort``, CLI 1.0.78); the SDK forwards the string to the
+# backend unvalidated, so this set only fences the vocabulary. Which subset a
+# given model takes is per model (``list_models()``'s
+# ``supported_reasoning_efforts``) and enforced by the backend.
+COPILOT_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 
 
 def format_supported(values: Iterable[str]) -> str:

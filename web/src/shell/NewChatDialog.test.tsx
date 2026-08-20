@@ -182,6 +182,28 @@ const CODEX_MODEL_OPTIONS_RESULT = {
   isLoading: false,
   isError: false,
 };
+// Mirrors the host's copilot model-options probe after policy filtering: the
+// auto router (default, no efforts), a reasoning model with its own ladder
+// (incl. "max", which only some models take), and an effort-less model.
+const COPILOT_MODEL_OPTIONS_RESULT = {
+  data: [
+    { id: "auto", displayName: "Auto", isDefault: true },
+    {
+      id: "claude-sonnet-5",
+      displayName: "Claude Sonnet 5",
+      supportedReasoningEfforts: [
+        { reasoningEffort: "low" },
+        { reasoningEffort: "medium" },
+        { reasoningEffort: "high" },
+        { reasoningEffort: "xhigh" },
+        { reasoningEffort: "max" },
+      ],
+    },
+    { id: "claude-haiku-4.5", displayName: "Claude Haiku 4.5" },
+  ],
+  isLoading: false,
+  isError: false,
+};
 
 const useHostModelOptionsMock = vi.mocked(useHostModelOptions);
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
@@ -755,6 +777,52 @@ function setupLandingMocks() {
     },
   ]);
 }
+
+/**
+ * A roster on (or switchable to) the copilot brain harness, plus the
+ * host-resolved copilot model catalog. Copilot deliberately has no top-level
+ * picker presence of its own: it is reached through agents on the copilot
+ * harness, so the fixtures are a user-created custom agent (sole agent, so it
+ * auto-selects) or a claude-sdk bundle agent whose Agent Harness select can
+ * pick Copilot.
+ */
+function setupCopilotMocks(agents: AvailableAgent[]) {
+  mockHosts([
+    {
+      ...host("online"),
+      configured_harnesses: { "claude-sdk": true, copilot: true },
+    } as Host,
+  ]);
+  useHostModelOptionsMock.mockImplementation(
+    (_hostId, harness) =>
+      (harness === "copilot"
+        ? COPILOT_MODEL_OPTIONS_RESULT
+        : harness === "codex-native"
+          ? CODEX_MODEL_OPTIONS_RESULT
+          : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+  );
+  mockAgents(agents);
+}
+
+/** A user-created custom agent on the copilot harness. */
+const CUSTOM_COPILOT_AGENT: AvailableAgent = {
+  id: "a3",
+  name: "my-copilot",
+  display_name: "My Copilot",
+  description: null,
+  harness: "copilot",
+  skills: [],
+} as AvailableAgent;
+
+/** A bundle agent whose brain harness can be switched to copilot. */
+const DEBBY_AGENT: AvailableAgent = {
+  id: "a4",
+  name: "debby",
+  display_name: "Debby",
+  description: null,
+  harness: "claude-sdk",
+  skills: [],
+} as AvailableAgent;
 
 function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
   const client = new QueryClient({
@@ -1547,6 +1615,92 @@ describe("NewChatLandingScreen", () => {
     expect(body.model_override).toBe("databricks-gpt-5-6");
     expect(body.reasoning_effort).toBeUndefined();
     expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex-native", true);
+  });
+
+  it("shows the Copilot catalog in the gear modal and no effort row on Default", () => {
+    setupCopilotMocks([CUSTOM_COPILOT_AGENT]);
+    renderLanding();
+    // Sole agent auto-selects, so the gear is directly reachable; a custom
+    // copilot agent needs no top-level picker presence of its own.
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    // A copilot agent is a bundle agent, so the Agent Harness row renders,
+    // and the Model row rides under it with the host-resolved catalog.
+    expect(screen.getByTestId("new-chat-landing-config-harness")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-config-model")).toBeTruthy();
+    // Default rides the backend's auto pick, which takes no effort; the
+    // Effort row is absent entirely, not just empty.
+    expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
+    // The model select offers the host-resolved (policy-filtered) catalog.
+    openSelect("new-chat-landing-config-model");
+    expect(screen.getByText("Auto")).toBeTruthy();
+    expect(screen.getByText("Claude Sonnet 5")).toBeTruthy();
+    expect(screen.getByText("Claude Haiku 4.5")).toBeTruthy();
+    closeMenu();
+  });
+
+  it("offers the selected Copilot model's own effort ladder", () => {
+    setupCopilotMocks([CUSTOM_COPILOT_AGENT]);
+    renderLanding();
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    pickSelectOption("new-chat-landing-config-model", "Claude Sonnet 5");
+    // The row appears with exactly the model's advertised levels, including
+    // "max", which the static claude-native list never offered per model.
+    openSelect("new-chat-landing-config-effort");
+    expect(screen.getByText("xHigh")).toBeTruthy();
+    expect(screen.getByText("Max")).toBeTruthy();
+    closeMenu();
+  });
+
+  it("drops a stale Copilot effort when switching to an effort-less model", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    setupCopilotMocks([CUSTOM_COPILOT_AGENT]);
+    renderLanding();
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    pickSelectOption("new-chat-landing-config-model", "Claude Sonnet 5");
+    pickSelectOption("new-chat-landing-config-effort", "Max");
+    // Haiku advertises no reasoning efforts: the row disappears and the
+    // drafted "max" must not ride along into the create call.
+    pickSelectOption("new-chat-landing-config-model", "Claude Haiku 4.5");
+    expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
+    saveConfig();
+
+    const { body } = await submitAndReadBody("run the build");
+    expect(body.agent_id).toBe("a3");
+    expect(body.model_override).toBe("claude-haiku-4.5");
+    expect(body.reasoning_effort).toBeUndefined();
+    // The agent already runs on copilot; no override is picked, none is sent.
+    expect(body.harness_override).toBeUndefined();
+  });
+
+  it("offers the Copilot catalog when a bundle agent's harness is switched to copilot", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    setupCopilotMocks([DEBBY_AGENT]);
+    renderLanding();
+
+    // Debby's declared brain is claude-sdk: no Model row of its own.
+    openAgentConfig("a4");
+    expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
+    // Switching the Agent Harness draft to Copilot brings the rows up live.
+    openSelect("new-chat-landing-config-harness");
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-copilot"));
+    expect(screen.getByTestId("new-chat-landing-config-model")).toBeTruthy();
+    pickSelectOption("new-chat-landing-config-model", "Claude Sonnet 5");
+    pickSelectOption("new-chat-landing-config-effort", "Max");
+    saveConfig();
+
+    // The create carries the harness override AND the copilot model/effort.
+    const { body } = await submitAndReadBody("run the build");
+    expect(body.agent_id).toBe("a4");
+    expect(body.harness_override).toBe("copilot");
+    expect(body.model_override).toBe("claude-sonnet-5");
+    expect(body.reasoning_effort).toBe("max");
   });
 
   it("arms codex full bypass as a plain Approval option, with no warning banner", () => {
