@@ -1943,6 +1943,95 @@ async def test_auto_title_rejects_multiline_titles(
     assert response.status_code == 400, response.text
 
 
+async def test_external_session_title_overwrites_an_explicit_title(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A terminal ``/rename`` wins over a title set from the Web UI.
+
+    Unlike ``/auto-title`` — which declines once a human has named the
+    session — this event carries an explicit operator action, so it is
+    authoritative.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="Set from the web UI")
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_title", "data": {"title": "auth-refactor"}},
+    )
+
+    assert response.status_code in (200, 202), response.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["title"] == "auth-refactor"
+
+
+async def test_external_session_title_collapses_whitespace(
+    client: httpx.AsyncClient,
+) -> None:
+    """Surrounding and repeated whitespace is normalized before persisting."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_title", "data": {"title": "  auth   refactor  "}},
+    )
+
+    assert response.status_code in (200, 202), response.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == "auth refactor"
+
+
+@pytest.mark.parametrize("title", ["", "   ", "one\ntwo"])
+async def test_external_session_title_rejects_malformed_titles(
+    client: httpx.AsyncClient,
+    title: str,
+) -> None:
+    """Blank and multi-line titles are rejected rather than persisted."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="Original title")
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_title", "data": {"title": title}},
+    )
+
+    assert response.status_code == 400, response.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == "Original title"
+
+
+async def test_external_session_title_declines_child_sessions(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Child titles are structural (``"<agent>:<label>"``), so a rename is dropped.
+
+    The sub-agent tooling parses those titles back apart; overwriting one
+    with free text would break that lookup.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        kind="sub_agent",
+        title="coder:debug-auth",
+        parent_conversation_id=parent["id"],
+        agent_id=agent["id"],
+    )
+
+    response = await client.post(
+        f"/v1/sessions/{child.id}/events",
+        json={"type": "external_session_title", "data": {"title": "auth-refactor"}},
+    )
+
+    assert response.status_code in (200, 202), response.text
+    assert store.get_conversation(child.id).title == "coder:debug-auth"
+
+
 async def test_patch_session_archive_hides_from_default_list(
     client: httpx.AsyncClient,
 ) -> None:

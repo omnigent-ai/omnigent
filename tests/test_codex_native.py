@@ -729,10 +729,11 @@ def _usage_event(input_tokens: int, context_window: int = 200_000) -> dict[str, 
         "params": {
             "threadId": "thread_123",
             "tokenUsage": {
+                "modelContextWindow": context_window,
                 "total": {
                     "inputTokens": input_tokens,
-                    "contextWindow": context_window,
                 },
+                "last": {"inputTokens": input_tokens},
             },
         },
     }
@@ -8415,6 +8416,55 @@ def test_session_usage_data_without_output_tokens_omits_cumulative_output() -> N
     assert data is not None
     assert data["cumulative_input_tokens"] == 500
     assert "cumulative_output_tokens" not in data
+
+
+def test_session_usage_data_uses_effective_model_context_window() -> None:
+    """The context ring uses Codex's effective model window when available."""
+    params = {
+        "tokenUsage": {
+            "modelContextWindow": 258_400,
+            "total": {
+                "inputTokens": 200_000,
+                "outputTokens": 10_000,
+            },
+        },
+    }
+    data = codex_native_forwarder._session_usage_data_from_params(params)
+    assert data is not None
+    assert data["context_window"] == 258_400
+
+
+def test_session_usage_data_prefers_effective_context_window_over_legacy() -> None:
+    """Codex's effective window takes precedence over the legacy total field."""
+    params = {
+        "tokenUsage": {
+            "modelContextWindow": 258_400,
+            "total": {
+                "inputTokens": 200_000,
+                "outputTokens": 10_000,
+                "contextWindow": 1_050_000,
+            },
+        },
+    }
+    data = codex_native_forwarder._session_usage_data_from_params(params)
+    assert data is not None
+    assert data["context_window"] == 258_400
+
+
+def test_session_usage_data_invalid_effective_window_falls_back_to_legacy() -> None:
+    """Malformed effective windows do not suppress a valid legacy fallback."""
+    params = {
+        "tokenUsage": {
+            "modelContextWindow": 0,
+            "total": {
+                "inputTokens": 200_000,
+                "contextWindow": 1_050_000,
+            },
+        },
+    }
+    data = codex_native_forwarder._session_usage_data_from_params(params)
+    assert data is not None
+    assert data["context_window"] == 1_050_000
 
 
 def test_session_usage_data_context_tokens_uses_last_turn_input() -> None:

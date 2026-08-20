@@ -2538,7 +2538,7 @@ async def _mark_runner_sessions_offline_impl(
         # turn edges), falling back to the row for a session whose live state
         # was published before a restart.
         live = _session_status_cache.get(conv.id, conv.live_status)
-        interrupted = live in ("running", "waiting")
+        interrupted = live in _MID_TURN_STATUSES
         dead_on_arrival = fail_idle_top_level and conv.kind != "sub_agent"
         if not interrupted and not dead_on_arrival:
             continue
@@ -5589,6 +5589,12 @@ async def _dispatch_session_event_to_runner_impl(
 RUNNER_DISCONNECT_GRACE_S: float = 10.0
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
+# Session statuses that mean a turn was in flight. A runner going away
+# only interrupts work in one of these states; from any other state the
+# departure is a benign disconnect, carried by liveness rather than a
+# failure. ``waiting`` counts because the turn's background work (shells,
+# sub-agents) outlives the turn and dies with the runner.
+_MID_TURN_STATUSES = ("running", "waiting")
 
 
 class _RelayTransportLost(Exception):
@@ -5604,6 +5610,48 @@ class _RelayTransportLost(Exception):
         self.intentional = intentional
 
 
+async def _runner_drop_interrupted_turn(
+    session_id: str,
+    conversation_store: ConversationStore,
+) -> bool:
+    """
+    Report whether a departing runner caught this session mid-turn.
+
+    Prefers the relay-fed cache — the replica holding the runner's tunnel
+    saw the turn edges — and falls back to the row for a session whose live
+    state was published before a restart, so a deploy mid-turn does not
+    downgrade a real interruption to a benign one.
+
+    An unreadable or missing row leaves the question open, and this runs
+    inside the disconnect handler: answering "not mid-turn" there would
+    both swallow the failure and let the error escape the handler, killing
+    the relay without publishing anything — the silent truncation the
+    failed status exists to prevent. So an indeterminate answer reports the
+    drop, as the ungated relay always did.
+
+    :param session_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :param conversation_store: Store used to read the durable live status.
+    :returns: ``True`` when a turn was in flight
+        (:data:`_MID_TURN_STATUSES`) or the state is indeterminate.
+    """
+    cached = _session_status_cache.get(session_id)
+    if cached is not None:
+        return cached in _MID_TURN_STATUSES
+    try:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    except Exception:  # noqa: BLE001 — an unreadable row must not kill the relay
+        _logger.warning(
+            "Relay: live-status read failed for session=%s; reporting the drop",
+            session_id,
+            exc_info=True,
+        )
+        return True
+    if conv is None:
+        return True
+    return conv.live_status in _MID_TURN_STATUSES
+
+
 async def _relay_runner_stream(
     session_id: str,
     runner_client: httpx.AsyncClient,
@@ -5616,9 +5664,14 @@ async def _relay_runner_stream(
     Transport drops from ingress recycles and sleep-wake reconnects
     re-register the runner within :data:`RUNNER_DISCONNECT_GRACE_S`, so a
     lost stream retries inside that window instead of failing the
-    session. The ``failed`` status (with durable ``runner_disconnected``
-    labels) publishes only when the runner stays gone past the grace; an
-    intentional Stop still exits quietly at once.
+    session. An intentional Stop exits quietly at once.
+
+    Past the grace the runner is genuinely gone, and only a session it
+    caught mid-turn (:func:`_runner_drop_interrupted_turn`) gets the
+    ``failed`` status and durable ``runner_disconnected`` labels — the same
+    rule :func:`_mark_runner_sessions_offline_impl` applies to the runner's
+    other sessions. An idle session had no work to interrupt, so it stays
+    idle and the disconnect surfaces through liveness instead.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -5673,6 +5726,20 @@ async def _relay_runner_stream(
                     session_id,
                     None,
                     conversation_store,
+                )
+            elif not await _runner_drop_interrupted_turn(session_id, conversation_store):
+                # The runner went away while this session sat idle (host
+                # asleep, host restart, `omnigent host` stopped). Nothing was
+                # interrupted, so there is no error to report: publishing one
+                # lit a red "connection to the host dropped" banner over a
+                # session that had simply finished its last turn. The absence
+                # is already carried by liveness (``clear_runner_liveness``),
+                # which drives the reconnect affordance. Stay silent — no
+                # status edge, and no clearing of labels either, so a genuine
+                # earlier failure keeps its error.
+                _logger.info(
+                    "Relay: runner gone for idle session=%s; no failure to report",
+                    session_id,
                 )
             else:
                 # Publish a failed status so the client's SSE stream sees a

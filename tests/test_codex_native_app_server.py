@@ -1685,6 +1685,38 @@ async def test_policy_hook_command_runs_python_isolated() -> None:
     assert argv[1:3] == ["-I", "-m"]
 
 
+def test_codex_model_upgrade_target_reads_catalog_migration() -> None:
+    """The runner records the exact old-to-new mapping Codex advertises."""
+    from omnigent.codex_native_app_server import _codex_model_upgrade_target
+
+    catalog = {
+        "models": [
+            {"slug": "gpt-5.4", "upgrade": {"model": "gpt-5.6-terra"}},
+            {"slug": "current", "upgrade": None},
+        ]
+    }
+
+    assert _codex_model_upgrade_target(catalog, "gpt-5.4") == "gpt-5.6-terra"
+    assert _codex_model_upgrade_target(catalog, "current") is None
+    assert _codex_model_upgrade_target(catalog, "missing") is None
+
+
+def test_acknowledge_codex_model_migration_updates_private_config(tmp_path: Path) -> None:
+    """Acknowledgement preserves user notices while suppressing one prompt."""
+    from omnigent.codex_native_app_server import _acknowledge_codex_model_migration
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text("[notice]\nhide_rate_limit_model_nudge = true\n", encoding="utf-8")
+
+    _acknowledge_codex_model_migration(codex_home, "gpt-5.4", "gpt-5.6-terra")
+
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert config["notice"]["hide_rate_limit_model_nudge"] is True
+    assert config["notice"]["model_migrations"] == {"gpt-5.4": "gpt-5.6-terra"}
+
+
 def test_routed_spawn_note_appends_then_restores_the_user_base(tmp_path: Path) -> None:
     """The codex routed-spawn note rides ``developer_instructions``, reversibly.
 

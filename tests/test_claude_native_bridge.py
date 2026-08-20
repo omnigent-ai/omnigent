@@ -5579,6 +5579,122 @@ def test_read_transcript_items_from_offset_returns_latest_model(
     assert result.latest_model == "claude-opus-4-7"
 
 
+def test_read_transcript_items_surfaces_custom_title_without_an_item(
+    tmp_path: Path,
+) -> None:
+    """
+    A ``/rename`` record surfaces on ``latest_custom_title`` and renders nothing.
+
+    Claude writes the operator's title as a ``custom-title`` metadata
+    record carrying no ``message``, so it must not become a conversation
+    item — the forwarder mirrors it onto the session title instead.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "u1",
+                        "message": {"role": "user", "content": "hi"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "custom-title",
+                        "customTitle": "auth-refactor",
+                        "sessionId": "s1",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+
+    assert result.latest_custom_title == "auth-refactor"
+    # The rename record itself is metadata, not a user/assistant bubble.
+    assert [item.item_type for item in result.items] == ["message"]
+
+
+def test_read_transcript_items_custom_title_last_write_wins(tmp_path: Path) -> None:
+    """Renaming twice in one window leaves the most recent title."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "custom-title", "customTitle": "first", "sessionId": "s1"}),
+                json.dumps({"type": "custom-title", "customTitle": "second", "sessionId": "s1"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+
+    assert result.latest_custom_title == "second"
+
+
+def test_read_transcript_items_ignores_ai_title_and_blank_custom_title(
+    tmp_path: Path,
+) -> None:
+    """
+    Claude's own ``aiTitle`` and a blank ``customTitle`` are both ignored.
+
+    Omnigent runs its own background titler, so forwarding Claude's
+    generated title would put two auto-titlers in a fight over one field;
+    only an explicit ``/rename`` propagates.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "ai-title",
+                        "aiTitle": "Generated summary of the session",
+                        "sessionId": "s1",
+                    }
+                ),
+                json.dumps({"type": "custom-title", "customTitle": "   ", "sessionId": "s1"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+    )
+
+    assert result.latest_custom_title is None
+    assert result.items == []
+
+
+def test_read_transcript_items_since_surfaces_custom_title(tmp_path: Path) -> None:
+    """The legacy line-cursor reader surfaces the rename too."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "custom-title", "customTitle": "auth-refactor", "sessionId": "s1"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = claude_native_bridge.read_transcript_items_since_with_position(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert result.latest_custom_title == "auth-refactor"
+
+
 def test_read_claude_context_state_returns_parsed_payload(tmp_path: Path) -> None:
     """
     ``context.json`` round-trips into a dict with both fields.

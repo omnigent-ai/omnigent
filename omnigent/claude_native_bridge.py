@@ -475,6 +475,11 @@ class TranscriptReadResult:
         entry was scanned.
     :param latest_model: ``message.model`` from the most recent
         assistant entry, or ``None``.
+    :param latest_custom_title: ``customTitle`` from the most recent
+        ``custom-title`` record — the explicit title a ``/rename`` typed
+        in the Claude Code pane writes. ``None`` when no such record was
+        scanned. Claude's own auto-generated ``aiTitle`` is deliberately
+        not surfaced here; Omnigent titles unnamed sessions itself.
     """
 
     line_cursor: int
@@ -483,6 +488,7 @@ class TranscriptReadResult:
     items: list[ClaudeTranscriptItem]
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
+    latest_custom_title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2223,11 +2229,14 @@ def read_transcript_items_since(
 
     Claude Code writes append-only JSONL records whose ``message``
     payloads include user prompts, assistant text, native tool calls,
-    and native tool results. This parser intentionally ignores
-    metadata records (title, file-history, permission mode, system
-    bookkeeping) and raw ``thinking`` blocks, while translating the
-    user-visible semantic records into Omnigent item types the web UI
-    already understands.
+    and native tool results. This parser intentionally renders no
+    conversation item for metadata records (title, file-history,
+    permission mode, system bookkeeping) or raw ``thinking`` blocks,
+    while translating the user-visible semantic records into Omnigent
+    item types the web UI already understands. Some metadata is still
+    read for out-of-band mirroring rather than dropped outright — a
+    ``custom-title`` record surfaces on
+    :attr:`TranscriptReadResult.latest_custom_title`.
 
     :param transcript_path: Claude transcript path, e.g.
         ``"/home/user/.claude/projects/x/session.jsonl"``.
@@ -2288,6 +2297,7 @@ def read_transcript_items_since_with_position(
     active_settled_id = settled_response_id
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
+    latest_custom_title: str | None = None
     for record in read_result.records:
         if record.text is None:
             continue
@@ -2317,6 +2327,9 @@ def read_transcript_items_since_with_position(
         model = _model_from_transcript_entry(entry)
         if model is not None:
             latest_model = model
+        custom_title = _custom_title_from_transcript_entry(entry)
+        if custom_title is not None:
+            latest_custom_title = custom_title
     return TranscriptReadResult(
         line_cursor=read_result.line_cursor,
         byte_offset=read_result.byte_offset,
@@ -2324,6 +2337,7 @@ def read_transcript_items_since_with_position(
         items=items,
         latest_usage=latest_usage,
         latest_model=latest_model,
+        latest_custom_title=latest_custom_title,
     )
 
 
@@ -2376,6 +2390,7 @@ def read_transcript_items_from_offset(
     active_settled_id = settled_response_id
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
+    latest_custom_title: str | None = None
     for record in read_result.records:
         if record.text is None:
             continue
@@ -2406,6 +2421,9 @@ def read_transcript_items_from_offset(
         model = _model_from_transcript_entry(entry)
         if model is not None:
             latest_model = model
+        custom_title = _custom_title_from_transcript_entry(entry)
+        if custom_title is not None:
+            latest_custom_title = custom_title
     return TranscriptReadResult(
         line_cursor=read_result.line_cursor,
         byte_offset=read_result.byte_offset,
@@ -2413,6 +2431,7 @@ def read_transcript_items_from_offset(
         items=items,
         latest_usage=latest_usage,
         latest_model=latest_model,
+        latest_custom_title=latest_custom_title,
     )
 
 
@@ -5158,6 +5177,32 @@ def _model_from_transcript_entry(entry: _JsonObject) -> str | None:
     model = message.get("model")
     if isinstance(model, str) and model:
         return model
+    return None
+
+
+def _custom_title_from_transcript_entry(entry: _JsonObject) -> str | None:
+    """
+    Return ``customTitle`` from a ``custom-title`` transcript record.
+
+    Claude Code appends this metadata record when the operator renames
+    the session from the pane (``/rename``). It carries no ``message``,
+    so it renders no conversation item; the forwarder mirrors it onto the
+    Omnigent session title instead.
+
+    Only the explicit user title is read. Claude also writes an
+    ``aiTitle`` record holding its own generated summary, which is
+    ignored here because Omnigent runs its own background titler and two
+    auto-titlers would fight over one field.
+
+    :param entry: One decoded transcript JSONL record.
+    :returns: The operator-chosen title, e.g. ``"auth-refactor"``, or
+        ``None`` for other record types and blank values.
+    """
+    if entry.get("type") != "custom-title":
+        return None
+    title = entry.get("customTitle")
+    if isinstance(title, str) and title.strip():
+        return title
     return None
 
 

@@ -6242,11 +6242,9 @@ async def test_sys_agent_get_projects_agent_metadata() -> None:
 @pytest.mark.asyncio
 async def test_sys_agent_list_degrades_when_sources_fail(tmp_path: Path) -> None:
     """
-    A failing source degrades to an empty section rather than failing the
-    whole call. Here the server 500s both list endpoints and no local
-    config dir exists, so all three sections come back empty — but the
-    tool still returns a well-formed result. If a source error
-    propagated, the tool would return an ``error`` instead.
+    A failing source degrades to an empty, retryable section rather than
+    failing the whole call or claiming that the source is exhausted. Here
+    the server 500s both list endpoints and no local config dir exists.
 
     :param tmp_path: Workspace dir with no agent-config subdir.
     """
@@ -6268,7 +6266,15 @@ async def test_sys_agent_list_degrades_when_sources_fail(tmp_path: Path) -> None
         )
 
     info = json.loads(output)
-    assert info == {"builtins": [], "session_agents": [], "local_configs": []}
+    assert info["builtins"] == []
+    assert info["session_agents"] == []
+    assert info["local_configs"] == []
+    assert info["page"]["has_more"] == {
+        "builtins": True,
+        "session_agents": True,
+        "local_configs": False,
+    }
+    assert isinstance(info["page"]["next_cursor"], str)
 
 
 @pytest.mark.asyncio

@@ -1556,6 +1556,12 @@ def _build_acp_cli_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_ACP_OS_ENV"] = os_env_payload
+    # Permission stance for approval cards. Absent leaves the harness wrap on its
+    # ``auto`` default (prompt); ``bypassPermissions`` skips the card for a call no
+    # policy had an opinion on, so a headless ACP worker doesn't park on a prompt.
+    permission_mode = spec.executor.config.get("permission_mode")
+    if permission_mode is not None:
+        env["HARNESS_ACP_PERMISSION_MODE"] = str(permission_mode)
     return env
 
 
@@ -1668,6 +1674,12 @@ def _build_acp_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_ACP_OS_ENV"] = os_env_payload
+    # Permission stance for approval cards. Absent leaves the harness wrap on its
+    # ``auto`` default (prompt); ``bypassPermissions`` skips the card for a call no
+    # policy had an opinion on, so a headless ACP worker doesn't park on a prompt.
+    permission_mode = spec.executor.config.get("permission_mode")
+    if permission_mode is not None:
+        env["HARNESS_ACP_PERMISSION_MODE"] = str(permission_mode)
     return env
 
 

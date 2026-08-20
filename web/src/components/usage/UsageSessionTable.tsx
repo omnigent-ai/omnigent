@@ -116,6 +116,18 @@ export function UsageSessionTable({ sessions }: Props) {
                 {primaryModel(s.models) && (
                   <span className="ml-2 text-xs text-muted-foreground">
                     {primaryModel(s.models)}
+                    {Object.keys(s.models).length > 1 && (
+                      <span
+                        className="ml-1.5 inline-flex items-center rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+                        title={Object.entries(s.models)
+                          .sort(([, a], [, b]) => b - a)
+                          .slice(1)
+                          .map(([name]) => name)
+                          .join(", ")}
+                      >
+                        +{Object.keys(s.models).length - 1}
+                      </span>
+                    )}
                   </span>
                 )}
               </td>

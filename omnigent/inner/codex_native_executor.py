@@ -319,6 +319,12 @@ class CodexNativeExecutor(Executor):
                         turn_params: dict[str, object] = {
                             "threadId": state.thread_id,
                             "input": input_items,
+                            "environments": [
+                                {
+                                    "environmentId": "local",
+                                    "cwd": state.cwd or str(Path.cwd()),
+                                }
+                            ],
                         }
                         response = await client.request("turn/start", turn_params)
                         result = _json_object(response.get("result"))
