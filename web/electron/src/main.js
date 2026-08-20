@@ -1132,7 +1132,20 @@ function createWindow(targetUrl, opts = {}) {
         if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
       });
     }
-    void win.loadURL(destination);
+    void win
+      .loadURL(destination)
+      .then(() => {
+        // A saved server can predate the recents list. Backfill it only after
+        // a successful cold load; explicit targets may be conversation URLs.
+        if (!ephemeral && !explicit && serverUrl) {
+          const settings = loadSettings();
+          rememberRecentServer(settings, serverUrl);
+          saveSettings(settings);
+        }
+      })
+      .catch(() => {
+        // Load failure falls back via did-fail-load → setup page w/ error.
+      });
   } else {
     // ?ephemeral=1 only changes the setup page's copy (the window's
     // WindowState is the source of truth for persistence behavior).

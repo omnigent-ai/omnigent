@@ -486,8 +486,8 @@
           });
       }
 
-      // Recently-connected servers (persisted by the main process on every
-      // successful non-ephemeral Connect). The URL keeps its one-click Connect
+      // Recently-connected servers (persisted by the main process after each
+      // successful non-ephemeral connection). The URL keeps its one-click Connect
       // behavior; the adjacent clipboard action copies without navigating.
       // An empty/unavailable list keeps the section hidden.
       const recentsSection = document.getElementById("recents");

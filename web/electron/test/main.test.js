@@ -183,6 +183,22 @@ describe("OAuth popup COOP-strip wiring (src/main.js)", () => {
   });
 });
 
+describe("recent-server startup wiring (src/main.js)", () => {
+  it("backfills a saved server only after its cold load succeeds", () => {
+    assert.match(
+      liveCode,
+      /loadURL\(destination\)\s*\.then\(\(\)\s*=>\s*\{\s*if\s*\(!ephemeral\s*&&\s*!explicit\s*&&\s*serverUrl\)[\s\S]{0,200}rememberRecentServer\(settings,\s*serverUrl\)/,
+      [
+        "createWindow no longer backfills a successfully loaded saved server into",
+        "recent_servers. Existing installs can have server_url without recent_servers,",
+        "so the setup page would show no recents after leaving that server. Keep the",
+        "backfill in loadURL(destination).then, gated away from ephemeral windows and",
+        "explicit target URLs (which may include a conversation path).",
+      ].join(" "),
+    );
+  });
+});
+
 // Guard for the deep-link path join in createWindow. A basename-less SPA path
 // (/c/<id>) lives UNDER the server's workspace mount (/omnigent), so it
 // must be string-concatenated (resolveServerPath) — NOT resolved with

@@ -46,10 +46,11 @@
   }
 
   /**
-   * Normalize a user-entered server URL into something navigable. Accepts a
-   * bare `host[:port][/path]` and defaults the scheme (https://, or http:// for
-   * loopback hosts), trims whitespace, and rejects anything that isn't an
-   * http(s) URL — fail loud rather than navigate to garbage.
+   * Normalize a user-entered server URL to its origin. Accepts a bare
+   * `host[:port][/path]`, defaults the scheme (https://, or http:// for loopback
+   * hosts), trims whitespace, and discards paths, queries, and fragments. A
+   * server connection always starts at the canonical root; workspace mounts
+   * are discovered separately by expandDatabricksWorkspaceUrl.
    *
    * @param {string} raw
    * @returns {string} A normalized absolute http(s) URL.
@@ -69,7 +70,7 @@
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       throw new Error(`unsupported scheme '${url.protocol}' (use http/https)`);
     }
-    return url.toString();
+    return `${url.origin}/`;
   }
 
   /**

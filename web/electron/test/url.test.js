@@ -1,7 +1,7 @@
 // Tests for the shared desktop URL helpers (src/url.js), run with
 // `node --test` (no extra deps). Covers the scheme-defaulting that lets a
-// pasted workspace URL (schemeless, /omnigent suffix from the internal user
-// guide) connect, the plain-http warning, and the workspace probe/expansion.
+// pasted workspace URL (including paths copied from the browser) connect, the
+// plain-http warning, and the workspace probe/expansion.
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
@@ -35,10 +35,10 @@ describe("defaultSchemeFor", () => {
 });
 
 describe("normalizeUrl", () => {
-  it("defaults a schemeless workspace /omnigent URL to https", () => {
+  it("defaults a schemeless workspace URL to https and removes its path", () => {
     assert.equal(
       normalizeUrl("dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"),
-      "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent",
+      "https://dbc-a5d4177a-49dc.cloud.databricks.com/",
     );
   });
 
@@ -61,8 +61,11 @@ describe("normalizeUrl", () => {
     assert.equal(normalizeUrl("http://example.databricks.com"), "http://example.databricks.com/");
   });
 
-  it("trims surrounding whitespace", () => {
-    assert.equal(normalizeUrl("  example.com/omnigent  "), "https://example.com/omnigent");
+  it("trims whitespace and removes paths, queries, and fragments", () => {
+    assert.equal(
+      normalizeUrl("  example.com/omnigent/c/123?view=chat#latest  "),
+      "https://example.com/",
+    );
   });
 
   it("rejects empty input", () => {
@@ -168,7 +171,7 @@ describe("databricksWorkspaceUiUrl", () => {
 });
 
 describe("expandDatabricksWorkspaceUrl", () => {
-  it("expands a bare https Databricks workspace root to the UI mount", async () => {
+  it("normalizes a pasted workspace path and expands to the canonical UI mount", async () => {
     const calls = [];
     await withFetch(
       async (url, opts) => {
@@ -176,8 +179,15 @@ describe("expandDatabricksWorkspaceUrl", () => {
         return fakeResponse("databricks");
       },
       async () => {
-        const out = await expandDatabricksWorkspaceUrl("https://ws.cloud.databricks.com/");
-        assert.equal(out, `https://ws.cloud.databricks.com${WORKSPACE_UI_PATH}`);
+        const normalized = normalizeUrl(
+          "https://ws.cloud.databricks.com/some/copied/path?o=123#fragment",
+        );
+        assert.equal(normalized, "https://ws.cloud.databricks.com/");
+        assert.equal(WORKSPACE_UI_PATH, "/omnigent");
+        assert.equal(
+          await expandDatabricksWorkspaceUrl(normalized),
+          "https://ws.cloud.databricks.com/omnigent",
+        );
       },
     );
     // Probed the root with a HEAD request.
