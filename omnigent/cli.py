@@ -834,7 +834,7 @@ def _peek_default_agent_harness(target: str) -> str | None:
     if not path.is_file():
         return None
     try:
-        raw = yaml.safe_load(path.read_text()) or {}
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError):
         return None
     if not isinstance(raw, dict):
@@ -2655,7 +2655,7 @@ def _load_existing_host_id() -> str | None:
         candidate_paths.append(CONFIG_PATH)
     for path in candidate_paths:
         try:
-            raw = yaml.safe_load(path.read_text()) if path.exists() else None
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else None
         except (OSError, yaml.YAMLError):
             continue
         if not isinstance(raw, dict):
@@ -5350,7 +5350,7 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
     # ── config.yaml ──────────────────────────────────
     config_path = source / "config.yaml"
     if config_path.exists():
-        raw = yaml.safe_load(config_path.read_text())
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
             changed = _expand_config_env_vars(raw, expand_env_vars)
             if changed:
@@ -5366,7 +5366,7 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
     mcp_dir = source / "tools" / "mcp"
     if mcp_dir.is_dir():
         for yaml_file in sorted(mcp_dir.glob("*.yaml")):
-            raw = yaml.safe_load(yaml_file.read_text())
+            raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
                 continue
             changed = False
@@ -10340,7 +10340,7 @@ def debug_logs(
         # Show all files for the session, oldest first, with separators.
         for f in reversed(log_files):
             click.echo(f"# {f}", err=True)
-            content = f.read_text(errors="replace")
+            content = f.read_text(encoding="utf-8", errors="replace")
             if lines > 0:
                 content = "\n".join(content.splitlines()[-lines:])
             click.echo(content)
@@ -10348,7 +10348,7 @@ def debug_logs(
     else:
         latest = log_files[0]
         click.echo(f"# {latest}", err=True)
-        content = latest.read_text(errors="replace")
+        content = latest.read_text(encoding="utf-8", errors="replace")
         if lines > 0:
             content = "\n".join(content.splitlines()[-lines:])
         click.echo(content)
@@ -11497,7 +11497,7 @@ def _bundled_agent_brain_harness(name: str) -> str | None:
     if not config_path.is_file():
         return None
     try:
-        raw = yaml.safe_load(config_path.read_text()) or {}
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError):
         return None
     if not isinstance(raw, dict):

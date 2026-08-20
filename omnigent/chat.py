@@ -2928,7 +2928,7 @@ def _materialize_override_bundle(source: Path, overrides: ChatOverrides) -> Path
                 raise click.ClickException(f"{source}: directory has no config.yaml to override.")
             target = config
 
-        raw = yaml.safe_load(target.read_text())
+        raw = yaml.safe_load(target.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise click.ClickException(
                 f"{source}: expected YAML mapping at top level, got {type(raw).__name__}"
@@ -2981,7 +2981,7 @@ def _load_yaml_for_override_peek(source: Path) -> _YamlMapping | None:
         config = source / "config.yaml"
         if not config.is_file():
             return None
-        parsed = yaml.safe_load(config.read_text())
+        parsed = yaml.safe_load(config.read_text(encoding="utf-8"))
         return parsed if isinstance(parsed, dict) else None
     return _load_yaml_if_single_file(source)
 
@@ -3001,7 +3001,7 @@ def _load_yaml_if_single_file(source: Path) -> _YamlMapping | None:
     """
     if not source.is_file():
         return None
-    parsed = yaml.safe_load(source.read_text())
+    parsed = yaml.safe_load(source.read_text(encoding="utf-8"))
     return parsed if isinstance(parsed, dict) else None
 
 
@@ -3685,7 +3685,7 @@ def _raise_server_failed(server: LocalServer) -> None:
     else:
         cmd_display = str(args)
     try:
-        lines = server.log_path.read_text(errors="replace").splitlines()
+        lines = server.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
         tail = "\n".join(lines[-_SERVER_LOG_TAIL_LINES:]) if lines else "(empty log file)"
     except OSError as e:
         tail = f"(could not read log file: {e})"

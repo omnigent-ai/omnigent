@@ -943,7 +943,7 @@ def _raise_local_server_failed(base_url: str, log_path: Path) -> None:
     :raises click.ClickException: Always.
     """
     try:
-        lines = log_path.read_text(errors="replace").splitlines()
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
         tail = "\n".join(lines[-50:]) if lines else "(empty log file)"
     except OSError as exc:
         tail = f"(could not read log file: {exc})"

@@ -176,7 +176,7 @@ def _read_contained_file(root: Path, value: str) -> str | None:
     try:
         resolved = candidate.resolve()
         if resolved.is_relative_to(root.resolve()) and resolved.is_file():
-            return resolved.read_text()
+            return resolved.read_text(encoding="utf-8")
     except OSError:
         # Path too long or invalid characters — fall through to inline text.
         pass
