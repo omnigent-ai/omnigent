@@ -1189,22 +1189,76 @@ class GitFilesystemRegistry(FilesystemRegistry):
         except ValueError:
             return None
 
-        _GIT_STATUS_TO_OP = {"A": "created", "M": "modified", "D": "deleted"}
-
         if baseline_sha is not None:
-            argv = [
-                "git",
-                "diff",
-                "--name-status",
-                "--no-renames",
-                "--end-of-options",
-                baseline_sha,
-                "--",
-                git_path,
-            ]
-        else:
-            argv = ["git", "status", "--porcelain", "--", git_path]
+            try:
+                return self._get_changed_file_since(norm, git_path, baseline_sha)
+            except GitStatusUnavailable:
+                _logger.warning(
+                    "Baseline SHA %s is unreachable for get_changed_file; "
+                    "falling back to git status",
+                    baseline_sha,
+                )
 
+        return self._get_changed_file_status(norm, git_path)
+
+    def _get_changed_file_since(
+        self,
+        norm: str,
+        git_path: str,
+        baseline_sha: str,
+    ) -> dict[str, Any] | None:
+        """Detect changes for a single file relative to a baseline commit."""
+        _GIT_STATUS_TO_OP = {"A": "created", "M": "modified", "D": "deleted"}
+        argv = [
+            "git",
+            "diff",
+            "--name-status",
+            "--no-renames",
+            "--end-of-options",
+            baseline_sha,
+            "--",
+            git_path,
+        ]
+        result = self._run_git_command(argv, "get_changed_file")
+        output = result.stdout.decode("utf-8", errors="replace")
+        numstat = self._run_git_numstat_since(baseline_sha)
+        for line in output.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) != 2:
+                continue
+            status_code = parts[0]
+            operation = _GIT_STATUS_TO_OP.get(status_code[0], "modified")
+            counts = numstat.get(norm, (None, None))
+            return self._make_record(norm, operation, counts)
+        # Baseline diff found nothing — check for untracked file.
+        untracked = self._list_untracked_files()
+        if norm in untracked or git_path in untracked:
+            return self._make_record(norm, "created", (None, None))
+        return None
+
+    def _get_changed_file_status(
+        self,
+        norm: str,
+        git_path: str,
+    ) -> dict[str, Any] | None:
+        """Detect changes for a single file via git status --porcelain."""
+        argv = ["git", "status", "--porcelain", "--", git_path]
+        result = self._run_git_command(argv, "get_changed_file")
+        output = result.stdout.decode("utf-8", errors="replace")
+        for line in output.splitlines():
+            parsed = _parse_git_porcelain_line(line)
+            if parsed is None:
+                continue
+            _, operation = parsed
+            return self._make_record(norm, operation)
+        return None
+
+    def _run_git_command(
+        self,
+        argv: list[str],
+        caller: str,
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Run a git subprocess, raising GitStatusUnavailable on failure."""
         started = time.monotonic()
         try:
             result = subprocess.run(
@@ -1216,28 +1270,31 @@ class GitFilesystemRegistry(FilesystemRegistry):
         except subprocess.TimeoutExpired as exc:
             elapsed = time.monotonic() - started
             _logger.warning(
-                "GitFilesystemRegistry.get_changed_file: %r in %s timed out after %.2fs",
+                "GitFilesystemRegistry.%s: %r in %s timed out after %.2fs",
+                caller,
                 argv,
                 self._git_root,
                 elapsed,
             )
-            raise GitStatusUnavailable(f"git status timed out after {elapsed:.1f}s") from exc
+            raise GitStatusUnavailable(f"git timed out after {elapsed:.1f}s") from exc
         except OSError as exc:
             elapsed = time.monotonic() - started
             _logger.warning(
-                "GitFilesystemRegistry.get_changed_file: %r in %s could not run after %.2fs: %s",
+                "GitFilesystemRegistry.%s: %r in %s could not run after %.2fs: %s",
+                caller,
                 argv,
                 self._git_root,
                 elapsed,
                 exc,
             )
-            raise GitStatusUnavailable(f"git status could not run: {exc}") from exc
+            raise GitStatusUnavailable(f"git could not run: {exc}") from exc
 
         elapsed = time.monotonic() - started
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
             _logger.warning(
-                "GitFilesystemRegistry.get_changed_file: %r in %s exited %d after %.2fs: %s",
+                "GitFilesystemRegistry.%s: %r in %s exited %d after %.2fs: %s",
+                caller,
                 argv,
                 self._git_root,
                 result.returncode,
@@ -1245,34 +1302,9 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 stderr,
             )
             raise GitStatusUnavailable(
-                f"git status exited {result.returncode}" + (f": {stderr}" if stderr else "")
+                f"git exited {result.returncode}" + (f": {stderr}" if stderr else "")
             )
-
-        output = result.stdout.decode("utf-8", errors="replace")
-        if baseline_sha is not None:
-            for line in output.splitlines():
-                parts = line.split("\t", 1)
-                if len(parts) != 2:
-                    continue
-                status_code = parts[0]
-                operation = _GIT_STATUS_TO_OP.get(status_code[0], "modified")
-                numstat = self._run_git_numstat_since(baseline_sha)
-                counts = numstat.get(norm, (None, None))
-                return self._make_record(norm, operation, counts)
-            # Baseline diff found nothing — check for untracked file.
-            untracked = self._list_untracked_files()
-            if norm in untracked or git_path in untracked:
-                return self._make_record(norm, "created", (None, None))
-            return None
-
-        for line in output.splitlines():
-            parsed = _parse_git_porcelain_line(line)
-            if parsed is None:
-                continue
-            _, operation = parsed
-            return self._make_record(norm, operation)
-
-        return None
+        return result
 
     def get_baseline(self, path: str, *, baseline_sha: str | None = None) -> str | None:
         """Return content at the baseline commit (or HEAD) via ``git show``.
