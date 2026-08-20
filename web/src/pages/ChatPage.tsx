@@ -3823,29 +3823,29 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             hover/focus-reveal on desktop. py-1 matches the design prototype's
             24px action row; the timestamp rides inside it. */}
         <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-            {ts && (
-              <span
-                className="select-none text-[11px] leading-4 text-foreground/56"
-                data-testid="message-timestamp"
-              >
-                {ts}
-              </span>
-            )}
-            <MessageActions>
-              {text && (
-                <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
-                  {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-                </MessageAction>
-              )}
-              <MessageAction
-                tooltip={isLinkCopied ? "Copied!" : "Copy link"}
-                size="icon-xxs"
-                data-testid="copy-message-link"
-                onClick={handleCopyLink}
-              >
-                {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
+          {ts && (
+            <span
+              className="select-none text-[11px] leading-4 text-foreground/56"
+              data-testid="message-timestamp"
+            >
+              {ts}
+            </span>
+          )}
+          <MessageActions>
+            {text && (
+              <MessageAction tooltip="Copy" size="icon-xxs" onClick={handleCopy}>
+                {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
               </MessageAction>
-            </MessageActions>
+            )}
+            <MessageAction
+              tooltip={isLinkCopied ? "Copied!" : "Copy link"}
+              size="icon-xxs"
+              data-testid="copy-message-link"
+              onClick={handleCopyLink}
+            >
+              {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
+            </MessageAction>
+          </MessageActions>
         </div>
       </div>
     </Message>
