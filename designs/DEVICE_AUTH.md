@@ -18,8 +18,8 @@
 > `set_grant_revocation_check`). Wired in `omnigent/server/app.py`,
 > **opt-in and default-off** via `OMNIGENT_DEVICE_GRANT_ENABLED` (the
 > `/oauth/*` routes are unmounted unless it is truthy), and then only in
-> **accounts** mode (OIDC delegates login to the IdP via the cli-ticket
-> flow and never mounts these routes).
+> **accounts** and **oidc** modes — the two that own a server-minted
+> session cookie. Header mode has no server-mintable identity.
 > Slack: `integrations/slack/src/omnigent_slack/oauth.py`,
 > `tokens.py` (Fernet-encrypted `oauth_tokens`), `auth_manager.py`, plus
 > the bearer/refresh wiring in `omnigent.py` (`ClientAuth`,
@@ -37,6 +37,14 @@
 > no token and mounts no device-grant/cli-login router in that mode
 > (`app.py`: device auth is `oidc`/`accounts` only), so `start_login`
 > raises a clear error rather than firing a request the server would 404.
+>
+> **Note.** Mounting the grant under OIDC does not change either
+> first-party client: the CLI (`cli.py`) and Slack (`oauth.py`) still
+> probe the mode and still take the cli-ticket flow there. The OIDC
+> device-grant routes exist for *external* clients — ones that must hold a
+> scoped, revocable, refreshable credential rather than the server's own
+> session JWT, and that cannot be trusted with account-wide authority.
+> Migrating the first-party clients onto it is separate work.
 >
 > Tests: `tests/server/test_device_auth.py`, and the Slack
 > `test_oauth.py` / `test_tokens.py` / `test_client_auth.py` /
@@ -91,9 +99,11 @@ The device grant builds on existing server primitives:
 - **Bearer validation** — `UnifiedAuthProvider._check_cookie` accepts
   `Authorization: Bearer <jwt>` and validates the same claim shape
   (`auth.py`). Delegated access tokens validate through this path unchanged.
-- **Browser consent under accounts mode** — the `accounts` provider
-  establishes the browser identity via its session cookie; the consent page
-  runs behind it. (This is why the grant mounts in accounts mode only — see
+- **Browser consent** — both `accounts` and `oidc` establish the browser
+  identity through the same HS256 session cookie, and the consent page runs
+  behind it. Under OIDC the bounce hands off to the IdP, so *how* the user
+  proves themselves — password, Google, SAML — is never this module's
+  business. (Header mode mints no session, which is why it is excluded — see
   the mount restriction below.)
 - **Open-redirect hardening** — `_sanitize_return_to` (`routes/auth.py`) guards
   the post-login bounce back to the consent page.
@@ -184,10 +194,70 @@ approved it.
 
 Mounted in `app.py` only when **`OMNIGENT_DEVICE_GRANT_ENABLED` is truthy**
 (opt-in, **default-off** — the `/oauth/*` routes are absent otherwise), and
-then **only in `accounts` mode** (OIDC delegates login to the IdP via the
-cli-ticket flow and never mounts these routes; header mode has no
-server-mintable identity — see `create_device_auth_router`, which raises if
-constructed for any other source). The `device_grants` table is created
+then **only in `accounts` and `oidc` modes**. Header mode has no
+server-mintable identity — there is nothing to delegate from and no login to
+bounce a consenting browser through — see `create_device_auth_router`, which
+raises if constructed for any other source.
+
+**Forced re-authentication across the two modes.** The consent gate (session
+`iat` ≥ grant `created_at`) bounces with `reauth=1`, and each login path has
+to honour it in its own way. Accounts holds back the SPA's auto-redirect and
+demands a password. OIDC has no form to hold back, so `/auth/login` forwards
+`reauth=1` to the IdP as `prompt=login` (OIDC Core 3.1.2.1). Dropping that
+forwarding does not break the flow — the IdP satisfies the bounce from its own
+session and the callback mints a fresh `iat` that clears the gate — it just
+silently removes the deliberate-credential-entry property the gate exists for.
+Pinned by `tests/server/test_oidc_reauth_prompt.py`.
+
+*Every* bounce is forced, including the one for a caller with no Omnigent
+session. Under accounts that changes nothing — no session means no credential,
+so the form is shown regardless — but under OIDC the caller may still hold a
+live IdP session, and the consent page cannot tell the two cases apart.
+
+**Requested, then verified.** `prompt=login` is only a request, so the bounce
+also sends `max_age=0`, which obliges a conforming IdP to report the moment it
+authenticated the user in the `auth_time` claim. The callback compares that
+claim against the id_token's own `iat` — both the IdP's clock, so skew between
+the two servers cancels out and a session established minutes earlier fails the
+comparison regardless of whose clock is ahead. A missing `auth_time` fails too:
+silence is indistinguishable from a reused session.
+
+**The proof rides on the session, not on `iat`.** Gating consent on the session
+cookie's `iat` was bypassable without ever attacking the gate. `/auth/login` is
+a public GET accepting any same-origin `return_to`, so an attacker who starts a
+grant can send the victim `/auth/login?return_to=/oauth/device?user_code=…`
+with **no** `reauth=1` — no `reauth_at` is signed, nothing is demanded, the IdP
+satisfies it from its own session, and the resulting cookie carries an `iat` of
+*now* that clears the gate. The forced path was never entered.
+
+So a successful re-authentication is recorded on the session itself, as an
+`auth_time` claim (`mint_session_token`), written **only** where a credential
+was actually presented: an accounts password submit, or an IdP-attested
+re-authentication. Consent requires `auth_time ≥ grant.created_at`. A login
+that skipped the bounce carries no claim, so it bounces and is made to prove
+itself — the demand no longer depends on the attacker's link having asked for
+it. `reauth_at` remains, signed into the state cookie, as the marker that makes
+the callback *refuse* (403, no session minted) rather than merely decline to
+stamp the proof.
+
+An IdP that never emits `auth_time` cannot carry a device grant: consent
+bounces once, the forced callback 403s with a clear error, and the loop
+terminates rather than spinning.
+
+**Which providers qualify.** `unsupported_reason` **allowlists**
+`provider_type == "oidc"` rather than denying known-bad values. `from_env`
+yields only `github` or `oidc` today, so the two are equivalent right now — but
+the next OAuth 2.0 dialect modelled under the `oidc` source would otherwise be
+admitted by default, behind a gate that cannot hold for it. GitHub is the
+present example: `from_env` points it at
+`https://github.com/login/oauth/authorize`, which has no `prompt` parameter, no
+id_token and no `auth_time`, so there is no way to demand a re-authentication
+nor to detect that none happened.
+
+`app.py` logs every refusal, and computes it **before** the auth-router mount —
+that mount is gated on `login_url` being truthy, and header mode's is `None`,
+so an operator in the one mode where the grant can never work was previously
+the only one who never saw the explanation. The `device_grants` table is created
 unconditionally by the migration regardless of the flag; only the router
 mount is gated. This router **owns** `mint_delegated_token` and
 `DELEGATED_SCOPE`.

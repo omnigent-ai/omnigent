@@ -21,10 +21,17 @@ Endpoints (all mounted at the app root):
   returns delegated access + refresh tokens.
 - ``POST /oauth/revoke`` — revoke a grant (backs client logout).
 
-Mounted only in ``accounts`` auth mode (and only when
-``OMNIGENT_DEVICE_GRANT_ENABLED`` is set). OIDC deployments delegate login
-to the IdP via the cli-ticket flow (``/auth/cli-login``) and never use this
-grant; header mode has no server-mintable identity.
+Mounted in ``accounts`` and ``oidc`` auth modes (and only when
+``OMNIGENT_DEVICE_GRANT_ENABLED`` is set). Header mode has no
+server-mintable identity, so there is nothing to delegate from.
+
+Under OIDC the consent page bounces an unauthenticated (or stale) browser
+through ``/auth/login``, which hands off to the IdP — so whether the user
+proves themselves with a password, Google, or anything else is the IdP's
+business and never this module's. The forced-re-authentication gate below
+relies on that bounce carrying ``reauth=1`` through to ``prompt=login``;
+without it the IdP would satisfy the bounce from its own session and the
+gate would pass without the user having proven anything.
 
 See ``designs/DEVICE_AUTH.md`` for the full design + threat model.
 
@@ -53,6 +60,7 @@ import logging
 import os
 import secrets
 import time
+from urllib.parse import quote
 
 import jwt
 from fastapi import APIRouter, HTTPException, Request
@@ -257,23 +265,72 @@ class _SlidingWindowRateLimiter:
         return True
 
 
+def unsupported_reason(auth_provider: UnifiedAuthProvider) -> str | None:
+    """Why this provider cannot carry a device grant, or ``None`` if it can.
+
+    The consent gate is only as strong as the login path's ability to
+    re-prompt a user the provider has already authenticated. Where that
+    cannot be demanded the grant is refused outright rather than issued
+    behind a gate that silently passes.
+
+    - ``header`` — identity comes from an upstream proxy: no session to
+      delegate from, and no login to bounce a consenting browser through.
+    - ``github`` — configured as an OIDC source, but GitHub's OAuth
+      authorization endpoint is not OIDC and has no ``prompt`` parameter.
+      It would ignore ``prompt=login``, reuse its session, and return a
+      callback whose fresh ``iat`` clears the gate.
+
+    :param auth_provider: The active provider.
+    :returns: A human-readable reason, or ``None`` when supported.
+    """
+    source = auth_provider._source
+    if source not in ("accounts", "oidc"):
+        return f"{source!r} auth has no server-minted session to delegate from"
+    if source == "oidc":
+        config = auth_provider._oidc_config
+        if config is None:
+            return "oidc auth is selected but no OIDC config is present"
+        # Allowlisted, not denylisted. `provider_type` distinguishes real
+        # OIDC from OAuth 2.0 dialects modelled under the same source, and
+        # only the former can be asked to re-authenticate (`prompt=login`)
+        # and made to attest that it did (`auth_time`). Admitting an
+        # unaudited value by default would silently issue grants behind a
+        # gate that cannot hold — which is the failure this predicate exists
+        # to prevent.
+        if config.provider_type != "oidc":
+            return (
+                f"{config.provider_type!r} is not full OIDC, so it cannot be asked to "
+                "re-authenticate an already signed-in user ('prompt=login') nor attest "
+                "that it did ('auth_time'), and the consent page's gate would not hold"
+            )
+    return None
+
+
 def create_device_auth_router(
     auth_provider: UnifiedAuthProvider,
     device_grant_store: DeviceGrantStore,
 ) -> APIRouter:
     """Build the ``/oauth/*`` device-grant router.
 
-    :param auth_provider: The active provider. Must be ``accounts`` mode;
-        its cookie config supplies the HMAC signing key and public base URL.
+    :param auth_provider: The active provider. Must be ``accounts`` or
+        ``oidc`` mode; its cookie config supplies the HMAC signing key and
+        public base URL.
     :param device_grant_store: Persistence for device grants.
     :returns: APIRouter to mount at the app root.
     """
-    if auth_provider._source != "accounts":
-        raise RuntimeError(
-            f"create_device_auth_router requires accounts auth (got {auth_provider._source!r})"
-        )
-    cookie_config = auth_provider._accounts_config
-    assert cookie_config is not None, "accounts mode must have an accounts config"
+    reason = unsupported_reason(auth_provider)
+    if reason is not None:
+        raise RuntimeError(f"create_device_auth_router cannot build: {reason}")
+    # Both modes sign the same HS256 session cookie and both configs expose
+    # `cookie_secret`, `session_cookie_name` and `base_url` — see the
+    # AccountsConfig docstring and UnifiedAuthProvider._check_cookie, which
+    # picks between them exactly this way.
+    cookie_config = (
+        auth_provider._oidc_config
+        if auth_provider._source == "oidc"
+        else auth_provider._accounts_config
+    )
+    assert cookie_config is not None, f"{auth_provider._source} mode must have a cookie config"
     cookie_secret = cookie_config.cookie_secret
     base_url = cookie_config.base_url
     provider_name = auth_provider._source
@@ -389,27 +446,43 @@ def create_device_auth_router(
 
     # ── Browser consent page ──────────────────────────────────────
 
-    def _bounce_to_login(user_code: str, *, reauth: bool) -> RedirectResponse:
-        """302 to the login page, returning to this consent URL afterward.
+    def _bounce_to_login(user_code: str) -> RedirectResponse:
+        """302 to the login page with ``reauth=1``, returning here afterward.
 
-        ``reauth`` adds ``&reauth=1`` so the login page forces a fresh
-        password submit instead of auto-bouncing an already-signed-in user
-        (which would loop back here with the same stale session).
+        Always forced, on every bounce. "No Omnigent session" does not mean
+        "no credential" under OIDC — the IdP holds its own, and would satisfy
+        an unforced bounce silently. The accounts SPA holds back its
+        auto-redirect and shows the password form; ``/auth/login`` forwards
+        this to the IdP as ``prompt=login``.
         """
         login_url = auth_provider.login_url or "/login"
         return_to = f"/oauth/device?user_code={user_code}" if user_code else "/oauth/device"
-        query = f"return_to={html.escape(return_to, quote=True)}"
-        if reauth:
-            query += "&reauth=1"
+        # Percent-encoded, not HTML-escaped: this is a URL query value, and
+        # `html.escape` leaves `?`, `=`, `#` and `+` untouched, so a user_code
+        # carrying one would truncate or corrupt the round-trip. `&` survives
+        # as `&amp;` today, which is why `reauth=1` still wins — an accident
+        # of the escaper, not a property worth depending on.
+        query = f"return_to={quote(return_to, safe='/')}&reauth=1"
         return RedirectResponse(url=f"{login_url}?{query}", status_code=302)
 
-    def _session_iat(request: Request) -> int | None:
-        """Return the ``iat`` (issue time) of the caller's session JWT.
+    def _session_auth_time(request: Request) -> int | None:
+        """When did this session's owner last *prove* who they are?
 
-        Read from the session cookie (accounts mode mints a fresh ``iat``
-        on every ``/auth/login``, so this is effectively the last-login
-        time). ``None`` when absent/invalid. Used to enforce that consent
-        follows a login started FOR this device flow.
+        Deliberately not ``iat``. Minting a session proves only that a login
+        flow completed, and under OIDC that can happen with no user
+        involvement: an attacker who sends a victim a plain
+        ``/auth/login?return_to=/oauth/device?user_code=…`` link — no
+        ``reauth=1`` — gets the IdP to satisfy it from its own session, and
+        the resulting cookie carries an ``iat`` of *now*. Gating on ``iat``
+        therefore let a crafted link walk straight past the consent check by
+        simply never asking for the re-authentication.
+
+        ``auth_time`` is written only where a credential was actually
+        presented (see :func:`omnigent.server.oidc.mint_session_token`), so
+        it cannot be manufactured by starting a login flow.
+
+        ``None`` when absent or invalid, which callers must treat as
+        unproven.
         """
         token = request.cookies.get(cookie_config.session_cookie_name)
         if not token:
@@ -418,8 +491,8 @@ def create_device_auth_router(
             payload = jwt.decode(token, cookie_secret, algorithms=["HS256"])
         except jwt.InvalidTokenError:
             return None
-        iat = payload.get("iat")
-        return iat if isinstance(iat, int) else None
+        auth_time = payload.get("auth_time")
+        return auth_time if isinstance(auth_time, int) else None
 
     @router.get("/oauth/device")
     async def device_consent_page(request: Request) -> Response:
@@ -435,15 +508,20 @@ def create_device_auth_router(
         device flow began (session ``iat`` ≥ the grant's ``created_at``). A
         pre-existing session — however recent — is bounced back through the
         login page with ``reauth=1``, so approving a device grant always
-        costs a deliberate, fresh password entry. This closes the
+        costs a deliberate, fresh credential entry. This closes the
         reflex-approve phishing case: a victim already signed in can't bind
-        an attacker's grant with one click; they must re-enter their password
+        an attacker's grant with one click; they must re-authenticate
         against a screen naming the exact identity and client.
+
+        Every bounce forces it, including the one for a caller with no
+        Omnigent session at all. Under OIDC that caller may still hold a
+        live IdP session, which would satisfy an unforced bounce without
+        their involvement.
         """
         user_id = auth_provider.get_user_id(request)
         user_code = (request.query_params.get("user_code") or "").strip()
         if user_id is None:
-            return _bounce_to_login(user_code, reauth=False)
+            return _bounce_to_login(user_code)
 
         if not user_code:
             return HTMLResponse(_consent_html(prompt_for_code=True), status_code=200)
@@ -456,13 +534,13 @@ def create_device_auth_router(
                 status_code=200,
             )
 
-        # Force a fresh login when the current session predates this grant:
-        # only a login started for THIS flow (iat ≥ the grant's created_at)
-        # may approve. Bounce with reauth=1 so the login page re-prompts
-        # rather than auto-returning the stale session (which would loop).
-        session_iat = _session_iat(request)
-        if session_iat is None or session_iat < grant.created_at:
-            return _bounce_to_login(user_code, reauth=True)
+        # Only a credential presented for THIS flow may approve it: the
+        # proven-authentication time must postdate the grant. Bounce with
+        # reauth=1 so the login page re-prompts rather than auto-returning
+        # the existing session (which would loop).
+        proven_at = _session_auth_time(request)
+        if proven_at is None or proven_at < grant.created_at:
+            return _bounce_to_login(user_code)
 
         return HTMLResponse(
             _consent_html(
@@ -497,10 +575,10 @@ def create_device_auth_router(
             )
 
         # Re-auth gate, enforced here too (not just on the consent GET): a
-        # stale session must not approve by POSTing directly. Only a login
-        # started for THIS flow (session iat ≥ the grant's created_at) passes.
-        session_iat = _session_iat(request)
-        if session_iat is None or session_iat < grant.created_at:
+        # stale session must not approve by POSTing directly. Only a
+        # credential proven for THIS flow passes.
+        proven_at = _session_auth_time(request)
+        if proven_at is None or proven_at < grant.created_at:
             return HTMLResponse(
                 _consent_html(
                     error="Your session is too old to approve this login. "

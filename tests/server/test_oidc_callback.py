@@ -186,7 +186,11 @@ def callback_client(
         yield client, keys
 
 
-def _do_callback(client: TestClient, id_token: str) -> httpx.Response:
+def _do_callback(
+    client: TestClient,
+    id_token: str,
+    extra_state: dict[str, object] | None = None,
+) -> httpx.Response:
     """Drive a full ``/auth/callback`` with a valid state cookie.
 
     Crafts the signed state cookie the way ``/auth/login`` would, sets
@@ -206,6 +210,7 @@ def _do_callback(client: TestClient, id_token: str) -> httpx.Response:
             "code_verifier": "verifier",
             "return_to": "/",
             "exp": int(time.time()) + 300,
+            **(extra_state or {}),
         },
         _TEST_SECRET,
         algorithm="HS256",
@@ -478,3 +483,154 @@ def test_callback_accepts_boolean_and_string_true(
     # Accepted as a verified identity → redirect + session.
     assert resp.status_code == 302, resp.text
     assert resp.cookies.get("ap_session") is not None
+
+
+# ── Forced re-authentication is verified, not merely requested ────
+
+
+def test_reauth_login_accepts_a_proven_fresh_authentication(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """An ``auth_time`` after the bounce is what the gate is looking for."""
+    client, keys = callback_client
+    bounced_at = int(time.time())
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": bounced_at}
+    )
+
+    res = _do_callback(client, token, extra_state={"reauth_at": bounced_at})
+
+    assert res.status_code == 302, res.text
+
+
+def test_reauth_login_refuses_a_session_the_idp_reused(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """The whole point: ``prompt=login`` is a request, this is the check.
+
+    An IdP that ignores it returns a token whose ``auth_time`` predates the
+    bounce. Accepting that would mint a session with a fresh ``iat``, clear
+    the device-grant consent gate, and delegate authority to a client the
+    user never re-authenticated for.
+    """
+    client, keys = callback_client
+    bounced_at = int(time.time())
+    token = keys.sign_id_token(
+        {
+            "email": "alice@example.com",
+            "email_verified": True,
+            # Signed in an hour before this token was issued, and never
+            # re-prompted. Both stamps are the IdP's own clock, so the gap is
+            # real regardless of whose clock is ahead.
+            "auth_time": bounced_at - 3600,
+        }
+    )
+
+    res = _do_callback(client, token, extra_state={"reauth_at": bounced_at})
+
+    assert res.status_code == 403
+    assert "Re-authentication" in res.json()["error"]
+    assert "Set-Cookie" not in res.headers, "a refused re-auth must not mint a session"
+
+
+def test_reauth_login_fails_closed_without_auth_time(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """No ``auth_time`` is not a pass.
+
+    ``max_age=0`` obliges a conforming IdP to report when it authenticated
+    the user. Silence is indistinguishable from a reused session, and this
+    gate is the only thing between a phished consent link and a grant.
+    """
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    res = _do_callback(client, token, extra_state={"reauth_at": int(time.time())})
+
+    assert res.status_code == 403
+
+
+def test_an_ordinary_login_is_unaffected_by_the_reauth_check(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """No ``reauth_at`` in the state ⇒ no ``auth_time`` requirement.
+
+    The check must not leak into normal sign-in, where most IdPs omit the
+    claim entirely and every login would start failing.
+    """
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    assert _do_callback(client, token).status_code == 302
+
+
+def _session_claims(res: httpx.Response) -> dict[str, object]:
+    """Decode the session cookie a successful callback set."""
+    cookie = res.headers["set-cookie"]
+    token = cookie.split("ap_session=", 1)[1].split(";", 1)[0]
+    return jwt.decode(token, _TEST_SECRET, algorithms=["HS256"])
+
+
+def test_a_proven_login_stamps_auth_time_on_the_session(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """The proof has to outlive the callback, or nothing downstream can see it.
+
+    ``iat`` cannot carry it: every completed callback has a fresh one,
+    including the ones where the IdP reused its own session.
+    """
+    client, keys = callback_client
+    now = int(time.time())
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": now}
+    )
+
+    claims = _session_claims(_do_callback(client, token))
+
+    assert isinstance(claims["auth_time"], int)
+    assert claims["auth_time"] >= now
+
+
+def test_an_unmarked_login_link_cannot_manufacture_proof(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """The bypass: reach /auth/login WITHOUT reauth=1 and the gate is skipped.
+
+    ``/auth/login`` is a public GET that accepts any same-origin
+    ``return_to``, so an attacker who starts a grant can send the victim
+    ``/auth/login?return_to=/oauth/device?user_code=XXXX`` — no ``reauth=1``,
+    therefore no ``reauth_at``, therefore no forced re-authentication. The IdP
+    satisfies it from its own session and the callback completes normally.
+
+    That must not produce a session the consent gate accepts. No proof, no
+    ``auth_time`` — the gate then bounces and demands one.
+    """
+    client, keys = callback_client
+    token = keys.sign_id_token(
+        {
+            "email": "alice@example.com",
+            "email_verified": True,
+            # The IdP reused a session from an hour before this token.
+            "auth_time": int(time.time()) - 3600,
+        }
+    )
+
+    res = _do_callback(client, token)  # no reauth_at: the crafted-link case
+
+    assert res.status_code == 302, "an ordinary login must still succeed"
+    assert "auth_time" not in _session_claims(res), (
+        "a reused IdP session must not be recorded as proof of identity"
+    )
+
+
+def test_an_idp_that_omits_auth_time_proves_nothing(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """Silence is not proof, even on an ordinary login."""
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    res = _do_callback(client, token)
+
+    assert res.status_code == 302
+    assert "auth_time" not in _session_claims(res)

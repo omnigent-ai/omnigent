@@ -2713,6 +2713,30 @@ def create_app(
     # /magic/redeem, /users, /users/{id}/reset, /users/me/password).
     # Must be registered BEFORE the SPA static mount because the SPA's
     # HTML5-history fallback catches all unmatched extensionless paths.
+    # Device-grant support is decided BEFORE the auth-router mount below,
+    # which is gated on `login_url` being truthy — and header mode's is None.
+    # Computing it inside that block meant the one operator most likely to be
+    # confused by a missing /oauth/* (header mode, where the grant can never
+    # work) was the one who never saw the explanation.
+    from omnigent.server.auth import UnifiedAuthProvider as _UnifiedAuthProvider
+    from omnigent.server.auth import env_var_is_truthy
+    from omnigent.server.routes.device_auth import unsupported_reason
+
+    _device_grant_wanted = env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
+    _device_grant_blocked = (
+        unsupported_reason(auth_provider)
+        if isinstance(auth_provider, _UnifiedAuthProvider)
+        else "a custom auth provider cannot mint the session the grant delegates from"
+    )
+    if _device_grant_wanted and _device_grant_blocked is not None:
+        # Asked for and refused: say so, or the operator sees only the absence
+        # of /oauth/* and assumes the flag did not take.
+        _logger.warning(
+            "device-grant: OMNIGENT_DEVICE_GRANT_ENABLED is set but the "
+            "/oauth/* routes are NOT mounted — %s. See designs/DEVICE_AUTH.md.",
+            _device_grant_blocked,
+        )
+
     if auth_provider is not None and getattr(auth_provider, "login_url", None):
         from omnigent.server.auth import UnifiedAuthProvider
 
@@ -2773,17 +2797,16 @@ def create_app(
             )
 
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
-        # OMNIGENT_DEVICE_GRANT_ENABLED, and accounts-mode only. OIDC delegates
-        # login to the IdP (cli-ticket flow), so it neither needs nor mounts
-        # these routes. Wires the revocation lookup into the auth provider so
-        # revoking a grant immediately rejects its delegated access tokens.
+        # OMNIGENT_DEVICE_GRANT_ENABLED, and only for providers that can be
+        # made to re-prompt an already signed-in user — see
+        # `unsupported_reason`, which owns that rule. Wires the revocation
+        # lookup into the auth provider so revoking a grant immediately
+        # rejects its delegated access tokens.
         # See designs/DEVICE_AUTH.md.
-        from omnigent.server.auth import env_var_is_truthy
-
         if (
-            env_var_is_truthy("OMNIGENT_DEVICE_GRANT_ENABLED", default=False)
+            _device_grant_wanted
             and isinstance(auth_provider, UnifiedAuthProvider)
-            and auth_provider._source == "accounts"
+            and _device_grant_blocked is None
             and permission_store is not None
         ):
             from omnigent.server.device_grant_store import DeviceGrantStore
