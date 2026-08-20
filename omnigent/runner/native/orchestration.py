@@ -3984,13 +3984,22 @@ async def _auto_create_codex_terminal(
     # the same "a denied spawn is an approved re-route" framing. Routed through
     # ``developer_instructions`` (whose sidecar base keeps a resume reversible),
     # never by editing config.toml here.
-    # Passed only for auto-harness sessions so a pinned or plain codex launch
-    # keeps main's kwargs exactly.
-    routed_spawn_extras: dict[str, str] = {}
+    # ``developer_instructions`` also carries the bundle's own ``instructions:``
+    # text (#3530): Codex owns its prompt, so the per-turn ``system_prompt`` the
+    # executor adapter builds is dropped by the native executor, and this
+    # additive setting at launch is the delivery point. Note and spec text share
+    # the one slot, so they are COMPOSED — writing either alone would silently
+    # drop the other. Still omitted entirely when there is nothing to say, so a
+    # pinned session with no instructions keeps main's kwargs exactly.
+    routed_spawn_note: str | None = None
     if launch_config.auto_harness:
         from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
 
-        routed_spawn_extras["developer_instructions"] = smart_routing_spawn_note("codex-native")
+        routed_spawn_note = smart_routing_spawn_note("codex-native")
+    routed_spawn_extras: dict[str, str] = {}
+    composed_instructions = _compose_native_instructions(agent_spec, routed_spawn_note)
+    if composed_instructions:
+        routed_spawn_extras["developer_instructions"] = composed_instructions
     app_server = build_codex_native_server(
         socket_path=socket_path,
         codex_home=codex_home,
@@ -5443,6 +5452,87 @@ def _cursor_fork_history_preamble(items: list[_JsonObject]) -> str:
     return "\n\n".join(turns)
 
 
+def _agent_instructions_from_spec(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+) -> str | None:
+    """
+    Read the agent's resolved ``instructions`` from a resolved agent spec.
+
+    A bundle's ``instructions:`` value is already resolved to TEXT by the spec
+    parser (``_resolve_instructions``): a bundle-relative file path is read,
+    anything else is inline text, and an absent key falls back to the first
+    context file found (AGENTS.md and friends). So this is a plain field read —
+    no file IO, no path validation to repeat here.
+
+    Harness executors (``executor.type: omnigent`` with a ``*-native``
+    harness) used to drop this entirely: ``build_instructions`` composed it
+    into the turn's ``system_prompt``, the executor adapter handed that to the
+    inner executor, and every native executor's ``run_turn`` began
+    ``del tools, system_prompt`` — correctly, because a native harness owns an
+    already-running CLI that no per-turn system prompt can reach. The delivery
+    point is therefore LAUNCH, not turn: each native arm forwards this text
+    through its harness's own *additive* instruction channel when the terminal
+    is created (#3530).
+
+    :param agent_spec: Agent spec object, or a resolved wrapper carrying a
+        ``spec`` attribute. ``None`` means no spec was available.
+    :returns: The agent's instruction text, or ``None`` when the spec is
+        absent or carries no instructions.
+    """
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is None:
+        return None
+    instructions = getattr(spec, "instructions", None)
+    if not isinstance(instructions, str) or not instructions.strip():
+        return None
+    return instructions
+
+
+def _compose_native_instructions(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+    *framework_notes: str | None,
+) -> str | None:
+    """
+    Compose a native launch's additive instructions: agent spec text, then framework notes.
+
+    The two native arms that HAVE an additive instruction channel own exactly
+    one each — claude's ``--append-system-prompt`` and codex's
+    ``developer_instructions`` — and before #3530 that single slot was already
+    spoken for by Smart Routing's routed-spawn note. Writing the spec's instructions into it
+    directly would silently drop that note — the two texts must COMPOSE, not
+    overwrite, which is what this helper exists to guarantee at every call
+    site.
+
+    Ordering is the repo's existing rule, borrowed wholesale from
+    :func:`omnigent.runtime.prompt.append_framework_instructions`:
+    user-authored agent instructions first, framework-owned metadata last, so
+    framework policy always has the final word.
+
+    :param agent_spec: Agent spec (or resolved wrapper) whose resolved
+        ``instructions`` lead the composition. ``None`` contributes nothing.
+    :param framework_notes: Framework-owned additions in priority order, e.g.
+        the routed-spawn note. ``None`` and blank entries are dropped, so a
+        pinned session with no spec instructions still yields ``None`` and its
+        argv stays byte-identical to a plain launch's.
+    :returns: The composed instruction text, or ``None`` when nothing at all
+        was contributed.
+    """
+    from omnigent.runtime.prompt import append_framework_instructions
+
+    notes = [note for note in framework_notes if note and note.strip()]
+    spec_instructions = _agent_instructions_from_spec(agent_spec)
+    if spec_instructions is None:
+        # Byte-identity guard. With no spec instructions this must reproduce
+        # exactly what the call site passed before #3530 — a single framework
+        # note, verbatim. Routing it through append_framework_instructions
+        # would ``.strip()`` it, and the routed-spawn note ends in a space
+        # (``_mcp_discovery_note``), so the argv would shift by a byte and
+        # break the "a pinned session's argv stays byte-identical" invariant
+        # the launch sites assert.
+        return "\n\n".join(notes) if notes else None
+    return append_framework_instructions(spec_instructions, notes)
+
+
 def _agent_os_env_from_spec(
     agent_spec: AgentSpec | ResolvedSpec | None,
 ) -> OSEnvSpec | None:
@@ -6530,6 +6620,13 @@ async def _auto_create_claude_terminal(
         launch_metadata.auto_harness,
         router_started=subagent_router_dir is not None,
     )
+    # The bundle's own ``instructions:`` text (#3530). Claude Code owns its
+    # prompt, so the per-turn ``system_prompt`` the executor adapter builds can
+    # never reach this already-running CLI — the native executor drops it. The
+    # additive ``--append-system-prompt`` flag at launch is the delivery point,
+    # and it is the SAME slot the routed-spawn note uses, so the two are
+    # composed rather than one overwriting the other.
+    append_system_prompt = _compose_native_instructions(agent_spec, routed_spawn_note)
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,
@@ -6540,7 +6637,7 @@ async def _auto_create_claude_terminal(
         skills_filter=skills_filter,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
         subagent_router_dir=subagent_router_dir,
-        append_system_prompt=routed_spawn_note,
+        append_system_prompt=append_system_prompt,
         allowed_tools=routed_spawn_tools,
         # The route-turn hook is registered only when this session can
         # actually route; otherwise every submit would pay its round trip.

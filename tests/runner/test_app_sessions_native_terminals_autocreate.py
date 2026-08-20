@@ -2993,6 +2993,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
     session_id: str,
     routed: bool,
     auto_harness: bool = False,
+    agent_spec: Any = None,
 ) -> Any:
     """Drive the claude-native launch and return the captured terminal spec.
 
@@ -3001,6 +3002,8 @@ async def _run_auto_create_claude_terminal_for_routing_class(
     :param auto_harness: Stamp the auto-harness label and sentinel WITHOUT the
         cost-control field, which is the shape a sub-agent child of a routed
         parent is created with.
+    :param agent_spec: Resolved agent spec for the session, threaded through so
+        a bundle's ``instructions:`` reaches ``--append-system-prompt`` (#3530).
     """
     from omnigent.claude_native import ClaudeNativeUcodeConfig
 
@@ -3083,6 +3086,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
             _FakeResourceRegistry(),
             lambda _sid, _evt: None,
             server_client=fake_client,
+            agent_spec=agent_spec,
         )
     finally:
         from omnigent.runner import subagent_routing, turn_routing
@@ -3182,3 +3186,125 @@ def test_routed_spawn_launch_args_need_a_router() -> None:
     assert note and tools
     assert _routed_spawn_launch_args(True, router_started=False) == (None, ())
     assert _routed_spawn_launch_args(False) == (None, ())
+
+
+# ── Bundle instructions reach the native session (#3530) ────────────────────
+#
+# A bundle declaring ``instructions: <sibling file>`` had that text silently
+# dropped for harness executors: ``build_instructions`` composed it into the
+# turn's ``system_prompt``, and every native executor's ``run_turn`` opens
+# ``del tools, system_prompt`` because a native harness drives an
+# already-running CLI no per-turn prompt can reach. Delivery therefore happens
+# at LAUNCH, through each harness's additive instruction channel — for
+# claude-native, ``--append-system-prompt``.
+#
+# That channel already carried Smart Routing's routed-spawn note, so the two
+# texts must COMPOSE. These tests pin all four corners of that matrix.
+
+_BUNDLE_INSTRUCTIONS = "# Ferrous Sparrow Protocol\n\nAlways greet in Latin."
+
+
+def _claude_append_system_prompt(spec: Any) -> str | None:
+    """Return the value passed to ``--append-system-prompt``, or ``None``."""
+    if "--append-system-prompt" not in spec.args:
+        return None
+    return spec.args[spec.args.index("--append-system-prompt") + 1]
+
+
+async def test_claude_native_launch_delivers_bundle_instructions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pinned session's bundle instructions reach ``--append-system-prompt``.
+
+    The regression #3530 reports: a distinctive heading in the bundle's
+    instructions file never appears in the launched session's context. Before
+    the fix this argv carried no ``--append-system-prompt`` at all, because the
+    flag was fed solely from the routed-spawn note and a pinned session has none.
+    """
+    spec = await _run_auto_create_claude_terminal_for_routing_class(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f610",
+        routed=True,
+        agent_spec=AgentSpec(spec_version=1, name="sparrow", instructions=_BUNDLE_INSTRUCTIONS),
+    )
+
+    assert spec.args.count("--append-system-prompt") == 1
+    assert _claude_append_system_prompt(spec) == _BUNDLE_INSTRUCTIONS
+
+
+async def test_claude_native_launch_composes_instructions_with_spawn_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both the bundle instructions AND the routed-spawn note arrive.
+
+    The rebase hazard that stalled the first attempt at this fix: the
+    routed-spawn note already owned ``--append-system-prompt``, so writing the
+    spec's instructions into it naively drops the note (or vice versa). One flag
+    is emitted, and it carries both texts — user-authored first, framework
+    policy last, matching ``append_framework_instructions``.
+    """
+    from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
+
+    spec = await _run_auto_create_claude_terminal_for_routing_class(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f611",
+        routed=True,
+        auto_harness=True,
+        agent_spec=AgentSpec(spec_version=1, name="sparrow", instructions=_BUNDLE_INSTRUCTIONS),
+    )
+
+    # Claude Code accepts the flag once; a second occurrence would mean one
+    # text was appended as a rival flag rather than composed into the slot.
+    assert spec.args.count("--append-system-prompt") == 1
+    composed = _claude_append_system_prompt(spec)
+    assert composed is not None
+    note = smart_routing_spawn_note("claude-native")
+    assert _BUNDLE_INSTRUCTIONS in composed
+    assert note.strip() in composed
+    # Ordering is load-bearing: framework policy gets the final word.
+    assert composed.index(_BUNDLE_INSTRUCTIONS) < composed.index(note.strip())
+
+
+async def test_claude_native_launch_without_instructions_keeps_argv_byte_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No ``instructions:`` in the bundle → the note alone, unchanged.
+
+    The launch sites treat "a session that contributes nothing extra keeps an
+    argv byte-identical to before" as an invariant. Composition must not perturb
+    the note — notably it must not ``.strip()`` it, since the note ends in a
+    space from ``_mcp_discovery_note``.
+    """
+    from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
+
+    spec = await _run_auto_create_claude_terminal_for_routing_class(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f612",
+        routed=True,
+        auto_harness=True,
+        agent_spec=AgentSpec(spec_version=1, name="sparrow"),
+    )
+
+    assert _claude_append_system_prompt(spec) == smart_routing_spawn_note("claude-native")
+
+
+async def test_claude_native_plain_launch_still_appends_no_system_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Neither instructions nor note → the flag is absent entirely.
+
+    Guards the other direction of the byte-identity invariant: the fix must not
+    start emitting an empty ``--append-system-prompt`` for plain sessions.
+    """
+    spec = await _run_auto_create_claude_terminal_for_routing_class(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f613",
+        routed=True,
+        agent_spec=AgentSpec(spec_version=1, name="sparrow", instructions="   \n  "),
+    )
+
+    assert "--append-system-prompt" not in spec.args
