@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import shlex
-from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -2380,7 +2379,6 @@ def _prepare_messages(
     content_cache: dict[str, str] | None,
     *,
     conversation_id: str | None = None,
-    framework_instructions: Sequence[str] = (),
 ) -> tuple[str, list[dict[str, Any]], int]:
     """
     Build system instructions and Responses API input items.
@@ -2398,13 +2396,9 @@ def _prepare_messages(
     :param content_cache: Per-task content reference cache.
     :param conversation_id: Optional owning conversation/session id
         used to verify session-scoped file ownership.
-    :param framework_instructions: Framework-owned additive instructions
-        for this turn (e.g. git-baseline scoping).
     :returns: Tuple of (system_instructions, messages, sys_tokens).
     """
-    sys_instructions = build_instructions(
-        spec, instructions, tool_schemas, framework_instructions=framework_instructions
-    )
+    sys_instructions = build_instructions(spec, instructions, tool_schemas)
     file_store = get_file_store()
     artifact_store = get_artifact_store()
     resolved = history

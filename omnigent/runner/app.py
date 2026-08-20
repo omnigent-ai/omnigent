@@ -7015,6 +7015,18 @@ def create_runner_app(
                 _publish_turn_status(conversation_id, "running")
 
                 if stream:
+                    await _ensure_session_registered(conversation_id)
+                    _baseline = _session_git_head_sha.get(conversation_id)
+                    if _baseline:
+                        from omnigent.runtime.prompt import (
+                            append_framework_instructions,
+                            git_baseline_instruction,
+                        )
+
+                        message_body["instructions"] = append_framework_instructions(
+                            message_body.get("instructions"),
+                            [git_baseline_instruction(_baseline)],
+                        )
                     response = await _stream_message_to_harness(message_body, conversation_id)
                     if not isinstance(response, StreamingResponse):
                         _on_proxy_stream_end(

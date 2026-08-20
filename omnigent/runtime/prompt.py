@@ -24,6 +24,13 @@ def git_baseline_instruction(baseline_sha: str) -> str:
     Centralised here so every ``build_instructions`` call site emits the
     same text.  The instruction tells the model which commits pre-date
     the current session so it only claims its own work.
+
+    Note: native terminal harnesses (claude-native, codex-native, etc.)
+    receive their system prompt only at launch and ignore per-turn
+    ``instructions``, so this instruction currently only reaches the
+    internal Responses-API executor path.  The Files-panel scoping
+    (via ``baseline_sha`` on ``list_filesystem_changes``) works for all
+    harness types regardless.
     """
     short = baseline_sha[:12]
     return (
