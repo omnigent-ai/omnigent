@@ -2584,7 +2584,7 @@ def create_runner_app(
         await _get_server_version(server_client)
         return _SessionInitContext(envelope=None)
 
-    def _load_envelope_session_init_context(
+    async def _load_envelope_session_init_context(
         envelope: RunnerSessionInitEnvelope,
         *,
         session_id: str,
@@ -2611,8 +2611,17 @@ def create_runner_app(
             if snapshot.git_head_sha:
                 _session_git_head_sha[session_id] = snapshot.git_head_sha
             else:
-                resolved = _resolve_git_head_from_workspace(snapshot.workspace)
+                resolved = await asyncio.to_thread(
+                    _resolve_git_head_from_workspace, snapshot.workspace
+                )
                 _session_git_head_sha[session_id] = resolved
+                if resolved and server_client is not None:
+                    with contextlib.suppress(Exception):
+                        await server_client.patch(
+                            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                            json={"git_head_sha": resolved},
+                            timeout=10.0,
+                        )
         # Set _session_start_cache last — it gates the early-return in
         # _ensure_session_registered, so SHA must be populated first.
         _session_start_cache[session_id] = float(snapshot.created_at)
@@ -2645,7 +2654,7 @@ def create_runner_app(
             body_sub_agent if isinstance(body_sub_agent, str) else None
         ):
             raise ValueError("session initialization envelope sub-agent mismatch")
-        return _load_envelope_session_init_context(
+        return await _load_envelope_session_init_context(
             envelope,
             session_id=session_id,
             agent_id=agent_id,
