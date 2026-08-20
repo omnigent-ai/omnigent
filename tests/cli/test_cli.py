@@ -24,6 +24,9 @@ from omnigent.cli import (
     _CLICK_SUBCOMMANDS,
     _GLOBAL_CONFIG_KEYS,
     _NATIVE_TERMINAL_DISPATCH_SPECS,
+    REQUIRE_WRAPPER_ENV,
+    WRAPPER_BYPASS_ENV,
+    WRAPPER_COMMAND_ENV,
     _bundle,
     _bundled_example_path,
     _dispatch_native_terminal_harness,
@@ -49,6 +52,7 @@ from omnigent.cli import (
     _save_local_config,
     _server_uvicorn_log_config,
     _start_cli_runner_process,
+    _wrapper_guard_error,
     cli,
 )
 from omnigent.cli_config import (
@@ -141,6 +145,46 @@ def test_python_module_entrypoint_uses_unified_click_cli() -> None:
     assert "Omnigent quick chat" not in result.stdout
 
 
+def _run_entrypoint(*args: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """Invoke the real CLI entry point in a subprocess with an augmented env."""
+    return subprocess.run(
+        [sys.executable, "-m", "omnigent", *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, **env},
+    )
+
+
+def test_wrapper_guard_blocks_naked_call_end_to_end() -> None:
+    """With the toggle set, a naked call is refused before any CLI dispatch."""
+    result = _run_entrypoint(
+        "--help",
+        env={REQUIRE_WRAPPER_ENV: "1", WRAPPER_COMMAND_ENV: "isaac omni"},
+    )
+
+    assert result.returncode == 2
+    assert "running `omnigent` directly is disabled" in result.stderr
+    assert "`isaac omni`" in result.stderr
+    # The block short-circuits before click renders help.
+    assert "Usage: python -m omnigent" not in result.stdout
+
+
+def test_wrapper_guard_bypass_reaches_cli_end_to_end() -> None:
+    """The bypass token lets the wrapped call dispatch normally."""
+    result = _run_entrypoint(
+        "--help",
+        env={
+            REQUIRE_WRAPPER_ENV: "1",
+            WRAPPER_COMMAND_ENV: "isaac omni",
+            WRAPPER_BYPASS_ENV: "1",
+        },
+    )
+
+    assert result.returncode == 0
+    assert "Usage: python -m omnigent [OPTIONS] COMMAND [ARGS]..." in result.stdout
+
+
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
@@ -164,6 +208,49 @@ def test_removed_ad_hoc_detection(argv: list[str], expected: bool) -> None:
         prompt shape.
     """
     assert _is_removed_ad_hoc_invocation(argv) is expected
+
+
+def test_wrapper_guard_inactive_when_toggle_unset() -> None:
+    """No block without the opt-in toggle, whatever else is set."""
+    assert _wrapper_guard_error({WRAPPER_COMMAND_ENV: "isaac omni"}, "omni") is None
+
+
+def test_wrapper_guard_blocks_naked_call_and_suggests_redirect() -> None:
+    """A naked call is refused with the configured redirect command."""
+    env = {REQUIRE_WRAPPER_ENV: "1", WRAPPER_COMMAND_ENV: "isaac omni"}
+
+    message = _wrapper_guard_error(env, "omni")
+
+    assert message is not None
+    assert "running `omni` directly is disabled" in message
+    assert "`isaac omni`" in message
+    assert f"set {WRAPPER_BYPASS_ENV}=1" in message
+
+
+def test_wrapper_guard_message_without_redirect() -> None:
+    """With no redirect command the block only offers the bypass escape hatch."""
+    message = _wrapper_guard_error({REQUIRE_WRAPPER_ENV: "1"}, "omnigent")
+
+    assert message is not None
+    assert "instead" not in message
+    assert f"Set {WRAPPER_BYPASS_ENV}=1" in message
+
+
+def test_wrapper_guard_bypass_passes_through() -> None:
+    """The wrapper's bypass token lets the wrapped call proceed."""
+    env = {
+        REQUIRE_WRAPPER_ENV: "1",
+        WRAPPER_COMMAND_ENV: "isaac omni",
+        WRAPPER_BYPASS_ENV: "1",
+    }
+
+    assert _wrapper_guard_error(env, "omni") is None
+
+
+@pytest.mark.parametrize("falsey", ["", "0", "false", "no", "off"])
+def test_wrapper_guard_toggle_falsey_values_do_not_block(falsey: str) -> None:
+    """Falsey toggle values are treated as unset."""
+    assert _wrapper_guard_error({REQUIRE_WRAPPER_ENV: falsey}, "omni") is None
 
 
 def test_extract_global_logging_flags_preserves_run_shorthand() -> None:

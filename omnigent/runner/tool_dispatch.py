@@ -6998,6 +6998,53 @@ async def _execute_task_lifecycle_tool(
     )
 
 
+async def _post_session_stop(server_client: httpx.AsyncClient, task_id: str) -> str | None:
+    """Hard-stop one claude-native child through the server."""
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{task_id}/events",
+            json={"type": "stop_session", "data": {}},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        return f"Error: sys_cancel_task stop_session failed: {type(exc).__name__}: {exc}"
+    if resp.status_code >= 400:
+        return (
+            f"Error: sys_cancel_task stop_session returned {resp.status_code}: {resp.text[:200]}"
+        )
+    return None
+
+
+async def _cancel_evicted_claude_native_subagent(
+    task_id: str,
+    *,
+    conversation_id: str,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Stop an owned claude-native child after its work entry was evicted."""
+    if server_client is None:
+        return "Error: sys_cancel_task requires server access for sub-agent tasks"
+    try:
+        resp = await server_client.get(f"/v1/sessions/{task_id}", timeout=10.0)
+    except httpx.HTTPError as exc:
+        return f"Error: sys_cancel_task lookup failed: {type(exc).__name__}: {exc}"
+    if resp.status_code != 200:
+        return f"Error: no in-flight task with task_id {task_id}"
+    snapshot = resp.json()
+    labels = snapshot.get("labels") if isinstance(snapshot, dict) else None
+    if (
+        not isinstance(snapshot, dict)
+        or snapshot.get("parent_session_id") != conversation_id
+        or not isinstance(labels, dict)
+        or labels.get(_SESSION_WRAPPER_LABEL_KEY) != CLAUDE_NATIVE_WRAPPER_VALUE
+    ):
+        return f"Error: no in-flight task with task_id {task_id}"
+    stop_error = await _post_session_stop(server_client, task_id)
+    if stop_error is not None:
+        return stop_error
+    return json.dumps({"cancelled": True, "task_id": task_id, "status": "cancelled"})
+
+
 async def _cancel_subagent_task(
     args: _JsonObject,
     *,
@@ -7040,14 +7087,22 @@ async def _cancel_subagent_task(
     if conversation_id is None:
         return "Error: sys_cancel_task requires conversation_id"
     entry = _runner_app.get_subagent_work(str(task_id))
-    if entry is None or entry.parent_session_id != conversation_id:
+    if entry is None:
+        return await _cancel_evicted_claude_native_subagent(
+            str(task_id),
+            conversation_id=conversation_id,
+            server_client=server_client,
+        )
+    if entry.parent_session_id != conversation_id:
         return f"Error: no in-flight task with task_id {task_id}"
     # A dispatched child sits in ``launching`` until its runtime emits a real
     # busy edge (see ``mark_subagent_work_started``). Cancellation must still
     # route to the child during that window — otherwise cancelling a slow-to-
-    # start sub-agent would silently no-op and leave it running. Only terminal
-    # states (``completed`` / ``failed`` / ``cancelled``) short-circuit here.
-    if entry.status not in ("launching", "running", "waiting"):
+    # start sub-agent would silently no-op and leave it running. A failed
+    # claude-native entry still falls through because its pane may be alive.
+    is_claude_native = entry.wrapper_label == CLAUDE_NATIVE_WRAPPER_VALUE
+    can_stop_failed_claude = is_claude_native and entry.status == "failed"
+    if entry.status not in ("launching", "running", "waiting") and not can_stop_failed_claude:
         return json.dumps(
             {
                 "cancelled": entry.status == "cancelled",
@@ -7060,9 +7115,7 @@ async def _cancel_subagent_task(
 
     # claude-native is the only harness with a runner-side hard-stop; every
     # other harness 204 no-ops on stop_session, so route them to interrupt.
-    event_type = (
-        "stop_session" if entry.wrapper_label == CLAUDE_NATIVE_WRAPPER_VALUE else "interrupt"
-    )
+    event_type = "stop_session" if is_claude_native else "interrupt"
 
     try:
         resp = await server_client.post(

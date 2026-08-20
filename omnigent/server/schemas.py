@@ -2440,6 +2440,7 @@ class SessionUsage(BaseModel):
     cost_usd: float = 0.0
     models: dict[str, float] = Field(default_factory=dict)
     harness: str | None = None
+    other_harnesses: list[str] | None = None
     llm_model: str | None = None
     agent_name: str | None = None
 
@@ -2747,6 +2748,29 @@ class SessionModelEvent(_SSEEventBase):
     type: Literal["session.model"]
     conversation_id: str
     model: str
+
+
+class SessionTitleEvent(_SSEEventBase):
+    """
+    Session-title update from a terminal-backed integration.
+
+    Emitted after an ``external_session_title`` POST from the
+    ``omnigent claude`` transcript forwarder when the operator renames
+    the session inside the Claude Code pane (``/rename``). Lets the web
+    session list show the new name without a reload.
+
+    :param type: Always ``"session.title"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param title: Title the session is now on, e.g. ``"auth-refactor"``.
+
+    Category: **transient** (SSE-only). The server also writes ``title``
+    on the conversation, so on reconnect clients restore the name from
+    the session snapshot rather than from a replayed event.
+    """
+
+    type: Literal["session.title"]
+    conversation_id: str
+    title: str
 
 
 class SessionReasoningEffortEvent(_SSEEventBase):
@@ -4186,6 +4210,7 @@ ServerStreamEvent = Annotated[
     SessionStatusEvent
     | SessionUsageEvent
     | SessionModelEvent
+    | SessionTitleEvent
     | SessionReasoningEffortEvent
     | SessionCollaborationModeEvent
     | SessionAgentChangedEvent
@@ -4374,10 +4399,14 @@ class SessionProjectSummary(BaseModel):
     :param id: First-class project id when one exists, or ``None`` for a
         label-only project not yet promoted to the ``projects`` table.
     :param name: Project name (the folder's display name and union key).
+    :param icon: The project's chosen emoji icon (a unicode grapheme), read
+        from its ``config``; ``None`` when unset or for a label-only folder,
+        so the sidebar falls back to the default folder glyph.
     """
 
     id: str | None = None
     name: str
+    icon: str | None = None
 
 
 class CreateProjectRequest(BaseModel):

@@ -131,7 +131,12 @@ def _normalize_responses_items_for_chat(
     for item in items:
         if item.get("type") == "message":
             raw_content = item.get("content")
-            if isinstance(raw_content, list):
+            if item.get("role") == "assistant" and isinstance(raw_content, str):
+                # The chat converter iterates assistant content expecting
+                # blocks, so a plain string is walked character by character and
+                # each one indexed. User strings take a different branch there.
+                item = {**item, "content": [{"type": "output_text", "text": raw_content}]}
+            elif isinstance(raw_content, list):
                 normalized_content = _normalize_content_blocks_for_chat(raw_content)
                 if normalized_content is not raw_content:
                     item = {**item, "content": normalized_content}

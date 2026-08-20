@@ -20,21 +20,20 @@ from omnigent.onboarding.ucode_setup import (
 )
 
 
-def test_find_ucode_command_prefers_uvx_from_main() -> None:
-    """Prefers an ephemeral uvx run pinned to main, even if ucode is installed.
+def test_find_ucode_command_prefers_uvx_pinned_commit() -> None:
+    """Prefers an ephemeral uvx run pinned to a fixed commit, even if ucode is
+    installed.
 
     The locally-installed binary may be stale (predating
-    ``configure --workspaces``), so uvx-from-main must win when both are
-    present. ``--refresh-package ucode`` forces re-resolution of the mutable
-    ``main`` ref so the cache can't serve an old commit.
+    ``configure --workspaces``), so uvx-from-pinned-commit must win when both
+    are present. The ref is a full SHA so setup resolves a reproducible ucode
+    rather than a moving ``main`` HEAD.
     """
     with patch("shutil.which", return_value="/usr/bin/uvx"):
         assert find_ucode_command() == [
             "/usr/bin/uvx",
-            "--refresh-package",
-            "ucode",
             "--from",
-            "git+https://github.com/databricks/ucode@main",
+            "git+https://github.com/databricks/ucode@94271a78c7139220b7333bcae91e522f95ef3af3",
             "ucode",
         ]
 
@@ -88,10 +87,8 @@ def test_build_ucode_configure_command_supports_uvx_prefix() -> None:
     command = build_ucode_configure_command(
         (
             "/usr/bin/uvx",
-            "--refresh-package",
-            "ucode",
             "--from",
-            "git+https://github.com/databricks/ucode@main",
+            "git+https://github.com/databricks/ucode@94271a78c7139220b7333bcae91e522f95ef3af3",
             "ucode",
         ),
         workspace_urls=("https://one.example.databricks.com",),
@@ -99,10 +96,8 @@ def test_build_ucode_configure_command_supports_uvx_prefix() -> None:
 
     assert command == [
         "/usr/bin/uvx",
-        "--refresh-package",
-        "ucode",
         "--from",
-        "git+https://github.com/databricks/ucode@main",
+        "git+https://github.com/databricks/ucode@94271a78c7139220b7333bcae91e522f95ef3af3",
         "ucode",
         "configure",
         "--workspaces",

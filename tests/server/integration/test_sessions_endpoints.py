@@ -1942,6 +1942,95 @@ async def test_auto_title_rejects_multiline_titles(
     assert response.status_code == 400, response.text
 
 
+async def test_external_session_title_overwrites_an_explicit_title(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A terminal ``/rename`` wins over a title set from the Web UI.
+
+    Unlike ``/auto-title`` — which declines once a human has named the
+    session — this event carries an explicit operator action, so it is
+    authoritative.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="Set from the web UI")
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_title", "data": {"title": "auth-refactor"}},
+    )
+
+    assert response.status_code in (200, 202), response.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["title"] == "auth-refactor"
+
+
+async def test_external_session_title_collapses_whitespace(
+    client: httpx.AsyncClient,
+) -> None:
+    """Surrounding and repeated whitespace is normalized before persisting."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_title", "data": {"title": "  auth   refactor  "}},
+    )
+
+    assert response.status_code in (200, 202), response.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == "auth refactor"
+
+
+@pytest.mark.parametrize("title", ["", "   ", "one\ntwo"])
+async def test_external_session_title_rejects_malformed_titles(
+    client: httpx.AsyncClient,
+    title: str,
+) -> None:
+    """Blank and multi-line titles are rejected rather than persisted."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="Original title")
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_title", "data": {"title": title}},
+    )
+
+    assert response.status_code == 400, response.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == "Original title"
+
+
+async def test_external_session_title_declines_child_sessions(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Child titles are structural (``"<agent>:<label>"``), so a rename is dropped.
+
+    The sub-agent tooling parses those titles back apart; overwriting one
+    with free text would break that lookup.
+    """
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(
+        kind="sub_agent",
+        title="coder:debug-auth",
+        parent_conversation_id=parent["id"],
+        agent_id=agent["id"],
+    )
+
+    response = await client.post(
+        f"/v1/sessions/{child.id}/events",
+        json={"type": "external_session_title", "data": {"title": "auth-refactor"}},
+    )
+
+    assert response.status_code in (200, 202), response.text
+    assert store.get_conversation(child.id).title == "coder:debug-auth"
+
+
 async def test_patch_session_archive_hides_from_default_list(
     client: httpx.AsyncClient,
 ) -> None:
@@ -6750,6 +6839,59 @@ async def test_post_external_session_todos_rejects_non_list_todos(
     )
     assert resp.status_code == 400, resp.text
     assert "external_session_todos" in resp.text
+
+
+async def test_post_external_session_todos_filters_malformed_items(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Individual malformed todo items are dropped before caching / broadcast.
+
+    The top-level payload is a valid list (so this is not the 400-rejection
+    path), but ``_handle_external_session_todos`` keeps only items with a
+    string ``content``, a ``status`` in {pending, in_progress, completed},
+    and a string ``activeForm``. This mirrors the same filter ``sse.ts``
+    applies on the live path, so a buggy forwarder version can't poison the
+    snapshot or the in-chat Plan tracker with half-formed entries.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sessions_module._session_todos_cache.pop(session["id"], None)
+
+    good = {"content": "Real task", "status": "in_progress", "activeForm": "Doing it"}
+    todos = [
+        good,
+        {"content": "Bad status", "status": "not-a-status", "activeForm": "x"},
+        {"content": 123, "status": "pending", "activeForm": "x"},  # non-str content
+        {"content": "No active form", "status": "completed", "activeForm": None},  # non-str
+        "not-a-dict",
+        {"status": "pending", "activeForm": "x"},  # missing content
+    ]
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_session_todos", "data": {"todos": todos}},
+        )
+        assert resp.status_code in (200, 202), resp.text
+
+        # Only the well-formed item survives — on both the live SSE channel
+        # and the cached snapshot the tracker reads on bind.
+        todo_events = [ev for _sid, ev in published if ev.get("type") == "session.todos"]
+        assert len(todo_events) == 1
+        assert todo_events[0]["todos"] == [good]
+
+        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+        assert snapshot["todos"] == [good]
+    finally:
+        sessions_module._session_todos_cache.pop(session["id"], None)
 
 
 async def test_post_external_mcp_startup_publishes_session_mcp_startup(

@@ -3632,6 +3632,170 @@ async def test_forwarder_mirrors_tui_model_switch_after_baseline(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_forwarder_mirrors_tui_rename_on_first_observation(tmp_path: Path) -> None:
+    """
+    A ``/rename`` posts ``external_session_title`` on the FIRST observation.
+
+    Unlike the model mirror there is no spawn default to protect: a
+    ``custom-title`` record exists only because the operator renamed the
+    session, so it is a real change worth posting immediately.
+
+    The second phase rewinds the byte cursor so the same ``custom-title``
+    record is read again — the restart / rewind path the dedupe exists
+    for. A steady-state poll reads only past its cursor and would never
+    re-see the record, so rewinding is what actually exercises the guard.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "custom-title", "customTitle": "auth-refactor", "sessionId": "s1"})
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    retry_tracker = forwarder._PostRetryTracker()
+    dedupe = forwarder._ForwardDedupeState()
+
+    requests: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """
+        Accept every forwarder POST and record its payload.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: 202 for every event.
+        """
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=retry_tracker,
+            dedupe=dedupe,
+        )
+        title_posts = [r for r in requests if r["type"] == "external_session_title"]
+        assert len(title_posts) == 1
+        assert title_posts[0]["data"] == {"title": "auth-refactor"}
+        assert dedupe.posted_title == "auth-refactor"
+
+        # Rewind to the top of the file so the rename record is re-read,
+        # as a restart / cursor rewind would. The dedupe must swallow it.
+        requests.clear()
+        rewound = forwarder.TranscriptForwardState(
+            transcript_path=transcript_path,
+            line_cursor=0,
+            byte_offset=0,
+            cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+        )
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=rewound,
+            retry_tracker=retry_tracker,
+            dedupe=dedupe,
+        )
+
+    assert [r for r in requests if r["type"] == "external_session_title"] == []
+
+
+@pytest.mark.asyncio
+async def test_forwarder_retries_title_post_after_transient_failure(tmp_path: Path) -> None:
+    """
+    A failed ``external_session_title`` POST is retried on a later poll.
+
+    ``observed_title`` is sticky across polls, so a poll whose incremental
+    window carries no ``custom-title`` record still reconciles the observed
+    title against the last POSTed one — the rename is not lost once the
+    original poll's window is gone.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "custom-title", "customTitle": "auth-refactor", "sessionId": "s1"})
+        + "\n",
+        encoding="utf-8",
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    retry_tracker = forwarder._PostRetryTracker()
+    dedupe = forwarder._ForwardDedupeState()
+
+    fail_titles = True
+    title_posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """
+        Fail title posts while ``fail_titles`` is set; accept everything else.
+
+        :param request: Outbound HTTP request from the forwarder.
+        :returns: 500 for the first title post, else 202.
+        """
+        payload = json.loads(request.content.decode("utf-8"))
+        if payload["type"] == "external_session_title":
+            title_posts.append(payload)
+            if fail_titles:
+                return httpx.Response(500, json={})
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        state = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=retry_tracker,
+            dedupe=dedupe,
+        )
+        # The POST failed, so the baseline stays behind the observation.
+        assert len(title_posts) == 1
+        assert dedupe.observed_title == "auth-refactor"
+        assert dedupe.posted_title is None
+
+        # Next poll: no new rename in the window, but the retry still fires.
+        fail_titles = False
+        with transcript_path.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "hi"}}
+                )
+                + "\n"
+            )
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=retry_tracker,
+            dedupe=dedupe,
+        )
+
+    assert len(title_posts) == 2
+    assert dedupe.posted_title == "auth-refactor"
+
+
+@pytest.mark.asyncio
 async def test_forwarder_retries_model_post_after_transient_failure(tmp_path: Path) -> None:
     """
     A failed ``external_model_change`` POST is retried on a later poll —

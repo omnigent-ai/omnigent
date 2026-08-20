@@ -210,6 +210,12 @@ class SessionConnectivity:
         dot off while ``runner_id``/``host_id`` are still ``None`` so
         the UI prompts for a host + directory before the clone can run,
         rather than treating it as an in-process session.
+    :param imported: ``True`` when this session was imported from a local
+        harness transcript (the ``omnigent.import.source`` label is set).
+        Like ``needs_workspace``, forces the online dot off while unbound:
+        an imported transcript has no live executor anywhere, so it must
+        launch a runner on a host before it can run — reporting it offline
+        routes the first message into the resume picker.
     :param runner_last_seen: Epoch seconds the bound runner's tunnel was
         last observed alive, written by the replica holding the tunnel.
         ``None`` when never observed (or cleared on graceful disconnect).
@@ -221,6 +227,7 @@ class SessionConnectivity:
     runner_id: str | None
     host_id: str | None
     needs_workspace: bool
+    imported: bool = False
     runner_last_seen: int | None = None
 
 

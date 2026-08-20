@@ -13,8 +13,11 @@ from omnigent.claude_native_bridge import (
     BRIDGE_DIR_ENV_VAR,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
+    ClaudePromptTimeout,
+    TmuxSessionNotAdvertised,
     inject_slash_command,
     inject_user_message,
+    kill_session,
     read_active_session_id,
     read_claude_status_model,
     read_launch_model,
@@ -192,10 +195,28 @@ class ClaudeNativeExecutor(Executor):
                         self._bridge_dir,
                         content=text,
                     )
+        except ClaudePromptTimeout as exc:
+            cleanup_error = self._reap_failed_turn()
+            message = describe_exception(exc)
+            if cleanup_error is not None:
+                message = f"{message} Cleanup also failed: {cleanup_error}"
+            yield ExecutorError(message=message)
+            return
         except RuntimeError as exc:
             yield ExecutorError(message=describe_exception(exc))
             return
         yield TurnComplete(response=None)
+
+    def _reap_failed_turn(self) -> str | None:
+        """Kill the Claude pane before a delivery timeout becomes ``failed``."""
+        try:
+            kill_session(self._bridge_dir, timeout_s=1.0)
+        except TmuxSessionNotAdvertised:
+            _logger.debug("claude-native: timed-out session already disappeared")
+        except RuntimeError as exc:
+            _logger.warning("claude-native: failed to reap timed-out session", exc_info=True)
+            return describe_exception(exc)
+        return None
 
     def _model_command_arg(self, wanted_model: str | None) -> str | None:
         """

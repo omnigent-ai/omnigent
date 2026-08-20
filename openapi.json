@@ -3705,6 +3705,7 @@
             "session.superseded": "#/components/schemas/SessionSupersededEvent",
             "session.terminal.activity": "#/components/schemas/SessionTerminalActivityEvent",
             "session.terminal_pending": "#/components/schemas/SessionTerminalPendingEvent",
+            "session.title": "#/components/schemas/SessionTitleEvent",
             "session.todos": "#/components/schemas/SessionTodosEvent",
             "session.usage": "#/components/schemas/SessionUsageEvent",
             "turn.cancelled": "#/components/schemas/TurnCancelledEvent",
@@ -3723,6 +3724,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionModelEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionTitleEvent"
           },
           {
             "$ref": "#/components/schemas/SessionReasoningEffortEvent"
@@ -4890,6 +4894,18 @@
       "SessionProjectSummary": {
         "description": "One entry of `GET /v1/sessions/projects` \u2014 a sidebar project folder.\n\nDual-read union of first-class projects and legacy `omni_project`\nlabel-projects, keyed by name.",
         "properties": {
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The project's chosen emoji icon (a unicode grapheme), read from its `config`; `None` when unset or for a label-only folder, so the sidebar falls back to the default folder glyph.",
+            "title": "Icon"
+          },
           "id": {
             "anyOf": [
               {
@@ -5990,6 +6006,46 @@
         "title": "SessionTerminalPendingEvent",
         "type": "object"
       },
+      "SessionTitleEvent": {
+        "description": "Session-title update from a terminal-backed integration.\n\nEmitted after an `external_session_title` POST from the\n`omnigent claude` transcript forwarder when the operator renames\nthe session inside the Claude Code pane (`/rename`). Lets the web\nsession list show the new name without a reload.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "title": {
+            "description": "Title the session is now on, e.g. `\"auth-refactor\"`. Category: **transient** (SSE-only). The server also writes `title` on the conversation, so on reconnect clients restore the name from the session snapshot rather than from a replayed event.",
+            "title": "Title",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.title",
+            "description": "Always `\"session.title\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "title"
+        ],
+        "title": "SessionTitleEvent",
+        "type": "object"
+      },
       "SessionTodosEvent": {
         "description": "Todo-list update from a Claude Code terminal-backed session.\n\nEmitted after an `external_session_todos` POST from the\n`omnigent claude` transcript forwarder, which captures todo\nupdates via `PostToolUse`/`TodoWrite` hook events from Claude\nCode and forwards them to the Omnigent server. Lets web render a\nlive todo panel in the right column without polling.",
         "properties": {
@@ -6093,6 +6149,20 @@
             "description": "Per-model recorded cost, keyed by the raw harness model id (e.g. `{\"claude-opus-4-8\": 14.03}`). Empty when no per-model cost was recorded. May not sum to `cost_usd` (see above).",
             "title": "Models",
             "type": "object"
+          },
+          "other_harnesses": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Other Harnesses"
           },
           "title": {
             "anyOf": [

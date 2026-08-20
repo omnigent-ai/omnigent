@@ -192,14 +192,10 @@ _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
     }
 )
 
-# Turn-error surfacing. A failed Codex turn arrives as ``turn/completed``
-# (or ``turn/failed``) with ``turn.status == "failed"`` and a ``turn.error``
-# object ``{message, codexErrorInfo?, additionalDetails?}``; keying status off
-# the method alone mapped such turns to ``idle`` — a "silent success". The
-# forwarder inspects ``turn.status``/``turn.error``, forces ``failed``, and
-# surfaces the reason. As a fallback it also catches an ``error`` ThreadItem in
-# ``turn.items``: both shapes exist in the app-server type system and the wire
-# shape varies by version, so detecting either keeps the fix robust.
+# Turn-error surfacing. Codex reports failures through a standalone ``error``
+# notification and on terminal turn boundaries via ``turn.error`` / failed
+# status. The forwarder handles both, plus the older ``error`` ThreadItem
+# fallback, so every non-retrying failure reaches the session UI.
 #
 # ``codexErrorInfo`` is the app-server's structured classification (e.g.
 # ``unauthorized``, ``usage_limit_exceeded``); auth-class values get a re-auth
@@ -359,6 +355,9 @@ class _CodexForwarderState:
     :param synced_item_keys: Stable item keys already posted to Omnigent this
         connection, e.g. ``{"thread_c:turn_c:item-1"}``. In-memory only;
         guards replay-vs-live overlap within one forwarder lifetime.
+    :param surfaced_terminal_error_turns: Turn ids whose standalone terminal
+        ``error`` notification was already surfaced. Used to suppress a later
+        terminal boundary for the same turn.
     :param posted_user_turns: Turn ids whose ``userMessage`` has been
         posted to Omnigent this connection, e.g. ``{"turn_123"}``. Used to
         enforce user-before-assistant ordering: before posting a turn's
@@ -406,6 +405,7 @@ class _CodexForwarderState:
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
     synced_item_keys: set[str] = field(default_factory=set)
+    surfaced_terminal_error_turns: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
     posted_tool_calls: set[str] = field(default_factory=set)
     partial_text_by_turn: dict[str, list[_PartialTextBuffer]] = field(default_factory=dict)
@@ -1001,6 +1001,15 @@ def _terminal_error_from_turn(params: _JsonObject) -> _CodexTerminalError | None
     if not isinstance(payload, dict):
         payload = _error_item_from_turn(turn)
     if payload is None:
+        return None
+    message = _error_payload_message(payload)
+    return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
+
+
+def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalError | None:
+    """Return the failure carried by Codex's standalone ``error`` notification."""
+    payload = params.get("error")
+    if not isinstance(payload, dict):
         return None
     message = _error_payload_message(payload)
     return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
@@ -2985,6 +2994,41 @@ async def _maybe_handle_turn_event(
     :param forwarder_state: Optional forwarder state.
     :returns: ``True`` when this event was handled.
     """
+    if method == "error":
+        if params.get("willRetry") is True:
+            _logger.info(
+                "Codex forwarder observed retryable turn error: turn_id=%s",
+                _turn_id_from_payload(params),
+            )
+            return True
+        if delta_coalescer is not None:
+            await delta_coalescer.flush()
+        error = _terminal_error_from_notification(params)
+        if error is None:
+            _logger.warning("Codex forwarder ignored malformed error notification")
+            return True
+        turn_id = _turn_id_from_payload(params)
+        if forwarder_state is not None and turn_id is not None:
+            if turn_id in forwarder_state.surfaced_terminal_error_turns:
+                _logger.info(
+                    "Codex forwarder ignored duplicate terminal error: turn_id=%s",
+                    turn_id,
+                )
+                return True
+            forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+            clear_active_turn_id_if_matches(bridge_dir, turn_id)
+        await _post_turn_status_edge(
+            client,
+            session_id,
+            _CodexTurnStatusEdge(
+                status="failed",
+                turn_id=turn_id,
+                source="error",
+                error=error,
+            ),
+        )
+        await usage_coalescer.flush()
+        return True
     if method == "turn/started":
         if delta_coalescer is not None:
             await delta_coalescer.flush()
@@ -3230,7 +3274,14 @@ async def _handle_terminal_turn_boundary(
         params=params,
         forwarder_state=forwarder_state,
     )
-    handled = await _handle_terminal_turn_event(client, session_id, bridge_dir, method, params)
+    handled = await _handle_terminal_turn_event(
+        client,
+        session_id,
+        bridge_dir,
+        method,
+        params,
+        forwarder_state=forwarder_state,
+    )
     if handled:
         await elicitation_tracker.resolve_by_terminal_turn_event(
             client,
@@ -4124,21 +4175,38 @@ async def _handle_terminal_turn_event(
     bridge_dir: Path,
     method: str,
     params: _JsonObject,
+    *,
+    forwarder_state: _CodexForwarderState | None = None,
 ) -> bool:
     """
-    Forward a terminal-observed Codex turn completion/failure event.
+    Handle a terminal-observed Codex turn completion/failure event.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param bridge_dir: Native Codex bridge directory.
     :param method: Codex method, e.g. ``"turn/completed"``.
     :param params: Codex turn event params.
-    :returns: ``True`` when the terminal event belonged to the active
-        turn and was forwarded, ``False`` when it was stale.
+    :param forwarder_state: Optional connection state used to suppress a
+        terminal boundary whose standalone error was already surfaced.
+    :returns: ``True`` when the terminal event belonged to the active turn
+        and its lifecycle was handled, ``False`` when it was stale.
     """
+    terminal_turn_id = _terminal_turn_id_from_params(params)
+    if (
+        forwarder_state is not None
+        and terminal_turn_id is not None
+        and terminal_turn_id in forwarder_state.surfaced_terminal_error_turns
+    ):
+        clear_active_turn_id_if_matches(bridge_dir, terminal_turn_id)
+        _logger.info(
+            "Codex forwarder suppressed terminal boundary after standalone error: "
+            "method=%s turn_id=%s",
+            method,
+            terminal_turn_id,
+        )
+        return True
     edge = _terminal_turn_status_edge(bridge_dir, method, params)
     if edge is None:
-        terminal_turn_id = _terminal_turn_id_from_params(params)
         _logger.info(
             "Codex forwarder ignored stale terminal turn event: method=%s turn_id=%s",
             method,

@@ -5029,6 +5029,159 @@ async def test_sys_cancel_task_interrupts_non_native_subagent() -> None:
     }
 
 
+@pytest.mark.asyncio
+async def test_sys_cancel_task_stops_terminal_claude_native_entry() -> None:
+    """A failed work status does not block cleanup of a live Claude pane."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    parent_id = "conv_parent_terminal"
+    child_id = "conv_child_terminal"
+    entry = runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="worker",
+        title="implementation",
+        wrapper_label="claude-code-native-ui",
+    )
+    entry.status = "failed"
+    posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(request.content))
+        entry.status = "cancelled"
+        return httpx.Response(204)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = json.loads(
+                await _cancel_subagent_task(
+                    {"task_id": child_id},
+                    conversation_id=parent_id,
+                    server_client=server_client,
+                )
+            )
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+
+    assert posts == [{"type": "stop_session", "data": {}}]
+    assert output == {"cancelled": True, "task_id": child_id, "status": "cancelled"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "cancelled"),
+    [("completed", False), ("cancelled", True)],
+)
+async def test_sys_cancel_task_returns_cached_finished_claude_native_status(
+    status: str,
+    cancelled: bool,
+) -> None:
+    """Finished Claude work does not issue a redundant hard-stop."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    parent_id = "conv_parent_finished"
+    child_id = f"conv_child_{status}"
+    entry = runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="worker",
+        title="implementation",
+        wrapper_label="claude-code-native-ui",
+    )
+    entry.status = status
+
+    try:
+        output = json.loads(
+            await _cancel_subagent_task(
+                {"task_id": child_id},
+                conversation_id=parent_id,
+                server_client=None,
+            )
+        )
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+
+    assert output == {"cancelled": cancelled, "task_id": child_id, "status": status}
+
+
+@pytest.mark.asyncio
+async def test_sys_cancel_task_stops_evicted_claude_native_entry() -> None:
+    """Server metadata restores the cleanup path after local eviction."""
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    parent_id = "conv_parent_evicted"
+    child_id = "conv_child_evicted"
+    posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": child_id,
+                    "parent_session_id": parent_id,
+                    "labels": {"omnigent.wrapper": "claude-code-native-ui"},
+                },
+            )
+        posts.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = json.loads(
+            await _cancel_subagent_task(
+                {"task_id": child_id},
+                conversation_id=parent_id,
+                server_client=server_client,
+            )
+        )
+
+    assert posts == [{"type": "stop_session", "data": {}}]
+    assert output == {"cancelled": True, "task_id": child_id, "status": "cancelled"}
+
+
+@pytest.mark.asyncio
+async def test_sys_cancel_task_rejects_foreign_evicted_entry() -> None:
+    """Eviction recovery cannot stop another parent's child."""
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    child_id = "conv_child_foreign"
+    posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": child_id,
+                    "parent_session_id": "conv_other_parent",
+                    "labels": {"omnigent.wrapper": "claude-code-native-ui"},
+                },
+            )
+        posts.append(json.loads(request.content))
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await _cancel_subagent_task(
+            {"task_id": child_id},
+            conversation_id="conv_requesting_parent",
+            server_client=server_client,
+        )
+
+    assert posts == []
+    assert output == f"Error: no in-flight task with task_id {child_id}"
+
+
 def test_session_status_to_task_status_maps_known_values() -> None:
     """
     ``_session_status_to_task_status`` maps a session.status value to the

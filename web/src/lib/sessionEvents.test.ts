@@ -28,6 +28,7 @@ import type {
   SessionStatusEvent,
   SessionTerminalActivityEvent,
   SessionTerminalPendingEvent,
+  SessionTitleEvent,
   SessionTodosEvent,
   SessionUsageEvent,
   SlashCommand,
@@ -1350,6 +1351,32 @@ describe("session.model (FLAT envelope)", () => {
 
   it("rejects missing conversation_id", () => {
     expect(parse("session.model", { model: "opus" })).toEqual([]);
+  });
+});
+
+describe("session.title (FLAT envelope)", () => {
+  it("lifts conversation_id and title", () => {
+    const events = parse("session.title", {
+      conversation_id: "conv_abc",
+      title: "auth-refactor",
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0] as SessionTitleEvent;
+    expect(ev.type).toBe("session_title");
+    expect(ev.conversationId).toBe("conv_abc");
+    expect(ev.title).toBe("auth-refactor");
+  });
+
+  it("rejects missing title", () => {
+    expect(parse("session.title", { conversation_id: "conv_abc" })).toEqual([]);
+  });
+
+  it("rejects an empty title", () => {
+    expect(parse("session.title", { conversation_id: "conv_abc", title: "" })).toEqual([]);
+  });
+
+  it("rejects missing conversation_id", () => {
+    expect(parse("session.title", { title: "auth-refactor" })).toEqual([]);
   });
 });
 

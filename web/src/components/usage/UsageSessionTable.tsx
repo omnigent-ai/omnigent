@@ -119,7 +119,17 @@ export function UsageSessionTable({ sessions }: Props) {
                   </span>
                 )}
               </td>
-              <td className="px-3 py-2 text-muted-foreground">{s.harness ?? "—"}</td>
+              <td className="px-3 py-2 text-muted-foreground">
+                {s.harness ?? "—"}
+                {s.otherHarnesses && s.otherHarnesses.length > 0 && (
+                  <span
+                    className="ml-1.5 inline-flex items-center rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+                    title={s.otherHarnesses.join(", ")}
+                  >
+                    +{s.otherHarnesses.length}
+                  </span>
+                )}
+              </td>
               <td className="px-3 py-2 text-right tabular-nums">
                 {formatSessionCostUsd(s.costUsd)}
               </td>

@@ -510,6 +510,15 @@ class _ForwardDedupeState:
         from ``posted_cost`` because it advances mid-turn (with in-flight
         sub-agent spend) while ``S`` stays frozen. ``None`` until first
         post.
+    :param observed_title: Last ``custom-title`` seen in the transcript,
+        sticky across polls, e.g. ``"auth-refactor"``. ``None`` until the
+        operator runs ``/rename``.
+    :param posted_title: Last title POSTed via
+        ``external_session_title``. Unlike ``posted_model`` this is NOT
+        seeded without a POST — a ``custom-title`` record only exists
+        because the operator renamed the session, so the first
+        observation is a real change worth mirroring. Left behind
+        ``observed_title`` on a failed POST so the next poll retries.
     :param recorded_token_usage: Last token counters recorded on a
         ``claude_native.usage`` span as ``gen_ai.usage.*``. Deduped
         separately from ``usage`` because that snapshot also moves on
@@ -523,6 +532,8 @@ class _ForwardDedupeState:
     recorded_token_usage: dict[str, int] | None = None
     observed_model: str | None = None
     posted_model: str | None = None
+    observed_title: str | None = None
+    posted_title: str | None = None
     # Last DISPLAY cost (USD) POSTed as ``cumulative_cost_usd`` — the
     # statusLine total ``S`` verbatim (matches /cost in the Claude TUI).
     # Kept to suppress duplicate posts when S hasn't advanced.
@@ -3575,6 +3586,15 @@ async def _forward_available_items(
         dedupe=dedupe,
         alias=_model_alias_for(result.latest_model),
     )
+    # Mirror a TUI-side `/rename` to the web session list. Claude writes the
+    # operator's title as a `custom-title` metadata record, which renders no
+    # conversation item, so this is the only path that surfaces it.
+    await _post_title_change_if_new(
+        client,
+        session_id=session_id,
+        dedupe=dedupe,
+        title=result.latest_custom_title,
+    )
     return updated
 
 
@@ -4214,6 +4234,86 @@ async def _post_external_model_change(
         json={"type": "external_model_change", "data": {"model": model}},
     )
     resp.raise_for_status()
+
+
+async def _post_external_session_title(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    title: str,
+) -> None:
+    """
+    Post one ``external_session_title`` event to the Sessions API.
+
+    Mirrors a ``/rename`` typed in the Claude Code pane onto the Omnigent
+    session title so the web session list stops showing the stale
+    auto-generated one.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id, e.g.
+        ``"conv_abc123"``.
+    :param title: Operator-chosen title, e.g. ``"auth-refactor"``.
+    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
+    """
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_title", "data": {"title": title}},
+    )
+    resp.raise_for_status()
+
+
+async def _post_title_change_if_new(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    dedupe: _ForwardDedupeState,
+    title: str | None,
+) -> None:
+    """
+    Mirror an observed ``/rename`` title to the session, deduped.
+
+    Unlike :func:`_post_model_change_if_new`, the FIRST observation is
+    posted rather than used to seed the baseline silently: a
+    ``custom-title`` record exists only because the operator ran
+    ``/rename``, so there is no passive spawn default to protect.
+
+    A steady-state poll reads only records past its byte cursor, so the
+    dedupe is not for the ordinary case — it covers the cursor rewind /
+    restart path that re-reads an already-posted record, and it is what
+    makes the retry below safe to attempt on every poll.
+
+    Best-effort: a failed POST leaves ``posted_title`` behind
+    ``observed_title`` so the next poll retries. ``observed_title`` is
+    sticky for exactly this reason — the retry must survive polls whose
+    own window carries no rename.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param dedupe: Shared per-session dedupe state; mutated in place.
+    :param title: Title just observed, or ``None`` when this poll's
+        window carried no ``custom-title`` record. ``observed_title`` is
+        sticky, so ``None`` does not clear it — a previously-observed but
+        unposted title is still retried here.
+    """
+    if title is not None:
+        dedupe.observed_title = title
+    if dedupe.observed_title is None or dedupe.observed_title == dedupe.posted_title:
+        return
+    try:
+        await _post_external_session_title(
+            client,
+            session_id=session_id,
+            title=dedupe.observed_title,
+        )
+        dedupe.posted_title = dedupe.observed_title
+    except httpx.HTTPError:
+        # Leave posted_title behind observed_title so the next poll retries.
+        _logger.warning(
+            "Failed to mirror /rename to Omnigent session=%s; the web session "
+            "list may show a stale title until the next poll",
+            session_id,
+            exc_info=True,
+        )
 
 
 async def _post_model_change_if_new(
