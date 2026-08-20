@@ -73,7 +73,7 @@ import { AddAgentDialog } from "./AddAgentDialog";
 // the previous session yanking the user into the file viewer of the
 // next one. Other params (e.g. ``?debug=1`` for ``useDebugMode``) are
 // global and must be preserved across navigation.
-const SESSION_SCOPED_PARAMS = ["file", "diff", "comment", "view"] as const;
+const SESSION_SCOPED_PARAMS = ["file", "diff", "comment", "view", "message"] as const;
 const CODEX_NATIVE_SUBAGENT_WRAPPER = "codex-native-ui-subagent";
 const OPENCODE_NATIVE_SUBAGENT_WRAPPER = "opencode-native-ui-subagent";
 const ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER = "antigravity-native-ui-subagent";

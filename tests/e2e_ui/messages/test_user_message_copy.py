@@ -7,7 +7,8 @@ landed on the clipboard and the icon flipped to its copied state.
 
 Selectors:
   - user bubble: ``data-testid="message-bubble"`` + ``data-role="user"``
-  - copy button: accessible name "Copy" (MessageAction sr-only label/tooltip)
+  - copy button: accessible name "Copy" exactly (MessageAction sr-only);
+    exact match avoids colliding with the sibling "Copy link" deep-link control
   - copied state: lucide check icon (``svg.lucide-check``) replaces the copy
     icon (``svg.lucide-copy``) for ~2s after a successful write
   - composer: placeholder "Ask the agent anything…"
@@ -59,7 +60,7 @@ def test_user_message_copy_button_copies_text(
         bubble = page.locator(_USER_BUBBLE).filter(has_text=marker)
         expect(bubble).to_be_visible(timeout=15_000)
 
-        copy_button = bubble.get_by_role("button", name="Copy")
+        copy_button = bubble.get_by_role("button", name="Copy", exact=True)
         # Copy icon is present before the click; hover-reveal only affects
         # opacity, not DOM presence, so the button is always in the tree.
         expect(copy_button.locator("svg.lucide-copy")).to_have_count(1)

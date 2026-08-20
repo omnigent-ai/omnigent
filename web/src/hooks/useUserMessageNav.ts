@@ -9,6 +9,7 @@
 // would each hold their own anchor and diverge.
 
 import { useCallback, useMemo, useState } from "react";
+import { releaseConversationScrollLock } from "@/components/ai-elements/conversation";
 import { useChatStore } from "@/store/chatStore";
 
 export interface UserMessageNav {
@@ -41,28 +42,33 @@ function getScrollParent(node: Element): Element | null {
 }
 
 /**
- * Smooth-scroll a user message into view (centered) and flash it once the
- * scroll settles. Shared by the Cmd+Alt nav hook and the turn rail so both
- * land on the message the same way. Anchors on the `data-user-message-id`
- * DOM attribute stamped by UserBubble.
+ * Smooth-scroll a transcript message into view (centered) and flash it once
+ * the scroll settles. Prefers ``data-message-id`` (user + assistant deep
+ * links); falls back to ``data-user-message-id`` for the activity rail /
+ * Cmd+Alt nav which still stamp that attribute on user bubbles.
  *
- * @param itemId - The user bubble's itemId (the DOM anchor to scroll to).
+ * @param messageId - Stable message id (user itemId or assistant responseId).
  * @param flash - Optional highlight callback fired when the scroll settles.
  */
-export function scrollToUserMessage(itemId: string, flash?: (id: string) => void): void {
-  const el = document.querySelector(
-    // CSS.escape is defensive — itemIds are alphanumeric today.
-    `[data-user-message-id="${CSS.escape(itemId)}"]`,
-  );
+export function scrollToMessage(messageId: string, flash?: (id: string) => void): void {
+  const el =
+    document.querySelector(`[data-message-id="${CSS.escape(messageId)}"]`) ??
+    document.querySelector(`[data-user-message-id="${CSS.escape(messageId)}"]`);
   if (!el) {
     // Fail loud: id exists in the list but DOM anchor is missing.
-    console.warn(`scrollToUserMessage: no element for itemId=${itemId}`);
+    console.warn(`scrollToMessage: no element for messageId=${messageId}`);
     return;
   }
 
   // Supersede the previous jump's pending flash so rapid nav only flashes
   // the message we finally land on.
   cancelPendingFlash?.();
+
+  // Opening a tall transcript starts StickToBottom locked to the bottom.
+  // Without releasing that lock, the next content-resize scrollToBottom
+  // yanks the view back — deep-link / rail jumps look like a no-op on
+  // multi-message sessions (single short transcripts stay in view anyway).
+  releaseConversationScrollLock();
 
   el.scrollIntoView({ block: "center", behavior: "smooth" });
 
@@ -88,7 +94,7 @@ export function scrollToUserMessage(itemId: string, flash?: (id: string) => void
     if (done) return;
     done = true;
     cleanup();
-    flash?.(itemId);
+    flash?.(messageId);
   }
 
   function onScroll(): void {
@@ -102,6 +108,17 @@ export function scrollToUserMessage(itemId: string, flash?: (id: string) => void
   // each scroll event reschedules it while the smooth-scroll is in motion.
   settleTimer = window.setTimeout(finish, SCROLL_SETTLE_MS);
   maxTimer = window.setTimeout(finish, SCROLL_SETTLE_MAX_MS);
+}
+
+/**
+ * Smooth-scroll a user message into view. Thin wrapper over
+ * {@link scrollToMessage} for the activity rail and Cmd+Alt nav.
+ *
+ * @param itemId - The user bubble's itemId (the DOM anchor to scroll to).
+ * @param flash - Optional highlight callback fired when the scroll settles.
+ */
+export function scrollToUserMessage(itemId: string, flash?: (id: string) => void): void {
+  scrollToMessage(itemId, flash);
 }
 
 export function useUserMessageNav(userMessageIds: readonly string[]): UserMessageNav {
@@ -122,7 +139,7 @@ export function useUserMessageNav(userMessageIds: readonly string[]): UserMessag
       ? userMessageIds[userMessageIds.length - 1]
       : userMessageIds[currentIndex - 1];
     setAnchorId(target);
-    scrollToUserMessage(target, flashUserMessage);
+    scrollToMessage(target, flashUserMessage);
   }, [userMessageIds, currentIndex, outside, flashUserMessage]);
 
   const goNext = useCallback(() => {
@@ -130,7 +147,7 @@ export function useUserMessageNav(userMessageIds: readonly string[]): UserMessag
     if (currentIndex >= userMessageIds.length - 1) return;
     const target = userMessageIds[currentIndex + 1];
     setAnchorId(target);
-    scrollToUserMessage(target, flashUserMessage);
+    scrollToMessage(target, flashUserMessage);
   }, [userMessageIds, currentIndex, outside, flashUserMessage]);
 
   // Stable identity so consumers can put the return value in an

@@ -258,6 +258,54 @@ describe("UserBubble copy button", () => {
   });
 });
 
+describe("UserBubble copy-link button", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("copies a ?message= deep link for the bubble itemId", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    vi.stubGlobal("location", {
+      href: "https://app.example/c/conv_1?debug=1",
+    });
+
+    renderBubble(userBubble("link me", { itemId: "item_42" }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith(
+        "https://app.example/c/conv_1?debug=1&message=item_42",
+      ),
+    );
+    expect(screen.getByTestId("message-bubble")).toHaveAttribute("data-message-id", "item_42");
+  });
+});
+
+describe("AssistantBubble copy-link button", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("stamps data-message-id with the responseId and copies that link", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    vi.stubGlobal("location", {
+      href: "https://app.example/c/conv_1",
+    });
+
+    renderBubble(assistantBubble("completed"));
+    expect(screen.getByTestId("message-bubble")).toHaveAttribute(
+      "data-message-id",
+      "codex_turn_123",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith("https://app.example/c/conv_1?message=codex_turn_123"),
+    );
+  });
+});
+
 describe("UserBubble @-mention attachment chips", () => {
   it("shows file and folder chips from [Attached: …] markers and hides the markers", () => {
     renderBubble(userBubble("[Attached: src/server.ts]\n[Attached: docs/]\n\nsummarize these"));
