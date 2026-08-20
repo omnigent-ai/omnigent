@@ -4665,6 +4665,20 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(useChatStore.getState().selectedEffort).toBe("high");
     });
 
+    it("keeps a routed effort session-scoped", () => {
+      bindConversationForTest("conv_routed", { costControlModeOverride: "on" });
+      useChatStore.setState({ selectedEffort: null });
+
+      handleSessionEvent({
+        type: "session_reasoning_effort",
+        conversationId: "conv_routed",
+        reasoningEffort: "high",
+      });
+
+      expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
+      expect(useChatStore.getState().selectedEffort).toBeNull();
+    });
+
     it("records a backgrounded conversation's effort switch on that conversation", () => {
       // The session-scoped value always lands, background included: a live entry
       // is never re-bound on return, so discarding the event left the picker
@@ -6971,14 +6985,46 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
       model_override: null,
     });
 
-    useChatStore.setState({ selectedModel: "claude-opus-4-7" });
+    useChatStore.setState({ selectedModel: "claude-opus-4-7", selectedEffort: "high" });
     await useChatStore.getState().switchTo("conv_routing");
 
     // No model_override PATCH fired (contrast the handoff test above).
     const patches = patchCallsFor("conv_routing");
     expect(patches.some((p) => "model_override" in p)).toBe(false);
+    expect(patches.some((p) => "reasoning_effort" in p)).toBe(false);
     // …and the session is not mislabeled as pinned to the sticky model.
     expect(useChatStore.getState().sessionModelOverride).toBeNull();
+    expect(useChatStore.getState().selectedEffort).toBeNull();
+  });
+
+  it("keeps a routed session effort without making it the sticky preference", async () => {
+    seedSession("conv_routed_effort", []);
+    withSnapshot("conv_routed_effort", {
+      labels: { "omnigent.wrapper": "codex-native-ui" },
+      cost_control_mode_override: "on",
+      reasoning_effort: "high",
+    });
+
+    useChatStore.setState({ selectedEffort: "medium" });
+    await useChatStore.getState().switchTo("conv_routed_effort");
+
+    expect(patchCallsFor("conv_routed_effort")).toEqual([]);
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
+    expect(useChatStore.getState().selectedEffort).toBeNull();
+  });
+
+  it("leaves sticky effort alone when a routed session has no effort control", async () => {
+    seedSession("conv_routed_custom", []);
+    withSnapshot("conv_routed_custom", {
+      labels: {},
+      cost_control_mode_override: "on",
+    });
+
+    useChatStore.setState({ selectedEffort: "medium" });
+    await useChatStore.getState().switchTo("conv_routed_custom");
+
+    expect(useChatStore.getState().sessionReasoningEffort).toBeNull();
+    expect(useChatStore.getState().selectedEffort).toBe("medium");
   });
 
   it("applies sticky effort but never the sticky model on a codex-native session", async () => {
@@ -9466,7 +9512,7 @@ describe("chatStore — setCostControlMode", () => {
     });
     expect(patchCall).toBeDefined();
     const body = JSON.parse((patchCall![1] as RequestInit).body as string);
-    expect(body).toEqual({ cost_control_mode_override: "on" });
+    expect(body).toEqual({ cost_control_mode_override: "on", reasoning_effort: "default" });
     // Settled state is the server echo, proving the canonical refresh ran.
     expect(useChatStore.getState().costControlModeOverride).toBe("on");
   });
@@ -9477,11 +9523,17 @@ describe("chatStore — setCostControlMode", () => {
     // judge never runs. The clear rides in the SAME PATCH as the toggle.
     seedSession("conv_cc_model", []);
     await useChatStore.getState().switchTo("conv_cc_model");
-    useChatStore.setState({ sessionModelOverride: "claude-opus-4-7" });
+    useChatStore.setState({
+      sessionModelOverride: "claude-opus-4-7",
+      selectedEffort: "high",
+      sessionReasoningEffort: "high",
+    });
 
     // The optimistic clear is visible before the PATCH resolves.
     const settled = useChatStore.getState().setCostControlMode("on");
     expect(useChatStore.getState().sessionModelOverride).toBeNull();
+    expect(useChatStore.getState().selectedEffort).toBeNull();
+    expect(useChatStore.getState().sessionReasoningEffort).toBeNull();
     await settled;
 
     const patchCall = fetchMock.mock.calls.find(([u, init]) => {
@@ -9496,6 +9548,7 @@ describe("chatStore — setCostControlMode", () => {
     expect(JSON.parse((patchCall![1] as RequestInit).body as string)).toEqual({
       cost_control_mode_override: "on",
       model_override: "default",
+      reasoning_effort: "default",
     });
   });
 
@@ -9518,6 +9571,7 @@ describe("chatStore — setCostControlMode", () => {
     expect(patchCall).toBeDefined();
     expect(JSON.parse((patchCall![1] as RequestInit).body as string)).toEqual({
       cost_control_mode_override: "on",
+      reasoning_effort: "default",
     });
   });
 
@@ -9547,6 +9601,7 @@ describe("chatStore — setCostControlMode", () => {
   it("rolls back the optimistic flip when the PATCH fails", async () => {
     seedSession("conv_cc3", []);
     await useChatStore.getState().switchTo("conv_cc3");
+    useChatStore.setState({ selectedEffort: "high", sessionReasoningEffort: "high" });
 
     fetchMock.mockImplementationOnce((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
@@ -9560,6 +9615,8 @@ describe("chatStore — setCostControlMode", () => {
     // Back to the pre-toggle value: the pill must not claim a state the
     // server never persisted (it would silently diverge from the snapshot).
     expect(useChatStore.getState().costControlModeOverride).toBeNull();
+    expect(useChatStore.getState().selectedEffort).toBe("high");
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("high");
   });
 
   it("rolls back on the toggling conversation when the failure outlives a switch", async () => {
@@ -9570,6 +9627,8 @@ describe("chatStore — setCostControlMode", () => {
     seedSession("conv_cc_bg", []);
     seedSession("conv_cc_fg", []);
     await useChatStore.getState().switchTo("conv_cc_bg");
+    useChatStore.setState({ selectedEffort: "high", sessionReasoningEffort: "high" });
+    window.localStorage.setItem("omnigent.picker.effort", "high");
 
     let failPatch: (() => void) | null = null;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
@@ -9593,8 +9652,39 @@ describe("chatStore — setCostControlMode", () => {
 
     // The rejected optimistic flip is gone from the conversation that owns it...
     expect(conversationRegistry.peek("conv_cc_bg")!.getState().costControlModeOverride).toBeNull();
+    expect(conversationRegistry.peek("conv_cc_bg")!.getState().sessionReasoningEffort).toBe("high");
     // ...and the visible conversation was never touched.
     expect(useChatStore.getState().costControlModeOverride).toBeNull();
+    expect(useChatStore.getState().selectedEffort).toBeNull();
+    expect(window.localStorage.getItem("omnigent.picker.effort")).toBe("high");
+  });
+
+  it("does not overwrite a newer effort when an older routing PATCH fails", async () => {
+    seedSession("conv_cc_race", []);
+    sessionLabels.set("conv_cc_race", { "omnigent.wrapper": "codex-native-ui" });
+    await useChatStore.getState().switchTo("conv_cc_race");
+    useChatStore.setState({ selectedEffort: "high", sessionReasoningEffort: "high" });
+
+    let failPatch: (() => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_cc_race" && init?.method === "PATCH" && failPatch === null) {
+        return new Promise<Response>((resolve) => {
+          failPatch = () =>
+            resolve(mockResponse({ error: { message: "boom" } }, { ok: false, status: 500 }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const toggling = useChatStore.getState().setCostControlMode("on");
+    await tick();
+    await useChatStore.getState().setEffort("low");
+    failPatch!();
+    await expect(toggling).rejects.toThrow();
+
+    expect(useChatStore.getState().selectedEffort).toBe("low");
+    expect(useChatStore.getState().sessionReasoningEffort).toBe("low");
   });
 
   it("hydrates from the session snapshot on bind and resets on switch-away", async () => {

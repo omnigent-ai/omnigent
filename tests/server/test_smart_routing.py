@@ -22,6 +22,7 @@ from omnigent.server.smart_routing import (
     LLMRoutingClient,
     RoutingResult,
     _build_rubric,
+    fetch_codex_model_efforts,
     fetch_runner_models,
     harness_bars_model,
     infer_models,
@@ -336,6 +337,9 @@ def test_build_rubric_shows_harness_names() -> None:
     assert "codex" in rubric
     assert "databricks-claude-haiku-4-5" in rubric
     assert "databricks-gpt-5-4-nano" in rubric
+    assert "gpt-5.6-terra (efforts: low, high)" in _build_rubric(
+        {"codex-native": ["gpt-5.6-terra"]}, {"gpt-5.6-terra": ["low", "high"]}
+    )
 
 
 # ── LLMRoutingClient ───────────────────────────────────────────────
@@ -385,6 +389,26 @@ async def test_llm_routing_client_clamps_hallucinated_model() -> None:
     result = await client.route("hard task", {"claude-sdk": models})
     assert result is not None
     assert result.model == models[0]  # clamped to cheapest
+
+
+@pytest.mark.asyncio
+async def test_llm_routing_client_accepts_only_an_effort_for_the_selected_model() -> None:
+    verdict = {
+        "harness": "codex-native",
+        "model": "gpt-5.6-terra",
+        "reasoning_effort": "high",
+        "rationale": "moderate",
+    }
+    client = LLMRoutingClient(_FakeLLMClient(verdict))
+    models = {"codex-native": ["gpt-5.6-terra"]}
+    efforts = {"gpt-5.6-terra": ["low", "high"]}
+
+    result = await client.route("task", models, efforts)
+    assert result is not None and result.reasoning_effort == "high"
+
+    verdict["reasoning_effort"] = "ultra"
+    result = await client.route("task", models, efforts)
+    assert result is None
 
 
 @pytest.mark.asyncio
@@ -501,6 +525,33 @@ async def test_fetch_runner_models_returns_none_on_empty_workers() -> None:
     assert result is None
 
 
+@pytest.mark.asyncio
+async def test_fetch_codex_model_efforts_normalizes_and_skips_empty_menus() -> None:
+    not_ready = MagicMock(status_code=503)
+    ready = MagicMock(status_code=200)
+    ready.json.return_value = {
+        "models": [
+            {
+                "id": "gpt-5.6-terra",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "low"},
+                    {"reasoningEffort": "max"},
+                    {"reasoningEffort": "ultra"},
+                ],
+            },
+            {"id": "gpt-no-effort", "supportedReasoningEfforts": []},
+        ]
+    }
+    client = MagicMock()
+    client.get = AsyncMock(side_effect=[not_ready, ready])
+
+    with patch("omnigent.server.smart_routing._CODEX_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,)):
+        result = await fetch_codex_model_efforts("conv_123", client)
+
+    assert result == {"gpt-5.6-terra": ["low", "xhigh"]}
+    assert client.get.await_count == 2
+
+
 # ── route_turn (integration) ───────────────────────────────────────
 
 
@@ -525,6 +576,59 @@ async def test_route_turn_uses_caps_routing_client() -> None:
     assert model == "databricks-claude-haiku-4-5"
     assert v is not None
     assert "tier" not in v
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("gateway_backed", "external_answers", "expected_source"),
+    [(False, True, "oss-llm"), (True, True, "databricks-aigw"), (True, False, "oss-llm")],
+)
+async def test_route_turn_threads_effort_only_from_the_local_judge(
+    gateway_backed: bool,
+    external_answers: bool,
+    expected_source: str,
+) -> None:
+    result = RoutingResult(
+        model="gpt-5.6-terra",
+        rationale="moderate",
+        harness="codex-native",
+        reasoning_effort="high",
+    )
+    external, local = (
+        FakeRoutingClient(result if external_answers else None),
+        FakeRoutingClient(result),
+    )
+    response = MagicMock(status_code=200)
+    response.raise_for_status = MagicMock()
+    response.json.return_value = {
+        "models": [
+            {
+                "id": "gpt-5.6-terra",
+                "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
+            }
+        ]
+    }
+    runner_client = MagicMock()
+    runner_client.get = AsyncMock(return_value=response)
+    caps = FakeCaps(
+        routing_client=external,
+        routing_backends=RoutingBackends(external=external, local=local),
+    )
+
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        model, verdict = await route_turn(
+            "codex-native",
+            "task",
+            session_id="conv_123",
+            runner_client=runner_client,
+            gateway_backed=gateway_backed,
+        )
+
+    assert model == "gpt-5.6-terra"
+    assert verdict is not None and verdict["router_source"] == expected_source
+    assert verdict.get("reasoning_effort") == ("high" if expected_source == "oss-llm" else None)
+    selected = local if expected_source == "oss-llm" else external
+    assert selected.model_efforts == [{"gpt-5.6-terra": ["high"]}]
 
 
 @pytest.mark.asyncio
@@ -659,6 +763,7 @@ async def test_route_turn_drops_out_of_family_catalog_models() -> None:
             "narrow fix",
             session_id="conv_123",
             runner_client=mock_client,
+            discover_efforts=False,
         )
     assert model == "databricks-gpt-5-5"
     assert client.offered == [{"codex-native": ["databricks-gpt-5-5", "databricks-gpt-5-4-mini"]}]

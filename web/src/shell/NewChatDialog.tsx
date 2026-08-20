@@ -2394,7 +2394,10 @@ export function NewChatLandingScreen() {
   }, []);
   const setCostControlMode = useCallback((mode: CostControlMode) => {
     _setCostControlMode(mode);
-    if (mode === "on") _setPickedModel("");
+    if (mode === "on") {
+      _setPickedModel("");
+      setPickedEffort("");
+    }
   }, []);
   // Controls the working-directory popover so picking a directory closes it.
   const [workspacePopoverOpen, setWorkspacePopoverOpen] = useState(false);

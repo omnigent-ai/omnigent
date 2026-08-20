@@ -1619,6 +1619,7 @@ def register_hooks_routes(
                 prompt,
                 session_id=session_id,
                 runner_client=runner_client,
+                discover_efforts=False,
                 catalog=catalog,
                 gateway_backed=turn_gateway_backed,
                 allow_static_fallback=turn_gateway_backed,

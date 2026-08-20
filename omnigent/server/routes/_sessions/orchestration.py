@@ -4007,6 +4007,7 @@ def _build_native_terminal_message_event(
     conv: Conversation,
     body: SessionEventInput,
     model_override: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     """
     Build the runner event that delivers a web message to a native TUI.
@@ -4020,6 +4021,7 @@ def _build_native_terminal_message_event(
         so the claude-native executor applies ``/model`` and injects the
         message under one lock (no separate racing ``model_change``
         event). ``None`` when routing did not pick a model.
+    :param reasoning_effort: Routed effort to apply with *model_override*.
     :returns: Harness ``MessageEvent`` body for the runner-local
         native terminal harness, including ``agent_id`` so the runner
         can resolve the harness spec on the first message.
@@ -4053,6 +4055,8 @@ def _build_native_terminal_message_event(
     # inject as ONE locked step, so the switch can't race the message.
     if model_override is not None:
         event["model_override"] = model_override
+    if reasoning_effort is not None:
+        event["reasoning"] = {"effort": reasoning_effort}
     return event
 
 
@@ -4064,6 +4068,7 @@ async def _forward_native_terminal_message(
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
     model_override: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -4087,12 +4092,18 @@ async def _forward_native_terminal_message(
         in-band on the message so the executor applies ``/model`` and the
         inject under one lock (no separate racing ``model_change``).
         ``None`` when routing did not pick a model.
+    :param reasoning_effort: Routed effort carried in the same message.
     :returns: None.
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
     """
     display_name, _, _ = _native_terminal_runtime(conv)
-    event = _build_native_terminal_message_event(conv, body, model_override=model_override)
+    event = _build_native_terminal_message_event(
+        conv,
+        body,
+        model_override=model_override,
+        reasoning_effort=reasoning_effort,
+    )
     _logger.info(
         "%s terminal message forward starting: session=%s block_types=%s model_override=%s",
         display_name,
@@ -5428,6 +5439,7 @@ async def _dispatch_session_event_to_runner_impl(
             conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
         ) or _native_parent_routing_on
         _native_routed_model: str | None = None
+        _native_routed_effort: str | None = None
         _native_verdict: dict[str, Any] | None = None
         # Set when nothing was routed — the call failed, or the family rule
         # below refused a cross-family spawn. The chip then carries the
@@ -5502,13 +5514,32 @@ async def _dispatch_session_event_to_runner_impl(
                         else _native_routed_model
                     )
                 if _native_applied_model is not None:
+                    _native_effort_owned = "reasoning_effort" in (_native_verdict or {})
+                    _effort_update: dict[str, Any] = {}
+                    if _native_effort_owned:
+                        raw_effort = (_native_verdict or {}).get("reasoning_effort")
+                        _native_routed_effort = raw_effort if isinstance(raw_effort, str) else None
+                        _effort_update = {
+                            "reasoning_effort": _native_routed_effort,
+                            "_unset_reasoning_effort": _native_routed_effort is None,
+                        }
                     try:
                         await asyncio.to_thread(
                             conversation_store.update_conversation,
                             session_id,
                             model_override=_native_routed_model,
+                            **_effort_update,
                         )
                         _publish_routed_model(session_id, _native_applied_model)
+                        if _native_effort_owned:
+                            session_stream.publish(
+                                session_id,
+                                {
+                                    "type": "session.reasoning_effort",
+                                    "conversation_id": session_id,
+                                    "reasoning_effort": _native_routed_effort,
+                                },
+                            )
                     except (OSError, ValueError):
                         _logger.warning(
                             "smart_routing: persist failed for native session=%s",
@@ -5536,6 +5567,9 @@ async def _dispatch_session_event_to_runner_impl(
                 # routed id; ``None`` when the pane has no spelling for it.
                 model_override=(
                     _native_routed_model if _native_applied_model is not None else None
+                ),
+                reasoning_effort=(
+                    _native_routed_effort if _native_applied_model is not None else None
                 ),
             )
             forwarded = True

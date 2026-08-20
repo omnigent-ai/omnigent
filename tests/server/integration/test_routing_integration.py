@@ -1501,6 +1501,53 @@ async def _dispatch_native_turn(
     return _routing_decisions(conv_store, conv.id)[-1].data, forwarded
 
 
+async def test_native_route_forwards_an_effort_owned_by_the_local_judge(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
+
+    conv, conv_store = await _claude_native_session(
+        client, db_uri, agent_name="routing-owned-effort"
+    )
+    conv_store.set_labels(conv.id, {"omnigent.wrapper": CODEX_NATIVE_CODING_AGENT.wrapper_label})
+    conv = conv_store.get_conversation(conv.id)
+    assert conv is not None
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    with (
+        patch(
+            "omnigent.server.smart_routing.route_turn_or_decline",
+            new=AsyncMock(
+                return_value=(
+                    GPT_MODEL,
+                    {"rationale": "moderate", "reasoning_effort": "high"},
+                    None,
+                )
+            ),
+        ),
+        patch.object(
+            orchestration_module.session_stream,
+            "publish",
+            side_effect=lambda sid, payload: published.append((sid, payload)),
+        ),
+    ):
+        _decision, forwarded = await _dispatch_native_turn(conv, conv_store, model=GPT_MODEL)
+
+    refreshed = conv_store.get_conversation(conv.id)
+    assert refreshed is not None
+    assert (refreshed.model_override, refreshed.reasoning_effort) == (GPT_MODEL, "high")
+    assert (forwarded[0]["model_override"], forwarded[0]["reasoning"]) == (
+        GPT_MODEL,
+        {"effort": "high"},
+    )
+    assert [
+        payload["reasoning_effort"]
+        for sid, payload in published
+        if sid == conv.id and payload.get("type") == "session.reasoning_effort"
+    ] == ["high"]
+
+
 async def test_a_childs_second_spawn_cannot_pin_a_model_the_pane_rejects(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -1514,6 +1561,8 @@ async def test_a_childs_second_spawn_cannot_pin_a_model_the_pane_rejects(
     spelling has to exist for it.
     """
     child, conv_store = await _native_child(client, db_uri, agent_name="routing-child-second")
+    child = conv_store.update_conversation(child.id, reasoning_effort="medium")
+    assert child is not None
     # The pane's vocabulary covers the first pick only.
     orchestration_module._model_options_cache[child.id] = [
         {"id": "opus", "model": ROUTED_MODEL},
@@ -1524,6 +1573,7 @@ async def test_a_childs_second_spawn_cannot_pin_a_model_the_pane_rejects(
         pinned = conv_store.get_conversation(child.id)
         assert pinned is not None
         assert pinned.model_override == ROUTED_MODEL
+        assert pinned.reasoning_effort == "medium"
         assert [f.get("model_override") for f in first_forwards] == [ROUTED_MODEL]
 
         # Second spawn, unspellable pick: recorded as not applied, and the

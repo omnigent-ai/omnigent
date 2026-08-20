@@ -67,6 +67,8 @@ ROUTES_SELECT_PATH = "routes:select"
 #: stall, and falling open onto the harness's own model is the better answer.
 ROUTING_REQUEST_TIMEOUT_S = 9.0
 
+_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0)
+
 # ── Model lists per harness family ──────────────────────────────────────────
 #
 # Ordered cheapest → most powerful within each family. Live per-session catalogs
@@ -236,6 +238,7 @@ class RoutingResult:
     rationale: str
     harness: str | None = None
     raw_model: str | None = None
+    reasoning_effort: str | None = None
 
 
 class RoutingClient(Protocol):
@@ -250,6 +253,7 @@ class RoutingClient(Protocol):
         self,
         message: str,
         available_models: dict[str, list[str]],
+        model_efforts: dict[str, list[str]] | None = None,
     ) -> RoutingResult | None:
         """Pick the best model for a session's initial message.
 
@@ -259,6 +263,7 @@ class RoutingClient(Protocol):
             a one-entry dict; multi-agent fan-out passes one entry per
             harness.  Implementations that only need the flat model list can
             call :func:`_flatten_models` to get a deduped ordered sequence.
+        :param model_efforts: Optional model id → supported effort values.
         :returns: A :class:`RoutingResult`, or ``None`` to skip routing.
         """
         ...
@@ -462,6 +467,51 @@ async def fetch_runner_models(
     return {worker: [model.id for model in models] for worker, models in catalog.items()}
 
 
+async def fetch_codex_model_efforts(
+    session_id: str,
+    runner_client: httpx.AsyncClient,
+) -> dict[str, list[str]] | None:
+    """Return the canonical effort menu advertised by Codex's live model list."""
+    import httpx as _httpx
+
+    from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
+
+    try:
+        for delay in (*_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S, None):
+            resp = await runner_client.get(
+                f"/v1/sessions/{session_id}/codex-model-options", timeout=5.0
+            )
+            if resp.status_code != 503 or delay is None:
+                break
+            await asyncio.sleep(delay)
+        resp.raise_for_status()
+        rows = resp.json().get("models", [])
+        result: dict[str, list[str]] = {}
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str):
+                continue
+            efforts: list[str] = []
+            for item in row.get("supportedReasoningEfforts", []):
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    effort = validate_effort(item.get("reasoningEffort"), "codex", CODEX_EFFORTS)
+                except ValueError:
+                    continue
+                if effort is not None and effort not in efforts:
+                    efforts.append(effort)
+            if efforts:
+                result[row["id"]] = efforts
+        return result or None
+    except (_httpx.HTTPError, AttributeError, TypeError, ValueError):
+        _logger.debug(
+            "fetch_codex_model_efforts: runner request failed for session=%s",
+            session_id,
+            exc_info=True,
+        )
+        return None
+
+
 def _flatten_models(available_models: dict[str, list[str]]) -> list[str]:
     """Return a deduped, ordered flat model list from a harness → models map.
 
@@ -521,11 +571,19 @@ Return **strict JSON only**:
 """
 
 
-def _build_rubric(available_models: dict[str, list[str]]) -> str:
+def _build_rubric(
+    available_models: dict[str, list[str]],
+    model_efforts: dict[str, list[str]] | None = None,
+) -> str:
     """Format the judge prompt with the harness → models structure."""
     sections: list[str] = []
     for harness, models in available_models.items():
-        model_lines = "\n".join(f"    - {m}" for m in models)
+        model_lines = "\n".join(
+            f"    - {model} (efforts: {', '.join(model_efforts[model])})"
+            if model_efforts and model_efforts.get(model)
+            else f"    - {model}"
+            for model in models
+        )
         sections.append(f"  harness: {harness}\n{model_lines}")
     return _JUDGE_SYSTEM_TEMPLATE.format(
         harness_menu="\n".join(sections),
@@ -543,6 +601,18 @@ _VERDICT_SCHEMA: dict[str, object] = {
         "rationale": {"type": "string"},
     },
     "required": ["harness", "model", "rationale"],
+    "additionalProperties": False,
+}
+
+_EFFORT_VERDICT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "harness": {"type": "string"},
+        "model": {"type": "string"},
+        "reasoning_effort": {"type": "string"},
+        "rationale": {"type": "string"},
+    },
+    "required": ["harness", "model", "reasoning_effort", "rationale"],
     "additionalProperties": False,
 }
 
@@ -567,11 +637,14 @@ class LLMRoutingClient:
         self,
         message: str,
         available_models: dict[str, list[str]],
+        model_efforts: dict[str, list[str]] | None = None,
     ) -> RoutingResult | None:
         import asyncio
 
         flat = _flatten_models(available_models)
-        rubric = _build_rubric(available_models)
+        rubric = _build_rubric(available_models, model_efforts)
+        if model_efforts:
+            rubric += "\nChoose a listed reasoning effort for the selected model."
         _logger.info(
             "LLMRoutingClient: available_models=%s prompt_chars=%d",
             dict(available_models),
@@ -596,7 +669,7 @@ class LLMRoutingClient:
                             "type": "json_schema",
                             "name": "routing_verdict",
                             "strict": True,
-                            "schema": _VERDICT_SCHEMA,
+                            "schema": _EFFORT_VERDICT_SCHEMA if model_efforts else _VERDICT_SCHEMA,
                         }
                     },
                     timeout=ROUTING_REQUEST_TIMEOUT_S,
@@ -653,7 +726,16 @@ class LLMRoutingClient:
                 None,
             )
 
-        return RoutingResult(model=model, rationale=str(rationale), harness=chosen_harness)
+        reasoning_effort = verdict.get("reasoning_effort")
+        if model_efforts is not None and reasoning_effort not in model_efforts.get(model, []):
+            self.last_error = "routing judge returned an unsupported effort"
+            return None
+        return RoutingResult(
+            model=model,
+            rationale=str(rationale),
+            harness=chosen_harness,
+            reasoning_effort=reasoning_effort,
+        )
 
 
 def _bearer_auth(token: str) -> httpx.Auth:
@@ -1802,7 +1884,9 @@ class ExternalRoutingClient:
         self,
         message: str,
         available_models: dict[str, list[str]],
+        model_efforts: dict[str, list[str]] | None = None,
     ) -> RoutingResult | None:
+        del model_efforts
         import httpx
         from google.protobuf import json_format
 
@@ -2247,6 +2331,7 @@ async def route_turn(
     *,
     session_id: str | None = None,
     runner_client: httpx.AsyncClient | None = None,
+    discover_efforts: bool = True,
     catalog: Sequence[str] | None = None,
     gateway_backed: bool = True,
     allow_static_fallback: bool = True,
@@ -2263,6 +2348,8 @@ async def route_turn(
         vocabulary. Authoritative: its gateway serves more models than the
         running CLI can be switched to, and offering those routes the turn
         onto a model the switch would silently drop.
+    :param discover_efforts: Whether Codex effort-aware routing is supported
+        by the caller's decision protocol.
     :param gateway_backed: Whether this session's harness resolves
         AI-Gateway-backed inference on its host. ``False`` takes the external
         router out of play and the built-in judge answers instead.
@@ -2296,11 +2383,17 @@ async def route_turn(
     # the number the timeout ladder above the hook has to cover.
     _prep_started = time.monotonic()
     _catalog_fetched = False
+    model_efforts: dict[str, list[str]] | None = None
     # Prefer the live runner catalog, but only its "self" row — the sub-agent
     # workers' models are not this session's. Key the map by harness id, not the
     # "self" label, so the seam infers the right single-harness scenario.
     available: dict[str, list[str]] | None = None
-    if catalog:
+    if discover_efforts and harness == "codex-native" and session_id and runner_client is not None:
+        _catalog_fetched = True
+        model_efforts = await fetch_codex_model_efforts(session_id, runner_client)
+        if model_efforts:
+            available = {harness: list(model_efforts)}
+    if available is None and catalog:
         in_vocabulary = models_in_family(harness, catalog)
         if in_vocabulary:
             available = {harness or "self": in_vocabulary}
@@ -2355,7 +2448,11 @@ async def route_turn(
     _prep_s = time.monotonic() - _prep_started
     _route_started = time.monotonic()
     call = await route_with_fallback(
-        backends, user_message, available, gateway_backed=gateway_backed
+        backends,
+        user_message,
+        available,
+        gateway_backed=gateway_backed,
+        model_efforts=model_efforts,
     )
     _logger.info(
         "smart_routing: session=%s prep=%.3fs router=%.3fs catalog_fetch=%s candidates=%d",
@@ -2401,6 +2498,12 @@ async def route_turn(
         "rationale": result.rationale,
         "router_source": call.source,
     }
+    # The external router currently owns only model selection. Preserve any
+    # existing effort unless the effort-aware local judge answered this call.
+    if model_efforts is not None and call.source == "oss-llm":
+        effort = result.reasoning_effort
+        if effort in model_efforts.get(model, []):
+            verdict["reasoning_effort"] = effort
     if raw_model and _bare_id(raw_model, prefixes) != _bare_id(model, prefixes):
         verdict["raw_model"] = raw_model
     return model, verdict
