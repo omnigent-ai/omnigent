@@ -500,10 +500,11 @@ export function ChatHeader({
                       : mobileMenu.agentCount}
                   </span>
                 </DropdownMenuItem>
-                {/* Shells — mirrors the desktop rail's Shells tab: visible
-                    when a real shell exists, or when the agent spec declares
-                    shell access so the empty-state "+ New shell" affordance
-                    is reachable on mobile too. */}
+                {/* Shells — the mobile entry into the session's shells
+                    (desktop has no Shells tab; it opens shells as soft tabs):
+                    visible when a real shell exists, or when the agent spec
+                    declares shell access so the empty-state "+ New shell"
+                    affordance is reachable on mobile too. */}
                 {!mobileMenu.hideTerminalsTab && mobileMenu.showShellsTab && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenShells}

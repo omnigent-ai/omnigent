@@ -8,20 +8,14 @@
 
 import type { RightRailTab } from "@/shell/railTabs";
 
-const RAIL_TABS: readonly RightRailTab[] = [
-  "files",
-  "changes",
-  "subagents",
-  "terminals",
-  "browser",
-];
+const RAIL_TABS: readonly RightRailTab[] = ["files", "changes", "subagents", "browser"];
 
 export interface SessionWorkspaceState {
   /** Whether the rail was left open in this session. */
   open?: boolean;
   /** User-chosen rail width (px) for this session. */
   widthPx?: number;
-  /** The selected rail tab (Files / Changes / Agents / Shells). */
+  /** The selected rail tab (Files / Changes / Agents). */
   rightRailTab?: RightRailTab;
   /** Ordered list of open file tabs. */
   openFiles?: string[];

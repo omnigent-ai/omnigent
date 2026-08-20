@@ -73,8 +73,8 @@ export function isAgentTerminalKey(terminalKey: string): boolean {
 
 /**
  * Project the terminal list down to the session's *inventory* — the
- * shells shown in the right-rail Shells tab, its count badge, and the
- * mobile menu entry.
+ * shells shown as the rail's soft tabs and in the mobile Shells menu
+ * entry / drawer.
  *
  * For terminal-first sessions (SDK and native alike) the agent's own
  * terminal is excluded: it is reachable through the pill's Terminal
@@ -269,6 +269,57 @@ export function useCreateTerminal(conversationId: string) {
       const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
       if (current.some((t) => t.id === info.id)) return;
       queryClient.setQueryData<TerminalInfo[]>(key, [...current, info]);
+    },
+  });
+}
+
+/**
+ * Delete (kill) a terminal for a conversation over HTTP.
+ *
+ * Issues DELETE on the terminal resource route, which the server proxies to
+ * the runner to terminate the PTY and drop the resource. The removal is also
+ * broadcast as a ``session.resource.deleted`` SSE delta that prunes the
+ * terminal from the query cache — so the tab closes even for callers that
+ * don't touch the cache themselves.
+ *
+ * :param conversationId: Session/conversation identifier.
+ * :param terminalId: Opaque terminal resource id (NOT the ``terminal:`` tab
+ *     key), e.g. ``"terminal_bash_s1"``.
+ * :raises Error: When the server rejects the delete (a 404 is treated as
+ *     success — the goal state, "no such terminal", already holds).
+ */
+export async function deleteTerminal(conversationId: string, terminalId: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals/${encodeURIComponent(terminalId)}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`terminal delete failed: ${res.status} ${res.statusText}`);
+  }
+}
+
+/**
+ * Mutation hook around :func:`deleteTerminal`.
+ *
+ * On success the terminal is removed from the query cache immediately (by
+ * id), so its soft tab closes without waiting for the
+ * ``session.resource.deleted`` SSE round-trip (which still arrives and
+ * dedupes as a no-op).
+ *
+ * :param conversationId: Session/conversation identifier.
+ * :returns: TanStack mutation taking the terminal resource id.
+ */
+export function useDeleteTerminal(conversationId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (terminalId: string) => deleteTerminal(conversationId, terminalId),
+    onSuccess: (_result, terminalId) => {
+      const key = terminalsQueryKey(conversationId);
+      const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
+      queryClient.setQueryData<TerminalInfo[]>(
+        key,
+        current.filter((t) => t.id !== terminalId),
+      );
     },
   });
 }
