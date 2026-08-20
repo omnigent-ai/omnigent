@@ -422,6 +422,86 @@ jobs:
           path: artifacts/
           retention-days: 14
 
+  # Harness bench smoke (NOT a conformance / drift gate).
+  # Validates that `python -m tests.harness_bench --no-live` imports, orchestrates,
+  # and renders a non-empty declared matrix. Offline cells are SKIPPED /
+  # NOT_APPLICABLE by design (`run_harness(live=False)` → uniform SKIPPED;
+  # `reconcile` ignores non-concrete observed), so this does NOT detect
+  # observed-vs-declared DRIFT — that requires Layer 2 / --live. See
+  # docs/harness-bench-design.md. Pass extras through to `uv run`: a bare
+  # `uv run` re-syncs without `dev` and drops pytest, which the bench imports
+  # via tests.e2e._harness_probes.
+  harness-bench-smoke:
+    name: Harness bench (smoke)
+    needs: gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        with:
+          enable-cache: true
+
+      - name: Cache virtualenv
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+
+      - name: Install dependencies
+        run: uv sync --locked --extra all --extra dev
+
+      - name: Run harness bench smoke (--no-live)
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          # --extra must match the sync step: `uv run` otherwise re-syncs the
+          # project default extras and drops pytest (dev), breaking the import
+          # chain through tests.e2e._harness_probes.
+          env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \
+            uv run --extra all --extra dev python -m tests.harness_bench \
+              --no-live --no-color \
+              --report artifacts/harness-bench-smoke.json
+          env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u DATABRICKS_TOKEN \
+            uv run --extra all --extra dev python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path("artifacts/harness-bench-smoke.json").read_text())
+          harnesses = payload["harnesses"]
+          # Guard against a silently empty / truncated matrix (false confidence).
+          assert len(harnesses) >= 14, f"expected >=14 harnesses, got {len(harnesses)}"
+          observed = {
+              cell["observed"]
+              for h in harnesses
+              for cell in h["cells"]
+          }
+          # Offline layer marks every applicable cell SKIPPED; NA for inapplicable.
+          assert observed <= {"skipped", "not_applicable"}, observed
+          drifted = [
+              (h["harness"], c["dimension"])
+              for h in harnesses
+              for c in h["cells"]
+              if c.get("verdict") == "drift"
+          ]
+          assert not drifted, f"offline must not report drift: {drifted}"
+          assert payload.get("has_drift") is False
+          n_cells = sum(len(h["cells"]) for h in harnesses)
+          print(
+              f"harness bench smoke ok: {len(harnesses)} harnesses, "
+              f"{n_cells} cells, observed={sorted(observed)}"
+          )
+          PY
+
   coverage-report:
     name: Coverage report
     # Combines per-shard coverage into a coverage-summary artifact. Runs in the
