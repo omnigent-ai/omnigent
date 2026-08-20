@@ -522,12 +522,13 @@ async def _save_config(page) -> None:
 
 
 def test_start_session_select_permission_mode(seeded_session: tuple[str, str]) -> None:
-    """Picking a non-default permission mode rides along to the create call.
+    """A launched permission mode reaches create and seeds the next session.
 
     Selecting "Accept edits" in the Claude Code config modal
     must (a) update the permission select as immediate feedback and
     (b) reach ``POST /v1/sessions`` as
-    ``terminal_launch_args: ["--permission-mode", "acceptEdits"]``.
+    ``terminal_launch_args: ["--permission-mode", "acceptEdits"]``, then
+    (c) remain selected when the user opens the next New Session screen.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_permission_mode(base_url, session_id))
@@ -605,6 +606,15 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
             assert body.get("terminal_launch_args") == ["--permission-mode", "acceptEdits"], body
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            await _open_entry_config(page, "ag_claude_e2e")
+            await expect(
+                page.get_by_test_id("new-chat-landing-config-permission")
+            ).to_contain_text("Accept edits")
         finally:
             await browser.close()
 
@@ -1642,6 +1652,18 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             assert body["agent_id"] == "ag_claude_e2e", body
             assert body.get("model_override") == "opus", body
             assert body.get("reasoning_effort") == "high", body
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            await _open_entry_config(page, "ag_claude_e2e")
+            await expect(page.get_by_test_id("new-chat-landing-config-model")).to_contain_text(
+                "Opus 4.8"
+            )
+            await expect(page.get_by_test_id("new-chat-landing-config-effort")).to_contain_text(
+                "High"
+            )
         finally:
             await browser.close()
 
