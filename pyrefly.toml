@@ -40,6 +40,8 @@ ignore-missing-imports = [
     "islo.*",
     "kubernetes",
     "kubernetes.*",
+    "microsandbox",
+    "microsandbox.*",
     "modal",
     "modal.*",
     "numpy",
