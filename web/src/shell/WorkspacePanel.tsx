@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { type ReactElement, useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
-import { isOwnerLevel } from "@/lib/permissionsApi";
+import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -117,6 +117,7 @@ function NewTabMenu({
   conversationId,
   onOpenTerminal,
   onCreateStart,
+  onCreateError,
   triggerClassName,
   liveness,
 }: {
@@ -126,6 +127,9 @@ function NewTabMenu({
   /** Called when a shell create is initiated (before the POST resolves), so
    *  the shell can be focused as soon as its tab appears in the list. */
   onCreateStart?: () => void;
+  /** Called when the shell create POST fails, so the caller can disarm the
+   *  focus snapshot armed by ``onCreateStart``. */
+  onCreateError?: () => void;
   /** Extra classes on the trigger wrapper — used to cancel the open-tabs
    *  region's gap so the "+" hugs the last tab. */
   triggerClassName?: string;
@@ -160,6 +164,7 @@ function NewTabMenu({
     onCreateStart?.();
     create.mutate(name, {
       onSuccess: (info) => onOpenTerminal(terminalTabKey(info)),
+      onError: () => onCreateError?.(),
     });
   };
 
@@ -383,6 +388,7 @@ function TerminalTabsStrip({
   openTerminals,
   activeTerminalKey,
   closingKey,
+  canClose,
   labelFor,
   onSelect,
   onClose,
@@ -393,6 +399,9 @@ function TerminalTabsStrip({
   activeTerminalKey: string | null;
   /** Tab key whose close (kill) is in flight — greyed + non-interactive. */
   closingKey: string | null;
+  /** Whether the viewer may close (kill) a shell. Closing is server-gated on
+   *  edit access, so a read-only viewer gets no close affordance. */
+  canClose: boolean;
   /** Resolve a tab key to its display label (shell name / session). */
   labelFor: (key: string) => string;
   /** Activate a terminal tab by key. */
@@ -425,7 +434,7 @@ function TerminalTabsStrip({
             title={name}
             onClick={() => !closing && onSelect(key)}
             onAuxClick={(e) => {
-              if (e.button === 1 && !closing) {
+              if (e.button === 1 && !closing && canClose) {
                 e.preventDefault();
                 onClose(key);
               }
@@ -449,19 +458,21 @@ function TerminalTabsStrip({
           >
             <TerminalIcon className="size-4 shrink-0" />
             <span className="min-w-0 truncate text-sm">{name}</span>
-            <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
-              <button
-                type="button"
-                aria-label={`Close ${name}`}
-                className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onClose(key);
-                }}
-              >
-                <XIcon className="size-4" />
-              </button>
-            </span>
+            {canClose && (
+              <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
+                <button
+                  type="button"
+                  aria-label={`Close ${name}`}
+                  className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onClose(key);
+                  }}
+                >
+                  <XIcon className="size-4" />
+                </button>
+              </span>
+            )}
           </div>
         );
       })}
@@ -600,6 +611,9 @@ interface WorkspacePanelProps {
   /** Called when a shell create is initiated from the "+" menu, so the new
    *  shell is focused as soon as its tab lands (not only on the create POST). */
   onShellCreateStart?: () => void;
+  /** Called when the shell create POST fails, so the focus snapshot armed by
+   *  ``onShellCreateStart`` is disarmed and can't grab an unrelated shell. */
+  onShellCreateFailed?: () => void;
 }
 
 /**
@@ -650,6 +664,7 @@ export function WorkspacePanel({
   onShowHiddenChange,
   liveness,
   onShellCreateStart,
+  onShellCreateFailed,
 }: WorkspacePanelProps) {
   // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
   // window keydown listener on every render — an inline arrow would change
@@ -724,9 +739,15 @@ export function WorkspacePanel({
           className="shrink-0"
           // When a file or shell tab is active no fixed trigger should
           // highlight, so feed the radix group a sentinel that matches none of
-          // them. The active file/shell tab carries its own highlight.
+          // them. The active file/shell tab carries its own highlight. Gate the
+          // shell case on the terminal actually being present (same gate as the
+          // content slot below): a sticky selection whose terminal is gone shows
+          // the fallback nav view, so its nav tab must highlight, not "__tab__".
           value={
-            selectedFilePath !== null || selectedTerminalKey !== null ? "__tab__" : rightRailTab
+            selectedFilePath !== null ||
+            (selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey))
+              ? "__tab__"
+              : rightRailTab
           }
           onValueChange={(v) => onRightRailTabChange(v as RightRailTab)}
         >
@@ -816,6 +837,7 @@ export function WorkspacePanel({
                 openTerminals={openTerminals}
                 activeTerminalKey={selectedTerminalKey}
                 closingKey={closingTerminalKey ?? null}
+                canClose={isEditorLevel(permissionLevel)}
                 labelFor={terminalLabelFor}
                 onSelect={openTerminalTab}
                 onClose={onCloseTerminal}
@@ -827,6 +849,7 @@ export function WorkspacePanel({
                 same gap the scroller's gap-0.5 gives between tabs. */}
             <NewTabMenu
               conversationId={conversationId}
+              onCreateError={onShellCreateFailed}
               onOpenTerminal={openTerminalTab}
               onCreateStart={onShellCreateStart}
               triggerClassName="ml-[2px]"
@@ -843,6 +866,7 @@ export function WorkspacePanel({
             conversationId={conversationId}
             onOpenTerminal={openTerminalTab}
             onCreateStart={onShellCreateStart}
+            onCreateError={onShellCreateFailed}
             liveness={liveness}
           />
         )}

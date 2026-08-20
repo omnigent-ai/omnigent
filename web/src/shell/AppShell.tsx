@@ -561,6 +561,11 @@ export function AppShell() {
   const markShellCreateStarted = useCallback(() => {
     pendingShellCreateRef.current = new Set(openTerminals);
   }, [openTerminals]);
+  // The create POST failed — disarm the focus snapshot so a later
+  // agent-spawned shell isn't mistaken for the one the user tried to open.
+  const clearShellCreatePending = useCallback(() => {
+    pendingShellCreateRef.current = null;
+  }, []);
   // Whether the agent's spec declares shell access (a ``terminals:`` block).
   // The desktop rail's Shells TAB shows only once a shell exists (creation is
   // via the tab-strip "+" menu), but the MOBILE Shells drawer — which has no
@@ -828,6 +833,12 @@ export function AppShell() {
     setSubagentsPanelOpen(false);
     setShellsPanelOpen(false);
     setFilesPanelShowHidden(true);
+    // Drop shell interaction state carried from the outgoing session: a
+    // still-armed create ref would otherwise auto-focus an unrelated shell in
+    // the new session, and an open "Close shell?" dialog would target a
+    // terminal absent from the new session's list.
+    pendingShellCreateRef.current = null;
+    setTerminalPendingClose(null);
     if (!conversationId) {
       // No session → no rail; false (not the open default) so rail-gated
       // effects stay quiet on non-session routes.
@@ -1774,6 +1785,7 @@ export function AppShell() {
                     onShowHiddenChange={setFilesPanelShowHidden}
                     liveness={liveness}
                     onShellCreateStart={markShellCreateStarted}
+                    onShellCreateFailed={clearShellCreatePending}
                   />
                 )}
               </div>

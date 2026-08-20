@@ -1071,7 +1071,8 @@ describe("Chat-mode terminal panel layout", () => {
   it("confirms before closing a shell tab, then kills the terminal", () => {
     // Closing a tab kills the underlying terminal (destructive), so the "x"
     // opens a confirm modal first; confirming issues the delete (which the SSE
-    // `resource.deleted` + cache prune turn into the tab disappearing).
+    // `resource.deleted` + cache prune turn into the tab disappearing). Closing
+    // is edit-gated, so this owner-level session shows the "x".
     writeSessionWorkspaceState("conv_abc", {
       open: true,
       selectedTerminalKey: "terminal:terminal_main",
@@ -1080,7 +1081,7 @@ describe("Chat-mode terminal panel layout", () => {
       data: { available: true, root: null },
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    mockConversations([{ id: "conv_abc", permission_level: 4 }]);
     useTerminalsMock.mockReturnValue({
       terminals: [{ id: "terminal_main", name: "main", session: "u-1", running: true }],
       isLoading: false,
@@ -1111,7 +1112,7 @@ describe("Chat-mode terminal panel layout", () => {
       data: { available: true, root: null },
       isLoading: false,
     } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    mockConversations([{ id: "conv_abc", permission_level: 4 }]);
     useTerminalsMock.mockReturnValue({
       terminals: [{ id: "terminal_main", name: "main", session: "u-1", running: true }],
       isLoading: false,
@@ -1126,6 +1127,31 @@ describe("Chat-mode terminal panel layout", () => {
     // No delete, and the shell's xterm is still mounted.
     expect(deleteTerminalMutate).not.toHaveBeenCalled();
     expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_main");
+  });
+
+  it("hides the shell close affordance from a read-only viewer", () => {
+    // Killing a shell is server-gated on edit access, so a read-only viewer
+    // gets no close "x" — otherwise the click would confirm, DELETE, and 403.
+    writeSessionWorkspaceState("conv_abc", {
+      open: true,
+      selectedTerminalKey: "terminal:terminal_main",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: 1 }]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "main", session: "u-1", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_abc");
+
+    // The tab and its xterm are present, but the close control is not.
+    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_main");
+    expect(screen.queryByRole("button", { name: "Close main · u-1" })).toBeNull();
   });
 
   it("selects a shell tab as active when the user clicks it", () => {

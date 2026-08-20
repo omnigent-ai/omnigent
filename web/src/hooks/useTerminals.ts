@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "../lib/identity";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
+import { showToast } from "@/components/ui/toast";
 
 export { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 
@@ -320,6 +321,12 @@ export function useDeleteTerminal(conversationId: string) {
         key,
         current.filter((t) => t.id !== terminalId),
       );
+    },
+    // The kill round-trips to the runner and can fail (offline runner, 403 for
+    // a non-editor, 500). Surface it — otherwise the tab silently reappears
+    // once ``isPending`` clears and the user has no idea the shell survived.
+    onError: () => {
+      showToast("Couldn't close the shell — it's still running.", { duration: 0 });
     },
   });
 }
