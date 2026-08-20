@@ -425,7 +425,14 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
     : children;
 
   return (
-    <div className={cn("relative", wrap && "chat-code-wrap")}>
+    <div
+      className={cn(
+        // Keep short fenced blocks compact inside the structural assistant column.
+        // Long blocks still stop at the column edge and wrap within it.
+        "relative w-fit max-w-full",
+        wrap && "chat-code-wrap",
+      )}
+    >
       {block}
       {/* Overlay actions, anchored left of Streamdown's own download button
           (which sits at the header's right edge). A flex row lets the buttons

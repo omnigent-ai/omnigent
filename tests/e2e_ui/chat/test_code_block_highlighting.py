@@ -31,6 +31,8 @@ import pytest
 from playwright.sync_api import Page, expect
 
 _AGENT_NAME = "hello_world"
+_ASSISTANT_BUBBLE = '[data-testid="message-bubble"][data-role="assistant"]'
+_CODE_BLOCK = '[data-streamdown="code-block"]'
 _CODE_BODY = '[data-streamdown="code-block-body"]'
 # Streamdown emits one span per highlighted token, each carrying its Shiki color
 # via the `--sdm-c` custom property. The raw (pre-highlight) path has no such
@@ -77,6 +79,16 @@ def test_code_block_becomes_syntax_highlighted(
     # The assistant bubble and its rendered code block must mount first.
     body = page.locator(_CODE_BODY).first
     expect(body).to_be_visible(timeout=30_000)
+
+    # Short fenced blocks keep their compact surface even though the assistant
+    # bubble structurally owns the full chat column.
+    bubble_box = page.locator(_ASSISTANT_BUBBLE).first.bounding_box()
+    block_box = page.locator(_CODE_BLOCK).first.bounding_box()
+    assert bubble_box is not None
+    assert block_box is not None
+    assert abs(block_box["x"] - bubble_box["x"]) <= 1
+    assert block_box["width"] < bubble_box["width"] - 1
+    assert block_box["x"] + block_box["width"] <= bubble_box["x"] + bubble_box["width"] + 1
 
     # The lazy @streamdown/code import + tokenization resolves asynchronously and
     # re-renders the block with per-token colored spans. Wait for more than one.

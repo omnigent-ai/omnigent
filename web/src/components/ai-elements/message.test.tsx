@@ -122,7 +122,18 @@ describe("MessageResponse", () => {
   });
 });
 
-describe("MessageResponse code-block copy", () => {
+describe("MessageResponse code blocks", () => {
+  it("keeps a fenced block compact within the message column", async () => {
+    const { container } = render(
+      <MessageResponse>{"```ts\nconst value = 1;\n```"}</MessageResponse>,
+    );
+
+    await waitFor(() => {
+      const block = container.querySelector('[data-streamdown="code-block"]');
+      expect(block?.parentElement).toHaveClass("w-fit", "max-w-full");
+    });
+  });
+
   it("copies the exact fenced code text through the fallback path", async () => {
     const copiedText: string[] = [];
     Object.defineProperty(Navigator.prototype, "clipboard", {
