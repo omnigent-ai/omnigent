@@ -456,6 +456,21 @@ async def test_decide_permission_card_names_the_tool() -> None:
     ex._elicitation_handler.assert_awaited_once_with("Ran command", {"command": "rm -rf build"})
 
 
+@pytest.mark.asyncio
+async def test_authoritative_policy_hook_prevents_second_policy_evaluation() -> None:
+    """A hook-governed agent's native consent request is not a second policy gate."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", policy_hook_authoritative=True))
+    params = _seed_tool_call(ex)
+    ex._policy_evaluator = AsyncMock()
+    ex._elicitation_handler = AsyncMock()
+    ex._elicitation_choice_handler = AsyncMock()
+
+    assert await ex._decide_permission(params) == (True, None)
+    ex._policy_evaluator.assert_not_awaited()
+    ex._elicitation_handler.assert_not_awaited()
+    ex._elicitation_choice_handler.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Scoped approval: the agent's own permission options
 # ---------------------------------------------------------------------------
@@ -1003,6 +1018,18 @@ def test_harness_wrap_builds_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ex._config.send_model_in_session_new is True
     assert ex._config.omnigent_mcp is False
     assert ex._config.model == "gpt-5.3"
+
+
+def test_harness_wrap_reads_authoritative_policy_hook(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.inner import acp_harness
+
+    monkeypatch.setenv("HARNESS_ACP_COMMAND", "hermes acp --accept-hooks")
+    monkeypatch.setenv("HARNESS_ACP_POLICY_HOOK_AUTHORITATIVE", "1")
+
+    ex = acp_harness._build_acp_executor()
+
+    assert isinstance(ex, AcpExecutor)
+    assert ex._config.policy_hook_authoritative is True
 
 
 def test_harness_wrap_reads_env_passthrough_names(monkeypatch: pytest.MonkeyPatch) -> None:

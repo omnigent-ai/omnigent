@@ -26,6 +26,8 @@ Env vars read at startup:
 - ``HARNESS_ACP_SEND_MODEL``: ``"1"`` to send the model in ``session/new``.
 - ``HARNESS_ACP_OMNIGENT_MCP``: ``"0"`` to disable Omnigent's MCP relay;
   ``session/new`` still receives an empty ``mcpServers`` array.
+- ``HARNESS_ACP_POLICY_HOOK_AUTHORITATIVE``: ``"1"`` when the agent runs the
+  Omnigent policy hook before its own ACP permission request.
 - ``HARNESS_ACP_OS_ENV``: JSON-encoded :class:`OSEnvSpec`. When unset, falls
   back to ``caller_process`` + ``sandbox=none``.
 - ``HARNESS_ACP_ENV_PASSTHROUGH``: comma-separated environment variable *names*
@@ -60,6 +62,7 @@ _ENV_MODEL = "HARNESS_ACP_MODEL"
 _ENV_SESSION_ID_MODE = "HARNESS_ACP_SESSION_ID_MODE"
 _ENV_SEND_MODEL = "HARNESS_ACP_SEND_MODEL"
 _ENV_OMNIGENT_MCP = "HARNESS_ACP_OMNIGENT_MCP"
+_ENV_POLICY_HOOK_AUTHORITATIVE = "HARNESS_ACP_POLICY_HOOK_AUTHORITATIVE"
 _ENV_CWD = "HARNESS_ACP_CWD"
 _ENV_OS_ENV = "HARNESS_ACP_OS_ENV"
 _ENV_ENV_PASSTHROUGH = "HARNESS_ACP_ENV_PASSTHROUGH"
@@ -143,6 +146,10 @@ def _build_acp_executor() -> Executor:
         omnigent_mcp=omnigent_mcp,
         env_passthrough=_env_passthrough_names(),
         permission_mode=permission_mode,
+        policy_hook_authoritative=_env_enabled(
+            _ENV_POLICY_HOOK_AUTHORITATIVE,
+            default=False,
+        ),
     )
     return AcpExecutor(config=config, cwd=cwd, os_env=_resolve_os_env())
 

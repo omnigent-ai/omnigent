@@ -303,17 +303,18 @@ def write_policy_hook_config(
     server_url: str,
     session_id: str,
     hermes_home: Path | None = None,
+    *,
+    model: str | None = None,
+    include_omnigent_mcp: bool = True,
 ) -> Path:
-    """Write per-session ``HERMES_HOME`` with Omnigent policy hook and MCP server.
+    """Write per-session ``HERMES_HOME`` with a policy hook and optional MCP server.
 
     Creates a ``config.yaml`` registering:
 
     1. A ``pre_tool_call`` shell hook that evaluates tool calls against the
        Omnigent policy engine (same hook the headless ``hermes`` harness uses).
-    2. An ``mcp_servers.omnigent`` entry that launches the Omnigent MCP stdio
-       server (``serve-mcp --bridge-dir <bridge_dir>``), exposing Omnigent
-       builtin tools (``sys_session_*``, ``sys_agent_*``, ``load_skill``,
-       ``web_fetch``, etc.) to the Hermes model.
+    2. When ``include_omnigent_mcp`` is true, an ``mcp_servers.omnigent`` entry
+       that launches the Omnigent MCP stdio server.
 
     Also copies the user's auth/env files so Hermes can still authenticate with
     its inference provider. Shared by the ``hermes-native`` TUI path and the
@@ -329,6 +330,11 @@ def write_policy_hook_config(
     :param session_id: Omnigent session / conversation ID.
     :param hermes_home: Where to write the credential-bearing home. ``None``
         places it under ``bridge_dir``.
+    :param model: Optional session model. When set, it overrides the user's
+        configured default in this generated home.
+    :param include_omnigent_mcp: Register the Omnigent MCP server in the
+        generated home. ACP callers set this to false because ``session/new``
+        owns MCP delivery.
     :returns: The HERMES_HOME path.
     """
     if hermes_home is None:
@@ -355,6 +361,8 @@ def write_policy_hook_config(
     # Merge user config so model/provider/auth settings carry over.
     user_cfg = _load_user_hermes_config()
     config: _ConfigObject = {**user_cfg}
+    if model is not None:
+        config["model"] = model
 
     config["hooks_auto_accept"] = True
     existing_hooks = config.get("hooks")
@@ -392,6 +400,10 @@ def write_policy_hook_config(
             ],
         },
     }
+    if not include_omnigent_mcp:
+        del config["mcp_servers"]["omnigent"]
+        if not config["mcp_servers"]:
+            del config["mcp_servers"]
 
     config_path = hermes_home / "config.yaml"
     config_path.write_text(json.dumps(config, indent=2) + "\n")

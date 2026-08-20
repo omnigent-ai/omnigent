@@ -323,6 +323,53 @@ def test_write_policy_hook_config_creates_expected_files(tmp_path) -> None:
     assert len(bridge_config["token"]) > 0
 
 
+def test_write_policy_hook_config_can_leave_mcp_to_acp_transport(tmp_path) -> None:
+    bridge_dir = tmp_path / "bridge"
+
+    hermes_home = b.write_policy_hook_config(
+        bridge_dir,
+        "http://localhost:6767",
+        "session-acp",
+        include_omnigent_mcp=False,
+    )
+
+    config = json.loads((hermes_home / "config.yaml").read_text())
+    assert "omnigent" not in config.get("mcp_servers", {})
+    assert config["hooks"]["pre_tool_call"]
+
+
+def test_acp_home_does_not_copy_user_configured_mcp(tmp_path, monkeypatch) -> None:
+    bridge_dir = tmp_path / "bridge"
+    user_hermes = tmp_path / ".hermes"
+    user_hermes.mkdir()
+
+    import yaml
+
+    (user_hermes / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "model": "user-default",
+                "mcp_servers": {
+                    "omnigent": {"command": "stale-omnigent-mcp"},
+                    "other": {"command": "other-mcp"},
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(b.Path, "home", staticmethod(lambda: tmp_path))
+
+    hermes_home = b.write_policy_hook_config(
+        bridge_dir,
+        "http://localhost:6767",
+        "session-acp-user-config",
+        include_omnigent_mcp=False,
+    )
+
+    config = json.loads((hermes_home / "config.yaml").read_text())
+    assert config["model"] == "user-default"
+    assert "mcp_servers" not in config
+
+
 def test_write_policy_hook_config_copies_user_files(tmp_path, monkeypatch) -> None:
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -357,6 +404,27 @@ def test_write_policy_hook_config_merges_user_model(tmp_path, monkeypatch) -> No
     assert config["model"] == "claude-sonnet-4-20250514"
     assert config["providers"] == {"anthropic": {}}
     assert config["hooks_auto_accept"] is True
+
+
+def test_write_policy_hook_config_overrides_user_model_for_session(tmp_path, monkeypatch) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    user_hermes = tmp_path / ".hermes"
+    user_hermes.mkdir()
+
+    import yaml
+
+    (user_hermes / "config.yaml").write_text(yaml.dump({"model": "user-default"}))
+    monkeypatch.setattr(b.Path, "home", staticmethod(lambda: tmp_path))
+
+    hermes_home = b.write_policy_hook_config(
+        bridge_dir,
+        "http://localhost:6767",
+        "s3",
+        model="session-model",
+    )
+    config = json.loads((hermes_home / "config.yaml").read_text())
+    assert config["model"] == "session-model"
 
 
 def test_read_hermes_home_returns_path_when_exists(tmp_path) -> None:
