@@ -1985,6 +1985,11 @@ function HarnessConfigModal({
 interface LandingDraft {
   message: string;
   files: File[];
+  /** Project context the draft was composed under ("" = the global composer).
+   * Launch-control state below restores only into the SAME context — a
+   * global draft's host/workspace/agent must never leak into a project
+   * launch (#5023). */
+  project: string;
   pickedAgentId: string | null;
   selectedHostId: string | null;
   sandboxSelected: boolean;
@@ -2182,16 +2187,26 @@ export function NewChatLandingScreen() {
   // Project driving this visit, when the sidebar's per-project "new session"
   // pencil landed here with a `?project=` query param. Empty otherwise.
   const projectParam = searchParams.get("project") ?? "";
+  // Launch-control draft state (host / workspace / agent / sandbox / worktree)
+  // restores only into the project context it was composed under: a global
+  // composer draft must not leak its workspace into a project launch, and a
+  // project draft must not leak into another project or the global composer
+  // (#5023). Authored content (message, files) and user preferences (model,
+  // permission modes) always restore regardless.
+  const landingDraftForContext: LandingDraft | null =
+    landingDraft !== null && landingDraft.project === projectParam ? landingDraft : null;
   // Seeded from the persisted last pick so a returning user starts on the
   // agent they used last; validated against the live list in
   // effectiveAgentId below (a stale id falls back to the default). A
   // project-driven visit defers to the project-prefill effect instead
   // (which falls back to the same last pick).
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(
-    () => landingDraft?.pickedAgentId ?? (projectParam !== "" ? null : readLastAgentId()),
+    () =>
+      landingDraftForContext?.pickedAgentId ??
+      (projectParam !== "" ? null : readLastAgentId()),
   );
   const [selectedHostId, setSelectedHostId] = useState<string | null>(
-    () => landingDraft?.selectedHostId ?? null,
+    () => landingDraftForContext?.selectedHostId ?? null,
   );
   // Sessions on the selected host — fetched only when a host is selected,
   // to avoid registering hundreds of sessions into the health poll at idle.
@@ -2200,13 +2215,13 @@ export function NewChatLandingScreen() {
   // host — the server provisions a sandbox host at create time
   // (host_type: "managed"), so no host_id or workspace is sent.
   const [sandboxSelected, setSandboxSelected] = useState(
-    () => landingDraft?.sandboxSelected ?? false,
+    () => landingDraftForContext?.sandboxSelected ?? false,
   );
   // Provider the sandbox pick launches on. Seeded to the sticky last pick (or
   // the first offered row) once the picker rows load; null both before that
   // seed and for a single-provider server that names no provider.
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(
-    () => landingDraft?.sandboxProvider ?? null,
+    () => landingDraftForContext?.sandboxProvider ?? null,
   );
   const { data: hostClaudeModelOptions, isLoading: hostClaudeModelsLoading } = useHostModelOptions(
     selectedHostId,
@@ -2267,13 +2282,17 @@ export function NewChatLandingScreen() {
   // `workspace` string (`<url>[#<branch>]`); both blank = empty
   // server-created workspace.
   const [sandboxRepoUrl, setSandboxRepoUrl] = useState<string>(
-    () => landingDraft?.sandboxRepoUrl ?? "",
+    () => landingDraftForContext?.sandboxRepoUrl ?? "",
   );
   const [sandboxRepoBranch, setSandboxRepoBranch] = useState<string>(
-    () => landingDraft?.sandboxRepoBranch ?? "",
+    () => landingDraftForContext?.sandboxRepoBranch ?? "",
   );
-  const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
-  const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
+  const [workspace, setWorkspace] = useState<string>(
+    () => landingDraftForContext?.workspace ?? "",
+  );
+  const [branchName, setBranchName] = useState<string>(
+    () => landingDraftForContext?.branchName ?? "",
+  );
   // The base branch auto-fills from the configured default (Settings › Git)
   // when the user names a worktree branch, and is left alone once the user
   // touches it — clearing the branch name re-arms the auto-fill (see the effect
@@ -2290,7 +2309,7 @@ export function NewChatLandingScreen() {
   // that worktree (no git opts). Editing the field away from it means the user
   // wants a *new* worktree off that name.
   const [prefilledBranch, setPrefilledBranch] = useState<string>(
-    () => landingDraft?.prefilledBranch ?? "",
+    () => landingDraftForContext?.prefilledBranch ?? "",
   );
   // Project to file the new session under. Empty = unfiled. Stamped as the
   // `omni_project` label at create (so the row is filed from its first sidebar
@@ -2339,8 +2358,8 @@ export function NewChatLandingScreen() {
   // switch, seeded from the user's last stored pick for that agent.
   const [pickedHarness, setPickedHarness] = useState<string | null>(
     () =>
-      landingDraft?.pickedHarness ??
-      readLastHarness(landingDraft?.pickedAgentId ?? readLastAgentId()),
+      landingDraftForContext?.pickedHarness ??
+      readLastHarness(landingDraftForContext?.pickedAgentId ?? readLastAgentId()),
   );
   // Per-session model + reasoning effort for the claude-native model picker.
   // "" = unselected: nothing is checked and `model_override` / `reasoning_effort`
@@ -2397,6 +2416,7 @@ export function NewChatLandingScreen() {
   draftRef.current = {
     message,
     files,
+    project: projectParam,
     pickedAgentId,
     selectedHostId,
     sandboxSelected,

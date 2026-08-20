@@ -2538,6 +2538,68 @@ describe("NewChatLandingScreen", () => {
     ).toBeNull();
   });
 
+  it("keeps a global composer draft's launch state out of a project launch, and restores it in its own context", async () => {
+    // The HOST pick is launch-control state: a global draft that picked
+    // machine-2 must not leak into a ?project= launch — the project re-seeds
+    // host / workspace / agent / sandbox from its own config (#5023).
+    // Authored content (the message) still restores everywhere.
+    mockHosts([host("online", 1), host("online", 2)]);
+    const first = renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "machine-1",
+      ),
+    );
+    // Deliberately pick the OTHER host so the draft's choice is distinct
+    // from the first-online default the project render would fall back to.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByText("machine-2"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain(
+        "machine-2",
+      ),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "finish the migration" },
+    });
+    first.unmount();
+    // Drop the sticky host choice: it's a launch preference that
+    // legitimately persists across renders and would re-select machine-2
+    // independently of the draft — the draft restore path under test is the
+    // only channel that must NOT fire.
+    window.localStorage.removeItem("omnigent:last-host-choice");
+
+    // Project launch: the message survives, the foreign host pick does not
+    // (the auto-seed falls back to the first online host).
+    const second = renderLanding({}, "/?project=docs");
+    await waitFor(() => expect(screen.getByText("docs")).toBeTruthy());
+    expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
+      "finish the migration",
+    );
+    expect(screen.getByTestId("new-chat-landing-host-chip").textContent).not.toContain(
+      "machine-2",
+    );
+
+    // A deliberate choice made IN the project context round-trips: reopening
+    // the same project restores its own draft's launch state (the issue's
+    // "returning to the same unfinished project draft" requirement).
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByText("machine-2"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-2"),
+    );
+    second.unmount();
+    window.localStorage.removeItem("omnigent:last-host-choice");
+
+    renderLanding({}, "/?project=docs");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-2"),
+    );
+    expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
+      "finish the migration",
+    );
+  });
+
   it("shows host-provided git credentials tooltip content in the sandbox repo popover", async () => {
     setOmnigentHostConfig({
       docsLinks: { databricksGitCredentials: "Use Databricks Git credentials before cloning." },
