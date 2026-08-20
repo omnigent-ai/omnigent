@@ -1525,11 +1525,32 @@ class OpenAIAgentsSDKExecutor(Executor):
             max_tokens=max_tokens,
         )
         current_item_count = len(await state.sdk_session.get_items())
+        # Reasoning item IDs must survive replay by default: newer OpenAI
+        # reasoning models link each function call (``fc_...``) to its
+        # preceding reasoning item (``rs_...``), and the API rejects a replayed
+        # function call whose linked reasoning item arrived ID-less —
+        # "Item 'fc_...' was provided without its required 'reasoning' item"
+        # (#5066). ``omit`` remains selectable per agent for OpenAI-compatible
+        # gateways whose legacy workaround was to strip the IDs.
+        reasoning_item_id_policy_raw = cfg.extra.get("reasoning_item_id_policy")
+        if reasoning_item_id_policy_raw is None:
+            reasoning_item_id_policy = "preserve"
+        elif reasoning_item_id_policy_raw in ("preserve", "omit"):
+            reasoning_item_id_policy = reasoning_item_id_policy_raw
+        else:
+            yield ExecutorError(
+                message=(
+                    "reasoning_item_id_policy must be 'preserve' or 'omit', "
+                    f"got {reasoning_item_id_policy_raw!r}"
+                ),
+                retryable=False,
+            )
+            return
         run_config = agents_sdk.RunConfig(
             model=model,
             model_provider=provider,
             tracing_disabled=True,
-            reasoning_item_id_policy="omit",
+            reasoning_item_id_policy=reasoning_item_id_policy,
             call_model_input_filter=self._filter_model_input,
         )
         max_turns = 1 if stepwise_internal_turns else int(cfg.extra.get("max_turns", 1000))

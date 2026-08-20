@@ -603,6 +603,82 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_reasoning_item_ids_preserved_by_default(self):
+        """Unset policy keeps reasoning item IDs so linked fc/rs items replay.
+
+        Newer OpenAI reasoning models require a replayed function call's
+        linked reasoning item to carry its ID; forcing ``omit`` stripped the
+        reasoning ID while keeping the function-call ID, and the next turn
+        400'd (#5066).
+        """
+
+        async def _t():
+            _FakeRunner.last_calls = []
+            _FakeRunner.next_result = _FakeResult(events=[], final_output="done")
+            executor = OpenAIAgentsSDKExecutor(client=object())
+            with patch(
+                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                return_value=_fake_agents_sdk(),
+            ):
+                events = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "hi", "session_id": "s1"}],
+                        [],
+                        "Be helpful.",
+                        ExecutorConfig(model="gpt-5.3-codex"),
+                    )
+                ]
+
+            self.assertEqual(events[-1].response, "done")
+            self.assertEqual(
+                _FakeRunner.last_calls[0]["run_config"].kwargs["reasoning_item_id_policy"],
+                "preserve",
+            )
+
+        _run(_t())
+
+    def test_reasoning_item_id_policy_omit_selectable_and_invalid_rejected(self):
+        """``omit`` remains selectable per agent; anything else fails loud."""
+
+        async def _t():
+            _FakeRunner.last_calls = []
+            _FakeRunner.next_result = _FakeResult(events=[], final_output="done")
+            executor = OpenAIAgentsSDKExecutor(client=object())
+            with patch(
+                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                return_value=_fake_agents_sdk(),
+            ):
+                events = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "hi", "session_id": "s1"}],
+                        [],
+                        "Be helpful.",
+                        ExecutorConfig(model="gpt-5.3-codex", extra={"reasoning_item_id_policy": "omit"}),
+                    )
+                ]
+                self.assertEqual(events[-1].response, "done")
+                self.assertEqual(
+                    _FakeRunner.last_calls[0]["run_config"].kwargs["reasoning_item_id_policy"],
+                    "omit",
+                )
+
+                bad = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "hi", "session_id": "s1"}],
+                        [],
+                        "Be helpful.",
+                        ExecutorConfig(model="gpt-5.3-codex", extra={"reasoning_item_id_policy": "strip"}),
+                    )
+                ]
+                self.assertIsInstance(bad[-1], ExecutorError)
+                self.assertFalse(bad[-1].retryable)
+                self.assertIn("reasoning_item_id_policy", bad[-1].message)
+
+        _run(_t())
+
     def test_parallel_tool_calls_can_be_overridden(self):
         async def _t():
             _FakeRunner.last_calls = []
