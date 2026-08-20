@@ -2422,6 +2422,83 @@ class TestStreamEventStreaming(unittest.TestCase):
 
         _run(_t())
 
+    def test_interrupt_teardown_does_not_mark_session_crashed(self):
+        """A user Stop must not poison later turns when teardown kills the CLI."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        clients = []
+        response_started = asyncio.Event()
+        process_terminated = asyncio.Event()
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+                self.is_error = None
+                self.usage = None
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = _ResultMessage
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+                    self.index = len(clients)
+                    clients.append(self)
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    return None
+
+                async def receive_response(self):
+                    if self.index == 0:
+                        response_started.set()
+                        await process_terminated.wait()
+                        raise RuntimeError("ProcessError: command exited after SIGTERM")
+                    yield _ResultMessage("claude-session-a", "recovered")
+
+                async def interrupt(self):
+                    return None
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            messages = [{"role": "user", "content": "hello", "session_id": "session-a"}]
+
+            async def _consume_turn():
+                return [event async for event in executor.run_turn(messages, [], "")]
+
+            async def _terminate(_client):
+                process_terminated.set()
+
+            with (
+                patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK),
+                patch.object(executor, "_force_close_client", side_effect=_terminate),
+            ):
+                interrupted_turn = asyncio.create_task(_consume_turn())
+                await asyncio.wait_for(response_started.wait(), timeout=5)
+                self.assertTrue(await executor.interrupt_session("session-a"))
+                await interrupted_turn
+
+                self.assertNotIn("session-a", executor._crashed_sessions)
+                events = [event async for event in executor.run_turn(messages, [], "")]
+
+            self.assertEqual(len(clients), 2)
+            self.assertIsInstance(events[-1], TurnComplete)
+            self.assertEqual(events[-1].response, "recovered")
+
+        _run(_t())
+
     def test_close_disconnects_all_live_clients(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
 

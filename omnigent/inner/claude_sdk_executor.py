@@ -2931,7 +2931,8 @@ class ClaudeSDKExecutor(Executor):
             self._evict_client_on_cancel(session_key)
             raise
         except Exception as exc:  # noqa: BLE001 — top-level executor error boundary; records crash and surfaces to caller
-            self._crashed_sessions[session_key] = str(exc)
+            if session_key in self._clients:
+                self._crashed_sessions[session_key] = str(exc)
             await self._close_live_client(session_key)
             stderr_text = "\n".join(stderr_lines) if stderr_lines else "(no stderr captured)"
             diagnostics_text = (
