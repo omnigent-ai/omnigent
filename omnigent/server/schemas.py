@@ -808,6 +808,7 @@ class ChildSessionSummary(BaseModel):
     object: str = "child_session"
     parent_session_id: str
     title: str | None = None
+    task_summary: str | None = None
     tool: str | None = None
     session_name: str | None = None
     kind: str = "sub_agent"
@@ -2449,6 +2450,7 @@ class SessionUsage(BaseModel):
     cost_usd: float = 0.0
     models: dict[str, float] = Field(default_factory=dict)
     harness: str | None = None
+    other_harnesses: list[str] | None = None
     llm_model: str | None = None
     agent_name: str | None = None
 

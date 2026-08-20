@@ -25,9 +25,50 @@ _MODULES = [
     pytest.param(opencode_state, "OMNIGENT_OPENCODE_NATIVE_STATE_DIR", id="opencode"),
 ]
 
+_STATE_ROOTS = [
+    pytest.param(
+        claude_state._claude_native_state_root,
+        "OMNIGENT_CLAUDE_NATIVE_STATE_DIR",
+        "claude-native",
+        id="claude",
+    ),
+    pytest.param(
+        codex_state._codex_native_state_root,
+        "OMNIGENT_CODEX_NATIVE_STATE_DIR",
+        "codex-native",
+        id="codex",
+    ),
+    pytest.param(
+        opencode_state._opencode_native_state_root,
+        "OMNIGENT_OPENCODE_NATIVE_STATE_DIR",
+        "opencode-native",
+        id="opencode",
+    ),
+]
+
 
 def _digest(value: str, module) -> str:
     return hashlib.sha256(value.encode()).hexdigest()[: module._ID_HASH_CHARS]
+
+
+@pytest.mark.parametrize(("resolver", "env_var", "subdir"), _STATE_ROOTS)
+def test_state_root_honors_data_dir(
+    resolver, env_var: str, subdir: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(env_var, raising=False)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+
+    assert resolver() == tmp_path / "data" / subdir
+
+
+@pytest.mark.parametrize(("resolver", "env_var", "_subdir"), _STATE_ROOTS)
+def test_specific_state_root_override_wins(
+    resolver, env_var: str, _subdir: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv(env_var, str(tmp_path / "specific"))
+
+    assert resolver() == tmp_path / "specific"
 
 
 @pytest.mark.parametrize(("module", "env_var"), _MODULES)

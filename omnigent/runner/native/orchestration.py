@@ -2158,17 +2158,16 @@ async def _auto_create_pi_terminal(
             resolve_pi_native_provider,
         )
 
-        # Thread the agent spec's pinned model (``executor.model``) into the
-        # resolved provider so the generated ``models.json`` — and the
-        # appended ``--model`` arg (see ``pi_native_provider_launch``) — select
-        # it, reaching parity with claude-native / cursor-native. ``None``
-        # (no model declared) keeps the provider's default model.
-        # model_override (set by /model or sys_session_create's model arg)
-        # takes precedence over the spec's pinned executor.model.
+        # Provider-qualified picker values select one of the models rendered
+        # from the provider configured through ``omni setup``.
         spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
         provider = resolve_pi_native_provider(model=spec_model)
         if provider is not None:
-            cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
+            cred_env, cred_args = pi_native_provider_launch(
+                bridge_dir / "pi-agent",
+                provider,
+                selection=spec_model,
+            )
             pi_env.update(cred_env)
             pi_args.extend(cred_args)
             # An unroutable model leaves Pi unable to select it, which looks

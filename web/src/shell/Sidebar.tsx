@@ -15,7 +15,6 @@ import {
   useState,
 } from "react";
 import {
-  AlertTriangleIcon,
   ArchiveIcon,
   ArchiveRestoreIcon,
   CheckIcon,
@@ -128,7 +127,8 @@ import {
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
+import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
+import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
@@ -474,6 +474,9 @@ export function Sidebar({
   onOpenSearch,
   peek,
 }: SidebarProps) {
+  const branding = useBranding();
+  const serverInfo = useServerInfo();
+  const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
   // sessions nested inside project folders. Set when selection mode is entered
@@ -794,12 +797,18 @@ export function Sidebar({
               data-testid="sidebar-brand"
               className="sidebar-brand rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
             >
-              <img
-                src={omnigentWordmark}
-                alt="Omnigent"
-                data-testid="sidebar-wordmark"
-                className="h-[15px] w-auto shrink-0 translate-y-px dark:invert"
-              />
+              {branding.app_name ? (
+                <span className="text-[15px] font-semibold tracking-tight">
+                  {branding.app_name}
+                </span>
+              ) : (
+                <img
+                  src={omnigentWordmark}
+                  alt="Omnigent"
+                  data-testid="sidebar-wordmark"
+                  className="h-[15px] w-auto shrink-0 translate-y-px dark:invert"
+                />
+              )}
             </Link>
             {/* On the macOS shell this copy is hidden and an identical cluster
             renders in the title-bar strip instead (see AppShell), so the icons
@@ -924,29 +933,31 @@ export function Sidebar({
                 )}
               </Link>
             </Button>
-            <Button
-              asChild
-              variant="ghost"
-              className={cn(
-                SIDEBAR_ROW,
-                "w-full justify-start border-0 font-normal",
-                SIDEBAR_HOVER_HIGHLIGHT,
-                isUsagePage && SIDEBAR_ACTIVE_HIGHLIGHT,
-              )}
-              data-testid="usage-nav"
-            >
-              <Link to="/usage" onClick={onNavClick}>
-                <WalletIcon
-                  className={cn(
-                    "ui-icon",
-                    isUsagePage
-                      ? "text-[var(--sidebar-active-foreground)]"
-                      : "text-muted-foreground",
-                  )}
-                />
-                Usage
-              </Link>
-            </Button>
+            {usagePageEnabled && (
+              <Button
+                asChild
+                variant="ghost"
+                className={cn(
+                  SIDEBAR_ROW,
+                  "w-full justify-start border-0 font-normal",
+                  SIDEBAR_HOVER_HIGHLIGHT,
+                  isUsagePage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                )}
+                data-testid="usage-nav"
+              >
+                <Link to="/usage" onClick={onNavClick}>
+                  <WalletIcon
+                    className={cn(
+                      "ui-icon",
+                      isUsagePage
+                        ? "text-[var(--sidebar-active-foreground)]"
+                        : "text-muted-foreground",
+                    )}
+                  />
+                  Usage
+                </Link>
+              </Button>
+            )}
           </div>
 
           <nav
@@ -1997,34 +2008,34 @@ function ConversationList({
                         // The filter stays reachable while bulk-selecting;
                         // switching scope just exits selection. Only the
                         // "select" entry point hides, being already active.
-                        <div className="flex items-center gap-0.5">
-                          {!selectionMode && (
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="icon-xs"
-                                  aria-label="Select sessions"
-                                  data-testid="toggle-selection-mode"
-                                  className="text-muted-foreground"
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    onEnterSelectionMode("sessions");
-                                  }}
-                                >
-                                  <ListChecksIcon className="size-3.5" />
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent side="bottom">Select sessions</TooltipContent>
-                            </Tooltip>
-                          )}
-                          <SessionFilterMenu
-                            value={activeTab}
-                            onChange={onActiveTabChange}
-                            multiUser={multiUser}
-                          />
-                        </div>
+                        !selectionMode ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon-xs"
+                                aria-label="Select sessions"
+                                data-testid="toggle-selection-mode"
+                                className="text-muted-foreground"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  onEnterSelectionMode("sessions");
+                                }}
+                              >
+                                <ListChecksIcon className="size-3.5" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent side="bottom">Select sessions</TooltipContent>
+                          </Tooltip>
+                        ) : undefined
+                      }
+                      persistentHeaderAction={
+                        <SessionFilterMenu
+                          value={activeTab}
+                          onChange={onActiveTabChange}
+                          multiUser={multiUser}
+                        />
                       }
                     />
                   </ChatsDropZone>
@@ -2461,6 +2472,7 @@ function ConversationSection({
   emptyMessage,
   indentRows,
   headerAction,
+  persistentHeaderAction,
   afterHeader,
   footer,
   onProjectAssigned,
@@ -2489,6 +2501,8 @@ function ConversationSection({
   /** Optional control overlaid at the header's right edge (e.g. a project's
       kebab). Hover/focus-revealed on desktop, always shown on mobile. */
   headerAction?: ReactNode;
+  /** Optional control that remains visible at the header's right edge. */
+  persistentHeaderAction?: ReactNode;
   /** Optional content rendered directly under the header, above the rows (and
       shown even when collapsed) — e.g. the bulk-selection action bar. */
   afterHeader?: ReactNode;
@@ -2513,13 +2527,18 @@ function ConversationSection({
             icon={icon}
             marker={marker}
             active={active}
-            hasAction={headerAction != null}
+            hasAction={headerAction != null || persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
           />
-          {headerAction && (
-            <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:has-[[aria-expanded=true]]:opacity-100">
-              {headerAction}
+          {(headerAction || persistentHeaderAction) && (
+            <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
+              {headerAction && (
+                <div className="flex items-center transition-opacity md:opacity-0 md:group-focus-within/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 md:has-[[aria-expanded=true]]:opacity-100">
+                  {headerAction}
+                </div>
+              )}
+              {persistentHeaderAction}
             </div>
           )}
         </div>
@@ -4352,6 +4371,38 @@ function BulkActionBar({
 
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [moveSearch, setMoveSearch] = useState("");
+  // Worktree sessions among the selection each carry one local git branch
+  // (git_branch); the delete modal lists them so each branch can be opted
+  // into cleanup individually. `branchesToDelete` holds the session ids whose
+  // branch the user ticked — default empty (opt-in, matching single-session
+  // delete, since branch deletion is irreversible).
+  const [branchesToDelete, setBranchesToDelete] = useState<Set<string>>(new Set());
+
+  const worktreeSelected = useMemo(
+    () => ownedSelected.filter((c) => c.git_branch),
+    [ownedSelected],
+  );
+  const allBranchesSelected =
+    worktreeSelected.length > 0 && worktreeSelected.every((c) => branchesToDelete.has(c.id));
+  // Drives the header checkbox's indeterminate ([-]) state: some but not all
+  // branches ticked.
+  const someBranchesSelected =
+    !allBranchesSelected && worktreeSelected.some((c) => branchesToDelete.has(c.id));
+
+  function toggleBranch(id: string, checked: boolean) {
+    setBranchesToDelete((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }
+
+  function toggleAllBranches() {
+    setBranchesToDelete(
+      allBranchesSelected ? new Set() : new Set(worktreeSelected.map((c) => c.id)),
+    );
+  }
 
   function handleMoveToProject(project: string) {
     const ids = ownedSelected.map((c) => c.id);
@@ -4404,7 +4455,7 @@ function BulkActionBar({
     // observer never fire.
     if (activeId && ids.includes(activeId)) navigate("/", { replace: true });
     onDeselectAll();
-    bulkDelete.mutate(ids);
+    bulkDelete.mutate({ ids, deleteBranchIds: branchesToDelete });
   }
 
   return (
@@ -4568,8 +4619,16 @@ function BulkActionBar({
         )}
       </div>
 
-      <Dialog open={confirmDeleteOpen} onOpenChange={setConfirmDeleteOpen}>
-        <DialogContent>
+      <Dialog
+        open={confirmDeleteOpen}
+        onOpenChange={(open) => {
+          setConfirmDeleteOpen(open);
+          // Reset the branch selection on close so it doesn't carry over to
+          // the next delete.
+          if (!open) setBranchesToDelete(new Set());
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
           <DialogHeader>
             <DialogTitle>Delete {ownedSelected.length} session(s)?</DialogTitle>
             <DialogDescription>
@@ -4577,15 +4636,78 @@ function BulkActionBar({
               be undone.
             </DialogDescription>
           </DialogHeader>
-          <p className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 p-3 text-sm text-muted-foreground">
-            <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0 text-warning" />
-            Branches are not cleaned up. Use single-session delete for branch surgery.
-          </p>
+          {worktreeSelected.length > 0 && (
+            <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
+              <p className="text-sm text-muted-foreground">
+                Optionally delete the local git branches for these worktree sessions. These actions
+                are <span className="font-semibold text-destructive">irreversible</span>.
+              </p>
+              <div className="max-h-56 overflow-y-auto">
+                <table className="w-full border-collapse text-left text-ui">
+                  <thead>
+                    <tr className="border-b border-destructive/20 text-sm text-muted-foreground">
+                      <th scope="col" className="w-8 py-1.5 pr-2 font-medium">
+                        <input
+                          type="checkbox"
+                          ref={(el) => {
+                            if (el) el.indeterminate = someBranchesSelected;
+                          }}
+                          checked={allBranchesSelected}
+                          onChange={toggleAllBranches}
+                          aria-label="Select all branches"
+                          data-testid="bulk-delete-branch-toggle-all"
+                          className="mt-1 size-4 shrink-0 accent-destructive"
+                        />
+                      </th>
+                      <th scope="col" className="py-1.5 pr-3 font-medium">
+                        Branch
+                      </th>
+                      <th scope="col" className="py-1.5 font-medium">
+                        Session
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {worktreeSelected.map((c) => (
+                      <tr key={c.id} className="align-top">
+                        <td className="py-2 pr-2">
+                          <input
+                            type="checkbox"
+                            data-testid="bulk-delete-branch-checkbox"
+                            checked={branchesToDelete.has(c.id)}
+                            onChange={(e) => toggleBranch(c.id, e.target.checked)}
+                            aria-label={`Delete branch ${c.git_branch}`}
+                            className="mt-0.5 size-4 shrink-0 cursor-pointer accent-destructive"
+                          />
+                        </td>
+                        <td className="py-2 pr-3">
+                          <span className="flex items-start gap-1.5">
+                            <GitBranchIcon className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+                            <code className="break-all rounded bg-muted px-1 py-0.5 text-sm">
+                              {c.git_branch}
+                            </code>
+                          </span>
+                        </td>
+                        <td className="py-2 text-sm text-muted-foreground">
+                          <span className="line-clamp-2 break-all">
+                            {conversationDisplayLabel(c)}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
           <DialogFooter className="border-t-0 bg-transparent">
             <Button
               type="button"
               variant="ghost"
-              onClick={() => setConfirmDeleteOpen(false)}
+              onClick={() => {
+                setConfirmDeleteOpen(false);
+                setBranchesToDelete(new Set());
+              }}
               disabled={bulkDelete.isPending}
             >
               Cancel

@@ -181,8 +181,8 @@ jobs:
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
-      - name: Install project + dev extras
-        run: uv sync --locked --extra all --extra dev
+      - name: Install project + test dependencies
+        run: uv sync --locked --extra all --group test
 
       - name: Install bubblewrap + tmux
         # bubblewrap: the UI tests open terminals under os_env, whose

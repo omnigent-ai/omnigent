@@ -112,6 +112,42 @@ function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
 
+describe("Composer growth layout", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("keeps multiline growth in layout instead of offsetting the form over the transcript", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    const form = ta.closest("form");
+    expect(form).not.toBeNull();
+
+    const originalGetComputedStyle = window.getComputedStyle.bind(window);
+    vi.spyOn(window, "getComputedStyle").mockImplementation((element, pseudoElt) => {
+      if (element === ta) {
+        return {
+          lineHeight: "20px",
+          paddingTop: "0px",
+          paddingBottom: "0px",
+          minHeight: "0px",
+        } as CSSStyleDeclaration;
+      }
+      return originalGetComputedStyle(element, pseudoElt);
+    });
+    Object.defineProperty(ta, "scrollHeight", {
+      configurable: true,
+      get: () => 220,
+    });
+
+    fireEvent.change(ta, { target: { value: "one\ntwo\nthree\nfour" } });
+
+    expect(ta.style.height).toBe("200px");
+    expect(form?.style.marginTop).toBe("");
+  });
+});
+
 describe("Composer Claude goal control", () => {
   afterEach(() => {
     cleanup();

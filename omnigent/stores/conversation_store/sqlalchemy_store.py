@@ -213,6 +213,7 @@ def _to_conversation(
         subagent_routing_override=overrides["subagent_routing_override"],
         harness_override=overrides["harness_override"],
         sub_agent_name=meta.sub_agent_name if meta else None,
+        task_summary=meta.task_summary if meta else None,
         external_session_id=meta.external_session_id if meta else None,
         # NULL → None; a stored JSON array (e.g. ``"[]"`` or
         # ``'["--foo"]'``) decodes back to a list. ``"[]"`` is a
@@ -1135,10 +1136,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id.in_(unique_ids),
                 )
             ).all()
-        # Fork-source label is in the AP DB.
+        # Connectivity markers are in the AP DB. Both signal on presence:
+        # the fork-source label forces an unbound clone to pick a workspace;
+        # the import-source label marks a transcript with no live executor.
         with self._conv_session("get_session_connectivity") as ap_sess:
-            # One pass over the fork-source connectivity marker, which
-            # signals on presence (its value is the source id).
             label_rows = ap_sess.execute(
                 select(
                     SqlConversationLabel.conversation_id,
@@ -1147,17 +1148,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
                     SqlConversationLabel.conversation_id.in_(unique_ids),
-                    SqlConversationLabel.key.in_([FORK_SOURCE_LABEL_KEY]),
+                    SqlConversationLabel.key.in_([FORK_SOURCE_LABEL_KEY, IMPORT_SOURCE_LABEL_KEY]),
                 )
             ).all()
         needs_workspace_ids = {
             row.conversation_id for row in label_rows if row.key == FORK_SOURCE_LABEL_KEY
+        }
+        imported_ids = {
+            row.conversation_id for row in label_rows if row.key == IMPORT_SOURCE_LABEL_KEY
         }
         return {
             row.id: SessionConnectivity(
                 runner_id=row.runner_id,
                 host_id=row.host_id,
                 needs_workspace=row.id in needs_workspace_ids,
+                imported=row.id in imported_ids,
                 runner_last_seen=row.runner_last_seen,
             )
             for row in meta_rows
@@ -2838,6 +2843,24 @@ class SqlAlchemyConversationStore(ConversationStore):
             if result.rowcount != 1:
                 return None
         # Bulk UPDATE leaves no in-session ORM row to reuse; re-read.
+        return self.get_conversation(conversation_id)
+
+    def set_task_summary(self, conversation_id: str, task_summary: str) -> Conversation | None:
+        """Set a human-readable task summary on a sub-agent conversation."""
+        with self._session("set_task_summary") as session:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                    )
+                    .values(task_summary=task_summary)
+                ),
+            )
+            if result.rowcount != 1:
+                return None
         return self.get_conversation(conversation_id)
 
     def set_runner_id(self, conversation_id: str, runner_id: str) -> bool:

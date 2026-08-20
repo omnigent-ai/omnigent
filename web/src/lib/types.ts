@@ -157,6 +157,8 @@ export type SessionStatus = "idle" | "launching" | "running" | "waiting" | "fail
  * - `"interrupt"`: `{}` (empty data)
  * - `"stop_session"`: `{}` (empty data) — terminate the live session
  *   without deleting its conversation (owner-only)
+ * - `"retry_session"`: `{}` (empty data) — reconnect the existing runner
+ *   without persisting or replaying user input
  * - `"slash_command"`: `{ kind: "skill", name, arguments }` — invoke a
  *   skill the same way the REPL does. The server resolves the skill,
  *   persists a visible receipt plus a hidden `<skill>` meta message,
@@ -171,6 +173,7 @@ export type SessionEventInput =
   | { type: "approval"; data: Record<string, unknown> }
   | { type: "interrupt"; data?: Record<string, unknown> }
   | { type: "stop_session"; data?: Record<string, unknown> }
+  | { type: "retry_session"; data?: Record<string, unknown> }
   | { type: "slash_command"; data: { kind: "skill"; name: string; arguments: string } }
   | { type: string; data: Record<string, unknown> };
 

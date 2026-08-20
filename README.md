@@ -365,8 +365,10 @@ Face Spaces**, **Modal**, **Cloudflare** (serverless, scale-to-zero), and
 covered too — and a **Cloudflare quick tunnel** (public) or **Tailscale**
 (private) reaches a server running on your own laptop without a deploy. The
 server can also provision a cloud sandbox per session (*managed hosts*), so no
-laptop has to stay online. The full menu of targets, the database options, and
-the sandbox setup live in
+laptop has to stay online. The full menu of targets, the database options, the
+sandbox setup, and
+[branding/white-labeling](https://github.com/omnigent-ai/omnigent/blob/main/deploy/README.md#branding-white-labeling)
+live in
 [`deploy/README.md`](https://github.com/omnigent-ai/omnigent/blob/main/deploy/README.md).
 
 Once the server is up, sign in and register your laptop as a host:

@@ -12,6 +12,8 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
 // vi.mock factory runs. projectsMock is mutated per-test to drive project
@@ -211,13 +213,19 @@ function mockConversations(convs: Conversation[]) {
   useConvMock.mockImplementation(() => result(convs));
 }
 
-function renderSidebar(open = true, initialEntry = "/", onOpenSearch?: () => void) {
+function renderSidebar(
+  open = true,
+  initialEntry = "/",
+  onOpenSearch?: () => void,
+  info?: ServerInfo,
+) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const sidebar = <Sidebar open={open} onClose={vi.fn()} onOpenSearch={onOpenSearch} />;
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
         <MemoryRouter initialEntries={[initialEntry]}>
-          <Sidebar open={open} onClose={vi.fn()} onOpenSearch={onOpenSearch} />
+          {info ? <CapabilitiesProvider info={info}>{sidebar}</CapabilitiesProvider> : sidebar}
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>,
@@ -631,7 +639,26 @@ describe("Sidebar session list", () => {
     expect(badge).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
-  it("reveals session selection as an icon action on the Sessions header", () => {
+  it("hides Usage navigation while the release feature is off", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    expect(screen.queryByTestId("usage-nav")).toBeNull();
+  });
+
+  it("shows and highlights Usage navigation when the release feature is on", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/usage", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { usage_page: true },
+    });
+
+    const usage = screen.getByTestId("usage-nav");
+    expect(usage).toHaveAttribute("href", "/usage");
+    expect(usage).toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
+  it("keeps filtering visible while session selection remains hover-revealed", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
@@ -645,13 +672,18 @@ describe("Sidebar session list", () => {
     expect(selectSessions).toHaveAttribute("data-size", "icon-xs");
     expect(selectSessions).toHaveClass("text-muted-foreground", "hover:text-foreground");
     expect(selectSessions).not.toHaveTextContent("Select sessions");
-    // The select + filter buttons share a flex wrapper inside the header's
-    // hover-reveal slot, so the reveal classes sit on the grandparent.
-    expect(selectSessions.parentElement?.parentElement).toHaveClass(
+    expect(selectSessions.parentElement).toHaveClass(
       "md:opacity-0",
       "md:group-hover/header:opacity-100",
       "md:group-focus-within/header:opacity-100",
+      "md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
     );
+
+    const filterSessions = within(sessionsSection!).getByRole("button", {
+      name: "Filter sessions",
+    });
+    expect(filterSessions.parentElement).not.toHaveClass("md:opacity-0");
+    expect(filterSessions.parentElement).toHaveClass("absolute", "right-1", "flex");
 
     fireEvent.click(selectSessions);
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
