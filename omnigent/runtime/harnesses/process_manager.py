@@ -1465,11 +1465,33 @@ class HarnessProcessManager:
         """
         if not self._tmp_parent.exists():
             return
-        for child in self._tmp_parent.iterdir():
-            if not child.is_dir() or not child.name.startswith("ap-"):
+        try:
+            children = list(self._tmp_parent.iterdir())
+        except OSError as exc:
+            _logger.warning(
+                "could not list harness tmp parent %s: %s; skipping orphan sweep",
+                self._tmp_parent,
+                exc,
+            )
+            return
+        for child in children:
+            try:
+                is_dir = child.is_dir()
+            except OSError:
+                continue
+            if not is_dir or not child.name.startswith("ap-"):
                 continue
             sentinel = child / _AP_PID_FILE
-            if not sentinel.exists():
+            try:
+                sentinel_exists = sentinel.exists()
+            except OSError as exc:
+                _logger.warning(
+                    "could not stat AP_PID sentinel at %s: %s; skipping",
+                    sentinel,
+                    exc,
+                )
+                continue
+            if not sentinel_exists:
                 # No sentinel — directory either pre-dates the
                 # convention or is mid-creation. Leave alone.
                 continue

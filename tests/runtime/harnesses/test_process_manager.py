@@ -929,6 +929,47 @@ async def test_orphan_sweep_preserves_live_omnigent_dirs(
         await fresh.shutdown()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions only")
+@pytest.mark.skipif(os.getuid() == 0, reason="root bypasses filesystem permissions")
+async def test_sweep_orphans_skips_unlistable_parent(
+    short_tmp_parent: Path,
+) -> None:
+    """Orphan sweep does not crash when the tmp parent is not listable.
+
+    On a shared-parent deployment (OMNIGENT_HARNESS_TMP_PARENT pointing at a
+    directory owned by another user with no read bit), iterdir() raises
+    PermissionError. The sweep should warn and return, not abort boot.
+    """
+    short_tmp_parent.chmod(0o333)
+    try:
+        mgr = HarnessProcessManager(tmp_parent=short_tmp_parent)
+        await mgr._sweep_orphans()
+    finally:
+        short_tmp_parent.chmod(0o700)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions only")
+@pytest.mark.skipif(os.getuid() == 0, reason="root bypasses filesystem permissions")
+async def test_sweep_orphans_skips_inaccessible_child(
+    short_tmp_parent: Path,
+) -> None:
+    """Orphan sweep skips ap-* siblings it cannot inspect.
+
+    A foreign ap-* directory with mode 0o000 blocks sentinel.exists()
+    with PermissionError. The sweep should warn, leave the directory
+    alone, and continue rather than propagating the error.
+    """
+    foreign = short_tmp_parent / "ap-foreign"
+    foreign.mkdir(mode=0o000)
+    try:
+        mgr = HarnessProcessManager(tmp_parent=short_tmp_parent)
+        await mgr._sweep_orphans()
+        assert foreign.exists()
+    finally:
+        foreign.chmod(0o700)
+        shutil.rmtree(foreign, ignore_errors=True)
+
+
 # ── Helper-level tests (small, fast) ───────────────────────────
 
 
