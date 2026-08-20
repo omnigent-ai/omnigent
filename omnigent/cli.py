@@ -4514,6 +4514,47 @@ def diagnose(server: str | None, json_output: bool) -> None:
     click.echo(f"auth    {snap['auth_source']} ({snap['auth_source_origin']})")
     click.echo(f"os      {snap['os']}")
     click.echo(f"python  {snap['python']}")
+    _echo_diagnose_health(snap.get("health") or {})
+
+
+def _echo_diagnose_health(health: dict[str, Any]) -> None:
+    """Print the health section of a diagnostics snapshot.
+
+    One line per section, omitting sections that are absent (no log yet, or a
+    non-Databricks deployment), so the output stays short on a healthy machine
+    and still carries the discriminating counts on a broken one.
+
+    :param health: The ``health`` mapping from
+        :func:`omnigent.diagnostics.collect_snapshot`.
+    """
+    credential = health.get("credential") or {}
+    probe = credential.get("probe")
+    if probe == "ok":
+        # A count, not a verdict: more than one match is not itself a failure.
+        # See omnigent.diagnostics_health._credential_health.
+        click.echo(f"cred    {credential.get('profiles_matching_host')} profile(s) match the host")
+    elif probe == "unavailable":
+        click.echo("cred    profile count unavailable")
+
+    host_log = health.get("host_log")
+    if host_log:
+        parts = [f"idle {host_log.get('idle_seconds', 0)}s"]
+        if host_log.get("stalled_on_connect"):
+            # Not "the tunnel is down": the connect line is logged before the
+            # attempt, so pair this with the idle time above.
+            parts.append("last line is the connect attempt")
+        parts.append(f"{host_log.get('service_restarts', 0)} server-initiated restart(s)")
+        click.echo(f"host    {', '.join(parts)}")
+
+    runner_log = health.get("runner_log")
+    if runner_log:
+        handoff = "bearer from host" if runner_log.get("bearer_handoff") else "no bearer from host"
+        click.echo(
+            f"runner  idle {runner_log.get('idle_seconds', 0)}s, {handoff}, "
+            f"{runner_log.get('sdk_fallback', 0)} self-refresh fallback(s), "
+            f"{runner_log.get('refresh_empty', 0)} empty refresh(es) "
+            f"in the last {runner_log.get('window_bytes', 0) // 1024} KiB"
+        )
 
 
 @cli.command("doctor")
