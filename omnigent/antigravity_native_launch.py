@@ -30,12 +30,9 @@ Key design points:
   for the host process; both are sidecar-plugin-scoped no-ops. So
   :func:`build_agy_launch` emits no env overrides for a fresh session.
 
-* **Auth is OAuth-only for the agy CLI** — empirically the CLI ignores
-  ``GEMINI_API_KEY`` (even with ``security.auth.selectedType="gemini-api-key"``)
-  and always demands Google OAuth.  API-key auth lives in the separate
-  ``antigravity`` SDK harness (the ``google-antigravity`` SDK), not
-  here.  :func:`resolve_native_antigravity_launch` always returns
-  ``"subscription"`` mode.
+* **Auth is inherited** — current agy releases accept either their persisted
+  Google OAuth login or ``GEMINI_API_KEY``. The isolated settings prepared by
+  the bridge select the Gemini provider when the key is present.
 """
 
 from __future__ import annotations
@@ -96,13 +93,13 @@ def agy_binary_path() -> str:
 class NativeAntigravityLaunch:
     """How a native Antigravity (agy) session should be launched.
 
-    Resolved by :func:`resolve_native_antigravity_launch`.  The agy CLI is
-    OAuth-only, so this is always ``auth_mode="subscription"``; API-key auth
-    is handled by the separate ``antigravity`` SDK harness, not this module.
+    Resolved by :func:`resolve_native_antigravity_launch`. ``auth_mode`` remains
+    ``"subscription"`` as an internal native-harness marker; agy itself chooses
+    OAuth or the ambient Gemini API key.
 
     :param auth_mode: Authentication mode.  Always ``"subscription"`` for the
-        agy CLI: auth is inherited from ``~/.gemini`` (the user's existing
-        agy login) and no credential seeding is performed.
+        native harness; agy resolves either the ambient API key or the user's
+        existing login and no credential seeding is performed here.
     :param model: Optional model label to pass to agy via ``--model``, e.g.
         ``"gemini-2.5-pro"``.  ``None`` lets agy use its own default.
     :param extra_env: Additional environment variables to inject into the
@@ -137,7 +134,7 @@ def resolve_native_antigravity_launch(
     """
     if not gemini_auth_has_credential():
         _logger.warning(
-            "No agy OAuth credential found (checked ~/.gemini/oauth_creds.json "
+            "No agy credential found (checked GEMINI_API_KEY, ~/.gemini/oauth_creds.json "
             "and ~/.gemini/antigravity-cli/antigravity-oauth-token, plus "
             "`agy models` on macOS for a Keychain-stored login); "
             "agy will prompt for login on first run."
@@ -229,7 +226,7 @@ def build_agy_launch(
     gate for this harness is post-hoc/audit-only). The flag is not duplicated
     when *extra_args* already carries it.
 
-    In both modes auth is inherited from ``~/.gemini`` — nothing is seeded —
+    In both modes auth is inherited from the ambient environment / agy state,
     and the workspace is the agy process cwd (set by the terminal spec), so no
     ``--add-dir`` is emitted. No env overrides are produced: agy ignores
     ``ANTIGRAVITY_SIDECAR_WEB_PORT`` / ``ANTIGRAVITY_CONVERSATION_ID`` /

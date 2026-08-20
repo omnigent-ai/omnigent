@@ -264,6 +264,7 @@ def test_build_host_daemon_env_remote_strips_provider_credentials(
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://example.databricks.com/serving-endpoints")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     monkeypatch.setenv("DATABRICKS_TOKEN", "test-databricks-token")
 
     env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
@@ -272,6 +273,9 @@ def test_build_host_daemon_env_remote_strips_provider_credentials(
     assert "OPENAI_API_KEY" not in env
     assert "OPENAI_BASE_URL" not in env
     assert "ANTHROPIC_API_KEY" not in env
+    # Native agy consumes this ambient credential directly, so it is the narrow
+    # provider-secret exception that must survive CLI → daemon → runner.
+    assert env["GEMINI_API_KEY"] == "test-gemini-key"
     # Databricks auth is intentionally preserved for the daemon's server auth.
     assert env["DATABRICKS_TOKEN"] == "test-databricks-token"
 
@@ -368,7 +372,7 @@ def test_ensure_host_daemon_reuses_healthy_background_daemon(
     """
     captured: dict[str, object] = {}
     _patch_daemon_spawn(monkeypatch, tmp_path, captured)
-    sig = cli.server_config_signature()
+    sig = cli._host_daemon_config_signature(None)
     _write_daemon_registry_record(
         tmp_path,
         pid=4242,
@@ -415,7 +419,7 @@ def test_ensure_host_daemon_respawns_on_host_identity_change(
         log_path=str(tmp_path / "daemon.log"),
         started_at=1_000_000,
         host_id="host_old",
-        config_sig=cli.server_config_signature(),
+        config_sig=cli._host_daemon_config_signature(None),
         resolved_server_url="http://127.0.0.1:8123",
     )
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
@@ -466,6 +470,103 @@ def test_ensure_host_daemon_respawns_on_config_drift(
     assert "args" in captured  # fresh daemon spawned
 
 
+def test_ensure_local_host_daemon_respawns_when_gemini_key_rotates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A reused local daemon cannot retain a stale native-agy credential."""
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    monkeypatch.setenv("GEMINI_API_KEY", "old-key")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=str(tmp_path / "daemon.log"),
+        config_sig=cli._host_daemon_config_signature(None),
+        resolved_server_url="http://127.0.0.1:8123",
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    torn_down: list[str] = []
+    monkeypatch.setattr(
+        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+    )
+
+    monkeypatch.setenv("GEMINI_API_KEY", "new-key")
+    changed = cli._ensure_host_daemon(None)
+
+    assert changed is True
+    assert len(torn_down) == 1 and "config" in torn_down[0]
+    assert captured["env"]["GEMINI_API_KEY"] == "new-key"  # type: ignore[index]
+    assert "args" in captured
+
+
+def test_ensure_remote_host_daemon_respawns_when_gemini_key_rotates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A reused remote daemon cannot retain a stale native-agy credential."""
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    server = "https://server.example.com"
+    monkeypatch.setenv("GEMINI_API_KEY", "old-key")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target=server,
+        mode="server",
+        server_url=server,
+        log_path=str(tmp_path / "daemon.log"),
+        config_sig=cli._host_daemon_config_signature(server),
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    torn_down: list[str] = []
+    monkeypatch.setattr(
+        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+    )
+
+    monkeypatch.setenv("GEMINI_API_KEY", "new-key")
+    changed = cli._ensure_host_daemon(server)
+
+    assert changed is False
+    assert torn_down == ["Gemini API key changed"]
+    assert captured["env"]["GEMINI_API_KEY"] == "new-key"  # type: ignore[index]
+    assert captured["args"] == [
+        cli.sys.executable,
+        "-m",
+        "omnigent.host._daemon_entry",
+        "--server",
+        server,
+    ]
+
+
+def test_foreground_remote_daemon_is_not_killed_when_gemini_key_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Credential drift never silently terminates a user-owned foreground host."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    server = "https://server.example.com"
+    monkeypatch.setenv("GEMINI_API_KEY", "old-key")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target=server,
+        mode="server",
+        server_url=server,
+        log_path=None,
+        config_sig=cli._host_daemon_config_signature(server),
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setenv("GEMINI_API_KEY", "new-key")
+    monkeypatch.setattr(
+        cli,
+        "_terminate_host_unit",
+        lambda *args, **kwargs: pytest.fail("foreground daemon must not be terminated"),
+    )
+
+    assert cli._reuse_existing_daemon_record(server).reuse is True
+
+
 def test_ensure_host_daemon_heals_offline_tunnel(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -485,7 +586,7 @@ def test_ensure_host_daemon_heals_offline_tunnel(
         server_url=None,
         log_path=str(tmp_path / "daemon.log"),
         started_at=1_000_000,
-        config_sig=cli.server_config_signature(),
+        config_sig=cli._host_daemon_config_signature(None),
         resolved_server_url="http://127.0.0.1:8123",
     )
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
@@ -522,7 +623,7 @@ def test_ensure_host_daemon_young_offline_daemon_not_torn_down(
         server_url=None,
         log_path=str(tmp_path / "daemon.log"),
         started_at=1_000_000,
-        config_sig=cli.server_config_signature(),
+        config_sig=cli._host_daemon_config_signature(None),
         resolved_server_url="http://127.0.0.1:8123",
     )
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)

@@ -2149,6 +2149,30 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
     assert "DATABRICKS_UNNAMED" not in runner_env
 
 
+def test_gemini_api_key_survives_remote_daemon_and_runner_hops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native agy receives its ambient API key in ``--server`` mode."""
+    from omnigent.cli import _build_host_daemon_env
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret")
+    server = "https://example.databricksapps.com"
+
+    daemon_env = _build_host_daemon_env(server_url=server)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server,
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    assert daemon_env["GEMINI_API_KEY"] == "gemini-secret"
+    assert runner_env["GEMINI_API_KEY"] == "gemini-secret"
+
+
 def test_build_runner_env_preserves_ambient_databricks_profile() -> None:
     """
     Ambient Databricks profile/config-file selectors reach host runners.
