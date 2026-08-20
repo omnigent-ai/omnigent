@@ -20,7 +20,7 @@ depends_on: tuple[str, ...] | None = None
 def upgrade() -> None:
     with op.batch_alter_table("omnigent_conversation_metadata") as batch_op:
         batch_op.add_column(
-            sa.Column("git_head_sha", sa.String(length=40), nullable=True),
+            sa.Column("git_head_sha", sa.String(length=64), nullable=True),
         )
 
 

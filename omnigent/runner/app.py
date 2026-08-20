@@ -646,7 +646,7 @@ def _response_body_preview(resp: object, *, limit: int = 500) -> str:
     return ""
 
 
-_GIT_SHA_RE = re.compile(r"[0-9a-f]{7,40}")
+_GIT_SHA_RE = re.compile(r"[0-9a-f]{7,64}")
 
 
 def _resolve_git_head_from_workspace(workspace: str | None) -> str | None:
@@ -2053,6 +2053,7 @@ def create_runner_app(
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_git_head_sha: dict[str, str | None] = {}  # session_id → HEAD SHA at session start
+    _session_git_head_locks: dict[str, asyncio.Lock] = {}  # session_id → SHA resolution lock
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
     _session_claude_launch_config_tasks: dict[
@@ -2605,7 +2606,6 @@ def create_runner_app(
             parent_session_id=snapshot.parent_session_id,
             git_head_sha=snapshot.git_head_sha,
         )
-        _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
         if session_id not in _session_git_head_sha:
             if snapshot.git_head_sha:
@@ -2613,6 +2613,9 @@ def create_runner_app(
             else:
                 resolved = _resolve_git_head_from_workspace(snapshot.workspace)
                 _session_git_head_sha[session_id] = resolved
+        # Set _session_start_cache last — it gates the early-return in
+        # _ensure_session_registered, so SHA must be populated first.
+        _session_start_cache[session_id] = float(snapshot.created_at)
         if envelope.sub_agent_name:
             _session_sub_agent_names[session_id] = envelope.sub_agent_name
         _session_init_envelopes[session_id] = (time.monotonic(), envelope)
@@ -3550,6 +3553,7 @@ def create_runner_app(
         _session_start_cache.pop(session_id, None)
         _session_workspace_cache.pop(session_id, None)
         _session_git_head_sha.pop(session_id, None)
+        _session_git_head_locks.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
         _session_snapshot_locks.pop(session_id, None)
         _session_init_envelopes.pop(session_id, None)
@@ -8530,27 +8534,33 @@ def create_runner_app(
     async def _ensure_session_registered(session_id: str) -> None:
         if session_id in _session_start_cache:
             return
-        snapshot = await _session_snapshot(session_id)
-        _session_start_cache[session_id] = snapshot.created_at
-        # Only memoize a workspace the server actually returned; a failed
-        # fetch is re-resolved lazily by _session_workspace_value.
-        if snapshot.ok:
-            _session_workspace_cache[session_id] = snapshot.workspace
-        if session_id not in _session_git_head_sha:
-            if snapshot.git_head_sha:
-                _session_git_head_sha[session_id] = snapshot.git_head_sha
-            else:
-                resolved = await asyncio.to_thread(
-                    _resolve_git_head_from_workspace, snapshot.workspace
-                )
-                _session_git_head_sha[session_id] = resolved
-                if resolved and server_client is not None:
-                    with contextlib.suppress(Exception):
-                        await server_client.patch(
-                            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-                            json={"git_head_sha": resolved},
-                            timeout=10.0,
-                        )
+        lock = _session_git_head_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            if session_id in _session_start_cache:
+                return
+            snapshot = await _session_snapshot(session_id)
+            # Only memoize a workspace the server actually returned; a failed
+            # fetch is re-resolved lazily by _session_workspace_value.
+            if snapshot.ok:
+                _session_workspace_cache[session_id] = snapshot.workspace
+            if session_id not in _session_git_head_sha:
+                if snapshot.git_head_sha:
+                    _session_git_head_sha[session_id] = snapshot.git_head_sha
+                else:
+                    resolved = await asyncio.to_thread(
+                        _resolve_git_head_from_workspace, snapshot.workspace
+                    )
+                    _session_git_head_sha[session_id] = resolved
+                    if resolved and server_client is not None:
+                        with contextlib.suppress(Exception):
+                            await server_client.patch(
+                                f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                                json={"git_head_sha": resolved},
+                                timeout=10.0,
+                            )
+            # Set _session_start_cache last — it gates the early-return
+            # above, so SHA must be populated first.
+            _session_start_cache[session_id] = snapshot.created_at
 
     async def _resolve_session_spec_entry(session_id: str) -> _SpecEntry | None:
         if session_id in _session_spec_cache:

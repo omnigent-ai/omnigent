@@ -99,12 +99,12 @@ _logger = logging.getLogger(__name__)
 
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 
-_GIT_SHA_RE = re.compile(r"[0-9a-f]{7,40}")
+_GIT_SHA_RE = re.compile(r"[0-9a-f]{7,64}")
 
 
 def _validated_git_sha(value: str | None) -> str | None:
     if value is not None and not _GIT_SHA_RE.fullmatch(value):
-        msg = f"git_head_sha must be a 7-40 character hex SHA, got {value!r}"
+        msg = f"git_head_sha must be a 7-64 character hex SHA, got {value!r}"
         raise ValueError(msg)
     return value
 
@@ -2824,7 +2824,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     meta_sess.add(meta)
                 if terminal_launch_args is not None:
                     meta.terminal_launch_args = json.dumps(terminal_launch_args)
-                if git_head_sha is not None:
+                if git_head_sha is not None and meta.git_head_sha is None:
                     meta.git_head_sha = _validated_git_sha(git_head_sha)
         else:
             meta = self._get_meta(ap_sess, conversation_id)
