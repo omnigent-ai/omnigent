@@ -87,12 +87,12 @@ _SDK_HARNESSES: frozenset[str] = frozenset(
 # login-status probe). The ``anthropic`` / ``openai`` families authenticate via
 # subscription provider config and do not appear here. Each lambda resolves
 # through its module at call time so a test can monkeypatch
-# ``…gemini_auth.gemini_login_detected`` / ``…kimi_auth.kimi_login_detected``
+# ``…gemini_auth.gemini_login_detected`` / ``…kimi_auth.kimi_auth_configured``
 # and have the patch take effect without this dict caching the old function
 # object.
 _FAMILY_CREDENTIAL_CHECK: dict[str, Callable[[], bool]] = {
     GEMINI_FAMILY: lambda: _gemini_auth.gemini_login_detected(),
-    KIMI_KEY: lambda: _kimi_auth.kimi_login_detected(),
+    KIMI_KEY: lambda: _kimi_auth.kimi_auth_configured(),
 }
 
 # CLI-wrapping pi harnesses. Both the bare ``pi`` surface and the native

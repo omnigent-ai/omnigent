@@ -3875,19 +3875,29 @@ def _run_configure_harnesses_interactive() -> None:
                 (_KIRO, "Kiro", _cli_absence_label(KIRO_KEY), "missing", _install_hint(kiro_hint))
             )
 
-        # Kimi Code — native CLI, own auth via `kimi login`. There is no CLI
-        # login-status probe, but `kimi login` writes a credential file, so a
-        # subprocess-free file check (`kimi_login_detected`) distinguishes
-        # "signed in" (green) from "installed but not configured" (yellow).
-        # Curl-installed (no npm package), so use its install_hint when absent.
+        # Kimi Code — native CLI, own auth via `kimi login` or a Moonshot API
+        # key in `~/.kimi-code/config.toml`. There is no CLI login-status probe,
+        # so a subprocess-free check (`kimi_auth_configured`) distinguishes
+        # "signed in / API key set" (green) from "installed but not configured"
+        # (yellow). Curl-installed (no npm package), so use its install_hint when
+        # absent.
         if harness_cli_installed(KIMI_KEY):
-            from omnigent.onboarding.kimi_auth import kimi_login_detected
+            from omnigent.onboarding.kimi_auth import kimi_auth_configured
 
-            if kimi_login_detected():
+            if kimi_auth_configured():
                 rows.append((_KIMI, "Kimi Code", "Signed in", "ready", ""))
             else:
                 rows.append(
-                    (_KIMI, "Kimi Code", "Not configured", "warn", "Sign in with `kimi login`.")
+                    (
+                        _KIMI,
+                        "Kimi Code",
+                        "Not configured",
+                        "warn",
+                        (
+                            "Sign in with `kimi login` or set a Kimi API key in"
+                            " `~/.kimi-code/config.toml`."
+                        ),
+                    )
                 )
         else:
             kimi_spec = harness_install_spec(KIMI_KEY)
