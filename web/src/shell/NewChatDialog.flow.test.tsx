@@ -867,6 +867,37 @@ describe("NewChatLandingScreen create flow", () => {
     );
   });
 
+  it("persists Codex bypass so the next session shows it instead of Default", async () => {
+    setAgents([agent({ id: "ag_codex", name: "codex-native-ui", display_name: "Codex" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_codex" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_codex");
+    pickSelectOption("new-chat-landing-config-approval", "Bypass approvals & sandbox");
+    saveConfig();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() =>
+      expect(
+        JSON.parse(localStorage.getItem("omnigent:last-mode-by-harness") ?? "{}")["codex-native"]
+          ?.mode,
+      ).toBe("bypass"),
+    );
+
+    cleanup();
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_codex");
+    expect(screen.getByTestId("new-chat-landing-config-approval").textContent).toContain(
+      "Bypass approvals & sandbox",
+    );
+  });
+
   it("does not leak one harness's mode onto another harness", async () => {
     // Codex has a pick on record; selecting Claude Code (no pick) must stay on
     // its default — modes are keyed per harness, not shared.

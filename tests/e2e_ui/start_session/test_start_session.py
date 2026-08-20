@@ -1904,14 +1904,15 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
 
 
 def test_start_session_bypass_sandbox(seeded_session: tuple[str, str]) -> None:
-    """Arming DANGEROUS Codex full-bypass rides along to the create.
+    """Codex full-bypass reaches create and seeds the next session.
 
     Bypass is the most-permissive option in the Codex config modal's Approval
     dropdown — Codex's ``--dangerously-bypass-approvals-and-sandbox`` stance.
     It reads back like Claude's "Bypass permissions": a plain dropdown pick with
     no warning banner. When armed, the create ``POST /v1/sessions`` must carry
     the ``omnigent.codex_native.bypass_sandbox: "1"`` conversation label so the
-    runner launches Codex with the bypass flag.
+    runner launches Codex with the bypass flag. After returning to New Session,
+    the same dropdown must still show bypass rather than resetting to Default.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_bypass_sandbox(base_url, session_id))
@@ -1978,6 +1979,15 @@ async def _drive_bypass_sandbox(base_url: str, session_id: str) -> None:
             # label alongside the codex-native wrapper labels.
             labels = body.get("labels") or {}
             assert labels.get("omnigent.codex_native.bypass_sandbox") == "1", body
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            await _open_entry_config(page, "ag_codex_e2e")
+            await expect(page.get_by_test_id("new-chat-landing-config-approval")).to_contain_text(
+                "Bypass approvals & sandbox"
+            )
         finally:
             await browser.close()
 

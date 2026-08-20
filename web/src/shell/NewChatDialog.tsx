@@ -399,6 +399,7 @@ function createdHarnessOptions({
   supportsModelPicker,
   permissionMode,
   approvalMode,
+  bypassSandbox,
   cursorExecMode,
   agySkipMode,
   pickedModel,
@@ -414,6 +415,7 @@ function createdHarnessOptions({
   supportsModelPicker: boolean;
   permissionMode: string;
   approvalMode: string;
+  bypassSandbox: boolean;
   cursorExecMode: string;
   agySkipMode: string;
   pickedModel: string;
@@ -429,7 +431,7 @@ function createdHarnessOptions({
     options.mode = permissionMode;
     options.effort = pickedEffort;
   } else if (supportsApprovalMode) {
-    options.mode = approvalMode;
+    options.mode = bypassSandbox ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : approvalMode;
   } else if (supportsCursorMode) {
     options.mode = cursorExecMode;
   } else if (supportsAgySkipPermissions) {
@@ -1710,7 +1712,7 @@ function HarnessConfigModal({
       setBypassSandbox(draftBypass);
       if (entryHarness) {
         writeHarnessOption(entryHarness, {
-          mode: draftApproval,
+          mode: isCodex && draftBypass ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : draftApproval,
           ...(isCodex ? { model: draftModel } : {}),
         });
       }
@@ -3020,10 +3022,13 @@ export function NewChatLandingScreen() {
   // first id, or a persisted/draft pick resolving on mount), which would wipe a
   // costControlMode/bypass restored from the landing draft.
   const prevAgentIdRef = useRef<string | null | undefined>(undefined);
+  const suppressBypassSeedRef = useRef(false);
   useEffect(() => {
     const prev = prevAgentIdRef.current;
     prevAgentIdRef.current = effectiveAgentId;
-    if (prev === undefined || prev === effectiveAgentId) return;
+    suppressBypassSeedRef.current =
+      prev !== undefined && prev !== null && prev !== effectiveAgentId;
+    if (!suppressBypassSeedRef.current) return;
     setBypassSandbox(false);
     setCostControlMode(null);
   }, [effectiveAgentId, setCostControlMode]);
@@ -3080,6 +3085,11 @@ export function NewChatLandingScreen() {
           : "",
       );
     } else if (supportsApprovalMode) {
+      setBypassSandbox(
+        !suppressBypassSeedRef.current &&
+          selectedNativeHarness === "codex-native" &&
+          stored.mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
+      );
       setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
       // A remembered routing "on" outranks a remembered concrete model, and
       // also drops any model/effort left in the shared state (e.g. seeded for
@@ -4065,6 +4075,7 @@ export function NewChatLandingScreen() {
           supportsModelPicker: agentSupportsModelPicker || nativeAgent?.harness === "codex-native",
           permissionMode,
           approvalMode,
+          bypassSandbox,
           cursorExecMode,
           agySkipMode,
           pickedModel,
