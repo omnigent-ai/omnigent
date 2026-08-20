@@ -29,6 +29,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 from omnigent._platform import IS_POSIX, WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.gateway_inference import gateway_inference_map
+from omnigent.git_executor import run_git
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host import HOST_FATAL_EXIT_CODE
@@ -2452,7 +2453,7 @@ class HostProcess:
             # but not tracked runners — the reaper must not wait() them out
             # from under subprocess (#1782).
             with self._host_subprocess_op():
-                created = await asyncio.to_thread(
+                created = await run_git(
                     create_worktree,
                     repo_path=frame.repo_path,
                     branch_name=frame.branch_name,
@@ -2493,7 +2494,7 @@ class HostProcess:
             # Pause the orphan reaper while remove_worktree runs git — see
             # _handle_create_worktree above and _reap_orphans_once (#1782).
             with self._host_subprocess_op():
-                await asyncio.to_thread(
+                await run_git(
                     remove_worktree,
                     worktree_path=frame.worktree_path,
                     branch=frame.branch,
@@ -2533,7 +2534,7 @@ class HostProcess:
             # Pause the orphan reaper while git runs — see
             # _handle_create_worktree above and _reap_orphans_once.
             with self._host_subprocess_op():
-                worktrees = await asyncio.to_thread(
+                worktrees = await run_git(
                     list_worktrees,
                     repo_path=frame.repo_path,
                 )
@@ -3297,9 +3298,12 @@ class HostProcess:
         elif isinstance(frame, HostListWorktreesFrame):
             await ws.send(encode_host_frame(await self._handle_list_worktrees(frame)))
         elif isinstance(frame, HostFsRequestFrame):
-            # Git status and directory walks can block, so run the read
-            # off the event loop and reply when it completes.
-            fs_result = await asyncio.to_thread(self._handle_fs_request, frame)
+            # Workspace reads for host-less sessions — the changed-files op
+            # shells out to ``git status``, which is slow on a large/stale
+            # tree. Run on the dedicated git pool (not the shared default
+            # executor) so a slow scan can't starve the workers the host's
+            # control plane needs for launch/stop/poll/auth.
+            fs_result = await run_git(self._handle_fs_request, frame)
             await ws.send(encode_host_frame(fs_result))
         elif isinstance(frame, HostModelOptionsFrame):
             await ws.send(encode_host_frame(await self._handle_model_options(frame)))
