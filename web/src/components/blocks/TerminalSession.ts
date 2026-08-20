@@ -805,4 +805,19 @@ export class TerminalSession {
     this.lastSentSize = { cols, rows };
     this.ws.send(JSON.stringify({ type: "resize", cols, rows }));
   }
+
+  /**
+   * Send a bare ESC byte to the terminal, as a physical Escape keypress would.
+   *
+   * Mobile on-screen keyboards have no Escape key, yet ESC is the primary
+   * interrupt/steer control for terminal-driven agents — this method backs the
+   * on-screen ESC control shown on touch devices (#4944). Routes through the
+   * same input path as keystrokes so the WS-open guard and the input-activity
+   * bookkeeping apply unchanged.
+   */
+  sendEscape(): void {
+    this.lastUserInputAt = performance.now();
+    if (this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(INPUT_ENCODER.encode(""));
+  }
 }

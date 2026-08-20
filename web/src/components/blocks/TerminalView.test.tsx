@@ -29,6 +29,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     dispose: ReturnType<typeof vi.fn>;
     setTheme: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
+    sendEscape: ReturnType<typeof vi.fn>;
   }[],
 }));
 
@@ -40,6 +41,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
     dispose = vi.fn();
     setTheme = vi.fn();
     focus = vi.fn();
+    sendEscape = vi.fn();
 
     constructor(
       container: HTMLDivElement,
@@ -58,6 +60,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         dispose: this.dispose,
         setTheme: this.setTheme,
         focus: this.focus,
+        sendEscape: this.sendEscape,
       });
     }
   },
@@ -544,5 +547,53 @@ describe("selectionHintText", () => {
     expect(hint).toContain("right-click");
     expect(hint).not.toContain("⌘");
     expect(hint.toLowerCase()).not.toContain("ctrl");
+  });
+});
+
+describe("on-screen ESC control (#4944)", () => {
+  function coarseMatchMedia(query: string): MediaQueryList {
+    const matches = query.includes("pointer: coarse");
+    return {
+      matches,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    } as MediaQueryList;
+  }
+
+  it("shows on coarse pointers once connected and sends ESC through the session", async () => {
+    const spy = vi.spyOn(window, "matchMedia").mockImplementation(coarseMatchMedia);
+    try {
+      render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      const inst = terminalSessionMock.instances[0];
+      act(() => inst.onState({ kind: "connected" }));
+
+      const esc = await screen.findByTestId("terminal-escape-button");
+      fireEvent.click(esc);
+
+      expect(inst.sendEscape).toHaveBeenCalledTimes(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("stays hidden on fine-pointer (desktop) devices", async () => {
+    const spy = vi
+      .spyOn(window, "matchMedia")
+      .mockImplementation((q: string) => coarseMatchMedia(q.replace("coarse", "fine")));
+    try {
+      render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      act(() => terminalSessionMock.instances[0].onState({ kind: "connected" }));
+
+      expect(screen.queryByTestId("terminal-escape-button")).toBeNull();
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
