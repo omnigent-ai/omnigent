@@ -81,6 +81,20 @@ class AcpCliHarness:
 # Keyed by canonical harness id. Keep keys sorted; each row's registrations
 # derive from here (see the module docstring for the full list).
 ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
+    # Cline's CLI exposes an ACP stdio server through ``cline --acp``. It is
+    # distributed as the ``cline`` npm package and uses Cline's own saved
+    # provider credentials; Omnigent does not store or inject a credential.
+    "cline": AcpCliHarness(
+        install=HarnessInstallSpec(
+            "Cline",
+            "cline",
+            "cline",
+            login_args=("auth",),
+            install_hint="npm install -g cline",
+            auth_hint="run `cline auth` to configure a provider",
+        ),
+        args=("--acp",),
+    ),
     # Devin (Cognition's ``devin`` CLI) drives ``devin acp`` — its ACP stdio
     # server. Ships via a curl installer (not npm) and authenticates through its
     # own ``devin auth login``, which writes a credential file it reads back at

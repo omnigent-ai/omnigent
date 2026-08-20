@@ -12,9 +12,9 @@ add/set-default/remove write paths surfaces here rather than silently.
 harness on a single compact row — the name on the left, then an aligned
 ``✓``/``✗`` status column — in 0.3 priority order: ``1=Claude``,
 ``2=Codex``, ``3=Cursor``, ``4=OpenCode``, ``5=Hermes``, ``6=Pi``,
-``7=Antigravity``, ``8=Qwen Code``, ``9=Goose``, ``10=Copilot``, ``11=Kiro``,
-``12=Kimi Code``, ``13=Import from OpenClaw``, ``14=Custom ACP agent``,
-``15=Quit``. There is no "More" folding — every harness is visible at once —
+``7=Antigravity``, ``8=Qwen Code``, ``9=Goose``, ``10=Cline``,
+``11=Devin``, ``12=Grok Build``, ``13=Copilot``, ``14=Kiro``, ``15=Kimi Code``,
+``16=Import from OpenClaw``, ``17=Custom ACP agent``, ``18=Quit``. There is no "More" folding — every harness is visible at once —
 and the actionable hint (install command / next step)
 renders only for the highlighted row, as the selector's description line.
 Selecting a harness drills into level 2 — its configured credentials, then ``+ Add a
@@ -1700,6 +1700,7 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Goose",
         # Builtin ACP CLI rows (ACP_CLI_HARNESSES) render after Goose, the other
         # ACP-family builtin, sorted by id, before the non-ACP harnesses.
+        "Cline",
         "Devin",
         "Grok Build",
         "Copilot",
@@ -1865,7 +1866,7 @@ def test_setup_imports_openclaw_agents(isolated_config) -> None:
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["15", "", "", "q"]) + "\n"
+    stdin = "\n".join(["16", "", "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1887,7 +1888,7 @@ def test_setup_imports_openclaw_agents_from_user_selected_path(isolated_config) 
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["15", "", str(selected), "", "q"]) + "\n"
+    stdin = "\n".join(["16", "", str(selected), "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1904,7 +1905,7 @@ def test_setup_rejects_user_selected_unrelated_file(isolated_config) -> None:
     selected = isolated_config / "package.json"
     selected.write_text('{"name": "unrelated"}', encoding="utf-8")
 
-    stdin = "\n".join(["15", "", str(selected), "2", "q"]) + "\n"
+    stdin = "\n".join(["16", "", str(selected), "2", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -2095,14 +2096,15 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("5", "_manage_hermes_harness"),
         ("8", "_manage_qwen_harness"),
         ("9", "_manage_goose_harness"),
-        # 10-11 are the builtin ACP CLI rows (Devin, Grok Build — sorted by id);
-        # every row after them shifted down by two when that block landed.
+        # 10-12 are the builtin ACP CLI rows (Cline, Devin, Grok Build — sorted
+        # by id); every row after them shifted when that block landed.
         ("10", "_show_acp_cli_harness"),
         ("11", "_show_acp_cli_harness"),
-        ("12", "_manage_copilot_harness"),
-        ("13", "_manage_kiro_harness"),
-        ("14", "_manage_kimi_harness"),
-        ("16", "_add_acp_agent"),
+        ("12", "_show_acp_cli_harness"),
+        ("13", "_manage_copilot_harness"),
+        ("14", "_manage_kiro_harness"),
+        ("15", "_manage_kimi_harness"),
+        ("17", "_add_acp_agent"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(
