@@ -4894,6 +4894,18 @@
       "SessionProjectSummary": {
         "description": "One entry of `GET /v1/sessions/projects` \u2014 a sidebar project folder.\n\nDual-read union of first-class projects and legacy `omni_project`\nlabel-projects, keyed by name.",
         "properties": {
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The project's chosen emoji icon (a unicode grapheme), read from its `config`; `None` when unset or for a label-only folder, so the sidebar falls back to the default folder glyph.",
+            "title": "Icon"
+          },
           "id": {
             "anyOf": [
               {

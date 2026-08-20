@@ -648,7 +648,12 @@ def register_core_routes(
             by_name: dict[str, SessionProjectSummary] = {}
             if project_store is not None:
                 for proj in project_store.list(user_id=user_id):
-                    by_name[proj.name] = SessionProjectSummary(id=proj.id, name=proj.name)
+                    icon = proj.config.get("icon")
+                    by_name[proj.name] = SessionProjectSummary(
+                        id=proj.id,
+                        name=proj.name,
+                        icon=icon if isinstance(icon, str) else None,
+                    )
             # Legacy path: label-derived projects (id=None unless already first-class).
             for name in conversation_store.list_projects(owned_by=user_id):
                 by_name.setdefault(name, SessionProjectSummary(id=None, name=name))

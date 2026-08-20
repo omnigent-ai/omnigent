@@ -1336,6 +1336,9 @@ export { PROJECT_LABEL_KEY };
 export interface ProjectSummary {
   id: string | null;
   name: string;
+  /** Chosen emoji icon (a unicode grapheme), or null/absent for the default
+      folder glyph. Sourced from the project's `config.icon`. */
+  icon?: string | null;
 }
 
 /**
@@ -1919,7 +1922,7 @@ export function useUpdateProjectConfig() {
       // config to `{}` and drop the saved defaults on that first visit.
       queryClient.setQueryData<ProjectSummary[]>(["projects"], (prev) => {
         if (!prev) return prev;
-        const summary = { id: project.id, name: project.name };
+        const summary = { id: project.id, name: project.name, icon: project.config?.icon };
         return prev.some((p) => p.name === project.name)
           ? prev.map((p) => (p.name === project.name ? summary : p))
           : [...prev, summary];
