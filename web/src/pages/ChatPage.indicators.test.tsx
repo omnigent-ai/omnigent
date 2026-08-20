@@ -8,6 +8,8 @@ import {
   ConnectionIndicator,
   RunnerStartingIndicator,
   SandboxFailedIndicator,
+  summarizeSetupScript,
+  WorktreeSetupIndicator,
 } from "./ChatPage";
 
 // Render-level coverage for the chat surface's status bands and bubble
@@ -19,7 +21,7 @@ import {
 afterEach(() => {
   // Several tests poke sandboxStatus into the global zustand store; reset it
   // so a leftover launch band can't bleed into the next test.
-  useChatStore.setState({ sandboxStatus: null });
+  useChatStore.setState({ sandboxStatus: null, worktreeSetup: null });
   cleanup();
 });
 
@@ -36,6 +38,92 @@ describe("SandboxFailedIndicator", () => {
     // ternary guards the suffix.
     render(<SandboxFailedIndicator status={{ stage: "failed", error: null }} />);
     expect(screen.getByText("Sandbox launch failed")).toBeInTheDocument();
+  });
+});
+
+describe("WorktreeSetupIndicator", () => {
+  it("self-gates to null for a session with no setup command", () => {
+    // WHY: the vast majority of sessions configure no hook — they must not
+    // gain a band.
+    render(<WorktreeSetupIndicator />);
+    expect(screen.queryByTestId("worktree-setup-indicator")).not.toBeInTheDocument();
+  });
+
+  it("names the running setup script so the gated first turn explains itself", () => {
+    // WHY: the server blocks the first turn until setup finishes; without this
+    // band the session just looks hung.
+    useChatStore.setState({
+      worktreeSetup: {
+        state: "running",
+        command: "bun install",
+        reason: null,
+        outputTail: null,
+      },
+    });
+    render(<WorktreeSetupIndicator />);
+    expect(screen.getByTestId("worktree-setup-indicator")).toBeInTheDocument();
+    expect(screen.getByText(/Running setup script… \(bun install\)/)).toBeInTheDocument();
+  });
+
+  it("summarizes a multi-line script instead of inlining the whole thing", () => {
+    // WHY: the band is a one-line truncating span, so a raw multi-line script
+    // collapses into an unreadable run-on.
+    useChatStore.setState({
+      worktreeSetup: {
+        state: "running",
+        command: "#!/usr/bin/env bash\n# install deps\nbun install\ncp ../../.env .",
+        reason: null,
+        outputTail: null,
+      },
+    });
+    render(<WorktreeSetupIndicator />);
+    // First MEANINGFUL line (shebang + comments skipped), marked as having more.
+    expect(screen.getByText(/Running setup script… \(bun install …\)/)).toBeInTheDocument();
+  });
+
+  it("reports the failure reason once setup gave up", () => {
+    // WHY: the hook is fail-open, so the session IS usable — the band has to
+    // say what didn't happen rather than block anything.
+    useChatStore.setState({
+      worktreeSetup: {
+        state: "failed",
+        command: null,
+        reason: "the command timed out and was killed",
+        outputTail: "installing…",
+      },
+    });
+    render(<WorktreeSetupIndicator />);
+    expect(
+      screen.getByText(/Setup script didn't finish: the command timed out and was killed/),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("summarizeSetupScript", () => {
+  it("returns null when there is nothing worth showing", () => {
+    expect(summarizeSetupScript(null)).toBeNull();
+    expect(summarizeSetupScript("")).toBeNull();
+    // A script that is only a shebang and comments describes no action.
+    expect(summarizeSetupScript("#!/bin/sh\n# nothing here\n")).toBeNull();
+  });
+
+  it("passes a single command through unchanged", () => {
+    expect(summarizeSetupScript("bun install")).toBe("bun install");
+  });
+
+  it("skips the shebang and comments to the first real line", () => {
+    expect(summarizeSetupScript("#!/bin/bash\n# setup\nbun install\n")).toBe("bun install");
+  });
+
+  it("marks that more lines follow", () => {
+    expect(summarizeSetupScript("bun install\nbun run build")).toBe("bun install …");
+  });
+
+  it("caps a very long first line", () => {
+    const summary = summarizeSetupScript("x".repeat(200));
+    expect(summary).not.toBeNull();
+    expect((summary as string).length).toBeLessThanOrEqual(60);
+    expect(summary).toMatch(/…$/);
   });
 });
 

@@ -18,6 +18,7 @@ from omnigent.host.frames import (
     HostCreateWorktreeFrame,
     HostListWorktreesFrame,
     HostRemoveWorktreeFrame,
+    HostRunWorktreeHookFrame,
     encode_host_frame,
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry
@@ -88,6 +89,7 @@ async def _await_host_worktree_result(
     request_id: str,
     frame: str,
     op: str,
+    timeout_s: float | None = None,
 ) -> dict[str, object]:
     """
     Send a worktree frame and await its matching result over the tunnel.
@@ -104,11 +106,18 @@ async def _await_host_worktree_result(
     :param frame: Encoded host frame to send.
     :param op: Short label for error messages, e.g.
         ``"worktree creation"``.
+    :param timeout_s: How long to wait for the host's reply. ``None``
+        reads :data:`_WORKTREE_TIMEOUT_S` at call time (so tests can
+        shorten it); the hook proxy passes the project's own (longer)
+        hook timeout plus a margin.
     :returns: The host's result dict (``status`` plus op-specific
         fields).
     :raises WorktreeHostUnavailableError: On connection loss or no
-        reply within :data:`_WORKTREE_TIMEOUT_S`.
+        reply within ``timeout_s``.
     """
+    # Read at CALL time, not as a default argument, so a monkeypatched
+    # module constant still shortens the wait.
+    wait_s = _WORKTREE_TIMEOUT_S if timeout_s is None else timeout_s
     future: asyncio.Future[dict[str, object]] = asyncio.get_running_loop().create_future()
     pending[request_id] = future
     try:
@@ -119,11 +128,11 @@ async def _await_host_worktree_result(
                 f"host '{host_conn.host_id}' connection lost during {op}"
             ) from exc
         try:
-            return await asyncio.wait_for(future, timeout=_WORKTREE_TIMEOUT_S)
+            return await asyncio.wait_for(future, timeout=wait_s)
         except asyncio.TimeoutError as exc:
             raise WorktreeHostUnavailableError(
                 f"host '{host_conn.host_id}' did not respond to {op} within "
-                f"{_WORKTREE_TIMEOUT_S:.0f}s (it may be running an older version "
+                f"{wait_s:.0f}s (it may be running an older version "
                 "that does not support worktrees)"
             ) from exc
     finally:
@@ -275,3 +284,106 @@ async def list_worktrees_on_host(
     if not isinstance(worktrees, list):
         raise WorktreeProxyError("host returned an incomplete worktree list")
     return worktrees
+
+
+# Slack over the host's own hook timeout so the host's report (including its
+# own "timed out" verdict) wins over a generic server-side timeout.
+_HOOK_REPLY_MARGIN_S: float = 30.0
+
+
+@dataclass
+class WorktreeHookOutcome:
+    """
+    Result of a project's worktree lifecycle command as seen by the server.
+
+    :param exit_code: The command's exit status, e.g. ``0``. ``None``
+        when it timed out.
+    :param timed_out: ``True`` when the host killed the hook's process
+        group after the timeout elapsed.
+    :param output_tail: Last 10 KB of combined stdout+stderr, e.g.
+        ``"bun install v1.1.0\\n..."``.
+    """
+
+    exit_code: int | None
+    timed_out: bool
+    output_tail: str
+
+    @property
+    def ok(self) -> bool:
+        """
+        Whether the hook completed successfully.
+
+        :returns: ``True`` for a zero exit code that did not time out.
+        """
+        return not self.timed_out and self.exit_code == 0
+
+
+async def run_worktree_hook_on_host(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    command: str,
+    worktree_path: str,
+    hook: str,
+    repo_path: str | None = None,
+    branch: str | None = None,
+    base_branch: str | None = None,
+    timeout_seconds: float,
+) -> WorktreeHookOutcome:
+    """
+    Send a ``host.run_worktree_hook`` frame and await the result.
+
+    :param host_registry: Server-side registry; used to enqueue the
+        outbound frame on the host's send queue.
+    :param host_conn: Live host connection that owns the worktree.
+    :param command: The project's configured script, e.g.
+        ``"bun install"`` or a multi-line shebang script.
+    :param worktree_path: Worktree directory to run in on the host, e.g.
+        ``"/Users/alice/myrepo-worktrees/feature-login"``.
+    :param hook: ``"post_create"`` or ``"pre_delete"``.
+    :param repo_path: Main repo work tree, exported to the hook as
+        ``OMNIGENT_REPO_PATH``.
+    :param branch: Branch in the worktree, exported as
+        ``OMNIGENT_BRANCH``.
+    :param base_branch: Base ref, exported as ``OMNIGENT_BASE_BRANCH``.
+    :param timeout_seconds: The project's hook timeout, already clamped.
+    :returns: The hook's exit code, timeout flag, and output tail.
+    :raises WorktreeHostUnavailableError: If the host connection drops or
+        doesn't reply within ``timeout_seconds`` plus a margin.
+    :raises WorktreeProxyError: If the host could not start the hook at
+        all (e.g. the worktree directory is gone).
+    """
+    request_id = secrets.token_hex(8)
+    frame = encode_host_frame(
+        HostRunWorktreeHookFrame(
+            request_id=request_id,
+            command=command,
+            worktree_path=worktree_path,
+            hook=hook,
+            repo_path=repo_path,
+            branch=branch,
+            base_branch=base_branch,
+            timeout_seconds=timeout_seconds,
+        )
+    )
+    result = await _await_host_worktree_result(
+        host_registry=host_registry,
+        host_conn=host_conn,
+        pending=host_conn.pending_worktree_hooks,
+        request_id=request_id,
+        frame=frame,
+        op=f"{hook} worktree hook",
+        timeout_s=timeout_seconds + _HOOK_REPLY_MARGIN_S,
+    )
+    if result.get("status") != "ok":
+        raise WorktreeProxyError(
+            f"{hook} worktree hook could not run: "
+            f"{result.get('error') or 'host reported no detail'}"
+        )
+    exit_code = result.get("exit_code")
+    output_tail = result.get("output_tail")
+    return WorktreeHookOutcome(
+        exit_code=exit_code if isinstance(exit_code, int) else None,
+        timed_out=bool(result.get("timed_out")),
+        output_tail=output_tail if isinstance(output_tail, str) else "",
+    )

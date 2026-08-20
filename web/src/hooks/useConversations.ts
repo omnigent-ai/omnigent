@@ -35,6 +35,11 @@ import {
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
 import { showToast } from "@/components/ui/toast";
+import {
+  showBulkTeardownFailureToast,
+  showTeardownFailureToast,
+  type TeardownFailure,
+} from "@/components/WorktreeTeardownToast";
 import { revokePermission } from "@/lib/permissionsApi";
 import { conversationDisplayLabel, setLegacyPinnedConversationId } from "@/shell/sidebarNav";
 import { stopSession } from "@/lib/sessionsApi";
@@ -486,17 +491,74 @@ export async function archiveConversation(id: string, archived: boolean): Promis
  * the server removes the worktree directory and deletes its branch.
  * See designs/SESSION_GIT_WORKTREE.md.
  */
-export async function deleteConversation(id: string, deleteBranch = false): Promise<void> {
+export async function deleteConversation(
+  id: string,
+  deleteBranch = false,
+): Promise<PreDeleteHookResult | null> {
   const query = deleteBranch ? "?delete_branch=true" : "";
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}${query}`, {
     method: "DELETE",
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  // The project's worktree teardown script, when one ran. Fail-open
+  // server-side, so a non-zero result still means the session is gone — the
+  // caller only surfaces it. A body we can't parse is not worth failing on.
+  let hook: PreDeleteHookResult | null;
+  try {
+    const body = (await res.json()) as { pre_delete_hook?: PreDeleteHookResult | null };
+    hook = body.pre_delete_hook ?? null;
+  } catch {
+    hook = null;
+  }
   // Drop any client-side queued messages for the now-deleted session; bound to
   // a dead conversation, they could never flush.
   useChatStore.getState().clearQueuedMessages(id);
   // A deleted conversation must stop pumping and let go of its stream.
   releaseConversation(id);
+  return hook;
+}
+
+/**
+ * Outcome of a project's worktree teardown script
+ * (`worktree_pre_delete_command`), reported in the DELETE response body.
+ *
+ * The session row is gone by the time this arrives, so there is nowhere to
+ * persist it — a failure surfaces as a toast and nothing else.
+ */
+export interface PreDeleteHookResult {
+  /** The script's exit status; `null` when it timed out or never started. */
+  exit_code: number | null;
+  /** True when the script was killed after exceeding its timeout. */
+  timed_out: boolean;
+  /** Last 10 KB of the script's combined stdout+stderr. */
+  output_tail: string;
+  /** Why the command could not run at all (host offline, worktree gone). */
+  error: string | null;
+}
+
+/**
+ * Whether a teardown-script result is worth telling the user about.
+ *
+ * @param hook - The reported result, or null when no script ran.
+ * @returns True when the script failed, timed out, or never ran.
+ */
+export function preDeleteHookFailed(
+  hook: PreDeleteHookResult | null | undefined,
+): hook is PreDeleteHookResult {
+  if (!hook) return false;
+  return hook.timed_out || hook.error !== null || hook.exit_code !== 0;
+}
+
+/**
+ * One-line description of a failed teardown script, for a toast.
+ *
+ * @param hook - The failed result.
+ * @returns The reason, e.g. `"timed out"`.
+ */
+function preDeleteHookReason(hook: PreDeleteHookResult): string {
+  if (hook.error !== null) return hook.error;
+  if (hook.timed_out) return "timed out";
+  return `exited with status ${hook.exit_code}`;
 }
 
 /**
@@ -821,7 +883,7 @@ export function useStopAndDeleteConversation() {
       } catch {
         // Best-effort: proceed with delete even if the stop didn't land.
       }
-      await deleteConversation(id, deleteBranch);
+      return await deleteConversation(id, deleteBranch);
     },
     onMutate: async ({ id }) => {
       // Snapshot the label before the row leaves the cache — a failure
@@ -841,8 +903,18 @@ export function useStopAndDeleteConversation() {
           : "Couldn't delete the session — it's back in the sidebar.",
       );
     },
-    onSuccess: (_data, { id }) => {
+    onSuccess: (hook, { id }, context) => {
       finalizeDeletedConversations(queryClient, [id]);
+      // The project's worktree teardown script failed. Fail-open server-side,
+      // so the session IS deleted — the toast is the only place this can
+      // surface (the row it would have hung off is gone).
+      if (preDeleteHookFailed(hook)) {
+        showTeardownFailureToast({
+          label: context?.label ?? "the session",
+          reason: preDeleteHookReason(hook),
+          outputTail: hook.output_tail,
+        });
+      }
     },
   });
 }
@@ -977,6 +1049,14 @@ export function useBulkDeleteConversations() {
       ids: string[];
       deleteBranchIds?: ReadonlySet<string>;
     }) => {
+      // Snapshot labels up front: the rows leave the cache in `onMutate`, so
+      // an aggregate teardown toast can no longer look them up afterwards.
+      const labels = new Map(
+        ids.map((id) => {
+          const row = findCachedConversationRow(queryClient, id);
+          return [id, row ? conversationDisplayLabel(row) : id];
+        }),
+      );
       const results = await Promise.allSettled(
         ids.map(async (id) => {
           try {
@@ -984,15 +1064,31 @@ export function useBulkDeleteConversations() {
           } catch {
             // Best-effort stop
           }
-          await deleteConversation(id, deleteBranchIds?.has(id) ?? false);
+          return await deleteConversation(id, deleteBranchIds?.has(id) ?? false);
         }),
       );
       const succeeded: string[] = [];
       const failed: string[] = [];
+      // One aggregate toast for every worktree whose teardown script failed;
+      // N toasts would bury the sidebar. Fail-open, so these sessions are gone.
+      const teardownFailures: TeardownFailure[] = [];
       for (let i = 0; i < results.length; i++) {
-        if (results[i].status === "fulfilled") succeeded.push(ids[i]);
-        else failed.push(ids[i]);
+        const result = results[i];
+        if (result.status === "fulfilled") {
+          succeeded.push(ids[i]);
+          if (preDeleteHookFailed(result.value)) {
+            const hook = result.value;
+            teardownFailures.push({
+              label: labels.get(ids[i]) ?? ids[i],
+              reason: preDeleteHookReason(hook),
+              outputTail: hook.output_tail,
+            });
+          }
+        } else {
+          failed.push(ids[i]);
+        }
       }
+      showBulkTeardownFailureToast(teardownFailures, ids.length);
       if (failed.length > 0) {
         throw new BulkConversationMutationError("delete", {
           failed,

@@ -6,7 +6,9 @@
 // Scope mirrors what the composer prefills today: host, workspace, agent,
 // whether new sessions start in a fresh git worktree, and the base branch a
 // worktree forks from (which overrides the user-global default in Settings ›
-// Git). Model / reasoning-effort / harness are per-agent run config,
+// Git) — plus the two worktree lifecycle scripts, which are the one group the
+// SERVER reads and executes rather than prefilling.
+// Model / reasoning-effort / harness are per-agent run config,
 // deliberately out of scope here. The host and agent pickers reuse the
 // composer's components; the working directory reuses its filesystem browser
 // (inline, so it scrolls inside the modal).
@@ -71,8 +73,56 @@ function Field({
   );
 }
 
+/**
+ * A stacked full-width field for a multi-line script.
+ *
+ * The side-by-side `Field` layout caps its control at `sm:w-64`, which is far
+ * too narrow to read a script in. These get the label above and the editor
+ * across the whole dialog instead.
+ */
+function ScriptField({
+  label,
+  hint,
+  htmlFor,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  htmlFor?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <label htmlFor={htmlFor} className="flex flex-col">
+        <span className="font-medium text-ui">{label}</span>
+        {hint && <span className="text-muted-foreground text-sm">{hint}</span>}
+      </label>
+      {children}
+    </div>
+  );
+}
+
+/** Shared classes for the two script editors: monospace, tab-friendly, and
+ *  vertically resizable so a long script can be opened up in place. */
+const SCRIPT_TEXTAREA_CLASS =
+  "w-full resize-y rounded-md border bg-transparent px-3 py-2 font-mono text-sm leading-relaxed outline-none disabled:cursor-not-allowed disabled:opacity-50";
+
+/** Placeholder for the setup script — a realistic multi-line example, so the
+ *  field reads as "script" rather than "one command". */
+const POST_CREATE_PLACEHOLDER = `# Runs in the new worktree before the first turn.
+# Multi-line is fine; add a #!/usr/bin/env bash line to use bash.
+bun install
+cp ../../.env .`;
+
+/** Placeholder for the teardown script. */
+const PRE_DELETE_PLACEHOLDER = `# Runs in the worktree just before it is deleted.
+docker compose down
+rm -rf node_modules`;
+
 /** Trim a text input to `undefined` when blank, so an empty field stores no
- *  default (an unset key) rather than an empty string. */
+ *  default (an unset key) rather than an empty string. For a script only the
+ *  OUTER whitespace goes — internal newlines and indentation are the program.
+ *  (The server normalizes CRLF; a textarea can emit it on Windows.) */
 function trimOrUndef(value: string): string | undefined {
   const trimmed = value.trim();
   return trimmed === "" ? undefined : trimmed;
@@ -124,6 +174,13 @@ export function ProjectSettingsDialog({
   const [baseBranch, setBaseBranch] = useState("");
   const [agentId, setAgentId] = useState<string | null>(null);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  // Worktree lifecycle scripts the HOST runs (unlike every other field here,
+  // which is only a composer prefill). Each may be one command or a multi-line
+  // script. Blank stores nothing, which turns the hook off. The timeout is
+  // shared by both and blank means the 300s default.
+  const [postCreateCommand, setPostCreateCommand] = useState("");
+  const [preDeleteCommand, setPreDeleteCommand] = useState("");
+  const [hookTimeout, setHookTimeout] = useState("");
 
   // The agent picker and the host Select portal their dropdowns OUTSIDE
   // DialogContent, so their dismiss (pick an option / click the body while
@@ -169,6 +226,11 @@ export function ProjectSettingsDialog({
     setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
     setWorkspaceOpen(false);
+    setPostCreateCommand(c.worktree_post_create_command ?? "");
+    setPreDeleteCommand(c.worktree_pre_delete_command ?? "");
+    setHookTimeout(
+      c.worktree_hook_timeout_seconds === undefined ? "" : String(c.worktree_hook_timeout_seconds),
+    );
   }, [open, stored, loadFailed]);
 
   const onSubmit = (e: FormEvent) => {
@@ -196,6 +258,19 @@ export function ProjectSettingsDialog({
     // invisible default after the toggle is turned off.
     const base = useWorktree ? trimOrUndef(baseBranch) : undefined;
     if (base) config.base_branch = base;
+    // Worktree lifecycle scripts. Kept independent of the worktree toggle:
+    // a session can start in an existing worktree the composer created without
+    // this project default being on, and the pre-delete command still applies.
+    const postCreate = trimOrUndef(postCreateCommand);
+    if (postCreate) config.worktree_post_create_command = postCreate;
+    const preDelete = trimOrUndef(preDeleteCommand);
+    if (preDelete) config.worktree_pre_delete_command = preDelete;
+    // Only meaningful with a script; a blank/unparseable value falls through
+    // to the server default rather than storing a bogus number.
+    const timeout = Number.parseInt(hookTimeout.trim(), 10);
+    if ((postCreate || preDelete) && Number.isFinite(timeout) && timeout > 0) {
+      config.worktree_hook_timeout_seconds = timeout;
+    }
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
@@ -394,6 +469,71 @@ export function ProjectSettingsDialog({
                 disabled={isLoading}
               />
             </Field>
+          )}
+
+          <ScriptField
+            label="Worktree setup script"
+            hint="Runs on the host in each new worktree before the first turn. One command or a full script; leave blank for none."
+            htmlFor="project-settings-post-create"
+          >
+            <textarea
+              id="project-settings-post-create"
+              data-testid="project-settings-post-create"
+              className={SCRIPT_TEXTAREA_CLASS}
+              rows={5}
+              spellCheck={false}
+              placeholder={POST_CREATE_PLACEHOLDER}
+              value={postCreateCommand}
+              onChange={(e) => setPostCreateCommand(e.target.value)}
+              disabled={isLoading}
+            />
+          </ScriptField>
+
+          <ScriptField
+            label="Worktree teardown script"
+            hint="Runs on the host in the worktree just before it's deleted (stop a dev server, drop a database)."
+            htmlFor="project-settings-pre-delete"
+          >
+            <textarea
+              id="project-settings-pre-delete"
+              data-testid="project-settings-pre-delete"
+              className={SCRIPT_TEXTAREA_CLASS}
+              rows={4}
+              spellCheck={false}
+              placeholder={PRE_DELETE_PLACEHOLDER}
+              value={preDeleteCommand}
+              onChange={(e) => setPreDeleteCommand(e.target.value)}
+              disabled={isLoading}
+            />
+          </ScriptField>
+
+          {(postCreateCommand.trim() !== "" || preDeleteCommand.trim() !== "") && (
+            <>
+              <Field
+                label="Script timeout"
+                hint="Seconds before either script is killed; blank uses 300."
+                htmlFor="project-settings-hook-timeout"
+              >
+                <input
+                  id="project-settings-hook-timeout"
+                  data-testid="project-settings-hook-timeout"
+                  type="number"
+                  min={1}
+                  max={3600}
+                  className="w-full rounded-md border bg-transparent px-3 py-2 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                  placeholder="300"
+                  value={hookTimeout}
+                  onChange={(e) => setHookTimeout(e.target.value)}
+                  disabled={isLoading}
+                />
+              </Field>
+              {/* The accepted trust model, stated where it's chosen: these
+                  scripts run as the host daemon's OS user with no sandbox. */}
+              <p className="text-muted-foreground text-sm" data-testid="project-settings-hook-note">
+                These scripts run unsandboxed as the user running the host, with the same access as
+                the agent itself.
+              </p>
+            </>
           )}
 
           <Field label="Agent" hint="Default agent / harness for new sessions">

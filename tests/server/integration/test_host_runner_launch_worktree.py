@@ -32,6 +32,7 @@ from omnigent.host.frames import (
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostRemoveWorktreeFrame,
+    HostRunWorktreeHookFrame,
     HostStatFrame,
     decode_host_frame,
 )
@@ -47,6 +48,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -81,6 +83,9 @@ def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
+        # Projects hold the per-project worktree setup command this endpoint
+        # must run before it spawns a runner.
+        project_store=SqlAlchemyProjectStore(db_uri),
     )
 
 
@@ -103,11 +108,17 @@ class _HostCapture:
     :param launch: ``host.launch_runner`` frames received.
     :param remove: ``host.remove_worktree`` frames received (a non-empty
         list proves the rollback path fired).
+    :param hooks: ``host.run_worktree_hook`` frames received (the
+        project's worktree setup command).
+    :param order: Frame-kind names in arrival order, so a test can assert
+        setup ran before the runner was launched.
     """
 
     create: list[HostCreateWorktreeFrame] = field(default_factory=list)
     launch: list[HostLaunchRunnerFrame] = field(default_factory=list)
     remove: list[HostRemoveWorktreeFrame] = field(default_factory=list)
+    hooks: list[HostRunWorktreeHookFrame] = field(default_factory=list)
+    order: list[str] = field(default_factory=list)
 
 
 # register(*, create_status=, create_error=, launch_status=) -> _HostCapture
@@ -173,6 +184,7 @@ async def register_host(
                         )
                 elif isinstance(frame, HostCreateWorktreeFrame):
                     cap.create.append(frame)
+                    cap.order.append("create")
                     fut = conn.pending_create_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         if create_status == "ok":
@@ -194,8 +206,23 @@ async def register_host(
                                     "error": create_error,
                                 }
                             )
+                elif isinstance(frame, HostRunWorktreeHookFrame):
+                    cap.hooks.append(frame)
+                    cap.order.append(f"hook:{frame.hook}")
+                    fut = conn.pending_worktree_hooks.pop(frame.request_id, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(
+                            {
+                                "status": "ok",
+                                "exit_code": 0,
+                                "timed_out": False,
+                                "output_tail": "setup ok\n",
+                                "error": None,
+                            }
+                        )
                 elif isinstance(frame, HostLaunchRunnerFrame):
                     cap.launch.append(frame)
+                    cap.order.append("launch")
                     fut = conn.pending_launches.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result(
@@ -209,6 +236,7 @@ async def register_host(
                         )
                 elif isinstance(frame, HostRemoveWorktreeFrame):
                     cap.remove.append(frame)
+                    cap.order.append("remove")
                     fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result({"status": "ok", "error": None})
@@ -443,3 +471,92 @@ async def test_launch_runner_retry_succeeds_after_failed_launch(
     assert conv is not None
     assert conv.workspace == f"{_SOURCE_REPO}-worktrees/feature-y"
     assert conv.git_branch == "feature/y"
+
+
+async def _filed_bare_session(
+    client: httpx.AsyncClient,
+    name: str,
+    project_name: str,
+    config: dict[str, object],
+) -> str:
+    """Create an unbound session filed into a project holding hook config.
+
+    The composer files a new session by stamping the legacy
+    ``omni_project`` label at create time, which is what the server
+    resolves the project's worktree hook config through.
+
+    :param client: The test HTTP client.
+    :param name: Agent name to create.
+    :param project_name: Project to create and file the session into.
+    :param config: The project's ``config`` object.
+    :returns: The new session id.
+    """
+    proj = await client.post("/v1/projects", json={"name": project_name, "config": config})
+    assert proj.status_code in (200, 201), proj.text
+    agent = await create_test_agent(client, name=name)
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "labels": {"omni_project": project_name}},
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+async def test_launch_runner_runs_setup_command_before_the_runner_starts(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """The project's setup command runs inline, before the runner launches.
+
+    This endpoint has no first-turn gate to lean on — the runner spawns as
+    part of the request — so setup must complete synchronously in between,
+    or the agent starts in a half-prepared worktree.
+    """
+    cap = register_host()
+    session_id = await _filed_bare_session(
+        client,
+        "wt-launch-hook-agent",
+        "Launch-hooked",
+        {"worktree_post_create_command": "bun install"},
+    )
+
+    resp = await _launch(client, session_id, git={"branch_name": "feature/hooked"})
+    assert resp.status_code == 200, resp.text
+
+    assert len(cap.hooks) == 1, f"expected one hook frame, got {len(cap.hooks)}"
+    hook = cap.hooks[0]
+    assert hook.hook == "post_create"
+    assert hook.command == "bun install"
+    assert hook.worktree_path == f"{_SOURCE_REPO}-worktrees/feature-hooked"
+    # Ordering is the whole point: worktree → setup → runner.
+    assert cap.order == ["create", "hook:post_create", "launch"]
+
+
+async def test_launch_runner_skips_setup_command_on_a_lost_bind(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """A bind that loses the CAS rolls the worktree back and runs no setup.
+
+    The rollback destroys the worktree, so running setup in it would be
+    pure waste (and could touch shared state like a package registry).
+    """
+    cap = register_host()
+    session_id = await _filed_bare_session(
+        client,
+        "wt-launch-lost-agent",
+        "Launch-hooked-lost",
+        {"worktree_post_create_command": "bun install"},
+    )
+
+    # First bind wins the CAS and takes the runner.
+    first = await _launch(client, session_id, git={"branch_name": "feature/first"})
+    assert first.status_code == 200, first.text
+    cap.order.clear()
+    cap.hooks.clear()
+
+    # Second bind creates a worktree, then loses the bind → rollback.
+    second = await _launch(client, session_id, git={"branch_name": "feature/second"})
+    assert second.status_code == 400, second.text
+    assert cap.hooks == [], "setup ran in a worktree that was about to be rolled back"
+    assert cap.order == ["create", "remove"]

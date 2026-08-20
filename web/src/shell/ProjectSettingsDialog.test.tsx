@@ -166,6 +166,99 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
   });
 
+  it("round-trips a multi-line worktree script verbatim", async () => {
+    // WHY: the stored value is a PROGRAM — internal newlines and indentation
+    // must survive the editor untouched, or we silently rewrite the user's
+    // script. Only the outer whitespace is trimmed on save.
+    const script = "#!/usr/bin/env bash\nset -euo pipefail\n\nbun install\n  cp ../../.env .";
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { worktree_post_create_command: script },
+    });
+    renderDialog();
+    const editor = await waitFor(() => screen.getByTestId("project-settings-post-create"));
+    // A textarea, not a single-line input — a script needs the rows.
+    expect(editor.tagName).toBe("TEXTAREA");
+    await waitFor(() => expect(editor).toHaveValue(script));
+
+    const edited = `${script}\nbun run build`;
+    fireEvent.change(editor, { target: { value: `\n  ${edited}  \n` } });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        worktree_post_create_command: edited,
+      }),
+    );
+  });
+
+  it("shows a multi-line placeholder so the field reads as a script", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    const editor = await waitFor(() => screen.getByTestId("project-settings-post-create"));
+    const placeholder = editor.getAttribute("placeholder") ?? "";
+    expect(placeholder).toContain("\n");
+    expect(placeholder).toContain("bun install");
+    // The teardown field gets its own example, not the setup one.
+    const teardown = screen.getByTestId("project-settings-pre-delete");
+    expect(teardown.getAttribute("placeholder")).toContain("docker compose down");
+  });
+
+  it("round-trips the worktree lifecycle commands and their timeout", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        worktree_post_create_command: "bun install",
+        worktree_pre_delete_command: "./teardown.sh",
+        worktree_hook_timeout_seconds: 600,
+      },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-post-create")).toHaveValue("bun install"),
+    );
+    expect(screen.getByTestId("project-settings-pre-delete")).toHaveValue("./teardown.sh");
+    // The timeout field (and the unsandboxed-execution note) only appear once a
+    // command is configured — they mean nothing on their own.
+    expect(screen.getByTestId("project-settings-hook-timeout")).toHaveValue(600);
+    expect(screen.getByTestId("project-settings-hook-note")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByTestId("project-settings-post-create"), {
+      target: { value: "  pnpm install  " },
+    });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        worktree_post_create_command: "pnpm install",
+        worktree_pre_delete_command: "./teardown.sh",
+        worktree_hook_timeout_seconds: 600,
+      }),
+    );
+  });
+
+  it("clears a worktree command when its field is emptied", async () => {
+    // Blank means "no hook" server-side, so an emptied field must drop the key
+    // rather than store an empty command the host would run as a blank shell.
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { worktree_post_create_command: "bun install" },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-post-create")).toHaveValue("bun install"),
+    );
+    fireEvent.change(screen.getByTestId("project-settings-post-create"), {
+      target: { value: "   " },
+    });
+    // Emptying the command hides the timeout field with it — it bounds
+    // nothing on its own.
+    expect(screen.queryByTestId("project-settings-hook-timeout")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
+  });
+
   it("hides the sandbox option when managed sandboxes are disabled", async () => {
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
     renderDialog();

@@ -8,14 +8,32 @@ designs/SESSION_GIT_WORKTREE.md.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 # fetch/add can be slow on large repos; bound it so git can't hang the
 # host's tunnel loop.
 _GIT_TIMEOUT_S: float = 120.0
+
+# Bound on the combined stdout+stderr a lifecycle hook reports back. Only
+# the TAIL is kept: a failing `bun install` puts the actionable error at the
+# end, and an unbounded capture would push megabytes of progress output
+# through the tunnel and into a conversation item.
+HOOK_OUTPUT_TAIL_BYTES: int = 10 * 1024
+
+# Clamp for a project's configured hook timeout, and the default when none
+# is configured. Mirrors the harness-install subprocess bound (300 s) so a
+# dependency install has room without letting a hook wedge a session for an
+# unbounded time.
+DEFAULT_HOOK_TIMEOUT_S: float = 300.0
+MIN_HOOK_TIMEOUT_S: float = 1.0
+MAX_HOOK_TIMEOUT_S: float = 3600.0
 
 # Max directory-collision suffixes (``-2`` .. ``-N``) before giving up.
 _MAX_DIR_COLLISION_SUFFIX: int = 50
@@ -460,3 +478,239 @@ def remove_worktree(
         branch_result = _run_git(["branch", "-D", branch], cwd=main_repo)
         if branch_result.returncode != 0:
             raise _git_error("git branch -D failed", branch_result)
+
+
+@dataclass
+class WorktreeHookResult:
+    """Outcome of a user-defined worktree lifecycle command.
+
+    :param exit_code: The shell's exit status, e.g. ``0`` on success.
+        ``None`` when the hook timed out (killed before it could report
+        one).
+    :param timed_out: ``True`` when the hook exceeded its timeout and its
+        process group was killed.
+    :param output_tail: Last :data:`HOOK_OUTPUT_TAIL_BYTES` of the
+        combined stdout+stderr, decoded lossily, e.g.
+        ``"bun install v1.1.0\\n..."``. Empty when the hook printed
+        nothing.
+    """
+
+    exit_code: int | None
+    timed_out: bool
+    output_tail: str
+
+
+def clamp_hook_timeout(seconds: float | None) -> float:
+    """Clamp a configured hook timeout into the supported range.
+
+    :param seconds: The project's configured timeout in seconds, e.g.
+        ``600``. ``None`` (or a non-finite / non-positive value) selects
+        :data:`DEFAULT_HOOK_TIMEOUT_S`.
+    :returns: A timeout within
+        [:data:`MIN_HOOK_TIMEOUT_S`, :data:`MAX_HOOK_TIMEOUT_S`].
+    """
+    if seconds is None:
+        return DEFAULT_HOOK_TIMEOUT_S
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return DEFAULT_HOOK_TIMEOUT_S
+    if value != value or value <= 0:  # NaN or non-positive
+        return DEFAULT_HOOK_TIMEOUT_S
+    return max(MIN_HOOK_TIMEOUT_S, min(MAX_HOOK_TIMEOUT_S, value))
+
+
+def _hook_script_argv(command: str, script_dir: Path) -> list[str]:
+    """Write a hook's script to a file and build the argv that runs it.
+
+    The configured value is a SCRIPT, not a single command line: it may
+    span many lines and may open with a shebang. Writing it to a file
+    rather than passing it as ``sh -c <string>`` is what makes both work
+    — ``cmd /c`` cannot accept embedded newlines at all, and under
+    ``sh -c`` a ``#!/usr/bin/env bash`` line is just a comment, so
+    bash-only syntax would fail on a ``sh``-is-dash host.
+
+    A leading shebang wins: the file is made executable and exec'd
+    directly, so the author's chosen interpreter runs it. Without one it
+    is fed to ``/bin/sh``, which keeps a one-liner behaving exactly as
+    before.
+
+    :param command: The configured script, e.g. ``"bun install"`` or
+        ``"#!/bin/bash\\nset -euo pipefail\\nbun install\\n"``.
+    :param script_dir: Directory to write the script into — a private
+        temp dir, never the worktree, so the script can't show up as an
+        untracked file in the user's repo.
+    :returns: argv for :class:`subprocess.Popen`, e.g.
+        ``["/bin/sh", "/tmp/omnigent-hook-x/hook"]``.
+    """
+    if sys.platform == "win32":  # pragma: no cover — POSIX CI
+        path = script_dir / "omnigent-hook.cmd"
+        # cmd.exe is CRLF-only, and `@echo off` keeps the batch file from
+        # echoing every line into the captured output.
+        body = command.replace("\r\n", "\n").replace("\n", "\r\n")
+        # newline="" disables Python's own translation, which would otherwise
+        # turn each "\r\n" written here into "\r\r\n" on Windows.
+        path.write_text(f"@echo off\r\n{body}\r\n", encoding="utf-8", newline="")
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        return [comspec, "/c", str(path)]
+    path = script_dir / "omnigent-hook"
+    # newline="" keeps the script's own line endings verbatim.
+    path.write_text(
+        command if command.endswith("\n") else f"{command}\n",
+        encoding="utf-8",
+        newline="",
+    )
+    if command.startswith("#!"):
+        path.chmod(0o700)
+        return [str(path)]
+    return ["/bin/sh", str(path)]
+
+
+def _hook_env(
+    *,
+    worktree_path: str,
+    repo_path: str | None,
+    branch: str | None,
+    base_branch: str | None,
+    hook: str,
+) -> dict[str, str]:
+    """Build the hook's environment: the daemon's env plus hook context.
+
+    :param worktree_path: The worktree the hook runs in, e.g.
+        ``"/Users/alice/myrepo-worktrees/feature-login"``.
+    :param repo_path: Main repo work tree, e.g. ``"/Users/alice/myrepo"``.
+        ``None`` omits ``OMNIGENT_REPO_PATH``.
+    :param branch: Branch checked out in the worktree, e.g.
+        ``"feature/login"``. ``None`` omits ``OMNIGENT_BRANCH``.
+    :param base_branch: Base ref the branch forked from, e.g. ``"main"``.
+        ``None`` omits ``OMNIGENT_BASE_BRANCH``.
+    :param hook: Which lifecycle point is running, ``"post_create"`` or
+        ``"pre_delete"``.
+    :returns: The child's environment mapping.
+    """
+    env = dict(os.environ)
+    env["OMNIGENT_WORKTREE_PATH"] = worktree_path
+    env["OMNIGENT_HOOK"] = hook
+    if repo_path is not None:
+        env["OMNIGENT_REPO_PATH"] = repo_path
+    if branch is not None:
+        env["OMNIGENT_BRANCH"] = branch
+    if base_branch is not None:
+        env["OMNIGENT_BASE_BRANCH"] = base_branch
+    return env
+
+
+def _kill_hook_process_group(proc: subprocess.Popen[bytes]) -> None:
+    """Kill a timed-out hook and everything it spawned.
+
+    A hook is a shell command, so the interesting children (``npm``, a
+    dev server) are grandchildren; killing only the shell would leave
+    them running. On POSIX the hook is started in its own process group
+    (``start_new_session``) so one ``killpg`` reaps the tree; Windows has
+    no equivalent, so only the shell is killed.
+
+    :param proc: The still-running hook process.
+    """
+    if sys.platform == "win32":  # pragma: no cover — POSIX CI
+        proc.kill()
+        return
+    import signal
+
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        # Already gone, or the group is not ours — fall back to the
+        # direct kill so we never leave the handle un-reaped.
+        proc.kill()
+
+
+def run_worktree_hook(
+    *,
+    command: str,
+    worktree_path: str,
+    repo_path: str | None = None,
+    branch: str | None = None,
+    base_branch: str | None = None,
+    hook: str,
+    timeout_seconds: float | None = None,
+) -> WorktreeHookResult:
+    """Run a user-defined worktree lifecycle script in a worktree.
+
+    Writes ``command`` to a private temp script and runs it with the
+    worktree as the cwd, capturing the combined stdout+stderr tail. Never
+    raises for a failing script — the exit code is part of the result,
+    because both lifecycle hooks are fail-open.
+
+    :param command: The configured script — one command
+        (``"bun install"``) or many lines, optionally opening with a
+        shebang that selects its interpreter. Whitespace-only is a
+        programming error (callers treat blank as unset) and raises.
+    :param worktree_path: Directory to run in, e.g.
+        ``"/Users/alice/myrepo-worktrees/feature-login"``.
+    :param repo_path: Main repo work tree, exported as
+        ``OMNIGENT_REPO_PATH``.
+    :param branch: Branch in the worktree, exported as
+        ``OMNIGENT_BRANCH``.
+    :param base_branch: Base ref, exported as
+        ``OMNIGENT_BASE_BRANCH``.
+    :param hook: ``"post_create"`` or ``"pre_delete"``, exported as
+        ``OMNIGENT_HOOK``.
+    :param timeout_seconds: Bound on the run; clamped by
+        :func:`clamp_hook_timeout`.
+    :returns: Exit code, timeout flag, and the captured output tail.
+    :raises WorktreeError: If ``command`` is blank, ``worktree_path`` is
+        not a directory, or the interpreter could not be started.
+    """
+    if not command.strip():
+        raise WorktreeError("worktree hook script must not be empty")
+    if not Path(worktree_path).is_dir():
+        raise WorktreeError(f"worktree path is not a directory: {worktree_path}")
+    timeout = clamp_hook_timeout(timeout_seconds)
+    env = _hook_env(
+        worktree_path=worktree_path,
+        repo_path=repo_path,
+        branch=branch,
+        base_branch=base_branch,
+        hook=hook,
+    )
+    # The script file must outlive the run, so the temp dir is removed only
+    # after the process is reaped (including the timeout path below).
+    script_dir = Path(tempfile.mkdtemp(prefix="omnigent-hook-"))
+    try:
+        try:
+            argv = _hook_script_argv(command, script_dir)
+        except OSError as exc:
+            raise WorktreeError(f"could not write the worktree hook script: {exc}") from exc
+        try:
+            proc = subprocess.Popen(
+                argv,
+                cwd=worktree_path,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                # Own process group so a timeout can kill the whole tree.
+                start_new_session=sys.platform != "win32",
+            )
+        except OSError as exc:
+            raise WorktreeError(f"could not start worktree hook: {exc}") from exc
+
+        timed_out = False
+        try:
+            raw, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_hook_process_group(proc)
+            # The pipe is still open on the killed children; drain what was
+            # produced so the user sees where the hook got stuck.
+            try:
+                raw, _ = proc.communicate(timeout=10.0)
+            except subprocess.TimeoutExpired:  # pragma: no cover — defensive
+                raw = b""
+        tail = (raw or b"")[-HOOK_OUTPUT_TAIL_BYTES:].decode("utf-8", errors="replace")
+        return WorktreeHookResult(
+            exit_code=None if timed_out else proc.returncode,
+            timed_out=timed_out,
+            output_tail=tail,
+        )
+    finally:
+        shutil.rmtree(script_dir, ignore_errors=True)

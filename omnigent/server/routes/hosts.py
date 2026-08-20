@@ -925,6 +925,32 @@ def create_hosts_router(
             git_branch,
         )
 
+        # Project-configured worktree setup command, run SYNCHRONOUSLY: unlike
+        # POST /v1/sessions there is no first-turn gate on this path — the
+        # runner spawns as part of this request, so setup must finish before it
+        # starts. Placed after the bind so a lost CAS (whose rollback destroys
+        # the worktree) never runs setup in it; fail-open, so a failing hook
+        # leaves its notice on the session and the launch continues.
+        if worktree is not None:
+            from dataclasses import replace as _replace
+
+            from omnigent.server.routes._sessions.helpers import (
+                _maybe_start_post_create_worktree_setup,
+            )
+
+            await _maybe_start_post_create_worktree_setup(
+                conv=_replace(
+                    target.conv,
+                    host_id=host_id,
+                    workspace=worktree.worktree_path,
+                    git_branch=worktree.branch,
+                ),
+                user_id=user_id,
+                conversation_store=conversation_store,
+                request=request,
+                run_inline=True,
+            )
+
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future

@@ -1703,6 +1703,11 @@ function MainAgentSurface({
   // staring at a fresh session during a slow MCP boot sees the startup band
   // instead of a bare "What should we work on?" empty state.
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
+  // True while the project's worktree setup script is running or reported a
+  // failure. Same reason as `mcpStartupActive`: the first turn is gated on the
+  // setup script server-side, so a fresh session must show why it's waiting
+  // rather than a bare empty state.
+  const worktreeSetupActive = useChatStore((s) => s.worktreeSetup !== null);
   // Render the inline terminal whenever the user has opted in via the
   // connection pill. The terminal surface owns its no-terminal state,
   // including stopped/resumable sessions, and the connection indicator
@@ -2025,7 +2030,10 @@ function MainAgentSurface({
                 <KeepBottomOnViewportResize />
                 <ConversationScrollRefBridge onScroller={setScroller} />
                 <HistoryAutoLoader scrollElement={scroller?.el ?? null} />
-                {bubbles.length === 0 && !showWorkingIndicator && !mcpStartupActive ? (
+                {bubbles.length === 0 &&
+                !showWorkingIndicator &&
+                !mcpStartupActive &&
+                !worktreeSetupActive ? (
                   // Cold launch: a centered spinner instead of the "ready to
                   // type" empty state (the create-then-send path uses the
                   // "row" variant). Two launch shapes land here: a
@@ -2103,6 +2111,11 @@ function MainAgentSurface({
                     Working… shimmer — it is strictly more specific about why
                     the turn hasn't produced output yet. */}
                     <McpStartupIndicator />
+                    {/* Worktree setup band: the project's post-create script
+                    (dependency install, .env copy) runs on the host and the
+                    first turn is gated on it, so the wait needs a reason.
+                    Self-gates to null for sessions with no setup script. */}
+                    <WorktreeSetupIndicator />
                   </>
                 )}
                 {/* Frames the initially loaded turn at the top of the viewport and
@@ -3367,6 +3380,84 @@ export function McpStartupIndicator() {
         <span className="flex items-center gap-2 text-muted-foreground text-ui">
           <AlertTriangleIcon className="size-4 shrink-0" aria-hidden />
           {`MCP startup incomplete (${parts.join("; ")})`}
+        </span>
+      </MessageContent>
+    </Message>
+  );
+}
+
+/** Longest script summary shown inline in the setup band. */
+const SETUP_SCRIPT_SUMMARY_MAX = 60;
+
+/**
+ * Reduce a setup script to one short line for the progress band.
+ *
+ * The configured value can be a whole multi-line script; rendering it raw
+ * would collapse into an unreadable run-on (a `truncate` span eats the
+ * newlines). Show the first line that actually does something — skipping a
+ * shebang and comments, which say nothing about what is running — and mark it
+ * when there is more.
+ *
+ * @param script - The configured script, or null when the event carried none.
+ * @returns A one-line summary, or null when there is nothing worth showing.
+ */
+export function summarizeSetupScript(script: string | null): string | null {
+  if (!script) return null;
+  const lines = script
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "" && !line.startsWith("#"));
+  if (lines.length === 0) return null;
+  const head =
+    lines[0].length > SETUP_SCRIPT_SUMMARY_MAX
+      ? `${lines[0].slice(0, SETUP_SCRIPT_SUMMARY_MAX - 1)}…`
+      : lines[0];
+  return lines.length > 1 ? `${head} …` : head;
+}
+
+/**
+ * Band for the project's post-create worktree setup script.
+ *
+ * The host runs the script (`worktree_post_create_command`) in the new
+ * worktree and the server gates the first turn on it, so a session can sit
+ * idle for a whole dependency install with nothing else to show. Renders a
+ * spinner while it runs and a one-line notice when it failed — the failure
+ * also lands as a durable transcript item, which is what survives a refresh.
+ * Self-gates to null when the store carries no setup state.
+ *
+ * @returns The band, or null when there is nothing to report.
+ */
+export function WorktreeSetupIndicator() {
+  const worktreeSetup = useChatStore((s) => s.worktreeSetup);
+  if (worktreeSetup === null) return null;
+  if (worktreeSetup.state === "running") {
+    return (
+      <Message
+        from="assistant"
+        data-testid="worktree-setup-indicator"
+        role="status"
+        aria-live="polite"
+      >
+        <MessageContent>
+          <span className="flex items-center gap-2 text-muted-foreground text-ui">
+            <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden />
+            {(() => {
+              const summary = summarizeSetupScript(worktreeSetup.command);
+              return summary ? `Running setup script… (${summary})` : "Running setup script…";
+            })()}
+          </span>
+        </MessageContent>
+      </Message>
+    );
+  }
+  return (
+    <Message from="assistant" data-testid="worktree-setup-indicator" role="status">
+      <MessageContent>
+        <span className="flex items-center gap-2 text-muted-foreground text-ui">
+          <AlertTriangleIcon className="size-4 shrink-0" aria-hidden />
+          {worktreeSetup.reason
+            ? `Setup script didn't finish: ${worktreeSetup.reason}`
+            : "Setup script didn't finish"}
         </span>
       </MessageContent>
     </Message>

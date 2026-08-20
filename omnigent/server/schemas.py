@@ -687,11 +687,20 @@ class ConversationDeleted(BaseModel):
     :param object: Fixed resource type, always
         ``"conversation.deleted"``.
     :param deleted: Always ``True``.
+    :param pre_delete_hook: Outcome of the project's worktree teardown
+        command when one ran, e.g.
+        ``{"exit_code": 1, "timed_out": False, "output_tail": "…",
+        "error": None}``. ``None`` when the project configures no
+        teardown command (or the session had no worktree). The hook is
+        fail-open, so a non-zero result here still means the session was
+        deleted — the UI surfaces it as a toast because the session row
+        is gone and nothing can be persisted against it.
     """
 
     id: str
     object: str = "conversation.deleted"
     deleted: bool = True
+    pre_delete_hook: dict[str, Any] | None = None
 
 
 class ConversationRef(BaseModel):

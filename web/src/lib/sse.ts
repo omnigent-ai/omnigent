@@ -55,6 +55,7 @@ import type {
   SessionSandboxStatusEvent,
   McpServerStartup,
   SessionMcpStartupEvent,
+  SessionWorktreeSetupEvent,
   SessionTerminalPendingEvent,
   SessionUsageEvent,
   SlashCommand,
@@ -737,6 +738,38 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       servers,
     } satisfies SessionMcpStartupEvent;
+  }
+  // Worktree setup command (project `worktree_post_create_command`). Three
+  // edges collapse into one normalized event; the store keeps only the latest.
+  if (eventType === "session.worktree_setup.in_progress") {
+    const command = data.command;
+    return {
+      type: "session_worktree_setup",
+      state: "running",
+      command: typeof command === "string" && command ? command : null,
+      reason: null,
+      outputTail: null,
+    } satisfies SessionWorktreeSetupEvent;
+  }
+  if (eventType === "session.worktree_setup.completed") {
+    return {
+      type: "session_worktree_setup",
+      state: "done",
+      command: null,
+      reason: null,
+      outputTail: null,
+    } satisfies SessionWorktreeSetupEvent;
+  }
+  if (eventType === "session.worktree_setup.failed") {
+    const reason = data.reason;
+    const tail = data.output_tail;
+    return {
+      type: "session_worktree_setup",
+      state: "failed",
+      command: null,
+      reason: typeof reason === "string" && reason ? reason : null,
+      outputTail: typeof tail === "string" && tail ? tail : null,
+    } satisfies SessionWorktreeSetupEvent;
   }
   if (eventType === "session.input.consumed") {
     // Nested envelope: `{type, data: {item_id, type, data}}`.

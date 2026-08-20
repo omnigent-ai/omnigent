@@ -34,6 +34,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostRunWorktreeHookFrame,
+    HostRunWorktreeHookResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -1061,6 +1063,101 @@ def test_remove_worktree_result_frame_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostRemoveWorktreeResultFrame)
     assert decoded == original
+
+
+# ── host.run_worktree_hook frames ───────────────────────
+
+
+def test_run_worktree_hook_frame_round_trip() -> None:
+    """Verify HostRunWorktreeHookFrame survives encode → decode.
+
+    Every field steers what the host actually executes and where, so a
+    dropped one would run the wrong command in the wrong directory.
+    """
+    original = HostRunWorktreeHookFrame(
+        request_id="req_wt_hook_1",
+        command="bun install && cp ../../.env .",
+        worktree_path="/Users/alice/myrepo-worktrees/feature-login",
+        hook="post_create",
+        repo_path="/Users/alice/myrepo",
+        branch="feature/login",
+        base_branch="main",
+        timeout_seconds=600.0,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostRunWorktreeHookFrame)
+    assert decoded == original
+
+
+def test_run_worktree_hook_frame_optional_context_defaults_none() -> None:
+    """Only command / worktree_path / hook are required; context is optional."""
+    original = HostRunWorktreeHookFrame(
+        request_id="req_wt_hook_2",
+        command="true",
+        worktree_path="/w",
+        hook="pre_delete",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostRunWorktreeHookFrame)
+    assert decoded.repo_path is None
+    assert decoded.branch is None
+    assert decoded.base_branch is None
+    assert decoded.timeout_seconds is None
+
+
+def test_run_worktree_hook_result_frame_round_trip() -> None:
+    """Verify HostRunWorktreeHookResultFrame survives encode → decode.
+
+    ``exit_code`` / ``timed_out`` / ``output_tail`` are what the UI renders,
+    so a reshaped field would silently show a failed hook as fine.
+    """
+    original = HostRunWorktreeHookResultFrame(
+        request_id="req_wt_hook_1",
+        status="ok",
+        exit_code=1,
+        timed_out=False,
+        output_tail="error: lockfile out of date\n",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostRunWorktreeHookResultFrame)
+    assert decoded == original
+
+
+def test_run_worktree_hook_result_frame_timeout_round_trip() -> None:
+    """A timed-out hook carries no exit code."""
+    original = HostRunWorktreeHookResultFrame(
+        request_id="req_wt_hook_1",
+        status="ok",
+        exit_code=None,
+        timed_out=True,
+        output_tail="installing…",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostRunWorktreeHookResultFrame)
+    assert decoded.exit_code is None
+    assert decoded.timed_out is True
+
+
+def test_run_worktree_hook_result_frame_failure_carries_error() -> None:
+    """A hook the host could not start reports ``status: "failed"``."""
+    original = HostRunWorktreeHookResultFrame(
+        request_id="req_wt_hook_1",
+        status="failed",
+        error="worktree path is not a directory: /gone",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostRunWorktreeHookResultFrame)
+    assert decoded.error == "worktree path is not a directory: /gone"
+
+
+def test_run_worktree_hook_frame_non_numeric_timeout_raises() -> None:
+    """A non-numeric timeout is rejected at decode, not coerced silently."""
+    raw = (
+        '{"kind": "host.run_worktree_hook", "request_id": "r", "command": "true", '
+        '"worktree_path": "/w", "hook": "post_create", "timeout_seconds": "soon"}'
+    )
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        decode_host_frame(raw)
 
 
 # ── host.list_worktrees frames ──────────────────────────

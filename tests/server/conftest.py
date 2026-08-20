@@ -45,6 +45,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
 # ── Controllable mock LLM ─────────────────────────────
 
@@ -594,6 +595,9 @@ def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
             cache_dir=tmp_path / "cache",
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
+        # Projects back the /v1/projects CRUD and the per-project worktree
+        # lifecycle commands the session routes resolve.
+        project_store=SqlAlchemyProjectStore(db_uri),
     )
 
 
