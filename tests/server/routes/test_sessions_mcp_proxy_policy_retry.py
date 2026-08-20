@@ -12,6 +12,7 @@ dependencies, following the pattern in ``test_sessions_mcp_proxy.py``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -36,17 +37,17 @@ from omnigent.spec.types import PolicyAction
 _SESSION_ID = "conv_test_policy_retry"
 
 
-def _make_conversation() -> Conversation:
+def _make_conversation(session_id: str = _SESSION_ID) -> Conversation:
     """
     Build a minimal :class:`Conversation` with an agent binding.
 
     :returns: A :class:`Conversation` pointing at agent ``"ag_test"``.
     """
     return Conversation(
-        id=_SESSION_ID,
+        id=session_id,
         created_at=0,
         updated_at=0,
-        root_conversation_id=_SESSION_ID,
+        root_conversation_id=session_id,
         agent_id="ag_test",
     )
 
@@ -195,6 +196,51 @@ def _parse_rpc_error(response: Any) -> dict[str, Any]:
     return payload["error"]
 
 
+def _arguments_hash(arguments: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+async def _issue_ask(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_id: str = _SESSION_ID,
+    tool_name: str = "sys_os_shell",
+    arguments: dict[str, Any] | None = None,
+) -> tuple[str, str]:
+    """Issue a real first-call ASK and return its id and request state."""
+    ask_engine = _FixedPolicyEngine(
+        result=PolicyResult(
+            action=PolicyAction.ASK,
+            reason="approval required",
+            deciding_policies=["test-gate"],
+        )
+    )
+    monkeypatch.setattr(
+        sessions_mod,
+        "_load_agent_spec_for_session",
+        lambda conv, agent_store: "fake_spec",
+    )
+    monkeypatch.setattr(
+        sessions_mod,
+        "_build_policy_engine_from_spec",
+        _engine_factory_expecting_preload(ask_engine),
+    )
+    response = await _handle_mcp_tools_call(
+        rpc_id=10,
+        session_id=session_id,
+        params={"name": tool_name, "arguments": arguments or {"command": "id -un"}},
+        conversation_store=_StubConversationStore(_make_conversation(session_id)),  # type: ignore[arg-type]
+        agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+        runner_router=None,
+    )
+    result = json.loads(bytes(response.body))["result"]
+    elicitation_id = next(iter(result["inputRequests"]))
+    return elicitation_id, result["requestState"]
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -315,6 +361,107 @@ async def test_forged_retry_with_ask_policy_rejects_unknown_elicitation(
     )
 
 
+@pytest.mark.parametrize(
+    ("replay_session", "replay_tool", "replay_arguments"),
+    [
+        (_SESSION_ID, "sys_os_read", {"path": "/etc/passwd"}),
+        (_SESSION_ID, "sys_os_shell", {"command": "whoami"}),
+        ("conv_other_session", "sys_os_shell", {"command": "id -un"}),
+    ],
+    ids=["tool", "arguments", "session"],
+)
+@pytest.mark.asyncio
+async def test_approval_is_bound_to_exact_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+    replay_session: str,
+    replay_tool: str,
+    replay_arguments: dict[str, Any],
+) -> None:
+    """An ASK approval cannot authorize a different tool call."""
+    elicitation_id, request_state = await _issue_ask(monkeypatch)
+    state = json.loads(request_state)
+    state["session_id"] = replay_session
+
+    try:
+        response = await _handle_mcp_tools_call(
+            rpc_id=11,
+            session_id=replay_session,
+            params={
+                "name": replay_tool,
+                "arguments": replay_arguments,
+                "requestState": json.dumps(state),
+                "inputResponses": {elicitation_id: {"action": "accept"}},
+            },
+            conversation_store=_StubConversationStore(_make_conversation(replay_session)),  # type: ignore[arg-type]
+            agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+            runner_router=None,
+        )
+        assert "does not match" in _parse_rpc_error(response)["message"].lower()
+        assert elicitation_id in _pending_policy_ask_writes
+    finally:
+        _pending_policy_ask_writes.pop(elicitation_id, None)
+
+
+@pytest.mark.asyncio
+async def test_approval_is_consumed_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A matching approval cannot be replayed after its first retry."""
+    elicitation_id, request_state = await _issue_ask(
+        monkeypatch,
+        arguments={"a": 1, "b": 2},
+    )
+    params = {
+        "name": "sys_os_shell",
+        "arguments": {"b": 2, "a": 1},
+        "requestState": request_state,
+        "inputResponses": {elicitation_id: {"action": "accept"}},
+    }
+    store = _StubConversationStore(_make_conversation())
+
+    try:
+        first = await _handle_mcp_tools_call(
+            rpc_id=12,
+            session_id=_SESSION_ID,
+            params=params,
+            conversation_store=store,  # type: ignore[arg-type]
+            agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+            runner_router=None,
+        )
+        assert "runner" in _parse_rpc_error(first)["message"].lower()
+
+        second = await _handle_mcp_tools_call(
+            rpc_id=13,
+            session_id=_SESSION_ID,
+            params=params,
+            conversation_store=store,  # type: ignore[arg-type]
+            agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+            runner_router=None,
+        )
+        assert "already resolved" in _parse_rpc_error(second)["message"].lower()
+    finally:
+        _pending_policy_ask_writes.pop(elicitation_id, None)
+
+
+@pytest.mark.asyncio
+async def test_matching_decline_consumes_approval(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A matching decline is terminal and cannot be replayed later."""
+    elicitation_id, request_state = await _issue_ask(monkeypatch)
+    response = await _handle_mcp_tools_call(
+        rpc_id=14,
+        session_id=_SESSION_ID,
+        params={
+            "name": "sys_os_shell",
+            "arguments": {"command": "id -un"},
+            "requestState": request_state,
+            "inputResponses": {elicitation_id: {"action": "decline"}},
+        },
+        conversation_store=_StubConversationStore(_make_conversation()),  # type: ignore[arg-type]
+        agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+        runner_router=None,
+    )
+    assert "denied by user" in _parse_rpc_error(response)["message"].lower()
+    assert elicitation_id not in _pending_policy_ask_writes
+
+
 @pytest.mark.asyncio
 async def test_retry_with_allow_policy_falls_through(
     monkeypatch: pytest.MonkeyPatch,
@@ -368,6 +515,35 @@ async def test_retry_with_allow_policy_falls_through(
             f"got: {payload['error']['message']!r}. "
             f"If 'Denied by policy', the ALLOW path on retry is broken."
         )
+
+
+@pytest.mark.asyncio
+async def test_matching_retry_consumed_when_policy_changes_to_allow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A now-unneeded matching approval does not linger for later replay."""
+    elicitation_id, request_state = await _issue_ask(monkeypatch)
+    allow_engine = _FixedPolicyEngine(result=PolicyResult(action=PolicyAction.ALLOW, reason=None))
+    monkeypatch.setattr(
+        sessions_mod,
+        "_build_policy_engine_from_spec",
+        _engine_factory_expecting_preload(allow_engine),
+    )
+
+    await _handle_mcp_tools_call(
+        rpc_id=15,
+        session_id=_SESSION_ID,
+        params={
+            "name": "sys_os_shell",
+            "arguments": {"command": "id -un"},
+            "requestState": request_state,
+            "inputResponses": {elicitation_id: {"action": "accept"}},
+        },
+        conversation_store=_StubConversationStore(_make_conversation()),  # type: ignore[arg-type]
+        agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+        runner_router=None,
+    )
+    assert elicitation_id not in _pending_policy_ask_writes
 
 
 @pytest.mark.asyncio
@@ -464,6 +640,9 @@ async def test_legitimate_retry_with_pending_entry_proceeds(
         state_updates=None,
         set_labels=None,
         from_mcp=True,
+        session_id=_SESSION_ID,
+        tool_name="sys_os_shell",
+        arguments_hash=_arguments_hash({"command": "id -un"}),
     )
 
     try:

@@ -576,11 +576,19 @@ class _PendingPolicyAskWrites:
         itself, so the events handler skips write application for
         these entries to avoid double-applying non-idempotent ops
         (e.g. ``INCREMENT`` state updates for cost-budget counters).
+    :param session_id: Session that owns an MCP approval.
+    :param tool_name: Exact MCP tool authorized by the approval.
+    :param arguments_hash: SHA-256 of the canonical MCP arguments.
+    :param transformed_arguments: Policy-transformed arguments to execute.
     """
 
     state_updates: list[StateUpdate] | None
     set_labels: dict[str, str] | None
     from_mcp: bool = False
+    session_id: str | None = None
+    tool_name: str | None = None
+    arguments_hash: str | None = None
+    transformed_arguments: dict[str, Any] | None = None
 
 
 _pending_policy_ask_writes: cachetools.LRUCache[str, _PendingPolicyAskWrites] = (
