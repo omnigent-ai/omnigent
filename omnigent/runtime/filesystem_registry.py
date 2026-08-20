@@ -1193,8 +1193,14 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
         if baseline_sha is not None:
             argv = [
-                "git", "diff", "--name-status", "--no-renames",
-                "--end-of-options", baseline_sha, "--", git_path,
+                "git",
+                "diff",
+                "--name-status",
+                "--no-renames",
+                "--end-of-options",
+                baseline_sha,
+                "--",
+                git_path,
             ]
         else:
             argv = ["git", "status", "--porcelain", "--", git_path]
