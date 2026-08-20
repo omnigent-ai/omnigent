@@ -26,7 +26,8 @@ name: Issue Triage
 #   6. Optionally comments when a duplicate or related issue is found
 #      (disabled by default; never comments when nothing matches)
 #   7. Optionally closes validated high-confidence duplicates (disabled by default)
-#   8. Assigns P0/P1 issues to a maintainer via round-robin
+#   8. Assigns an owner to every triaged open issue via round-robin — including
+#      duplicates left open when closure is disabled
 
 on:
   issues:
@@ -725,10 +726,13 @@ jobs:
                 gh issue close "$ISSUE_NUMBER" --repo "$REPO" \
                   --duplicate-of "$duplicate_of"
               fi
-            else
-              echo "Duplicate closure disabled; leaving issue open."
+              # Closed as a duplicate; no owner needed.
+              exit 0
             fi
-            exit 0
+            # Closure disabled: the duplicate stays open, so fall through and
+            # route it to an owner like any other triaged open issue rather than
+            # leaving it permanently unassigned.
+            echo "Duplicate closure disabled; leaving issue open and assigning an owner."
           fi
 
           # If the issue was filed by a maintainer, assign it to them directly.
@@ -747,9 +751,10 @@ jobs:
           # Otherwise, assign an owner: the least-loaded area owner, with LLM
           # rank as a tiebreaker (load primary, rank secondary). Symmetric with
           # the PR reviewer path. Skipped if the maintainer-author was already
-          # assigned above. Every triaged issue gets an owner — the only issues
-          # left unassigned are needs_info ones (too vague to route until the
-          # reporter adds detail).
+          # assigned above. Every triaged open issue gets an owner — including
+          # duplicates left open when closure is disabled — the only issues left
+          # unassigned are needs_info ones (too vague to route until the reporter
+          # adds detail).
           needs_info=$(jq -r '.needs_info // false' /tmp/triage_result.json)
           if [ "$maintainer_assigned" = "false" ] && [ "$needs_info" != "true" ]; then
             # Open-issue load per candidate (fewest assigned open issues wins ties).
