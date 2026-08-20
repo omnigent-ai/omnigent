@@ -220,21 +220,20 @@ class CodexNativeExecutor(Executor):
             return
         # Wait for the bridge to boot OUTSIDE the injection lock: this is a
         # one-time poll for the state file to appear (first turn, app-server
-        # starting), with no shared-state mutation, so holding the lock
-        # across its up-to-60s wait would needlessly block concurrent
-        # steering (enqueue_session_message). Once the state exists, the
-        # decision/RPC/write below runs under the lock — re-reading state so
+        # starting), with no shared-state mutation. A cold TUI can wait on
+        # interactive hook review before it creates a thread, so there is no
+        # arbitrary deadline here; cancellation still stops the wait, and the
+        # runner writes a startup error when the TUI exits. Once state exists,
+        # the decision/RPC/write below runs under the lock — re-reading state so
         # it's atomic with respect to a steer that landed during the wait.
         state = read_bridge_state(self._bridge_dir)
         if state is None:
-            for _ in range(60):
+            while state is None:
                 # Startup already failed; the runner recorded the cause — stop waiting.
                 if read_bridge_startup_error(self._bridge_dir) is not None:
                     break
                 await asyncio.sleep(1.0)
                 state = read_bridge_state(self._bridge_dir)
-                if state is not None:
-                    break
 
         # No client-side wait for Codex MCP startup: the app-server accepts
         # ``turn/start`` mid-startup and defers execution until the round

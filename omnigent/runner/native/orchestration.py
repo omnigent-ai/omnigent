@@ -158,6 +158,9 @@ _AUTO_FORWARDER_TASKS: dict[str, asyncio.Task[object]] = {}
 # Bound how long terminal (re)creation waits for a cancelled forwarder.
 _AUTO_FORWARDER_CANCEL_TIMEOUT_S = 10.0
 
+# Avoid flashing a terminal-setup notice during ordinary fast Codex startup.
+_CODEX_THREAD_WAIT_NOTICE_DELAY_S = 2.0
+
 # Delegated runner bearers last 30 minutes and refresh five minutes before
 # expiry. A one-minute cadence allows several retries without giving the child
 # the runner binding token; cached factory calls stay local and cheap.
@@ -3726,7 +3729,6 @@ async def _auto_create_codex_terminal(
     from pathlib import Path
 
     from omnigent.codex_native_app_server import (
-        _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION,
         CodexAppServerClient,
         build_codex_native_server,
         build_codex_remote_args,
@@ -4008,8 +4010,10 @@ async def _auto_create_codex_terminal(
         trust_project=True,
         **routed_spawn_extras,
     )
-    # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
-    # app-server reads the endpoint out of its own process env at start, and
+    # Generate routing hooks.json. Omnigent-owned policy/routing hooks are
+    # trusted explicitly by the app-server handshake; user hooks remain
+    # reviewable in the terminal TUI.
+    # The app-server reads the endpoint out of its own process env at start, and
     # the server decides per spawn whether to route. Any Smart Routing session,
     # pinned or auto — the advertisement is also what makes this session's
     # codex-home diverge from a plain one (generated hooks.json, routed-spawn
@@ -4068,11 +4072,17 @@ async def _auto_create_codex_terminal(
     else:
         from omnigent.codex_native_bridge import CodexNativeBridgeState, write_bridge_state
 
-        await preload_codex_thread_for_resume(
-            codex_ws_url,
-            launch_config.external_session_id,
-            terminal_launch_args=launch_config.terminal_launch_args,
-        )
+        try:
+            await preload_codex_thread_for_resume(
+                codex_ws_url,
+                launch_config.external_session_id,
+                terminal_launch_args=launch_config.terminal_launch_args,
+            )
+        except Exception:
+            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+            with contextlib.suppress(Exception):
+                await app_server.close()
+            raise
         write_bridge_state(
             bridge_dir,
             CodexNativeBridgeState(
@@ -4125,23 +4135,8 @@ async def _auto_create_codex_terminal(
                     # OpenAI built-in (which would force the first-run
                     # login screen and block thread creation).
                     config_overrides=tuple(app_server.config_overrides),
-                    # Omnigent provisions the private CODEX_HOME and vets
-                    # hook sources itself; skip the interactive trust prompt
-                    # that headless sub-agents can never answer.
-                    #
-                    # Requires a *positively parsed* version, unlike the
-                    # hooks-file gate in ``codex_native_app_server``, which
-                    # treats an unknown version as supported. The two differ
-                    # because their failure modes do: an unsupported hooks
-                    # file is ignored by codex and caught downstream at the
-                    # trust check, whereas an unknown CLI flag aborts argv
-                    # parsing — so a transient ``codex --version`` hiccup on a
-                    # pre-0.131 codex would turn a recoverable trust prompt
-                    # into a dead terminal.
-                    bypass_hook_trust=(
-                        app_server.codex_cli_version is not None
-                        and app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
-                    ),
+                    # Keep new or changed hooks reviewable in terminal view.
+                    bypass_hook_trust=False,
                 ),
                 env=codex_terminal_env(app_server),
                 # Match the local ``omnigent codex`` terminal scrollback.
@@ -4185,6 +4180,7 @@ async def _auto_create_codex_terminal(
                 codex_home=codex_home,
                 event_client=event_client,
                 routing_summary=_codex_launch.summary,
+                publish_event=publish_event,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -4234,6 +4230,7 @@ async def _codex_discover_thread_and_forward(
     codex_home: Path,
     event_client: CodexAppServerClient,
     routing_summary: str,
+    publish_event: Callable[[str, _JsonObject], None],
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -4260,6 +4257,9 @@ async def _codex_discover_thread_and_forward(
         routing (provider / profile / model, or the login-fallback state),
         threaded into the startup-timeout error so hosted users can diagnose
         without runner-log access (see #2745).
+    :param publish_event: Runner session event publisher. After a short grace,
+        reports that chat is blocked on Codex setup in Terminal and clears the
+        reason as soon as thread discovery finishes.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -4281,8 +4281,40 @@ async def _codex_discover_thread_and_forward(
     )
 
     try:
+        notice_published = False
+
+        async def _publish_terminal_setup_notice() -> None:
+            nonlocal notice_published
+            await asyncio.sleep(_CODEX_THREAD_WAIT_NOTICE_DELAY_S)
+            publish_event(
+                session_id,
+                {
+                    "type": "session.status",
+                    "status": "running",
+                    "blocked_on": "Codex setup in Terminal",
+                },
+            )
+            notice_published = True
+
+        notice_task = asyncio.create_task(
+            _publish_terminal_setup_notice(),
+            name=f"codex-terminal-setup-notice-{session_id}",
+        )
         try:
-            thread_id = await wait_for_thread_started(event_client)
+            try:
+                # A cold TUI may pause indefinitely for interactive hook review.
+                # Keep its app-server and the initial chat turn alive until the
+                # user answers in Terminal; stream closure still fails promptly.
+                thread_id = await wait_for_thread_started(event_client, timeout=None)
+            finally:
+                notice_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await notice_task
+                if notice_published:
+                    publish_event(
+                        session_id,
+                        {"type": "session.status", "status": "running"},
+                    )
         except (TimeoutError, RuntimeError) as exc:
             # Expected failure modes of wait_for_thread_started: the TUI exited
             # at startup, or the event stream ended before a thread was
