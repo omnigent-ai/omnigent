@@ -3729,12 +3729,12 @@ async def test_forwarder_mirrors_in_pane_permission_mode_switch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A shift+tab in the TUI is POSTed; the launch mode is not (seed-first).
+    Both the launch mode and a later shift+tab reach the session label.
 
     Claude Code emits no event on a mode change, so the pane footer is polled.
-    The first read is the launch mode — posting it would let a passive spawn
-    default overwrite a mode the web UI just set — and only a later, different
-    footer is a real user switch worth mirroring.
+    The launch mode is posted as well: a manual-mode session has no mode label
+    and no launch flag, so skipping it would leave the web picker with nothing
+    to render. Repeat polls of an unchanged footer stay quiet.
     """
     bridge_dir = tmp_path / "bridge"
     pane_mode: str | None = "default"
@@ -3771,32 +3771,72 @@ async def test_forwarder_mirrors_in_pane_permission_mode_switch(
                 dedupe=dedupe,
             )
 
-        # Poll 1: launch mode seeds the baseline silently.
+        # Poll 1: the launch mode is posted, so the picker has a mode to show.
         await _poll()
-        assert posts == []
+        assert [p["type"] for p in posts] == ["external_permission_mode_change"]
+        assert posts[0]["data"] == {"permission_mode": "default"}
         assert dedupe.posted_permission_mode == "default"
 
         # Poll 2: unchanged footer is a no-op, not a repeat POST.
         await _poll()
-        assert posts == []
+        assert len(posts) == 1
 
         # Poll 3: the user presses shift+tab into auto mode.
         pane_mode = "auto"
         await _poll()
-        assert [p["type"] for p in posts] == ["external_permission_mode_change"]
-        assert posts[0]["data"] == {"permission_mode": "auto"}
+        assert posts[-1]["data"] == {"permission_mode": "auto"}
         assert dedupe.posted_permission_mode == "auto"
 
         # Poll 4: still auto — the switch isn't re-posted every poll.
         await _poll()
-        assert len(posts) == 1
+        assert len(posts) == 2
 
         # A footerless pane reads as unknown and must not post a reversal.
         pane_mode = None
         await _poll()
-        assert len(posts) == 1
+        assert len(posts) == 2
         assert dedupe.posted_permission_mode == "auto"
     assert reads == 5
+
+
+@pytest.mark.asyncio
+async def test_forwarder_posts_manual_launch_mode_so_picker_renders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A manual-mode launch publishes a mode, keeping the picker reachable.
+
+    Manual is the default, and launching into it writes no
+    ``--permission-mode`` arg and no mode label, leaving the pane footer as the
+    only source. The first poll must post it: with no mode stored the web
+    picker hides itself, and manual becomes a state no one can switch out of.
+    """
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setattr(forwarder, "read_permission_mode", lambda _bridge_dir: "default")
+    monkeypatch.setattr(forwarder, "_PERMISSION_MODE_POLL_INTERVAL_S", 0.0)
+    dedupe = forwarder._ForwardDedupeState()
+
+    posts: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Accept the POST and record its payload."""
+        posts.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(202, json={})
+
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await forwarder._forward_permission_mode_from_pane(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            dedupe=dedupe,
+        )
+
+    assert posts == [
+        {"type": "external_permission_mode_change", "data": {"permission_mode": "default"}}
+    ]
+    assert dedupe.posted_permission_mode == "default"
 
 
 @pytest.mark.asyncio
@@ -3822,14 +3862,15 @@ async def test_forwarder_retries_permission_mode_post_after_transient_failure(
     dedupe = forwarder._ForwardDedupeState()
 
     posts: list[dict[str, Any]] = []
-    fail_next = True
+    fail_modes = {"plan"}
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
-        """Fail the first mode POST with 503; accept the rest."""
-        nonlocal fail_next
-        posts.append(json.loads(request.content.decode("utf-8")))
-        if fail_next:
-            fail_next = False
+        """Fail the first ``plan`` POST with 503; accept everything else."""
+        payload = json.loads(request.content.decode("utf-8"))
+        posts.append(payload)
+        mode = payload["data"]["permission_mode"]
+        if mode in fail_modes:
+            fail_modes.discard(mode)
             return httpx.Response(503, json={})
         return httpx.Response(202, json={})
 
@@ -3845,14 +3886,17 @@ async def test_forwarder_retries_permission_mode_post_after_transient_failure(
                 dedupe=dedupe,
             )
 
-        await _poll()  # seed the baseline
+        await _poll()  # the launch mode lands
+        assert dedupe.posted_permission_mode == "default"
+
         pane_mode = "plan"
         await _poll()
-        assert len(posts) == 1
+        assert len(posts) == 2
         assert dedupe.posted_permission_mode == "default"  # NOT advanced — POST failed
 
         await _poll()
         assert [p["data"] for p in posts] == [
+            {"permission_mode": "default"},
             {"permission_mode": "plan"},
             {"permission_mode": "plan"},
         ]

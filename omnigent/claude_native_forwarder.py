@@ -539,9 +539,8 @@ class _ForwardDedupeState:
     # because it can advance while ``posted_cost`` (S) is frozen.
     posted_policy_cost: float | None = None
     # Last permission mode POSTed as ``external_permission_mode_change`` —
-    # mirrors an in-pane shift+tab switch the web UI never sees. Seeded from
-    # the first observation WITHOUT posting (that's the launch mode, not a
-    # switch), same rule as ``posted_model``.
+    # mirrors the launch mode and any in-pane shift+tab switch, neither of
+    # which the web UI can observe on its own.
     posted_permission_mode: str | None = None
     # Monotonic deadline before which the next pane read is skipped, so the
     # subprocess spawn runs at _PERMISSION_MODE_POLL_INTERVAL_S, not every poll.
@@ -4252,9 +4251,12 @@ async def _forward_permission_mode_from_pane(
     switch. Polling the footer is the only signal available: Claude Code emits
     nothing on a mode change, and hook payloads only arrive on tool use.
 
-    The first observation is the launch mode, not a switch, so it seeds the
-    baseline without posting. Best-effort and idempotent — an unchanged mode
-    or an unreadable pane is a no-op, and a failed POST is retried next poll.
+    The launch mode is posted too, not just later switches: a session started
+    in manual mode carries no ``--permission-mode`` arg and no mode label, so
+    with nothing posted the web picker has no mode to render and hides itself.
+    Best-effort and idempotent — the server ignores a mode equal to the stored
+    label, an unchanged mode or unreadable pane is a no-op, and a failed POST
+    is retried next poll.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
@@ -4269,11 +4271,6 @@ async def _forward_permission_mode_from_pane(
     dedupe.permission_mode_next_read = now + _PERMISSION_MODE_POLL_INTERVAL_S
     mode = await asyncio.to_thread(read_permission_mode, bridge_dir)
     if mode is None or mode == dedupe.posted_permission_mode:
-        return
-    if dedupe.posted_permission_mode is None:
-        # First read is the launch mode; seed the baseline without posting so
-        # a passive spawn default can't overwrite a UI-set mode.
-        dedupe.posted_permission_mode = mode
         return
     try:
         await _post_external_permission_mode_change(

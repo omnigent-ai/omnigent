@@ -6341,17 +6341,21 @@ async def test_in_pane_permission_mode_switch_reaches_the_sse_wire_end_to_end(
                     dedupe=dedupe,
                 )
 
-            # Launch mode seeds silently — nothing should hit the wire.
+            # The launch mode crosses the wire too, so a session launched into
+            # manual has a mode to render before anyone presses shift+tab.
             await _poll()
             # The user presses shift+tab in the TUI.
             pane_mode = "auto"
             await _poll()
 
+        launch_event = await collector.next_event()
         event = await collector.next_event()
     finally:
         collector.task.cancel()
 
     # Crossed the SSE boundary in the shape the frontend parser expects.
+    assert launch_event["type"] == "session.permission_mode"
+    assert launch_event["permission_mode"] == "default"
     assert event["type"] == "session.permission_mode"
     assert event["conversation_id"] == session_id
     assert event["permission_mode"] == "auto"
