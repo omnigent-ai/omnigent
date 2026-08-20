@@ -737,6 +737,51 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop() -> None:
 
 
 @pytest.mark.asyncio
+async def test_relay_suppresses_disconnect_after_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dormant runner dropping after a completed turn stays quietly idle."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _TunnelCloseRunnerClient(gate)
+    store = _RecordingLabelStore()
+    session_id = "e8d9c0b1a2f34567890123456789abcd"
+
+    try:
+        sessions_module._session_status_cache[session_id] = "idle"
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_idle_disconnect",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=2.0)
+
+        assert sessions_module._session_status_cache[session_id] == "idle"
+        assert sessions_module._last_task_error_from_labels(store.labels[session_id]) is None
+    finally:
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=1.0)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
 async def test_relay_suppresses_disconnect_error_during_managed_wake() -> None:
     """Replacing a dormant managed runner does not surface as a task failure."""
     from omnigent.runtime import session_stream

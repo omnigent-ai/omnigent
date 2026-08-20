@@ -5980,6 +5980,17 @@ async def _relay_runner_stream(
                 )
                 await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
+            if not lost.intentional and _session_status_cache.get(session_id) == "idle":
+                _logger.info(
+                    "Relay: suppressing disconnect after idle for session=%s",
+                    session_id,
+                )
+                await _persist_session_status_error_labels(
+                    session_id,
+                    None,
+                    conversation_store,
+                )
+                return
             _logger.warning(
                 "Relay: runner transport lost for session=%s",
                 session_id,
