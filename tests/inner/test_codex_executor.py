@@ -3276,16 +3276,18 @@ def test_select_codex_skill_dirs_none_and_list(tmp_path: Path) -> None:
 
 
 def test_codex_skill_sources_order_bundle_then_host(tmp_path: Path) -> None:
-    """codex_skill_sources lists <bundle>/skills before <home>/.codex/skills."""
+    """Codex sources prefer bundle, then legacy and shared user skills."""
     from omnigent.inner.codex_executor import codex_skill_sources
 
     bundle = tmp_path / "bundle"
     (bundle / "skills").mkdir(parents=True)
     home = tmp_path / "home"
     (home / ".codex" / "skills").mkdir(parents=True)
+    (home / ".agents" / "skills").mkdir(parents=True)
     assert codex_skill_sources(bundle, home) == [
         bundle / "skills",
         home / ".codex" / "skills",
+        home / ".agents" / "skills",
     ]
 
 
