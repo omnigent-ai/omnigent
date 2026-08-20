@@ -1325,6 +1325,18 @@ class GitFilesystemRegistry(FilesystemRegistry):
             return None
 
         ref = baseline_sha or "HEAD"
+        content = self._git_show(ref, git_path, norm)
+        if content is None and baseline_sha is not None:
+            _logger.warning(
+                "Baseline SHA %s is unreachable for get_baseline %r; "
+                "falling back to HEAD",
+                baseline_sha,
+                norm,
+            )
+            content = self._git_show("HEAD", git_path, norm)
+        return content
+
+    def _git_show(self, ref: str, git_path: str, norm: str) -> str | None:
         try:
             result = subprocess.run(
                 ["git", "show", f"{ref}:{git_path}"],
@@ -1336,7 +1348,8 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 return result.stdout.decode("utf-8", errors="replace")
         except Exception:
             _logger.debug(
-                "GitFilesystemRegistry.get_baseline: git show failed for %r",
+                "GitFilesystemRegistry.get_baseline: git show %s failed for %r",
+                ref,
                 norm,
                 exc_info=True,
             )
