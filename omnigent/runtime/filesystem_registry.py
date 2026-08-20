@@ -515,20 +515,30 @@ class FilesystemRegistry(ABC):
         """
 
     @abstractmethod
-    def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
+    def get_changed_file(
+        self,
+        session_id: str,
+        path: str,
+        *,
+        baseline_sha: str | None = None,
+    ) -> dict[str, Any] | None:
         """Return the change record for a single *path*, or ``None``.
 
         :param session_id: The session to query, e.g. ``"conv_abc123"``.
         :param path: Path relative to the workspace root, e.g. ``"src/foo.py"``.
+        :param baseline_sha: When set, detect changes relative to this commit
+            instead of HEAD.
         :returns: A file-record dict with ``path``, ``status``, ``bytes``, and
             ``modified_at`` fields, or ``None`` when the file has no changes.
         """
 
     @abstractmethod
-    def get_baseline(self, path: str) -> str | None:
+    def get_baseline(self, path: str, *, baseline_sha: str | None = None) -> str | None:
         """Return the pre-modification baseline content of *path*, or ``None``.
 
         :param path: Path relative to the workspace root, e.g. ``"src/foo.py"``.
+        :param baseline_sha: When set, return content at this commit instead
+            of HEAD.
         :returns: File content before modification, or ``None`` when no
             baseline is available (new/untracked file, or no snapshot seeded).
         """
@@ -691,7 +701,13 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             for r in records[:limit]
         ]
 
-    def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
+    def get_changed_file(
+        self,
+        session_id: str,
+        path: str,
+        *,
+        baseline_sha: str | None = None,
+    ) -> dict[str, Any] | None:
         """Return the change record for a single *path*, or ``None``.
 
         Equivalent to scanning :meth:`list_changed_files` for a specific path
@@ -702,6 +718,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         :param session_id: The conversation to query, e.g. ``"conv_abc123"``.
         :param path: Path relative to the workspace root, e.g.
             ``"src/foo.py"``.
+        :param baseline_sha: Ignored for agent-edit registries.
         :returns: A file-record dict (``path``, ``status``, ``bytes``,
             ``modified_at``) when the file was changed this session, or
             ``None`` when it was not touched.
@@ -726,7 +743,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
             "modified_at": last_event.modified_at,
         }
 
-    def get_baseline(self, path: str) -> str | None:
+    def get_baseline(self, path: str, *, baseline_sha: str | None = None) -> str | None:
         """Return the pre-modification baseline content of *path*, or ``None``.
 
         Falls back to the in-memory snapshot captured by :meth:`seed_snapshot`
@@ -735,6 +752,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
 
         :param path: Path relative to the workspace root,
             e.g. ``"src/foo.py"``.
+        :param baseline_sha: Ignored for agent-edit registries (snapshot-based).
         :returns: File content before it was first modified this session, or
             ``None`` when no baseline is available.
         """
@@ -1141,16 +1159,24 @@ class GitFilesystemRegistry(FilesystemRegistry):
             counts[rel_path] = (added, removed)
         return counts
 
-    def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
+    def get_changed_file(
+        self,
+        session_id: str,
+        path: str,
+        *,
+        baseline_sha: str | None = None,
+    ) -> dict[str, Any] | None:
         """Return the change record for a single *path*, or ``None``.
 
-        Queries ``git status --porcelain -- <path>`` for the specific file
-        rather than scanning the full working-tree diff.
+        When *baseline_sha* is set, uses ``git diff`` against the baseline
+        to detect committed changes; otherwise falls back to
+        ``git status --porcelain``.
 
         :param session_id: Ignored for git-backed registries.
         :param path: Path relative to the workspace root.
+        :param baseline_sha: Optional baseline commit for scoped detection.
         :returns: A file-record dict or ``None`` when the file has no
-            uncommitted changes.
+            changes relative to the baseline (or HEAD).
         """
         norm = _normalize_path(path, self._cwd)
         if norm is None:
@@ -1163,11 +1189,16 @@ class GitFilesystemRegistry(FilesystemRegistry):
         except ValueError:
             return None
 
-        # Mirror list_changed_files: a read that *could not run* (timeout /
-        # spawn error / non-zero exit) raises so the diff endpoint surfaces it,
-        # instead of being swallowed to ``None`` — which the endpoint turns
-        # into a 404 indistinguishable from "this path has no changes".
-        argv = ["git", "status", "--porcelain", "--", git_path]
+        _GIT_STATUS_TO_OP = {"A": "created", "M": "modified", "D": "deleted"}
+
+        if baseline_sha is not None:
+            argv = [
+                "git", "diff", "--name-status", "--no-renames",
+                "--end-of-options", baseline_sha, "--", git_path,
+            ]
+        else:
+            argv = ["git", "status", "--porcelain", "--", git_path]
+
         started = time.monotonic()
         try:
             result = subprocess.run(
@@ -1212,6 +1243,22 @@ class GitFilesystemRegistry(FilesystemRegistry):
             )
 
         output = result.stdout.decode("utf-8", errors="replace")
+        if baseline_sha is not None:
+            for line in output.splitlines():
+                parts = line.split("\t", 1)
+                if len(parts) != 2:
+                    continue
+                status_code = parts[0]
+                operation = _GIT_STATUS_TO_OP.get(status_code[0], "modified")
+                numstat = self._run_git_numstat_since(baseline_sha)
+                counts = numstat.get(norm, (None, None))
+                return self._make_record(norm, operation, counts)
+            # Baseline diff found nothing — check for untracked file.
+            untracked = self._list_untracked_files()
+            if norm in untracked or git_path in untracked:
+                return self._make_record(norm, "created", (None, None))
+            return None
+
         for line in output.splitlines():
             parsed = _parse_git_porcelain_line(line)
             if parsed is None:
@@ -1221,12 +1268,14 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
         return None
 
-    def get_baseline(self, path: str) -> str | None:
-        """Return committed content via ``git show HEAD:<path>``.
+    def get_baseline(self, path: str, *, baseline_sha: str | None = None) -> str | None:
+        """Return content at the baseline commit (or HEAD) via ``git show``.
 
         :param path: Path relative to the workspace root.
-        :returns: Content of the file at HEAD, or ``None`` for new/untracked
-            files or when the subprocess fails.
+        :param baseline_sha: When set, return content at this commit instead
+            of HEAD.
+        :returns: Content of the file at the baseline, or ``None`` for
+            new/untracked files or when the subprocess fails.
         """
         norm = _normalize_path(path, self._cwd)
         if norm is None:
@@ -1237,9 +1286,10 @@ class GitFilesystemRegistry(FilesystemRegistry):
         except ValueError:
             return None
 
+        ref = baseline_sha or "HEAD"
         try:
             result = subprocess.run(
-                ["git", "show", f"HEAD:{git_path}"],
+                ["git", "show", f"{ref}:{git_path}"],
                 cwd=str(self._git_root),
                 capture_output=True,
                 timeout=_git_timeout_seconds(),

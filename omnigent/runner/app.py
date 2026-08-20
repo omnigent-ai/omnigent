@@ -8328,9 +8328,13 @@ def create_runner_app(
         try:
             # Offloaded like list_filesystem_changes: get_changed_file shells out
             # to git (status + show) synchronously, so keep it off the loop.
+            baseline = _session_git_head_sha.get(session_id)
             record = (
                 await _asyncio.to_thread(
-                    session_registry.get_changed_file, session_id, relative_path
+                    session_registry.get_changed_file,
+                    session_id,
+                    relative_path,
+                    baseline_sha=baseline,
                 )
                 if session_registry is not None
                 else None
@@ -8356,7 +8360,9 @@ def create_runner_app(
         is_deleted = record.get("status") == "deleted"
 
         before: str | None = (
-            await _asyncio.to_thread(session_registry.get_baseline, relative_path)
+            await _asyncio.to_thread(
+                session_registry.get_baseline, relative_path, baseline_sha=baseline
+            )
             if session_registry is not None
             else None
         )
