@@ -1483,6 +1483,9 @@ class SqlScheduledTask(OmnigentBase):
     last_run_conversation_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     created_at: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    requires_hook_review: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=false()
+    )
 
     __table_args__ = (
         CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),

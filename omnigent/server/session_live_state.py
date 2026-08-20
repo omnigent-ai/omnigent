@@ -233,6 +233,10 @@ def persist_scheduled_run_completion(
             error=error,
             error_code=error_code,
         )
+        if error_code in {"hook_audit_required", "hook_audit_unavailable"}:
+            store.update(run.scheduled_task_id, requires_hook_review=True)
+        elif run_status == "succeeded":
+            store.update(run.scheduled_task_id, requires_hook_review=False)
 
     _submit("scheduled_run_completion", _transition)
 

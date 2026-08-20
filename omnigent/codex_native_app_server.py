@@ -49,6 +49,7 @@ from omnigent.inner.codex_executor import (
     _databricks_codex_base_url,
     _databricks_codex_config_overrides,
     _find_codex_cli,
+    _merge_codex_user_hook_trust_back,
     _populate_codex_home_config,
     _provider_codex_config_overrides,
     codex_extended_catalog_requested,
@@ -1176,6 +1177,7 @@ class CodexNativeAppServer:
             except asyncio.TimeoutError:
                 _kill_process_tree(self.proc)
                 await self.proc.wait()
+        self.persist_user_hook_trust()
         if self.process_registry_tag is not None:
             unregister_codex_native_process(self.process_registry_tag)
         if self.process_owner_lock is not None:
@@ -1188,6 +1190,13 @@ class CodexNativeAppServer:
         self.stderr_task = None
         self.process_registry_tag = None
         self.process_owner_lock = None
+
+    def persist_user_hook_trust(self) -> None:
+        """Carry user hook approvals from this private home into the shared config."""
+        _merge_codex_user_hook_trust_back(
+            self.codex_home,
+            _codex_home_config_source_from_env(),
+        )
 
     async def _wait_until_ready(self) -> None:
         """
@@ -1469,6 +1478,39 @@ def _our_policy_hooks_from_list(listed: _JsonObject, cwd: str) -> list[_JsonObje
     :returns: The matching Omnigent policy-hook metadata dicts.
     """
     return _our_hooks_from_list(listed, cwd, _POLICY_HOOK_MODULE)
+
+
+async def codex_user_hooks_audit_status(request: CodexRequestFn, *, cwd: str) -> str:
+    """Return ``trusted``, ``review_required``, or ``unavailable`` for user hooks."""
+    listed = await request("hooks/list", {"cwds": [cwd]})
+    result = _string_object_dict(listed.get("result")) or listed
+    data = _object_list(result.get("data")) or []
+    entry = next(
+        (
+            item
+            for raw in data
+            if (item := _string_object_dict(raw)) is not None and item.get("cwd") == cwd
+        ),
+        None,
+    )
+    if entry is None:
+        return "unavailable"
+    hooks = [
+        hook
+        for raw in (_object_list(entry.get("hooks")) or [])
+        if (hook := _string_object_dict(raw)) is not None
+        and _POLICY_HOOK_MODULE not in str(hook.get("command", ""))
+        and _CODEX_ROUTER_HOOK_MODULE not in str(hook.get("command", ""))
+    ]
+    if not hooks:
+        return "trusted"
+    if any(hook.get("currentHash") is None or hook.get("trustStatus") is None for hook in hooks):
+        return "unavailable"
+    return (
+        "trusted"
+        if all(hook.get("trustStatus") in _TRUSTED_HOOK_STATUSES for hook in hooks)
+        else "review_required"
+    )
 
 
 def _hooks_list_diagnostics(listed: _JsonObject, cwd: str) -> str:

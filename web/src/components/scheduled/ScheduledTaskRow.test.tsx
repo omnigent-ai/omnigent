@@ -29,6 +29,7 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     lastRunAt: null,
     lastRunStatus: null,
     lastRunConversationId: null,
+    requiresHookReview: false,
     nextRunAt: null,
     ...overrides,
   };
@@ -95,6 +96,13 @@ describe("⋯ menu actions", () => {
     expect(runNow).toBeInTheDocument();
     fireEvent.click(runNow);
     expect(onRunNow).toHaveBeenCalledWith(t);
+  });
+
+  it("labels tasks that need hook review and offers the review action", () => {
+    renderRow(task({ requiresHookReview: true }));
+    expect(screen.getByText("Needs hook review")).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    expect(screen.getByTestId("task-run-now")).toHaveTextContent("Review hooks");
   });
 
   it("disables the menu trigger while the row is busy", () => {

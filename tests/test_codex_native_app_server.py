@@ -27,6 +27,7 @@ from omnigent.codex_native_app_server import (
     _our_policy_hooks_from_list,
     _sync_codex_developer_instructions,
     build_codex_native_server,
+    codex_user_hooks_audit_status,
     discover_codex_model_options,
     framework_approved_tools,
     trust_codex_router_hooks,
@@ -37,6 +38,34 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("trust_status", "expected"),
+    [("trusted", "trusted"), ("untrusted", "review_required"), (None, "unavailable")],
+)
+async def test_codex_user_hooks_audit_status(trust_status: str | None, expected: str) -> None:
+    async def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        assert method == "hooks/list"
+        return {
+            "result": {
+                "data": [
+                    {
+                        "cwd": "/repo",
+                        "hooks": [
+                            {
+                                "command": "/repo/my-hook.sh",
+                                "currentHash": "abc" if trust_status is not None else None,
+                                "trustStatus": trust_status,
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+
+    assert await codex_user_hooks_audit_status(request, cwd="/repo") == expected
 
 
 async def test_discover_codex_model_options_strips_secrets_and_stops_process(

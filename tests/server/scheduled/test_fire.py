@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -91,6 +92,17 @@ class FakeScheduledTaskStore:
             }
         )
         return None
+
+    def list_runs(self, scheduled_task_id: str, *, limit: int = 100) -> tuple[list[Any], None]:
+        rows = [SimpleNamespace(**row, id=row["run_id"]) for row in reversed(self.runs)]
+        return rows[:limit], None
+
+    def update_run(self, run_id: str, *, status: str, **kwargs: Any) -> Any:
+        run = next((item for item in self.runs if item["run_id"] == run_id), None)
+        if run is None:
+            return None
+        run.update(status=status, **kwargs)
+        return run
 
 
 class SequencedScheduledTaskStore(FakeScheduledTaskStore):
@@ -284,7 +296,7 @@ async def test_pause_between_on_fire_and_run_fire_is_noop() -> None:
 
     assert launches == []
     assert conv_store.created == []
-    assert store.runs == []
+    assert store.runs[0]["status"] == "scheduled"
 
 
 @pytest.mark.asyncio
@@ -302,7 +314,7 @@ async def test_delete_between_on_fire_and_run_fire_is_noop() -> None:
 
     assert launches == []
     assert conv_store.created == []
-    assert store.runs == []
+    assert store.runs[0]["status"] == "scheduled"
 
 
 @pytest.mark.asyncio
@@ -355,7 +367,7 @@ async def test_fire_runs_under_task_workspace_scope() -> None:
     assert store.get_workspace_ids == [42, 42]
     assert conv_store.create_workspace_ids == [42]
     assert perm.grant_workspace_ids == [42]
-    assert store.update_workspace_ids == [42]
+    assert store.update_workspace_ids == [42, 42]
     assert store.run_workspace_ids == [42]
 
 
@@ -1001,7 +1013,7 @@ async def test_run_now_active_creates_session_grant_and_run() -> None:
     started = await run_now(0, "task_1")
     await _drain()
 
-    assert started is True
+    assert isinstance(started, str)
     assert len(conv_store.created) == 1
     assert perm.grants and perm.grants[0][2] == LEVEL_OWNER
     assert len(launched) == 1
@@ -1026,7 +1038,7 @@ async def test_run_now_fires_paused_task() -> None:
     started = await run_now(0, "task_1")
     await _drain()
 
-    assert started is True
+    assert isinstance(started, str)
     assert len(conv_store.created) == 1
     assert len(launched) == 1
     assert len(store.runs) == 1
@@ -1046,7 +1058,7 @@ async def test_run_now_missing_row_is_noop() -> None:
     started = await run_now(0, "task_1")
     await _drain()
 
-    assert started is False
+    assert started is None
     assert launched == []
     assert store.runs == []
 
@@ -1076,8 +1088,8 @@ async def test_run_now_skips_when_already_in_flight() -> None:
         if conv_store.created:
             break
         await asyncio.sleep(0.01)
-    assert first is True
-    assert second is False
+    assert isinstance(first, str)
+    assert second is None
     assert len(conv_store.created) == 1
     release.set()
     await _drain()

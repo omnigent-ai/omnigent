@@ -415,6 +415,11 @@ export function AppShell() {
   // toggle. Snapshot wins on conflict; spreading undefined is a no-op.
   const sessionLabels = { ...activeConv?.labels, ...activeSession?.labels };
   const terminalFirst = sessionLabels["omnigent.ui"] === "terminal";
+  useEffect(() => {
+    if (terminalFirst && searchParams.get("view") === "terminal" && panelInitialKey === null) {
+      setPanelInitialKeyState(PANEL_NO_TERMINAL_KEY);
+    }
+  }, [terminalFirst, searchParams, panelInitialKey]);
   const isClaudeNative = sessionLabels["omnigent.wrapper"] === "claude-code-native-ui";
   // Native-CLI wrapper of either family. Keys harness behavior gates
   // (composer slash commands, `/model`); terminal-first SDK sessions

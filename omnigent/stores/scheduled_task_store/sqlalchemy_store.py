@@ -61,6 +61,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         last_run_at=row.last_run_at,
         last_run_conversation_id=row.last_run_conversation_id,
         updated_at=row.updated_at,
+        requires_hook_review=row.requires_hook_review,
     )
 
 
@@ -251,6 +252,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
+        requires_hook_review: bool | None = None,
     ) -> ScheduledTask | None:
         """Update mutable fields.
 
@@ -301,6 +303,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 row.last_run_conversation_id != last_run_conversation_id
             ):
                 row.last_run_conversation_id = last_run_conversation_id
+                changed = True
+            if (
+                requires_hook_review is not None
+                and row.requires_hook_review != requires_hook_review
+            ):
+                row.requires_hook_review = requires_hook_review
                 changed = True
             if changed:
                 row.updated_at = now_epoch()
@@ -413,23 +421,32 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         run_id: str,
         *,
         status: str,
-        finished_at: int,
+        finished_at: int | None = None,
+        conversation_id: str | None = None,
+        fired_at: int | None = None,
         error: str | None = None,
         error_code: str | None = None,
     ) -> ScheduledTaskRun | None:
-        """Transition a still-``running`` run to a terminal status.
+        """Advance a still-pending run without clobbering a terminal run.
 
         Conditional on the current status being ``running`` so an
         already-terminal run is never clobbered and concurrent sweeps cannot
         double-transition (see the interface docstring).
         """
-        running_code = encode_scheduled_task_run_status("running")
+        active_codes = {
+            encode_scheduled_task_run_status("scheduled"),
+            encode_scheduled_task_run_status("running"),
+        }
         with self._session("update_task_run") as session:
             row = session.get(SqlScheduledTaskRun, (current_workspace_id(), run_id))
-            if row is None or row.status != running_code:
+            if row is None or row.status not in active_codes:
                 return None
             row.status = encode_scheduled_task_run_status(status)
             row.finished_at = finished_at
+            if conversation_id is not None:
+                row.conversation_id = conversation_id
+            if fired_at is not None:
+                row.fired_at = fired_at
             row.error = error
             row.error_code = error_code
             session.flush()
@@ -471,13 +488,16 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         """
         if not scheduled_task_ids:
             return []
-        running_code = encode_scheduled_task_run_status("running")
+        active_codes = (
+            encode_scheduled_task_run_status("scheduled"),
+            encode_scheduled_task_run_status("running"),
+        )
         with self._session("list_running_runs_for_tasks") as session:
             stmt = (
                 select(SqlScheduledTaskRun)
                 .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
                 .where(SqlScheduledTaskRun.scheduled_task_id.in_(scheduled_task_ids))
-                .where(SqlScheduledTaskRun.status == running_code)
+                .where(SqlScheduledTaskRun.status.in_(active_codes))
                 .order_by(desc(SqlScheduledTaskRun.scheduled_at), desc(SqlScheduledTaskRun.id))
             )
             rows = session.execute(stmt).scalars().all()

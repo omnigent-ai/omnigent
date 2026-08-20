@@ -24,6 +24,11 @@ import httpx
 from playwright.sync_api import Page, expect
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
+from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+    SqlAlchemyScheduledTaskStore,
+)
+from tests.e2e_ui.conftest import _server_state
+
 
 def _builtin_agent_id(base_url: str, name: str) -> str:
     """Look up a built-in agent's id by name via ``GET /v1/agents``.
@@ -96,6 +101,16 @@ def _create_task(
 def _row_by_name(page: Page, name: str):
     """The scheduled-task row whose title matches ``name``."""
     return page.locator('[data-testid="scheduled-task-row"]').filter(has_text=name)
+
+
+def _require_hook_review(task_id: str) -> None:
+    """Mark a seeded task as requiring review in the isolated test database."""
+    database_uri = _server_state.get("database_uri")
+    assert database_uri, "live_server did not publish its isolated database URI"
+    updated = SqlAlchemyScheduledTaskStore(str(database_uri)).update(
+        task_id, requires_hook_review=True
+    )
+    assert updated is not None
 
 
 def _pick_minute(page: Page, minute: int) -> None:
@@ -396,6 +411,26 @@ def test_scheduled_task_row_run_controls(
         page.wait_for_timeout(200)
         deadline += 1
     assert _has_failed_run(), "Run now did not record a failed run within the timeout"
+
+
+def test_scheduled_task_row_surfaces_required_hook_review(
+    page: Page,
+    live_server: str,
+) -> None:
+    """A task blocked by changed Codex hooks exposes its manual review action."""
+    agent_id = _builtin_agent_id(live_server, "hello_world")
+    task_id = _create_task(
+        live_server, agent_id, "Review target", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"
+    )
+    _require_hook_review(task_id)
+
+    page.goto(f"{live_server}/tasks")
+    row = _row_by_name(page, "Review target")
+    expect(row).to_contain_text("Needs hook review", timeout=30_000)
+
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    expect(page.get_by_test_id("task-run-now")).to_have_text("Review hooks")
 
 
 # ── Model + reasoning-effort selectors (PR #3331) ──────────────────────────

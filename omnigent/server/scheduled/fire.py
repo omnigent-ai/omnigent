@@ -173,7 +173,7 @@ def build_run_now(
     deps: FireDeps,
     *,
     launch_dispatch: LaunchDispatch | None = None,
-) -> Callable[[int, str], Awaitable[bool]]:
+) -> Callable[[int, str], Awaitable[str | None]]:
     """Build the manual "run now" trigger — an immediate fire of a task.
 
     Reuses the exact scheduled-fire machinery (the same
@@ -200,7 +200,7 @@ def build_run_now(
     else:
         dispatch = launch_dispatch
 
-    async def run_now(workspace_id: int, scheduled_task_id: str) -> bool:
+    async def run_now(workspace_id: int, scheduled_task_id: str) -> str | None:
         return await _trigger_fire(
             deps,
             workspace_id,
@@ -221,7 +221,7 @@ async def _trigger_fire(
     preflight: ConnectedHostPreflight | None,
     *,
     require_active: bool,
-) -> bool:
+) -> str | None:
     """Synchronously guard a fire, then dispatch the run in the background.
 
     Shared by the scheduled fire path (``require_active=True``) and the manual
@@ -239,32 +239,68 @@ async def _trigger_fire(
         task = await asyncio.to_thread(deps.scheduled_task_store.get, scheduled_task_id)
         if task is None:
             _logger.info("scheduled fire: task %s no longer exists — skipping", scheduled_task_id)
-            return False
+            return None
         if require_active and task.state != "active":
             _logger.info(
                 "scheduled fire: task %s is %s (not active) — skipping",
                 scheduled_task_id,
                 task.state,
             )
-            return False
+            return None
+        if require_active and task.requires_hook_review:
+            _logger.info("scheduled fire: task %s needs manual hook review", scheduled_task_id)
+            return None
+        latest_runs, _ = await asyncio.to_thread(
+            deps.scheduled_task_store.list_runs, scheduled_task_id, limit=1
+        )
+        if latest_runs and latest_runs[0].status in {"scheduled", "running"}:
+            _logger.info(
+                "scheduled fire: task %s has a persisted in-flight run", scheduled_task_id
+            )
+            return None
 
     key = (workspace_id, scheduled_task_id)
     if key in _IN_FLIGHT_TASKS:
         _logger.info("scheduled fire: task %s already in flight — skipping", scheduled_task_id)
-        return False
+        return None
     _IN_FLIGHT_TASKS.add(key)
+
+    run_id = _new_id()
+    scheduled_at = int(time.time())
+    with workspace_scope(workspace_id):
+        await asyncio.to_thread(
+            deps.scheduled_task_store.create_run,
+            run_id,
+            scheduled_task_id,
+            "scheduled",
+            scheduled_at,
+        )
+        await asyncio.to_thread(
+            deps.scheduled_task_store.update,
+            scheduled_task_id,
+            last_run_at=scheduled_at,
+        )
 
     # Fire-and-forget: the session create + launch runs in the background so the
     # caller returns immediately (the scheduler re-arms the timer now; the route
     # returns 202).
     fire_task = asyncio.create_task(
-        _run_fire(deps, workspace_id, scheduled_task_id, dispatch, preflight, require_active),
+        _run_fire(
+            deps,
+            workspace_id,
+            scheduled_task_id,
+            dispatch,
+            preflight,
+            require_active,
+            run_id,
+            scheduled_at,
+        ),
         name=f"scheduled-fire-{scheduled_task_id}",
     )
     _PENDING_FIRES.add(fire_task)
     fire_task.add_done_callback(_PENDING_FIRES.discard)
     fire_task.add_done_callback(lambda _task: _IN_FLIGHT_TASKS.discard(key))
-    return True
+    return run_id
 
 
 async def _run_fire(
@@ -274,6 +310,8 @@ async def _run_fire(
     dispatch: LaunchDispatch,
     preflight: ConnectedHostPreflight | None,
     require_active: bool = True,
+    run_id: str | None = None,
+    scheduled_at: int | None = None,
 ) -> None:
     """Background body of a firing: create session, grant, launch, record run.
 
@@ -294,9 +332,17 @@ async def _run_fire(
             )
             return
 
-        scheduled_at = int(time.time())
+        scheduled_at = scheduled_at or int(time.time())
         try:
-            await _run_fire_for_task(deps, task, dispatch, preflight, scheduled_at)
+            await _run_fire_for_task(
+                deps,
+                task,
+                dispatch,
+                preflight,
+                scheduled_at,
+                run_id=run_id,
+                manual=not require_active,
+            )
         except Exception:
             _logger.exception("scheduled fire: task %s failed", task.id)
 
@@ -307,6 +353,9 @@ async def _run_fire_for_task(
     dispatch: LaunchDispatch,
     preflight: ConnectedHostPreflight | None,
     scheduled_at: int,
+    *,
+    run_id: str | None = None,
+    manual: bool = False,
 ) -> None:
     """Run a freshly re-read active task inside its workspace scope."""
     try:
@@ -323,6 +372,7 @@ async def _run_fire_for_task(
                 None,
                 scheduled_at,
                 "skipped",
+                run_id=run_id,
                 error=f"execution_target {task.execution_target!r} not supported yet",
                 error_code="unsupported_target",
             )
@@ -351,6 +401,7 @@ async def _run_fire_for_task(
                 status="failed",
                 error=str(exc),
                 error_code=exc.error_code,
+                run_id=run_id,
             )
             return
 
@@ -366,6 +417,7 @@ async def _run_fire_for_task(
                 status="failed",
                 error=error,
                 error_code=error_code,
+                run_id=run_id,
             )
             return
 
@@ -382,6 +434,7 @@ async def _run_fire_for_task(
                     status="failed",
                     error=str(exc),
                     error_code=exc.error_code,
+                    run_id=run_id,
                 )
                 return
 
@@ -407,11 +460,12 @@ async def _run_fire_for_task(
                 status="failed",
                 error=error,
                 error_code=error_code,
+                run_id=run_id,
             )
             return
 
         try:
-            conv = await _create_session(deps, effective)
+            conv = await _create_session(deps, effective, manual=manual)
         except Exception:
             _logger.exception("scheduled fire: failed to create session for task %s", task.id)
             await _record_run(
@@ -422,6 +476,7 @@ async def _run_fire_for_task(
                 status="failed",
                 error="session creation failed",
                 error_code="session_create_failed",
+                run_id=run_id,
             )
             return
 
@@ -441,8 +496,24 @@ async def _run_fire_for_task(
                 status="failed",
                 error="owner grant failed",
                 error_code="owner_grant_failed",
+                run_id=run_id,
             )
             return
+
+        if run_id is not None:
+            fired_at = int(time.time())
+            await asyncio.to_thread(
+                deps.scheduled_task_store.update_run,
+                run_id,
+                status="running",
+                conversation_id=conv.id,
+                fired_at=fired_at,
+            )
+            await asyncio.to_thread(
+                deps.scheduled_task_store.update,
+                task.id,
+                last_run_conversation_id=conv.id,
+            )
 
         try:
             await dispatch(conv, effective)
@@ -462,10 +533,12 @@ async def _run_fire_for_task(
                 status="failed",
                 error="runner launch/dispatch failed",
                 error_code="launch_failed",
+                run_id=run_id,
             )
             return
 
-        await _record_run(deps, task, conv.id, scheduled_at, status="running")
+        if run_id is None:
+            await _record_run(deps, task, conv.id, scheduled_at, status="running")
         _logger.info("scheduled fire: task %s fired session %s", task.id, conv.id)
     except Exception:
         _logger.exception("scheduled fire: task %s failed", task.id)
@@ -583,7 +656,9 @@ async def _resolve_default_workspace(deps: FireDeps, host_id: str) -> str:
     return canonical
 
 
-async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
+async def _create_session(
+    deps: FireDeps, task: ScheduledTask, *, manual: bool = False
+) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
     # Connected-host, existing-workspace runs create the conversation directly.
     # Future execution modes such as managed sandbox, branch selection, and
@@ -594,6 +669,12 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
         title=task.name,
         host_id=task.host_id,
         workspace=task.workspace,
+        labels={
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "codex-native-ui",
+            "omnigent.scheduled_task.id": task.id,
+            "omnigent.scheduled_task.trigger": "manual" if manual else "scheduled",
+        },
     )
     if task.model_override is not None or task.reasoning_effort is not None:
         updated: Conversation | None = await asyncio.to_thread(
@@ -631,6 +712,7 @@ async def _record_run(
     status: str,
     error: str | None = None,
     error_code: str | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Stamp last_run_* on the task and write a scheduled_task_runs row."""
     await asyncio.to_thread(
@@ -642,6 +724,7 @@ async def _record_run(
         status,
         error=error,
         error_code=error_code,
+        run_id=run_id,
     )
 
 
@@ -654,6 +737,7 @@ def _record_run_sync(
     *,
     error: str | None = None,
     error_code: str | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Synchronous run recording body for ``asyncio.to_thread`` callers."""
     now = int(time.time())
@@ -661,16 +745,27 @@ def _record_run_sync(
     if conversation_id is not None:
         update_fields["last_run_conversation_id"] = conversation_id
     deps.scheduled_task_store.update(task.id, **update_fields)
-    deps.scheduled_task_store.create_run(
-        _new_id(),
-        task.id,
-        status,
-        scheduled_at,
-        conversation_id=conversation_id,
-        fired_at=now,
-        error=error,
-        error_code=error_code,
-    )
+    if run_id is not None:
+        deps.scheduled_task_store.update_run(
+            run_id,
+            status=status,
+            conversation_id=conversation_id,
+            fired_at=now,
+            finished_at=now if status not in {"scheduled", "running"} else None,
+            error=error,
+            error_code=error_code,
+        )
+    else:
+        deps.scheduled_task_store.create_run(
+            _new_id(),
+            task.id,
+            status,
+            scheduled_at,
+            conversation_id=conversation_id,
+            fired_at=now,
+            error=error,
+            error_code=error_code,
+        )
 
 
 async def _validate_fire_session_inputs(

@@ -136,6 +136,7 @@ class ScheduledTaskStore(ABC):
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
+        requires_hook_review: bool | None = None,
     ) -> ScheduledTask | None:
         """
         Update mutable fields of a task.
@@ -230,7 +231,9 @@ class ScheduledTaskStore(ABC):
         run_id: str,
         *,
         status: str,
-        finished_at: int,
+        finished_at: int | None = None,
+        conversation_id: str | None = None,
+        fired_at: int | None = None,
         error: str | None = None,
         error_code: str | None = None,
     ) -> ScheduledTaskRun | None:
