@@ -219,6 +219,74 @@ def test_parse_non_modal_provider_yields_rejecting_factory() -> None:
     assert "lakebox" in exc.value.detail
 
 
+def test_parse_valid_coda_config_builds_managed_provider_factory() -> None:
+    """A complete CoDA block is registered as a launch-capable provider."""
+    from omnigent.onboarding.sandboxes.coda import CodaProvider
+
+    deployment = parse_sandbox_config(
+        {
+            "provider": "coda",
+            "server_url": "https://server.example.test/",
+            "coda": {
+                "app_name": "synthetic-coda",
+                "app_url": "https://synthetic-coda.aws.databricksapps.com/",
+            },
+        }
+    )
+
+    assert deployment is not None
+    config = deployment.default
+    assert config.provider == "coda"
+    assert config.server_url == "https://server.example.test"
+    assert config.managed_launch_supported is True
+    assert config.token_ttl_s == 13 * 3600
+    launcher = config.launcher_factory()
+    assert isinstance(launcher, CodaProvider)
+    assert launcher.provider == "coda"
+
+
+@pytest.mark.parametrize(
+    "coda_config, message",
+    [
+        ({}, "requires app_name and app_url"),
+        ({"app_name": "synthetic-coda"}, "requires app_name and app_url"),
+        ({"app_url": "https://synthetic-coda.example.test"}, "requires app_name and app_url"),
+        ({"app_name": "synthetic-coda", "app_url": ""}, "must be a non-empty string"),
+        ({"app_name": "synthetic-coda", "app_url": "https://x", "unexpected": True}, "unknown"),
+        (
+            {"app_name": "synthetic-coda", "app_url": "plain text"},
+            "sandbox.coda.app_url",
+        ),
+        (
+            {
+                "app_name": "synthetic-coda",
+                "app_url": "http://synthetic-coda.aws.databricksapps.com",
+            },
+            "sandbox.coda.app_url",
+        ),
+        (
+            {
+                "app_name": "synthetic-coda",
+                "app_url": "https://synthetic-coda.aws.databricksapps.com/path",
+            },
+            "sandbox.coda.app_url",
+        ),
+    ],
+)
+def test_parse_coda_rejects_incomplete_or_unknown_config(
+    coda_config: dict[str, object], message: str
+) -> None:
+    """Incomplete CoDA configuration fails at startup with a safe message."""
+    with pytest.raises(ValueError, match=message):
+        parse_sandbox_config(
+            {
+                "provider": "coda",
+                "server_url": "https://server.example.test",
+                "coda": coda_config,
+            }
+        )
+
+
 def test_parse_valid_daytona_config_builds_parameterized_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
