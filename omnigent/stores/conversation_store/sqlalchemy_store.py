@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any, Protocol, cast
@@ -3904,6 +3905,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         return conv
 
     async def delete_conversation(self, conversation_id: str) -> bool:
+        """Delete a conversation subtree without blocking the event loop."""
+        return await asyncio.to_thread(self._delete_conversation_sync, conversation_id)
+
+    def _delete_conversation_sync(self, conversation_id: str) -> bool:
         """
         Delete a conversation and all of its descendants, cleaning up
         every related row explicitly (no DB-level CASCADE).
