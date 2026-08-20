@@ -14,7 +14,8 @@ harness on a single compact row — the name on the left, then an aligned
 ``2=Codex``, ``3=Cursor``, ``4=OpenCode``, ``5=Hermes``, ``6=Pi``,
 ``7=Antigravity``, ``8=Qwen Code``, ``9=Goose``, ``10=Cline``,
 ``11=Devin``, ``12=Grok Build``, ``13=Copilot``, ``14=Kiro``, ``15=Kimi Code``,
-``16=Import from OpenClaw``, ``17=Custom ACP agent``, ``18=Quit``. There is no "More" folding — every harness is visible at once —
+``16=Import from OpenClaw``, ``17=Custom ACP agent``, ``18=Quit``. There is no
+"More" folding — every harness is visible at once —
 and the actionable hint (install command / next step)
 renders only for the highlighted row, as the selector's description line.
 Selecting a harness drills into level 2 — its configured credentials, then ``+ Add a
