@@ -147,6 +147,7 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
         "SessionStart",
         "Stop",
         "StopFailure",
+        "SubagentStop",
         "TaskCompleted",
         "TaskCreated",
         "UserPromptSubmit",

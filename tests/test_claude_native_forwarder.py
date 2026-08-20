@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import os
 import queue
 import threading
+import time
 from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +32,7 @@ from omnigent.claude_native_bridge import (
     ClaudeTranscriptItem,
     prepare_bridge_dir,
     read_active_session_id,
+    read_hook_events_since_with_position,
     record_hook_event,
     write_active_session_id,
 )
@@ -5005,6 +5008,7 @@ async def test_subagent_watcher_retry_skips_previously_posted_items(
             start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
             item_retry_tracker=item_retry_tracker,
             status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            stopped_subagent_ids=set(),
         )
         second = await forwarder._forward_available_subagents(
             client=client,
@@ -5016,6 +5020,7 @@ async def test_subagent_watcher_retry_skips_previously_posted_items(
             start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
             item_retry_tracker=item_retry_tracker,
             status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            stopped_subagent_ids=set(),
         )
 
     assert posted_items == ["user:go", "assistant:done", "assistant:done"]
@@ -7379,6 +7384,7 @@ async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
                 task_subjects={},
                 task_statuses={},
                 task_order=[],
+                subagent_stops=set(),
             )
 
     # Poll 1: persist fails → cursor is held BEFORE the compaction hook record,
@@ -7542,6 +7548,7 @@ async def test_subagent_item_drop_writes_dead_letter(tmp_path: Path) -> None:
                 base_delay_s=0.0, max_permanent_attempts=1
             ),
             status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            stopped_subagent_ids=set(),
         )
 
     forwarder._reset_forward_health()
@@ -7598,6 +7605,7 @@ async def test_subagent_start_drop_writes_dead_letter(tmp_path: Path) -> None:
             ),
             item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
             status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            stopped_subagent_ids=set(),
         )
 
     forwarder._reset_forward_health()
@@ -7750,6 +7758,7 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path) 
             task_subjects={},
             task_statuses={},
             task_order=[],
+            subagent_stops=set(),
             response_id="resp_turn_1",
         )
 
@@ -8160,3 +8169,237 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
     assert stall_warnings, "the deadline trip must be loudly logged, never silent"
     # The warning's traceback names the stalled await for next-time forensics.
     assert stall_warnings[0].exc_info is not None
+
+
+@pytest.mark.asyncio
+async def test_subagent_stays_running_until_stop_hook(tmp_path: Path) -> None:
+    """
+    A quiet sub-agent stays ``running`` until its ``SubagentStop`` fires.
+
+    The sidebar rolls a running child up onto the parent row, so this is
+    what keeps a session reading as working while its main agent waits on
+    a sub-agent. Real sub-agent transcripts go minutes between items (a
+    long tool call, a long thinking block), so quiet time must NOT settle
+    the child — only the hook edge does.
+
+    :param tmp_path: Pytest temp dir for the bridge dir and transcript.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="plan1",
+        agent_type="Plan",
+        description="plan the refactor",
+        tool_use_id="toolu_plan",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "sa-assistant-plan",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            },
+        ],
+    )
+    statuses: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Accept every POST, recording status edges per child session.
+
+        :param request: Request issued by the forwarder.
+        :returns: Canned Omnigent response.
+        """
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_subagent_start":
+            return httpx.Response(200, json={"child_session_id": "conv_child_plan"})
+        if body.get("type") == "external_session_status":
+            statuses.append((request.url.path, body["data"]["status"]))
+        return httpx.Response(202, json={})
+
+    stops: set[str] = set()
+
+    async def _poll(state: forwarder.SubagentForwardState) -> forwarder.SubagentForwardState:
+        return await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            stopped_subagent_ids=stops,
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await _poll(forwarder.SubagentForwardState(subagents={}))
+        # Registration published running. Now go quiet for far longer than
+        # the old 5s window: the child must still read running.
+        state = forwarder.SubagentForwardState(
+            subagents={
+                "plan1": dataclasses.replace(
+                    state.subagents["plan1"],
+                    last_activity_ts=time.time() - 120.0,
+                )
+            }
+        )
+        state = await _poll(state)
+        assert [s for _, s in statuses] == ["running"]
+
+        # The hook edge settles it, once.
+        stops.add("plan1")
+        state = await _poll(state)
+        state = await _poll(state)
+
+    assert [s for _, s in statuses] == ["running", "idle"]
+    assert all(path.endswith("/conv_child_plan/events") for path, _ in statuses)
+
+
+@pytest.mark.asyncio
+async def test_subagent_settles_on_backstop_when_stop_hook_never_fires(tmp_path: Path) -> None:
+    """
+    Without any ``SubagentStop`` edge, the quiescence backstop still settles.
+
+    Covers the degraded path: a Claude build that never fires the event, a
+    dropped hook write, or a hook command that failed. The child must not
+    stay ``running`` forever — the parent row would spin with nothing
+    working — so the widened timer remains the floor under a missing hook.
+
+    :param tmp_path: Pytest temp dir for the bridge dir and transcript.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="nohook1",
+        agent_type="Explore",
+        description="no stop hook available",
+        tool_use_id="toolu_nohook",
+        transcript_records=[
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "sa-assistant-nohook",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            },
+        ],
+    )
+    statuses: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Accept every POST, recording status edges.
+
+        :param request: Request issued by the forwarder.
+        :returns: Canned Omnigent response.
+        """
+        body = json.loads(request.content.decode("utf-8"))
+        if body.get("type") == "external_subagent_start":
+            return httpx.Response(200, json={"child_session_id": "conv_child_nohook"})
+        if body.get("type") == "external_session_status":
+            statuses.append(body["data"]["status"])
+        return httpx.Response(202, json={})
+
+    async def _poll(
+        client: httpx.AsyncClient, state: forwarder.SubagentForwardState
+    ) -> forwarder.SubagentForwardState:
+        return await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_parent",
+            bridge_dir=bridge_dir,
+            transcript_path=transcript_path,
+            state=state,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            # Empty for every poll: the hook edge never arrives.
+            stopped_subagent_ids=set(),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://ap",
+    ) as client:
+        state = await _poll(client, forwarder.SubagentForwardState(subagents={}))
+        assert statuses == ["running"]
+        # Quiet past the backstop window with no hook edge in sight.
+        state = forwarder.SubagentForwardState(
+            subagents={
+                "nohook1": dataclasses.replace(
+                    state.subagents["nohook1"],
+                    last_activity_ts=time.time() - (forwarder._SUBAGENT_IDLE_QUIESCENCE_S + 1.0),
+                )
+            }
+        )
+        await _poll(client, state)
+
+    assert statuses == ["running", "idle"]
+
+
+def test_subagent_stop_hook_record_carries_agent_id(tmp_path: Path) -> None:
+    """
+    A ``SubagentStop`` hook record exposes Claude's ``agent_id``.
+
+    That id is the ``agent-<id>`` transcript stem the sub-agent forwarder
+    keys its child sessions by, so without it the stop edge cannot be
+    matched to a child conversation.
+
+    :param tmp_path: Pytest temp dir for the bridge dir.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "hooks.jsonl").write_text(
+        json.dumps(
+            {
+                "recorded_at": 1.0,
+                "payload": {
+                    "hook_event_name": "SubagentStop",
+                    "agent_id": "plan1",
+                    "agent_type": "Plan",
+                    "transcript_path": "/p/session.jsonl",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    result = read_hook_events_since_with_position(bridge_dir, 0)
+    assert [r.event_name for r in result.records] == ["SubagentStop"]
+    assert result.records[0].subagent_id == "plan1"
+
+
+def test_subagent_stop_hook_record_falls_back_to_transcript_path(tmp_path: Path) -> None:
+    """
+    Without ``agent_id``, the id comes from the sub-agent transcript stem.
+
+    Claude builds at the supported floor may send only
+    ``agent_transcript_path``; ``agent-<id>.jsonl`` names the same id, so
+    the stop edge still matches a child session.
+
+    :param tmp_path: Pytest temp dir for the bridge dir.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "hooks.jsonl").write_text(
+        json.dumps(
+            {
+                "recorded_at": 1.0,
+                "payload": {
+                    "hook_event_name": "SubagentStop",
+                    "agent_transcript_path": "/p/session/subagents/agent-plan9.jsonl",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    result = read_hook_events_since_with_position(bridge_dir, 0)
+    assert result.records[0].subagent_id == "plan9"

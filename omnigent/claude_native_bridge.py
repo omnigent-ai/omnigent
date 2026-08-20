@@ -527,6 +527,11 @@ class ClaudeHookRecord:
         ``TaskCompleted`` (``"completed"``), or
         ``PostToolUse``/``TaskUpdate`` event (``"in_progress"`` or
         ``"completed"``). ``None`` for all other events.
+    :param subagent_id: Claude-side sub-agent id from a ``SubagentStop``
+        hook payload's ``agent_id``, e.g. ``"a5c7effac5a9a35ab"`` — the
+        same id as the ``agent-<id>`` transcript stem, which is where it
+        is read from when a payload carries only
+        ``agent_transcript_path``. ``None`` for all other events.
     :param background_task_count: Number of background tasks still running
         when a ``Stop`` hook fires — entries in the payload's
         ``background_tasks`` array whose per-task ``status`` is not terminal
@@ -550,6 +555,7 @@ class ClaudeHookRecord:
     task_id: str | None = None
     task_subject: str | None = None
     task_status: str | None = None
+    subagent_id: str | None = None
     background_task_count: int = 0
 
 
@@ -1416,6 +1422,11 @@ def build_hook_settings(
         "SessionStart": [{"hooks": [session_start_hook]}],
         "Stop": [{"hooks": [hook]}],
         "StopFailure": [{"hooks": [hook]}],
+        # ``SubagentStop`` fires when a Task sub-agent finishes. Its
+        # payload's ``agent_id`` names the ``agent-<id>`` transcript, so
+        # the forwarder can settle that child's status on an authoritative
+        # edge instead of guessing from transcript quiet time.
+        "SubagentStop": [{"hooks": [hook]}],
         # ``UserPromptSubmit`` is the symmetric counterpart to
         # ``Stop`` — fires when a new user prompt reaches Claude
         # (web-UI message via tmux send-keys, or direct keystrokes
@@ -2766,6 +2777,18 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         if isinstance(raw_task_id, str) and raw_task_id:
             task_id = raw_task_id
         task_status = "completed"
+    subagent_id: str | None = None
+    if event_name == "SubagentStop" and isinstance(payload, dict):
+        raw_agent_id = payload.get("agent_id")
+        raw_agent_transcript = payload.get("agent_transcript_path")
+        if isinstance(raw_agent_id, str) and raw_agent_id:
+            subagent_id = raw_agent_id
+        elif isinstance(raw_agent_transcript, str) and raw_agent_transcript:
+            # Older payloads carry only the sub-agent's transcript path;
+            # ``agent-<id>.jsonl`` names the same id.
+            stem = Path(raw_agent_transcript).stem
+            if stem.startswith("agent-"):
+                subagent_id = stem.removeprefix("agent-") or None
     background_task_count = 0
     if event_name == "Stop" and isinstance(payload, dict):
         raw_bg = payload.get("background_tasks")
@@ -2822,6 +2845,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_id=task_id,
         task_subject=task_subject,
         task_status=task_status,
+        subagent_id=subagent_id,
         background_task_count=background_task_count,
     )
 

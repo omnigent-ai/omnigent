@@ -69,13 +69,15 @@ _MAX_PERSISTED_COMPACTION_SEQS = 16
 # prose answer can be hundreds of chunks.
 _MAX_SEEN_DELTA_KEYS = 5000
 
-# Seconds of transcript inactivity after which we publish ``idle`` for
-# a sub-agent. The transcript is the only signal we have for sub-agent
-# completion in Phase A (no SubagentStop hook is subscribed); 5s is the
-# shortest window that comfortably absorbs a stalled tool call without
-# flickering the badge. Phase B will replace this with an authoritative
-# hook signal and drop the heuristic.
-_SUBAGENT_IDLE_QUIESCENCE_S = 5.0
+# Fallback only: seconds of transcript inactivity after which we publish
+# ``idle`` for a sub-agent whose ``SubagentStop`` hook never arrived (a
+# Claude build that does not fire the event, or a dropped hook write).
+# The authoritative edge is the hook; this window only has to be wider
+# than any real quiet stretch mid-run, and real sub-agents go minutes
+# between transcript items (a long Bash call, a long thinking block), so
+# it is deliberately generous. A tight window here read a working
+# sub-agent as idle and dropped the parent row's sidebar spinner.
+_SUBAGENT_IDLE_QUIESCENCE_S = 900.0
 
 # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
 # One per Claude Task-tool subagent; appears alongside the matching
@@ -808,6 +810,9 @@ async def forward_claude_transcript_to_session(
     task_subjects: dict[str, str] = {}
     task_statuses: dict[str, str] = {}
     task_order: list[str] = []
+    # Claude-side ids whose SubagentStop hook has fired. The hook phase
+    # fills it; the sub-agent phase reads it to settle a child's status.
+    stopped_subagent_ids: set[str] = set()
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
@@ -864,6 +869,7 @@ async def forward_claude_transcript_to_session(
                         task_subjects = {}
                         task_statuses = {}
                         task_order = []
+                        stopped_subagent_ids = set()
                         # A rotated session is a fresh dedupe context — reseed
                         # so the new session's first model observation doesn't
                         # post against the prior session's baseline.
@@ -900,6 +906,7 @@ async def forward_claude_transcript_to_session(
                         task_subjects = {}
                         task_statuses = {}
                         task_order = []
+                        stopped_subagent_ids = set()
                         # A rotated session is a fresh dedupe context — reseed
                         # so the new session's first model observation doesn't
                         # post against the prior session's baseline.
@@ -965,6 +972,7 @@ async def forward_claude_transcript_to_session(
                             task_subjects=task_subjects,
                             task_statuses=task_statuses,
                             task_order=task_order,
+                            subagent_stops=stopped_subagent_ids,
                             # The turn-end edges (Stop→idle / StopFailure→failed)
                             # carry the turn's response id so ap-web can CLOSE the
                             # streaming ``activeResponse`` opened by the turn-start
@@ -984,6 +992,7 @@ async def forward_claude_transcript_to_session(
                             start_retry_tracker=subagent_start_retries,
                             item_retry_tracker=subagent_item_retries,
                             status_retry_tracker=subagent_status_retries,
+                            stopped_subagent_ids=stopped_subagent_ids,
                         )
                         # Reconcile + POST cumulative cost AFTER sub-agents are
                         # forwarded so the estimate sees this poll's sub-agent
@@ -1288,11 +1297,17 @@ async def _forward_available_subagents(
     start_retry_tracker: _PostRetryTracker,
     item_retry_tracker: _PostRetryTracker,
     status_retry_tracker: _PostRetryTracker,
+    stopped_subagent_ids: set[str],
 ) -> SubagentForwardState:
     """
     Discover new Claude Task-tool sub-agents on disk, mint Omnigent child
-    conversations for them, tail their transcripts, and publish
-    quiescence-based status.
+    conversations for them, tail their transcripts, and publish status.
+
+    A sub-agent reads ``running`` from the moment it is registered until
+    its ``SubagentStop`` hook names it in ``stopped_subagent_ids``. That
+    matters beyond the child's own row: the session list rolls a running
+    child up onto the parent row, so the sidebar keeps showing the session
+    as working while the main agent sits waiting on the sub-agent.
 
     Idempotent across forwarder restarts: ``state`` (persisted to
     ``subagent_forwarder.json``) holds the Omnigent child id and byte
@@ -1316,6 +1331,10 @@ async def _forward_available_subagents(
     :param status_retry_tracker: Backoff tracker for failed
         ``external_session_status`` POSTs (keyed by
         ``status:<child_id>``).
+    :param stopped_subagent_ids: Claude-side ids whose ``SubagentStop``
+        hook has fired, accumulated across polls by
+        :func:`_forward_available_status_events`. Never pruned — one
+        session spawns tens of sub-agents, so the set stays small.
     :returns: Updated state with new sub-agents registered and
         existing sub-agents' cursors advanced.
     """
@@ -1598,20 +1617,20 @@ async def _forward_available_subagents(
                 last_status=entry.last_status,
             )
 
-        # Quiescence-based status. Sub-agent transcripts don't carry
-        # an explicit "done" record (Claude doesn't expose one), so
-        # we infer "running" from item flow and "idle" from quiet
-        # time. The dedupe on ``last_status`` avoids spamming the
-        # cache on every tick when nothing changed.
-        desired_status: str | None = None
-        if had_item:
-            desired_status = "running"
-        elif (
+        # A registered sub-agent is running until Claude says it stopped.
+        # Item flow is NOT the signal: transcripts go minutes quiet
+        # mid-run, which read as finished and dropped both the child's dot
+        # and the parent row's rolled-up spinner. The dedupe on
+        # ``last_status`` avoids spamming the cache on every tick.
+        desired_status: str | None = "running"
+        if subagent_id in stopped_subagent_ids or (
             new_entry.last_activity_ts is not None
             and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
-            and new_entry.last_status != "idle"
         ):
             desired_status = "idle"
+        elif new_entry.last_status == "idle":
+            # Already settled; a late transcript flush must not reopen it.
+            desired_status = None
         if desired_status is not None and desired_status != new_entry.last_status:
             retry_key = f"subagent_status:{entry.child_conversation_id}"
             if status_retry_tracker.retry_delay_s(retry_key) is None:
@@ -2606,6 +2625,7 @@ async def _forward_available_status_events(
     task_subjects: dict[str, str],
     task_statuses: dict[str, str],
     task_order: list[str],
+    subagent_stops: set[str],
     response_id: str | None = None,
 ) -> HookForwardState:
     """
@@ -2624,6 +2644,11 @@ async def _forward_available_status_events(
     ``external_session_todos`` events. The ``task_subjects``,
     ``task_statuses``, and ``task_order`` dicts are mutated in-place
     to accumulate per-session task state across polls.
+
+    ``SubagentStop`` records are collected into ``subagent_stops``
+    (mutated in-place) rather than published here: they name a child
+    session, not this one, so the sub-agent phase — which holds the
+    Claude-side id to Omnigent child-id mapping — settles their status.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
@@ -2644,6 +2669,9 @@ async def _forward_available_status_events(
     :param task_order: Mutable ordered list of task ids in creation order,
         e.g. ``["1", "2", "3"]``. Appended in-place from ``TaskCreated``
         events. Used to render the task list in a stable order.
+    :param subagent_stops: Claude-side sub-agent ids observed to have
+        stopped, mutated in place and read by
+        :func:`_forward_available_subagents`.
     :param response_id: Active turn's response id, stamped on the
         ``Stop``→``idle`` / ``StopFailure``→``failed`` edges so ap-web
         closes the streaming ``activeResponse`` opened by the matching
@@ -2671,6 +2699,8 @@ async def _forward_available_status_events(
     durable = state
     for record in result.records:
         status = _HOOK_EVENT_TO_STATUS.get(record.event_name or "")
+        if record.event_name == "SubagentStop" and record.subagent_id is not None:
+            subagent_stops.add(record.subagent_id)
         next_durable = HookForwardState(
             event_cursor=record.event_cursor,
             byte_offset=record.byte_offset,
