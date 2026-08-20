@@ -199,6 +199,28 @@ def test_make_auth_token_factory_returns_none_without_databricks_creds(
     assert _make_auth_token_factory() is None
 
 
+def test_make_auth_token_factory_ignores_ambient_databricks_auth_for_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local server must not inherit unrelated ambient Databricks auth."""
+    resolve_calls: list[int] = []
+
+    def _unexpected_sdk_auth(*args: Any, **kwargs: Any) -> tuple[Any, str]:
+        del args, kwargs
+        resolve_calls.append(1)
+        raise AssertionError("loopback servers must not resolve ambient Databricks auth")
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        _unexpected_sdk_auth,
+    )
+
+    assert _make_auth_token_factory() is None
+    assert resolve_calls == []
+
+
 def test_make_auth_token_factory_uses_managed_mint_when_only_binding_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

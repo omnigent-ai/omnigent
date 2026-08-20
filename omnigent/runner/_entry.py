@@ -98,6 +98,16 @@ def _server_url_from_env() -> str:
     return server_url.strip()
 
 
+def _url_is_loopback(url: str) -> bool:
+    """Return whether *url* targets the local loopback interface."""
+    from urllib.parse import urlparse
+
+    try:
+        return urlparse(url).hostname in ("127.0.0.1", "localhost", "::1")
+    except ValueError:
+        return False
+
+
 def _runner_config_path() -> Path:
     """Return the global Omnigent config path visible to the runner.
 
@@ -471,10 +481,10 @@ def _make_auth_token_factory(
          binding token are present.
       3. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
          (populated by ``omnigent login``), keyed by ``server_url``.
-      4. Databricks OAuth token (refreshed via the SDK) — host-keyed
-         when a Databricks Apps pointer record is stored for
-         ``server_url`` (``omnigent login <apps-url>``), ambient
-         otherwise.
+      4. Databricks OAuth token for non-loopback servers (refreshed via
+         the SDK) — host-keyed when a Databricks Apps pointer record is
+         stored for ``server_url`` (``omnigent login <apps-url>``),
+         ambient otherwise.
 
     Returns ``None`` when no credentials are available.
 
@@ -618,6 +628,8 @@ def _make_auth_token_factory(
             oidc_token = load_token(resolved_server_url)
             if oidc_token:
                 return oidc_token
+            if _url_is_loopback(resolved_server_url):
+                return None
         return _sdk_token()
 
     # Probe once to check if a user credential is available.
