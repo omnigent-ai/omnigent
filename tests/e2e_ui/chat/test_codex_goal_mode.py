@@ -43,10 +43,10 @@ def _goal_response(session_id: str, method: str, suffix: str = ""):
 @pytest.mark.timeout(300)
 def test_codex_goal_mode_processes_first_message_with_untrusted_hooks(
     page: Page,
-    mocked_native_codex_goal_session: MockedCodexNativeSession,
+    mocked_native_codex_session: MockedCodexNativeSession,
 ) -> None:
     """Bypass hook review, then exercise goal controls through the real UI path."""
-    session = mocked_native_codex_goal_session
+    session = mocked_native_codex_session
     page.goto(f"{session.base_url}/c/{session.session_id}")
 
     _open_terminal_view(page)

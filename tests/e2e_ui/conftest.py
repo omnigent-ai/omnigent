@@ -694,8 +694,8 @@ def set_fallback_mock_llm(
     resp.raise_for_status()
 
 
-def _codex_cli_supports_goal_mode(codex_path: str) -> bool:
-    """Return whether the installed Codex CLI has app-server goal APIs."""
+def _codex_cli_supports_mocked_app_server(codex_path: str) -> bool:
+    """Return whether the Codex CLI supports the mocked app-server tests."""
     version = subprocess.run(
         [codex_path, "--version"],
         text=True,
@@ -2798,7 +2798,7 @@ providers:
 
 
 @pytest.fixture
-def mocked_native_codex_goal_session(
+def mocked_native_codex_session(
     built_spa: None,
     tmp_path_factory: pytest.TempPathFactory,
     request: pytest.FixtureRequest,
@@ -2813,23 +2813,23 @@ def mocked_native_codex_goal_session(
     in the same shard.
     """
     if request.config.getoption("--ui-base-url"):
-        pytest.skip("mocked native Codex goal e2e requires an isolated spawned server")
+        pytest.skip("mocked native Codex e2e requires an isolated spawned server")
 
     codex_path = shutil.which("codex")
     if codex_path is None:
-        pytest.skip("codex CLI is required for mocked native Codex goal e2e")
-    if not _codex_cli_supports_goal_mode(codex_path):
-        pytest.skip("codex CLI >= 0.139.0 is required for app-server goal APIs")
+        pytest.skip("codex CLI is required for mocked native Codex e2e")
+    if not _codex_cli_supports_mocked_app_server(codex_path):
+        pytest.skip("codex CLI >= 0.139.0 is required for mocked app-server e2e")
 
     try:
         sidecar_bin = build_sidecar_bin()
     except RuntimeError:
         pytest.skip("cargo is required for Codex parity sidecar")
 
-    server_tmp = tmp_path_factory.mktemp("e2e_ui_codex_goal_server")
-    sidecar = start_codex_responses_sidecar(
-        sidecar_bin,
-        server_tmp / "responses.json",
+    server_tmp = tmp_path_factory.mktemp("e2e_ui_mocked_codex_server")
+    responses = getattr(
+        request,
+        "param",
         [
             [
                 ev_response_created("resp-goal-ui-bootstrap"),
@@ -2837,6 +2837,11 @@ def mocked_native_codex_goal_session(
                 ev_completed("resp-goal-ui-bootstrap"),
             ]
         ],
+    )
+    sidecar = start_codex_responses_sidecar(
+        sidecar_bin,
+        server_tmp / "responses.json",
+        responses,
     )
 
     config_home = server_tmp / "config-home"
