@@ -50,10 +50,13 @@ def _make_spec(
     harness: str,
     model: str | None = None,
     acp_agent: object = _MISSING,
+    permission_mode: str | None = None,
 ) -> AgentSpec:
     config: dict[str, object] = {"harness": harness}
     if model is not None:
         config["model"] = model
+    if permission_mode is not None:
+        config["permission_mode"] = permission_mode
     if acp_agent is not _MISSING:
         config["acp_agent"] = acp_agent
     return AgentSpec(
@@ -315,3 +318,24 @@ def test_embedded_agent_round_trip_preserves_all_fields(
     # env_passthrough preservation
     if "expected_env_passthrough" in agent_fields:
         assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == agent_fields["expected_env_passthrough"]
+
+
+def test_permission_mode_forwarded(_isolate_config: Path) -> None:
+    """executor.config.permission_mode rides the spawn env to the wrap (#5052)."""
+    _write_acp_config(_isolate_config)
+    env = _build_acp_spawn_env(_make_spec(harness="acp:goose", permission_mode="bypassPermissions"))
+    assert env["HARNESS_ACP_PERMISSION_MODE"] == "bypassPermissions"
+    # Unset keeps today's behavior: no var, the wrap defaults to always-ask.
+    env = _build_acp_spawn_env(_make_spec(harness="acp:goose"))
+    assert "HARNESS_ACP_PERMISSION_MODE" not in env
+
+
+def test_permission_mode_forwarded_for_cli_rows(_isolate_config: Path) -> None:
+    """Builtin ACP CLI rows (devin etc.) forward the same knob via the cli builder."""
+    from omnigent.runtime.workflow import _build_acp_cli_spawn_env
+
+    _write_acp_config(_isolate_config)
+    env = _build_acp_cli_spawn_env(
+        _make_spec(harness="devin", permission_mode="auto"), harness="devin"
+    )
+    assert env["HARNESS_ACP_PERMISSION_MODE"] == "auto"

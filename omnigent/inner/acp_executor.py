@@ -185,6 +185,14 @@ class AcpAgentConfig:
         the agent authenticates with — an agent that reads a variable must name
         it here (or in ``os_env.sandbox.env_passthrough``) or it starts
         unauthenticated. Names only; values come from the host environment.
+    :param permission_mode: Opt-out of the per-tool human approval card, the
+        same ``executor.config.permission_mode`` knob the other harness
+        families read. ``"bypassPermissions"`` (claude-sdk / claude-native /
+        antigravity semantics) and ``"auto"`` (cursor semantics — its default
+        exists so headless workers don't stall) skip the card and allow;
+        every other value (and unset) behaves exactly as before. TOOL_CALL
+        policy still applies ahead of the skip, so a hard DENY still blocks
+        (#5052).
     """
 
     command: str
@@ -194,6 +202,7 @@ class AcpAgentConfig:
     send_model_in_session_new: bool = False
     omnigent_mcp: bool = True
     env_passthrough: tuple[str, ...] = ()
+    permission_mode: str | None = None
 
 
 class _AcpRequestError(Exception):
@@ -831,6 +840,21 @@ class AcpExecutor(Executor):
             args = cached if isinstance(cached, dict) else {}
         return str(name), args
 
+    # Permission modes that skip the human approval card. ``bypassPermissions``
+    # matches the claude-sdk / claude-native / antigravity semantics;
+    # ``auto`` matches cursor's (its default exists precisely so headless /
+    # Polly workers don't stall on a card nobody answers). Policy DENY still
+    # applies ahead of the skip in _decide_permission (#5052).
+    _ELICITATION_SKIP_MODES = frozenset({"bypassPermissions", "auto"})
+
+    def _elicitation_skipped(self) -> bool:
+        """Whether the configured permission mode skips the human approval card.
+
+        :returns: ``True`` only for the opt-in modes; unset / other values keep
+            today's always-ask behavior.
+        """
+        return (self._config.permission_mode or "") in self._ELICITATION_SKIP_MODES
+
     async def _decide_permission(self, params: _AcpJsonObject) -> bool:
         """Decide allow/deny for a permission request — policy then elicitation.
 
@@ -863,6 +887,11 @@ class AcpExecutor(Executor):
                 logger.info("acp permission denied by policy: tool=%s", tool_name)
                 return False
             if action == "POLICY_ACTION_ASK":
+                if self._elicitation_skipped():
+                    logger.info(
+                        "acp permission auto-allowed (permission mode): tool=%s", tool_name
+                    )
+                    return True
                 if handler is None:
                     logger.warning(
                         "acp TOOL_CALL policy ASK with no elicitation handler; denying tool=%s",
@@ -877,6 +906,10 @@ class AcpExecutor(Executor):
                 )
                 return allowed
             # ALLOW / UNSPECIFIED / unknown → fall through to elicitation.
+
+        if self._elicitation_skipped():
+            logger.info("acp permission auto-allowed (permission mode): tool=%s", tool_name)
+            return True
 
         if handler is not None:
             allowed = bool(await handler(tool_name, tool_input))
