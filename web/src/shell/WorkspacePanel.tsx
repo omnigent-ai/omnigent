@@ -116,12 +116,16 @@ function shellConnectState(liveness: SessionLiveness | undefined): ShellConnectS
 function NewTabMenu({
   conversationId,
   onOpenTerminal,
+  onCreateStart,
   triggerClassName,
   liveness,
 }: {
   conversationId: string;
   /** Open a freshly-created terminal as a rail tab by its tab key. */
   onOpenTerminal: (key: string) => void;
+  /** Called when a shell create is initiated (before the POST resolves), so
+   *  the shell can be focused as soon as its tab appears in the list. */
+  onCreateStart?: () => void;
   /** Extra classes on the trigger wrapper — used to cancel the open-tabs
    *  region's gap so the "+" hugs the last tab. */
   triggerClassName?: string;
@@ -149,6 +153,11 @@ function NewTabMenu({
     preferred !== null && declaredTerminals.includes(preferred) ? preferred : declaredTerminals[0];
 
   const launchShell = (name: string) => {
+    // Signal the create is starting so the shell gets focused the moment its
+    // tab lands in the list — not only when this POST resolves. On a waking
+    // (runner-asleep) session the POST can lag the tab's arrival by seconds;
+    // ``onOpenTerminal`` on success is a backstop for when it's already open.
+    onCreateStart?.();
     create.mutate(name, {
       onSuccess: (info) => onOpenTerminal(terminalTabKey(info)),
     });
@@ -588,6 +597,9 @@ interface WorkspacePanelProps {
    *  connect affordance (Reconnecting… / Offline). Absent is treated as
    *  ready. */
   liveness?: SessionLiveness;
+  /** Called when a shell create is initiated from the "+" menu, so the new
+   *  shell is focused as soon as its tab lands (not only on the create POST). */
+  onShellCreateStart?: () => void;
 }
 
 /**
@@ -637,6 +649,7 @@ export function WorkspacePanel({
   filesPanelShowHidden,
   onShowHiddenChange,
   liveness,
+  onShellCreateStart,
 }: WorkspacePanelProps) {
   // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
   // window keydown listener on every render — an inline arrow would change
@@ -815,6 +828,7 @@ export function WorkspacePanel({
             <NewTabMenu
               conversationId={conversationId}
               onOpenTerminal={openTerminalTab}
+              onCreateStart={onShellCreateStart}
               triggerClassName="ml-[2px]"
               liveness={liveness}
             />
@@ -828,6 +842,7 @@ export function WorkspacePanel({
           <NewTabMenu
             conversationId={conversationId}
             onOpenTerminal={openTerminalTab}
+            onCreateStart={onShellCreateStart}
             liveness={liveness}
           />
         )}
@@ -857,7 +872,11 @@ export function WorkspacePanel({
           (tree vs changed-only list); Subagents lists the root's children +
           a "main" link back to the parent. */}
       <div data-workspace-panel-content className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        {selectedTerminalKey !== null ? (
+        {selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey) ? (
+          // Show the selected shell's xterm only while its terminal is actually
+          // present. The selection is sticky (AppShell never prunes it off the
+          // list), so during a transient terminals-list churn this falls back to
+          // the default view and the xterm reappears when the terminal returns.
           <RailTerminalView
             conversationId={conversationId}
             terminalKey={selectedTerminalKey}

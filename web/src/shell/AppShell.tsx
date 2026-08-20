@@ -340,11 +340,7 @@ export function AppShell() {
   // terminal. The hook is react-query-backed and dedup'd with the rail.
   // reconcileWhilePending: self-heals if the live resource.created SSE was
   // missed (see UseTerminalsOptions for the why).
-  const {
-    terminals,
-    isLoading: terminalsLoading,
-    error: terminalsError,
-  } = useTerminals(conversationId ?? null, {
+  const { terminals } = useTerminals(conversationId ?? null, {
     reconcileWhilePending: terminalPending,
   });
 
@@ -549,12 +545,6 @@ export function AppShell() {
   // Tab key awaiting a close confirmation, or null. Closing a tab kills the
   // terminal, so a user-initiated close routes through a confirm modal first.
   const [terminalPendingClose, setTerminalPendingClose] = useState<string | null>(null);
-  // A just-opened shell may not be in ``openTerminals`` yet — the tab list
-  // derives from the terminal query, which can lag the ``openTerminalTab``
-  // selection by a render (create round-trip / SSE ``created`` still landing).
-  // Hold that key here so the selection-prune below doesn't deselect it
-  // mid-arrival; cleared once it lands.
-  const pendingTerminalSelectRef = useRef<string | null>(null);
   // While a close is in flight, grey the tab being killed so the delay between
   // confirming and the tab disappearing (the DELETE round-trip + its
   // ``resource.deleted``) reads as "closing", not frozen.
@@ -562,6 +552,15 @@ export function AppShell() {
     deleteTerminalMutation.isPending && deleteTerminalMutation.variables
       ? `terminal:${deleteTerminalMutation.variables}`
       : null;
+  // A user-initiated "+"→Shell create: snapshot the shell tabs present when it
+  // starts so the effect below can focus the newly-created shell the instant
+  // its tab lands in the list. That's decoupled from the create POST, which on
+  // a waking (runner-asleep) session resolves well after the reconcile poll /
+  // SSE has already surfaced the tab.
+  const pendingShellCreateRef = useRef<Set<string> | null>(null);
+  const markShellCreateStarted = useCallback(() => {
+    pendingShellCreateRef.current = new Set(openTerminals);
+  }, [openTerminals]);
   // Whether the agent's spec declares shell access (a ``terminals:`` block).
   // The desktop rail's Shells TAB shows only once a shell exists (creation is
   // via the tab-strip "+" menu), but the MOBILE Shells drawer — which has no
@@ -1269,9 +1268,9 @@ export function AppShell() {
   const openTerminalTab = useCallback(
     (key: string) => {
       // The tab already exists (tabs derive 1:1 from the terminal list); this
-      // just focuses it and reveals the rail. Mark it pending so the prune
-      // doesn't deselect it if the list hasn't caught up to a fresh create yet.
-      pendingTerminalSelectRef.current = key;
+      // just focuses it and reveals the rail. The selection is sticky (never
+      // pruned off the list), so a fresh create that's still landing stays
+      // selected and its xterm surfaces the instant the terminal appears.
       setSelectedTerminalKey(key);
       setSelectedFilePath(null);
       setFileViewerCommentsOpen(false);
@@ -1285,6 +1284,21 @@ export function AppShell() {
     },
     [clearFileViewerUrl, conversationId],
   );
+
+  // Focus a shell the user just created ("+"→Shell) as soon as its tab appears
+  // — a new non-agent terminal key that wasn't present when the create started.
+  // This runs off the live list, so it fires on the reconcile poll / SSE even
+  // before the create POST resolves (which lags on a waking runner), so the
+  // opened shell doesn't sit unselected while its tab is already showing.
+  useEffect(() => {
+    const known = pendingShellCreateRef.current;
+    if (known === null) return;
+    const fresh = openTerminals.find((k) => !known.has(k) && !isAgentTerminalKey(k));
+    if (fresh !== undefined) {
+      pendingShellCreateRef.current = null;
+      openTerminalTab(fresh);
+    }
+  }, [openTerminals, openTerminalTab]);
 
   // User clicked a tab's "x". Closing a tab kills the underlying terminal, so
   // confirm first rather than acting immediately.
@@ -1311,26 +1325,16 @@ export function AppShell() {
     if (info && conversationId) deleteTerminalMutation.mutate(info.id);
   }, [terminalPendingClose, openTerminals, terminals, conversationId, deleteTerminalMutation]);
 
-  // Clear the active shell selection when its terminal goes away (closed by the
-  // agent, killed via a tab close, or the runner emptied the list) — the rail
-  // then falls back to its default content. The tab itself drops automatically
-  // (``openTerminals`` derives from the list). Skip while the list is still
-  // loading OR the fetch errored so a non-authoritative empty list can't wipe a
-  // valid selection (an errored read is `[]` too).
-  useEffect(() => {
-    if (terminalsLoading || terminalsError !== null) return;
-    const valid = new Set(terminals.map((t) => terminalTabKey(t)));
-    // A just-opened shell is still arriving in the list — leave the selection
-    // alone until it lands (then stop protecting it), so a fresh open/create
-    // doesn't flicker unselected. A restored selection isn't protected, so a
-    // dead persisted terminal still falls back to the default view.
-    const pending = pendingTerminalSelectRef.current;
-    if (pending !== null) {
-      if (valid.has(pending)) pendingTerminalSelectRef.current = null;
-      else return;
-    }
-    setSelectedTerminalKey((active) => (active !== null && !valid.has(active) ? null : active));
-  }, [terminals, terminalsLoading, terminalsError]);
+  // The active shell selection is sticky: it changes only on explicit user
+  // action (opening a shell/file, switching a nav tab, closing the active
+  // shell). We deliberately do NOT clear it off the terminal list — the list
+  // churns transiently (runner health-poll clearing the cache, create/SSE
+  // races), and pruning against those windows was stranding a just-opened shell
+  // unselected once its tab recovered. Instead the rail only *shows* the
+  // selected shell's xterm while its terminal is actually present
+  // (``WorkspacePanel`` gates on ``openTerminals``); a selection whose terminal
+  // is momentarily or permanently absent falls back to the default view, and
+  // reappears the instant the terminal returns.
 
   function openExecutionLogsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
@@ -1769,6 +1773,7 @@ export function AppShell() {
                     filesPanelShowHidden={filesPanelShowHidden}
                     onShowHiddenChange={setFilesPanelShowHidden}
                     liveness={liveness}
+                    onShellCreateStart={markShellCreateStarted}
                   />
                 )}
               </div>
