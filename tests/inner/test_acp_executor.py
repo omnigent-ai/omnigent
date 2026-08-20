@@ -1132,3 +1132,32 @@ def test_startup_error_names_the_exception_type_when_str_is_empty() -> None:
     """No stderr and an empty ``str(exc)`` still yields something actionable."""
     ex = AcpExecutor(AcpAgentConfig(command="x", name="A"))
     assert "TimeoutError" in ex._startup_error_message(TimeoutError())
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_allow_short_circuits_elicitation() -> None:
+    """An explicit policy ALLOW must not prompt: always-ask agents would
+    otherwise refuse policy-permitted calls on every unattended run (#4928)."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+
+    class _V:
+        action = "POLICY_ACTION_ALLOW"
+
+    ex._policy_evaluator = AsyncMock(return_value=_V())
+    ex._elicitation_handler = AsyncMock(return_value=False)
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is True
+    ex._elicitation_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_decide_permission_unspecified_still_elicits() -> None:
+    """UNSPECIFIED keeps the conservative path: elicitation decides (#4928)."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+
+    class _V:
+        action = None
+
+    ex._policy_evaluator = AsyncMock(return_value=_V())
+    ex._elicitation_handler = AsyncMock(return_value=True)
+    assert await ex._decide_permission({"toolCall": {"title": "shell"}}) is True
+    ex._elicitation_handler.assert_awaited_once()
