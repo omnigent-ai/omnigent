@@ -1595,22 +1595,23 @@ async def _prepare_chat_session_via_daemon(
     )
     from omnigent.native_terminal import bind_session_runner
 
-    try:
+    async def resolve_session() -> tuple[str, bool]:
+        """Fork, resume, or create the session to bind, and say if it is fresh.
+
+        :returns: The session id and whether it was created just now.
+        :raises click.ClickException: If the server rejects the create/fork.
+        """
         async with OmnigentClient(base_url=base_url, headers=headers, auth=auth) as sdk:
             try:
                 if fork_session_id is not None:
                     fork_result = await sdk.sessions.fork(fork_session_id)
-                    session_id = fork_result["id"]
-                    fresh_session = False
-                elif resume_conversation_id is not None:
-                    session_id = resume_conversation_id
-                    fresh_session = False
-                else:
-                    created = await sdk.sessions.create(
-                        bundle, filename="agent.tar.gz", workspace=workspace
-                    )
-                    session_id = created.id
-                    fresh_session = True
+                    return fork_result["id"], False
+                if resume_conversation_id is not None:
+                    return resume_conversation_id, False
+                created = await sdk.sessions.create(
+                    bundle, filename="agent.tar.gz", workspace=workspace
+                )
+                return created.id, True
             except ClientOmnigentError as exc:
                 # Any create/fork/resume rejection here is a server-side answer, not
                 # a client bug worth a traceback: a wrong base URL that answers
@@ -1621,6 +1622,7 @@ async def _prepare_chat_session_via_daemon(
                     f"Could not start a session on {base_url}: {exc}"
                 ) from exc
 
+    try:
         # A separate raw httpx client for the host-runner protocol (the daemon
         # launch helpers operate on httpx, not the SDK), pinned to the host's replica.
         timeout = httpx.Timeout(30.0, read=120.0)
@@ -1629,8 +1631,11 @@ async def _prepare_chat_session_via_daemon(
         ) as client:
             if progress is not None:
                 progress.update(STARTUP_PHASE_CONNECTING)
-            await wait_for_host_online(
-                client, host_id, timeout_s=_DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
+            (session_id, fresh_session), _ = await asyncio.gather(
+                resolve_session(),
+                wait_for_host_online(
+                    client, host_id, timeout_s=_DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
+                ),
             )
             if progress is not None:
                 progress.update(STARTUP_PHASE_LAUNCHING_AGENT)
