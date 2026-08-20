@@ -3291,7 +3291,7 @@ async def _wait_for_claude_terminal_ready(
     session_id: str,
     *,
     timeout_s: float,
-) -> str:
+) -> _ClaudeTerminalSnapshot:
     """
     Poll until the runner has auto-created the Claude terminal.
 
@@ -3303,14 +3303,15 @@ async def _wait_for_claude_terminal_ready(
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Session id, e.g. ``"conv_abc123"``.
     :param timeout_s: Max seconds to wait, e.g. ``60.0``.
-    :returns: The terminal resource id, e.g. ``"terminal_claude_main"``.
+    :returns: The terminal snapshot, whose tmux coordinates come from
+        the same response that reported the terminal ready.
     :raises click.ClickException: If no terminal appears in time.
     """
     deadline = asyncio.get_event_loop().time() + timeout_s
     while asyncio.get_event_loop().time() < deadline:
-        terminal_id = await _find_running_claude_terminal(client, session_id)
-        if terminal_id is not None:
-            return terminal_id
+        found = await _find_running_claude_terminal(client, session_id)
+        if found is not None:
+            return found
         await asyncio.sleep(DAEMON_POLL_INTERVAL_S)
     raise click.ClickException(
         f"The runner did not create the Claude terminal for {session_id!r} "
@@ -3545,7 +3546,7 @@ async def _prepare_claude_terminal_via_daemon(
                 startup_progress=startup_progress,
                 progress_message="Starting Claude terminal...",
             )
-            terminal_id = await _wait_for_claude_terminal_ready(
+            terminal = await _wait_for_claude_terminal_ready(
                 client, session_id, timeout_s=_DAEMON_TERMINAL_READY_TIMEOUT_S
             )
         else:
@@ -3562,7 +3563,7 @@ async def _prepare_claude_terminal_via_daemon(
                 startup_progress=startup_progress,
                 progress_message="Starting Claude terminal...",
             )
-            _, terminal_id = await asyncio.gather(
+            _, terminal = await asyncio.gather(
                 wait_for_runner_online(
                     client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S
                 ),
@@ -3574,21 +3575,16 @@ async def _prepare_claude_terminal_via_daemon(
             startup_profiler,
             "claude terminal ready",
             startup_progress=startup_progress,
+            detail=f"terminal={terminal.terminal_id}",
             progress_message="Claude terminal ready.",
-        )
-        tmux = await _read_claude_terminal_tmux(client, session_id)
-        _mark_startup_step(
-            startup_profiler,
-            "daemon terminal tmux metadata read",
-            startup_progress=startup_progress,
         )
     return PreparedClaudeTerminal(
         session_id=session_id,
-        terminal_id=terminal_id,
+        terminal_id=terminal.terminal_id,
         bridge_dir=bridge_dir_for_conversation_id(session_id),
         reattached=reattached,
-        tmux_socket=tmux.socket,
-        tmux_target=tmux.target,
+        tmux_socket=terminal.tmux.socket,
+        tmux_target=terminal.tmux.target,
     )
 
 
@@ -3902,26 +3898,20 @@ async def _prepare_claude_terminal(
                 "checking existing terminal",
                 startup_progress=startup_progress,
             )
-            existing_terminal_id = await _find_running_claude_terminal(client, session_id)
-            if existing_terminal_id is not None:
+            existing_terminal = await _find_running_claude_terminal(client, session_id)
+            if existing_terminal is not None:
                 _mark_startup_step(
                     startup_profiler,
                     "existing terminal found",
                     startup_progress=startup_progress,
                 )
-                reattach_tmux = await _read_claude_terminal_tmux(client, session_id)
-                _mark_startup_step(
-                    startup_profiler,
-                    "existing terminal tmux metadata read",
-                    startup_progress=startup_progress,
-                )
                 return PreparedClaudeTerminal(
                     session_id=session_id,
-                    terminal_id=existing_terminal_id,
+                    terminal_id=existing_terminal.terminal_id,
                     bridge_dir=bridge_dir_for_bridge_id(bridge_id),
                     reattached=True,
-                    tmux_socket=reattach_tmux.socket,
-                    tmux_target=reattach_tmux.target,
+                    tmux_socket=existing_terminal.tmux.socket,
+                    tmux_target=existing_terminal.tmux.target,
                 )
             # Session exists but no live terminal — recover claude's prior transcript via --resume.
             _mark_startup_step(
@@ -4943,9 +4933,9 @@ async def _launch_claude_terminal(
 async def _find_running_claude_terminal(
     client: httpx.AsyncClient,
     session_id: str,
-) -> str | None:
+) -> _ClaudeTerminalSnapshot | None:
     """
-    Return the existing running ``claude/main`` terminal id if present.
+    Return the existing running ``claude/main`` terminal if present.
 
     Lookup happens before rebinding an existing session to this
     invocation's local runner. That preserves reattach behavior for a
@@ -4954,11 +4944,15 @@ async def _find_running_claude_terminal(
     callers deterministically bind the current local runner and launch
     a fresh terminal.
 
+    The one response carries the tmux coordinates too, so callers that
+    want to attach directly read them off the snapshot instead of
+    re-fetching the same resource (the lookup costs ~2s remotely).
+
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Session/conversation id, e.g.
         ``"conv_abc123"``.
-    :returns: The deterministic Claude terminal id, or ``None`` when
-        the wrapper should launch a new terminal.
+    :returns: The terminal snapshot, or ``None`` when the wrapper should
+        launch a new terminal.
     :raises click.ClickException: If the server rejects the lookup for
         a reason other than "not currently attachable".
     """
@@ -4979,7 +4973,10 @@ async def _find_running_claude_terminal(
         metadata = payload.get("metadata")
         if isinstance(metadata, dict) and metadata.get("running") is False:
             return None
-        return terminal_id
+        return _ClaudeTerminalSnapshot(
+            terminal_id=terminal_id,
+            tmux=_parse_claude_terminal_tmux(metadata),
+        )
     if resp.status_code in {404, 409, 502, 503}:
         return None
     if resp.status_code >= 400:
@@ -5006,18 +5003,63 @@ class _ClaudeTerminalTmux:
     target: str | None
 
 
+@dataclass(frozen=True)
+class _ClaudeTerminalSnapshot:
+    """
+    A running Claude terminal as one lookup saw it.
+
+    Pairs the resource id with the tmux coordinates from the same
+    response so an attach decision needs a single round trip.
+
+    :param terminal_id: The deterministic terminal resource id, e.g.
+        ``"terminal_claude_main"``.
+    :param tmux: Local tmux coordinates the runner advertised.
+    """
+
+    terminal_id: str
+    tmux: _ClaudeTerminalTmux
+
+
+def _parse_claude_terminal_tmux(metadata: object) -> _ClaudeTerminalTmux:
+    """
+    Read the tmux socket/target off a terminal resource's metadata.
+
+    Lets the caller decide whether to attach to the runner's tmux
+    directly (same machine, low latency) instead of relaying over the
+    WebSocket PTY bridge. Best-effort: metadata of the wrong shape or
+    without the coordinates yields ``(None, None)``, which callers treat
+    as "not locally attachable" and fall back to the WebSocket path.
+
+    :param metadata: The ``metadata`` field of a terminal resource
+        payload, e.g. ``{"tmux_socket": "/tmp/x/tmux.sock", "tmux_target":
+        "main"}``.
+    :returns: The tmux coordinates, or ``_ClaudeTerminalTmux(None,
+        None)`` when unavailable.
+    """
+    if not isinstance(metadata, dict):
+        return _ClaudeTerminalTmux(socket=None, target=None)
+    raw_socket = metadata.get("tmux_socket")
+    raw_target = metadata.get("tmux_target")
+    socket = Path(raw_socket) if isinstance(raw_socket, str) and raw_socket else None
+    target = raw_target if isinstance(raw_target, str) and raw_target else None
+    return _ClaudeTerminalTmux(socket=socket, target=target)
+
+
 async def _read_claude_terminal_tmux(
     client: httpx.AsyncClient,
     session_id: str,
 ) -> _ClaudeTerminalTmux:
     """
-    Read the tmux socket/target the Claude terminal resource exposes.
+    Fetch the tmux socket/target the Claude terminal resource exposes.
 
-    Lets the caller decide whether to attach to the runner's tmux
-    directly (same machine, low latency) instead of relaying over the
-    WebSocket PTY bridge. Best-effort: any lookup failure, non-200, or
-    missing metadata yields ``(None, None)``, which callers treat as
-    "not locally attachable" and fall back to the WebSocket path.
+    For callers holding no terminal snapshot — the launch path, whose
+    ``POST`` answers before the runner has published its tmux coordinates.
+    Callers that just looked the terminal up read ``snapshot.tmux``
+    instead of paying for a second round trip.
+
+    Best-effort: any lookup failure, non-200, or missing metadata yields
+    ``(None, None)``, which callers treat as "not locally attachable" and
+    fall back to the WebSocket path.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
@@ -5035,14 +5077,7 @@ async def _read_claude_terminal_tmux(
         return _ClaudeTerminalTmux(socket=None, target=None)
     if resp.status_code != 200:
         return _ClaudeTerminalTmux(socket=None, target=None)
-    metadata = resp.json().get("metadata")
-    if not isinstance(metadata, dict):
-        return _ClaudeTerminalTmux(socket=None, target=None)
-    raw_socket = metadata.get("tmux_socket")
-    raw_target = metadata.get("tmux_target")
-    socket = Path(raw_socket) if isinstance(raw_socket, str) and raw_socket else None
-    target = raw_target if isinstance(raw_target, str) and raw_target else None
-    return _ClaudeTerminalTmux(socket=socket, target=target)
+    return _parse_claude_terminal_tmux(resp.json().get("metadata"))
 
 
 def _claude_terminal_request(

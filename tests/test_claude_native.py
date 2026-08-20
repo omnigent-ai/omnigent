@@ -1738,35 +1738,23 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         session_id: str,
         *,
         timeout_s: float,
-    ) -> str:
+    ) -> claude_native._ClaudeTerminalSnapshot:
         """
-        Return the Claude terminal id once the wait phase is reached.
+        Return the Claude terminal once the wait phase is reached.
 
         :param client: HTTP client created by the prepare helper.
         :param session_id: Created conversation id.
         :param timeout_s: Timeout supplied by production.
-        :returns: Fixed terminal id.
+        :returns: Snapshot carrying the terminal id and tmux coordinates.
         """
         del client, timeout_s
         assert session_id == "conv_daemon_progress"
-        return claude_native.claude_terminal_resource_id()
-
-    async def fake_read_tmux(
-        client: object,
-        session_id: str,
-    ) -> claude_native._ClaudeTerminalTmux:
-        """
-        Return local tmux metadata for direct attach.
-
-        :param client: HTTP client created by the prepare helper.
-        :param session_id: Created conversation id.
-        :returns: Fake tmux coordinates.
-        """
-        del client
-        assert session_id == "conv_daemon_progress"
-        return claude_native._ClaudeTerminalTmux(
-            socket=tmp_path / "tmux.sock",
-            target="claude:main",
+        return claude_native._ClaudeTerminalSnapshot(
+            terminal_id=claude_native.claude_terminal_resource_id(),
+            tmux=claude_native._ClaudeTerminalTmux(
+                socket=tmp_path / "tmux.sock",
+                target="claude:main",
+            ),
         )
 
     monkeypatch.setattr(claude_native, "_create_claude_session", fake_create_session)
@@ -1782,7 +1770,22 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         "_wait_for_claude_terminal_ready",
         fake_wait_for_terminal_ready,
     )
-    monkeypatch.setattr(claude_native, "_read_claude_terminal_tmux", fake_read_tmux)
+
+    async def fail_read_tmux(
+        client: object,
+        session_id: str,
+    ) -> claude_native._ClaudeTerminalTmux:
+        """
+        Fail if prepare re-fetches the terminal just for its tmux coordinates.
+
+        :param client: HTTP client created by the prepare helper.
+        :param session_id: Created conversation id.
+        :returns: Never returns.
+        """
+        del client
+        raise AssertionError(f"unexpected second terminal lookup for {session_id}")
+
+    monkeypatch.setattr(claude_native, "_read_claude_terminal_tmux", fail_read_tmux)
 
     prepared = await claude_native._prepare_claude_terminal_via_daemon(
         base_url="https://example.com",
@@ -2191,17 +2194,20 @@ async def test_prepare_reattaches_existing_claude_terminal(
     """
     calls: list[str] = []
 
-    async def fake_find(client: object, session_id: str) -> str | None:
+    async def fake_find(client: object, session_id: str) -> claude_native._ClaudeTerminalSnapshot:
         """
         Return the existing terminal and record lookup order.
 
         :param client: HTTP client created by the prepare helper.
         :param session_id: Existing session id.
-        :returns: Existing terminal id.
+        :returns: Snapshot of the existing terminal.
         """
         del client
         calls.append(f"find:{session_id}")
-        return claude_native.claude_terminal_resource_id()
+        return claude_native._ClaudeTerminalSnapshot(
+            terminal_id=claude_native.claude_terminal_resource_id(),
+            tmux=claude_native._ClaudeTerminalTmux(socket=None, target=None),
+        )
 
     async def fail_bind(client: object, session_id: str, runner_id: str) -> None:
         """
@@ -2303,7 +2309,8 @@ async def test_find_running_claude_terminal_reads_resource_endpoint() -> None:
     async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
         found = await claude_native._find_running_claude_terminal(client, "conv with space")
 
-    assert found == terminal_id
+    assert found is not None
+    assert found.terminal_id == terminal_id
     assert requested_urls == [
         "https://example.com/v1/sessions/conv%20with%20space"
         "/resources/terminals/terminal_claude_main"
@@ -5079,7 +5086,9 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
     """
     captured_terminal_args: dict[str, Any] = {}
 
-    async def _fake_find_running(_client: object, _session_id: str) -> str | None:
+    async def _fake_find_running(
+        _client: object, _session_id: str
+    ) -> claude_native._ClaudeTerminalSnapshot | None:
         """
         No live terminal → force the cold-resume code path.
 

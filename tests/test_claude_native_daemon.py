@@ -430,3 +430,46 @@ def test_run_with_remote_server_unreachable_server_raises_clean_error(
     assert "Could not reach the omnigent server at https://unreachable.example" in str(
         exc_info.value
     )
+
+
+async def test_wait_for_claude_terminal_ready_returns_tmux_from_one_lookup() -> None:
+    """
+    The readiness poll hands back tmux coordinates from its own response.
+
+    The terminal resource GET costs ~2.3s against a remote server, and the
+    caller needs both "is it up" and "where is its tmux". Re-fetching the
+    same resource for the coordinates doubled that cost on every launch, so
+    the poll's own payload must carry them.
+    """
+    requests: list[str] = []
+    terminal_id = claude_native.claude_terminal_resource_id()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Answer the terminal lookup with a running terminal + tmux metadata."""
+        requests.append(f"{request.method} {request.url.path}")
+        return httpx.Response(
+            200,
+            json={
+                "id": terminal_id,
+                "type": "terminal",
+                "metadata": {
+                    "running": True,
+                    "tmux_socket": "/tmp/omnigent/tmux.sock",
+                    "tmux_target": "claude:main",
+                },
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://e.com"
+    ) as client:
+        found = await claude_native._wait_for_claude_terminal_ready(
+            client, "conv_a", timeout_s=5.0
+        )
+
+    assert found.terminal_id == terminal_id
+    assert found.tmux.socket == Path("/tmp/omnigent/tmux.sock")
+    assert found.tmux.target == "claude:main"
+    assert requests == [
+        f"GET /v1/sessions/conv_a/resources/terminals/{terminal_id}",
+    ]
