@@ -435,6 +435,9 @@ class _CodexForwarderState:
     # thread rotation), so a settled round stays settled and later items
     # can skip re-reading the bridge file for the life of the session.
     mcp_startup_settled: bool = False
+    # Completed goal updates already mirrored as terminal session edges. Codex
+    # can replay the same notification after a subscription reconnect.
+    completed_goal_updates: set[tuple[object, ...]] = field(default_factory=set)
 
     def note_resume_response(self, response: CodexMessage) -> None:
         """
@@ -2625,6 +2628,14 @@ async def _handle_event(
         if child_coalescer is not None:
             await child_coalescer.flush()
         return
+    if method == "thread/goal/updated":
+        await _handle_completed_goal_update(
+            client,
+            session_id=route_session_id,
+            params=params,
+            forwarder_state=forwarder_state,
+        )
+        return
     if not is_child and await _maybe_handle_delta_event(
         client,
         session_id=route_session_id,
@@ -2644,6 +2655,31 @@ async def _handle_event(
             forwarder_state=forwarder_state,
             bridge_dir=bridge_dir,
         )
+
+
+async def _handle_completed_goal_update(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    params: _JsonObject,
+    forwarder_state: _CodexForwarderState | None,
+) -> None:
+    """Mirror a Codex goal completion as the child's terminal status edge."""
+    goal = params.get("goal")
+    if not isinstance(goal, dict) or goal.get("status") != "completed":
+        return
+    key = (
+        goal.get("threadId"),
+        goal.get("updatedAt"),
+        goal.get("createdAt"),
+        goal.get("tokensUsed"),
+        goal.get("timeUsedSeconds"),
+    )
+    if forwarder_state is not None:
+        if key in forwarder_state.completed_goal_updates:
+            return
+        forwarder_state.completed_goal_updates.add(key)
+    await _post_status(client, session_id, "idle")
 
 
 def _resolve_event_session(

@@ -5824,6 +5824,9 @@ def create_runner_app(
                 conv,
                 _model_override,
             )
+        _reasoning_effort = msg_body.get("reasoning_effort")
+        if isinstance(_reasoning_effort, str) and _reasoning_effort:
+            harness_body["reasoning"] = {"effort": _reasoning_effort}
         if _session_histories[conv]:
             harness_body["content"] = _session_histories[conv]
         else:

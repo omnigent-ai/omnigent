@@ -5984,6 +5984,7 @@ async def _emit_server_routing_decision(
     harness: str | None = None,
     decision_id: str | None = None,
     attempted_override: str | None = None,
+    effort_pinned: bool = False,
 ) -> str | None:
     """Persist and publish a ``routing_decision`` transcript chip.
 
@@ -6002,6 +6003,8 @@ async def _emit_server_routing_decision(
         router overrode — an LLM-supplied ``args.model``, or a native
         spawn's own ``requested_model``. ``None`` when nothing was asked
         for, or when the pick names the same arm as the ask.
+    :param effort_pinned: ``True`` when an explicit session/task effort won.
+        The router's un-applied effort is then omitted from the display record.
     :returns: The decision id, so callers can join it onto the session
         row, or ``None`` when the payload failed validation and no chip
         was recorded.
@@ -6014,6 +6017,14 @@ async def _emit_server_routing_decision(
     raw_model = verdict.get("raw_model")
     # Which router answered, so the chip can mark an AI-Gateway-routed decision.
     router_source = verdict.get("router_source")
+    reasoning_effort = verdict.get("reasoning_effort")
+    display_effort = (
+        reasoning_effort
+        if not effort_pinned and isinstance(reasoning_effort, str) and reasoning_effort
+        else None
+    )
+    from omnigent.server.smart_routing import codex_subscription_display_label
+
     item_data: dict[str, Any] = {
         "model": model,
         "applied": bool(applied),
@@ -6026,6 +6037,8 @@ async def _emit_server_routing_decision(
         "router_source": (
             router_source if isinstance(router_source, str) and router_source else None
         ),
+        "reasoning_effort": display_effort,
+        "display_label": codex_subscription_display_label(model, router_source, display_effort),
     }
     if agent is not None:
         item_data["agent"] = agent

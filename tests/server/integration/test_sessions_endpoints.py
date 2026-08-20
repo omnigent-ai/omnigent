@@ -7249,6 +7249,68 @@ async def test_stop_session_forwards_stop_session_event_to_runner(
     )
 
 
+async def test_stop_waiting_parent_stops_active_child(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Stopping a waiting parent also stops the child whose result it awaits."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes.sessions import _session_status_cache
+
+    forwarded: list[_ForwardedEffort] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            forwarded.append(
+                _ForwardedEffort(
+                    url=str(request.url),
+                    body=json.loads(request.content) if request.content else None,
+                )
+            )
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    parent_id: str | None = None
+    child_id: str | None = None
+    try:
+        agent = await create_test_agent(client)
+        parent = await _create_session(client, agent["id"])
+        parent_id = parent["id"]
+        child = SqlAlchemyConversationStore(db_uri).create_conversation(
+            kind="sub_agent",
+            parent_conversation_id=parent_id,
+            title="codex:implementation",
+        )
+        child_id = child.id
+        _session_status_cache[parent_id] = "waiting"
+        _session_status_cache[child_id] = "running"
+
+        resp = await client.post(
+            f"/v1/sessions/{parent_id}/events",
+            json={"type": "stop_session", "data": {}},
+        )
+        assert resp.status_code == 202, resp.text
+    finally:
+        if parent_id is not None:
+            _session_status_cache.pop(parent_id, None)
+        if child_id is not None:
+            _session_status_cache.pop(child_id, None)
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert parent_id is not None and child_id is not None
+    stop_targets = [
+        event.url.rsplit("/", 1)[0].rsplit("/", 1)[-1]
+        for event in forwarded
+        if event.body == {"type": "stop_session"}
+    ]
+    assert stop_targets == [parent_id, child_id]
+
+
 @pytest.mark.parametrize(
     "failure_mode",
     [

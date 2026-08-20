@@ -356,6 +356,8 @@ export interface ConversationState {
    * on bind and written through `setSubagentRouting`.
    */
   subagentRoutingOverride: "on" | "off" | null;
+  /** Opt-in state for configured Databricks Kimi on this session. */
+  databricksKimiRoutingEnabled: boolean;
   /**
    * Per-session Codex collaboration-mode flag. Hydrated from
    * ``omnigent.codex_native.collaboration_mode`` on bind and updated by the
@@ -710,6 +712,7 @@ export interface ChatActions {
    * unrouted sub-agents. No-ops when there is no active conversation.
    */
   setSubagentRouting: (mode: "on" | "off") => Promise<void>;
+  setDatabricksKimiRoutingEnabled: (enabled: boolean) => Promise<void>;
   /**
    * Re-read the active session's routing switches (cost control + sub-agent
    * routing) from the server and apply them.
@@ -1271,6 +1274,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sessionReasoningEffort: null,
   costControlModeOverride: null,
   subagentRoutingOverride: null,
+  databricksKimiRoutingEnabled: false,
   codexPlanMode: false,
   hasMoreHistory: false,
   loadingMoreHistory: false,
@@ -2179,6 +2183,23 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
+  setDatabricksKimiRoutingEnabled: async (enabled) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const previous = get().databricksKimiRoutingEnabled;
+    const patchSet = setterFor(conversationId);
+    patchSet({ databricksKimiRoutingEnabled: enabled });
+    try {
+      const session = await updateSession(conversationId, {
+        databricksKimiRoutingEnabled: enabled,
+      });
+      patchSet({ databricksKimiRoutingEnabled: session.databricksKimiRoutingEnabled ?? false });
+    } catch (err) {
+      patchSet({ databricksKimiRoutingEnabled: previous });
+      throw err;
+    }
+  },
+
   refreshSessionOverrides: async () => {
     const { conversationId } = get();
     if (!conversationId) return;
@@ -2199,6 +2220,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     setActive({
       costControlModeOverride: session.costControlModeOverride ?? null,
       subagentRoutingOverride: session.subagentRoutingOverride ?? null,
+      databricksKimiRoutingEnabled: session.databricksKimiRoutingEnabled ?? false,
     });
   },
 
@@ -2873,6 +2895,7 @@ function sessionBindingPatch(
   | "subAgentName"
   | "costControlModeOverride"
   | "subagentRoutingOverride"
+  | "databricksKimiRoutingEnabled"
   | "codexPlanMode"
   | "contextWindow"
   | "gitBranch"
@@ -2898,6 +2921,7 @@ function sessionBindingPatch(
     subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
     subagentRoutingOverride: session.subagentRoutingOverride ?? null,
+    databricksKimiRoutingEnabled: session.databricksKimiRoutingEnabled ?? false,
     codexPlanMode: codexPlanModeFromSession(session),
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,

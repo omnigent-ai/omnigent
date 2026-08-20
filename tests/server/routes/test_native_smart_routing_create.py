@@ -44,6 +44,7 @@ from omnigent.server.smart_routing import (
     RoutePick,
     RoutingResult,
     TaskV1RouteOptionSource,
+    automatic_routing_model_allowed,
     infer_models,
     route_session_harness,
 )
@@ -1538,9 +1539,8 @@ async def test_sdk_harness_create_is_not_gated_by_native_gateway_state(
 #
 # A create routes before any session (and so any runner) exists, so the live
 # per-session catalog is out of reach. The host answers instead, and the static
-# table only tops up what it could not answer for. Either way the router's
-# current arms must be servable candidates — an arm missing from the candidate
-# set is substituted down a generation (a routed gpt-5-6-sol applying 5-5).
+# table only tops up what it could not answer for. Automatic routing removes
+# Sol from that offer while retaining the other servable candidates.
 
 SOL = "databricks-gpt-5-6-sol"
 LUNA = "databricks-gpt-5-6-luna"
@@ -1550,35 +1550,35 @@ HOST_GPT_CATALOG = [LUNA, SOL]
 @pytest.mark.parametrize(
     ("verdict_model", "harness_candidates", "catalog", "expected_offer", "expected_pick"),
     [
-        # The host's catalog is offered verbatim instead of the static table,
-        # and a servable pick applies exactly (no substitution, no raw pick).
+        # The host's catalog wins over the static table, but automatic routing
+        # removes Sol before the router can select it.
         (
-            SOL,
+            LUNA,
             ("codex-native",),
             {"codex-native": HOST_GPT_CATALOG},
-            {"codex-native": HOST_GPT_CATALOG},
-            ("codex-native", SOL),
+            {"codex-native": [LUNA]},
+            ("codex-native", LUNA),
         ),
         # Out-of-family rows in the host's answer are filtered out before the
         # offer, so the router can never pick an unspawnable model.
         (
-            SOL,
+            LUNA,
             ("codex-native",),
             {"codex-native": [*HOST_GPT_CATALOG, CLAUDE_MODEL]},
-            {"codex-native": HOST_GPT_CATALOG},
-            ("codex-native", SOL),
+            {"codex-native": [LUNA]},
+            ("codex-native", LUNA),
         ),
         # Hosts only resolve a pre-launch catalog for the CLIs that can report
         # one without running; the static table tops up the rest.
         (
-            SOL,
+            LUNA,
             AUTO_NATIVE_ROUTING_HARNESSES,
             {"codex-native": HOST_GPT_CATALOG},
             {
-                "codex-native": HOST_GPT_CATALOG,
+                "codex-native": [LUNA],
                 "claude-native": None,  # filled from infer_models below
             },
-            ("codex-native", SOL),
+            ("codex-native", LUNA),
         ),
         # No host answer at all: the static table is the whole offer.
         (
@@ -1609,7 +1609,11 @@ async def test_pre_session_catalog_is_offered_instead_of_the_static_table(
     assert error is None
     # ``None`` in the expectation means "whatever the static table serves".
     want = {
-        name: rows if rows is not None else infer_models(name)
+        name: [
+            model
+            for model in (rows if rows is not None else infer_models(name) or [])
+            if automatic_routing_model_allowed(model)
+        ]
         for name, rows in expected_offer.items()
     }
     assert routing_client.offered[0] == want

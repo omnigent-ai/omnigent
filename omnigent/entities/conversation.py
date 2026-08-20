@@ -608,6 +608,11 @@ class RoutingDecisionData(BaseModel):
         must still round-trip through stored rows and the wire instead
         of failing validation. ``None`` on rows written before the
         field existed.
+    :param reasoning_effort: Reasoning effort the router applied alongside
+        :attr:`model`, e.g. ``"medium"``. ``None`` when the route left an
+        explicit effort pin intact or the provider does not support effort.
+    :param display_label: Deterministic human-readable label for an automatic
+        provider route. ``None`` when no actual router-selected effort exists.
     """
 
     model: str
@@ -623,6 +628,8 @@ class RoutingDecisionData(BaseModel):
     raw_model: str | None = None
     attempted_override: str | None = None
     router_source: str | None = None
+    reasoning_effort: str | None = None
+    display_label: str | None = None
 
     @field_validator("model")
     @classmethod

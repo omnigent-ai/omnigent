@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  codexSubscriptionRouteLabel,
   harnessDisplayLabel,
   isSessionScopedDecision,
   routingExtras,
@@ -19,6 +20,8 @@ describe("routingExtrasFromWire", () => {
         raw_model: "gpt-5-6-sol",
         attempted_override: "databricks-claude-opus-4-8",
         router_source: "databricks-aigw",
+        reasoning_effort: "medium",
+        display_label: "codex-subscription-gpt-5.6-terra-medium",
       }),
     ).toEqual({
       harness: "codex-native",
@@ -27,6 +30,8 @@ describe("routingExtrasFromWire", () => {
       rawModel: "gpt-5-6-sol",
       attemptedOverride: "databricks-claude-opus-4-8",
       routerSource: "databricks-aigw",
+      reasoningEffort: "medium",
+      displayLabel: "codex-subscription-gpt-5.6-terra-medium",
     });
   });
 
@@ -58,6 +63,30 @@ describe("routingExtrasFromWire", () => {
     expect(
       routingExtrasFromWire({ harness: "", scope: "galaxy", decision_id: null, raw_model: 7 }),
     ).toEqual({});
+  });
+
+  it("names the Databricks provider and Kimi endpoint without inventing an effort", () => {
+    expect(codexSubscriptionRouteLabel("databricks-kimi-k2-6", "codex-subscription", null)).toBe(
+      "databricks-kimi-k2-6",
+    );
+  });
+});
+
+describe("codexSubscriptionRouteLabel", () => {
+  it("includes the actual model and effort for an automatic subscription route", () => {
+    expect(codexSubscriptionRouteLabel("gpt-5-6-luna", "codex-subscription", "low")).toBe(
+      "codex-subscription-gpt-5.6-luna-light",
+    );
+  });
+
+  it.each([
+    ["codex-subscription", null],
+    ["codex-subscription", ""],
+    ["codex-subscription", "xhigh"],
+    ["codex-subscription", "ultra"],
+    ["oss-llm", "low"],
+  ])("does not invent an effort for source=%s effort=%s", (source, effort) => {
+    expect(codexSubscriptionRouteLabel("gpt-5-6-luna", source, effort)).toBeNull();
   });
 });
 

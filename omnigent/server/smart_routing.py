@@ -15,12 +15,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
+from omnigent.errors import OmnigentError
 from omnigent.model_fallbacks import (
+    CODEX_DEFAULT_MODEL,
     SMART_ROUTING_CLAUDE_LADDER,
     SMART_ROUTING_CURRENT_GENERATION_GPT,
     SMART_ROUTING_FAMILY_FALLBACKS,
@@ -29,8 +32,10 @@ from omnigent.model_fallbacks import (
     SMART_ROUTING_PI_LADDER,
     SMART_ROUTING_TASK_V1_CLAUDE_ARMS,
     SMART_ROUTING_TASK_V1_CODEX_ARMS,
+    static_model_fallback,
 )
 from omnigent.model_metadata import ModelCostTier, ModelIntent, ModelWireAPI
+from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -236,6 +241,7 @@ class RoutingResult:
     rationale: str
     harness: str | None = None
     raw_model: str | None = None
+    reasoning_effort: str | None = None
 
 
 class RoutingClient(Protocol):
@@ -262,6 +268,209 @@ class RoutingClient(Protocol):
         :returns: A :class:`RoutingResult`, or ``None`` to skip routing.
         """
         ...
+
+
+class CodexSubscriptionRoutingClient:
+    """Route a Codex CLI subscription without calling a separate judge model.
+
+    A ChatGPT subscription can run Codex, but it does not expose an API
+    credential for the server-level LLM judge. Keeping the choice local lets a
+    user opt into Smart Routing without sending a request to another provider.
+
+    The host's Codex model picker (or the release-curated subscription fallback)
+    defines eligibility. A declarative task profile chooses one model tier and
+    effort together; tier fallback is explicit, never based on catalog order.
+    """
+
+    router_source = "codex-subscription"
+    _fallback = static_model_fallback(SUBSCRIPTION_KIND, "codex")
+    fallback_models = _fallback.model_ids if _fallback is not None else (CODEX_DEFAULT_MODEL,)
+
+    # Automatic subscription routing intentionally uses only the three effort
+    # choices exposed in the Codex UI.  ``xhigh`` (Extra High) and ``ultra``
+    # remain valid explicit pins, but are never router-selected.
+    _AUTOMATIC_EFFORTS = frozenset({"low", "medium", "high"})
+    _AUTOMATIC_EFFORT_LABELS = MappingProxyType(
+        {"low": "light", "medium": "medium", "high": "high"}
+    )
+
+    _TASK_PROFILES = (
+        (
+            "difficult work",
+            "sol",
+            "high",
+            ("architecture", "root cause", "system-wide", "difficult", "ambiguity"),
+        ),
+        (
+            "investigation",
+            "terra",
+            "high",
+            ("investigate", "investigation", "security", "performance", "migration"),
+        ),
+        (
+            "debugging or review",
+            "terra",
+            "medium",
+            ("debug", "bug", "review", "multi-file", "multiple files", "refactor", "test"),
+        ),
+        ("trivial work", "luna", "low", ("trivial", "typo", "one line", "one-line", "format")),
+        (
+            "quick work",
+            "luna",
+            "low",
+            ("quick", "small", "simple", "tiny", "rename", "explain", "summarize"),
+        ),
+        ("routine edit", "luna", "low", ("edit", "update", "add", "change")),
+    )
+    _DEFAULT_PROFILE = ("routine work", "luna", "low")
+    _TIER_FALLBACKS = MappingProxyType(
+        {
+            "luna": ("luna", "terra", "sol"),
+            "terra": ("terra", "luna", "sol"),
+            "sol": ("sol", "terra", "luna"),
+        }
+    )
+
+    # Kimi is deliberately restricted to work whose failure can safely fall
+    # through to the established Codex tiers.  It is never an automatic choice
+    # for investigation, debugging, or architecture work.
+    _KIMI_TASK_PROFILES = frozenset({"trivial work", "quick work", "routine edit", "routine work"})
+
+    def __init__(self) -> None:
+        self.last_error: str | None = None
+
+    @classmethod
+    def _task_profile(cls, message: str) -> tuple[str, str, str]:
+        """Resolve the first matching declarative task profile."""
+        text = message.lower()
+        for name, tier, effort, signals in cls._TASK_PROFILES:
+            if any(signal in text for signal in signals):
+                return name, tier, effort
+        return cls._DEFAULT_PROFILE
+
+    @classmethod
+    def _effort_for_model(cls, effort: str, model: str) -> str:
+        """Clamp an automatic effort to the selected eligible model."""
+        from omnigent.reasoning_effort import clamp_effort_for_model
+
+        # Model caps still win when they keep us in the automatic vocabulary.
+        # A deployment must not be able to promote an automatic choice to
+        # Extra High/Ultra through a cap fallback.
+        clamped = clamp_effort_for_model(effort, model)
+        if clamped is not None and clamped in cls._AUTOMATIC_EFFORTS:
+            return clamped
+        return effort if effort in cls._AUTOMATIC_EFFORTS else "high"
+
+    @staticmethod
+    def _tier_model(candidates: list[str], tier: str) -> str | None:
+        """Return an eligible tier model without using candidate position."""
+        needle = f"-{tier}"
+        return next((model for model in candidates if needle in model.lower()), None)
+
+    @classmethod
+    def _model_for_profile(
+        cls, candidates: list[str], preferred_tier: str
+    ) -> tuple[str, str] | None:
+        """Select a preferred tier, then use its explicit degradation order."""
+        for tier in cls._TIER_FALLBACKS[preferred_tier]:
+            if model := cls._tier_model(candidates, tier):
+                return model, tier
+        return None
+
+    async def route(
+        self,
+        message: str,
+        available_models: dict[str, list[str]],
+    ) -> RoutingResult | None:
+        self.last_error = None
+        all_candidates = _flatten_models(available_models)
+        candidates = [model for model in all_candidates if _model_family(model) == "gpt"]
+        if not candidates:
+            self.last_error = "no Codex subscription candidates were available"
+            return None
+
+        profile, preferred_tier, requested_effort = self._task_profile(message)
+        kimi = next((model for model in all_candidates if _is_databricks_kimi_model(model)), None)
+        if kimi is not None and profile in self._KIMI_TASK_PROFILES:
+            harness = next(
+                (name for name, models in available_models.items() if kimi in models), None
+            )
+            return RoutingResult(
+                model=kimi,
+                rationale=f"Selected configured Databricks Kimi for cheap {profile}.",
+                harness=harness,
+            )
+        selected = self._model_for_profile(candidates, preferred_tier)
+        if selected is None:
+            self.last_error = "no tiered Codex subscription candidates were available"
+            return None
+        model, actual_tier = selected
+        harness = next(
+            (name for name, models in available_models.items() if model in models),
+            None,
+        )
+        effort = self._effort_for_model(requested_effort, model)
+        fallback = "" if actual_tier == preferred_tier else f"; fell back to {actual_tier}"
+        rationale = f"Selected Codex {actual_tier}/{effort} for {profile}{fallback}."
+        return RoutingResult(
+            model=model,
+            rationale=rationale,
+            harness=harness,
+            reasoning_effort=effort,
+        )
+
+
+def _is_databricks_kimi_model(model: str) -> bool:
+    """Whether *model* is a Databricks-served Kimi endpoint spelling."""
+    normalized = model.lower().replace("_", "-")
+    return "kimi" in normalized and normalized.startswith(("databricks-", "system.ai." + "kimi"))
+
+
+def configured_databricks_kimi_models(models: Sequence[str]) -> tuple[list[str], str | None]:
+    """Return explicitly configured Databricks Kimi candidates, never probing auth.
+
+    Provider config is read only.  In particular this must not call the
+    Databricks CLI, select a profile, resolve a token, or synthesize an
+    endpoint.  A listed Kimi endpoint plus a declared Databricks provider is
+    the minimum explicit configuration contract.
+    """
+    listed = [model for model in models if _is_databricks_kimi_model(model)]
+    if not listed:
+        return [], "Databricks Kimi is unavailable: no configured Kimi endpoint was listed."
+    try:
+        from omnigent.onboarding.provider_config import (
+            DATABRICKS_KIND,
+            load_config,
+            load_providers,
+        )
+
+        providers = load_providers(load_config())
+    except (OmnigentError, OSError, ValueError):
+        return [], "Databricks Kimi is unavailable: configured provider could not be read."
+    if not any(provider.kind == DATABRICKS_KIND for provider in providers.values()):
+        return [], (
+            "Databricks Kimi is unavailable: no Databricks provider is explicitly configured."
+        )
+    return listed, None
+
+
+def codex_subscription_display_label(
+    model: str,
+    router_source: str | None,
+    reasoning_effort: str | None,
+) -> str | None:
+    """Return the readable label for one automatic subscription decision."""
+    if router_source != CodexSubscriptionRoutingClient.router_source:
+        return None
+    if _is_databricks_kimi_model(model):
+        return f"databricks-{model.removeprefix('databricks-')}"
+    if not reasoning_effort:
+        return None
+    effort_label = CodexSubscriptionRoutingClient._AUTOMATIC_EFFORT_LABELS.get(reasoning_effort)
+    if effort_label is None:
+        return None
+    readable_model = re.sub(r"^gpt-(\d+)-(\d+)(?=-|$)", r"gpt-\1.\2", model)
+    return f"codex-subscription-{readable_model}-{effort_label}"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -1134,6 +1343,20 @@ def _bare_id(model: str, prefixes: Sequence[str] | None = None) -> str:
     bare = strip_catalog_prefix(model, _configured_prefixes(prefixes))
     # Folded last so an upper-case ``[1M]`` is dropped too.
     return bare.replace(".", "-").lower().removesuffix("[1m]")
+
+
+def automatic_routing_model_allowed(
+    model: str,
+    *,
+    prefixes: Sequence[str] | None = None,
+) -> bool:
+    """Whether automatic routing may offer or apply *model*.
+
+    Sol remains a valid explicit model choice.  Smart Routing is the one
+    policy-controlled path that excludes it, across catalog spellings,
+    router vocabulary, and long-context aliases.
+    """
+    return _bare_id(model, prefixes) != _bare_id(SMART_ROUTING_TASK_V1_CODEX_ARMS[1])
 
 
 def _model_family(model: str) -> str:
@@ -2112,6 +2335,14 @@ async def route_session_harness(
             if in_family:
                 harness_models[h] = in_family
 
+    # A Codex CLI subscription has no gateway catalog to top up from.  Its
+    # explicit local router may still route an auto-harness session onto the
+    # Codex runner using the same subscription-only candidates as a later turn.
+    if isinstance(backends.local, CodexSubscriptionRoutingClient):
+        for h in candidate_harnesses:
+            if h in ("codex", "codex-native") and h not in harness_models:
+                harness_models[h] = list(backends.local.fallback_models)
+
     # Fall back to the static table when neither catalog produced routable
     # candidates (e.g. a child session whose catalog only lists "self" under an
     # unrecognized worker name, or the runner was unreachable), and to top up
@@ -2228,6 +2459,8 @@ async def route_session_harness(
         "rationale": result.rationale,
         "router_source": call.source,
     }
+    if result.reasoning_effort is not None:
+        verdict["reasoning_effort"] = result.reasoning_effort
     if raw_model and _bare_id(raw_model, prefixes) != _bare_id(chosen_model, prefixes):
         verdict["raw_model"] = raw_model
 
@@ -2250,6 +2483,7 @@ async def route_turn(
     catalog: Sequence[str] | None = None,
     gateway_backed: bool = True,
     allow_static_fallback: bool = True,
+    allow_databricks_kimi: bool = False,
 ) -> tuple[str | None, dict[str, Any] | None]:
     """Pick the best model for a turn via the deployment's routing backends.
 
@@ -2319,6 +2553,16 @@ async def route_turn(
         # names models this pane cannot be switched to. Decline the turn rather
         # than route it onto an unreachable endpoint.
         models = infer_models(harness) if allow_static_fallback else None
+        # A Codex CLI subscription is deliberately off-gateway, so its model
+        # fallback is separate from infer_models(), whose tables are all
+        # Databricks endpoint ids.  It is only enabled by the explicit local
+        # subscription router and only for a Codex session.
+        if (
+            models is None
+            and isinstance(backends.local, CodexSubscriptionRoutingClient)
+            and harness in ("codex", "codex-native")
+        ):
+            models = list(backends.local.fallback_models)
         if models is None:
             _logger.info(
                 "smart_routing: route_turn skipped for session=%s: "
@@ -2330,6 +2574,19 @@ async def route_turn(
         available = {harness or "": models}
 
     prefixes = routing_settings().model_prefixes
+    kimi_status: str | None = None
+    if isinstance(backends.local, CodexSubscriptionRoutingClient):
+        flattened = _flatten_models(available)
+        configured_kimi, kimi_status = configured_databricks_kimi_models(flattened)
+        allowed_kimi = set(configured_kimi) if allow_databricks_kimi else set()
+        available = {
+            name: [
+                model
+                for model in models
+                if not _is_databricks_kimi_model(model) or model in allowed_kimi
+            ]
+            for name, models in available.items()
+        }
     # A turn cannot change the harness, so a model its gateway bars is not a
     # candidate at all. The seam still injects whatever arms the router's menu
     # requires, so dropping these rows never makes that menu partial.
@@ -2401,6 +2658,10 @@ async def route_turn(
         "rationale": result.rationale,
         "router_source": call.source,
     }
+    if result.reasoning_effort is not None:
+        verdict["reasoning_effort"] = result.reasoning_effort
+    if allow_databricks_kimi and kimi_status is not None:
+        verdict["rationale"] = f"{result.rationale} {kimi_status} Fell back to Codex."
     if raw_model and _bare_id(raw_model, prefixes) != _bare_id(model, prefixes):
         verdict["raw_model"] = raw_model
     return model, verdict

@@ -269,6 +269,20 @@ async def test_patch_session_title(
     assert resp.status_code == 200
 
 
+async def test_patch_session_keeps_an_explicit_sol_model_override(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """The Smart Routing exclusion does not restrict the manual model picker."""
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"model_override": "gpt-5.6-sol"},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["model_override"] == "gpt-5.6-sol"
+
+
 async def test_patch_session_not_found(client: httpx.AsyncClient) -> None:
     """Patching a nonexistent session returns 404."""
     resp = await client.patch(

@@ -115,6 +115,7 @@ from omnigent.server.routes._sessions.common import (
     _pushed_model_options_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
+    _session_status_cache,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -126,6 +127,7 @@ from omnigent.server.routes._sessions.helpers import (
     _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
+    _collect_descendant_conversation_ids,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
     _forward_session_change_to_runner,
@@ -236,6 +238,20 @@ def _evict_retry_recovery_task(
         _retry_recovery_tasks.pop(session_id, None)
     if not completed_task.cancelled():
         completed_task.exception()
+
+
+async def _stop_active_children_of_waiting_parent(
+    session_id: str,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+) -> None:
+    """Stop active child sessions when their parent is waiting for their result."""
+    if _session_status_cache.get(session_id) != "waiting":
+        return
+    child_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
+    for child_id in child_ids:
+        if _session_status_cache.get(child_id) in {"running", "waiting"}:
+            await _stop_session_via_runner(child_id, runner_router)
 
 
 async def _recover_retry_session(
@@ -769,6 +785,11 @@ def register_events_routes(
             # of closing the dialog as if it succeeded.
             try:
                 stop_delivered = await _stop_session_via_runner(session_id, runner_router)
+                await _stop_active_children_of_waiting_parent(
+                    session_id,
+                    conversation_store,
+                    runner_router,
+                )
             except Exception:
                 # Stop didn't land: the turn keeps running, so lift the
                 # fence or its remaining output is dropped forever.

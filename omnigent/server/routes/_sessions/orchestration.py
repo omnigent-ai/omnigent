@@ -1079,6 +1079,7 @@ def _build_session_response(
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
+        databricks_kimi_routing_enabled=labels.get("omnigent.routing.databricks_kimi") == "on",
         context_window=context_window,
         last_total_tokens=last_total_tokens,
         # Seed the client's cost indicator on resume. Uses the SUBTREE
@@ -4001,6 +4002,7 @@ def _build_native_terminal_message_event(
     conv: Conversation,
     body: SessionEventInput,
     model_override: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     """
     Build the runner event that delivers a web message to a native TUI.
@@ -4047,6 +4049,8 @@ def _build_native_terminal_message_event(
     # inject as ONE locked step, so the switch can't race the message.
     if model_override is not None:
         event["model_override"] = model_override
+    if reasoning_effort is not None:
+        event["reasoning_effort"] = reasoning_effort
     return event
 
 
@@ -4058,6 +4062,7 @@ async def _forward_native_terminal_message(
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
     model_override: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -4086,7 +4091,12 @@ async def _forward_native_terminal_message(
         the injection request.
     """
     display_name, _, _ = _native_terminal_runtime(conv)
-    event = _build_native_terminal_message_event(conv, body, model_override=model_override)
+    event = _build_native_terminal_message_event(
+        conv,
+        body,
+        model_override=model_override,
+        reasoning_effort=reasoning_effort,
+    )
     _logger.info(
         "%s terminal message forward starting: session=%s block_types=%s model_override=%s",
         display_name,
@@ -4522,6 +4532,16 @@ def _out_of_family_spawn_notice(
     )
 
 
+def _routed_reasoning_effort(
+    verdict: Mapping[str, Any] | None, current_effort: str | None
+) -> str | None:
+    """Return a subscription-router effort only when the user did not pin one."""
+    if current_effort is not None or not isinstance(verdict, Mapping):
+        return None
+    effort = verdict.get("reasoning_effort")
+    return effort if isinstance(effort, str) else None
+
+
 def _publish_routed_model(session_id: str, model: str) -> None:
     """
     Publish a ``session.model`` SSE for a router-selected model.
@@ -4743,6 +4763,10 @@ async def _forward_event_to_runner(
     effective_runner_override = (
         body.model_override if body.model_override is not None else conv.model_override
     )
+    # Routing persists its chosen effort onto the conversation below. Preserve
+    # whether the user had already pinned one so the decision card records the
+    # actual automatic pick instead of treating that persisted value as a pin.
+    _user_effort_pinned = conv.reasoning_effort is not None
     # ── Auto-harness resolution ───────────────────────────────────────
     # When the session was created with harness_override="auto", the real
     # harness + model are determined here on the first message where user
@@ -4801,6 +4825,16 @@ async def _forward_event_to_runner(
                 if _auto_model is not None and effective_runner_override is None:
                     _conv_updates["model_override"] = _auto_model
                     effective_runner_override = _auto_model
+                if (
+                    _auto_model is not None
+                    and (
+                        _auto_effort := _routed_reasoning_effort(
+                            _auto_verdict, conv.reasoning_effort
+                        )
+                    )
+                    is not None
+                ):
+                    _conv_updates["reasoning_effort"] = _auto_effort
                 _updated = await asyncio.to_thread(
                     conversation_store.update_conversation,
                     session_id,
@@ -4943,6 +4977,12 @@ async def _forward_event_to_runner(
                     _child_updates: dict[str, Any] = {}
                     if _routed_model is not None:
                         _child_updates["model_override"] = _routed_model
+                        if (
+                            _child_effort := _routed_reasoning_effort(
+                                _verdict, conv.reasoning_effort
+                            )
+                        ) is not None:
+                            _child_updates["reasoning_effort"] = _child_effort
                     if _routed_harness is not None:
                         _child_updates["harness_override"] = _routed_harness
                     if _child_updates:
@@ -4993,6 +5033,9 @@ async def _forward_event_to_runner(
                     catalog=await _native_turn_catalog(session_id, conv, runner_client),
                     gateway_backed=_turn_backed,
                     allow_static_fallback=_turn_backed,
+                    allow_databricks_kimi=(
+                        conv.labels.get("omnigent.routing.databricks_kimi") == "on"
+                    ),
                 )
                 if _turn_route_err is not None:
                     # Not routed, and visibly so — the turn runs on the
@@ -5016,6 +5059,10 @@ async def _forward_event_to_runner(
                                 conversation_store.update_conversation,
                                 session_id,
                                 model_override=_routed_model,
+                                reasoning_effort=_routed_reasoning_effort(
+                                    _verdict, conv.reasoning_effort
+                                )
+                                or conv.reasoning_effort,
                             )
                             _publish_routed_model(session_id, _turn_spelling)
                         except (OSError, ValueError):
@@ -5094,6 +5141,7 @@ async def _forward_event_to_runner(
                 _auto_card_verdict,
                 scope="session",
                 harness=_auto_harness,
+                effort_pinned=_user_effort_pinned,
             )
             if not _auto_route_failed:
                 # A failed call is NOT this session's routing decision: the
@@ -5113,6 +5161,7 @@ async def _forward_event_to_runner(
                     scope="session",
                     harness=_auto_harness,
                     decision_id=_auto_decision_id,
+                    effort_pinned=_user_effort_pinned,
                 )
         if _routed_model is not None and _verdict is not None:
             _decision_scope = "child_session" if _parent_routing_on else "turn"
@@ -5140,6 +5189,7 @@ async def _forward_event_to_runner(
                 scope=_decision_scope,
                 harness=_routed_harness or _resolve_harness(conv),
                 attempted_override=_overridden,
+                effort_pinned=_user_effort_pinned,
             )
             if not _route_failed:
                 # A failed call is NOT this session's routing decision: the
@@ -5161,6 +5211,7 @@ async def _forward_event_to_runner(
                     scope=_decision_scope,
                     harness=_routed_harness or _resolve_harness(conv),
                     decision_id=_decision_id,
+                    effort_pinned=_user_effort_pinned,
                     attempted_override=_overridden,
                 )
     except (httpx.HTTPError, ConnectionError) as exc:
@@ -5416,6 +5467,9 @@ async def _dispatch_session_event_to_runner_impl(
         _native_routing_enabled = (
             conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
         ) or _native_parent_routing_on
+        # The routed effort is persisted before the card is emitted. Snapshot
+        # the user pin first so automatic decisions keep their real effort.
+        _user_effort_pinned = conv.reasoning_effort is not None
         _native_routed_model: str | None = None
         _native_verdict: dict[str, Any] | None = None
         # Set when nothing was routed — the call failed, or the family rule
@@ -5471,6 +5525,9 @@ async def _dispatch_session_event_to_runner_impl(
                     catalog=await _native_turn_catalog(session_id, conv, _native_runner_client),
                     gateway_backed=_native_backed,
                     allow_static_fallback=_native_backed,
+                    allow_databricks_kimi=(
+                        conv.labels.get("omnigent.routing.databricks_kimi") == "on"
+                    ),
                 )
                 if _native_route_err is not None:
                     _native_routed_model, _native_verdict = _unavailable_routing_card(
@@ -5496,6 +5553,10 @@ async def _dispatch_session_event_to_runner_impl(
                             conversation_store.update_conversation,
                             session_id,
                             model_override=_native_routed_model,
+                            reasoning_effort=_routed_reasoning_effort(
+                                _native_verdict, conv.reasoning_effort
+                            )
+                            or conv.reasoning_effort,
                         )
                         _publish_routed_model(session_id, _native_applied_model)
                     except (OSError, ValueError):
@@ -5526,6 +5587,7 @@ async def _dispatch_session_event_to_runner_impl(
                 model_override=(
                     _native_routed_model if _native_applied_model is not None else None
                 ),
+                reasoning_effort=_routed_reasoning_effort(_native_verdict, conv.reasoning_effort),
             )
             forwarded = True
         finally:
@@ -5544,6 +5606,7 @@ async def _dispatch_session_event_to_runner_impl(
                 _native_verdict,
                 scope=_native_scope,
                 harness=_resolve_harness(conv),
+                effort_pinned=_user_effort_pinned,
             )
             if not _native_route_failed:
                 # The label is the route-once gate, so a failed call must not
@@ -5562,6 +5625,7 @@ async def _dispatch_session_event_to_runner_impl(
                     scope=_native_scope,
                     harness=_resolve_harness(conv),
                     decision_id=_native_decision_id,
+                    effort_pinned=_user_effort_pinned,
                 )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
     item_id = await _forward_event_to_runner(
@@ -7706,7 +7770,14 @@ async def _create_session_from_existing_agent(
             if _native_smart_routing
             else _fixed_routed_model or body.model_override
         ),
-        reasoning_effort=body.reasoning_effort,
+        reasoning_effort=(
+            body.reasoning_effort
+            if body.reasoning_effort is not None
+            else _routed_reasoning_effort(
+                _native_routing_verdict if _native_smart_routing else _fixed_routing_verdict,
+                None,
+            )
+        ),
     )
 
     # Validated before any row exists so a bad value never creates an
@@ -8083,6 +8154,7 @@ async def _create_session_from_existing_agent(
                 _native_routing_verdict,
                 scope="session",
                 harness=_routed_native.harness if _routed_native is not None else None,
+                effort_pinned=body.reasoning_effort is not None,
             )
             # The same prompt is submitted again inside the harness, where the
             # first-prompt hook would score it a second time for the verdict
@@ -8111,6 +8183,7 @@ async def _create_session_from_existing_agent(
                 _fixed_routing_verdict,
                 scope="session",
                 harness=_fixed_native_harness,
+                effort_pinned=body.reasoning_effort is not None,
             )
             await _stamp_routing_decision_label(conv.id, conversation_store, _fixed_decision_id)
             if _fixed_decision_id is not None:

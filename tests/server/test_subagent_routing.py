@@ -286,6 +286,56 @@ async def test_same_family_pick_rewrites() -> None:
     assert len(decision.decision_id) == 36
 
 
+async def test_subagent_routing_never_offers_or_applies_normalized_sol() -> None:
+    """A bad subagent verdict declines instead of rewriting the spawn to Sol."""
+    client = FakeRoutingClient(RoutingResult(model="databricks-gpt-5-6-sol", rationale="bad"))
+    decision = await resolve_subagent_route(
+        "conv_1",
+        _request(harness="codex-native"),
+        caps=FakeCaps(routing_client=client),
+        available_models={"codex-native": ["gpt-5.6-sol", "gpt-5.6-luna"]},
+        gateway_backed=False,
+    )
+    assert client.offered == [{"codex-native": ["gpt-5.6-luna"]}]
+    assert decision.action == "allow"
+    assert decision.model is None
+    assert "no verdict" in decision.rationale
+
+
+async def test_explicit_subagent_effort_pin_wins_over_subscription_routing() -> None:
+    """A spawn-level effort remains untouched while its model is routed."""
+    client = FakeRoutingClient(
+        RoutingResult(
+            model=GPT_MODEL,
+            rationale="bounded task",
+            harness="codex-native",
+            reasoning_effort="xhigh",
+        )
+    )
+    decision = await resolve_subagent_route(
+        "conv_1",
+        _request(harness="codex-native", requested_effort="low"),
+        caps=FakeCaps(routing_client=client),
+    )
+    assert decision.action == "rewrite"
+    assert decision.reasoning_effort is None
+
+
+async def test_automatic_subagent_effort_is_persisted_for_the_task_display() -> None:
+    """The transcript record retains the actual automatic model-and-effort pair."""
+    decision = SubagentRouteDecision(
+        action="rewrite",
+        model="gpt-5.6-luna",
+        rationale="routine task",
+        router_source="codex-subscription",
+        reasoning_effort="low",
+    )
+    record = decision_record(_request(harness="codex-native"), decision)
+
+    assert (record.model, record.reasoning_effort) == ("gpt-5.6-luna", "low")
+    assert record.display_label == "codex-subscription-gpt-5.6-luna-light"
+
+
 @pytest.mark.parametrize(
     ("picked", "note", "recorded_override"),
     [
@@ -810,6 +860,7 @@ async def test_every_decision_is_persisted_with_native_subagent_scope() -> None:
     assert data["harness"] == "claude-native"
     assert data["applied"] is True
     assert data["rationale"] == "deep reasoning"
+    assert data["reasoning_effort"] is None
 
 
 async def test_deny_is_persisted_unapplied() -> None:

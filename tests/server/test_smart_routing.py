@@ -19,6 +19,7 @@ import pytest
 from omnigent.server.routing_backend import RoutingBackends
 from omnigent.server.smart_routing import (
     _AUTO_ROUTING_HARNESSES,
+    CodexSubscriptionRoutingClient,
     LLMRoutingClient,
     RoutingResult,
     _build_rubric,
@@ -63,6 +64,150 @@ class _FakeLLMClient:
         return _FakeResponse(
             output=[_FakeMessageOutput(content=[_FakeOutputText(text=text)])],
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "expected", "effort"),
+    [
+        ("Fix this trivial typo", "gpt-5.6-luna", "low"),
+        ("Quickly make this simple rename", "gpt-5.6-luna", "low"),
+        ("Add validation to the settings form", "gpt-5.6-luna", "low"),
+        ("Debug this regression", "gpt-5.6-terra", "medium"),
+        ("Investigate the production performance migration", "gpt-5.6-terra", "high"),
+        ("Design a complex system-wide architecture", "gpt-5.6-sol", "high"),
+    ],
+)
+async def test_codex_subscription_router_applies_the_local_task_policy(
+    message: str, expected: str, effort: str
+) -> None:
+    """The deterministic subscription policy uses only Codex UI efforts."""
+    client = CodexSubscriptionRoutingClient()
+    result = await client.route(
+        message,
+        {"codex-native": ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra"]},
+    )
+    assert result is not None
+    assert (result.model, result.harness) == (expected, "codex-native")
+    assert result.reasoning_effort == effort
+    assert result.reasoning_effort in {"low", "medium", "high"}
+
+
+@pytest.mark.asyncio
+async def test_codex_subscription_router_uses_only_the_eligible_candidate_menu() -> None:
+    """A missing Luna degrades to Terra even when an un-tiered arm comes first."""
+    client = CodexSubscriptionRoutingClient()
+    result = await client.route(
+        "Quick edit",
+        {"codex-native": ["gpt-5.6-terra", "gpt-5.5"]},
+    )
+    assert result is not None
+    assert result.model == "gpt-5.6-terra"
+
+
+@pytest.mark.asyncio
+async def test_databricks_kimi_is_only_selected_for_conservative_work() -> None:
+    """Kimi is cheap routing, never the automatic choice for deep work."""
+    client = CodexSubscriptionRoutingClient()
+    candidates = {"codex-native": ["databricks-kimi-k2-6", "gpt-5.6-luna", "gpt-5.6-sol"]}
+    quick = await client.route("Quick edit", candidates)
+    difficult = await client.route("Design difficult system-wide architecture", candidates)
+    assert quick is not None and quick.model == "databricks-kimi-k2-6"
+    assert difficult is not None and difficult.model == "gpt-5.6-sol"
+
+
+@pytest.mark.asyncio
+async def test_route_turn_kimi_toggle_filters_or_uses_explicit_configuration() -> None:
+    """Off is Codex-only; on admits Kimi only after explicit provider configuration."""
+    from types import SimpleNamespace
+
+    client = CodexSubscriptionRoutingClient()
+    caps = FakeCaps(routing_client=client, routing_backends=RoutingBackends(local=client))
+    provider = SimpleNamespace(kind="databricks")
+    patches = (
+        patch("omnigent.onboarding.provider_config.load_config", return_value={}),
+        patch(
+            "omnigent.onboarding.provider_config.load_providers", return_value={"dbx": provider}
+        ),
+        patch("omnigent.runtime._globals._caps", new=caps),
+    )
+    with patches[0], patches[1], patches[2]:
+        off_model, _ = await route_turn(
+            "codex-native",
+            "Quick edit",
+            catalog=["databricks-kimi-k2-6", "gpt-5.6-luna"],
+            gateway_backed=False,
+            allow_static_fallback=False,
+        )
+        on_model, on_verdict = await route_turn(
+            "codex-native",
+            "Quick edit",
+            catalog=["databricks-kimi-k2-6", "gpt-5.6-luna"],
+            gateway_backed=False,
+            allow_static_fallback=False,
+            allow_databricks_kimi=True,
+        )
+    assert off_model == "gpt-5.6-luna"
+    assert on_model == "databricks-kimi-k2-6"
+    assert on_verdict is not None
+
+
+@pytest.mark.asyncio
+async def test_route_turn_kimi_missing_config_falls_open_with_status() -> None:
+    """An opt-in without a provider keeps the Codex choice and explains why."""
+    client = CodexSubscriptionRoutingClient()
+    caps = FakeCaps(routing_client=client, routing_backends=RoutingBackends(local=client))
+    with (
+        patch("omnigent.onboarding.provider_config.load_config", return_value={}),
+        patch("omnigent.onboarding.provider_config.load_providers", return_value={}),
+        patch("omnigent.runtime._globals._caps", new=caps),
+    ):
+        model, verdict = await route_turn(
+            "codex-native",
+            "Quick edit",
+            catalog=["databricks-kimi-k2-6", "gpt-5.6-luna"],
+            gateway_backed=False,
+            allow_static_fallback=False,
+            allow_databricks_kimi=True,
+        )
+    assert model == "gpt-5.6-luna"
+    assert verdict is not None
+    assert "no Databricks provider is explicitly configured" in verdict["rationale"]
+
+
+@pytest.mark.asyncio
+async def test_codex_subscription_router_falls_back_by_tier_not_catalog_position() -> None:
+    """Complex work chooses Sol despite Luna appearing first in the catalog."""
+    client = CodexSubscriptionRoutingClient()
+    result = await client.route(
+        "Resolve difficult system-wide ambiguity",
+        {"codex-native": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]},
+    )
+    assert result is not None
+    assert (result.model, result.reasoning_effort) == ("gpt-5.6-sol", "high")
+
+
+@pytest.mark.asyncio
+async def test_codex_subscription_router_clamps_effort_for_selected_model() -> None:
+    """Deployment model caps constrain the automatic effort, never its vocabulary."""
+    from omnigent.reasoning_effort import ModelEffortCaps
+    from omnigent.server.smart_routing import RoutingSettings
+
+    client = CodexSubscriptionRoutingClient()
+    caps = ModelEffortCaps(
+        fallback={"gpt-5-6-terra": "high"},
+        unsupported={"gpt-5-6-terra": frozenset({"xhigh"})},
+    )
+    with patch(
+        "omnigent.server.smart_routing.routing_settings",
+        return_value=RoutingSettings(model_effort_caps=caps),
+    ):
+        result = await client.route(
+            "Design a complex system-wide architecture",
+            {"codex-native": ["gpt-5.6-terra"]},
+        )
+    assert result is not None
+    assert result.reasoning_effort == "high"
 
 
 @dataclass
@@ -2085,6 +2230,40 @@ async def test_route_session_harness_keeps_raw_pick_in_verdict() -> None:
     assert error is None
 
 
+@pytest.mark.asyncio
+async def test_route_session_harness_declines_a_normalized_sol_verdict() -> None:
+    """A buggy automatic router cannot persist Sol onto a newly created session."""
+    client = FakeRoutingClient(
+        RoutingResult(model="system.ai.gpt-5-6-sol[1M]", rationale="too costly")
+    )
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
+        harness, model, verdict, error = await route_session_harness(
+            "do it",
+            harness_candidates=("codex",),
+            catalog={"codex": ["gpt-5.6-sol", "gpt-5.6-luna"]},
+            gateway_backed=False,
+        )
+    assert client.offered == [{"codex": ["gpt-5.6-luna"]}]
+    assert (harness, model, verdict) == (None, None, None)
+    assert error is not None
+
+
+@pytest.mark.asyncio
+async def test_route_turn_declines_a_normalized_sol_verdict() -> None:
+    """A turn router cannot forward Sol even if it disregards its candidate menu."""
+    client = FakeRoutingClient(RoutingResult(model="gpt-5.6-sol", rationale="too costly"))
+    with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
+        model, verdict = await route_turn(
+            "codex-native",
+            "do it",
+            catalog=["gpt-5.6-sol", "gpt-5.6-terra"],
+            gateway_backed=False,
+            allow_static_fallback=False,
+        )
+    assert client.offered == [{"codex-native": ["gpt-5.6-terra"]}]
+    assert (model, verdict) == (None, None)
+
+
 # ── Route-options seam ────────────────────────────────────────────────────
 
 
@@ -2977,6 +3156,43 @@ async def test_route_turn_declines_rather_than_offer_gateway_ids_off_gateway() -
         )
     assert (model, verdict) == (None, None)
     assert local.offered == []
+
+
+@pytest.mark.asyncio
+async def test_route_turn_uses_codex_subscription_fallback_off_gateway() -> None:
+    """Subscription routing has its own non-Databricks Codex candidate menu."""
+    client = CodexSubscriptionRoutingClient()
+    caps = FakeCaps(routing_client=client, routing_backends=RoutingBackends(local=client))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        model, verdict = await route_turn(
+            "codex-native",
+            "Quickly fix this typo",
+            gateway_backed=False,
+            allow_static_fallback=False,
+        )
+    assert model == "gpt-5.6-luna"
+    assert verdict is not None
+    assert verdict["router_source"] == "codex-subscription"
+    assert verdict["reasoning_effort"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_session_start_uses_codex_subscription_fallback_off_gateway() -> None:
+    """Auto-harness selection can start directly on a Codex subscription."""
+    client = CodexSubscriptionRoutingClient()
+    caps = FakeCaps(routing_client=client, routing_backends=RoutingBackends(local=client))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        harness, model, verdict, error = await route_session_harness(
+            "Quickly fix this typo",
+            harness_candidates=("codex-native",),
+            gateway_backed=False,
+            allow_static_fallback=False,
+        )
+    assert error is None
+    assert (harness, model) == ("codex-native", "gpt-5.6-luna")
+    assert verdict is not None
+    assert verdict["router_source"] == "codex-subscription"
+    assert verdict["reasoning_effort"] == "low"
 
 
 @pytest.mark.asyncio

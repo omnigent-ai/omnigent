@@ -6179,6 +6179,7 @@ function formatEffortLabel(effort: string): string {
 /** Gear-modal row governing the routing of sub-agents the session spawns. */
 const SUBAGENT_ROUTING_LABEL = "Subagent routing";
 const SUBAGENT_ROUTING_DESCRIPTION = "Model routing for subagents this session spawns";
+const DATABRICKS_KIMI_ROUTING_LABEL = "Use configured Databricks Kimi";
 
 /**
  * In-session run-config modal opened from the composer's gear icon. The
@@ -6220,6 +6221,7 @@ function SessionConfigModal({
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
+  const databricksKimiRoutingEnabled = useChatStore((s) => s.databricksKimiRoutingEnabled);
   const conversationId = useChatStore((s) => s.conversationId);
   const { llmModel, usesServerModelOptions, modelOptions, pickerSelectedModel, modelLabel } =
     useResolvedComposerModel(modelPickerKind, codexModelOptions);
@@ -6257,12 +6259,16 @@ function SessionConfigModal({
   const [pickedSubagentRouting, setPickedSubagentRouting] = useState<"on" | "off" | undefined>(
     undefined,
   );
+  const [draftDatabricksKimiRoutingEnabled, setDraftDatabricksKimiRoutingEnabled] = useState(
+    databricksKimiRoutingEnabled,
+  );
   useEffect(() => {
     if (!open) return;
     setDraftModelId(resolvedModelId);
     setDraftEffort(selectedEffort);
     setDraftRoutingOn(liveRoutingOn);
     setPickedSubagentRouting(undefined);
+    setDraftDatabricksKimiRoutingEnabled(databricksKimiRoutingEnabled);
     // Nothing pushes a routing-switch change to the client (no SSE event, and
     // the session query never goes stale), so re-read them here — otherwise the
     // switches show whatever they were at bind time.
@@ -6345,6 +6351,8 @@ function SessionConfigModal({
           pickedSubagentRouting !== (store.subagentRoutingOverride ?? "off")
         )
           await store.setSubagentRouting(pickedSubagentRouting);
+        if (draftDatabricksKimiRoutingEnabled !== store.databricksKimiRoutingEnabled)
+          await store.setDatabricksKimiRoutingEnabled(draftDatabricksKimiRoutingEnabled);
       } catch {
         // Individual setters already roll back their optimistic state; a failed
         // PATCH shouldn't wedge the modal open.
@@ -6461,6 +6469,29 @@ function SessionConfigModal({
                   <SelectItem value="off" data-subagent-routing="off">
                     Default
                   </SelectItem>
+                </SelectContent>
+              </Select>
+            </ConfigRow>
+          )}
+          {costRoutingEligible && (
+            <ConfigRow
+              label={DATABRICKS_KIMI_ROUTING_LABEL}
+              description="Allow automatic routing to an already configured Kimi endpoint"
+            >
+              <Select
+                value={draftDatabricksKimiRoutingEnabled ? "on" : "off"}
+                onValueChange={(value) => setDraftDatabricksKimiRoutingEnabled(value === "on")}
+              >
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="composer-config-databricks-kimi-routing"
+                  aria-label={DATABRICKS_KIMI_ROUTING_LABEL}
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  <SelectItem value="off">Off</SelectItem>
+                  <SelectItem value="on">On</SelectItem>
                 </SelectContent>
               </Select>
             </ConfigRow>

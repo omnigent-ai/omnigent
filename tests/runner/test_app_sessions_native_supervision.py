@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -11,6 +12,7 @@ import pytest
 
 from omnigent import (
     claude_native_bridge,
+    codex_native_forwarder,
 )
 from omnigent.claude_native_bridge import (
     bridge_dir_for_conversation_id,
@@ -927,6 +929,69 @@ async def test_native_subagent_completion_wakes_idle_parent() -> None:
     # Notice names the finished worker and steers the parent to drain the inbox.
     assert "sub-agent claude_code/auth finished (completed)" in wake_text
     assert "sys_read_inbox" in wake_text
+
+
+@pytest.mark.asyncio
+async def test_codex_completed_goal_wakes_parent_once(tmp_path: Path) -> None:
+    """A Codex goal completion supplies the terminal result awaited by its parent."""
+    from omnigent.runner import app as runner_app
+
+    parent_id = "a23e9c6654b748a2ab844e873ecf4451"
+    child_id = "42c350c26f6242489b0e43121b452c28"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    server_client = _WakeRecordingServerClient(parent_id)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    runner_app._session_inboxes_ref[parent_id] = session_inbox
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="codex",
+        title="implementation",
+    )
+    state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id=parent_id,
+        subagents_by_thread={"thread_child": child_id},
+    )
+    event: dict[str, object] = {
+        "method": "thread/goal/updated",
+        "params": {
+            "threadId": "thread_child",
+            "goal": {
+                "threadId": "thread_child",
+                "status": "completed",
+                "createdAt": 1,
+                "updatedAt": 2,
+                "tokensUsed": 12,
+                "timeUsedSeconds": 3,
+            },
+        },
+    }
+    try:
+        async with _runner_client(app) as client:
+            for _ in range(2):
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id=parent_id,
+                    bridge_dir=tmp_path,
+                    event=event,
+                    usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(
+                        client, parent_id
+                    ),
+                    elicitation_tracker=codex_native_forwarder._CodexElicitationTaskTracker(),
+                    expected_thread_id="thread_parent",
+                    forwarder_state=state,
+                )
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert session_inbox.qsize() == 1
+    assert session_inbox.get_nowait()["status"] == "completed"
+    assert len(server_client.wake_posts) == 1
 
 
 @pytest.mark.asyncio
