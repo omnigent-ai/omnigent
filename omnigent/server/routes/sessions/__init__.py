@@ -306,6 +306,7 @@ from omnigent.server.routes._sessions.common import (
     _interrupt_fenced_sessions as _interrupt_fenced_sessions,
     _logger as _logger,
     _managed_launch_tasks as _managed_launch_tasks,
+    _managed_wake_sessions as _managed_wake_sessions,
     _model_options_cache as _model_options_cache,
     _model_options_inflight as _model_options_inflight,
     _model_options_stale as _model_options_stale,

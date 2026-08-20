@@ -167,6 +167,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _interrupt_fenced_sessions,
     _logger,
     _managed_launch_tasks,
+    _managed_wake_sessions,
     _MirroredToolCall,
     _model_options_cache,
     _model_options_inflight,
@@ -3178,10 +3179,19 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     ):
         return False
 
-    if host_registry is not None:
-        host_registry.deregister(conv.host_id)
-    if tunnel_registry is not None and conv.runner_id is not None:
-        tunnel_registry.deregister(conv.runner_id)
+    # The stale tunnel and its relay are intentionally replaced during a
+    # managed wake. Mark the handoff before deregistration so those expected
+    # disconnects do not become a user-visible task failure.
+    _managed_wake_sessions.add(session_id)
+    try:
+        await _retire_runner_relay_for_managed_wake(session_id)
+        if host_registry is not None:
+            host_registry.deregister(conv.host_id)
+        if tunnel_registry is not None and conv.runner_id is not None:
+            tunnel_registry.deregister(conv.runner_id)
+    except BaseException:
+        _managed_wake_sessions.discard(session_id)
+        raise
 
     _logger.info(
         "Managed host %s for session %s needs wake before reusing tunnels "
@@ -3195,12 +3205,34 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
         runner_tunnel_stale,
         extra={"session_id": session_id},
     )
-    return await _maybe_relaunch_managed_sandbox(
-        session_id=session_id,
-        conv=conv,
-        app_state=app_state,
-        conversation_store=conversation_store,
+    try:
+        started = await _maybe_relaunch_managed_sandbox(
+            session_id=session_id,
+            conv=conv,
+            app_state=app_state,
+            conversation_store=conversation_store,
+        )
+    except BaseException:
+        _managed_wake_sessions.discard(session_id)
+        raise
+    if not started:
+        _managed_wake_sessions.discard(session_id)
+    return started
+
+
+async def _retire_runner_relay_for_managed_wake(session_id: str) -> None:
+    """Cancel the relay bound to the runner a managed wake will replace."""
+    stale_relay = _runner_relay_tasks.get(session_id)
+    if stale_relay is None or stale_relay.task.done():
+        return
+    _logger.info(
+        "Managed wake: retiring stale runner relay for session %s (runner %s)",
+        session_id,
+        stale_relay.runner_id,
     )
+    stale_relay.task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await stale_relay.task
 
 
 async def ensure_runner_connected(
@@ -3549,11 +3581,12 @@ def _kick_managed_wake_impl(
         session_id,
         extra={"session_id": session_id},
     )
+    _managed_wake_sessions.add(session_id)
     tracker.begin(session_id)
     # Seed the progress indicator immediately — the user is watching the
     # session page when the wake fires (the composer let them send into a
     # host_asleep session).
-    _publish_sandbox_status(session_id, "provisioning")
+    _publish_sandbox_status(session_id, "waking")
     wake_task = asyncio.create_task(
         _run_managed_wake(
             session_id=session_id,
@@ -3617,6 +3650,7 @@ async def _run_managed_wake(
         reason = "managed session has no host binding"
         tracker.fail(session_id, reason)
         _publish_sandbox_status(session_id, "failed", reason)
+        _managed_wake_sessions.discard(session_id)
         return
 
     def _on_stage(stage: str) -> None:
@@ -3631,6 +3665,7 @@ async def _run_managed_wake(
         _publish_sandbox_status(session_id, stage)
 
     try:
+        await _retire_runner_relay_for_managed_wake(session_id)
         # Wake the same sandbox in place; resume_managed_host is single-flight
         # per host and a no-op if it's already online.
         await resume_managed_host(
@@ -3723,6 +3758,8 @@ async def _run_managed_wake(
         )
         tracker.fail(session_id, "internal error during managed host wake")
         _publish_sandbox_status(session_id, "failed", "internal error during managed host wake")
+    finally:
+        _managed_wake_sessions.discard(session_id)
 
 
 async def _ensure_runner_session_initialized(
@@ -5924,6 +5961,12 @@ async def _relay_runner_stream(
             return
         except _RelayTransportLost as lost:
             now = loop.time()
+            if session_id in _managed_wake_sessions:
+                _logger.info(
+                    "Relay: suppressing expected managed-wake disconnect for session=%s",
+                    session_id,
+                )
+                return
             # An attempt that streamed longer than the grace was a live
             # tunnel dropping anew — give the new outage a fresh window.
             if deadline is None or now - started > RUNNER_DISCONNECT_GRACE_S:

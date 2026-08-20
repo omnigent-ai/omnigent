@@ -1737,13 +1737,12 @@ class SessionLabelsResponse(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
 
 
-# Stages of a managed-sandbox launch, in pipeline order: the sandbox
-# is provisioned, the repository workspace is cloned into it (skipped
-# when the session has no repo workspace), the in-sandbox host starts
-# and registers, and the agent runner is launched on it. ``ready`` and
-# ``failed`` are terminal.
+# Stages of a managed-sandbox launch or resume. New sandboxes move from
+# provisioning through clone/start/connect; resumed sandboxes move from
+# waking to connect. ``ready`` and ``failed`` are terminal.
 SandboxLaunchStage = Literal[
     "provisioning",
+    "waking",
     "cloning",
     "starting",
     "connecting",
@@ -1761,13 +1760,15 @@ class SandboxStatus(BaseModel):
     for sessions without a managed launch and once the launch
     succeeds (the session then looks like any host-bound session).
 
-    :param stage: Current launch stage, e.g. ``"provisioning"`` —
+    :param stage: Current launch stage, e.g. ``"provisioning"`` or
+        ``"waking"`` —
         one of :data:`SandboxLaunchStage`, in pipeline order:
         ``provisioning`` (creating the sandbox) → ``cloning``
         (cloning the repository workspace; skipped when the session
         has none) → ``starting`` (starting the in-sandbox host) →
         ``connecting`` (launching the agent runner) → ``ready`` /
-        ``failed``.
+        ``failed``. A resumed sandbox begins at ``waking`` and then
+        joins the same ``connecting`` → ``ready`` / ``failed`` tail.
     :param error: Failure detail when ``stage == "failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
         ``None`` otherwise.

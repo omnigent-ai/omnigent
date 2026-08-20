@@ -11,8 +11,8 @@ import { CHAT_COLUMN_WIDTH } from "./chatLayout";
 
 /**
  * Band copy for each in-flight managed-sandbox launch stage, in
- * pipeline order: provisioning → cloning (repo workspaces only) →
- * starting → connecting. `starting` is the in-sandbox host booting
+ * launch and resume order: provisioning/waking → cloning (repo workspaces
+ * only) → starting → connecting. `starting` is the in-sandbox host booting
  * and dialing back to the server (so it reads "Connecting host");
  * `connecting` is the agent runner being launched on that host
  * (so it reads "Starting agent"). Terminal stages are absent on
@@ -21,6 +21,7 @@ import { CHAT_COLUMN_WIDTH } from "./chatLayout";
  */
 const SANDBOX_STAGE_LABELS: Record<string, string | undefined> = {
   provisioning: "Provisioning sandbox",
+  waking: "Waking sandbox",
   cloning: "Cloning repository",
   starting: "Connecting host",
   connecting: "Starting agent",
