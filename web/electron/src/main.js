@@ -48,7 +48,7 @@ const { registerWorkspaceChromeHide } = require("./workspace-chrome");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
-const { registerSessionExpiryReload } = require("./session-expiry");
+const { registerSessionExpiryReload, shouldRestoreDeepLink } = require("./session-expiry");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
@@ -378,6 +378,13 @@ function registerLocalhostAccess() {
 const lastExpiryReloadAt = new WeakMap();
 const EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
 
+// Per-window deep-link URL to restore after SSO re-auth. When the auth gate
+// reloads the window on session expiry, the user returns to the workspace home
+// (origin root). To preserve context, we save the pre-reload deep link here and
+// restore it after the post-auth navigation completes. The pending entry is
+// cleared once restoration fires (one-shot per reload cycle).
+const pendingDeepLinkRestoreUrl = new WeakMap();
+
 /**
  * Recover the desktop window when the workspace SSO session expires.
  *
@@ -385,6 +392,11 @@ const EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
  * page, reload every window pinned to that origin so the gate can re-challenge
  * — see session-expiry.js. A desktop user has no address bar to refresh out of
  * the resulting "Failed to load" state manually, so the shell does it.
+ *
+ * On reload, if the window is on a deep link within the pinned origin, save it
+ * so after post-auth navigation (which lands at the origin root), the deep link
+ * can be restored. The restoration fires on the did-navigate event (see
+ * createWindow).
  */
 function registerSessionExpiryAccess() {
   registerSessionExpiryReload(session.defaultSession, isPinnedServerUrl, (origin) => {
@@ -394,6 +406,18 @@ function registerSessionExpiryAccess() {
       const last = lastExpiryReloadAt.get(win) ?? 0;
       if (now - last < EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
       lastExpiryReloadAt.set(win, now);
+      // Save the current URL before reload if it's a deep link (not root).
+      // If restoration is needed, it fires on the next did-navigate.
+      const currentUrl = win.webContents.getURL();
+      try {
+        const currentParsed = new URL(currentUrl);
+        const currentPathname = currentParsed.pathname || "/";
+        if (currentPathname !== "/" && currentParsed.origin === origin) {
+          pendingDeepLinkRestoreUrl.set(win, currentUrl);
+        }
+      } catch {
+        // Unparseable URL (e.g. about:blank, file://); nothing to save.
+      }
       win.webContents.reload();
     }
   });
@@ -1219,6 +1243,30 @@ function createWindow(targetUrl, opts = {}) {
   // window, hide it by overlaying Omnigent's own root — see
   // registerWorkspaceChromeHide, which wires the inject-on-did-finish-load.
   registerWorkspaceChromeHide(win.webContents);
+
+  // Restore a deep link after SSO re-auth. When the auth gate reloads the
+  // window on session expiry, the post-auth navigation lands at the workspace
+  // home (origin root). If a deep link was saved before the reload, restore it
+  // here. The did-navigate listener fires on main-frame navigations; we compare
+  // against the pinned origin and clear the pending entry after restoration so
+  // a restore doesn't fire twice.
+  win.webContents.on("did-navigate", (_event, url) => {
+    if (win.isDestroyed()) return;
+    const savedUrl = pendingDeepLinkRestoreUrl.get(win);
+    if (!savedUrl) return;
+    // Clear the pending entry first to prevent loops if our restoration
+    // loadURL triggers another did-navigate.
+    pendingDeepLinkRestoreUrl.delete(win);
+    const state = windows.get(win);
+    if (!state || !state.origin) return;
+    // Check if we should restore the saved URL. If the landed URL is on the
+    // pinned origin at root and the saved URL is a deeper path on the same
+    // origin, restore it. Otherwise, the navigation already returned to the
+    // intended deep link or was an unexpected redirect — leave it alone.
+    if (shouldRestoreDeepLink({ savedUrl, landedUrl: url, pinnedOrigin: state.origin })) {
+      void win.webContents.loadURL(savedUrl);
+    }
+  });
 
   // The desktop never auto-connects this machine as a runner — on launch or on
   // connect. Connecting is an explicit action from the host menu.

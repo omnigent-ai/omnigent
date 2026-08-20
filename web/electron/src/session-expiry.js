@@ -12,8 +12,14 @@
 // server, reload the window. That re-issues the top-level navigation the SSO
 // gate inspects, so it can re-challenge and re-mint the session.
 //
-// Kept Electron-free at its core (isLoginRedirect) so the matching logic is
-// unit-testable (test/session-expiry.test.js) without booting the app.
+// On re-auth, the user lands back at the workspace home (origin root). To
+// restore the user's context, we save the deep link before reload and, after
+// re-auth completes, navigate back to it. This is Electron-owned behavior and
+// does not depend on the server's next_url redirect logic.
+//
+// Kept Electron-free at its core (isLoginRedirect, shouldRestoreDeepLink) so
+// the matching logic is unit-testable (test/session-expiry.test.js) without
+// booting the app.
 
 /**
  * Whether a webRequest redirect is the auth gate bouncing an expired session
@@ -36,6 +42,58 @@ function isLoginRedirect(details) {
     return false;
   }
   return pathname.endsWith("/login.html") || pathname === "login.html";
+}
+
+/**
+ * Whether to restore a saved deep link to the window after post-auth navigation
+ * completes. True iff: both URLs parse; the landed URL is on the pinned origin
+ * at its root (the post-login destination); the saved URL is on the pinned
+ * origin at a deeper path (there is something to restore); and they differ
+ * (restoration is necessary).
+ *
+ * Returns false for: URLs that don't parse; origins that don't match the pinned
+ * origin; already on the deep link when re-auth finishes (auth flow returned
+ * to the deep link, no restoration needed); saved URL was already root (nothing
+ * to restore); or after a complete re-auth cycle where restoration already
+ * fired (the same saved URL should not trigger twice).
+ *
+ * @param {{ savedUrl?: string, landedUrl?: string, pinnedOrigin?: string }} params
+ * @returns {boolean}
+ */
+function shouldRestoreDeepLink({ savedUrl, landedUrl, pinnedOrigin }) {
+  if (!savedUrl || !landedUrl || !pinnedOrigin) return false;
+
+  let savedParsed, landedParsed;
+  try {
+    savedParsed = new URL(savedUrl);
+    landedParsed = new URL(landedUrl);
+  } catch {
+    return false;
+  }
+
+  // Both must be on the pinned origin.
+  if (savedParsed.origin !== pinnedOrigin || landedParsed.origin !== pinnedOrigin) {
+    return false;
+  }
+
+  // Landed URL must be at the origin root (post-login landing).
+  const landedPathname = landedParsed.pathname || "/";
+  if (landedPathname !== "/") {
+    return false;
+  }
+
+  // Saved URL must be at a deeper path (there is a real route to restore).
+  const savedPathname = savedParsed.pathname || "/";
+  if (savedPathname === "/" || savedPathname === "") {
+    return false;
+  }
+
+  // They must differ (restoration is necessary).
+  if (savedUrl === landedUrl) {
+    return false;
+  }
+
+  return true;
 }
 
 /**
@@ -71,5 +129,6 @@ function registerSessionExpiryReload(ses, isConnectedServerOrigin, reloadWindows
 
 module.exports = {
   isLoginRedirect,
+  shouldRestoreDeepLink,
   registerSessionExpiryReload,
 };

@@ -10,7 +10,7 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 
-const { isLoginRedirect, registerSessionExpiryReload } = require("../src/session-expiry");
+const { isLoginRedirect, shouldRestoreDeepLink, registerSessionExpiryReload } = require("../src/session-expiry");
 
 describe("isLoginRedirect", () => {
   it("matches a 303 redirect to the login page", () => {
@@ -59,6 +59,140 @@ describe("isLoginRedirect", () => {
         redirectURL: "https://ws.databricks.com/x?p=/login.html",
       }),
       false,
+    );
+  });
+});
+
+describe("shouldRestoreDeepLink", () => {
+  const PINNED_ORIGIN = "https://ws.databricks.com";
+
+  it("restores when landed at root and saved at a deep link on the same origin", () => {
+    assert.equal(
+      shouldRestoreDeepLink({
+        savedUrl: "https://ws.databricks.com/ml/omnigents/c/abc123",
+        landedUrl: "https://ws.databricks.com/",
+        pinnedOrigin: PINNED_ORIGIN,
+      }),
+      true,
+    );
+  });
+
+  it("restores when landed at origin-root path (implicit) and saved at a deep link", () => {
+    assert.equal(
+      shouldRestoreDeepLink({
+        savedUrl: "https://ws.databricks.com/ml/omnigents/c/abc123",
+        landedUrl: "https://ws.databricks.com",
+        pinnedOrigin: PINNED_ORIGIN,
+      }),
+      true,
+    );
+  });
+
+  it("does not restore when already on the deep link after re-auth", () => {
+    // Auth already returned to the deep link; no restoration needed.
+    assert.equal(
+      shouldRestoreDeepLink({
+        savedUrl: "https://ws.databricks.com/ml/omnigents/c/abc123",
+        landedUrl: "https://ws.databricks.com/ml/omnigents/c/abc123",
+        pinnedOrigin: PINNED_ORIGIN,
+      }),
+      false,
+    );
+  });
+
+  it("does not restore when saved URL was already root", () => {
+    // Nothing to restore if we saved root.
+    assert.equal(
+      shouldRestoreDeepLink({
+        savedUrl: "https://ws.databricks.com/",
+        landedUrl: "https://ws.databricks.com/",
+        pinnedOrigin: PINNED_ORIGIN,
+      }),
+      false,
+    );
+  });
+
+  it("does not restore when saved origin differs from pinned origin", () => {
+    // Saved URL is on a foreign origin (shouldn't happen, but be safe).
+    assert.equal(
+      shouldRestoreDeepLink({
+        savedUrl: "https://other.databricks.com/ml/omnigents/c/abc123",
+        landedUrl: "https://ws.databricks.com/",
+        pinnedOrigin: PINNED_ORIGIN,
+      }),
+      false,
+    );
+  });
+
+  it("does not restore when landed origin differs from pinned origin", () => {
+    // Post-auth navigation went to a foreign origin (shouldn't happen).
+    assert.equal(
+      shouldRestoreDeepLink({
+        savedUrl: "https://ws.databricks.com/ml/omnigents/c/abc123",
+        landedUrl: "https://other.databricks.com/",
+        pinnedOrigin: PINNED_ORIGIN,
+      }),
+      false,
+    );
+  });
+
+  it("does not restore when landed URL is not at root", () => {
+    // Post-auth landed at a subpath (not the expected root redirect).
+    assert.equal(
+      shouldRestoreDeepLink({
+        savedUrl: "https://ws.databricks.com/ml/omnigents/c/abc123",
+        landedUrl: "https://ws.databricks.com/unexpected/path",
+        pinnedOrigin: PINNED_ORIGIN,
+      }),
+      false,
+    );
+  });
+
+  it("does not restore when URLs are unparseable", () => {
+    assert.equal(
+      shouldRestoreDeepLink({
+        savedUrl: "not a url",
+        landedUrl: "https://ws.databricks.com/",
+        pinnedOrigin: PINNED_ORIGIN,
+      }),
+      false,
+    );
+    assert.equal(
+      shouldRestoreDeepLink({
+        savedUrl: "https://ws.databricks.com/ml/omnigents/c/abc123",
+        landedUrl: "not a url",
+        pinnedOrigin: PINNED_ORIGIN,
+      }),
+      false,
+    );
+  });
+
+  it("does not restore when parameters are missing", () => {
+    assert.equal(shouldRestoreDeepLink({}), false);
+    assert.equal(
+      shouldRestoreDeepLink({
+        savedUrl: "https://ws.databricks.com/ml/omnigents/c/abc123",
+      }),
+      false,
+    );
+    assert.equal(
+      shouldRestoreDeepLink({
+        landedUrl: "https://ws.databricks.com/",
+      }),
+      false,
+    );
+  });
+
+  it("preserves query strings and fragments in saved URL on restore", () => {
+    // The comparison is URL-string based, so query and fragment matter.
+    // This test documents that we compare full URLs (not just pathname).
+    assert.equal(
+      shouldRestoreDeepLink({
+        savedUrl: "https://ws.databricks.com/ml/omnigents/c/abc123?tab=settings#section",
+        landedUrl: "https://ws.databricks.com/",
+        pinnedOrigin: PINNED_ORIGIN,
+      }),
+      true,
     );
   });
 });
