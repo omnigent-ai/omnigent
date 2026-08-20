@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import click
+
 import hashlib
 import json
 import os
@@ -464,6 +466,7 @@ def test_ensure_host_daemon_keeps_old_for_different_server(
 
     with (
         patch("omnigent.cli._HOST_PID_PATH", pid_path),
+        patch("omnigent.cli._pid_is_recorded_daemon", lambda record: True),
         patch("omnigent.cli._pid_alive", lambda pid: pid in {4242, 4243}),
         patch("omnigent.cli.os.kill", lambda pid, sig: killed.append(pid)),
         patch("omnigent.cli.subprocess.Popen", side_effect=_fake_popen),
@@ -679,6 +682,7 @@ def _patch_background_host_spawn(
     # No fixed grace: the stubbed pid is trivially "alive", so waiting for it
     # only slows the test down.
     monkeypatch.setattr("omnigent.cli._BACKGROUND_HOST_GRACE_S", 0.0)
+    monkeypatch.setattr("omnigent.cli._pid_is_recorded_daemon", lambda record: record.pid in {4242, 4243, 5150} or True)
     monkeypatch.setattr("omnigent.cli._pid_alive", lambda checked: checked == pid)
     monkeypatch.setattr("omnigent.cli._daemon_host_online", lambda record, **kwargs: True)
     # Local mode waits for the server the daemon owns; no real server here.
@@ -807,6 +811,7 @@ def test_host_background_reuses_running_daemon(
     )
 
     spawned_args, _ = _patch_background_host_spawn(monkeypatch, tmp_path)
+    monkeypatch.setattr("omnigent.cli._pid_is_recorded_daemon", lambda record: record.pid in {4242, 4243, 5150} or True)
     monkeypatch.setattr("omnigent.cli._pid_alive", lambda checked: checked in {4242, 5150})
     _write_daemon_record(
         _HostDaemonRecord(
@@ -832,6 +837,136 @@ def test_host_background_reuses_running_daemon(
     # Local mode was requested explicitly, so the stop hint says so too.
     assert 'omnigent host stop --server ""' in result.output
     assert spawned_args == [], "a healthy daemon must not be respawned"
+
+
+def test_recycled_pid_record_is_pruned_and_host_claims(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A record whose pid now names a foreign process is stale, not a conflict.
+
+    After a reboot the kernel recycles low pids into system daemons; a bare
+    existence check made the host refuse to start forever with "already
+    running (pid=724)" while the pid belonged to, e.g., root's
+    wifianalyticsd (#5095). With identity validation the record is pruned
+    and the foreground host claims its target normally.
+    """
+    from omnigent.cli import (
+        _HostDaemonRecord,
+        _claim_foreground_daemon_record,
+        _daemon_record_path,
+        _read_daemon_record,
+        server_config_signature,
+    )
+
+    monkeypatch.setattr("omnigent.cli._pid_alive", lambda pid: True)
+    # Alive but NOT the daemon we recorded: the recycled-pid signature.
+    monkeypatch.setattr("omnigent.cli._pid_is_recorded_daemon", lambda record: False)
+
+    stale = _HostDaemonRecord(
+        pid=724,
+        target="https://omnigent.example.com",
+        mode="server",
+        server_url="https://omnigent.example.com",
+        log_path=str(tmp_path / "old.log"),
+        started_at=1_787_152_783,
+        host_id=None,
+        config_sig=server_config_signature(),
+    )
+    from omnigent.cli import _write_daemon_record
+
+    _write_daemon_record(stale)
+
+    fresh = _HostDaemonRecord(
+        pid=os.getpid(),
+        target="https://omnigent.example.com",
+        mode="server",
+        server_url="https://omnigent.example.com",
+        log_path=str(tmp_path / "new.log"),
+        started_at=int(time.time()),
+        host_id=None,
+        config_sig=server_config_signature(),
+    )
+    # On main this raises "A host daemon is already running (pid=724)"; with
+    # identity validation the stale record is pruned and the claim proceeds.
+    previous = _claim_foreground_daemon_record(fresh)
+    assert previous is None
+    current = _read_daemon_record(_daemon_record_path(fresh.target))
+    assert current is not None and current.pid == fresh.pid
+
+
+def test_terminate_daemon_recycled_pid_discards_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminating a recycled-pid record discards it instead of signalling
+    (or crashing on) a foreign process (#5095)."""
+    from omnigent.cli import (
+        _HostDaemonRecord,
+        _daemon_record_path,
+        _delete_daemon_record,
+        _read_daemon_record,
+        _terminate_daemon,
+        server_config_signature,
+    )
+
+    record = _HostDaemonRecord(
+        pid=1,
+        target="https://omnigent.example.com",
+        mode="server",
+        server_url="https://omnigent.example.com",
+        log_path=str(tmp_path / "log"),
+        started_at=1_787_152_783,
+        host_id=None,
+        config_sig=server_config_signature(),
+    )
+
+    monkeypatch.setattr("omnigent.cli._pid_alive", lambda pid: True)
+    monkeypatch.setattr("omnigent.cli._pid_is_recorded_daemon", lambda rec: False)
+
+    with pytest.raises(click.ClickException, match="stale"):
+        _terminate_daemon(record, force=False)
+    # The stale record is gone — the operator's rerun starts cleanly.
+    assert _read_daemon_record(_daemon_record_path(record.target)) is None
+
+
+def test_terminate_daemon_permission_error_discards_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EPERM from os.kill proves the pid is not ours: discard the record and
+    say so, instead of the crash that made `omnigent stop` unusable (#3750,
+    #5095)."""
+    from omnigent.cli import (
+        _HostDaemonRecord,
+        _daemon_record_path,
+        _read_daemon_record,
+        _terminate_daemon,
+        server_config_signature,
+    )
+
+    record = _HostDaemonRecord(
+        pid=4242,
+        target="https://omnigent.example.com",
+        mode="server",
+        server_url="https://omnigent.example.com",
+        log_path=str(tmp_path / "log"),
+        started_at=1_787_152_783,
+        host_id=None,
+        config_sig=server_config_signature(),
+    )
+
+    monkeypatch.setattr("omnigent.cli._pid_alive", lambda pid: True)
+    monkeypatch.setattr("omnigent.cli._pid_is_recorded_daemon", lambda rec: True)
+
+    def _eperm_kill(pid: int, sig: int) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr("omnigent.cli.os.kill", _eperm_kill)
+
+    with pytest.raises(click.ClickException, match="not an omnigent daemon"):
+        _terminate_daemon(record, force=False)
+    assert _read_daemon_record(_daemon_record_path(record.target)) is None
 
 
 def test_host_background_signs_in_before_spawning(

@@ -303,6 +303,7 @@ def test_ensure_host_daemon_reuses_same_target(
     captured: dict[str, object] = {}
     _patch_daemon_spawn(monkeypatch, tmp_path, captured)
     (tmp_path / "host.pid").write_text("4242\nlocal\n")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
 
     _ensure_host_daemon(None)
@@ -323,6 +324,7 @@ def test_ensure_host_daemon_keeps_other_target_daemons(
     captured: dict[str, object] = {}
     killed: list[int] = []
     _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(cli.os, "kill", lambda pid, sig: killed.append(pid))
 
@@ -350,6 +352,7 @@ def test_ensure_host_daemon_local_daemon_serves_requested_url_is_noop(
     captured: dict[str, object] = {}
     _patch_daemon_spawn(monkeypatch, tmp_path, captured)
     (tmp_path / "host.pid").write_text("4242\nlocal\n")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: "http://127.0.0.1:8123")
 
@@ -380,6 +383,7 @@ def test_ensure_host_daemon_reuses_healthy_background_daemon(
         config_sig=sig,
         resolved_server_url="http://127.0.0.1:8123",
     )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     # Old enough to be eligible for the tunnel-health check, and online.
     monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)
@@ -418,6 +422,7 @@ def test_ensure_host_daemon_respawns_on_host_identity_change(
         config_sig=cli.server_config_signature(),
         resolved_server_url="http://127.0.0.1:8123",
     )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(cli, "_load_existing_host_id", lambda: "host_new")
     torn_down: list[str] = []
@@ -454,6 +459,7 @@ def test_ensure_host_daemon_respawns_on_config_drift(
         config_sig="stale-signature-0000",
         resolved_server_url="http://127.0.0.1:8123",
     )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     torn_down: list[str] = []
     monkeypatch.setattr(
@@ -488,6 +494,7 @@ def test_ensure_host_daemon_heals_offline_tunnel(
         config_sig=cli.server_config_signature(),
         resolved_server_url="http://127.0.0.1:8123",
     )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     # Old enough to be past the min-age grace; tunnel does not recover.
     monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)
@@ -525,6 +532,7 @@ def test_ensure_host_daemon_young_offline_daemon_not_torn_down(
         config_sig=cli.server_config_signature(),
         resolved_server_url="http://127.0.0.1:8123",
     )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     # Younger than _DAEMON_REUSE_MIN_AGE_S → skip the tunnel-health teardown.
     monkeypatch.setattr(cli.time, "time", lambda: 1_000_002.0)
@@ -816,6 +824,7 @@ def test_foreground_connect_refuses_duplicate_live_daemon(
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     monkeypatch.setattr(cli, "_load_effective_config", dict)
     monkeypatch.setattr(cli, "_load_or_create_host_id", lambda: "host_abc")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: pid == 4242)
     _write_daemon_registry_record(
         tmp_path,
@@ -1066,6 +1075,7 @@ def test_host_status_json_reports_daemon_host_and_sessions(
 ) -> None:
     """``host status --json`` includes daemon, host, runner, and sessions."""
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     _write_daemon_registry_record(
         tmp_path,
@@ -1129,6 +1139,7 @@ def test_host_status_reports_unreachable_daemon_without_traceback(
 ) -> None:
     """``host status`` renders per-daemon connection failures."""
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     _write_daemon_registry_record(
         tmp_path,
