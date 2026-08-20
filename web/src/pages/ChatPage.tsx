@@ -354,32 +354,6 @@ export function collectBubbleMarkdown(items: RenderItem[]): string {
 // All chat-column elements must share this width to stay aligned.
 const CHAT_COLUMN_WIDTH = "max-w-3xl min-[1921px]:max-w-4xl min-[2561px]:max-w-5xl";
 
-const TABLE_SEPARATOR_RE = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
-const DISPLAY_MATH_RE = /(^|\n)\s*(\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\])/;
-
-function isMarkdownTableRow(line: string): boolean {
-  return line.trim().includes("|");
-}
-
-export function containsMarkdownTable(items: RenderItem[]): boolean {
-  return items.some((item) => {
-    if (item.kind !== "text") return false;
-    const lines = item.text.split("\n");
-    return lines.some(
-      (line, index) =>
-        TABLE_SEPARATOR_RE.test(line) &&
-        index > 0 &&
-        index < lines.length - 1 &&
-        isMarkdownTableRow(lines[index - 1] ?? "") &&
-        isMarkdownTableRow(lines[index + 1] ?? ""),
-    );
-  });
-}
-
-export function containsDisplayMath(items: RenderItem[]): boolean {
-  return items.some((item) => item.kind === "text" && DISPLAY_MATH_RE.test(item.text));
-}
-
 /**
  * Build optimistic user bubbles from the pending-send queue.
  *
@@ -2133,10 +2107,9 @@ function MainAgentSurface({
                       <Message
                         key={item.elicitationId}
                         from="assistant"
-                        className="max-w-full"
                         data-testid="bottom-elicitation"
                       >
-                        <MessageContent className="w-full">
+                        <MessageContent>
                           <ElicitationCard item={item} />
                         </MessageContent>
                       </Message>
@@ -3857,14 +3830,6 @@ function AssistantBubble({
     showsWorking,
   });
 
-  // Elicitation cards (e.g. AskUserQuestion form) want full chat-column
-  // width to match the composer, not the default w-fit shrink-to-content.
-  const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
-  const isWide =
-    hasElicitation || containsMarkdownTable(bubble.items) || containsDisplayMath(bubble.items);
-  // An error banner's dashed rule spans the full chat column: MessageContent
-  // is w-fit, so without w-full an error-only bubble shrink-wraps the 560px
-  // pill and the rule clips to it instead of reaching the column edges.
   const hasError = bubble.items.some((it) => it.kind === "error");
   // A bubble carrying an error but no prose stands alone as a thread-level
   // element — the hover footer's timestamp/actions belong to assistant text,
@@ -3873,18 +3838,8 @@ function AssistantBubble({
 
   return (
     <>
-      <Message
-        from="assistant"
-        data-testid="message-bubble"
-        data-role="assistant"
-        className={isWide ? "max-w-full" : "max-w-3xl"}
-      >
-        {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap
-            rather than shrink-wrapping to the summary row's ~110px, which
-            collapsed the row's trailing hairline (a flex-1 span) to zero
-            and stopped its click target short of the column. Keeping the
-            cap lands the hairline where an answered turn's does. */}
-        <MessageContent className={isWide || foldOnly || hasError ? "w-full" : undefined}>
+      <Message from="assistant" data-testid="message-bubble" data-role="assistant">
+        <MessageContent>
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}

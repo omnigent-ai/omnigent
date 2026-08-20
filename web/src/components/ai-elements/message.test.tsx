@@ -30,13 +30,28 @@ describe("MessageContent", () => {
     expect(content).not.toHaveClass("text-[0.8125rem]", "leading-[1.125rem]");
     expect(content).not.toHaveClass("group-[.is-user]:px-4", "group-[.is-user]:py-3");
   });
+
+  it("fills assistant messages while user content stays shrink-wrapped", () => {
+    render(<MessageContent>Message text</MessageContent>);
+
+    expect(screen.getByText("Message text")).toHaveClass(
+      "group-[.is-assistant]:w-full",
+      "group-[.is-user]:w-fit",
+    );
+  });
 });
 
 describe("Message", () => {
-  it("keeps the message shrinkable", () => {
+  it("fills the available width for assistant messages", () => {
     render(<Message data-testid="message" from="assistant" />);
 
-    expect(screen.getByTestId("message")).toHaveClass("min-w-0");
+    expect(screen.getByTestId("message")).toHaveClass("min-w-0", "max-w-full");
+  });
+
+  it("keeps the user message capped and right-aligned", () => {
+    render(<Message data-testid="message" from="user" />);
+
+    expect(screen.getByTestId("message")).toHaveClass("min-w-0", "max-w-[95%]", "ml-auto");
   });
 
   it("keeps a caller's width override alongside min-w-0", () => {
