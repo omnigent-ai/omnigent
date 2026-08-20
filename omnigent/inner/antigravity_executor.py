@@ -123,9 +123,8 @@ def _ensure_antigravity_sdk() -> ModuleType:
         app-boot crash.
     """
     try:
-        # importlib keeps the ``-> ModuleType`` return type clean regardless of
-        # whether the optional extra is installed at mypy time (a static import
-        # would resolve to ``Any`` and trip ``warn_return_any``).
+        # importlib keeps the ``-> ModuleType`` boundary explicit while leaving
+        # this optional integration lazy until the first turn.
         return importlib.import_module("google.antigravity")
     except ImportError as exc:
         from omnigent.onboarding.antigravity_auth import ANTIGRAVITY_EXTRA

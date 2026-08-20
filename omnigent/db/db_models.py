@@ -624,6 +624,7 @@ class SqlConversationMetadata(OmnigentBase):
     # No FK: host records are managed outside this table.
     host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     sub_agent_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    task_summary: Mapped[str | None] = mapped_column(String(128), nullable=True)
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     session_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     session_usage: Mapped[str | None] = mapped_column(CompressedText, nullable=True)

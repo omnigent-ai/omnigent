@@ -246,6 +246,11 @@ def test_owner_browses_outside_workspace_but_shared_collaborator_cannot(
         # Proof the tree re-rooted: this file exists only outside the workspace.
         expect(owner_rail.get_by_text("owner-only.txt")).to_be_visible(timeout=30_000)
     finally:
+        # The snapshot stub does a real `route.fetch()`, and `useSession`
+        # refetches that URL for as long as the page lives. Closing with one in
+        # flight leaks its error onto the next Playwright call — landing on an
+        # unrelated later test — so drop the routes before closing.
+        owner_page.unroute_all(behavior="ignoreErrors")
         owner_page.close()
         owner_ctx.close()
 
@@ -284,6 +289,7 @@ def test_owner_browses_outside_workspace_but_shared_collaborator_cannot(
         refused = bob_page.request.get(_absolute_fs_url(live_server, session_id, outside))
         assert refused.status == 403, refused.text()
     finally:
+        bob_page.unroute_all(behavior="ignoreErrors")
         bob_page.close()
         bob_ctx.close()
 

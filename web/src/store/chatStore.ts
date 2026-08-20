@@ -53,6 +53,7 @@ import type {
   ToolGroup,
   UserMessageBlock,
 } from "@/lib/blocks";
+import { userInputElicitationKey } from "@/lib/askUserQuestion";
 import { LIVE_ITEM_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
@@ -81,7 +82,13 @@ import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
-import { parseEvent, parseSseStream, type SseStreamResult } from "@/lib/sse";
+import {
+  SSE_STALL_TIMEOUT_MS,
+  parseEvent,
+  parseSseStream,
+  withStallGuard,
+  type SseStreamResult,
+} from "@/lib/sse";
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
@@ -972,6 +979,27 @@ const BACKGROUND_FLUSH_COOLDOWN_MS = 5_000;
 const backgroundFlushInFlight = new Set<string>();
 const backgroundFlushCooldownUntil = new Map<string, number>();
 
+// Failure-scoped backoff for the silent sticky-apply PATCHes (effort/model): if
+// the backend errors they never persist and would re-fire on every rebind, so a
+// failure pauses them and the next success resumes. Reset in initChatStore.
+const STICKY_APPLY_BACKOFF_MS = 30_000;
+let stickyApplyBackoffUntil = 0;
+
+// Silent sticky applies pause for a cooldown after any failure — treated as a
+// transient backend-wide hiccup (a 404 here means the permission check didn't
+// succeed, a flaky permission service, not that the session is gone), so one
+// failure pauses every session. Explicit /model and /effort picks aren't gated.
+function stickyApplyBlocked(): boolean {
+  return Date.now() < stickyApplyBackoffUntil;
+}
+
+// Arm on failure only; the gate reopens by time, never on a success. During an
+// outage the ~10% of requests that succeed must not flap the gate open and leak
+// a fresh apply each time.
+function armStickyApplyBackoff(): void {
+  stickyApplyBackoffUntil = Date.now() + STICKY_APPLY_BACKOFF_MS;
+}
+
 // Remembers each File's successful upload so a retry reuses the server-assigned
 // file_id instead of re-uploading the blob (which would orphan the prior one).
 // Retries re-send the same File objects — background flush re-queues them on a
@@ -1105,6 +1133,7 @@ export function initChatStore(client: QueryClient): void {
   workspaceInvalidationTimers.clear();
   backgroundFlushInFlight.clear();
   backgroundFlushCooldownUntil.clear();
+  stickyApplyBackoffUntil = 0;
   // Drop every live conversation: their streams must not outlive the app (or,
   // in tests, leak into the next case).
   conversationRegistry.clear();
@@ -1540,12 +1569,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(selfAuthor !== null ? { author: selfAuthor } : {}),
         },
       ],
-      // A new turn supersedes the prior turn's background-shell tally: the
-      // "N background tasks still running" label must give way to "Working…" the
-      // moment the user sends, not linger until the next status edge. The
-      // count is sticky (see the `session_status` handler) precisely so a
-      // trailing idle can't wipe it, so it has to be cleared explicitly here.
-      backgroundTaskCount: 0,
+      // A new turn does NOT supersede the background-shell tally: shells
+      // launched in an earlier turn keep running across the turn boundary, so
+      // the composer pill must stay lit alongside the "Working…" shimmer rather
+      // than blink off the moment the user sends. The count is sticky (see the
+      // `session_status` handler) and the next Stop hook re-reports it
+      // authoritatively. Only the parked-dialog reason clears — a fresh send is
+      // not parked on a dialog.
       blockedOn: null,
     }));
 
@@ -3067,22 +3097,29 @@ async function bindStream(
       !routingOn &&
       nativeModelFamily !== null &&
       session.modelOverride == null &&
-      compatibleStickyModel != null;
+      compatibleStickyModel != null &&
+      // While cooling down we skip the PATCH, so don't let the /model readout
+      // claim an override the server won't have — effectiveSessionOverride stays
+      // null, matching the un-persisted server truth.
+      !stickyApplyBlocked();
     const effectiveSessionOverride =
       session.modelOverride ?? (willApplyStickyModel ? compatibleStickyModel : null);
     if (
       !isSubAgentSession &&
       canApplyEffort &&
       session.reasoningEffort == null &&
-      stickyEffort != null
+      stickyEffort != null &&
+      !stickyApplyBlocked()
     ) {
       updateSession(id, { reasoningEffort: stickyEffort }).catch((err: unknown) => {
+        armStickyApplyBackoff();
         console.warn(`Failed to apply sticky effort=${stickyEffort} to session ${id}:`, err);
       });
     }
     if (willApplyStickyModel) {
       updateSession(id, { modelOverride: compatibleStickyModel, silent: true }).catch(
         (err: unknown) => {
+          armStickyApplyBackoff();
           console.warn(
             `Failed to apply sticky model=${compatibleStickyModel} to session ${id}:`,
             err,
@@ -3151,7 +3188,11 @@ async function bindStream(
       // branches that used to live here served the transcript LRU's revisit
       // path, which no longer exists — a revisit finds a live entry and never
       // re-binds.)
-      const allBlocks = [...unique, ...state.blocks, ...uniquePendingElicitations];
+      const allBlocks = [
+        ...unique,
+        ...withoutRebuiltUserInputCards(state.blocks, unique),
+        ...uniquePendingElicitations,
+      ];
       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
       // Decide the optimistic user bubbles to render after this bind, and
       // (on cold load) keep the per-conversation stash consistent.
@@ -3560,6 +3601,40 @@ function reconcileElicitationBlocks(
 }
 
 /**
+ * Drop live question / plan cards that history has already rebuilt.
+ *
+ * An answered card stays in the block list, and history hydration
+ * reconstructs the same card from the persisted tool call once its
+ * result lands — so a merge that pulls fresh items in alongside the
+ * live tail would show the exchange twice. The two copies carry
+ * different elicitation ids (the live one is minted per prompt and
+ * never persisted), so they pair on what was asked instead. Only
+ * answered cards are dropped: a still-parked prompt is the one the
+ * user can act on, and no persisted item can rebuild it.
+ *
+ * @param liveBlocks - Blocks the live pump produced.
+ * @param historyBlocks - Blocks translated from persisted items.
+ * @returns `liveBlocks` without the copies history now carries.
+ */
+function withoutRebuiltUserInputCards(
+  liveBlocks: AnyBlock[],
+  historyBlocks: AnyBlock[],
+): AnyBlock[] {
+  const rebuilt = new Set<string>();
+  for (const b of historyBlocks) {
+    if (b.type !== "elicitation") continue;
+    const key = userInputElicitationKey(b);
+    if (key !== null) rebuilt.add(key);
+  }
+  if (rebuilt.size === 0) return liveBlocks;
+  return liveBlocks.filter((b) => {
+    if (b.type !== "elicitation" || b.status !== "responded") return true;
+    const key = userInputElicitationKey(b);
+    return key === null || !rebuilt.has(key);
+  });
+}
+
+/**
  * Snapshot the ids of currently rendered elicitation cards, split by
  * answerable state, BEFORE a snapshot fetch. `pending` cards are
  * eligible for the gap-resolved flip; `autoResolved` cards are
@@ -3627,10 +3702,8 @@ async function rehydrateWindowOnReconnect(
     const tailIds = new Set(
       tail.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
-    const merged = [
-      ...freshBlocks.filter((b) => !b.ctx.itemId || !tailIds.has(b.ctx.itemId)),
-      ...tail,
-    ];
+    const windowBlocks = freshBlocks.filter((b) => !b.ctx.itemId || !tailIds.has(b.ctx.itemId));
+    const merged = [...windowBlocks, ...withoutRebuiltUserInputCards(tail, windowBlocks)];
     return {
       ...reconnectStatusPatch(session, s),
       blocks:
@@ -3758,18 +3831,19 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
       // committed blocks, so before-its-first would invert the bubble.
       // No rid blocks at all: append; the later replay lands after.
       const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
+      // A card answered before the gap whose call the gap persisted comes
+      // back rebuilt in `unseen` — drop the live copy before anchoring.
+      const kept = withoutRebuiltUserInputCards(s.blocks, unseen);
       let at = -1;
       if (rid) {
-        at = s.blocks.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);
+        at = kept.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);
         if (at === -1) {
-          const lastRid = s.blocks.findLastIndex((b) => b.ctx.responseId === rid);
+          const lastRid = kept.findLastIndex((b) => b.ctx.responseId === rid);
           if (lastRid !== -1) at = lastRid + 1;
         }
       }
       nextBlocks =
-        at >= 0
-          ? [...s.blocks.slice(0, at), ...unseen, ...s.blocks.slice(at)]
-          : [...s.blocks, ...unseen];
+        at >= 0 ? [...kept.slice(0, at), ...unseen, ...kept.slice(at)] : [...kept, ...unseen];
     }
     // Recover elicitation state the dead socket swallowed: gap-fired
     // prompts, gap-resolved cards, and re-parked prompts whose card
@@ -3805,10 +3879,48 @@ const presenceIdle = createPresenceIdleTracker({
     for (const controller of [...presenceAttemptControllers]) controller.abort();
   },
 });
+
+// ── Stream liveness ─────────────────────────────────────────────────
+// When bytes last arrived on each live stream attempt (heartbeats
+// included), stamped from the moment the attempt starts. Lets the fast
+// paths below tell a stream that is merely quiet from one that is
+// probably dead — tracked per attempt, since background conversations
+// hold streams of their own.
+const streamAttemptActivity = new Map<AbortController, number>();
+
+// Two missed 15 s server heartbeats plus slack. Deliberately shorter than
+// the stall guard's own window (`SSE_STALL_TIMEOUT_MS`): the guard is the
+// ceiling; these event-driven checks make the common cases immediate.
+export const SSE_STALE_RECYCLE_MS = 35_000;
+
+/**
+ * Recycle every live stream attempt that looks dead — no bytes for
+ * `SSE_STALE_RECYCLE_MS` while its connection is supposedly up.
+ *
+ * Fired on the two moments a half-open socket is most likely to be
+ * discovered: the tab becoming visible again (wake from sleep) and the
+ * browser regaining network. Aborting only the per-attempt controller
+ * funnels each pump into its normal reconnect + snapshot reconcile
+ * (background pumps add their own jitter); a healthy stream (fresh
+ * bytes) is left untouched, so alt-tabbing never churns connections.
+ */
+function recycleStreamIfStale(): void {
+  const now = Date.now();
+  // Copy first: aborting settles each attempt's `finally`, which deletes
+  // from this map while we iterate it.
+  for (const [attempt, lastActivityAt] of [...streamAttemptActivity]) {
+    if (now - lastActivityAt > SSE_STALE_RECYCLE_MS) attempt.abort();
+  }
+}
+
 if (typeof document !== "undefined") {
-  document.addEventListener("visibilitychange", () =>
-    presenceIdle.handleVisibilityChange(document.hidden),
-  );
+  document.addEventListener("visibilitychange", () => {
+    presenceIdle.handleVisibilityChange(document.hidden);
+    if (!document.hidden) recycleStreamIfStale();
+  });
+}
+if (typeof window !== "undefined") {
+  window.addEventListener("online", () => recycleStreamIfStale());
 }
 
 /**
@@ -3878,6 +3990,9 @@ export async function startStreamPump(
       const onOuterAbort = () => attempt.abort();
       controller.signal.addEventListener("abort", onOuterAbort);
       presenceAttemptControllers.add(attempt);
+      // Stamped from attempt start so the wake fast-path can also recycle
+      // an open that has hung past the stale window, not just a dead body.
+      streamAttemptActivity.set(attempt, Date.now());
       try {
         const idle = presenceIdle.idleNow();
         let streamRes: Response;
@@ -3939,12 +4054,26 @@ export async function startStreamPump(
           failedOpens += 1;
           continue;
         }
+        // An auth layer in front of the server (e.g. an expired app-ingress
+        // session) can answer with a redirect the fetch follows to a 200
+        // text/html login page. Pumping that body would end instantly
+        // without `[DONE]` and reconnect with no backoff — a hot loop that
+        // leaves the transcript silently frozen. Treat a non-SSE content
+        // type as a failed open so it backs off like any other bad answer.
+        const contentType = streamRes.headers.get("content-type") ?? "";
+        if (!contentType.toLowerCase().includes("text/event-stream")) {
+          void streamRes.body.cancel().catch(() => {});
+          console.warn(`Session ${id}: stream open returned '${contentType}', will retry`);
+          failedOpens += 1;
+          continue;
+        }
 
         const reconnecting = hasConnected;
         hasConnected = true;
         failedOpens = 0;
         consecutive404s = 0;
         presenceIdle.noteReported(idle);
+        streamAttemptActivity.set(attempt, Date.now());
         if (reconnecting) {
           dropEphemeralInFlightBlocks(id, set);
         } else {
@@ -3952,9 +4081,25 @@ export async function startStreamPump(
           // a previous stream bind so the debug panel starts clean.
           clearSseLog(id);
         }
+        // Guard the byte stream with a silence watchdog: the server
+        // heartbeats every 15 s, so a longer gap means a half-open socket
+        // (laptop sleep, network path change, proxy reap). The guard ends
+        // the stream like a transport drop, and this loop's reconnect +
+        // reconcile resupplies whatever committed during the dead window —
+        // without it the pump blocks in read() forever and the transcript
+        // silently freezes until a page reload.
+        const guardedBody = withStallGuard(streamRes.body, {
+          onActivity: () => {
+            streamAttemptActivity.set(attempt, Date.now());
+          },
+          onStall: () =>
+            console.warn(
+              `Session ${id}: no stream bytes in ${SSE_STALL_TIMEOUT_MS} ms; reconnecting`,
+            ),
+        });
         // Start the pump, then reconcile the snapshot concurrently (race-safe
         // via itemId dedup) — mirrors bindStream's stream-then-snapshot order.
-        const pumpPromise = pumpStreamEvents(id, streamRes.body, controller, set, get);
+        const pumpPromise = pumpStreamEvents(id, guardedBody, controller, set, get);
         if (reconnecting) {
           await reconcileOnReconnect(id, set, get);
         }
@@ -3971,6 +4116,7 @@ export async function startStreamPump(
       } finally {
         controller.signal.removeEventListener("abort", onOuterAbort);
         presenceAttemptControllers.delete(attempt);
+        streamAttemptActivity.delete(attempt);
       }
     }
   } finally {
@@ -4711,7 +4857,7 @@ function committedUserBlock(
       // Client clock — see blockStream.ctx; keeps server-stamped
       // `createdAtS` comparisons single-clock. A promoted optimistic
       // bubble keeps its send-time stamp rather than re-stamping now.
-      clientCreatedAtS: createdAtS ?? Math.floor(Date.now() / 1000),
+      ...(createdAtS !== undefined ? { clientCreatedAtS: createdAtS } : {}),
     },
     content,
     stableKey,
@@ -4807,9 +4953,10 @@ async function refetchRunnerBackedSessionState(
     }
   }
   setterFor(conversationId)(statePatch);
-  if (stickyModel != null && !alreadyApplied) {
+  if (stickyModel != null && !alreadyApplied && !stickyApplyBlocked()) {
     updateSession(conversationId, { modelOverride: stickyModel, silent: true }).catch(
       (err: unknown) => {
+        armStickyApplyBackoff();
         console.warn(
           `Failed to apply delayed sticky model=${stickyModel} to session ${conversationId}:`,
           err,
@@ -5162,11 +5309,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // after it appeared. So: an explicit count is authoritative (a Stop
         // hook's `0` clears it, so a finished shell drops the indicator on the
         // next turn end; a positive count sets it); `undefined` leaves it
-        // untouched; and a new turn (`running`) or a failure clears it —
-        // mirroring the server's `_publish_status`.
+        // untouched. A new `running` turn does NOT clear it — background shells
+        // outlive turn boundaries, so the pill stays lit alongside the "Working…"
+        // shimmer and the next Stop hook re-reports authoritatively. Only a
+        // failure clears it (a dead session may never post another count to drop
+        // a stale tally). Mirrors the server's `_publish_status`.
         if (event.backgroundTaskCount !== undefined) {
           patch.backgroundTaskCount = event.backgroundTaskCount;
-        } else if (event.status === "running" || event.status === "failed") {
+        } else if (event.status === "failed") {
           patch.backgroundTaskCount = 0;
         }
         if (event.responseId !== undefined && event.status === "running") {
@@ -5739,6 +5889,7 @@ function applyChildSessionUpdated(
   if (child.title !== undefined) patch.title = strOrNull(child.title);
   if (child.tool !== undefined) patch.tool = strOrNull(child.tool);
   if (child.session_name !== undefined) patch.session_name = strOrNull(child.session_name);
+  if (child.task_summary !== undefined) patch.task_summary = strOrNull(child.task_summary);
   if (child.labels !== undefined) patch.labels = strRecordOrEmpty(child.labels);
   if (child.current_task_status !== undefined)
     patch.current_task_status = strOrNull(child.current_task_status);
@@ -5758,6 +5909,7 @@ function applyChildSessionUpdated(
     const inserted: ChildSessionInfo = {
       id: childId,
       title: patch.title ?? null,
+      task_summary: patch.task_summary ?? null,
       tool: patch.tool ?? null,
       session_name: patch.session_name ?? null,
       labels: patch.labels ?? {},

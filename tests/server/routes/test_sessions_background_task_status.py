@@ -6,8 +6,10 @@ in-chat "N background tasks still running" indicator survives the trailing
 PTY-activity ``idle`` (which carries no count) and a reload.
 
 The tally must clear on an authoritative ``Stop``-hook ``0`` (the shell
-finished), on a new turn (``running``), and on a failure — but NOT on the
-countless trailing ``idle`` edges that carry no count. It must never make
+finished) and on a failure — but NOT on the countless trailing ``idle`` edges
+that carry no count, and NOT on a new ``running`` turn (background shells
+outlive turn boundaries, so the composer pill stays lit alongside the working
+shimmer until the next authoritative count). It must never make
 ``_session_status_with_child_rollup`` report ``running``: the turn is over
 and the session takes a new message immediately.
 """
@@ -85,10 +87,14 @@ def test_authoritative_zero_clears_tally_and_list_drops_to_idle() -> None:
     assert _session_status_with_child_rollup(_SID, []) == "idle"
 
 
-def test_new_turn_running_clears_tally() -> None:
+def test_new_turn_running_keeps_tally() -> None:
+    # A new ``running`` turn does NOT clear the tally: background shells outlive
+    # turn boundaries, so the composer pill stays lit alongside the working
+    # shimmer until the next authoritative count (the trailing ``running`` edge
+    # carries none).
     _publish_status(_SID, "idle", background_task_count=2)
     _publish_status(_SID, "running")
-    assert _SID not in _sessions_mod._session_background_task_count_cache
+    assert _sessions_mod._session_background_task_count_cache.get(_SID) == 2
 
 
 def test_failure_clears_tally_and_wins_over_count() -> None:

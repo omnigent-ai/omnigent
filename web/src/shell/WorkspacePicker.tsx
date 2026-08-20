@@ -220,7 +220,18 @@ function PickerIconButton({
     // under the app-root provider. Mirrors FilesPanel's hidden-files toggle.
     <TooltipProvider>
       <Tooltip>
-        <TooltipTrigger asChild>
+        <TooltipTrigger
+          asChild
+          // Opening the picker focuses its first button, and Radix pops a
+          // tooltip on any focus — a label thrown over the listing nobody asked
+          // for. Only a keyboard focus ring reveals it (Radix skips its own
+          // handler once the event's default is prevented).
+          onFocus={(event) => {
+            if (!(event.target as HTMLElement).matches(":focus-visible")) {
+              event.preventDefault();
+            }
+          }}
+        >
           <span className="shrink-0">
             <button
               type="button"

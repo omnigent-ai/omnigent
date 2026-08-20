@@ -120,7 +120,7 @@ impl ProcSpec {
         }
     }
 
-    /// `pnpm run dev -- --host <host> --port <p> --strictPort`, from `web/`.
+    /// `pnpm run dev --host <host> --port <p> --strictPort`, from `web/`.
     /// `OMNIGENT_URL` (in the pod env) points Vite's proxy at this pod's backend.
     pub fn vite(pod: &Pod) -> ProcSpec {
         if let Some(profile) = &pod.profile {
@@ -128,10 +128,10 @@ impl ProcSpec {
         }
         ProcSpec {
             program: "pnpm".into(),
+            // pnpm forwards script arguments directly; `--` would make Vite ignore the flags.
             args: vec![
                 "run".into(),
                 "dev".into(),
-                "--".into(),
                 "--host".into(),
                 pod.vite_host.clone(),
                 "--port".into(),
@@ -151,7 +151,7 @@ mod tests {
     use crate::profile::{ProcessProfile, Profile};
 
     #[test]
-    fn vite_uses_configured_bind_host_but_backend_url_stays_loopback() {
+    fn vite_forwards_configured_host_and_port_but_backend_url_stays_loopback() {
         let repo = tempdir();
         let pod_dir = tempdir();
         let pod = Pod::create(
@@ -167,8 +167,18 @@ mod tests {
         .unwrap();
 
         let vite = ProcSpec::vite(&pod);
-        let host_flag = vite.args.iter().position(|arg| arg == "--host").unwrap();
-        assert_eq!(vite.args[host_flag + 1], "0.0.0.0");
+        assert_eq!(
+            vite.args,
+            [
+                "run",
+                "dev",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "19292",
+                "--strictPort",
+            ]
+        );
         assert_eq!(pod.server_url(), "http://127.0.0.1:19191");
     }
 

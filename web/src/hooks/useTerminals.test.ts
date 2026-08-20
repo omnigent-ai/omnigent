@@ -22,6 +22,13 @@ import {
   useTerminals,
   type TerminalInfo,
 } from "./useTerminals";
+import {
+  clearDirectAttachCaches,
+  directProbeUrl,
+  resolveInitialAttachUrl,
+  watchDirectUpgrade,
+  withAttachParams,
+} from "@/lib/terminals";
 
 // useTerminals reads runner liveness to treat an offline runner as zero
 // terminals. Mock it so we can drive that signal directly; it defaults to
@@ -122,6 +129,182 @@ describe("terminalInfoFromResource", () => {
       metadata: { terminal_transport: "garbage" },
     });
     expect(junk?.transport).toBeUndefined();
+  });
+
+  it("lifts metadata.direct_attach_url only for loopback ws:// URLs", () => {
+    const direct = terminalInfoFromResource({
+      id: "terminal_bash_s1",
+      type: "terminal",
+      name: "bash:s1",
+      metadata: { direct_attach_url: "ws://127.0.0.1:54321/v1/x/attach?token=t" },
+    });
+    expect(direct?.directAttachUrl).toBe("ws://127.0.0.1:54321/v1/x/attach?token=t");
+
+    // Anything that could steer the terminal socket at a non-loopback
+    // host is dropped, even from our own server.
+    for (const bad of [
+      "wss://127.0.0.1:54321/attach?token=t",
+      "ws://evil.example:54321/attach?token=t",
+      "ws://localhost:54321/attach?token=t",
+      42,
+      null,
+    ]) {
+      const info = terminalInfoFromResource({
+        id: "terminal_bash_s1",
+        type: "terminal",
+        name: "bash:s1",
+        metadata: { direct_attach_url: bad },
+      });
+      expect(info?.directAttachUrl).toBeUndefined();
+    }
+  });
+});
+
+describe("direct attach URL helpers", () => {
+  beforeEach(() => {
+    clearDirectAttachCaches();
+  });
+
+  it("withAttachParams appends per-attach params after the token", () => {
+    const base = "ws://127.0.0.1:54321/v1/x/attach?token=t";
+    expect(withAttachParams(base, false, undefined)).toBe(base);
+    expect(withAttachParams(base, true, undefined)).toBe(`${base}&read_only=true`);
+    expect(withAttachParams(base, false, "control")).toBe(`${base}&transport=control`);
+    expect(withAttachParams(base, true, "pty")).toBe(`${base}&read_only=true&transport=pty`);
+  });
+
+  it("directProbeUrl swaps the path for /probe and keeps the token", () => {
+    expect(directProbeUrl("ws://127.0.0.1:54321/v1/x/attach?token=t&read_only=true")).toBe(
+      "ws://127.0.0.1:54321/probe?token=t&read_only=true",
+    );
+    expect(directProbeUrl("not a url")).toBeNull();
+  });
+});
+
+describe("resolveInitialAttachUrl / watchDirectUpgrade", () => {
+  /** WebSocket stub whose fate is decided by the test. */
+  class FakeWebSocket {
+    static instances: FakeWebSocket[] = [];
+    static behavior: "open" | "error" | "hang" = "open";
+    url: string;
+    closed = false;
+    private listeners = new Map<string, () => void>();
+    constructor(url: string) {
+      this.url = url;
+      FakeWebSocket.instances.push(this);
+      queueMicrotask(() => {
+        const behavior = FakeWebSocket.behavior;
+        if (behavior === "hang") return;
+        this.listeners.get(behavior === "open" ? "open" : "error")?.();
+      });
+    }
+    addEventListener(type: string, listener: () => void): void {
+      this.listeners.set(type, listener);
+    }
+    close(): void {
+      this.closed = true;
+    }
+  }
+
+  /** Stub the Permissions API's local-network-access answer. */
+  function stubPermission(state: "granted" | "denied" | "prompt" | "missing"): void {
+    const base = globalThis.navigator ?? {};
+    const permissions =
+      state === "missing"
+        ? undefined
+        : {
+            query: async (desc: { name: string }) => {
+              expect(desc.name).toBe("local-network-access");
+              return { state };
+            },
+          };
+    vi.stubGlobal("navigator", Object.assign(Object.create(base), { permissions }));
+  }
+
+  beforeEach(() => {
+    clearDirectAttachCaches();
+    FakeWebSocket.instances = [];
+    FakeWebSocket.behavior = "open";
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    stubPermission("missing");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const DIRECT = "ws://127.0.0.1:54321/v1/x/attach?token=t";
+  const RELAY = "wss://server.example/v1/x/attach";
+
+  it("returns the relay URL when no direct URL is offered", async () => {
+    expect(await resolveInitialAttachUrl(undefined, RELAY)).toBe(RELAY);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
+  it("returns the relay immediately when permission state is unknown or prompt", async () => {
+    // Never stall the first paint behind a permission prompt: the
+    // initial dial is relay; the upgrade happens in the background.
+    expect(await resolveInitialAttachUrl(DIRECT, RELAY)).toBe(RELAY);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    stubPermission("prompt");
+    expect(await resolveInitialAttachUrl(DIRECT, RELAY)).toBe(RELAY);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
+  it("dials direct on first connect when permission is granted and the probe opens", async () => {
+    stubPermission("granted");
+    expect(await resolveInitialAttachUrl(DIRECT, RELAY)).toBe(DIRECT);
+    // The probe dialed the side-effect-free /probe route, not the
+    // attach route, and closed its socket after settling.
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(FakeWebSocket.instances[0].url).toBe("ws://127.0.0.1:54321/probe?token=t");
+    expect(FakeWebSocket.instances[0].closed).toBe(true);
+  });
+
+  it("falls back to the relay when granted but nothing is listening", async () => {
+    stubPermission("granted");
+    FakeWebSocket.behavior = "error";
+    expect(await resolveInitialAttachUrl(DIRECT, RELAY)).toBe(RELAY);
+  });
+
+  it("watchDirectUpgrade succeeds on Allow and primes the next dial to go direct", async () => {
+    // Prompt state: the background probe carries the LNA prompt; the
+    // user clicking Allow completes the handshake.
+    stubPermission("prompt");
+    expect(await watchDirectUpgrade(DIRECT)).toBe(true);
+    // The known-good cache now routes the re-dial straight to direct
+    // without consulting the permission API again.
+    stubPermission("missing");
+    expect(await resolveInitialAttachUrl(DIRECT, RELAY)).toBe(DIRECT);
+  });
+
+  it("watchDirectUpgrade skips probing entirely when permission is denied", async () => {
+    stubPermission("denied");
+    expect(await watchDirectUpgrade(DIRECT)).toBe(false);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
+  it("watchDirectUpgrade settles false on abort and on a blocked handshake", async () => {
+    FakeWebSocket.behavior = "hang";
+    const ctl = new AbortController();
+    const pending = watchDirectUpgrade(DIRECT, ctl.signal);
+    await Promise.resolve();
+    ctl.abort();
+    expect(await pending).toBe(false);
+    expect(FakeWebSocket.instances[0].closed).toBe(true);
+
+    FakeWebSocket.behavior = "error";
+    expect(await watchDirectUpgrade(DIRECT)).toBe(false);
+  });
+
+  it("falls back to the relay when the WebSocket constructor throws", async () => {
+    // Safari throws a synchronous SecurityError for ws:// from an
+    // https page; the resolver must treat it as an ordinary miss.
+    stubPermission("granted");
+    vi.stubGlobal("WebSocket", function ThrowingWebSocket() {
+      throw new Error("SecurityError");
+    });
+    expect(await resolveInitialAttachUrl(DIRECT, RELAY)).toBe(RELAY);
   });
 });
 

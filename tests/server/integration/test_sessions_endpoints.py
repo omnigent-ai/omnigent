@@ -17,6 +17,7 @@ import json
 import uuid
 from dataclasses import dataclass
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -24,7 +25,10 @@ import pytest
 from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
-from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+from omnigent.server.routes._sessions.helpers import (
+    _NativeTerminalEnsureOutcome,
+    _RunnerForwardResult,
+)
 from omnigent.spec.types import SkillSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -6748,6 +6752,59 @@ async def test_post_external_session_todos_rejects_non_list_todos(
     assert "external_session_todos" in resp.text
 
 
+async def test_post_external_session_todos_filters_malformed_items(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Individual malformed todo items are dropped before caching / broadcast.
+
+    The top-level payload is a valid list (so this is not the 400-rejection
+    path), but ``_handle_external_session_todos`` keeps only items with a
+    string ``content``, a ``status`` in {pending, in_progress, completed},
+    and a string ``activeForm``. This mirrors the same filter ``sse.ts``
+    applies on the live path, so a buggy forwarder version can't poison the
+    snapshot or the in-chat Plan tracker with half-formed entries.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda sid, ev: published.append((sid, ev)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sessions_module._session_todos_cache.pop(session["id"], None)
+
+    good = {"content": "Real task", "status": "in_progress", "activeForm": "Doing it"}
+    todos = [
+        good,
+        {"content": "Bad status", "status": "not-a-status", "activeForm": "x"},
+        {"content": 123, "status": "pending", "activeForm": "x"},  # non-str content
+        {"content": "No active form", "status": "completed", "activeForm": None},  # non-str
+        "not-a-dict",
+        {"status": "pending", "activeForm": "x"},  # missing content
+    ]
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_session_todos", "data": {"todos": todos}},
+        )
+        assert resp.status_code in (200, 202), resp.text
+
+        # Only the well-formed item survives — on both the live SSE channel
+        # and the cached snapshot the tracker reads on bind.
+        todo_events = [ev for _sid, ev in published if ev.get("type") == "session.todos"]
+        assert len(todo_events) == 1
+        assert todo_events[0]["todos"] == [good]
+
+        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+        assert snapshot["todos"] == [good]
+    finally:
+        sessions_module._session_todos_cache.pop(session["id"], None)
+
+
 async def test_post_external_mcp_startup_publishes_session_mcp_startup(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -7310,6 +7367,93 @@ async def test_stop_session_no_runner_lifts_stop_fence(
     finally:
         if session_id is not None:
             _interrupt_fenced_sessions.discard(session_id)
+
+
+async def test_retry_session_reports_live_runner_noop_without_mutating_history(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live non-native runner is not falsely reported as recovered."""
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], initial_message="Keep this once")
+    before = await client.get(f"/v1/sessions/{session['id']}")
+    before_items = before.json()["items"]
+    runner_client = object()
+    get_runner = AsyncMock(return_value=runner_client)
+    monkeypatch.setattr(routes_events, "_get_runner_client", get_runner)
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {
+        "queued": False,
+        "recovered": False,
+        "recovery": "already_connected",
+    }
+    get_runner.assert_awaited()
+    after = await client.get(f"/v1/sessions/{session['id']}")
+    assert after.json()["items"] == before_items
+
+
+async def test_retry_session_ensures_dead_required_native_terminal_once(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live runner still recreates its required native terminal."""
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    session = await _create_session(client, agent["id"], initial_message="Keep this once")
+    before = await client.get(f"/v1/sessions/{session['id']}")
+    before_items = before.json()["items"]
+    runner_client = object()
+    ensure_terminal = AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None))
+    relay_ready = AsyncMock(return_value=None)
+    monkeypatch.setattr(routes_events, "_get_runner_client", AsyncMock(return_value=runner_client))
+    monkeypatch.setattr(routes_events, "_ensure_native_terminal_ready", ensure_terminal)
+    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", relay_ready)
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {
+        "queued": False,
+        "recovered": True,
+        "recovery": "native_terminal_ready",
+    }
+    ensure_terminal.assert_awaited_once()
+    assert ensure_terminal.await_args.kwargs["persist_resource_event"] is False
+    relay_ready.assert_awaited_once()
+    after = await client.get(f"/v1/sessions/{session['id']}")
+    assert after.json()["items"] == before_items
+
+
+async def test_retry_session_keeps_error_actionable_when_runner_is_unavailable(
+    client: httpx.AsyncClient,
+) -> None:
+    """Retry fails loud when no runner can reconnect, without adding history."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "retry_session", "data": {}},
+    )
+
+    assert response.status_code == 503, response.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["items"] == []
 
 
 @pytest.mark.parametrize(
