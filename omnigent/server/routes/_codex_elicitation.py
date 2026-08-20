@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from omnigent.codex_native_elicitation import is_codex_request_id
 from omnigent.errors import ErrorCode, OmnigentError
@@ -81,7 +81,7 @@ def parse_codex_elicitation_request(payload: dict[str, Any]) -> CodexElicitation
     """
     method = payload.get("method")
     params = payload.get("params")
-    request_id = payload.get("id")
+    request_id: object = payload.get("id")
     if not isinstance(method, str) or not method:
         raise OmnigentError(
             "Codex elicitation request must include a non-empty method string.",
@@ -97,6 +97,7 @@ def parse_codex_elicitation_request(payload: dict[str, Any]) -> CodexElicitation
             "Codex elicitation request must include a string or integer id.",
             code=ErrorCode.INVALID_INPUT,
         )
+    typed_request_id = cast(int | str, request_id)
     adapter = _CODEX_ELICITATION_ADAPTERS.get(method)
     if adapter is None:
         raise OmnigentError(
@@ -104,9 +105,9 @@ def parse_codex_elicitation_request(payload: dict[str, Any]) -> CodexElicitation
             code=ErrorCode.INVALID_INPUT,
         )
     return CodexElicitationRequest(
-        params=adapter.build_params(request_id, method, params),
+        params=adapter.build_params(typed_request_id, method, params),
         method=method,
-        request_id=request_id,
+        request_id=typed_request_id,
         codex_params=params,
         response_builder=adapter.build_response,
     )
@@ -367,6 +368,7 @@ def _codex_command_approval_response(
         decisions, e.g. ``{"availableDecisions": [...]}``.
     :returns: Codex command approval response payload.
     """
+    decision: str | dict[str, dict[str, list[str]]]
     if method == _CODEX_COMMAND_EXECUTION_REQUEST_APPROVAL_METHOD:
         amendment = _result_execpolicy_amendment(result.content)
         if result.action == "accept" and amendment is not None:

@@ -30,7 +30,7 @@ until grep -qE "passed in [0-9]|failed in [0-9]|short test summary" /tmp/e2e.log
 grep -E "passed in [0-9]|failed in [0-9]" /tmp/e2e.log | tail -1
 ```
 
-This applies to **both** the unit suite (`uv run pytest -n 8 --dist=loadfile`) and the e2e suite. Inside Claude Code, use `Bash(run_in_background=true)` plus a separate `Bash` polling loop with `until grep -q ...` to wait for the terminal marker — that pattern frees the assistant to continue with other work and surfaces the summary as a single notification.
+This applies to **both** the unit suite (`uv run --no-sync pytest -n 8 --dist=loadfile`) and the e2e suite. Inside Claude Code, use `Bash(run_in_background=true)` plus a separate `Bash` polling loop with `until grep -q ...` to wait for the terminal marker — that pattern frees the assistant to continue with other work and surfaces the summary as a single notification.
 
 ## Prerequisites
 
@@ -41,7 +41,7 @@ This applies to **both** the unit suite (`uv run pytest -n 8 --dist=loadfile`) a
 ```bash
 export PROFILE=<your-profile>
 TOKEN=$(databricks auth token --profile "$PROFILE" | jq -r .access_token)
-uv run pytest tests/e2e/ \
+uv run --no-sync pytest tests/e2e/ \
   --llm-api-key="$TOKEN" \
   --profile="$PROFILE" \
   -n 8 --dist=loadscope
@@ -51,7 +51,7 @@ uv run pytest tests/e2e/ \
 
 ```bash
 export OPENAI_API_KEY=sk-...
-uv run pytest tests/e2e/ \
+uv run --no-sync pytest tests/e2e/ \
   --llm-api-key="$OPENAI_API_KEY" \
   -n 8 --dist=loadscope
 ```
@@ -64,15 +64,15 @@ Some tests gate on local binaries. Install whichever you need; tests for missing
 |---------|-------------------------------------------------------|--------------------------------------------------------|
 | `tmux`  | `test_sys_terminal_e2e.py`, `test_repl_terminal_overview_e2e.py`, `tests/inner/test_terminal*.py`, `tests/terminals/`, `tests/tools/builtins/test_sys_terminal.py` | `brew install tmux` (macOS) / `apt install tmux` (Debian) |
 | `claude` | `claude-sdk` harness rows (`test_per_harness_claude_sdk.py` and any `[claude-sdk]` parametrize) | Anthropic Claude CLI — see `claude-agent-sdk` docs    |
-| `codex`  | `codex` harness rows (`test_per_harness_codex.py`, `test_openai_coder_codex_tools.py`, `test_run_omnigent_coding_supervisor.py`)                              | OpenAI Codex CLI                                       |
+| `codex`  | `codex` harness rows (`test_per_harness_codex.py`, `test_run_omnigent_coding_supervisor.py`)                              | OpenAI Codex CLI                                       |
 | `pi`     | `pi` harness rows (`test_per_harness_pi.py`)                                                            | Internal CLI — see project docs                        |
 | `databricks` | Required only when using `--profile <name>`                                                         | `brew install databricks` (macOS) / official installer |
 | `omnigent` (formerly `ap`) | A handful of legacy tests (`test_repl_approval_e2e.py`, `test_dispatch_fork_repl_e2e.py`)        | `uv sync` makes the CLI available via `uv run omnigent …`. Tests checking for a standalone `ap` binary on PATH currently skip — that's pre-existing infra debt unrelated to this directory. |
 
 ### Python environment
 
-- `uv sync --extra dev --extra claude-sdk --extra openai-agents` from the repo root to install pytest, pytest-xdist, filelock, and harness SDKs.
-- The `databricks-sdk` is a runtime dep, so `databricks auth token` works from any shell once `~/.databrickscfg` is set up.
+- `uv sync --extra all --group test` from the repo root installs pytest, its plugins, and the runtime integrations exercised by the suite.
+- The `databricks` CLI must be installed separately for profile-backed runs; once configured, it reads `~/.databrickscfg`.
 
 ## Recommended invocation
 
@@ -81,7 +81,7 @@ Some tests gate on local binaries. Install whichever you need; tests for missing
 # Export PROFILE first; the snippet reuses it twice.
 export PROFILE=<your-profile>
 TOKEN=$(databricks auth token --profile "$PROFILE" | jq -r .access_token)
-uv run pytest tests/e2e/ \
+uv run --no-sync pytest tests/e2e/ \
   --llm-api-key="$TOKEN" \
   --profile="$PROFILE" \
   -n 8 --dist=loadscope

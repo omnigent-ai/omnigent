@@ -17,6 +17,7 @@ from omnigent.entities.environment_filesystem import FilesystemPathNotFound
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.runner import create_runner_app
+from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from tests.runner.helpers import NullServerClient
 
@@ -29,6 +30,9 @@ def workspace(tmp_path: Path) -> Path:
     (ws / "hello.txt").write_text("hello world")
     (ws / "src").mkdir()
     (ws / "src" / "main.py").write_text("print('hi')")
+    # A binary file (PNG signature + a NUL) that is not valid UTF-8, used to
+    # exercise the base64 binary-read path.
+    (ws / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x01\x02\xff")
     return ws
 
 
@@ -165,6 +169,56 @@ async def test_read_file_content(
     assert body["content"] == "hello world"
     assert body["encoding"] == "utf-8"
     assert body["bytes"] == 11
+
+
+@pytest.mark.asyncio
+async def test_read_binary_file_content(
+    client: httpx.AsyncClient,
+) -> None:
+    """A non-UTF-8 file is returned whole as base64, not truncated text."""
+    import base64
+
+    raw = b"\x89PNG\r\n\x1a\n\x00\x01\x02\xff"
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/logo.png"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["encoding"] == "base64"
+    assert body["content_type"] == "image/png"
+    # The base64 payload round-trips to the exact original bytes — no
+    # UTF-8 replacement-char corruption.
+    assert base64.b64decode(body["content"]) == raw
+    assert body["bytes"] == len(raw)
+    assert body["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_read_text_byte_cap_truncates_on_utf8_boundary(
+    workspace: Path,
+) -> None:
+    """A byte cap that lands mid-codepoint still yields decodable UTF-8.
+
+    Slicing the raw UTF-8 byte string at an arbitrary cap can split a
+    multi-byte codepoint, leaving invalid bytes that raise
+    ``UnicodeDecodeError`` (500) when the response path later decodes them.
+    The read path must truncate on a valid boundary instead.
+    """
+    # "é" is 2 bytes (0xC3 0xA9) in UTF-8; on "aé" a 2-byte cap keeps the "a"
+    # and lands mid-codepoint inside "é".
+    (workspace / "accents.txt").write_text("aé")
+
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+
+    content = await fs.read("accents.txt", max_bytes=2)
+    assert content.truncated is True
+    # The partial trailing codepoint is dropped, leaving decodable bytes.
+    assert content.data.decode("utf-8") == "a"
 
 
 @pytest.mark.asyncio
@@ -593,6 +647,25 @@ async def test_shell_nonzero_exit(
 
 
 @pytest.mark.asyncio
+async def test_shell_timeout_returns_structured_result(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /shell returns the timeout result instead of raising."""
+    resp = await client.post(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/shell",
+        json={"command": "sleep 2", "timeout": 1},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "session.environment.shell_result"
+    assert body["stdout"] == ""
+    assert body["stderr"] == ""
+    assert body["exit_code"] is None
+    assert body["timed_out"] is True
+    assert body["cwd"] is not None
+
+
+@pytest.mark.asyncio
 async def test_shell_missing_command_returns_400(
     client: httpx.AsyncClient,
 ) -> None:
@@ -700,6 +773,11 @@ async def test_filesystem_changes_modified(
     entries_by_path = {e["path"]: e for e in body["data"]}
     assert "hello.txt" in entries_by_path, "Modified file must appear in changes"
     assert entries_by_path["hello.txt"]["status"] == "modified"
+    # Line-count fields are always serialized; null in non-git (agent-edit)
+    # mode since those records carry no counts (see .get() in the endpoint).
+    entry = entries_by_path["hello.txt"]
+    assert entry["lines_added"] is None
+    assert entry["lines_removed"] is None
 
 
 @pytest.mark.asyncio
@@ -1492,3 +1570,173 @@ async def test_worktree_session_uses_session_workspace_for_changes(
             "The /changes endpoint is reading from the runner's global "
             "workspace instead of the session's worktree workspace."
         )
+
+
+@pytest.mark.asyncio
+async def test_search_scopes_to_a_subdirectory(client: httpx.AsyncClient) -> None:
+    """Search covers exactly what the tree is showing. Scoped to a directory it
+    reports the resolved base and returns paths relative to it, so a panel
+    browsing that directory does not show hits from outside it."""
+    scoped = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search/src?q=."
+    )
+    assert scoped.status_code == 200, scoped.text
+    body = scoped.json()
+    paths = {e["path"] for e in body["data"]}
+
+    assert body["base"].endswith("/src")
+    # Paths are relative to the scoped base (no "src/" prefix), and the
+    # parent's files are absent -- search covers exactly the scoped tree.
+    assert paths == {"main.py"}, paths
+
+
+@pytest.mark.asyncio
+async def test_search_reports_untruncated_for_a_small_tree(client: httpx.AsyncClient) -> None:
+    """``truncated`` distinguishes "searched everything, found nothing" from
+    "ran out of scan budget". A small workspace always completes, so a caller
+    can trust an empty result here to mean there really are no matches."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+        "/search?q=zzq9xnomatchzz"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert body["data"] == []
+    assert body["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_search_scan_budget_bounds_a_no_match_walk(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A query matching nothing never fills the result cap, so the walk needs
+    its own bound. With the scan budget lowered, a tree larger than the budget
+    stops early and says so rather than walking to completion."""
+    deep = tmp_path / "many"
+    deep.mkdir()
+    for i in range(60):
+        (deep / f"f{i}.txt").write_text("x")
+
+    monkeypatch.setattr(
+        "omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET",
+        10,
+    )
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+    entries, truncated = await fs.search_files("zzq9xnomatchzz")
+
+    assert entries == []
+    assert truncated is True, "a budget-exhausted search must not look like 'no matches'"
+
+
+@pytest.mark.asyncio
+async def test_scoped_search_reports_the_matched_files_own_size(tmp_path: Path) -> None:
+    """A scoped search must stat the file it actually matched.
+
+    Result paths are relative to the search base, but the helper's cwd is the
+    workspace root -- so statting the relative path either misses or, worse,
+    stats a same-named file under the workspace and reports ITS size/mtime.
+    The workspace decoy here shares the basename and has a very different
+    size, so a regression reports a wrong number rather than merely a null.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "collide.txt").write_text("x" * 500)
+    # Same basename at the workspace root, where a cwd-relative stat lands.
+    (tmp_path / "collide.txt").write_text("y")
+
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        ),
+    )
+
+    entries, _truncated = await fs.search_files("collide", path=str(outside))
+
+    assert [e.path for e in entries] == ["collide.txt"]
+    assert entries[0].bytes == 500, "reported the workspace decoy's size, not the matched file's"
+
+
+@pytest.mark.asyncio
+async def test_write_outside_workspace_accepted_for_an_unconfined_environment(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """The runner serves an absolute write when the environment is unconfined.
+
+    It does not ask WHO is writing -- it cannot see the caller. Identity is
+    the server's gate: absolute paths require session ownership there, pinned
+    in ``tests/server/routes/test_shell_permission_gate.py``. What the runner
+    still enforces on its own is the sandbox policy, which is why a CONFINED
+    environment refuses the same request (see the isolation suite).
+    """
+    target = tmp_path / "outside.txt"
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+    encoded = "%2F" + str(target).lstrip("/")
+
+    resp = await client.put(
+        f"{base}/{encoded}", json={"content": "written\n", "encoding": "utf-8"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert target.read_text() == "written\n"
+
+
+@pytest.mark.asyncio
+async def test_edit_and_delete_outside_workspace_round_trip(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """Edit and delete follow write outside the workspace. Edit in particular
+    has to report a path it can echo back: the response entry cannot be made
+    relative to the workspace root, which previously turned a successful edit
+    into a 400."""
+    target = tmp_path / "roundtrip.txt"
+    target.write_text("alpha beta\n")
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+    url = f"{base}/%2F{str(target).lstrip('/')}"
+
+    edited = await client.patch(url, json={"old_text": "alpha", "new_text": "gamma"})
+    assert edited.status_code == 200, edited.text
+    assert target.read_text() == "gamma beta\n"
+
+    removed = await client.request("DELETE", url)
+    assert removed.status_code == 200, removed.text
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_unwritable_target_reports_an_error_not_a_crash(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """An ordinary OS permission denial must surface as a filesystem error. The
+    in-process route bypasses the helper subprocess, which is what normally
+    converts a raised OSError into an error payload."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)  # read+execute only: no new entries
+    try:
+        base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+        url = f"{base}/%2F{str(locked / 'nope.txt').lstrip('/')}"
+
+        resp = await client.put(url, json={"content": "x", "encoding": "utf-8"})
+
+        assert resp.status_code < 500, f"expected a handled error, got {resp.status_code}"
+        assert "error" in resp.json()
+    finally:
+        locked.chmod(0o700)

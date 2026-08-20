@@ -12,9 +12,9 @@ import inspect
 import json
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, Protocol, TypeAlias
 
 from .datamodel import AgentDef, ExecutorSpec
 from .executor import (
@@ -31,12 +31,12 @@ from .executor import (
 # a tool result (str or dict) for "tool_result". Policies branch on
 # type internally; pinning a union here would force every inspection
 # site to narrow before reading.
-PolicyContent: TypeAlias = Any  # type: ignore[explicit-any]
+PolicyContent: TypeAlias = object
 
 # Ambient context handed to policies: ``{"labels": {...}, "configured_phases":
 # [...], plus caller-supplied extras}``. Policy authors may add arbitrary
 # keys for their evaluators.
-PolicyContext: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+PolicyContext: TypeAlias = dict[str, object]
 
 # Dynamically-supplied Python callable acting as a policy evaluator.
 # Signatures vary (``(content, phase)`` or ``(content, phase, context)``),
@@ -45,17 +45,39 @@ PolicyContext: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 PolicyCallable: TypeAlias = Callable[..., Any]  # type: ignore[explicit-any]
 
 # Arbitrary kwargs passed to a policy factory function.
-FactoryParams: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+FactoryParams: TypeAlias = dict[str, object]
 
 # Raw return value from a policy callable — either a ``PolicyResult``, a
 # dict-shaped version of one, or any other value (the caller coerces
 # everything else into ``PolicyAction.ALLOW``).
-PolicyCallableResult: TypeAlias = Any  # type: ignore[explicit-any]
+PolicyCallableResult: TypeAlias = object
 
 # Parsed JSON dict from a PromptPolicy LLM response — shape is
 # ``{"action": str, "reason": str|None, "set_labels": dict}`` but values
 # arrive from LLM output, so we keep them open and narrow field-by-field.
-PolicyResponsePayload: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+PolicyResponsePayload: TypeAlias = dict[str, object]
+PolicyPhase: TypeAlias = Literal["request", "response", "tool_call", "tool_result"]
+
+
+def _default_policy_phases() -> list[PolicyPhase]:
+    return ["request", "response"]
+
+
+class _LabelRule(Protocol):
+    @property
+    def values(self) -> Sequence[str]:
+        raise NotImplementedError
+
+
+class _PolicySession(Protocol):
+    @property
+    def labels(self) -> Mapping[str, str]:
+        raise NotImplementedError
+
+    @property
+    def _root_label_schema(self) -> Mapping[str, _LabelRule]:
+        raise NotImplementedError
+
 
 _POLICY_SYSTEM_PROMPT = (
     "You are an Omnigent policy evaluator. Return exactly one JSON object and nothing else."
@@ -104,15 +126,13 @@ class Policy:
     # (rare — most paths pass a name from the YAML loader or a test).
     # Error messages and executor IDs fall back to ``"<unnamed>"``.
     name: str | None = None
-    on: list[Literal["request", "response", "tool_call", "tool_result"]] = field(
-        default_factory=lambda: ["request", "response"]
-    )
+    on: list[PolicyPhase] = field(default_factory=_default_policy_phases)
     _runtime_context: PolicyRuntimeContext | None = field(
         default=None,
         init=False,
         repr=False,
     )
-    _session: Any | None = field(default=None, init=False, repr=False)
+    _session: _PolicySession | None = field(default=None, init=False, repr=False)
 
     def bind_runtime(self, runtime_context: PolicyRuntimeContext) -> None:
         self._runtime_context = runtime_context
@@ -182,7 +202,7 @@ def _build_inner_event(
     content: PolicyContent,
     phase: str,
     context: PolicyContext,
-) -> dict[str, Any]:
+) -> PolicyContext:
     """
     Build an ``event`` dict from inner-system args.
 
@@ -205,7 +225,7 @@ def _build_inner_event(
             tool_name = raw_tool_name
 
     labels = context.get("labels")
-    event: dict[str, Any] = {
+    event: PolicyContext = {
         "type": phase,
         "target": tool_name,
         "data": content,
@@ -222,7 +242,7 @@ def _call_policy_callable(
     content: PolicyContent,
     phase: str,
     context: PolicyContext,
-    config: dict[str, Any] | None = None,
+    config: PolicyContext | None = None,
 ) -> PolicyCallableResult:
     """
     Build an event dict and invoke a sync policy callable.
@@ -251,7 +271,7 @@ async def _async_call_policy_callable(
     content: PolicyContent,
     phase: str,
     context: PolicyContext,
-    config: dict[str, Any] | None = None,
+    config: PolicyContext | None = None,
 ) -> PolicyCallableResult:
     """
     Async sibling of :func:`_call_policy_callable`. Builds an
@@ -288,8 +308,8 @@ class FunctionPolicy(Policy):
     callable: PolicyCallable | None = None
     factory_params: FactoryParams = field(default_factory=dict)
     factory: PolicyCallable | None = field(default=None, repr=False)
-    # Any: opaque user-supplied configuration values.
-    config: dict[str, Any] | None = None  # type: ignore[explicit-any]
+    # Opaque user-supplied configuration values.
+    config: PolicyContext | None = None
 
     def __post_init__(self) -> None:
         if self.factory_params and self.factory is None:
@@ -331,7 +351,7 @@ class FunctionPolicy(Policy):
         if self.callable is None:
             return PolicyResult(action=PolicyAction.ALLOW)
 
-        phase_context = {"configured_phases": list(self.on)}
+        phase_context: PolicyContext = {"configured_phases": list(self.on)}
         if context:
             phase_context.update(context)
         merged_context = self._get_context(phase_context)
@@ -359,7 +379,7 @@ class FunctionPolicy(Policy):
         return PolicyResult(action=PolicyAction.ALLOW)
 
 
-def _coerce_v0_dict_to_result(raw: dict[str, Any]) -> PolicyResult:
+def _coerce_v0_dict_to_result(raw: PolicyResponsePayload) -> PolicyResult:
     """
     Parse a ``{"result": ..., "reason": ..., "data": ...}`` dict into
     a :class:`PolicyResult`.
@@ -374,9 +394,10 @@ def _coerce_v0_dict_to_result(raw: dict[str, Any]) -> PolicyResult:
             f"FunctionPolicy dict return missing 'result' key; got {raw!r}",
         )
     action = PolicyAction(str(result_raw).lower())
+    raw_reason = raw.get("reason")
     return PolicyResult(
         action=action,
-        reason=raw.get("reason"),
+        reason=str(raw_reason) if raw_reason is not None else None,
     )
 
 
@@ -545,7 +566,6 @@ class PromptPolicy(Policy):
             label_schema = {
                 key: {
                     "values": list(rule.values),
-                    "monotonic": rule.monotonic,
                 }
                 for key, rule in self._session._root_label_schema.items()
             }
@@ -607,71 +627,6 @@ class PromptPolicy(Policy):
         )
 
 
-# ---------------------------------------------------------------------------
-# PolicyEngine
-# ---------------------------------------------------------------------------
-
-
-class PolicyEngine:
-    """Evaluates all applicable policies for a given phase."""
-
-    def __init__(self, policies: dict[str, Policy]) -> None:
-        self.policies = policies
-        self._session: Any | None = None
-
-    def bind_runtime(self, runtime_context: PolicyRuntimeContext) -> None:
-        for policy in self.policies.values():
-            policy.bind_runtime(runtime_context)
-
-    def bind_session(self, session: Any) -> None:
-        """Bind to a session so policies can read session labels."""
-        self._session = session
-        for policy in self.policies.values():
-            _bind_session_recursive(policy, session)
-
-    async def evaluate(
-        self,
-        content: PolicyContent,
-        phase: str,
-        context: PolicyContext | None = None,
-    ) -> PolicyResult:
-        """Run all policies that apply to this phase.
-
-        Uses max-action semantics: DENY > ASK > ALLOW.  DENY short-circuits
-        immediately; ASK is noted but evaluation continues so a later policy
-        can still escalate to DENY.
-        """
-        accumulated_set_labels: dict[str, str] = {}
-        worst_result: PolicyResult | None = None
-        for _name, policy in self.policies.items():
-            if phase in policy.on:
-                result = await policy.evaluate(content, phase, context)
-                if result.set_labels:
-                    accumulated_set_labels.update(result.set_labels)
-                if result.action == PolicyAction.DENY:
-                    result.set_labels = accumulated_set_labels
-                    self._apply_label_changes(accumulated_set_labels)
-                    return result
-                if result.action == PolicyAction.ASK and worst_result is None:
-                    worst_result = result
-        self._apply_label_changes(accumulated_set_labels)
-        if worst_result is not None:
-            worst_result.set_labels = accumulated_set_labels
-            return worst_result
-        return PolicyResult(action=PolicyAction.ALLOW, set_labels=accumulated_set_labels)
-
-    def _apply_label_changes(self, set_labels: dict[str, str]) -> None:
-        """Apply label changes to the bound session."""
-        if set_labels and self._session is not None:
-            for key, value in set_labels.items():
-                self._session._apply_root_label_update(str(key), str(value))
-
-    def reset_turn(self) -> None:
-        """Reset per-turn state on all policies."""
-        for policy in self.policies.values():
-            policy.reset_turn()
-
-
 def _merge_executor_specs(
     base: ExecutorSpec | None,
     override: ExecutorSpec | None,
@@ -718,6 +673,6 @@ def _extract_json_object(text: str) -> PolicyResponsePayload:
     raise ValueError(f"policy response is not valid JSON: {text!r}")
 
 
-def _bind_session_recursive(policy: Policy, session: Any) -> None:
+def _bind_session_recursive(policy: Policy, session: _PolicySession) -> None:
     """Bind a session to a policy."""
     policy._session = session

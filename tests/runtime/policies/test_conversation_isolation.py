@@ -143,7 +143,7 @@ async def test_deny_on_one_conversation_does_not_leak_to_other(
 async def test_seeding_isolated_across_conversations(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """Seeding on conv_a does not trigger writes on conv_b.
+    """Seeding on 94c349190e241f85a984b3df8f129696 does not trigger writes on conv_b.
     Each call to ``build_policy_engine`` is scoped by
     conversation_id — proved by observing B's state is
     unchanged by A's seed."""
@@ -219,7 +219,7 @@ async def test_parallel_conversations_with_different_specs(
     are spec-scoped)."""
     from omnigent.spec.types import LabelDef
 
-    # Spec A: has a schema for `integrity` with monotonic.
+    # Spec A: has a schema for `integrity`.
     policy_a = make_fixed_policy(
         name="write_integrity",
         on=[PhaseSelector(phase=Phase.REQUEST)],
@@ -230,7 +230,7 @@ async def test_parallel_conversations_with_different_specs(
     engine_a = PolicyEngine(
         policies=[policy_a],
         label_defs={
-            "integrity": LabelDef(values=["0", "1"], monotonic="decreasing"),
+            "integrity": LabelDef(values=["0", "1"]),
         },
         ask_timeout=30,
         conversation_id=conv_a.id,

@@ -16,6 +16,7 @@ import pytest
 from omnigent.inner.nessie.policies import (
     blast_radius,
     headless_subagent_purpose_guard,
+    read_only_os,
     spawn_bounds,
     worktree_guard,
 )
@@ -111,11 +112,21 @@ def test_blast_radius_gates_pi_native_bash_tool() -> None:
     assert _result(evaluate(_tool_call("bash", command="git status"), {})) == "ALLOW"
 
 
+@pytest.mark.parametrize("tool", ["Shell", "terminal", "developer__shell"])
+def test_blast_radius_gates_other_native_shell_tools(tool: str) -> None:
+    """Cursor, Hermes, and Goose shell calls receive the same push gate."""
+    evaluate = blast_radius()
+
+    assert _result(evaluate(_tool_call(tool, command="git push origin main"), {})) == "ASK"
+    assert (
+        _result(evaluate(_tool_call(tool, command="git push --force origin main"), {})) == "DENY"
+    )
+
+
 def test_blast_radius_ignores_non_shell_tools() -> None:
     """
-    Non-shell tool calls pass through ALLOW — blast_radius only inspects
-    ``sys_os_shell`` and ``Bash``. A failure here means the guard is matching
-    on the wrong tool and would corrupt unrelated tool dispatch.
+    Non-shell tool calls pass through ALLOW. A failure means the guard is
+    matching the wrong tool and would corrupt unrelated tool dispatch.
     """
     evaluate = blast_radius()
     assert _result(evaluate(_tool_call("sys_session_send", agent="impl_claude"), {})) == "ALLOW"
@@ -134,6 +145,21 @@ def test_blast_radius_gate_pushes_false_allows_recoverable_not_catastrophic() ->
         == "ALLOW"
     )
     assert _result(evaluate(_tool_call("sys_os_shell", command="rm -rf /"), {})) == "DENY"
+
+
+def test_blast_radius_risky_action_can_deny() -> None:
+    """``risky_action=DENY`` blocks ordinary pushes and other risky commands."""
+    evaluate = blast_radius(risky_action="DENY")
+
+    assert _result(evaluate(_tool_call("Bash", command="git push origin main"), {})) == "DENY"
+    assert _result(evaluate(_tool_call("Bash", command="terraform apply"), {})) == "DENY"
+    assert _result(evaluate(_tool_call("Bash", command="git status"), {})) == "ALLOW"
+
+
+def test_blast_radius_rejects_unknown_risky_action() -> None:
+    """Invalid actions fail at policy construction instead of silently allowing."""
+    with pytest.raises(ValueError, match="risky_action must be 'ASK' or 'DENY'"):
+        blast_radius(risky_action="ALLOW")
 
 
 # Catastrophic commands that the previous single-regex DENY set MISSED — each
@@ -194,6 +220,7 @@ def test_blast_radius_denies_destructive_variants(command: str) -> None:
         "rm -r node_modules",  # recursive, no force, relative
         "rm -rf /home/u/proj/build",  # scoped path under /home, not a system dir
         "git push origin main",  # ordinary outward push (also asserts the gate=False ALLOW)
+        "git push --dry-run origin HEAD",  # dry-run still exercises the push gate
         "git push -u origin main",  # set-upstream is outward, not force/delete
         "git push -o ci.skip origin main",  # push-option value is not a destructive flag
         "git push -o=fast origin main",  # attached push-option value must not over-match `f`
@@ -370,17 +397,42 @@ def test_headless_subagent_purpose_guard_ignores_non_session_tools() -> None:
     "path,expected",
     [
         ("src/app.py", "ALLOW"),
-        ("ap-web/src/store/chatStore.ts", "ALLOW"),
+        ("web/src/store/chatStore.ts", "ALLOW"),
+        # normpath collapses safe ..-then-back traversals — these stay in tree.
+        ("subdir/../file.py", "ALLOW"),
         ("/etc/passwd", "DENY"),
         ("~/.bashrc", "DENY"),
         ("../outside.py", "DENY"),
         ("a/../../escape.py", "DENY"),
+        # Backslash embedded in a component was bypassing the split-on-'/' check.
+        ("subdir/..\\escape", "DENY"),
+        ("..\\etc\\passwd", "DENY"),
+        # Windows-shaped absolutes written with forward slashes: no backslash to
+        # catch, and posixpath reads "C:" as an ordinary relative dir name.
+        ("C:/Windows/System32/x.txt", "DENY"),
+        ("c:/temp/x", "DENY"),
+        ("//server/share/x", "DENY"),
+        # normpath strips "./" and collapses "a/../", so a drive-letter check
+        # against the raw string would miss these. Pins that it runs on the
+        # normalized path.
+        ("./C:/Windows/System32/x.txt", "DENY"),
+        ("a/../C:/Windows/x", "DENY"),
+        # Only ASCII [A-Za-z] is a Windows drive; a Unicode-aware isalpha()
+        # would reject this ordinary relative dir too.
+        ("Ω:/x", "ALLOW"),
     ],
 )
 def test_worktree_guard_blocks_escapes(path: str, expected: str) -> None:
     """
     worktree_guard ALLOWS relative in-tree write paths and DENIES absolute or
     ``..``-escaping ones.
+
+    The verdict must not depend on ``sys.platform``: the guard normalizes with
+    ``posixpath``, not ``os.path``, because ``ntpath.normpath`` rewrites "/" to
+    "\\" and would make the leading-"/" test inert — every POSIX absolute path
+    would ALLOW on a Windows runner. Running this suite on Windows is what pins
+    that; the drive-letter and UNC cases pin the forms ``posixpath`` alone
+    still reads as relative.
 
     A DENY-case failure means an unsandboxed worker could write outside its
     worktree (the confinement that makes workers safe is gone). An ALLOW-case
@@ -401,6 +453,12 @@ def test_worktree_guard_blocks_escapes(path: str, expected: str) -> None:
         # Claude native Edit also uses ``file_path``.
         ("Edit", "file_path", "main.py", "ALLOW"),
         ("Edit", "file_path", "~/.bashrc", "DENY"),
+        # Claude native MultiEdit also uses ``file_path``. Without it in the
+        # gated set, an unsandboxed worker could escape its worktree via a
+        # multi-file edit -- the gap these cases pin.
+        ("MultiEdit", "file_path", "src/app.py", "ALLOW"),
+        ("MultiEdit", "file_path", "/etc/passwd", "DENY"),
+        ("MultiEdit", "file_path", "../escape.py", "DENY"),
         # Pi native write/edit (lowercase) use ``path`` (Omnigent convention).
         ("write", "path", "src/app.py", "ALLOW"),
         ("write", "path", "/etc/passwd", "DENY"),
@@ -412,6 +470,9 @@ def test_worktree_guard_blocks_escapes(path: str, expected: str) -> None:
         "Write-escape",
         "Edit-in-tree",
         "Edit-home-escape",
+        "MultiEdit-in-tree",
+        "MultiEdit-absolute",
+        "MultiEdit-escape",
         "pi-write-in-tree",
         "pi-write-absolute",
         "pi-edit-escape",
@@ -449,3 +510,41 @@ def test_worktree_guard_only_guards_writes() -> None:
     """
     evaluate = worktree_guard()
     assert _result(evaluate(_tool_call("sys_os_read", path="/etc/hosts"), {})) == "ALLOW"
+
+
+@pytest.mark.parametrize(
+    "tool,args",
+    [
+        # Omnigent built-in write/edit.
+        ("sys_os_write", {"path": "a.py", "content": "x"}),
+        ("sys_os_edit", {"path": "a.py", "old": "x", "new": "y"}),
+        # Claude/Codex native aliases.
+        ("Write", {"file_path": "a.py", "content": "x"}),
+        ("Edit", {"file_path": "a.py", "old_string": "x", "new_string": "y"}),
+        ("MultiEdit", {"file_path": "a.py", "edits": []}),
+        # Pi native lowercase.
+        ("write", {"path": "a.py", "content": "x"}),
+        ("edit", {"path": "a.py"}),
+    ],
+)
+def test_read_only_os_denies_every_write_tool(tool: str, args: dict[str, Any]) -> None:
+    """
+    read_only_os DENIES every file-mutating tool regardless of path.
+
+    A report-only agent (e.g. Sentinel and its sub-agents) carries the bundled
+    sys_os_write / sys_os_edit tools but must never use them; if this returns
+    anything but DENY, an "auto-fix" slips past the policy layer.
+    """
+    assert _result(read_only_os()(_tool_call(tool, **args), {})) == "DENY"
+
+
+def test_read_only_os_allows_reads_and_shell() -> None:
+    """
+    Reads, searches, and shell pass through — read_only_os gates only writes.
+    Fails if it broadened to reads (a reviewer couldn't open files to
+    fact-check) or to shell (pair blast_radius for that, not this policy).
+    """
+    evaluate = read_only_os()
+    assert _result(evaluate(_tool_call("sys_os_read", path="a.py"), {})) == "ALLOW"
+    assert _result(evaluate(_tool_call("sys_os_shell", command="rg secret"), {})) == "ALLOW"
+    assert _result(evaluate(_tool_call("Read", file_path="a.py"), {})) == "ALLOW"

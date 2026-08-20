@@ -200,6 +200,57 @@ def test_list_files_empty(
     assert result["files"] == []
 
 
+def test_list_files_allows_empty_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_ctx: ToolContext,
+) -> None:
+    """
+    list_files has no required arguments, so an empty argument
+    string should behave like an empty JSON object.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tool_ctx: Tool execution context.
+    """
+    monkeypatch.setattr(
+        "omnigent.runtime.get_file_store",
+        lambda: _FakeFileStore(
+            [
+                _FakeFile(
+                    "file_1",
+                    "report.pdf",
+                    1024,
+                    "application/pdf",
+                    1000,
+                    session_id="conv_alice",
+                ),
+            ]
+        ),
+    )
+
+    tool = ListFilesTool()
+    result = json.loads(tool.invoke("", tool_ctx))
+
+    assert result["files"][0]["file_id"] == "file_1"
+
+
+@pytest.mark.parametrize("arguments", ["not-json", "[]"])
+def test_list_files_rejects_malformed_arguments(
+    arguments: str,
+    tool_ctx: ToolContext,
+) -> None:
+    """
+    Malformed or non-object arguments return a JSON error instead
+    of raising out of the tool invocation.
+
+    :param arguments: Raw tool argument string.
+    :param tool_ctx: Tool execution context.
+    """
+    tool = ListFilesTool()
+    result = json.loads(tool.invoke(arguments, tool_ctx))
+
+    assert "error" in result
+
+
 def test_list_files_respects_limit(
     monkeypatch: pytest.MonkeyPatch,
     tool_ctx: ToolContext,
@@ -223,6 +274,70 @@ def test_list_files_respects_limit(
     result = json.loads(tool.invoke('{"limit": 5}', tool_ctx))
 
     assert len(result["files"]) == 5
+
+
+def test_list_files_caps_limit_at_100(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_ctx: ToolContext,
+) -> None:
+    """
+    list_files clamps oversized limits to the documented maximum.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tool_ctx: Tool execution context.
+    """
+    files = [
+        _FakeFile(f"file_{i}", f"f{i}.txt", 100, None, i, session_id="conv_alice")
+        for i in range(150)
+    ]
+    monkeypatch.setattr(
+        "omnigent.runtime.get_file_store",
+        lambda: _FakeFileStore(files),
+    )
+
+    tool = ListFilesTool()
+    result = json.loads(tool.invoke('{"limit": 150}', tool_ctx))
+
+    assert len(result["files"]) == 100
+
+
+@pytest.mark.parametrize("limit", [0, -1, "5", True])
+def test_list_files_rejects_invalid_limit(
+    limit: object,
+    tool_ctx: ToolContext,
+) -> None:
+    """
+    Invalid limits are rejected before they reach the store.
+
+    :param limit: Invalid limit value to encode in the tool call.
+    :param tool_ctx: Tool execution context.
+    """
+    tool = ListFilesTool()
+    result = json.loads(tool.invoke(json.dumps({"limit": limit}), tool_ctx))
+
+    assert "error" in result
+    assert "limit" in result["error"]
+
+
+def test_list_files_rejects_non_string_after(tool_ctx: ToolContext) -> None:
+    """
+    The pagination cursor must be a string file id.
+
+    :param tool_ctx: Tool execution context.
+    """
+    tool = ListFilesTool()
+    result = json.loads(tool.invoke('{"after": 123}', tool_ctx))
+
+    assert result == {"error": "'after' must be a string"}
+
+
+def test_list_files_requires_conversation_id() -> None:
+    tool = ListFilesTool()
+    ctx = ToolContext(task_id="task_test", agent_id="agent_test")
+
+    result = json.loads(tool.invoke("{}", ctx))
+
+    assert result == {"error": "list_files requires a conversation_id"}
 
 
 def test_list_files_excludes_other_sessions(
@@ -306,6 +421,110 @@ def test_download_file_saves_to_workspace(
     assert saved.name == "hello.txt"
 
 
+@pytest.mark.parametrize(
+    "malicious_filename",
+    [
+        "../escape.txt",
+        "../../escape.txt",
+        "foo/../../bar.txt",
+        "/etc/passwd",
+        "/tmp/abs-escape.txt",
+    ],
+)
+def test_download_file_confines_untrusted_filename_to_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_ctx: ToolContext,
+    malicious_filename: str,
+) -> None:
+    """
+    A malicious stored filename cannot write outside the workspace.
+
+    The stored filename is untrusted metadata (persisted verbatim from
+    whoever uploaded the file). Traversal sequences and absolute paths
+    must be reduced to a basename and confined to the workspace, never
+    escaping it.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tool_ctx: Tool execution context.
+    :param malicious_filename: A traversal/absolute filename to reject.
+    """
+    content = b"payload"
+    monkeypatch.setattr(
+        "omnigent.runtime.get_file_store",
+        lambda: _FakeFileStore(
+            [
+                _FakeFile(
+                    "file_evil",
+                    malicious_filename,
+                    len(content),
+                    "text/plain",
+                    1000,
+                    session_id="conv_alice",
+                ),
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.get_artifact_store",
+        lambda: _FakeArtifactStore({"file_evil": content}),
+    )
+
+    tool = DownloadFileTool()
+    result = json.loads(tool.invoke('{"file_id": "file_evil"}', tool_ctx))
+
+    # The write must land strictly inside the workspace.
+    saved = Path(result["path"])
+    workspace = tool_ctx.workspace
+    assert workspace is not None
+    assert saved.resolve().is_relative_to(workspace.resolve())
+    # Nothing was written outside the workspace.
+    assert not Path("/etc/passwd").is_symlink()
+    assert saved.exists()
+    assert saved.read_bytes() == content
+
+
+def test_download_file_basenames_store_filename(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_ctx: ToolContext,
+) -> None:
+    """
+    A filename with leading directory components is saved by basename.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tool_ctx: Tool execution context.
+    """
+    content = b"report-bytes"
+    monkeypatch.setattr(
+        "omnigent.runtime.get_file_store",
+        lambda: _FakeFileStore(
+            [
+                _FakeFile(
+                    "file_nested",
+                    "reports/2026/q2.csv",
+                    len(content),
+                    "text/csv",
+                    1000,
+                    session_id="conv_alice",
+                ),
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.get_artifact_store",
+        lambda: _FakeArtifactStore({"file_nested": content}),
+    )
+
+    tool = DownloadFileTool()
+    result = json.loads(tool.invoke('{"file_id": "file_nested"}', tool_ctx))
+
+    saved = Path(result["path"])
+    workspace = tool_ctx.workspace
+    assert workspace is not None
+    assert saved.name == "q2.csv"
+    assert saved.parent.resolve() == workspace.resolve()
+    assert saved.read_bytes() == content
+
+
 def test_download_file_not_found(
     monkeypatch: pytest.MonkeyPatch,
     tool_ctx: ToolContext,
@@ -330,6 +549,40 @@ def test_download_file_not_found(
 
     assert "error" in result
     assert "not found" in result["error"].lower()
+
+
+@pytest.mark.parametrize("arguments", ["", "not-json", "[]"])
+def test_download_file_rejects_invalid_arguments(
+    arguments: str,
+    tool_ctx: ToolContext,
+) -> None:
+    """
+    Invalid raw arguments return a JSON error instead of raising.
+
+    :param arguments: Raw tool argument string.
+    :param tool_ctx: Tool execution context.
+    """
+    tool = DownloadFileTool()
+    result = json.loads(tool.invoke(arguments, tool_ctx))
+
+    assert "error" in result
+
+
+@pytest.mark.parametrize("file_id", [123, True])
+def test_download_file_rejects_non_string_file_id(
+    file_id: object,
+    tool_ctx: ToolContext,
+) -> None:
+    """
+    ``file_id`` must be a string before querying the file store.
+
+    :param file_id: Invalid file id value.
+    :param tool_ctx: Tool execution context.
+    """
+    tool = DownloadFileTool()
+    result = json.loads(tool.invoke(json.dumps({"file_id": file_id}), tool_ctx))
+
+    assert result == {"error": "'file_id' must be a string"}
 
 
 def test_download_file_missing_content(

@@ -50,9 +50,12 @@ def create_policy_registry_router(
         # check needed since the registry is not session-scoped.
         require_user(request, auth_provider)
         entries = get_registry()
+        # Filter out internal-only policies (e.g., subagent_cost_budget)
+        # that are for internal use only and should not appear in the UI
+        public_entries = [e for e in entries if not e.internal_only]
         return {
             "object": "list",
-            "data": [asdict(e) for e in entries],
+            "data": [asdict(e) for e in public_entries],
         }
 
     return router

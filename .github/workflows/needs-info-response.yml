@@ -1,0 +1,71 @@
+name: Clear needs-info on author response
+
+# When the issue AUTHOR comments on an issue that carries `needs-info`, remove
+# the label — the reporter has (presumably) supplied the missing detail — then
+# call the triage workflow directly:
+#
+#   author comments  ->  this workflow removes `needs-info`
+#                     ->  this workflow calls issue-triage.yml to re-triage
+#                         (reads the follow-up comments, classifies + assigns,
+#                          or re-adds `needs-info` if it is still too vague)
+#   author never responds  ->  stale.yml closes the issue after inactivity
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: needs-info-response-${{ github.event.issue.number }}
+  # An in-flight run may already have removed needs-info and started re-triage.
+  # Cancelling it could leave the issue unlabeled without completing triage.
+  cancel-in-progress: false
+
+jobs:
+  clear-needs-info:
+    runs-on: ubuntu-latest
+    outputs:
+      removed: ${{ steps.remove-label.outputs.removed }}
+    # Only when a NON-bot commenter who IS the issue author comments on an OPEN
+    # issue (not a PR — issue_comment fires for PRs too) that still carries
+    # `needs-info`.
+    if: >-
+      !endsWith(github.event.sender.login, '[bot]') &&
+      !github.event.issue.pull_request &&
+      github.event.issue.state == 'open' &&
+      github.event.comment.user.login == github.event.issue.user.login &&
+      contains(github.event.issue.labels.*.name, 'needs-info')
+    steps:
+      - name: Remove needs-info label
+        id: remove-label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          # Re-check the live labels before removing: the job gate reads the
+          # (possibly stale) event payload, and `gh --remove-label` errors on a
+          # label that is already gone. This keeps the step idempotent under a
+          # race (e.g. two quick comments, or a concurrent removal).
+          if gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json labels \
+               --jq '.labels[].name' | grep -qx needs-info; then
+            echo "Author responded on #$ISSUE_NUMBER; removing needs-info to re-triage."
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label needs-info
+            echo "removed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs-info already cleared on #$ISSUE_NUMBER; nothing to do."
+            echo "removed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  retriage:
+    needs: clear-needs-info
+    if: needs.clear-needs-info.outputs.removed == 'true'
+    uses: ./.github/workflows/issue-triage.yml
+    with:
+      issue_number: ${{ github.event.issue.number }}
+      retriage: true
+    secrets: inherit

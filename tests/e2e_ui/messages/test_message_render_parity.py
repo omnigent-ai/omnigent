@@ -38,6 +38,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm, set_fallback_mock_llm
+
 _COMPOSER = "Ask the agent anything…"
 _USER = '[data-testid="message-bubble"][data-role="user"]'
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
@@ -47,6 +49,9 @@ _TURNS = 5
 
 # A custom openai-agents turn is a single LLM call.
 _CUSTOM_TURN_TIMEOUT_MS = 90_000
+
+# Model name baked into _CUSTOM_AGENT_YAML; used to key the mock fallback.
+_ECHO_PROBE_MODEL = "gpt-4o-mini"
 
 
 def _send(page: Page, text: str) -> None:
@@ -61,6 +66,21 @@ def _send(page: Page, text: str) -> None:
     page.get_by_role("button", name="Send", exact=True).click()
 
 
+def _select_view_mode(page: Page, option: str) -> None:
+    """Click the header Chat/Terminal switcher's *option* segment.
+
+    Both destinations are always on screen (a segmented control, not a menu),
+    so this is a single click with no menu to open first.
+
+    :param page: The Playwright page, on the session's chat surface.
+    :param option: The segment to activate, ``"Chat"`` or ``"Terminal"``.
+    """
+    expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(timeout=30_000)
+    segment = page.get_by_test_id(f"view-mode-{option.lower()}")
+    expect(segment).to_be_enabled(timeout=30_000)
+    segment.click()
+
+
 def _ensure_chat_view(page: Page) -> None:
     """Switch a terminal-first (native) session to its chat bubble view.
 
@@ -71,12 +91,9 @@ def _ensure_chat_view(page: Page) -> None:
 
     :param page: The Playwright page, on the session's chat surface.
     """
-    view_mode = page.get_by_role("group", name="View mode")
-    if view_mode.count() == 0:
+    if page.get_by_test_id("view-mode-toggle").count() == 0:
         return
-    chat_button = view_mode.get_by_role("button", name="Chat")
-    expect(chat_button).to_be_visible(timeout=30_000)
-    chat_button.click()
+    _select_view_mode(page, "Chat")
 
 
 def _turn_prompt(index: int, user_marker: str, assistant_token: str) -> str:
@@ -232,6 +249,8 @@ def _run_render_parity_journey(
     session_id: str,
     *,
     per_turn_timeout_ms: int,
+    mock_llm_server_url: str | None = None,
+    mock_model: str | None = None,
 ) -> None:
     """Drive five turns, then assert no-duplicate render + transcript parity.
 
@@ -239,18 +258,46 @@ def _run_render_parity_journey(
     :param base_url: Spawned server base URL.
     :param session_id: The session/conversation id to chat in.
     :param per_turn_timeout_ms: How long to wait for each turn to land.
+    :param mock_llm_server_url: When provided, pre-configure the mock LLM
+        server with per-turn echo responses (content-based routing keyed on
+        the user marker) before any message is sent. Required when the runner
+        routes through the mock rather than a real LLM.
+    :param mock_model: Model name to set as a catch-all fallback on the mock
+        when *mock_llm_server_url* is given. Extra LLM calls from the agent
+        (e.g. tool-schema loading) hit this queue and get an empty reply.
     """
     page.goto(f"{base_url}/c/{session_id}")
     _ensure_chat_view(page)
 
+    # Pre-generate tokens for all turns so they can be queued in the mock
+    # before any message is sent.
+    nonces = [uuid.uuid4().hex[:8] for _ in range(_TURNS)]
+    all_turns = [(f"usr-{i + 1}-{nonces[i]}", f"ast-{i + 1}-{nonces[i]}") for i in range(_TURNS)]
+
+    # Set model fallback once — survives reset_mock_llm, handles any extra
+    # LLM calls the agent makes that don't match the per-turn content queue.
+    if mock_llm_server_url is not None and mock_model is not None:
+        set_fallback_mock_llm(mock_llm_server_url, mock_model, "")
+
     user_markers: list[str] = []
     assistant_tokens: list[str] = []
-    for index in range(1, _TURNS + 1):
-        nonce = uuid.uuid4().hex[:8]
-        user_marker = f"usr-{index}-{nonce}"
-        assistant_token = f"ast-{index}-{nonce}"
+    for index, (user_marker, assistant_token) in enumerate(all_turns, start=1):
         user_markers.append(user_marker)
         assistant_tokens.append(assistant_token)
+
+        if mock_llm_server_url is not None:
+            # Reset before each turn so only THIS turn's queue is active.
+            # Without this, the openai-agents harness accumulates conversation
+            # history, making previous user markers appear in later requests —
+            # causing the earlier (now empty) queue to match first via
+            # insertion-order tie-breaking and return no response.
+            reset_mock_llm(mock_llm_server_url)
+            configure_mock_llm(
+                mock_llm_server_url,
+                [{"text": assistant_token}],
+                key=user_marker,
+                match=user_marker,
+            )
 
         _send(page, _turn_prompt(index, user_marker, assistant_token))
         # The echoed token in an assistant bubble = the turn produced its
@@ -272,10 +319,16 @@ def _run_render_parity_journey(
 def test_custom_agent_message_render_parity(
     page: Page,
     custom_agent_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     base_url, session_id = custom_agent_session
     _run_render_parity_journey(
-        page, base_url, session_id, per_turn_timeout_ms=_CUSTOM_TURN_TIMEOUT_MS
+        page,
+        base_url,
+        session_id,
+        per_turn_timeout_ms=_CUSTOM_TURN_TIMEOUT_MS,
+        mock_llm_server_url=mock_llm_server_url,
+        mock_model=_ECHO_PROBE_MODEL,
     )
 
 
@@ -285,3 +338,48 @@ def test_custom_agent_message_render_parity(
 # is owned by the native-harness CI enablement work; until that lands, this
 # suite covers the render-parity / no-duplicate logic via the custom
 # openai-agents agent above.
+
+
+@pytest.mark.timeout(300)
+def test_tool_run_fold_semantic_label(
+    page: Page,
+    tool_fold_session: tuple[str, str],
+) -> None:
+    """A settled turn folds its process trace, with semantic tool labels inside.
+
+    The ``tool_fold_probe`` agent deterministically runs
+    ``sys_os_shell("ls")`` then ``sys_os_read("README.md")`` before
+    replying. Once the turn settles, the chat view collapses the whole
+    process trace behind the "Worked" row (``TurnWorkedFold`` in
+    ``BlockRenderer.tsx``), leaving the final answer visible. Expanding
+    that row must reveal the tool run collapsed into its semantic action
+    summary — "Listed 1 directory, read 1 file" (``formatToolRunLabel``
+    in ``web/src/lib/toolTitle.ts``), matching the native CLIs' step
+    one-liners, not a generic "See N steps" count — and expanding the
+    summary must reveal the individual tool cards.
+    """
+    base_url, session_id = tool_fold_session
+    page.goto(f"{base_url}/c/{session_id}")
+    _ensure_chat_view(page)
+    _send(page, "Inspect the workspace.")
+
+    # The Worked row only forms once the wrap-up text lands and the turn
+    # settles (a live turn keeps its trace expanded), so waiting for it
+    # covers the turn.
+    worked = page.get_by_test_id("turn-worked-fold")
+    expect(worked).to_be_visible(timeout=_CUSTOM_TURN_TIMEOUT_MS)
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=30_000)
+    # The final answer stays visible outside the fold.
+    expect(page.get_by_text("Workspace inspected.")).to_be_visible()
+
+    # Expanding the Worked row replays the trace, where the tool run is
+    # one semantic summary line.
+    worked.locator('[data-slot="collapsible-trigger"]').first.click()
+    fold = page.get_by_text("Listed 1 directory, read 1 file", exact=True)
+    expect(fold).to_be_visible()
+
+    # Expanding reveals the individual per-tool rows (toolTitle.ts titles:
+    # the raw command for shell, "Read <path>" for reads).
+    fold.click()
+    expect(page.get_by_text("ls", exact=True).first).to_be_visible()
+    expect(page.get_by_text("README.md").first).to_be_visible()

@@ -46,12 +46,14 @@ from typing import TYPE_CHECKING, ClassVar
 
 import click
 
+from omnigent.inner import ui
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
     RemoteCommandResult,
     SandboxLauncher,
     host_image_wheel_install_command,
 )
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -167,7 +169,7 @@ def _drive_foreground_pty(pty: PtyHandle, sandbox_id: str, command: str) -> int:
             f"The PTY session on sandbox '{sandbox_id}' ended without "
             f"an exit code{f': {result.error}' if result.error else ''}."
         )
-    return result.exit_code
+    return int(result.exit_code)
 
 
 class DaytonaSandboxLauncher(SandboxLauncher):
@@ -186,6 +188,19 @@ class DaytonaSandboxLauncher(SandboxLauncher):
     # Daytona preview links are sandbox→public only; there is no
     # local→sandbox path for the App OAuth callback port.
     supports_local_port_forward: ClassVar[bool] = False
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(
+            cli_bootstrap=True,
+            managed_launch=True,
+            local_port_forward=False,
+            resume_stopped=False,
+            programmatic_terminate=True,
+            file_copy=True,
+            streaming_exec=False,
+            foreground_exec=True,
+        )
 
     def __init__(self, *, image: str | None = None, env: Sequence[str] | None = None) -> None:
         """
@@ -351,9 +366,10 @@ class DaytonaSandboxLauncher(SandboxLauncher):
             # 502 — and a waiting message POST — carries it verbatim
             # instead of a generic "internal error".
             raise click.ClickException(f"Daytona sandbox creation failed: {exc}") from exc
-        self._sandboxes[handle.id] = handle
-        click.echo(f"  → created {handle.id}")
-        return handle.id
+        sandbox_id = str(handle.id)
+        self._sandboxes[sandbox_id] = handle
+        click.echo(f"  → created {sandbox_id}")
+        return sandbox_id
 
     def attach(self, sandbox_id: str) -> None:
         """
@@ -407,11 +423,12 @@ class DaytonaSandboxLauncher(SandboxLauncher):
         try:
             handle.set_autostop_interval(_AUTO_STOP_DISABLED)
         except daytona.DaytonaError as exc:
-            click.secho(
+            ui.console.print(
                 f"  → warning: could not disable idle auto-stop on "
                 f"'{sandbox_id}' ({exc}); the sandbox may stop after "
                 "Daytona's idle timeout.",
-                fg="yellow",
+                style="omni.warning",
+                markup=False,
             )
         else:
             click.echo("  → idle auto-stop disabled (sandbox lives until deleted)")

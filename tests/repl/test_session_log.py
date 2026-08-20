@@ -25,6 +25,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from omnigent.entities import (
     FunctionCallOutputData,
     MessageData,
@@ -35,6 +37,7 @@ from omnigent.repl._session_log import (
     default_log_path,
     write_session_log_from_store,
 )
+from omnigent.stores.conversation_store import ConversationNotFoundError
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -48,7 +51,7 @@ def test_default_log_path_uses_default_dir_when_none() -> None:
     directory the legacy non-AP path writes to. Keeps the
     user's mental model consistent across paths.
     """
-    path = default_log_path("conv_abc1234567890def_extra", None)
+    path = default_log_path("86f918829b75e808604b560cdd723920", None)
     assert path.parent == DEFAULT_LOG_DIR, (
         f"Expected the parent to be {DEFAULT_LOG_DIR}, got "
         f"{path.parent}. If different, the legacy --log location "
@@ -58,12 +61,13 @@ def test_default_log_path_uses_default_dir_when_none() -> None:
 
 def test_default_log_path_filename_shape(tmp_path: Path) -> None:
     """
-    Filename is ``{YYYYMMDD-HHMMSS}-{conv_short}.json``. We don't
+    Filename is ``{YYYYMMDD-HHMMSS}-{conv-short}.json``. We don't
     pin the exact timestamp (race against the clock) but verify
     the structure: 15-char timestamp + dash + 16-char conv-short
     + ``.json``.
     """
-    path = default_log_path("conv_abc1234567890def_extra", tmp_path)
+    conv_id = "86f918829b75e808604b560cdd723920"
+    path = default_log_path(conv_id, tmp_path)
     name = path.name
     assert name.endswith(".json"), (
         f"Expected .json suffix, got {name!r}. Readers grep for this extension to find logs."
@@ -77,7 +81,7 @@ def test_default_log_path_filename_shape(tmp_path: Path) -> None:
     assert len(parts[0]) == 8, f"YYYYMMDD prefix should be 8 chars, got {parts[0]!r}."
     assert len(parts[1]) == 6, f"HHMMSS should be 6 chars, got {parts[1]!r}."
     # The conv slug is the FIRST 16 chars of the conversation id.
-    assert parts[2] == "conv_abc12345678", (
+    assert parts[2] == conv_id[:16], (
         f"Conv slug should be the first 16 chars of the conversation "
         f"id, got {parts[2]!r}. If different, the slug truncation "
         f"length changed (we rely on it to keep filenames short)."
@@ -159,6 +163,22 @@ def test_write_session_log_from_store_dumps_basic_conversation(
     user_item, assistant_item = payload["conversation"]["items"]
     assert user_item["data"]["role"] == "user"
     assert assistant_item["data"]["role"] == "assistant"
+
+
+def test_write_session_log_from_store_rejects_missing_conversation(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    missing_id = "0" * 32
+
+    with pytest.raises(ConversationNotFoundError, match=missing_id):
+        write_session_log_from_store(
+            conv_store,
+            missing_id,
+            agent_name="missing_agent",
+            log_dir=tmp_path,
+        )
 
 
 def test_write_session_log_from_store_pages_long_conversations(

@@ -37,6 +37,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Protocol
 
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -341,18 +342,29 @@ class TunnelRegistry:
     @staticmethod
     def _abort_session_inflight(session: RunnerSession, error: BaseException) -> None:
         for state in list(session.in_flight.values()):
-            _call_soon_threadsafe(state, lambda state=state: _abort_request_state(state, error))
+            _call_soon_threadsafe(state, partial(_abort_request_state, state, error))
         session.in_flight.clear()
         for channel in list(session.ws_channels.values()):
-            _call_channel_soon_threadsafe(
-                channel, lambda ch=channel: ch.inbound_queue.put_nowait(None)
-            )
+            _call_channel_soon_threadsafe(channel, partial(channel.inbound_queue.put_nowait, None))
         session.ws_channels.clear()
 
     def get(self, runner_id: str) -> RunnerSession | None:
         """Return the session for a runner_id, or None if not online."""
         with self._lock:
             return self._sessions.get(runner_id)
+
+    def is_runner_telemetry_opted_out(self, runner_id: str) -> bool:
+        """Return whether the runner's host has opted out of telemetry.
+
+        :param runner_id: Runner id, e.g. ``"runner_0123456789abcdef"``.
+        :returns: ``True`` when the runner sent ``telemetry_opt_out=True``
+            in its hello frame, or when the runner is offline (unknown
+            runners default to not opted out).
+        """
+        session = self.get(runner_id)
+        if session is None:
+            return False
+        return session.hello.telemetry_opt_out
 
     async def wait_for_runner(
         self,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -205,3 +206,123 @@ def test_message_display_hook_many_appends_stay_line_clean(
     # All 50 chunks parse and arrive in index order — no line was torn.
     assert [d.index for d in result.deltas] == list(range(50))
     assert result.byte_offset == os.path.getsize(bridge_dir / hook.MESSAGE_DELTAS_FILE)
+
+
+# ── import-cost regression guards ────────────────────────────
+#
+# Claude Code blocks its TUI on command hooks, so every module on a hook's
+# import path is paid per streamed chunk / statusline tick / tool call.
+# ``omnigent/__init__`` re-exports lazily (PEP 562) precisely to keep these
+# subprocesses cheap. The guards below pin the import graph in a fresh
+# interpreter — the deterministic form of the latency claim; the wall-clock
+# form is the ``native_hook_spawn`` benchmark journey (dev/benchmarks).
+
+_HEAVY_IMPORTS = (
+    "fastapi",
+    "httpx",
+    "omnigent.inner.databricks_executor",
+    "omnigent.inner.datamodel",
+    "omnigent.model_catalog",
+    "omnigent.spec.parser",
+    "pydantic",
+)
+
+
+def _heavy_imports_after(statements: str) -> list[str]:
+    """
+    Run *statements* in a fresh interpreter and report loaded heavy modules.
+
+    :param statements: Newline-joined Python statements to execute, e.g.
+        ``"import omnigent"``.
+    :returns: The subset of :data:`_HEAVY_IMPORTS` present in the child's
+        ``sys.modules`` after *statements* ran.
+    """
+    repo_root = Path(hook.__file__).resolve().parent.parent
+    code = "\n".join(
+        (
+            "import json, sys",
+            f"sys.path.insert(0, {str(repo_root)!r})",
+            statements,
+            f"heavy = [m for m in {list(_HEAVY_IMPORTS)!r} if m in sys.modules]",
+            "print(json.dumps(heavy))",
+        )
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_package_init_defers_the_heavy_import_graph() -> None:
+    """
+    ``import omnigent`` alone loads none of the heavy graph.
+
+    The package init used to eagerly import the datamodel/executor graph,
+    taxing every hook subprocess ~250 ms before its first line ran. The
+    same child also proves the init's one eager side effect (the FIPS md5
+    patch) still applies.
+    """
+    statements = "\n".join(
+        (
+            "import omnigent",
+            "import hashlib",
+            "assert hashlib.md5.__name__ == '_fips_safe_md5', hashlib.md5.__name__",
+        )
+    )
+    assert _heavy_imports_after(statements) == []
+
+
+def test_package_lazy_exports_resolve_on_access() -> None:
+    """
+    The lazy re-exports keep the package's public import contract.
+
+    Plain and optional exports, ``from omnigent import`` forms, bare
+    submodule attribute access, and ``dir()`` all resolve exactly as the
+    eager init did — laziness must never be observable beyond timing.
+    """
+    statements = "\n".join(
+        (
+            "import omnigent",
+            "from omnigent import AgentDef, Executor, load_agent_def",
+            "assert omnigent.TurnComplete is not None",
+            "assert 'omnigent.inner.executor' in sys.modules",
+            "_ = omnigent.DatabricksExecutor  # optional: a class or None, never a raise",
+            "assert omnigent.inner is not None",
+            "assert 'TurnComplete' in dir(omnigent)",
+        )
+    )
+    _heavy_imports_after(statements)  # the child's asserts are the test
+
+
+@pytest.mark.parametrize(
+    ("module", "allowed"),
+    [
+        ("omnigent.claude_native_message_display_hook", frozenset()),
+        ("omnigent.claude_native_status", frozenset()),
+        (
+            "omnigent.claude_native_hook",
+            # The observer path (the most frequent invocation) is pure
+            # stdlib + light bridge state: httpx and the policy machinery
+            # are imported inside the subcommands that speak HTTP, and the
+            # bridge defers its tools/spec/pydantic graph to the launch
+            # path. Nothing heavy may ride the module import.
+            frozenset(),
+        ),
+    ],
+)
+def test_hook_entrypoints_stay_import_light(module: str, allowed: frozenset[str]) -> None:
+    """
+    A hook entrypoint's fresh-interpreter import graph stays bounded.
+
+    Claude Code spawns these per streamed chunk / statusline tick / tool
+    call and blocks on them, so a heavy dependency creeping onto any of
+    these import paths is a direct TUI-latency regression even while
+    every functional test still passes.
+    """
+    loaded = _heavy_imports_after(f"import {module}")
+    assert set(loaded) <= allowed, f"{module} newly imports {sorted(set(loaded) - allowed)}"

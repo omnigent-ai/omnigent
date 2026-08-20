@@ -58,6 +58,25 @@ def _row(rail: Locator, name: str) -> Locator:
     return rail.get_by_role("button", name=re.compile(re.escape(name))).filter(has_text=name)
 
 
+def _search_for(search: Locator, query: str) -> None:
+    """Type ``query`` into the All search box and confirm it stuck.
+
+    The rail restores its ``?view=explore`` scope and lists files on mount at
+    the same time the chat composer autofocuses its textarea. A ``fill`` issued
+    in that window can lose focus mid-keystroke (or land in the composer), so
+    the search input reads back empty and the debounced ``/search`` never fires
+    — leaving the tree unfiltered. Asserting the value landed retries the fill
+    until it holds, so the query actually runs before we assert on results.
+    """
+    search.fill(query)
+    expect(search).to_have_value(query)
+
+
+# The fill can race the rail's mount-time re-render (scope restore + first
+# listing) and the composer autofocus, dropping the typed query so the tree
+# stays unfiltered. ``_search_for`` waits the value in to make that rare, and
+# the rerun covers the residual race rather than widening per-action waits.
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_search_filters_all_files(
     page: Page,
     all_search_session: tuple[str, str],
@@ -69,15 +88,21 @@ def test_search_filters_all_files(
     rail = page.get_by_role("complementary", name="Workspace")
     search = rail.get_by_role("searchbox", name="Search all files")
     expect(search).to_be_visible(timeout=30_000)
+    # Wait for the All tree to finish its initial listing before searching: the
+    # seeded files must be on screen so the panel has settled out of its mount
+    # -time re-render (scope restore + first fetch) that would otherwise reset
+    # the search box.
+    for name in _ALL_FILES:
+        expect(_row(rail, name)).to_be_visible(timeout=15_000)
 
     # Server-side recursive search (debounced ~300ms): only beta matches.
-    search.fill("beta_three")
+    _search_for(search, "beta_three")
     expect(_row(rail, _BETA)).to_be_visible(timeout=15_000)
     expect(_row(rail, _ALPHA_ONE)).to_have_count(0)
     expect(_row(rail, _ALPHA_TWO)).to_have_count(0)
 
     # Re-querying for the shared fragment surfaces both alpha files.
-    search.fill("alpha_")
+    _search_for(search, "alpha_")
     expect(_row(rail, _ALPHA_ONE)).to_be_visible(timeout=15_000)
     expect(_row(rail, _ALPHA_TWO)).to_be_visible()
     expect(_row(rail, _BETA)).to_have_count(0)

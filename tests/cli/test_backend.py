@@ -11,10 +11,14 @@ wiring that routes ``--server`` through them.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import re
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import click
 import pytest
@@ -233,6 +237,25 @@ def test_build_host_daemon_env_local_preserves_server_credentials(
     assert empty_string_env["OPENAI_API_KEY"] == "test-key"
 
 
+def test_build_host_daemon_env_local_forwards_bedrock_skip_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLAUDE_CODE_SKIP_BEDROCK_AUTH reaches the local daemon env.
+
+    LiteLLM proxies fronting Bedrock need this flag to disable AWS SigV4
+    auth. Without it in the daemon allowlist, ``omni claude`` drops the
+    flag and Claude Code falls back to native AWS auth (which fails).
+    """
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SKIP_BEDROCK_AUTH", "1")
+
+    env = _build_host_daemon_env(server_url=None)
+
+    assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
+    assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
+
+
 def test_build_host_daemon_env_remote_strips_provider_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -251,6 +274,26 @@ def test_build_host_daemon_env_remote_strips_provider_credentials(
     assert "ANTHROPIC_API_KEY" not in env
     # Databricks auth is intentionally preserved for the daemon's server auth.
     assert env["DATABRICKS_TOKEN"] == "test-databricks-token"
+
+
+def test_build_host_daemon_env_remote_keeps_runner_env_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator env-forwarding control var survives the remote daemon hop.
+
+    ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` names extra env vars for the daemon to
+    forward on to runners. In ``--server`` mode the daemon env is allowlisted by
+    a prefix set that includes ``DATABRICKS_`` but *not* plain ``OMNIGENT_``, so
+    without an explicit allowlist entry the control var itself is stripped here —
+    and ``_build_runner_env`` never sees the names it lists, making the whole
+    passthrough a silent no-op remotely. It carries only var names, not secrets.
+    """
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "MY_GATEWAY_TOKEN")
+
+    env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
+
+    assert env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "MY_GATEWAY_TOKEN"
 
 
 def test_ensure_host_daemon_reuses_same_target(
@@ -577,6 +620,101 @@ def test_daemon_host_online_false_when_no_host_id(
     assert cli._daemon_host_online(record) is False
 
 
+# Every proxy variable httpx consults, so the cases below see exactly the
+# ambient proxy configuration they set up (a developer's own ``NO_PROXY``
+# would otherwise exempt loopback and skip the proxy transport entirely).
+_PROXY_ENV_VARS = (
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+)
+
+
+def _socks_proxy_without_extra(monkeypatch: pytest.MonkeyPatch, base_url: str) -> None:
+    """Point the ambient environment at a SOCKS proxy httpx cannot build.
+
+    Reproduces a shell exporting ``ALL_PROXY=socks5://…`` on an install
+    without the ``httpx[socks]`` extra: httpx raises ``ImportError`` while
+    constructing the client. Blanking ``socksio`` in :data:`sys.modules`
+    makes the extra look absent whether or not it is really installed.
+
+    :param monkeypatch: Fixture used to scope the environment changes.
+    :param base_url: Server URL to pre-seed headers for, so the probe does
+        not resolve real credentials.
+    """
+    for name in _PROXY_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:1080")
+    monkeypatch.setitem(sys.modules, "socksio", None)
+    monkeypatch.setitem(cli._host_http_headers_cache, base_url, {})
+
+
+def test_host_http_json_reports_failure_when_socks_extra_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxy httpx cannot build is a transport failure, not a crash.
+
+    Uses a remote server because that is where a proxy still applies:
+    loopback targets bypass proxies outright (see the companion test), so
+    there is no proxy transport left to fail to build.
+    """
+    base_url = "https://server.example.com"
+    _socks_proxy_without_extra(monkeypatch, base_url)
+
+    result = cli._host_http_json(
+        base_url=base_url,
+        method="GET",
+        path="/v1/hosts/host_abc",
+        timeout_s=2.0,
+    )
+
+    assert result.status_code == 0
+    assert "socksio" in str(result.body)
+
+
+def test_host_http_json_ignores_proxy_for_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The local server is reached directly, never through a proxy.
+
+    A proxy resolves ``127.0.0.1`` against itself, so honoring one here
+    means a developer who exports ``ALL_PROXY`` cannot reach their own
+    server at all — every call fails before it leaves the machine.
+    """
+    base_url = "http://127.0.0.1:8123"
+    _socks_proxy_without_extra(monkeypatch, base_url)
+
+    result = cli._host_http_json(
+        base_url=base_url,
+        method="GET",
+        path="/v1/hosts/host_abc",
+        timeout_s=2.0,
+    )
+
+    assert result.status_code == 0
+    # The SOCKS transport was never built, so this is an ordinary refused
+    # connection rather than the missing-extra ImportError.
+    assert "socksio" not in str(result.body)
+
+
+def test_daemon_host_online_false_when_socks_extra_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reuse probe degrades to "offline" instead of failing the command.
+
+    ``_daemon_host_online`` runs on the way into every command that ensures
+    the backend, so an unbuildable proxy must not escape as an exception.
+    """
+    _socks_proxy_without_extra(monkeypatch, "http://127.0.0.1:8123")
+
+    assert cli._daemon_host_online(_online_record()) is False
+
+
 def test_daemon_tunnel_recovers_returns_true_on_immediate_online(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -648,6 +786,7 @@ def test_foreground_connect_registers_status_record(
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     monkeypatch.setattr(cli, "_load_effective_config", dict)
     monkeypatch.setattr(cli, "_load_or_create_host_id", lambda: "host_abc")
+    monkeypatch.setattr(cli, "_ensure_databricks_server_auth", lambda server, **kw: None)
     observed: list[cli._HostDaemonRecord] = []
 
     def _fake_run_host_process(server_url: str) -> None:
@@ -905,6 +1044,7 @@ def test_foreground_connect_remote_omits_local_server_prompt(
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     monkeypatch.setattr(cli, "_load_effective_config", dict)
     monkeypatch.setattr(cli, "_load_or_create_host_id", lambda: "host_abc")
+    monkeypatch.setattr(cli, "_ensure_databricks_server_auth", lambda server, **kw: None)
     monkeypatch.setattr(
         cli,
         "local_server_url_if_healthy",
@@ -973,7 +1113,7 @@ def test_host_status_json_reports_daemon_host_and_sessions(
 
     monkeypatch.setattr(cli, "_host_http_json", _fake_http_json)
 
-    result = CliRunner().invoke(cli_group, ["host", "status", "--json"])
+    result = CliRunner().invoke(cli_group, ["host", "status", "--json", "--sessions"])
 
     assert result.exit_code == 0, result.output
     assert '"target": "https://server.example.com"' in result.output
@@ -1021,7 +1161,9 @@ def test_host_status_wide_terminal_shows_full_session_and_runner_ids() -> None:
     """Wide ``host status`` tables preserve full session and runner ids."""
     session_id = "conv_1234567890abcdef1234567890abcdef12345678"
     runner_id = "runner_token_1234567890abcdef1234567890abcdef12345678"
-    console = Console(width=180, record=True, color_system=None)
+    # Rich only honours an explicit width when height is set too; otherwise
+    # it falls back to detecting the real terminal size.
+    console = Console(width=180, height=40, record=True, color_system=None)
 
     cli._add_host_payload_sessions_table(
         console,
@@ -1041,6 +1183,127 @@ def test_host_status_wide_terminal_shows_full_session_and_runner_ids() -> None:
     rendered = console.export_text()
     assert session_id in rendered
     assert runner_id in rendered
+
+
+_LONG_SERVER_URL = "https://omnigent-000000000000000.workspace.example.databricksapps.com"
+_LONG_LOG_PATH = "/Users/example/.omnigent/logs/host/host-20260801-095205-263883.log"
+
+_ANSI_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;]*[A-Za-z]")
+_OSC8_OPEN_RE = re.compile(r"\x1b\]8;[^;]*;([^\x1b\x07]+)(?:\x07|\x1b\\)")
+_OSC8_CLOSE_RE = re.compile(r"\x1b\]8;[^;]*;(?:\x07|\x1b\\)")
+
+
+def _render_host_status(*, width: int, payload: dict[str, Any]) -> str:
+    """Render one host-status payload through a fixed-width terminal console.
+
+    :param width: Terminal width in cells, e.g. ``60``.
+    :param payload: Daemon payload as built by ``_daemon_status_payload``.
+    :returns: Rendered output including ANSI and OSC escape sequences.
+    """
+    buffer = io.StringIO()
+    console = Console(
+        file=buffer,
+        width=width,
+        height=40,
+        force_terminal=True,
+        color_system="truecolor",
+        highlight=False,
+    )
+    with patch.object(cli, "_host_console", lambda: console):
+        cli._echo_daemon_payloads([payload])
+    return buffer.getvalue()
+
+
+def _daemon_payload(**overrides: Any) -> dict[str, Any]:
+    """Build a daemon status payload for host-status rendering tests.
+
+    :param overrides: Payload fields to replace, e.g. ``server_url``.
+    :returns: Payload accepted by ``_echo_daemon_payloads``.
+    """
+    payload: dict[str, Any] = {
+        "target": _LONG_SERVER_URL,
+        "mode": "server",
+        "server_url": _LONG_SERVER_URL,
+        "pid": 45867,
+        "process": "online",
+        "log_path": _LONG_LOG_PATH,
+        "host_id": "host_77599b2c44934910b00cfdfda3ba21fc",
+        "host_status": "online",
+        "sessions": [],
+        "error": None,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_host_status_links_the_full_server_url_when_display_is_shortened() -> None:
+    """A narrow ``host status`` still links the untruncated server URL.
+
+    Middle-truncating the URL into the visible text is fine, but the click
+    target must stay openable rather than pointing at ``https://omni…com``.
+    """
+    rendered = _render_host_status(width=60, payload=_daemon_payload())
+
+    targets = _OSC8_OPEN_RE.findall(rendered)
+    assert _LONG_SERVER_URL in targets, f"full server URL is not a link target: {targets!r}"
+    assert "…" in _ANSI_RE.sub("", rendered), "expected the narrow display text to be shortened"
+    assert not any("…" in target for target in targets), (
+        f"a truncated URL was used as a click target: {targets!r}"
+    )
+
+
+def test_host_status_hyperlinks_never_span_a_line_break() -> None:
+    """Every hyperlink opened by ``host status`` closes on the same line.
+
+    An unterminated OSC 8 run makes the terminal treat the rest of the
+    status block as part of the link, so clicking opens a URL with the
+    following lines glued on.
+    """
+    rendered = _render_host_status(width=60, payload=_daemon_payload(error="host not found"))
+
+    for line in rendered.split("\n"):
+        opens = len(_OSC8_OPEN_RE.findall(line))
+        closes = len(_OSC8_CLOSE_RE.findall(line))
+        assert opens == closes, f"unbalanced hyperlink escapes on line: {line!r}"
+
+
+def test_host_status_lines_fit_the_terminal_width() -> None:
+    """``host status`` lines stay inside the terminal width.
+
+    A line that fills or exceeds the width is soft-wrapped, and terminals
+    join soft-wrapped rows into one logical line when detecting links —
+    which is how the log path and the URL end up merged into one target.
+    """
+    width = 60
+    rendered = _render_host_status(width=width, payload=_daemon_payload())
+
+    for line in rendered.split("\n"):
+        visible = _ANSI_RE.sub("", line)
+        assert len(visible) < width, f"line fills or overflows the terminal: {visible!r}"
+
+
+def test_host_status_links_the_daemon_log_path() -> None:
+    """The daemon log path is emitted as a clickable ``file://`` link."""
+    rendered = _render_host_status(width=60, payload=_daemon_payload())
+
+    targets = _OSC8_OPEN_RE.findall(rendered)
+    assert f"file://{_LONG_LOG_PATH}" in targets, f"log path is not linked: {targets!r}"
+
+
+def test_host_status_plain_output_has_no_escape_sequences() -> None:
+    """Piped ``host status`` output stays free of hyperlink escapes.
+
+    Link markup must degrade to plain text so redirected output and
+    ``grep`` keep working.
+    """
+    buffer = io.StringIO()
+    console = Console(file=buffer, width=100, height=40, force_terminal=False, highlight=False)
+    with patch.object(cli, "_host_console", lambda: console):
+        cli._echo_daemon_payloads([_daemon_payload()])
+
+    rendered = buffer.getvalue()
+    assert "\x1b" not in rendered, f"unexpected escape sequences in piped output: {rendered!r}"
+    assert _LONG_SERVER_URL in rendered
 
 
 def test_host_sessions_subcommand_is_removed() -> None:
@@ -1084,6 +1347,10 @@ def test_host_stop_stops_sessions_before_daemon(
                     ]
                 },
             )
+        # Stop resolves the session's host (any-replica metadata read) before
+        # keying the stop event by it.
+        if method == "GET" and path == "/v1/sessions/conv_owned":
+            return cli._HostHttpResult(status_code=200, body={"host_id": "host_abc"})
         if method == "POST" and path == "/v1/sessions/conv_owned/events":
             return cli._HostHttpResult(status_code=200, body={"queued": False})
         raise AssertionError(f"unexpected request: {method} {path}")
@@ -1105,6 +1372,7 @@ def test_host_stop_stops_sessions_before_daemon(
     assert result.exit_code == 0, result.output
     assert events == [
         ("GET", "/v1/sessions"),
+        ("GET", "/v1/sessions/conv_owned"),
         ("POST", "/v1/sessions/conv_owned/events"),
         ("TERM", "https://server.example.com"),
     ]
@@ -1144,6 +1412,85 @@ def test_host_stop_daemon_only_skips_session_stop(
     assert terminated == ["https://server.example.com"]
 
 
+def test_host_stop_session_list_timeout_points_at_force(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A session-list timeout names the flags that stop the daemon anyway.
+
+    ``GET /v1/sessions`` is one of the slowest managed APIs, so the
+    pre-check times out on healthy hosts. The failure has to name the
+    escape hatch or the daemon looks unstoppable.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: cli._HostHttpResult(
+            status_code=0,
+            body="ReadTimeout: The read operation timed out",
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: pytest.fail("daemon terminated despite the failure"),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com"],
+    )
+
+    assert result.exit_code != 0
+    assert "ReadTimeout" in result.output
+    assert "--force" in result.output
+    assert "--daemon-only" in result.output
+
+
+def test_host_stop_force_terminates_after_session_list_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--force`` stops the daemon when the session pre-check times out."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_host_http_json",
+        lambda **kwargs: cli._HostHttpResult(
+            status_code=0,
+            body="ReadTimeout: The read operation timed out",
+        ),
+    )
+    terminated: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda record, *, force: terminated.append(record.target),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["host", "stop", "--server", "https://server.example.com", "--force"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert terminated == ["https://server.example.com"]
+    assert "sessions_stopped=0" in result.output
+
+
 def test_host_stop_session_stops_only_named_sessions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1172,6 +1519,37 @@ def test_host_stop_session_stops_only_named_sessions(
 
     assert result.exit_code == 0, result.output
     assert stopped == ["conv_a", "conv_b"]
+
+
+def test_stop_session_keys_event_by_resolved_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``stop-session`` resolves the session's host and keys the stop event by it.
+
+    A standalone ``omni host stop-session`` process has an empty session→host
+    map, so it reads the host from the session record first; the stop_session
+    event is a server→runner forward that must reach the replica holding the
+    runner's tunnel. A metadata GET (any replica) precedes it, and the POST
+    carries ``host_id`` from that record.
+    """
+    calls: list[dict[str, object]] = []
+
+    def _fake_http_json(**kwargs: object) -> cli._HostHttpResult:
+        calls.append(kwargs)
+        if kwargs["method"] == "GET":
+            return cli._HostHttpResult(status_code=200, body={"host_id": "host_bea4"})
+        return cli._HostHttpResult(status_code=202, body={})
+
+    monkeypatch.setattr(cli, "_host_http_json", _fake_http_json)
+
+    cli._stop_session_on_server(base_url="https://ws/api/2.0/omnigent", session_id="conv_1")
+
+    get_call = next(c for c in calls if c["method"] == "GET")
+    post_call = next(c for c in calls if c["method"] == "POST")
+    # Host resolved from the session record, then the stop event is keyed by it.
+    assert get_call["path"] == "/v1/sessions/conv_1"
+    assert post_call["path"] == "/v1/sessions/conv_1/events"
+    assert post_call["host_id"] == "host_bea4"
 
 
 def test_ensure_backend_remote_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1205,6 +1583,24 @@ def test_ensure_backend_local_discovers_url(monkeypatch: pytest.MonkeyPatch) -> 
     assert _ensure_backend(None) == "http://127.0.0.1:8123"
     assert _ensure_backend("") == "http://127.0.0.1:8123"
     assert calls == [None, None]
+
+
+def test_ensure_backend_defaults_scheme_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A schemeless ``--server`` URL is defaulted to https before expansion.
+
+    Covers run / claude / codex / chat, which all resolve ``--server``
+    through ``_ensure_backend``; the guide hands out schemeless URLs.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda s: False)
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
+    monkeypatch.setattr(cli, "_ensure_databricks_server_auth", lambda server: None)
+
+    result = _ensure_backend("dbc-x.cloud.databricks.com/omnigent")
+
+    # Scheme defaulted to https before the workspace expansion ran.
+    assert seen == ["https://dbc-x.cloud.databricks.com/omnigent"]
+    assert result == _expand_marker("https://dbc-x.cloud.databricks.com/omnigent")
 
 
 def test_discover_local_server_url_returns_when_healthy(
@@ -1367,17 +1763,17 @@ def _patch_auth_preflight(
 
     monkeypatch.setattr(
         "omnigent.chat._remote_headers",
-        lambda server_url=None: {},
+        lambda server_url=None, *, host_id=None: {},
     )
     monkeypatch.setattr(httpx, "get", lambda url, **kw: _databricks_probe_response(probe_status))
     monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: tty)
     login_calls: list[str] = []
-    monkeypatch.setattr(
-        cli,
-        "_databricks_login",
-        lambda server, workspace_host: login_calls.append(f"{server} {workspace_host}"),
-    )
+
+    def _capture_login(server: str, workspace_host: str, org_id: str | None = None) -> None:
+        login_calls.append(f"{server} {workspace_host}")
+
+    monkeypatch.setattr(cli, "_databricks_login", _capture_login)
     return login_calls
 
 
@@ -1428,6 +1824,208 @@ def test_ensure_backend_databricks_preflight_skips_when_authenticated(
 
     assert login_calls == []
     assert result == "https://myapp-1234.aws.databricksapps.com"
+
+
+def test_databricks_preflight_silent_sdk_refresh_skips_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh SDK token recovers an expired Databricks Apps session silently."""
+    import httpx
+
+    responses = iter([_databricks_probe_response(302), _databricks_probe_response(200)])
+    requests: list[dict[str, object]] = []
+    stored: list[tuple[str, str, str | None]] = []
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer expired"},
+    )
+
+    def _get(url: str, **kwargs: object) -> object:
+        requests.append(kwargs)
+        return next(responses)
+
+    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr(cli, "_databricks_workspace_token", lambda workspace: "fresh-token")
+    monkeypatch.setattr(cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("login"))
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: "123")
+
+    def _store(
+        server: str,
+        workspace: str,
+        user_id: str | None = None,
+        org_id: str | None = None,
+    ) -> None:
+        stored.append((server, workspace, org_id))
+
+    monkeypatch.setattr("omnigent.cli_auth.store_databricks_auth", _store)
+
+    cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert requests[1]["headers"] == {"Authorization": "Bearer fresh-token"}
+    assert requests[1]["params"] == {"o": "123"}
+    assert stored == [(_HOST_DATABRICKS_SERVER, "https://example.databricks.com", "123")]
+
+
+# ── Foreground ``host`` auth pre-flight ─────────────────────────────
+#
+# ``host`` runs the same Databricks sign-in pre-flight ``run`` does before
+# connecting to a remote server, but exposes ``--non-interactive`` so a
+# scripted invocation keeps the old fail-loud behavior instead of launching
+# the browser login. ``CliRunner`` swaps ``sys.stdin`` for a non-TTY stream,
+# so the auto-login-on-TTY branch is covered by the direct pre-flight test
+# below; the ``host`` wiring is asserted with a capturing pre-flight stub.
+
+_HOST_DATABRICKS_SERVER = "https://myapp-1234.aws.databricksapps.com"
+
+
+def test_databricks_preflight_non_interactive_overrides_tty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``non_interactive=True`` fails with the login hint even on a TTY.
+
+    Without the override an un-authed Databricks server would launch the
+    browser login on a TTY (covered by
+    ``test_ensure_backend_databricks_preflight_runs_login_on_tty``); the
+    flag is what lets ``host`` stay scripted.
+    """
+    login_calls = _patch_auth_preflight(monkeypatch, probe_status=302, tty=True)
+
+    with pytest.raises(click.ClickException) as exc:
+        cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+    assert f"omnigent login {_HOST_DATABRICKS_SERVER}" in str(exc.value)
+    # The browser login never ran despite the TTY.
+    assert login_calls == []
+
+
+def _patch_foreground_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> list[str]:
+    """Stub the foreground-host plumbing and capture connect targets.
+
+    Covers both local and remote ``host`` invocations: the local server
+    bring-up is stubbed so ``host ""`` reaches ``run_host_process`` too.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Temp dir for the host pidfile.
+    :returns: Capture list of ``run_host_process`` server URLs.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_load_effective_config", dict)
+    monkeypatch.setattr(cli, "_load_or_create_host_id", lambda: "host_abc")
+    monkeypatch.setattr(
+        cli,
+        "ensure_local_omnigent_server",
+        lambda: LocalServerStartup(url="http://127.0.0.1:8000", spawned=True),
+    )
+    # No healthy local server after exit → the Ctrl-C stop prompt stays quiet.
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+    connected: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.host.connect.run_host_process",
+        lambda server_url: connected.append(server_url),
+    )
+    return connected
+
+
+def _capture_preflight(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, bool]]:
+    """Replace the auth pre-flight with a capturing no-op.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: Capture list of ``(server, non_interactive)`` pre-flight calls.
+    """
+    calls: list[tuple[str, bool]] = []
+
+    def _capture(server: str, *, non_interactive: bool = False) -> None:
+        calls.append((server, non_interactive))
+
+    monkeypatch.setattr(cli, "_ensure_databricks_server_auth", _capture)
+    return calls
+
+
+def test_host_remote_runs_auth_preflight_before_connect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Remote ``host`` runs the sign-in pre-flight, then connects."""
+    preflight = _capture_preflight(monkeypatch)
+    connected = _patch_foreground_host(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli_group, ["host", "--server", _HOST_DATABRICKS_SERVER])
+
+    assert result.exit_code == 0, result.output
+    assert preflight == [(_HOST_DATABRICKS_SERVER, False)]
+    assert connected == [_HOST_DATABRICKS_SERVER]
+
+
+def test_host_non_interactive_flag_forwarded_to_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--non-interactive`` reaches the pre-flight as ``non_interactive=True``."""
+    preflight = _capture_preflight(monkeypatch)
+    _patch_foreground_host(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli_group, ["host", "--server", _HOST_DATABRICKS_SERVER, "--non-interactive"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert preflight == [(_HOST_DATABRICKS_SERVER, True)]
+
+
+def test_host_non_interactive_flag_positional_shorthand(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``omnigent host <url> --non-interactive`` parses the flag with the shorthand."""
+    preflight = _capture_preflight(monkeypatch)
+    _patch_foreground_host(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli_group, ["host", _HOST_DATABRICKS_SERVER, "--non-interactive"])
+
+    assert result.exit_code == 0, result.output
+    assert preflight == [(_HOST_DATABRICKS_SERVER, True)]
+
+
+def test_host_local_skips_auth_preflight(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Local-mode ``host ""`` never runs the remote sign-in pre-flight."""
+    preflight = _capture_preflight(monkeypatch)
+    connected = _patch_foreground_host(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli_group, ["host", ""])
+
+    assert result.exit_code == 0, result.output
+    assert preflight == []
+    assert connected == ["http://127.0.0.1:8000"]
+
+
+def test_host_remote_preflight_hints_headless(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Un-authed Databricks ``host`` (no TTY) fails with the login hint, never connecting."""
+    login_calls = _patch_auth_preflight(monkeypatch, probe_status=302, tty=False)
+    connected = _patch_foreground_host(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli_group, ["host", "--server", _HOST_DATABRICKS_SERVER])
+
+    assert result.exit_code != 0
+    assert f"omnigent login {_HOST_DATABRICKS_SERVER}" in result.output
+    # Pre-flight bailed: no browser login and no connect.
+    assert login_calls == []
+    assert connected == []
+
+
+def test_host_remote_preflight_skips_when_authenticated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A 200 probe (valid creds / header mode) connects without a login flow."""
+    login_calls = _patch_auth_preflight(monkeypatch, probe_status=200, tty=False)
+    connected = _patch_foreground_host(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli_group, ["host", "--server", _HOST_DATABRICKS_SERVER])
+
+    assert result.exit_code == 0, result.output
+    assert login_calls == []
+    assert connected == [_HOST_DATABRICKS_SERVER]
 
 
 # ── Workspace-URL expansion for attach / resume / host ──────────────
@@ -1512,6 +2110,71 @@ def test_resolve_attach_server_local_fallback_not_expanded(
     assert _resolve_attach_server(None, configured_server=None) == "http://127.0.0.1:8123"
 
 
+def test_resolve_attach_server_defaults_scheme_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``attach --server <ws>/omnigent`` (no scheme) is defaulted to https."""
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
+
+    result = _resolve_attach_server("dbc-x.cloud.databricks.com/omnigent", configured_server=None)
+
+    assert seen == ["https://dbc-x.cloud.databricks.com/omnigent"]
+    assert result == _expand_marker("https://dbc-x.cloud.databricks.com/omnigent")
+
+
+@pytest.mark.parametrize(
+    ("workspace_id", "shard"),
+    [
+        # Real workspace/host pairs observed in public repositories, so this
+        # asserts a fact about Azure rather than restating the implementation's
+        # own arithmetic. Sources: databricks-industry-solutions/energy-sandbox
+        # (4173618801742158), posit-dev/chatlas VCR cassette (138962681435081);
+        # 6480446341130099 and 984752964297111 came from URLs that carried both
+        # the canonical host and ?o=<id>, so the id is self-confirming.
+        ("4173618801742158", "18"),
+        ("6480446341130099", "19"),
+        ("984752964297111", "11"),  # 15-digit id
+        ("8079947826164900", "0"),  # bare shard-0 rendering
+        ("138962681435081", "1"),
+    ],
+)
+def test_canonical_azure_databricks_url_matches_real_workspaces(
+    workspace_id: str, shard: str
+) -> None:
+    """The synthesized host matches the real canonical host for known workspaces."""
+    result = cli._canonical_azure_databricks_url(
+        f"https://mydomain.azuredatabricks.net/?o={workspace_id}"
+    )
+
+    assert result == (f"https://adb-{workspace_id}.{shard}.azuredatabricks.net/?o={workspace_id}")
+
+
+def test_canonical_azure_databricks_url_declines_other_urls() -> None:
+    """Canonical, non-Azure, and selector-less URLs yield no candidate."""
+    # Already canonical
+    assert (
+        cli._canonical_azure_databricks_url("https://adb-123.3.azuredatabricks.net/?o=123") is None
+    )
+    # AWS host (not azuredatabricks.net)
+    assert cli._canonical_azure_databricks_url("https://acme.cloud.databricks.com/?o=123") is None
+    # Azure vanity but no ?o= to derive the workspace id
+    assert cli._canonical_azure_databricks_url("https://mydomain.azuredatabricks.net") is None
+    # Non-numeric selector is ignored
+    assert (
+        cli._canonical_azure_databricks_url("https://mydomain.azuredatabricks.net/?o=notanid")
+        is None
+    )
+    # A non-ASCII "digit" that int() would reject is declined, not crashed
+    assert cli._canonical_azure_databricks_url("https://mydomain.azuredatabricks.net/?o=²") is None
+    # Arabic-Indic digits satisfy isdecimal() and int(), so the ASCII guard is
+    # what stops a nonsensical host being synthesized here.
+    assert cli._canonical_azure_databricks_url("https://mydomain.azuredatabricks.net/?o=٣") is None
+    # A malformed port must not crash the shared resolver
+    assert (
+        cli._canonical_azure_databricks_url("https://mydomain.azuredatabricks.net:notaport/?o=123")
+        is None
+    )
+
+
 def test_resolve_host_server_expands_explicit_workspace_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1550,6 +2213,57 @@ def test_resolve_host_server_none_stays_local(monkeypatch: pytest.MonkeyPatch) -
     )
 
     assert _resolve_host_server(None) is None
+
+
+def test_resolve_host_server_defaults_scheme_and_accepts_omnigent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``host`` subcommands accept a schemeless ``/omnigent`` workspace URL.
+
+    The internal user guide's web URL omits the scheme and ends in
+    ``/omnigent``; host must default it to https before expansion, just
+    like ``omnigent login``.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
+
+    result = _resolve_host_server("dbc-x.cloud.databricks.com/omnigent")
+
+    # Scheme defaulted to https before the expansion saw the URL.
+    assert seen == ["https://dbc-x.cloud.databricks.com/omnigent"]
+    assert result == _expand_marker("https://dbc-x.cloud.databricks.com/omnigent")
+
+
+def test_host_command_defaults_scheme_and_accepts_omnigent_web_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``omnigent host --server <ws>/omnigent`` (no scheme) normalizes before connect.
+
+    Pasting the guide's web URL (schemeless, ``/omnigent`` suffix) must
+    default to https and expand to the API mount, not connect to the raw
+    input.
+    """
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_load_effective_config", dict)
+    monkeypatch.setattr(cli, "_load_or_create_host_id", lambda: "host_abc")
+    monkeypatch.setattr(cli, "_ensure_databricks_server_auth", lambda server, **kw: None)
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
+    observed: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.host.connect.run_host_process",
+        lambda server_url: observed.append(server_url),
+    )
+
+    result = CliRunner().invoke(
+        cli_group, ["host", "--server", "dbc-x.cloud.databricks.com/omnigent"]
+    )
+
+    assert result.exit_code == 0, result.output
+    # Scheme defaulted to https before the workspace expansion ran.
+    assert seen == ["https://dbc-x.cloud.databricks.com/omnigent"]
+    # The foreground connect targeted the expanded API-mount URL.
+    assert observed == [_expand_marker("https://dbc-x.cloud.databricks.com/omnigent")]
 
 
 def test_resume_command_expands_server_url(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1593,3 +2307,23 @@ def test_resume_command_without_server_skips_expansion(
 
     assert result.exit_code == 0, result.output
     assert captured == {"target": "conv_abc123", "server": None}
+
+
+def test_resume_command_defaults_scheme_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``omnigent resume --server <ws>/omnigent`` (no scheme) is defaulted to https."""
+    seen: list[str] = []
+    monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.resume_dispatch.run_resume",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    result = CliRunner().invoke(
+        cli_group,
+        ["resume", "conv_abc123", "--server", "dbc-x.cloud.databricks.com/omnigent"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen == ["https://dbc-x.cloud.databricks.com/omnigent"]
+    assert captured["server"] == _expand_marker("https://dbc-x.cloud.databricks.com/omnigent")

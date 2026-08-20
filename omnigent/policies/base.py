@@ -23,7 +23,6 @@ write-through store) and the composition loop live in
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
 
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.spec.types import PolicySpec
@@ -50,7 +49,7 @@ class Policy(ABC):
     async def evaluate(
         self,
         ctx: EvaluationContext,
-        context: dict[str, Any],
+        context: dict[str, object],
     ) -> PolicyResult:
         """
         Return this policy's decision for one evaluation.
@@ -80,7 +79,7 @@ class Policy(ABC):
         rate-limit factory in
         ``examples/_shared/rate_limit_policy.py`` — override
         this to clear those counters at the start of each
-        turn. Mirrors :meth:`omnigent.inner.policies.Policy.reset_turn`.
+        turn. Mirrors :meth:`omnigent.runtime.policies.engine.PolicyEngine.reset_turn`.
 
         The runtime calls this once per "turn" — defined as one
         user prompt → terminal assistant response cycle, which
@@ -91,5 +90,5 @@ class Policy(ABC):
         Deliberately a concrete no-op (not ``@abstractmethod``)
         so subclasses opt INTO per-turn lifecycle handling
         rather than being forced to override; same convention
-        as :meth:`omnigent.inner.policies.Policy.reset_turn`.
+        as :meth:`omnigent.runtime.policies.engine.PolicyEngine.reset_turn`.
         """

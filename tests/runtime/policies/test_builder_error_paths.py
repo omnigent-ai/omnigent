@@ -74,7 +74,7 @@ def test_resolve_non_callable_rejected() -> None:
     """Dotted path resolves to a non-callable (e.g. a module
     constant) → ValueError naming the resolved type."""
     # Point at a non-callable module-level constant
-    # (`omnigent.spec.types.DEFAULT_ASK_TIMEOUT` = 30, an int).
+    # (`omnigent.spec.types.DEFAULT_ASK_TIMEOUT` is an int).
     with pytest.raises(ValueError, match=r"not callable"):
         resolve_function_policy(
             _fn_spec("omnigent.spec.types.DEFAULT_ASK_TIMEOUT"),

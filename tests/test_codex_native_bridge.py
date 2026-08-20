@@ -2,21 +2,49 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from omnigent.codex_native_bridge import (
     CodexNativeBridgeState,
+    cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
+    clear_bridge_state,
     codex_home_for_bridge_dir,
+    codex_mcp_config_overrides,
+    mcp_startup_waiting_detail,
+    pending_mcp_servers,
     prepare_bridge_dir,
+    read_bridge_startup_error,
     read_bridge_state,
     read_codex_config_model,
+    read_mcp_startup,
     read_policy_hook_config,
+    settle_pending_mcp_startup,
+    update_mcp_server_startup,
+    write_bridge_startup_error,
     write_bridge_state,
+    write_codex_config_model,
     write_policy_hook_config,
 )
+
+
+def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Path) -> None:
+    """codex launches serve-mcp with ``-I`` so the workspace can't shadow omnigent.
+
+    The MCP server starts in the session workspace, and without ``-I`` python puts
+    that cwd on ``sys.path``, so a workspace that is an omnigent checkout supplies
+    the bridge's own package. Every other native bridge passes ``-I`` here.
+
+    :param tmp_path: Stands in for the per-session bridge dir.
+    """
+    overrides = codex_mcp_config_overrides(tmp_path)
+
+    prefix = "mcp_servers.omnigent.args="
+    raw = next(o[len(prefix) :] for o in overrides if o.startswith(prefix))
+    assert json.loads(raw)[:4] == ["-I", "-m", "omnigent.claude_native_bridge", "serve-mcp"]
 
 
 def _seed_active_turn(bridge_dir: Path, active_turn_id: str | None) -> None:
@@ -94,6 +122,42 @@ def test_read_codex_config_model_none_when_unparsable(bridge_dir: Path) -> None:
     _write_config(bridge_dir, 'model = "gpt-5.4\n[broken')
 
     assert read_codex_config_model(bridge_dir) is None
+
+
+def test_write_codex_config_model_replaces_top_level_key(bridge_dir: Path) -> None:
+    """The existing top-level ``model`` line is replaced, sections untouched.
+
+    An Omnigent-initiated switch (routing / web picker) must land on the same
+    key an in-TUI ``/model`` writes, or the forwarder's next config re-read
+    mirrors the stale launch model back and reverts the switch.
+    """
+    _write_config(
+        bridge_dir,
+        'model = "databricks-gpt-5-5"\n'
+        'model_provider = "databricks"\n'
+        "[model_providers.databricks]\n"
+        'model = "section-model-not-touched"\n',
+    )
+
+    assert write_codex_config_model(bridge_dir, "gpt-5.6-luna") is True
+    assert read_codex_config_model(bridge_dir) == "gpt-5.6-luna"
+    body = (codex_home_for_bridge_dir(bridge_dir) / "config.toml").read_text()
+    assert 'model = "section-model-not-touched"' in body
+    assert 'model_provider = "databricks"' in body
+
+
+def test_write_codex_config_model_inserts_when_absent(bridge_dir: Path) -> None:
+    """A config with no top-level ``model`` gains one at the top."""
+    _write_config(bridge_dir, 'model_provider = "databricks"\n')
+
+    assert write_codex_config_model(bridge_dir, "gpt-5.6-luna") is True
+    assert read_codex_config_model(bridge_dir) == "gpt-5.6-luna"
+
+
+def test_write_codex_config_model_creates_missing_file(bridge_dir: Path) -> None:
+    """No codex-home/config.toml yet → the writer creates it (best-effort)."""
+    assert write_codex_config_model(bridge_dir, "gpt-5.6-luna") is True
+    assert read_codex_config_model(bridge_dir) == "gpt-5.6-luna"
 
 
 def test_policy_hook_config_round_trips(bridge_dir: Path) -> None:
@@ -199,3 +263,119 @@ def test_clear_active_turn_id_if_matches_no_state_returns_true(bridge_dir: Path)
     """
     # bridge_dir exists (fixture) but no state.json was written.
     assert clear_active_turn_id_if_matches(bridge_dir, "turn_1") is True
+
+
+def test_bridge_startup_error_round_trips_and_is_cleared(bridge_dir: Path) -> None:
+    """
+    The startup-error breadcrumb round-trips, and ``clear_bridge_state``
+    drops it before each launch so stale failures don't linger (issue #59).
+    """
+    assert read_bridge_startup_error(bridge_dir) is None
+
+    write_bridge_startup_error(bridge_dir, "thread never started (TimeoutError)")
+    assert read_bridge_startup_error(bridge_dir) == "thread never started (TimeoutError)"
+
+    clear_bridge_state(bridge_dir)
+    assert read_bridge_startup_error(bridge_dir) is None
+
+
+def test_mcp_startup_updates_round_trip(bridge_dir: Path) -> None:
+    """
+    Per-server MCP startup updates accumulate and read back (issue #2058).
+
+    The executor's first-turn gate and the runner's Stop handler both key
+    off this map; the ``pending``/``waiting`` views must name exactly the
+    servers whose latest status is ``starting``.
+    """
+    assert read_mcp_startup(bridge_dir) == {}
+    assert pending_mcp_servers({}) == []
+    assert mcp_startup_waiting_detail({}) is None
+
+    update_mcp_server_startup(bridge_dir, "safe", "starting")
+    update_mcp_server_startup(bridge_dir, "storage-console", "starting")
+    servers = update_mcp_server_startup(bridge_dir, "safe", "failed", error="handshake failed")
+
+    assert servers == read_mcp_startup(bridge_dir)
+    assert read_mcp_startup(bridge_dir) == {
+        "safe": {"status": "failed", "error": "handshake failed"},
+        "storage-console": {"status": "starting", "error": None},
+    }
+    # Only still-starting servers are pending; the failed one settled.
+    assert pending_mcp_servers(read_mcp_startup(bridge_dir)) == ["storage-console"]
+    assert (
+        mcp_startup_waiting_detail(read_mcp_startup(bridge_dir))
+        == "MCP startup still waiting on storage-console"
+    )
+
+
+def test_cancel_pending_mcp_startup_flips_only_starting(bridge_dir: Path) -> None:
+    """
+    Stop's local cancel flips ``starting`` servers to ``cancelled`` only.
+
+    Settled servers (ready/failed) must keep their state — rewriting them
+    would misreport what actually happened; a second cancel is a no-op so
+    a repeated Stop doesn't claim it cancelled anything.
+    """
+    update_mcp_server_startup(bridge_dir, "safe", "ready")
+    update_mcp_server_startup(bridge_dir, "testman", "failed", error="boom")
+    update_mcp_server_startup(bridge_dir, "storage-console", "starting")
+
+    assert cancel_pending_mcp_startup(bridge_dir) == ["storage-console"]
+    assert read_mcp_startup(bridge_dir) == {
+        "safe": {"status": "ready", "error": None},
+        "testman": {"status": "failed", "error": "boom"},
+        "storage-console": {"status": "cancelled", "error": None},
+    }
+    # Nothing pending anymore → repeat cancel reports nothing flipped.
+    assert cancel_pending_mcp_startup(bridge_dir) == []
+
+
+def test_settle_pending_mcp_startup_drops_only_starting(bridge_dir: Path) -> None:
+    """
+    Settling drops unresolved ``starting`` entries and keeps terminal ones.
+
+    Codex never delivers per-server outcomes to Omnigent's observer
+    connection, so at settle the unresolved entries are removed rather
+    than guessed; a locally-cancelled server must survive so the web band
+    can keep saying it was cancelled. A second settle is a no-op.
+    """
+    update_mcp_server_startup(bridge_dir, "safe", "starting")
+    update_mcp_server_startup(bridge_dir, "storage-console", "cancelled")
+
+    servers, changed = settle_pending_mcp_startup(bridge_dir)
+
+    assert changed is True
+    assert servers == {"storage-console": {"status": "cancelled", "error": None}}
+    assert read_mcp_startup(bridge_dir) == servers
+    # Fully settled → nothing to drop, nothing rewritten.
+    assert settle_pending_mcp_startup(bridge_dir) == (servers, False)
+
+
+def test_read_mcp_startup_ignores_malformed_entries(bridge_dir: Path) -> None:
+    """
+    Malformed or unknown-status entries are dropped on read.
+
+    A corrupt file must degrade to "no state" rather than crash the
+    executor gate or feed a bogus status into the web UI.
+    """
+    (bridge_dir / "mcp_startup.json").write_text("not json")
+    assert read_mcp_startup(bridge_dir) == {}
+
+    (bridge_dir / "mcp_startup.json").write_text(
+        '{"servers": {"ok": {"status": "ready"}, "bad": {"status": "exploded"},'
+        ' "": {"status": "ready"}}}'
+    )
+    assert read_mcp_startup(bridge_dir) == {"ok": {"status": "ready", "error": None}}
+
+
+def test_clear_bridge_state_removes_mcp_startup(bridge_dir: Path) -> None:
+    """
+    ``clear_bridge_state`` drops the MCP startup map with the other
+    runtime state, so a relaunch never gates its first turn on a prior
+    app-server's startup round.
+    """
+    update_mcp_server_startup(bridge_dir, "safe", "starting")
+
+    clear_bridge_state(bridge_dir)
+
+    assert read_mcp_startup(bridge_dir) == {}

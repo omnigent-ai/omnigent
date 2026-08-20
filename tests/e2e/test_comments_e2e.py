@@ -391,18 +391,18 @@ def test_comments_update_body_and_status(http_client: httpx.Client) -> None:
         f"Status changed unexpectedly: expected 'draft', got {updated['status']!r}"
     )
 
-    # Update status to resolved.
+    # Update status to addressed.
     resolve_resp = http_client.patch(
         f"/v1/sessions/{session_id}/comments/{comment_id}",
-        json={"status": "resolved"},
+        json={"status": "addressed"},
         headers={"X-Forwarded-Email": _OWNER_EMAIL},
     )
     resolve_resp.raise_for_status()
     resolved = resolve_resp.json()
 
     # The status must reflect the PATCH; body must be unchanged.
-    assert resolved["status"] == "resolved", (
-        f"Status not updated to 'resolved': got {resolved['status']!r}"
+    assert resolved["status"] == "addressed", (
+        f"Status not updated to 'addressed': got {resolved['status']!r}"
     )
     assert resolved["body"] == "Revised text", (
         "Body regressed after status update — PATCH should only touch "

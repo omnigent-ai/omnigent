@@ -13,7 +13,10 @@ from omnigent.entities.conversation import (
     FunctionCallData,
     MessageData,
 )
-from omnigent.runtime.content_resolver import resolve_content_references
+from omnigent.runtime.content_resolver import (
+    extract_text_attachments,
+    resolve_content_references,
+)
 
 # ── Fake stores ──────────────────────────────────────────────────────
 
@@ -678,6 +681,13 @@ def test_resolve_content_type_uses_stored_type() -> None:
     assert _resolve_content_type("application/pdf", "report.pdf") == "application/pdf"
 
 
+def test_resolve_content_type_strips_mime_parameters() -> None:
+    """Stored MIME parameters are excluded from provider-facing data URIs."""
+    from omnigent.runtime.content_resolver import _resolve_content_type
+
+    assert _resolve_content_type("image/png;charset=binary", "photo.png") == "image/png"
+
+
 def test_resolve_content_type_ignores_octet_stream() -> None:
     """application/octet-stream is treated as unresolved — falls through to filename."""
     from omnigent.runtime.content_resolver import _resolve_content_type
@@ -918,3 +928,239 @@ def test_resolve_image_file_keeps_specific_mime(
     assert image_block["image_url"].startswith("data:image/png;base64,"), (
         f"Expected image/png data URI, got: {image_block['image_url'][:60]}"
     )
+
+
+# ── Attachment upload limits ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("content_type", "expected_mb"),
+    [
+        ("image/png", 5),
+        ("image/jpeg", 5),
+        ("image/webp", 5),
+        ("application/pdf", 20),
+        ("text/plain", 10),
+        ("text/markdown", 10),
+        ("text/x-python", 10),
+        ("text/typescript", 10),
+        ("application/json", 10),
+        ("application/x-ipynb+json", 10),
+    ],
+)
+def test_attachment_upload_limit_allowed_types(content_type: str, expected_mb: int) -> None:
+    """Images, PDF, and text-like types get their per-type byte cap."""
+    from omnigent.runtime.content_resolver import attachment_upload_limit
+
+    assert attachment_upload_limit(content_type) == expected_mb * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # pptx
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # docx
+        "application/vnd.ms-excel",
+        "application/zip",
+        "application/octet-stream",
+        "audio/mpeg",
+        "video/mp4",
+    ],
+)
+def test_attachment_upload_limit_rejects_unsupported_types(content_type: str) -> None:
+    """Office/binary/media types are not uploadable (None ⇒ caller 415s)."""
+    from omnigent.runtime.content_resolver import attachment_upload_limit
+
+    assert attachment_upload_limit(content_type) is None
+
+
+def test_attachment_upload_limits_are_under_global_ceiling() -> None:
+    """Every per-type limit stays within the global request-size backstop."""
+    from omnigent.runtime.content_resolver import (
+        MAX_ATTACHMENT_UPLOAD_BYTES,
+        MAX_IMAGE_UPLOAD_BYTES,
+        MAX_PDF_UPLOAD_BYTES,
+        MAX_TEXT_UPLOAD_BYTES,
+    )
+
+    assert MAX_IMAGE_UPLOAD_BYTES <= MAX_ATTACHMENT_UPLOAD_BYTES
+    assert MAX_PDF_UPLOAD_BYTES <= MAX_ATTACHMENT_UPLOAD_BYTES
+    assert MAX_TEXT_UPLOAD_BYTES <= MAX_ATTACHMENT_UPLOAD_BYTES
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("data.csv", "text/csv"),
+        ("notes.txt", "text/plain"),
+        ("main.py", "text/x-python"),
+        ("app.ts", "text/typescript"),
+        ("readme.md", "text/markdown"),
+        ("nb.ipynb", "application/x-ipynb+json"),
+    ],
+)
+def test_attachment_text_type_for_extension_recognised(filename: str, expected: str) -> None:
+    """Known text/code extensions resolve to a text-like MIME (the fallback
+    used when the declared MIME mislabels them as binary)."""
+    from omnigent.runtime.content_resolver import attachment_text_type_for_extension
+
+    assert attachment_text_type_for_extension(filename) == expected
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["sheet.xls", "sheet.xlsx", "deck.pptx", "doc.docx", "archive.zip", "blob", None],
+)
+def test_attachment_text_type_for_extension_rejects_binary(filename: str | None) -> None:
+    """Real binaries (and missing/unknown extensions) get no text fallback,
+    so they stay rejected even if the declared MIME is wrong."""
+    from omnigent.runtime.content_resolver import attachment_text_type_for_extension
+
+    assert attachment_text_type_for_extension(filename) is None
+
+
+def test_text_code_extensions_resolve_to_allowed_text() -> None:
+    """Every declared text/code extension resolves to a text-like type that
+    has an upload limit — so the route's extension fallback admits it (no 415),
+    regardless of the browser-reported MIME."""
+    from omnigent.runtime.content_resolver import (
+        _TEXT_CODE_EXTENSIONS,
+        attachment_text_type_for_extension,
+        attachment_upload_limit,
+    )
+
+    for ext in _TEXT_CODE_EXTENSIONS:
+        mime = attachment_text_type_for_extension(f"file{ext}")
+        assert mime is not None, f"{ext} resolved to no text type"
+        assert attachment_upload_limit(mime) is not None, f"{ext} -> {mime} has no limit"
+
+
+def test_client_server_attachment_extension_parity() -> None:
+    """The web client's TEXT_CODE_EXTENSIONS must all be accepted server-side,
+    even when the browser reports a non-text MIME — the parity contract the two
+    share. Guards against the client gate admitting a file the upload route then
+    415s (the divergence Polly flagged)."""
+    import re
+    from pathlib import Path
+
+    from omnigent.runtime.content_resolver import (
+        _resolve_content_type,
+        attachment_text_type_for_extension,
+        attachment_upload_limit,
+    )
+
+    ts_path = Path(__file__).resolve().parents[2] / "web" / "src" / "lib" / "attachments.ts"
+    if not ts_path.exists():
+        pytest.skip("web/src/lib/attachments.ts not present (server-only checkout)")
+    block = ts_path.read_text().split("TEXT_CODE_EXTENSIONS = new Set([")[1].split("]")[0]
+    client_exts = re.findall(r'"(\.[a-z0-9]+)"', block)
+    assert client_exts, "could not parse client TEXT_CODE_EXTENSIONS"
+
+    # MIMEs a browser/OS might attach to these extensions, including wrong ones.
+    worst_case_mimes = [
+        "",
+        "application/octet-stream",
+        "video/mp2t",  # .ts
+        "application/xml",  # .xml
+        "application/x-ruby",  # .rb
+    ]
+
+    def server_accepts(name: str, browser_mime: str) -> bool:
+        content_type = _resolve_content_type(browser_mime, name)
+        limit = attachment_upload_limit(content_type)
+        if limit is None:
+            ext_type = attachment_text_type_for_extension(name)
+            if ext_type is not None:
+                limit = attachment_upload_limit(ext_type)
+        return limit is not None
+
+    rejected = [
+        (ext, mime)
+        for ext in client_exts
+        for mime in worst_case_mimes
+        if not server_accepts(f"file{ext}", mime)
+    ]
+    assert not rejected, f"client accepts but server would 415: {rejected}"
+
+
+# ── extract_text_attachments (request-phase PII scanning) ─────────
+
+
+def _stores_with(
+    file_id: str,
+    filename: str,
+    content_type: str,
+    blob: bytes,
+    session_id: str | None = None,
+) -> tuple[FakeFileStore, FakeArtifactStore]:
+    """Build fake stores holding one attachment.
+
+    :returns: ``(file_store, artifact_store)`` with the given file.
+    """
+    fs = FakeFileStore(
+        files={
+            file_id: StoredFile(
+                id=file_id,
+                created_at=1000,
+                filename=filename,
+                bytes=len(blob),
+                content_type=content_type,
+                session_id=session_id,
+            )
+        }
+    )
+    return fs, FakeArtifactStore(blobs={file_id: blob})
+
+
+def test_extracts_text_from_csv_attachment() -> None:
+    """A text/csv ``input_file`` attachment's content is decoded for scanning.
+
+    Regression for #2906: an attached CSV is base64-inlined to the model and
+    never appears in the typed message, so its PII must be surfaced here for
+    the request-phase PII policy to catch it.
+    """
+    csv = b"id,full_name,credit_card\n1,Alice,4111 1111 1111 1111\n"
+    fs, arts = _stores_with("file_csv", "data.csv", "text/csv", csv)
+    content = [
+        {"type": "input_text", "text": "print this"},
+        {"type": "input_file", "file_id": "file_csv"},
+    ]
+    out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
+    assert len(out) == 1
+    assert out[0]["filename"] == "data.csv"
+    assert out[0]["content_type"] == "text/csv"
+    assert "4111 1111 1111 1111" in out[0]["text"]
+
+
+def test_skips_binary_attachments() -> None:
+    """Non-text attachments (image/PDF) are not decoded."""
+    fs, arts = _stores_with("file_png", "photo.png", "image/png", PNG_BYTES)
+    content = [{"type": "input_file", "file_id": "file_png"}]
+    assert extract_text_attachments(content, fs, arts) == []  # type: ignore[arg-type]
+
+
+def test_ignores_non_input_file_blocks() -> None:
+    """Only ``input_file`` blocks are considered; text blocks are left to the
+    normal user-text extraction path."""
+    fs, arts = _stores_with("file_csv", "data.csv", "text/csv", b"a,b\n1,2\n")
+    content = [{"type": "input_text", "text": "ssn 123-45-6789"}]
+    assert extract_text_attachments(content, fs, arts) == []  # type: ignore[arg-type]
+
+
+def test_missing_file_is_best_effort() -> None:
+    """A dangling file_id is skipped, not raised — scanning must not break
+    message delivery."""
+    fs = FakeFileStore(files={})
+    arts = FakeArtifactStore(blobs={})
+    content = [{"type": "input_file", "file_id": "file_gone"}]
+    assert extract_text_attachments(content, fs, arts) == []  # type: ignore[arg-type]
+
+
+def test_skips_foreign_session_file() -> None:
+    """A file owned by another session is not scanned (ownership guard)."""
+    fs, arts = _stores_with(
+        "file_csv", "data.csv", "text/csv", b"cc 4111 1111 1111 1111", session_id="other"
+    )
+    content = [{"type": "input_file", "file_id": "file_csv"}]
+    out = extract_text_attachments(content, fs, arts, session_id="mine")  # type: ignore[arg-type]
+    assert out == []

@@ -47,12 +47,12 @@ import shutil
 import uuid
 from pathlib import Path
 
-from tests._model_pools import resolve_model
 from tests.e2e.omnigent._pexpect_harness import (
     clean_exit,
     spawn_omnigent_run,
     submit_prompt,
 )
+from tests.e2e.omnigent.conftest import configure_mock_llm
 
 # A deliberately distinctive URL the agent will echo — picked
 # so the OSC 8 byte sequence containing it can be unambiguously
@@ -84,7 +84,7 @@ prompt: |
      turn with the literal text "DONE".
 
 executor:
-  model: databricks-gpt-5-mini
+  model: mock-model
   harness: openai-agents
 
 os_env:
@@ -94,7 +94,7 @@ os_env:
     type: none
 """
 
-_MODEL = resolve_model("databricks-gpt-5-mini", key=__name__)
+_MODEL = "mock-model"
 _HARNESS = "openai-agents"
 
 # Whole run usually takes 15–25 s (one tool call + one
@@ -108,8 +108,8 @@ _EXIT_TIMEOUT = 15.0
 def test_run_omnigent_url_linkify_emits_osc_8_in_pty(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
-    databricks_workspace: tuple[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
     """
@@ -119,9 +119,8 @@ def test_run_omnigent_url_linkify_emits_osc_8_in_pty(
     Strategy:
 
     1. Spawn ``omnigent run --omnigent`` via pexpect.
-    2. Drive a real LLM through a script that calls
-       ``sys_os_shell echo Visit <URL> for docs`` and ends
-       the turn.
+    2. Configure mock LLM to call ``sys_os_shell`` with the
+       echo command, then acknowledge with DONE.
     3. Capture all PTY output via ``logfile_read`` (a
        ``StringIO``).
     4. After ``DONE`` is observed, scan the captured bytes for
@@ -146,13 +145,30 @@ def test_run_omnigent_url_linkify_emits_osc_8_in_pty(
     :param omnigent_repo_root: Repo root used as cwd so the
         subprocess imports this worktree's ``omnigent``
         package, not the editable-install one.
-    :param omnigent_credentials_env: Env dict with
-        ``OPENAI_API_KEY`` etc. already set.
-    :param databricks_workspace: ``(profile, host)`` from the
-        conftest.
+    :param mock_credentials_env: Mock-LLM env vars pointing at
+        the mock server.
+    :param mock_llm_server_url: Mock server URL for configuring
+        response queues.
     :param tmp_path: Per-test pytest tmp dir, used only for
         the YAML file.
     """
+    # Turn 1: LLM calls sys_os_shell to echo the URL.
+    # Turn 2: LLM acknowledges with DONE.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_shell_1",
+                        "name": "sys_os_shell",
+                        "arguments": f'{{"command": "echo Visit {_TEST_URL} for docs"}}',
+                    }
+                ]
+            },
+            {"text": "The command output the URL. DONE"},
+        ],
+    )
     yaml_path = tmp_path / "linkify_e2e_test.yaml"
     yaml_path.write_text(_YAML_BODY)
 
@@ -164,7 +180,7 @@ def test_run_omnigent_url_linkify_emits_osc_8_in_pty(
     test_tmpdir = Path("/tmp") / f"oa-linkify-{short_id}"
     test_tmpdir.mkdir()
     try:
-        env = dict(omnigent_credentials_env)
+        env = dict(mock_credentials_env)
         env["TMPDIR"] = str(test_tmpdir)
 
         captured = io.StringIO()

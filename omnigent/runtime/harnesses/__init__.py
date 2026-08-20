@@ -24,47 +24,17 @@ sibling modules; this ``__init__.py`` is just the registry.
 
 from __future__ import annotations
 
-# Harness-name → fully-qualified module path. Each module must
-# export ``create_app() -> FastAPI``; the runner imports the module,
-# calls the factory, and serves the result over a Unix socket.
-#
-# Populated as per-harness wraps land in Phase 1 step 4. The test
-# suite injects fixture entries at test time (via direct dict
-# mutation in conftest fixtures).
-_HARNESS_MODULES: dict[str, str] = {
-    # Step 4b: claude-sdk harness wrap. See
-    # omnigent/inner/claude_sdk_harness.py.
-    "claude-sdk": "omnigent.inner.claude_sdk_harness",
-    # User-facing alias accepted in specs / Omnigent harness dispatch.
-    "claude": "omnigent.inner.claude_sdk_harness",
-    # Native Claude Code terminal bridge used by ``omnigent claude``.
-    "claude-native": "omnigent.inner.claude_native_harness",
-    # Native Codex TUI terminal bridge used by ``omnigent codex``.
-    "codex-native": "omnigent.inner.codex_native_harness",
-    # Step 4c: codex harness wrap. See
-    # omnigent/inner/codex_harness.py.
-    "codex": "omnigent.inner.codex_harness",
-    # Step 4d: pi harness wrap. See
-    # omnigent/inner/pi_harness.py.
-    "pi": "omnigent.inner.pi_harness",
-    # Step 4e: openai-agents harness wrap. See
-    # omnigent/inner/openai_agents_sdk_harness.py. Registry
-    # key is the Omnigent-side spelling (``openai-agents``,
-    # no ``-sdk`` suffix) to match
-    # ``OmnigentExecutor``'s harness allowlist and the
-    # ``executor.harness`` field used in Omnigent YAML; the
-    # backing Python module retains the ``_sdk`` suffix because
-    # the underlying SDK package is ``openai-agents`` and the
-    # executor class is :class:`OpenAIAgentsSDKExecutor`.
-    "openai-agents": "omnigent.inner.openai_agents_sdk_harness",
-    # Supervisor harness wrap. See
-    # omnigent/inner/databricks_supervisor_harness.py. Drives the Databricks
-    # Agent Bricks Supervisor API at
-    # ``{workspace}/ai-gateway/mlflow/v1/responses``. Differs from
-    # the SDK-wrapping harnesses above in that the inner executor
-    # has no third-party SDK dependency — it talks HTTP / SSE
-    # directly to the Databricks gateway.
-    "databricks_supervisor": "omnigent.inner.databricks_supervisor_harness",
-}
+from omnigent.harness_plugins import harness_modules
+
+# Harness-name -> fully-qualified module path, sourced from the harness
+# registry (built-ins + installed community plugins). Each module must
+# export ``create_app() -> FastAPI``; the runner imports the module, calls
+# the factory, and serves the result over a Unix socket. The historical
+# mutable-dict surface is preserved (tests inject fixture entries by dict
+# mutation), but the contents come from the dynamic registry, not a literal.
+
+# Keep the historical mutable dict surface while sourcing builtins and
+# community plugins from the dynamic registry.
+_HARNESS_MODULES = harness_modules()
 
 __all__ = ["_HARNESS_MODULES"]

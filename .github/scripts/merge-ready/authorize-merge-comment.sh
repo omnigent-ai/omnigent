@@ -4,8 +4,8 @@
 # `/merge` only enables auto-merge / direct-merges an already-mergeable
 # PR -- branch protection still blocks red or unreviewed PRs -- so the
 # bar is repo write access, not the stricter MAINTAINER set that gates
-# `force-merge`. This keeps `/merge` usable by the whole team while
-# blocking outside contributors and drive-by accounts.
+# the maintainer-only waivers. This keeps `/merge` usable by the whole
+# team while blocking outside contributors and drive-by accounts.
 #
 # The job-level `if` already pre-filters on author_association as a
 # cheap first pass; this is the authoritative check, because an org

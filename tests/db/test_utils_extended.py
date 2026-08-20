@@ -19,11 +19,12 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from omnigent.db.db_models import SqlUser
+from omnigent.db.query_context import current_query_name, query_name_scope
 from omnigent.db.utils import (
-    _ITEM_TYPE_PREFIX,
+    _ITEM_TYPES,
     clear_engine_cache,
     delete_fts_by_conversation,
     ensure_fts_table,
@@ -34,6 +35,7 @@ from omnigent.db.utils import (
     get_or_create_engine,
     insert_fts,
     make_managed_session_maker,
+    make_named_managed_session_maker,
     normalize_database_url,
     now_epoch,
     now_epoch_us,
@@ -113,7 +115,7 @@ class TestManagedSessionMaker:
 
         # Data should be visible in a new session
         with managed() as session:
-            loaded = session.get(SqlUser, "commit_test")
+            loaded = session.get(SqlUser, (0, "commit_test"))
             assert loaded is not None
 
     def test_auto_rollback_on_exception(self, db_uri: str) -> None:
@@ -127,11 +129,13 @@ class TestManagedSessionMaker:
 
         # Data should NOT be visible
         with managed() as session:
-            loaded = session.get(SqlUser, "rollback_test")
+            loaded = session.get(SqlUser, (0, "rollback_test"))
             assert loaded is None
 
     def test_sqlite_foreign_keys_enabled(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
+        if engine.dialect.name != "sqlite":
+            pytest.skip("PRAGMA foreign_keys is SQLite-only")
         managed = make_managed_session_maker(engine)
 
         with managed() as session:
@@ -147,8 +151,66 @@ class TestManagedSessionMaker:
             session.add(SqlUser(id="immediate_test", is_admin=False))
 
         with managed() as session:
-            loaded = session.get(SqlUser, "immediate_test")
+            loaded = session.get(SqlUser, (0, "immediate_test"))
             assert loaded is not None
+
+    def test_named_session_covers_implicit_flush_and_commit(self, db_uri: str) -> None:
+        engine = get_or_create_engine(db_uri)
+        managed = make_named_managed_session_maker(
+            engine,
+            query_name_prefix="omnigent.test_store",
+        )
+        observed_names: list[str | None] = []
+
+        def capture_name(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: bool,
+        ) -> None:
+            if statement.lstrip().upper().startswith("INSERT"):
+                observed_names.append(current_query_name())
+
+        event.listen(engine, "before_cursor_execute", capture_name)
+        try:
+            with managed("insert_user") as session:
+                session.add(SqlUser(id="named_session_test", is_admin=False))
+        finally:
+            event.remove(engine, "before_cursor_execute", capture_name)
+
+        assert observed_names == ["omnigent.test_store.insert_user"]
+        assert current_query_name() is None
+
+    def test_nested_query_name_overrides_and_restores_session_name(self, db_uri: str) -> None:
+        engine = get_or_create_engine(db_uri)
+        managed = make_named_managed_session_maker(
+            engine,
+            query_name_prefix="omnigent.test_store",
+        )
+
+        with managed("outer_operation") as session:
+            assert current_query_name() == "omnigent.test_store.outer_operation"
+            with query_name_scope("omnigent.test_store.inner_query"):
+                session.execute(text("SELECT 1"))
+                assert current_query_name() == "omnigent.test_store.inner_query"
+            assert current_query_name() == "omnigent.test_store.outer_operation"
+
+        assert current_query_name() is None
+
+    def test_named_session_rejects_empty_names(self, db_uri: str) -> None:
+        engine = get_or_create_engine(db_uri)
+        with pytest.raises(ValueError, match="query_name_prefix must not be empty"):
+            make_named_managed_session_maker(engine, query_name_prefix=" ")
+
+        managed = make_named_managed_session_maker(
+            engine,
+            query_name_prefix="omnigent.test_store",
+        )
+        with pytest.raises(ValueError, match="query_name must not be empty"):
+            with managed(" "):
+                raise AssertionError("empty query name entered its session")
 
 
 # ── ID generators ─────────────────────────────────────
@@ -157,21 +219,22 @@ class TestManagedSessionMaker:
 class TestIdGenerators:
     def test_generate_file_id_format(self) -> None:
         fid = generate_file_id()
-        assert re.fullmatch(r"file_[0-9a-f]{32}", fid)
+        assert re.fullmatch(r"[0-9a-f]{32}", fid)
 
     def test_generate_conversation_id_format(self) -> None:
         cid = generate_conversation_id()
-        assert re.fullmatch(r"conv_[0-9a-f]{32}", cid)
+        assert re.fullmatch(r"[0-9a-f]{32}", cid)
 
     def test_generate_task_id_format(self) -> None:
+        # response ids stay prefixed: the column is a polymorphic harness token,
+        # not a bare uuid, so it is not narrowed to Uuid16.
         tid = generate_task_id()
         assert re.fullmatch(r"resp_[0-9a-f]{32}", tid)
 
     def test_generate_item_id_all_types(self) -> None:
-        for item_type, prefix in _ITEM_TYPE_PREFIX.items():
+        for item_type in _ITEM_TYPES:
             item_id = generate_item_id(item_type)
-            assert item_id.startswith(prefix), f"{item_type} should start with {prefix}"
-            assert len(item_id) == len(prefix) + 32
+            assert re.fullmatch(r"[0-9a-f]{32}", item_id), f"{item_type} -> {item_id}"
 
     def test_generate_item_id_unknown_type_raises(self) -> None:
         with pytest.raises(ValueError, match="unknown item type"):
@@ -194,12 +257,24 @@ class TestFtsHelpers:
 
     def test_insert_and_search_fts(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
+        if engine.dialect.name != "sqlite":
+            pytest.skip("FTS5 virtual table is SQLite-only; no-op on other backends")
         ensure_fts_table(engine)
         managed = make_managed_session_maker(engine)
 
         with managed() as session:
-            insert_fts(session, "msg_1", "conv_1", "hello world")
-            insert_fts(session, "msg_2", "conv_1", "goodbye world")
+            insert_fts(
+                session,
+                "9980c8a9248139f14f4165e5d53088aa",
+                "8e32600337d08f59ad381caf96a90659",
+                "hello world",
+            )
+            insert_fts(
+                session,
+                "0fd4e86b2daa009cd9929641dbd7dab6",
+                "8e32600337d08f59ad381caf96a90659",
+                "goodbye world",
+            )
 
         with managed() as session:
             rows = session.execute(
@@ -209,24 +284,37 @@ class TestFtsHelpers:
                 )
             ).fetchall()
             assert len(rows) == 1
-            assert rows[0][0] == "msg_1"
+            assert rows[0][0] == "9980c8a9248139f14f4165e5d53088aa"
 
     def test_delete_fts_by_conversation(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
+        if engine.dialect.name != "sqlite":
+            pytest.skip("FTS5 virtual table is SQLite-only; no-op on other backends")
         ensure_fts_table(engine)
         managed = make_managed_session_maker(engine)
 
         with managed() as session:
-            insert_fts(session, "msg_a", "conv_del", "searchable text")
-            insert_fts(session, "msg_b", "conv_keep", "also searchable")
+            insert_fts(
+                session,
+                "83cd574b729d39c61cf72d568188531a",
+                "553a265445caf1cdb034abe0b449485d",
+                "searchable text",
+            )
+            insert_fts(
+                session,
+                "0917d69fc9d16f420210e37ed3ef5f31",
+                "aacdf565fffe01a05b5f40d6c4ac83d7",
+                "also searchable",
+            )
 
         with managed() as session:
-            delete_fts_by_conversation(session, "conv_del")
+            delete_fts_by_conversation(session, "553a265445caf1cdb034abe0b449485d")
 
         with managed() as session:
             deleted = session.execute(
                 text(
-                    "SELECT item_id FROM conversation_items_fts WHERE conversation_id = 'conv_del'"
+                    "SELECT item_id FROM conversation_items_fts"
+                    " WHERE conversation_id = '553a265445caf1cdb034abe0b449485d'"
                 )
             ).fetchall()
             assert len(deleted) == 0
@@ -234,7 +322,7 @@ class TestFtsHelpers:
             kept = session.execute(
                 text(
                     "SELECT item_id FROM conversation_items_fts "
-                    "WHERE conversation_id = 'conv_keep'"
+                    "WHERE conversation_id = 'aacdf565fffe01a05b5f40d6c4ac83d7'"
                 )
             ).fetchall()
             assert len(kept) == 1

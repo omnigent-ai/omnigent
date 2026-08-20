@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import builtins
+
 from sqlalchemy import and_, asc, desc, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.converters import sql_agent_to_entity
-from omnigent.db.db_models import SqlAgent
+from omnigent.db.db_models import (
+    SqlAgent,
+    SqlConversation,
+    current_workspace_id,
+)
+from omnigent.db.enum_codecs import encode_agent_kind
 from omnigent.db.utils import (
+    get_or_create_conversation_engine,
     get_or_create_engine,
-    make_managed_session_maker,
+    make_named_managed_session_maker,
     now_epoch,
 )
 from omnigent.entities import Agent, PagedList
@@ -22,20 +31,78 @@ class SqlAlchemyAgentStore(AgentStore):
     Persists agents in a relational database via SQLAlchemy ORM.
     """
 
-    def __init__(self, storage_location: str) -> None:
+    def __init__(
+        self, storage_location: str, conversation_storage_location: str | None = None
+    ) -> None:
         """
         Initialize the SQLAlchemy agent store.
 
         Creates or reuses a SQLAlchemy engine and session factory
         for the given database URI.
 
-        :param storage_location: SQLAlchemy database URI,
+        :param storage_location: SQLAlchemy database URI for the Omnigent DB,
             e.g. ``"sqlite:///agents.db"`` or
-            ``"postgresql://user:pass@host/db"``.
+            ``"postgresql://<user>:<password>@host/db"``.
+        :param conversation_storage_location: Optional URI for the Agent
+            Platform DB. The ``conversations`` table lives there, and
+            resolving a session-scoped agent's ``session_id`` requires a
+            reverse lookup on ``conversations.agent_id``. Defaults to
+            ``storage_location`` when ``None`` (single-DB mode).
         """
         super().__init__(storage_location)
+        self.conversation_storage_location = conversation_storage_location
         self._engine = get_or_create_engine(storage_location)
-        self._session = make_managed_session_maker(self._engine)
+        self._session = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.agent_store",
+        )
+        conv_uri = conversation_storage_location or storage_location
+        self._conv_engine = (
+            self._engine
+            if conv_uri == storage_location
+            else get_or_create_conversation_engine(conv_uri)
+        )
+        self._conv_session = make_named_managed_session_maker(
+            self._conv_engine,
+            query_name_prefix="omnigent.agent_store",
+        )
+
+    def _session_id_for_agent(self, agent_id: str) -> str | None:
+        """
+        Resolve a session-scoped agent to a conversation in its spawn tree.
+
+        The returned id backs the owning-session authorization in
+        ``validate_session_agent``: the caller must have READ on the agent's
+        session, so no one can run another user's private agent by guessing its
+        raw id. Access is resolved at the spawn-tree ROOT —
+        ``check_session_access`` walks ``parent_conversation_id`` up to the root
+        and grants on the root's ACL — so any conversation in the tree
+        authorizes identically.
+
+        That is what makes this a single bounded query. Named ``sys_session_send``
+        children are created bound to the *same* ``agent_id`` as their mint, so
+        several conversation rows can share it — but they all carry the SAME
+        ``root_conversation_id`` (children inherit their parent's root, and the
+        mint's own root when it is itself a child). So selecting the root from
+        *any one* of them (an unordered ``LIMIT 1``) is unambiguous and O(1):
+        there is no "wrong row" to return. It also sidesteps read-replica lag —
+        the root is the oldest node in the tree, never a just-written child that
+        a replica has not caught up to. ``conversations`` lives on the AP DB, so
+        this runs on the conversation engine.
+
+        :param agent_id: Agent identifier, e.g. ``"ag_abc123"``.
+        :returns: The agent's spawn-tree root conversation id, or ``None`` when
+            no conversation points at this agent.
+        """
+        with self._conv_session("select_session_id_for_agent") as conv_sess:
+            return conv_sess.execute(
+                select(SqlConversation.root_conversation_id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.agent_id == agent_id,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
 
     def create(
         self,
@@ -45,7 +112,7 @@ class SqlAlchemyAgentStore(AgentStore):
         description: str | None = None,
     ) -> Agent:
         """
-        Register a new agent in the database.
+        Register a new template agent in the database.
 
         :param agent_id: Pre-generated unique agent identifier,
             e.g. ``"ag_0f1a2b3c..."``.
@@ -62,9 +129,25 @@ class SqlAlchemyAgentStore(AgentStore):
             name=name,
             bundle_location=bundle_location,
             version=1,
+            kind=encode_agent_kind("template"),
             description=description,
         )
-        with self._session() as session:
+        with self._session("create_agent") as session:
+            # Template names are unique within a workspace. This can't be a
+            # partial unique index (MySQL has none), so enforce it here.
+            conflict = session.execute(
+                select(SqlAgent.id).where(
+                    SqlAgent.workspace_id == current_workspace_id(),
+                    SqlAgent.name == name,
+                    SqlAgent.kind == encode_agent_kind("template"),
+                )
+            ).first()
+            if conflict is not None:
+                raise IntegrityError(
+                    "Duplicate template agent name",
+                    params={"name": name},
+                    orig=Exception(f"UNIQUE constraint: name={name!r}"),
+                )
             session.add(row)
             return sql_agent_to_entity(row)
 
@@ -76,23 +159,35 @@ class SqlAlchemyAgentStore(AgentStore):
             e.g. ``"agent_abc123"``.
         :returns: The :class:`Agent` if found, otherwise ``None``.
         """
-        with self._session() as session:
-            row = session.get(SqlAgent, agent_id)
-            return sql_agent_to_entity(row) if row else None
+        with self._session("select_agent_by_id") as session:
+            row = session.get(SqlAgent, (current_workspace_id(), agent_id))
+            if row is None:
+                return None
+        # For session-scoped agents, derive the owning conversation id
+        # from the forward pointer so callers can use agent.session_id.
+        # Runs outside the Omnigent session: the lookup targets the AP DB.
+        session_id: str | None = None
+        if row.kind == encode_agent_kind("session"):
+            session_id = self._session_id_for_agent(agent_id)
+        return sql_agent_to_entity(row, session_id=session_id)
 
     def get_by_name(self, name: str) -> Agent | None:
         """
         Look up a registered template agent by its unique name.
 
+        Only agents with ``kind = 'template'`` are returned; session-scoped
+        copies bound to a specific conversation are excluded.
+
         :param name: The template agent's unique name,
             e.g. ``"code-assistant"``.
         :returns: The :class:`Agent` if found, otherwise ``None``.
         """
-        with self._session() as session:
+        with self._session("select_agent_by_name") as session:
             row = session.execute(
                 select(SqlAgent).where(
+                    SqlAgent.workspace_id == current_workspace_id(),
                     SqlAgent.name == name,
-                    SqlAgent.session_id.is_(None),
+                    SqlAgent.kind == encode_agent_kind("template"),
                 )
             ).scalar_one_or_none()
             return sql_agent_to_entity(row) if row else None
@@ -107,6 +202,9 @@ class SqlAlchemyAgentStore(AgentStore):
         """
         List registered template agents with cursor-based pagination.
 
+        Only agents with ``kind = 'template'`` are returned; session-scoped
+        copies are excluded.
+
         :param limit: Maximum number of agents to return.
         :param after: Cursor agent ID; return agents appearing
             after this agent in sort order,
@@ -116,28 +214,27 @@ class SqlAlchemyAgentStore(AgentStore):
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :returns: A :class:`PagedList` of :class:`Agent` objects.
         """
-        with self._session() as session:
+        with self._session("list_agents") as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
-            template_agent = SqlAgent.session_id.is_(None)
-            stmt = select(SqlAgent).where(template_agent)
+            is_template = SqlAgent.kind == encode_agent_kind("template")
+            in_workspace = SqlAgent.workspace_id == current_workspace_id()
+            stmt = select(SqlAgent).where(in_workspace, is_template)
             if after:
                 sub = (
                     select(SqlAgent.created_at)
-                    .where(SqlAgent.id == after, template_agent)
+                    .where(in_workspace, SqlAgent.id == after, is_template)
                     .scalar_subquery()
                 )
-                # "after" = further in sort direction
                 ts_cmp = SqlAgent.created_at < sub if is_desc else SqlAgent.created_at > sub
                 id_cmp = SqlAgent.id < after if is_desc else SqlAgent.id > after
                 stmt = stmt.where(or_(ts_cmp, and_(SqlAgent.created_at == sub, id_cmp)))
             if before:
                 sub = (
                     select(SqlAgent.created_at)
-                    .where(SqlAgent.id == before, template_agent)
+                    .where(in_workspace, SqlAgent.id == before, is_template)
                     .scalar_subquery()
                 )
-                # "before" = opposite of sort direction
                 ts_cmp = SqlAgent.created_at > sub if is_desc else SqlAgent.created_at < sub
                 id_cmp = SqlAgent.id > before if is_desc else SqlAgent.id < before
                 stmt = stmt.where(or_(ts_cmp, and_(SqlAgent.created_at == sub, id_cmp)))
@@ -156,7 +253,7 @@ class SqlAlchemyAgentStore(AgentStore):
                 has_more=has_more,
             )
 
-    def get_names(self, agent_ids: list[str]) -> dict[str, str]:
+    def get_names(self, agent_ids: builtins.list[str]) -> dict[str, str]:
         """
         Batch-fetch agent names for a list of IDs.
 
@@ -170,9 +267,12 @@ class SqlAlchemyAgentStore(AgentStore):
         """
         if not agent_ids:
             return {}
-        with self._session() as session:
+        with self._session("select_agent_names") as session:
             rows = session.execute(
-                select(SqlAgent.id, SqlAgent.name).where(SqlAgent.id.in_(agent_ids))
+                select(SqlAgent.id, SqlAgent.name).where(
+                    SqlAgent.workspace_id == current_workspace_id(),
+                    SqlAgent.id.in_(agent_ids),
+                )
             ).all()
             return {row.id: row.name for row in rows}
 
@@ -192,14 +292,18 @@ class SqlAlchemyAgentStore(AgentStore):
         :returns: The updated :class:`Agent`, or ``None`` if not
             found.
         """
-        with self._session() as session:
-            row = session.get(SqlAgent, agent_id)
+        with self._session("update_agent") as session:
+            row = session.get(SqlAgent, (current_workspace_id(), agent_id))
             if not row:
                 return None
             row.bundle_location = bundle_location
             row.version = row.version + 1
             row.updated_at = now_epoch()
-            return sql_agent_to_entity(row)
+        # Reverse lookup targets the AP DB — see _session_id_for_agent.
+        session_id: str | None = None
+        if row.kind == encode_agent_kind("session"):
+            session_id = self._session_id_for_agent(agent_id)
+        return sql_agent_to_entity(row, session_id=session_id)
 
     def delete(self, agent_id: str) -> bool:
         """
@@ -210,8 +314,8 @@ class SqlAlchemyAgentStore(AgentStore):
         :returns: ``True`` if the agent was deleted, ``False`` if
             it did not exist.
         """
-        with self._session() as session:
-            row = session.get(SqlAgent, agent_id)
+        with self._session("delete_agent") as session:
+            row = session.get(SqlAgent, (current_workspace_id(), agent_id))
             if not row:
                 return False
             session.delete(row)

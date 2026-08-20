@@ -18,20 +18,13 @@ def test_random_mascot_lines_returns_otto_the_starfish() -> None:
     lines = random_mascot_lines()
 
     assert lines == [
-        "             #/##            ",
-        "            ##/###           ",
-        "           ###/(##           ",
-        "          ####/####       ###",
-        "#//#######################//#",
-        " ####//##    ###(    #//#### ",
-        "   ######    ###    #####    ",
-        "  ############ (#######      ",
-        " #  #& #################     ",
-        " #/#####//##########/###     ",
-        "     #///###     ####//##    ",
-        "      ##             ##      ",
+        "⠀⠀⠀⢠⣿⡄⠀⠀⠀",
+        "⢴⣶⣶⠉⣿⠉⣶⣶⡦",
+        "⠀⠙⣿⣶⣿⣶⣿⠋⠀",
+        "⠀⢠⣿⡿⠿⢿⣿⡄⠀",
+        "⠀⠈⠁⠀⠀⠀⠈⠁⠀",
     ]
-    assert MASCOT_ART_COL_WIDTH == 29
+    assert MASCOT_ART_COL_WIDTH == 9
     # The art is symbol-only: no letters or digits anywhere.
     assert all(not any(ch.isalnum() for ch in line) for line in lines)
     assert all(len(line) == MASCOT_ART_COL_WIDTH for line in lines)

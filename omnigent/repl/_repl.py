@@ -13,10 +13,12 @@ import json
 import logging
 import os
 import pathlib
+import re
 import sys
+import tempfile
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, TextIO
+from typing import TYPE_CHECKING, Protocol, TextIO, TypeAlias
 
 from omnigent_client import (
     BlockContext,
@@ -24,6 +26,7 @@ from omnigent_client import (
     OmnigentClient,
     OmnigentError,
     ReasoningBlock,
+    RegisteredAgent,
     ResponseEndBlock,
     ResponseStartBlock,
     Session,
@@ -59,12 +62,17 @@ from omnigent_ui_sdk.terminal._formatter import FormattedItem
 from omnigent_ui_sdk.terminal._theme import LIGHT_THEME, get_theme
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion, merge_completers
 from prompt_toolkit.document import Document
+from prompt_toolkit.formatted_text import StyleAndTextTuples
+from prompt_toolkit.lexers import Lexer
 from rich.console import RenderableType
+from rich.markup import escape
 from rich.text import Text
 
 from omnigent.spec.types import SkillSpec
 
 if TYPE_CHECKING:
+    from omnigent_client._tool_handler import ToolCallInfo
+
     from omnigent.server.schemas import SessionStatusEvent
 
 _log = logging.getLogger(__name__)
@@ -121,15 +129,6 @@ def _is_recoverable_sse_transport_error(exc: BaseException) -> bool:
     return False
 
 
-# Type aliases for the slash-command dispatch contract. Every
-# ``_cmd_*`` handler binds these in the same order; centralizing
-# the alias keeps a future signature change to a single edit.
-SlashCommandHandler = Callable[
-    [str, Session, OmnigentClient, TerminalHost, RichBlockFormatter],
-    Awaitable[None],
-]
-
-
 class _SessionSnapshot(Protocol):
     """
     Minimal snapshot shape returned by ``client.sessions``.
@@ -154,13 +153,32 @@ class _SessionSnapshot(Protocol):
         context-ring on resume without waiting for the first response.
     """
 
-    agent_id: str
-    agent_name: str | None
-    runner_id: str | None
-    reasoning_effort: str | None
-    llm_model: str | None
-    context_window: int | None
-    last_total_tokens: int | None
+    @property
+    def agent_id(self) -> str: ...
+
+    @property
+    def agent_name(self) -> str | None: ...
+
+    @property
+    def runner_id(self) -> str | None: ...
+
+    @property
+    def reasoning_effort(self) -> str | None: ...
+
+    @property
+    def model_override(self) -> str | None: ...
+
+    @property
+    def llm_model(self) -> str | None: ...
+
+    @property
+    def harness(self) -> str | None: ...
+
+    @property
+    def context_window(self) -> int | None: ...
+
+    @property
+    def last_total_tokens(self) -> int | None: ...
 
 
 # Key-binding hints rendered on the welcome panel's second line.
@@ -172,6 +190,12 @@ class _SessionSnapshot(Protocol):
 # by iTerm2/Warp/tmux). Updating the hint without updating the
 # binding would desync the user's expectation from what actually
 # fires.
+# NOTE: keep this list short enough that the bottom toolbar
+# (``{model · state} … hints … state: sleeping``) fits the e2e PTY
+# width (120 cols). Adding an entry here can wrap the toolbar and
+# split the ``state: sleeping`` sync marker the e2e harness waits on
+# (tests/e2e/omnigent/_pexpect_harness.py). /quit discoverability is
+# served by the grouped ``/help`` output instead.
 WELCOME_HINTS = ["/help help", "Ctrl+O debug", "Ctrl+T show tools", "Esc cancel", "Ctrl+C exit"]
 
 # Per-request item count for ``client.sessions.list_items``
@@ -186,6 +210,13 @@ WELCOME_HINTS = ["/help help", "Ctrl+O debug", "Ctrl+T show tools", "Esc cancel"
 # overlay's single-page fetch silently dropped everything past
 # position 99.
 _LIST_ITEMS_PAGE_SIZE = 100
+
+# Sub-agent tree (state badge + ``↓`` menu). The depth cap mirrors web's
+# ``MAX_TREE_DEPTH`` so the CLI tree matches the web Agents rail; the poll
+# cadence refreshes deeper levels (the SSE stream only carries the active
+# session's direct children) while sub-agents are active.
+_MAX_SUBAGENT_TREE_DEPTH = 3
+_SUBAGENT_POLL_SECONDS = 2.0
 
 
 def _load_startup_theme() -> TerminalTheme:
@@ -358,6 +389,7 @@ def _build_startup_header(
     from omnigent.onboarding.detected import effective_config_with_detected
     from omnigent.onboarding.provider_config import (
         describe_active_credential,
+        first_available_provider,
         load_config,
         surface_default_provider,
     )
@@ -383,7 +415,24 @@ def _build_startup_header(
             # pi scope, else the cross-family fallback).
             entry = surface_default_provider(config, fam)
             if entry is None:
-                label = "not configured"
+                # No default for this surface — but a launch falls back to the
+                # first credential that can serve it (the same
+                # first_available_provider the runtime spawn-env builders use).
+                # Name it so the header tells the truth: no default was chosen,
+                # yet the head WILL launch through this one.
+                fallback = first_available_provider(config, fam)
+                if fallback is None:
+                    label = "not configured"
+                else:
+                    cred_text = credential_label(
+                        fallback.kind,
+                        fallback.name,
+                        profile=fallback.profile,
+                        display_name=fallback.display_name,
+                    )
+                    label = (
+                        f"no default → will use {_header_glyph(fallback.kind)} {cred_text}"
+                    ).strip()
             else:
                 cred_text = credential_label(
                     entry.kind,
@@ -408,6 +457,7 @@ def _render_startup_banner_ansi(
     ui_name: str,
     *,
     server_url: str | None = None,
+    server_version: str | None = None,
     header: _StartupHeader | None = None,
 ) -> str:
     """
@@ -419,29 +469,55 @@ def _render_startup_banner_ansi(
 
     When *header* is supplied, the box becomes a Claude-Code-style header:
     the agent name (bold) plus dim rows for the one-line summary, the
-    model + credential, the working folder, and (for a remote server) the
-    server URL; a per-family creds line is appended beneath the box for
-    multi-vendor agents. When *header* is ``None`` the box keeps its
-    minimal form — just the name, with the server URL taking the single
-    info row when the host is non-loopback (keybinding hints live in the
-    bottom toolbar, so the hint row is omitted).
+    model + credential, the working folder, and the server URL (shown for
+    any target, loopback included) with the installed version appended
+    inline as ``"<url>  ·  server <ver>"``; a per-family creds line is
+    appended beneath the box for multi-vendor agents. When *header* is
+    ``None`` the box keeps its minimal form — just the name, with the
+    server URL taking the single info row when the host is non-loopback
+    (keybinding hints live in the bottom toolbar, so the hint row is
+    omitted).
 
     :param ui_name: Humanized agent label shown bold at the top of the box.
-    :param server_url: Base URL the REPL is connected to. Surfaced only
-        when the host is non-loopback. ``None`` skips it.
+    :param server_url: Base URL the REPL is connected to. In the header
+        box it's shown for any target (including a local
+        ``http://127.0.0.1:<port>`` dev server); the minimal banner still
+        surfaces it only when the host is non-loopback. ``None`` skips it.
+    :param server_version: Installed server version (e.g. ``"0.3.0.dev0"``)
+        from a best-effort ``GET /v1/info`` probe, rendered inline on the
+        server-URL row (or its own row if there's no URL). ``None`` (probe
+        failed /
+        not attempted) skips the row. Only consulted on the *header* path.
     :param header: Resolved header data (folder / model / credential /
         summary / creds line) from :func:`_build_startup_header`, or
         ``None`` for the minimal banner.
     :returns: ANSI-styled string ready to be written to stdout.
     """
+    from omnigent.cli_auth import is_workspace_hosted_url
+    from omnigent.conversation_browser import display_server_url
     from omnigent.inner.banner import BannerLine, startup_banner_strings
 
     remote = _is_remote_server_url(server_url)
+    # User-facing form of the URL: a Databricks workspace-hosted server is
+    # connected to on its ``/api/2.0/omnigent`` API mount, but the banner
+    # should show the recognizable workspace ``/omnigent`` URL. Non-Databricks
+    # URLs pass through unchanged. The probe still uses the real base URL via
+    # the client; only the displayed string is mapped.
+    display_url = display_server_url(server_url) if server_url else server_url
+    # Suppress the version on Databricks workspace mounts — a workspace build
+    # has no meaningful version string to show (authoritative gate; the call
+    # site also skips the probe there, but this guarantees it never renders
+    # regardless of caller).
+    version = (
+        None
+        if (server_url is not None and is_workspace_hosted_url(server_url))
+        else server_version
+    )
 
     if header is None:
         banner = startup_banner_strings(
             ui_name,
-            hint_line=server_url if remote else "",
+            hint_line=display_url if remote else "",
             art_color="#F43BA6",
         )
         return banner.ansi
@@ -460,8 +536,20 @@ def _render_startup_banner_ansi(
     elif header.model_label:
         info_lines.append(BannerLine(header.model_label, dim=True))
     info_lines.append(BannerLine(header.folder, dim=True))
-    if remote and server_url is not None:
-        info_lines.append(BannerLine(server_url, dim=True))
+    # Server URL + installed version on one row: "<url>  ·  server <ver>".
+    # The URL is shown for ANY server target, loopback included — a local
+    # dev server (``http://127.0.0.1:<port>``) is meaningful context here,
+    # so "which server am I on / what version is it" reads as one line. The
+    # version comes from a best-effort ``GET /v1/info`` probe; when it's
+    # unresolved (slow / old server) only the URL shows, and when there's no
+    # URL at all the version stands on its own row.
+    if display_url is not None:
+        url_row = display_url
+        if version:
+            url_row = f"{display_url}  ·  server {version}"
+        info_lines.append(BannerLine(url_row, dim=True))
+    elif version:
+        info_lines.append(BannerLine(f"server {server_version}", dim=True))
 
     banner = startup_banner_strings(ui_name, info_lines=info_lines, art_color="#F43BA6")
     if header.creds_line:
@@ -476,6 +564,60 @@ def _render_startup_banner_ansi(
             f"  {_ANSI_DIM}{header.creds_line}{_ANSI_RESET}"
         )
     return banner.ansi
+
+
+async def _fetch_server_version(client: OmnigentClient) -> str | None:
+    """Best-effort server version for the header row, with a legacy fallback.
+
+    Tries ``GET /v1/info`` → ``server_version`` first, then falls back to
+    the long-standing ``GET /api/version`` → ``version`` endpoint. The
+    fallback matters for older servers (e.g. a staging deployment that
+    predates ``server_version`` landing in ``/v1/info``): ``/api/version``
+    has reported the same installed version for far longer, so the row
+    still fills in instead of waiting for that server to redeploy. Both
+    return the identical ``importlib.metadata`` version, so the fallback is
+    not a different value, just an older surface.
+
+    Routed through the REPL's already-connected :class:`OmnigentClient` so
+    the probe carries the SAME auth (bearer / cookie), base URL, and TLS /
+    custom-CA configuration the REPL is already using. These endpoints are
+    NOT universally unauthed — a hosted deployment (behind OIDC / accounts /
+    a Databricks front door) gates them like any other route, so a bare
+    credential-less GET would 401 and the version would silently never show
+    on exactly the remote servers where the URL row is displayed. Reusing
+    the authenticated client makes the probe answer there.
+
+    Because the client's ``httpx.AsyncClient`` is awaited directly (not run
+    on a thread), this never blocks the event loop. Each request is bounded
+    *per phase* (connect / read / write each 1.0s) so the worst case a
+    healthy-but-slow or unreachable server can add to the previously-instant
+    banner stays small — the connect phase, the dominant cost for an
+    unreachable host, fails within a second (and a dead host fails the first
+    request, so the fallback adds no latency there). Any failure —
+    unreachable, slow, 401/4xx/5xx, non-JSON, or a server too old to report
+    either field — returns ``None`` and the banner simply omits the version
+    row. A welcome-banner detail must never block or fail REPL boot, so this
+    swallows every error.
+
+    :param client: The connected client the REPL drives; its authenticated
+        ``_http`` and ``_base_url`` are reused for the probe.
+    :returns: The installed server version string (e.g. ``"0.3.0.dev0"``),
+        or ``None`` when it can't be resolved.
+    """
+    import httpx
+
+    timeout = httpx.Timeout(1.0)
+    # (endpoint, response key) pairs tried in order: the richer capabilities
+    # probe first, then the legacy version endpoint older servers still have.
+    for path, key in (("/v1/info", "server_version"), ("/api/version", "version")):
+        try:
+            resp = await client._http.get(f"{client._base_url}{path}", timeout=timeout)
+            version = resp.json().get(key)
+        except Exception:  # noqa: BLE001 — startup-UI boundary: never block boot on a banner detail
+            return None
+        if isinstance(version, str) and version:
+            return version
+    return None
 
 
 def _is_remote_server_url(url: str | None) -> bool:
@@ -534,9 +676,7 @@ def _humanize_agent_name(agent_name: str) -> str:
 class TimedFormatter(RichBlockFormatter):  # type: ignore[misc]
     """Shows final elapsed time after response completes."""
 
-    def __init__(self, **kwargs: object) -> None:
-        super().__init__(**kwargs)
-        self._start_time: float | None = None
+    _start_time: float | None = None
 
     def format_response_start(self, block: ResponseStartBlock) -> list[FormattedItem]:
         self._start_time = block.ctx.timestamp
@@ -765,9 +905,67 @@ class _ApprovalState:
         self._current_phase = None
 
 
+class _FieldInputState:
+    """Collect free-form field values one at a time via the main input loop.
+
+    Same future-based pattern as :class:`_ApprovalState` — no direct
+    ``input()`` calls so ``prompt_toolkit``'s ``patch_stdout`` is
+    never disrupted.
+    """
+
+    def __init__(self) -> None:
+        self._future: asyncio.Future[str] | None = None
+        self._field_name: str | None = None
+        # Set by ``cancel`` so the field-collection loop can tell an
+        # abort (Esc on the turn) apart from an empty submit and stop
+        # prompting rather than advancing to — and re-prompting for —
+        # the next field after the turn is already gone.
+        self._aborted: bool = False
+
+    @property
+    def pending(self) -> bool:
+        return self._future is not None and not self._future.done()
+
+    @property
+    def field_name(self) -> str | None:
+        return self._field_name
+
+    @property
+    def aborted(self) -> bool:
+        """:returns: ``True`` if collection was cancelled mid-prompt."""
+        return self._aborted
+
+    def begin(self, field_name: str) -> asyncio.Future[str]:
+        # A fresh prompt is never pre-aborted. Cleared here (not in the
+        # collection loop) so the flag spans exactly one begin/await
+        # cycle: the loop reads it the instant the await returns, and
+        # the only await between fields IS this ``begin``.
+        self._aborted = False
+        if self._future is not None and not self._future.done():
+            self._future.set_result("")
+        self._field_name = field_name
+        self._future = asyncio.get_running_loop().create_future()
+        return self._future
+
+    def resolve(self, text: str) -> bool:
+        if self._future is None or self._future.done():
+            return False
+        self._future.set_result(text)
+        self._future = None
+        self._field_name = None
+        return True
+
+    def cancel(self) -> None:
+        self._aborted = True
+        if self._future is not None and not self._future.done():
+            self._future.set_result("")
+        self._future = None
+        self._field_name = None
+
+
 def _build_elicitation_content_from_schema(
     schema: dict[str, object],
-) -> dict[str, object] | None:
+) -> dict[str, str | int | float | bool | list[str] | None] | None:
     """
     Delegate to the shared schema auto-fill utility.
 
@@ -780,7 +978,7 @@ def _build_elicitation_content_from_schema(
     """
     from omnigent.tools._elicitation_schema import build_accept_content_from_schema
 
-    return build_accept_content_from_schema(schema)  # type: ignore[arg-type]
+    return build_accept_content_from_schema(schema)
 
 
 def _make_elicitation_prompt(
@@ -885,9 +1083,11 @@ def _make_elicitation_prompt(
             ctx.mode == "url"
             and isinstance(ctx.url, str)
             and not ctx.url.startswith("/approve/")
-            and server_url
+            and server_url is not None
         )
         if _is_external_url:
+            assert server_url is not None
+            assert isinstance(ctx.url, str)
             # External URL (OAuth, MCP server, etc.) — show the link,
             # block keyboard approval.
             full_url = f"{server_url.rstrip('/')}{ctx.url}"
@@ -1070,7 +1270,11 @@ class _SessionsChatReplAdapter:
         self,
         client: OmnigentClient,
         agent_name: str,
-        tool_callables: dict[str, object] | None = None,
+        tool_callables: dict[
+            str,
+            Callable[[ToolCallInfo], object | Awaitable[object]],
+        ]
+        | None = None,
         hooks: StreamHooks | None = None,
         session_id: str | None = None,
         session_bundle: bytes | None = None,
@@ -1080,6 +1284,9 @@ class _SessionsChatReplAdapter:
         on_session_start: Callable[[str], None] | None = None,
         harness: str | None = None,
         attach_only: bool = False,
+        field_input_state: _FieldInputState | None = None,
+        host: TerminalHost | None = None,
+        fmt: RichBlockFormatter | None = None,
     ) -> None:
         """
         Wire the adapter; do NOT issue any HTTP calls.
@@ -1122,12 +1329,19 @@ class _SessionsChatReplAdapter:
             never bind/recover a runner (turns post to the session's
             existing host-bound runner). Used by ``omnigent attach``.
             ``False`` (default) is the runner-owning ``run`` path.
+        :param field_input_state: Shared state for collecting schema
+            field values interactively via the main input loop.
+        :param host: Terminal output channel for rendering field prompts.
+        :param fmt: Formatter for styling field prompts.
         """
         self._client = client
         self._agent_id: str | None = None
         self._agent_name = agent_name
         self._tool_callables = tool_callables
         self._hooks = hooks or StreamHooks()
+        self._field_input_state = field_input_state
+        self._host = host
+        self._fmt = fmt
         self._session_id: str | None = session_id
         self._session_bundle = session_bundle
         self._session_bundle_filename = session_bundle_filename
@@ -1139,6 +1353,21 @@ class _SessionsChatReplAdapter:
         # binding is owner-only, and re-binding would be a no-op even for the
         # owner. ``attach_only`` short-circuits all runner bind/recover logic.
         self._attach_only = attach_only
+        # Set while observing another session read-only (e.g. diving into a
+        # running sub-agent via :meth:`view_session`). Suppresses every
+        # runner-bind PATCH — including the periodic ``_runner_recover_watch``
+        # watchdog — so observing a sub-agent never hijacks its runner or
+        # disturbs the owned session's binding.
+        self._readonly_view = False
+        # Set while CO-DRIVING a sub-agent interactively from the ↓ selector:
+        # the displayed session is a child the user is chatting with, sends are
+        # POSTed to the CHILD's existing runner (co-drive, like the web UI), and
+        # the runner binding is NOT moved. Tracked SEPARATELY from
+        # ``_readonly_view`` (which stays ``True`` in this mode so the tree root
+        # stays frozen on the parent and no bind PATCH fires) so that enabling
+        # sends never re-roots the selector — Left-arrow still returns to the
+        # parent/root after a chat. See :meth:`view_session`.
+        self._interactive_child = False
         self._on_session_start = on_session_start
         self._session_start_notified = False
         self._bound_runner_id: str | None = None
@@ -1166,6 +1395,7 @@ class _SessionsChatReplAdapter:
         self._context_window: int | None = None
         self._last_total_tokens: int | None = None
         self._pending_local_tasks: dict[str, asyncio.Task[None]] = {}
+        self._turn_done: asyncio.Event
         # FIFO counter: local sends are already echoed by ``on_input``,
         # so their ``session.input.consumed`` events are suppressed.
         self._pending_local_user_sends: int = 0
@@ -1305,7 +1535,7 @@ class _SessionsChatReplAdapter:
         event's workflow already sees ``conv.model_override`` via the
         server-side fallback. After the session exists, persists
         through ``PATCH /v1/sessions/{id}`` (matching
-        :meth:`set_reasoning_effort`) so the ap-web picker and the
+        :meth:`set_reasoning_effort`) so the web picker and the
         REPL stay in sync on the next snapshot read.
 
         :param model: New model identifier, e.g. ``"claude-opus-4-7"``,
@@ -1422,6 +1652,9 @@ class _SessionsChatReplAdapter:
         if session.agent_name:
             self._agent_name = session.agent_name
         self._bound_runner_id = session.runner_id
+        # Don't clobber a runner if it is revived after timeout
+        if self._runner_recover is None and session.runner_id:
+            self._runner_id = session.runner_id
         self._reasoning_effort = session.reasoning_effort
         self._model_override = session.model_override
         self._llm_model = session.llm_model
@@ -1454,64 +1687,10 @@ class _SessionsChatReplAdapter:
             if self._session_id is not None and self._stream_task is not None:
                 return self._session_id
             if self._session_id is None:
-                if self._session_bundle is None:
-                    raise RuntimeError(
-                        "Sessions API fresh session creation requires a local agent bundle. "
-                        "Start the REPL from `omnigent run <agent.yaml>` so the CLI can "
-                        "upload the bundle through POST /v1/sessions."
-                    )
-                if _dbg:
-                    print(
-                        "[sessions-adapter] POST /v1/sessions multipart bundle",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                # Snapshot pre-create /model pick before hydration
-                # clobbers it; PATCHed below since create() has no
-                # model_override metadata field.
-                pending_model_override = self._model_override
-                session = await self._client.sessions.create(
-                    self._session_bundle,
-                    filename=self._session_bundle_filename,
-                    reasoning_effort=self._reasoning_effort,
-                    # Record the user's terminal cwd so the Web UI
-                    # can show "running locally in <workspace>" for
-                    # CLI sessions. Doesn't drive any behavior —
-                    # CLI sessions don't bind to a host_id, so the
-                    # ck_conversations_workspace_required_for_host
-                    # constraint isn't active.
-                    workspace=os.getcwd(),
-                )
-                self._session_id = session.id
-                self._hydrate_from_session_snapshot(session)
-                if pending_model_override is not None and session.model_override is None:
-                    # PATCH the pre-session ``/model`` pick so the
-                    # first event picks it up via conv.model_override.
-                    # ``silent`` skips the tmux ``/model`` forward —
-                    # the user already typed the command locally; we
-                    # don't want a second copy injected into the pane.
-                    try:
-                        patched = await self._client.sessions.set_model_override(
-                            self._session_id,
-                            model_override=pending_model_override,
-                            silent=True,
-                        )
-                        self._model_override = patched.model_override
-                    except Exception:  # noqa: BLE001 — REPL boundary; log and clear
-                        _log.warning(
-                            "Failed to apply pending /model=%r to session %s; "
-                            "clearing local cache.",
-                            pending_model_override,
-                            self._session_id,
-                            exc_info=True,
-                        )
-                        self._model_override = None
-                if _dbg:
-                    print(
-                        f"[sessions-adapter] session created id={self._session_id!r}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                if self._session_bundle is not None:
+                    await self._create_session_from_bundle(pending_debug=_dbg)
+                else:
+                    await self._create_session_from_registered_agent(pending_debug=_dbg)
             else:
                 if _dbg:
                     print(
@@ -1533,7 +1712,144 @@ class _SessionsChatReplAdapter:
                     name=f"sessions-adapter-recover-{self._session_id}",
                 )
             self._notify_session_start_once()
+            assert self._session_id is not None
             return self._session_id
+
+    async def _create_session_from_registered_agent(self, *, pending_debug: bool) -> None:
+        """
+        Create a session bound to an agent already registered server-side.
+
+        The remote-URL path: there is no local bundle to upload, so
+        resolve the picked name to its id and use the JSON create route.
+        A remote client also has no runner of its own, so adopt one the
+        server already has online — otherwise the first turn fails the
+        runner-binding precondition.
+
+        :param pending_debug: Whether to emit adapter debug lines.
+        :returns: None.
+        """
+        if pending_debug:
+            print(
+                "[sessions-adapter] POST /v1/sessions json agent_id",
+                file=sys.stderr,
+                flush=True,
+            )
+        # Skip the name lookup only when nothing needs it: we already know
+        # the id, and a bound runner means we don't need the harness either.
+        agent: RegisteredAgent | None = None
+        if self._agent_id is None or self._runner_id is None:
+            agent = await self._client.sessions.resolve_agent(self._agent_name)
+        agent_id = self._agent_id or (agent.id if agent is not None else None)
+        if agent_id is None:
+            raise RuntimeError(f"Could not resolve an agent id for {self._agent_name!r}")
+        if self._runner_id is None:
+            from omnigent.harness_aliases import canonicalize_harness
+
+            self._runner_id = await self._client.sessions.resolve_online_runner(
+                harness=agent.harness if agent is not None else None,
+                canonicalize=lambda name: canonicalize_harness(name) or name,
+            )
+            if pending_debug:
+                print(
+                    f"[sessions-adapter] adopted server runner {self._runner_id!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        # Snapshot the pre-create /model pick before hydration clobbers
+        # it; applied after create since create has no such field.
+        pending_model_override = self._model_override
+        session = await self._client.sessions.create_from_agent_id(
+            agent_id,
+            reasoning_effort=self._reasoning_effort,
+            workspace=os.getcwd(),
+        )
+        self._session_id = session.id
+        self._hydrate_from_session_snapshot(session)
+        await self._apply_pending_model_override(pending_model_override, session)
+        if pending_debug:
+            print(
+                f"[sessions-adapter] session created id={self._session_id!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    async def _create_session_from_bundle(self, *, pending_debug: bool) -> None:
+        """
+        Create a session by uploading the local agent bundle.
+
+        :param pending_debug: Whether to emit adapter debug lines.
+        :returns: None.
+        :raises RuntimeError: If called with no bundle available.
+        """
+        if self._session_bundle is None:
+            raise RuntimeError("Cannot create a bundled session without a bundle")
+        if pending_debug:
+            print(
+                "[sessions-adapter] POST /v1/sessions multipart bundle",
+                file=sys.stderr,
+                flush=True,
+            )
+        # Snapshot the pre-create /model pick before hydration clobbers
+        # it; applied after create since create has no such field.
+        pending_model_override = self._model_override
+        session = await self._client.sessions.create(
+            self._session_bundle,
+            filename=self._session_bundle_filename,
+            reasoning_effort=self._reasoning_effort,
+            # Record the user's terminal cwd so the Web UI can show
+            # "running locally in <workspace>" for CLI sessions. Doesn't
+            # drive any behavior — CLI sessions don't bind to a host_id,
+            # so the ck_conversations_workspace_required_for_host
+            # constraint isn't active.
+            workspace=os.getcwd(),
+        )
+        self._session_id = session.id
+        self._hydrate_from_session_snapshot(session)
+        await self._apply_pending_model_override(pending_model_override, session)
+        if pending_debug:
+            print(
+                f"[sessions-adapter] session created id={self._session_id!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    async def _apply_pending_model_override(
+        self, pending_model_override: str | None, session: _SessionSnapshot
+    ) -> None:
+        """
+        Apply a pre-session ``/model`` pick to a freshly created session.
+
+        Neither create route carries a ``model_override`` field, so a
+        ``/model`` typed before the first turn has to be PATCHed after
+        create for the first event to pick it up via
+        ``conv.model_override``. ``silent`` skips the tmux ``/model``
+        forward: the user already typed the command locally and we don't
+        want a second copy injected into the pane.
+
+        :param pending_model_override: The pick captured before create,
+            e.g. ``"opus"``. ``None`` is a no-op.
+        :param session: The created session snapshot.
+        :returns: None.
+        """
+        if pending_model_override is None or session.model_override is not None:
+            return
+        if self._session_id is None:
+            return
+        try:
+            patched = await self._client.sessions.set_model_override(
+                self._session_id,
+                model_override=pending_model_override,
+                silent=True,
+            )
+            self._model_override = patched.model_override
+        except Exception:  # noqa: BLE001 — REPL boundary; log and clear
+            _log.warning(
+                "Failed to apply pending /model=%r to session %s; clearing local cache.",
+                pending_model_override,
+                self._session_id,
+                exc_info=True,
+            )
+            self._model_override = None
 
     def _notify_session_start_once(self) -> None:
         """
@@ -1561,13 +1877,23 @@ class _SessionsChatReplAdapter:
         """
         # Attach/co-drive clients never bind: they post turns to the
         # session's existing host-bound runner. Binding is owner-only
-        # server-side, so a non-owner attach must not PATCH it.
-        if self._attach_only:
+        # server-side, so a non-owner attach must not PATCH it. The same
+        # holds while observing a sub-agent read-only — binding there would
+        # hijack the child's runner and orphan the parent.
+        if self._attach_only or self._readonly_view:
             return
         async with self._bind_lock:
             if self._session_id is None:
                 raise RuntimeError("Cannot bind runner before a session exists")
             if self._runner_id is None:
+                if self._session_bundle is None:
+                    # Remote target: we tried to adopt one of the server's
+                    # online runners at create time and found none.
+                    raise RuntimeError(
+                        "This server has no online runner to run the turn. Start one "
+                        "against it with `omnigent host --server <url>` (or run the "
+                        "agent locally with `omnigent run <agent.yaml>`), then retry."
+                    )
                 raise RuntimeError(
                     "Sessions API dispatch requires a registered runner id. "
                     "Start through `omnigent run <agent>` or pass --server so the CLI "
@@ -1697,6 +2023,13 @@ class _SessionsChatReplAdapter:
             The unbind is soft-failed on old servers (see
             :meth:`_unbind_runner_soft`).
         """
+        # Switching to a top-level session re-establishes runner ownership,
+        # so clear any read-only-view suppression (and interactive-child
+        # co-drive) left over from diving into a sub-agent — otherwise the bind
+        # below (and every later bind) no-ops and the switched-to session can
+        # never dispatch a turn.
+        self._readonly_view = False
+        self._interactive_child = False
         old_session_id = self._session_id
         if old_session_id is not None and old_session_id != new_session_id:
             await self._unbind_runner_soft(old_session_id)
@@ -1712,6 +2045,55 @@ class _SessionsChatReplAdapter:
         self._hydrate_from_session_snapshot(session)
         await self._bind_runner_if_needed()
 
+        self._stream_task = asyncio.create_task(self._stream_pump())
+        return new_session_id
+
+    async def view_session(
+        self, new_session_id: str, *, read_only: bool, interactive: bool = False
+    ) -> str:
+        """Re-point the displayed session WITHOUT moving runner bindings.
+
+        Unlike :meth:`switch_to_session` (a top-level ``/switch`` that
+        unbinds the old session's runner and PATCHes this REPL's runner onto
+        the new one), this only re-points the SSE stream + displayed session
+        id. It never unbinds the prior session nor binds the target — so an
+        active sub-agent keeps running on its own runner, and the parent
+        keeps the runner binding it needs to receive the sub-agent's result.
+
+        Used to dive into a sub-agent's conversation from the inline menu:
+        moving the *binding* there would orphan the parent (it could no longer
+        wake to collect the result) and hijack the child's runner, leaving the
+        sub-agent stuck "still running" with nothing delivered.
+
+        :param new_session_id: Session to observe, e.g. ``"conv_child123"``.
+        :param read_only: ``True`` while observing a sub-agent (suppresses
+            all runner-bind PATCHes via ``_readonly_view``); ``False`` when
+            returning to the owned top-level session so its runner-affinity
+            watchdog resumes.
+        :param interactive: ``True`` to CO-DRIVE the child — the user can send
+            messages, which POST to the child's existing runner (like the web
+            UI) with NO bind move. Only meaningful with ``read_only=True``
+            (interactive implies observing a child); it stays read-only of the
+            *runner binding* while lifting the plain-send guard. Returning to
+            the root passes ``interactive=False``.
+        :returns: The observed session id (echoed back).
+        """
+        # Apply the displayed-session state atomically up front (no await in
+        # between), so the background root-tracking poll never observes a
+        # half-applied switch (session id moved but flags not yet, or vice
+        # versa) and mistakes the sub-agent for the tree root. ``_readonly_view``
+        # stays the binding-suppression flag; ``_interactive_child`` separately
+        # gates sends, so co-driving a child never re-roots the selector.
+        self._session_id = new_session_id
+        self._readonly_view = read_only
+        self._interactive_child = interactive and read_only
+        if self._stream_task is not None:
+            self._stream_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._stream_task
+            self._stream_task = None
+        session = await self._client.sessions.get(new_session_id)
+        self._hydrate_from_session_snapshot(session)
         self._stream_task = asyncio.create_task(self._stream_pump())
         return new_session_id
 
@@ -1772,7 +2154,11 @@ class _SessionsChatReplAdapter:
                         flush=True,
                     )
                 async for event in self._client.sessions.stream(self._session_id):
-                    if isinstance(event, _StatusEv) and event.status in ("idle", "failed"):
+                    if isinstance(event, _StatusEv) and event.status in (
+                        "idle",
+                        "waiting",
+                        "failed",
+                    ):
                         turn_done = getattr(self, "_turn_done", None)
                         if turn_done is not None:
                             turn_done.set()
@@ -1832,7 +2218,7 @@ class _SessionsChatReplAdapter:
         input: str | list[dict[str, object]],
         *,
         files: list[str] | None = None,
-    ):
+    ) -> AsyncGenerator[object, None]:
         """
         Post a user message. Rendering is push-based via ``_on_event``.
 
@@ -1878,7 +2264,7 @@ class _SessionsChatReplAdapter:
                             "filename": pathlib.Path(path).name,
                         }
                     )
-            input = content_blocks  # type: ignore[assignment]
+            input = content_blocks
 
         if isinstance(input, str):
             content: list[dict[str, object]] = [{"type": "input_text", "text": input}]
@@ -1895,7 +2281,7 @@ class _SessionsChatReplAdapter:
         # uses this to know it should handle streaming text deltas
         # and tool rendering inline rather than as history items.
         self._is_streaming = True
-        self._turn_done: asyncio.Event = asyncio.Event()
+        self._turn_done = asyncio.Event()
         self._pending_local_user_sends += 1
 
         try:
@@ -1993,7 +2379,7 @@ class _SessionsChatReplAdapter:
             event_payload["model_override"] = self._model_override
 
         self._is_streaming = True
-        self._turn_done: asyncio.Event = asyncio.Event()
+        self._turn_done = asyncio.Event()
         command_key = (skill_name, arguments)
         self._pending_local_skill_slash_commands.append(command_key)
 
@@ -2033,7 +2419,7 @@ class _SessionsChatReplAdapter:
                 self._pending_local_skill_slash_commands.remove(command_key)
             self._is_streaming = False
 
-    async def cancel(self):
+    async def cancel(self) -> None:
         """
         Interrupt the running turn (if any).
 
@@ -2072,7 +2458,7 @@ class _SessionsChatReplAdapter:
         import inspect
         import json as _json
 
-        callable_fn = self._tool_callables.get(name) if self._tool_callables else None  # type: ignore[union-attr]
+        callable_fn = self._tool_callables.get(name) if self._tool_callables else None
         if callable_fn is None:
             return
 
@@ -2107,7 +2493,11 @@ class _SessionsChatReplAdapter:
 
         task = asyncio.create_task(_run(), name=f"client-tool-{call_id}")
         self._pending_local_tasks[call_id] = task
-        task.add_done_callback(lambda _t, _k=call_id: self._pending_local_tasks.pop(_k, None))
+
+        def _discard_task(_task: asyncio.Task[None]) -> None:
+            self._pending_local_tasks.pop(call_id, None)
+
+        task.add_done_callback(_discard_task)
 
     async def _handle_elicitation(
         self,
@@ -2159,11 +2549,18 @@ class _SessionsChatReplAdapter:
             if content is not None:
                 resolve_payload["content"] = content
             elif schema.get("properties"):
-                # Schema has properties we can't auto-fill — the REPL
-                # can't render arbitrary forms. Decline and tell the
-                # user to use the web UI.
-                # TODO: render schema fields as terminal input prompts.
-                resolve_payload["action"] = "decline"
+                # Never leave the elicitation unresolved: any failure
+                # while prompting (or a user abort) declines, so the
+                # agent turn doesn't hang waiting on a verdict that the
+                # background task would otherwise never POST.
+                try:
+                    prompted = await self._prompt_schema_fields(schema)
+                except Exception:  # noqa: BLE001
+                    prompted = None
+                if prompted is not None:
+                    resolve_payload["content"] = prompted
+                else:
+                    resolve_payload["action"] = "decline"
 
         try:
             # URL-based elicitation: deliver the verdict to the
@@ -2182,6 +2579,151 @@ class _SessionsChatReplAdapter:
                 # The harness already received the verdict — treat as no-op.
                 return
             raise
+
+    async def _prompt_schema_fields(
+        self,
+        schema: dict[str, object],
+    ) -> dict[str, str | int | float | bool | list[str] | None] | None:
+        """Prompt the user for each schema property via the main input loop.
+
+        Returns the filled content dict, or ``None`` if the interactive
+        state is unavailable (e.g. no ``_field_input_state`` wired up).
+        """
+        from rich.text import Text
+
+        fis = self._field_input_state
+        host = self._host
+        fmt = self._fmt
+        if fis is None or host is None or fmt is None:
+            return None
+
+        properties = schema.get("properties")
+        if not properties or not isinstance(properties, dict):
+            return None
+
+        required_value = schema.get("required", [])
+        required = set(required_value) if isinstance(required_value, list) else set()
+        content: dict[str, str | int | float | bool | list[str] | None] = {}
+
+        for key, prop in properties.items():
+            if not isinstance(prop, dict):
+                return None
+
+            prop_type = prop.get("type", "string")
+            description = prop.get("description", "")
+            default = prop.get("default")
+            enum_vals = prop.get("enum")
+            one_of = prop.get("oneOf")
+
+            # Build the prompt label.
+            label_parts: list[str] = [f"   {key}"]
+            if description:
+                label_parts.append(f" — {description}")
+            hint_parts: list[str] = []
+            if one_of and isinstance(one_of, list):
+                opts = [
+                    str(o.get("const", "")) for o in one_of if isinstance(o, dict) and "const" in o
+                ]
+                if opts:
+                    hint_parts.append("/".join(opts))
+            elif enum_vals and isinstance(enum_vals, list):
+                hint_parts.append("/".join(str(v) for v in enum_vals))
+            elif prop_type == "boolean":
+                hint_parts.append("true/false")
+            else:
+                hint_parts.append(str(prop_type))
+            if default is not None:
+                hint_parts.append(f"default: {default}")
+            if key not in required:
+                hint_parts.append("optional")
+            hint = ", ".join(hint_parts)
+            label_parts.append(f" [{hint}]")
+
+            # Render as plain styled text, NOT markup: the label embeds
+            # server-controlled schema text (description, enum values,
+            # key) that ``Text.from_markup`` would parse as Rich tags —
+            # a stray ``[`` silently mangles the line and an unbalanced
+            # one raises ``MarkupError``, which would crash this
+            # background task and hang the elicitation.
+            host.output(Text("   " + "".join(label_parts), style=fmt.accent))
+
+            # Re-prompt the same field on bad input rather than discarding
+            # everything: a single typo on field N shouldn't decline the
+            # whole form. The user aborts the turn with Esc (→ ``aborted``).
+            while True:
+                raw = await fis.begin(key)
+                if fis.aborted:
+                    return None
+
+                stripped = raw.strip()
+                if not stripped:
+                    if default is not None:
+                        content[key] = default
+                    elif key in required:
+                        host.output(
+                            Text(
+                                f"     ↳ {key} is required — enter a value (Esc cancels)",
+                                style=fmt.warning,
+                            ),
+                        )
+                        continue
+                    # Optional with no default: leave unset.
+                    break
+
+                # Parse according to type.
+                val: str | int | float | bool = stripped
+                if prop_type == "boolean":
+                    val = stripped.lower() in ("true", "1", "yes", "y")
+                elif prop_type == "integer":
+                    try:
+                        val = int(stripped)
+                    except ValueError:
+                        host.output(
+                            Text(
+                                f"     ↳ expected a whole number, got {stripped!r}",
+                                style=fmt.warning,
+                            ),
+                        )
+                        continue
+                elif prop_type == "number":
+                    try:
+                        val = float(stripped)
+                    except ValueError:
+                        host.output(
+                            Text(
+                                f"     ↳ expected a number, got {stripped!r}",
+                                style=fmt.warning,
+                            ),
+                        )
+                        continue
+
+                # Validate enum constraints.
+                if one_of and isinstance(one_of, list):
+                    valid = [
+                        o.get("const") for o in one_of if isinstance(o, dict) and "const" in o
+                    ]
+                    if val not in valid:
+                        host.output(
+                            Text(
+                                f"     ↳ choose one of: {', '.join(str(v) for v in valid)}",
+                                style=fmt.warning,
+                            ),
+                        )
+                        continue
+                elif enum_vals and isinstance(enum_vals, list):
+                    if val not in enum_vals:
+                        host.output(
+                            Text(
+                                f"     ↳ choose one of: {', '.join(str(v) for v in enum_vals)}",
+                                style=fmt.warning,
+                            ),
+                        )
+                        continue
+
+                content[key] = val
+                break
+
+        return content
 
     async def _unbind_runner_soft(self, session_id: str) -> None:
         """
@@ -2233,6 +2775,11 @@ class _SessionsChatReplAdapter:
         branch. Idempotent when no session is established. The unbind
         is soft-failed on old servers (see :meth:`_unbind_runner_soft`).
         """
+        # A fresh session is owned, not observed — clear any read-only-view
+        # suppression / interactive-child co-drive from a sub-agent dive so the
+        # new session can bind.
+        self._readonly_view = False
+        self._interactive_child = False
         old_session_id = self._session_id
         if old_session_id is not None:
             await self._unbind_runner_soft(old_session_id)
@@ -2282,6 +2829,15 @@ class _SessionsChatReplAdapter:
             self._stream_task = None
         self._session_id = new_session_id
         self._bound_runner_id = None  # Force re-bind on next send
+
+
+_ReplSession: TypeAlias = Session | _SessionsChatReplAdapter
+
+# Every slash-command handler binds these parameters in the same order.
+SlashCommandHandler = Callable[
+    [str, _ReplSession, OmnigentClient, TerminalHost, RichBlockFormatter],
+    Awaitable[None],
+]
 
 
 @dataclass(frozen=True)
@@ -2654,7 +3210,7 @@ async def run_repl(
     if debug_events:
         _pipeline_counters = PipelineCounters()
         _event_tape = EventTape(counters=_pipeline_counters)
-        host.pipeline_counters = _pipeline_counters  # type: ignore[attr-defined]
+        host.pipeline_counters = _pipeline_counters
 
     # Ctrl+T: toggle tool-output panels in the formatter.
     def _toggle_tool_output() -> None:
@@ -2677,6 +3233,7 @@ async def run_repl(
     # normal prompt_toolkit input path avoids the stdin /
     # patch_stdout fight that a direct input() call produced.
     approval_state = _ApprovalState()
+    field_input_state = _FieldInputState()
     hooks = StreamHooks(
         on_elicitation_request=_make_elicitation_prompt(
             host, fmt, approval_state, server_url=server_url
@@ -2687,21 +3244,20 @@ async def run_repl(
     # The ToolHandler's ``execute`` callable matches the
     # SessionsChat ToolCallable contract closely enough; the
     # name → callable indirection is what SessionsChat expects.
-    tool_callables: dict[str, object] | None = None
+    tool_callables: (
+        dict[
+            str,
+            Callable[[ToolCallInfo], object | Awaitable[object]],
+        ]
+        | None
+    ) = None
     if tool_handler is not None:
-        tool_callables = {
-            schema["name"]: tool_handler.execute  # type: ignore[index]
-            for schema in tool_handler.schemas
-            if isinstance(schema, dict) and "name" in schema
-        }
-    # ``Session`` typing here is intentional: the adapter
-    # is duck-compatible with the legacy surface the REPL
-    # uses (send/cancel/current_response_id/model/
-    # is_streaming/reset/resume_from_response/
-    # set_reasoning_effort/reasoning_effort). mypy is
-    # appeased via the runtime cast; the static type
-    # mismatch surfaces in tests, not at runtime.
-    session = _SessionsChatReplAdapter(  # type: ignore[assignment]
+        tool_callables = {}
+        for schema in tool_handler.schemas:
+            name = schema.get("name")
+            if isinstance(name, str):
+                tool_callables[name] = tool_handler.execute
+    session = _SessionsChatReplAdapter(
         client=client,
         agent_name=agent_name,
         tool_callables=tool_callables,
@@ -2714,6 +3270,9 @@ async def run_repl(
         on_session_start=on_session_start,
         harness=harness,
         attach_only=attach_only,
+        field_input_state=field_input_state,
+        host=host,
+        fmt=fmt,
     )
     # Make per-invocation log paths visible to slash commands such as
     # /logs without broadening the slash-command dispatch signature.
@@ -2859,7 +3418,7 @@ async def run_repl(
                 # Local name distinct from run_repl's `agent_name` param:
                 # assigning to `agent_name` here would shadow it for the
                 # whole handler, leaving it unbound in other branches.
-                current_agent = session._agent_name  # type: ignore[union-attr]
+                current_agent = session._agent_name
                 items_out = list(
                     fmt.format_response_start(
                         ResponseStartBlock(
@@ -2883,7 +3442,7 @@ async def run_repl(
                 # a stream-pump reconnect gap or before this REPL
                 # attached is lost — so also re-sync at each turn start.
                 _spawn_metadata_refresh()
-            elif event.status in ("idle", "failed"):
+            elif event.status in ("idle", "waiting", "failed"):
                 from omnigent_client import TextDone
 
                 # A SETUP-phase failure (spec resolution, spawn-env
@@ -2949,8 +3508,8 @@ async def run_repl(
                     _maybe_log_tape_entry(tape_entry)
                 return
             if event.data.type == "message" and event.data.data.get("role") == "user":
-                if session._pending_local_user_sends > 0:  # type: ignore[union-attr]
-                    session._pending_local_user_sends -= 1  # type: ignore[union-attr]
+                if session._pending_local_user_sends > 0:
+                    session._pending_local_user_sends -= 1
                 else:
                     text = _extract_message_text(event.data.data)
                     items_out = [fmt.user_message(text)]
@@ -2983,6 +3542,20 @@ async def run_repl(
                     ),
                 )
             if tape_entry is not None:
+                _maybe_log_tape_entry(tape_entry)
+            return
+
+        # Live sub-agent tree updates ride the parent stream as
+        # ``session.created`` / ``session.child_session.updated``. Apply them
+        # to the host registry (state badge + ↓ menu) before the generic
+        # translation below, which has no branch for them and would drop them.
+        if _apply_child_session_event(
+            event,
+            active_conversation_id=session.session_id,
+            host=host,
+        ):
+            if tape_entry is not None:
+                _event_tape.update_translation(tape_entry, event)  # type: ignore[union-attr]
                 _maybe_log_tape_entry(tape_entry)
             return
 
@@ -3059,7 +3632,7 @@ async def run_repl(
                 fmt.format_reasoning_start(
                     ReasoningStartBlock(
                         ctx=BlockContext(
-                            agent=session._agent_name,  # type: ignore[union-attr]
+                            agent=session._agent_name,
                             depth=0,
                             turn=0,
                         ),
@@ -3085,7 +3658,7 @@ async def run_repl(
                     _RC(
                         text=sdk_ev.delta,
                         ctx=BlockContext(
-                            agent=session._agent_name,  # type: ignore[union-attr]
+                            agent=session._agent_name,
                             depth=0,
                             turn=0,
                         ),
@@ -3108,14 +3681,14 @@ async def run_repl(
                 if (
                     item.get("type") == "function_call"
                     and item.get("status") == "action_required"
-                    and session._tool_callables  # type: ignore[union-attr]
+                    and session._tool_callables
                 ):
                     call_id = item.get("call_id", "")
                     name = item.get("name", "")
                     args_str = item.get("arguments", "{}")
                     sid = getattr(session, "session_id", None) or ""
                     if isinstance(call_id, str) and isinstance(name, str):
-                        session._spawn_client_tool(  # type: ignore[union-attr]
+                        session._spawn_client_tool(
                             sid,
                             call_id,
                             name,
@@ -3192,14 +3765,14 @@ async def run_repl(
                         if isinstance(call_id, str) and name is not None:
                             call_id_to_tool_metadata[call_id] = (name, arguments or {})
                     if tape_entry is not None:
-                        captured: list[object] = []
+                        captured: list[FormattedItem | None] = []
                         original_output = host.output
 
-                        def _capturing_output(it: object) -> None:
-                            captured.append(it)
-                            original_output(it)
+                        def _capturing_output(item: FormattedItem | None) -> None:
+                            captured.append(item)
+                            original_output(item)
 
-                        host.output = _capturing_output  # type: ignore[assignment]
+                        host.output = _capturing_output
                         try:
                             if plan.flush_inflight_text:
                                 # Commit in-flight streamed prose before
@@ -3214,7 +3787,7 @@ async def run_repl(
                                 call_id_to_tool_metadata=call_id_to_tool_metadata,
                             )
                         finally:
-                            host.output = original_output  # type: ignore[assignment]
+                            host.output = original_output
                         _event_tape.update_format(tape_entry, captured)  # type: ignore[union-attr]
                         _event_tape.mark_rendered(tape_entry, len(captured))  # type: ignore[union-attr]
                     else:
@@ -3235,7 +3808,7 @@ async def run_repl(
             return
 
         if isinstance(sdk_ev, _Created):
-            session._current_response_id = sdk_ev.response.id  # type: ignore[union-attr]
+            session._current_response_id = sdk_ev.response.id
             if tape_entry is not None:
                 _maybe_log_tape_entry(tape_entry)
             return
@@ -3321,7 +3894,7 @@ async def run_repl(
                 sdk_ev, getattr(session, "session_id", None) or ""
             )
             elicit_task = asyncio.create_task(
-                session._handle_elicitation(sid, sdk_ev),  # type: ignore[union-attr]
+                session._handle_elicitation(sid, sdk_ev),
             )
             _background_event_tasks.add(elicit_task)
             elicit_task.add_done_callback(_background_event_tasks.discard)
@@ -3340,7 +3913,7 @@ async def run_repl(
                 _maybe_log_tape_entry(tape_entry)
             return
 
-    session._on_event = _render_session_event  # type: ignore[union-attr]
+    session._on_event = _render_session_event
 
     def _maybe_log_tape_entry(entry: TapeEntry) -> None:
         """Write a tape entry to the JSONL log if the handle is open.
@@ -3350,7 +3923,7 @@ async def run_repl(
         if _event_log_fh is not None:
             from omnigent.repl._event_tape import log_entry_jsonl
 
-            log_entry_jsonl(_event_log_fh, entry)  # type: ignore[arg-type]
+            log_entry_jsonl(_event_log_fh, entry)
 
     is_streaming = False
 
@@ -3373,8 +3946,36 @@ async def run_repl(
 
     host.on_help = show_help
 
+    # Output of "!" shell commands, buffered and folded into the next turn's
+    # llm_text so the agent can reason about what the user ran.
+    _pending_bang_blocks: list[str] = []
+    # Lightweight cwd persistence for "!" commands: a standalone "!cd <dir>"
+    # updates this; other "!" commands run in it. One-element list so the
+    # nested closure can rebind the value.
+    _bang_cwd: list[str] = [os.getcwd()]
+
+    # Paint the composer in the omnigent-logo green while the line is a "!"
+    # shell command, so bang mode is visible before Enter is pressed.
+    # ``PromptSession`` reads ``.lexer`` through a ``DynamicLexer``, so setting
+    # it here takes effect live.
+    _prompt_session = getattr(host, "_prompt", None)
+    if _prompt_session is not None:
+        _prompt_session.lexer = _BangInputLexer()
+
     async def on_input(text: str, attachments: list[PendingAttachment] | None = None) -> None:
         nonlocal conversation_id, is_streaming
+
+        # Pending schema field input: consume this line as the
+        # current field's value before any other routing.
+        if field_input_state.pending:
+            field_name = field_input_state.field_name or "field"
+            # Plain styled text: ``field_name`` (server schema) and
+            # ``text`` (user input) must not be parsed as Rich markup.
+            host.output(
+                Text(f"   › {field_name}: {text}", style=fmt.muted),
+            )
+            field_input_state.resolve(text)
+            return
 
         # Pending policy approval: consume this input as the
         # verdict BEFORE slash-command / normal-send routing.
@@ -3404,12 +4005,73 @@ async def run_repl(
             approval_state.resolve_verdict(verdict)
             return
 
+        # A line starting with "!" runs a shell command (Claude Code parity);
+        # its output is buffered and folded into the next agent turn. "!!"
+        # escapes — it sends a literal leading "!" as an ordinary prompt.
+        if text.startswith("!") and not text.startswith("!!"):
+            cmd = text[1:].strip()
+            if not cmd:
+                host.output(
+                    Text.from_markup(
+                        f"   [{fmt.muted}]! <command> runs a shell command · "
+                        f"!! sends a literal ![/{fmt.muted}]",
+                    ),
+                )
+                return
+            # Lightweight cwd persistence: a standalone "!cd <dir>" changes the
+            # directory subsequent "!" commands run in (see _resolve_cd).
+            cd_target = _resolve_cd(cmd, _bang_cwd[0])
+            if cd_target is not None:
+                if os.path.isdir(cd_target):
+                    _bang_cwd[0] = cd_target
+                    host.output(Text.from_markup(f"  [{_BANG_ECHO_MARKUP}]! {escape(cmd)}[/]"))
+                    host.output(
+                        Text.from_markup(
+                            f"   [{fmt.muted}]now in {escape(cd_target)}[/{fmt.muted}]"
+                        ),
+                    )
+                    _pending_bang_blocks.append(
+                        f"$ {cmd}\n(changed shell directory to: {cd_target})"
+                    )
+                else:
+                    msg = f"cd: not a directory: {escape(cd_target)}"
+                    host.output(Text.from_markup(f"   [{fmt.warning}]{msg}[/{fmt.warning}]"))
+                return
+            _pending_bang_blocks.append(await _run_bang_command(cmd, host, fmt, cwd=_bang_cwd[0]))
+            return
+        if text.startswith("!!"):
+            text = text[1:]  # drop one "!"; fall through as a normal prompt
+
         # Slash commands are short tokens like "/help", "/clear".
         # File paths like "/Users/foo/bar.jpg" start with "/" but
         # contain more path separators — don't treat those as commands.
         first_token = text.split()[0] if text.split() else ""
         if first_token.startswith("/") and "/" not in first_token[1:]:
+            # Starting a new conversation orphans any buffered "!" output — it
+            # belonged to the prior conversation. Drop it so it can't leak into
+            # the fresh conversation's first turn.
+            if first_token in ("/clear", "/new"):
+                _pending_bang_blocks.clear()
             await handle_slash_command(text, session, client, host, fmt)
+            return
+
+        # While observing a sub-agent read-only (dived in via ↓ on a CLOSED /
+        # non-chattable child), refuse plain message sends — there's no live
+        # runner to co-drive and a ``message`` to a closed session 409s.
+        # Interactive-child mode (a still-open child) lifts this guard: the send
+        # below POSTs to the CHILD's existing runner (co-drive), which the
+        # ``_readonly_view`` bind-suppression already routes correctly without
+        # moving the parent's runner. Slash commands (handled above) still work;
+        # press ← to return to the top-level session.
+        if getattr(session, "_readonly_view", False) and not getattr(
+            session, "_interactive_child", False
+        ):
+            host.output(
+                Text.from_markup(
+                    f"   [{fmt.muted}]read-only view (closed sub-agent) — press ← to "
+                    f"return to the main session before sending[/{fmt.muted}]",
+                ),
+            )
             return
 
         files = [a.path for a in attachments] if attachments else None
@@ -3422,6 +4084,10 @@ async def run_repl(
         if filenames:
             suffix = " ".join(filenames)
             llm_text = f"{text} {suffix}".strip() if text else suffix
+        # Fold any buffered "!" shell output into this turn so the agent sees it.
+        if _pending_bang_blocks:
+            llm_text = "\n\n".join([*_pending_bang_blocks, llm_text]).strip()
+            _pending_bang_blocks.clear()
 
         if is_streaming:
             # Show the message immediately in dimmed style so the
@@ -3477,6 +4143,7 @@ async def run_repl(
             # hook's future doesn't leak waiting for a verdict
             # that will never come.
             approval_state.cancel()
+            field_input_state.cancel()
             # Best-effort — server may already have finished.
             with contextlib.suppress(Exception):
                 await asyncio.shield(session.cancel())
@@ -3533,9 +4200,11 @@ async def run_repl(
     # Warp) and prompt-toolkit binds it cleanly.
     from omnigent_ui_sdk import Overlay
 
-    async def _overview_builder(target: OverlayTarget) -> RenderableType:
+    async def _overview_builder(target: OverlayTarget | None) -> RenderableType:
         from omnigent.cli_diagnostics import current_cli_log_path
 
+        if target is None:
+            return Text.from_markup("[dim]No debug target available.[/dim]")
         return await _build_debug_overview(
             target,
             client=client,
@@ -3589,6 +4258,159 @@ async def run_repl(
         ),
     )
 
+    # ── ↓ Sub-agents menu ──────────────────────────────────────
+    # While sub-agents are running, the toolbar reads ``state: N agents
+    # running`` instead of ``sleeping`` (see ``build_toolbar``) and a
+    # ``↓ agents`` hint advertises the menu. Pressing Down on an empty input
+    # opens an inline, navigable list of the running sub-agents at the bottom
+    # of the terminal (the host owns the list UI); Enter switches into the
+    # selected agent's live session via the ``on_subagent_select`` callback
+    # wired below, Esc closes. The tree is fed live by
+    # ``_apply_child_session_event`` (direct children) plus the recursive
+    # ``_refresh_subagent_tree`` poll (deeper levels).
+
+    # The session the tree is rooted at — the originally-launched "main"
+    # session. It tracks the live top-level session id while the user is at
+    # the top and freezes once they dive into a sub-agent, so the whole
+    # hierarchy + the way back to main stay correct even if the main session
+    # id changes (e.g. a runner rebind reassigns it). The adapter's
+    # ``_readonly_view`` flag (set atomically by ``view_session`` and cleared
+    # on switch / clear / new) is the single source of truth for "are we
+    # observing a sub-agent below the root".
+    subagent_root: list[str | None] = [None]
+
+    # The root the selector tree was last discovered for. Lets the poll run a
+    # one-shot discovery whenever the root CHANGES (resume / ``/switch`` into a
+    # session that already has children, with no fresh SSE to seed them) even
+    # though no sub-agents are registered yet — see ``_subagent_poll_loop``.
+    polled_root: list[str | None] = [None]
+
+    def _sync_subagent_root() -> None:
+        # Track the live top-level session id while we're at the top. While
+        # observing a sub-agent — either read-only OR co-driving it
+        # interactively — freeze the root: never self-heal off
+        # ``session.session_id``, which would capture the sub-agent as the root
+        # and make Left-arrow "back to main" vanish. The root is DECOUPLED from
+        # ``_readonly_view`` alone: interactive-child mode keeps ``_readonly_view``
+        # set, but we also guard on ``_interactive_child`` so a future change
+        # that toggles read-only can't silently re-root onto the child.
+        # ``view_session`` sets the session id + both flags together, so this
+        # never sees a half-applied switch.
+        observing_child = getattr(session, "_readonly_view", False) or getattr(
+            session, "_interactive_child", False
+        )
+        if not observing_child and session.session_id is not None:
+            subagent_root[0] = session.session_id
+
+    async def _refresh_subagents() -> None:
+        root_id = subagent_root[0]
+        if root_id is None:
+            return
+        # Capture the generation BEFORE the fetch so a clear-during-poll
+        # (``/switch`` / ``/new`` / ``/clear`` re-rooting mid-fetch) makes the
+        # resulting seed a no-op instead of resurrecting cleared nodes.
+        await _refresh_subagent_tree(client, host, root_id, generation=host.subagent_generation)
+
+    async def _subagent_poll_loop() -> None:
+        # Periodically re-fetch the tree so nested (grandchild) levels + live
+        # statuses stay current — the SSE stream only carries the active
+        # session's direct children. The root-sync runs every tick (cheap, no
+        # I/O) so the root stays accurate. The tree re-fetch fires while there
+        # is live work to track — an active sub-agent, or a child the user has
+        # dived into (whose own stream can't refresh its row) — OR when the root
+        # just changed (the discovery poll that repopulates the selector after a
+        # resume / ``/switch`` into a session that already has children, which
+        # would otherwise never poll: no SSE, no nodes yet). It deliberately
+        # goes quiet once everything settles at the top level: a finished
+        # sub-agent's status no longer changes, so polling retained-but-terminal
+        # nodes forever is pure waste; a child that later resumes re-arms the
+        # poll via the active stream's ``session.child_session.updated``.
+        while True:
+            try:
+                _sync_subagent_root()
+                root_id = subagent_root[0]
+                observing_subagent = getattr(session, "_readonly_view", False) or getattr(
+                    session, "_interactive_child", False
+                )
+                if _should_discover_subagents(
+                    root_id,
+                    has_active_subagents=host.has_active_subagents(),
+                    observing_subagent=observing_subagent,
+                    last_polled_root=polled_root[0],
+                ):
+                    await _refresh_subagents()
+                    polled_root[0] = root_id
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — best-effort background poll; never crash the REPL
+                pass
+            await asyncio.sleep(_SUBAGENT_POLL_SECONDS)
+
+    async def _open_subagent_by_id(target_id: str) -> None:
+        # Invoked by the host when the user picks a row in the inline ↓ menu
+        # or presses Left to go back. Runs between prompt iterations, so
+        # re-pointing + re-rendering is safe.
+        #
+        # Use ``view_session`` (read-only re-point), NOT ``switch_to_session``
+        # (which moves the runner binding): diving into a running sub-agent
+        # must not unbind the parent (it would never wake to collect the
+        # result) nor hijack the child's runner (it would be left stuck
+        # "still running" with nothing delivered).
+        if not target_id or target_id == session.session_id:
+            return  # Already viewing this session (e.g. selected "main").
+        # Returning to the top-level session re-enables runner ownership;
+        # diving into a sub-agent is always read-only of the runner BINDING (no
+        # rebind). A still-open child additionally becomes an interactive
+        # co-drive target — the user can type to chat with it, POSTing to the
+        # child's own runner (web-UI parity) without moving the parent's
+        # binding. A CLOSED child is view-only (a ``message`` to it 409s).
+        # ``view_session`` applies the session id + flags atomically, which both
+        # freezes the root (so Left-arrow still returns to the parent after a
+        # chat) and re-roots on return.
+        returning_to_root = subagent_root[0] is not None and target_id == subagent_root[0]
+        interactive = not returning_to_root and host.is_subagent_chattable(target_id)
+        try:
+            await session.view_session(
+                target_id,
+                read_only=not returning_to_root,
+                interactive=interactive,
+            )
+        except Exception as exc:  # noqa: BLE001 — REPL boundary: render the failure, stay alive
+            host.output(
+                Text.from_markup(f"  [bold red]Failed to open {target_id[:16]}…: {exc}[/]")
+            )
+            return
+        await _attach_to_conversation(
+            target_id,
+            session,
+            client,
+            host,
+            fmt,
+            ui_name=_humanize_agent_name(session.model),
+            redraw_screen=True,
+        )
+        # Tell the user which mode they're in so a closed child doesn't look
+        # silently unresponsive when a typed message is refused.
+        if interactive:
+            host.output(
+                Text.from_markup(
+                    f"  [{fmt.muted}]interactive — type to chat with this sub-agent; "
+                    f"← back to main[/{fmt.muted}]"
+                )
+            )
+        elif not returning_to_root:
+            host.output(
+                Text.from_markup(
+                    f"  [{fmt.muted}]read-only (closed sub-agent) — ← back to main[/{fmt.muted}]"
+                )
+            )
+        await _refresh_subagents()
+
+    host.on_subagent_select = _open_subagent_by_id
+    # Let the host see the active session id so Left-arrow can return to the
+    # top-level session whenever the user is inside a sub-agent.
+    host.active_session_id_getter = lambda: session.session_id
+
     # ── Ctrl+E event tape overlay (--debug-events only) ────────
     # Registered unconditionally only when the debug flag is set.
     # Uses the two-pane Overlay mode: the sidebar lists every tape
@@ -3609,7 +4431,7 @@ async def run_repl(
             return build_tape_detail(
                 _event_tape,
                 target.key,
-                fmt,  # type: ignore[arg-type]
+                fmt,
             )
 
         async def _tape_targets() -> list[OverlayTarget]:
@@ -3620,7 +4442,7 @@ async def run_repl(
             from omnigent.repl._event_tape import _OverlayTargetLike
 
             raw_targets: list[_OverlayTargetLike] = build_tape_targets(
-                _event_tape,  # type: ignore[arg-type]
+                _event_tape,
             )
             return [OverlayTarget(key=t.key, label=t.label, icon=t.icon) for t in raw_targets]
 
@@ -3683,8 +4505,27 @@ async def run_repl(
                 _header = _build_startup_header(harness, agent_description, used_families)
             except Exception:  # noqa: BLE001 — startup-UI boundary: a config read must never block REPL boot
                 _log.exception("Failed to build startup header; falling back to plain banner")
+        # Installed server version for the header's "server <ver>" row.
+        # Probed via the connected (authenticated) client so a short, bounded
+        # GET /v1/info never stalls boot and answers even on auth-gated hosted
+        # servers; None on any failure simply omits the row. Skipped when:
+        #   - there's no header (minimal banner ignores the version), or
+        #   - the server is a Databricks workspace mount — a workspace build
+        #     reports no meaningful version string (its /api/version returns a
+        #     placeholder like "source"), so showing it is noise.
+        from omnigent.cli_auth import is_workspace_hosted_url
+
+        _show_version = _header is not None and not (
+            server_url is not None and is_workspace_hosted_url(server_url)
+        )
+        server_version = await _fetch_server_version(client) if _show_version else None
         _sys.stdout.write(
-            _render_startup_banner_ansi(ui_name, server_url=server_url, header=_header)
+            _render_startup_banner_ansi(
+                ui_name,
+                server_url=server_url,
+                server_version=server_version,
+                header=_header,
+            )
         )
         _sys.stdout.flush()
 
@@ -3727,9 +4568,15 @@ async def run_repl(
         if initial_message:
             # Auto-send the initial message (e.g. onboarding greeting).
             auto_send_task = asyncio.create_task(on_input(initial_message))
+        # Background poll that keeps the sub-agent tree (badge + ↓ menu)
+        # current at nested depths for the lifetime of ``host.run``.
+        subagent_poll_task = asyncio.create_task(_subagent_poll_loop())
         try:
             await host.run(on_input)
         finally:
+            subagent_poll_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await subagent_poll_task
             if auto_send_task is not None and not auto_send_task.done():
                 auto_send_task.cancel()
             for _task in list(_background_event_tasks):
@@ -3738,7 +4585,7 @@ async def run_repl(
                     await _task
             # Close the JSONL event log file handle if it was opened.
             if _event_log_fh is not None:
-                _event_log_fh.close()  # type: ignore[union-attr]
+                _event_log_fh.close()
     close_session = getattr(session, "aclose", None)
     if close_session is not None:
         result = close_session()
@@ -3777,7 +4624,7 @@ async def run_repl(
 
 async def _maybe_write_session_log(
     client: OmnigentClient,
-    session: Session,
+    session: _ReplSession,
     agent_name: str,
     log_dir: pathlib.Path,
     host: TerminalHost,
@@ -3868,18 +4715,43 @@ def _cmd(
 @_cmd("/help", "Show this help")
 async def _cmd_help(
     arg: str,  # noqa: ARG001 — dispatch-contract params (see COMMANDS docstring)
-    session: Session,  # noqa: ARG001
+    session: _ReplSession,  # noqa: ARG001
     client: OmnigentClient,  # noqa: ARG001
     host: TerminalHost,
     fmt: RichBlockFormatter,
 ) -> None:
     from rich.text import Text
 
-    lines = []
-    for name, (desc, _) in COMMANDS.items():
-        if name in ("/?", "/exit"):
-            continue  # Skip aliases.
-        lines.append(f"  [{fmt.accent}]{name}[/{fmt.accent}]  [{fmt.muted}]{desc}[/{fmt.muted}]")
+    # Grouped, column-aligned command help instead of a flat alphabetical
+    # wall. Commands not listed in a group still render (under "Other"), so a
+    # newly registered command is never silently hidden from /help.
+    groups: list[tuple[str, list[str]]] = [
+        ("Chat", ["/new", "/clear", "/switch", "/fork", "/history", "/cancel"]),
+        ("Context", ["/compact", "/context", "/model", "/effort"]),
+        ("Display", ["/theme"]),
+        ("Diagnostics", ["/logs", "/report"]),
+        ("Help", ["/help", "/quit"]),
+    ]
+    visible = {n: d for n, (d, _) in COMMANDS.items() if n not in ("/?", "/exit")}
+    grouped = {name for _, names in groups for name in names}
+    leftover = [n for n in visible if n not in grouped]
+    if leftover:
+        groups.append(("Other", leftover))
+
+    name_width = max((len(n) for n in visible), default=0)
+    lines: list[str] = []
+    for title, names in groups:
+        rows = [(n, visible[n]) for n in names if n in visible]
+        if not rows:
+            continue
+        if lines:
+            lines.append("")  # blank line between sections
+        lines.append(f"  [{fmt.muted}]{title}[/{fmt.muted}]")
+        for name, desc in rows:
+            padded = name.ljust(name_width)
+            lines.append(
+                f"    [{fmt.accent}]{padded}[/{fmt.accent}]  [{fmt.muted}]{desc}[/{fmt.muted}]"
+            )
     host.output(Text.from_markup("\n".join(lines)))
 
 
@@ -3892,7 +4764,7 @@ _THEME_CLEAR_ALIASES = {"default", "auto", "reset"}
 @_cmd("/theme", "Show/set terminal theme; /theme light or /theme dark")
 async def _cmd_theme(
     arg: str,
-    session: Session,  # noqa: ARG001 — dispatch-contract params
+    session: _ReplSession,  # noqa: ARG001 — dispatch-contract params
     client: OmnigentClient,  # noqa: ARG001 — dispatch-contract params
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -3947,7 +4819,7 @@ _EFFORT_CLEAR_ALIASES = {"default", "off", "reset"}
 
 
 async def _set_session_reasoning_effort(
-    session: Session,
+    session: _ReplSession,
     effort: str | None,
 ) -> None:
     """
@@ -3972,7 +4844,7 @@ async def _set_session_reasoning_effort(
 @_cmd("/effort", "Show/set reasoning effort; /effort lists options")
 async def _cmd_effort(
     arg: str,
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,  # noqa: ARG001 — dispatch-contract params
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -4024,6 +4896,7 @@ async def _cmd_effort(
 
 
 _MODEL_CLEAR_ALIASES = {"default", "off", "reset"}
+_MODEL_SHOW_ALIASES = {"show", "list", "status", "current"}
 
 
 def _model_readout_harness(active_model: str | None) -> str:
@@ -4053,7 +4926,7 @@ def _model_readout_harness(active_model: str | None) -> str:
     return "claude-sdk"
 
 
-def _session_readout_harness(session: Session) -> str:
+def _session_readout_harness(session: _ReplSession) -> str:
     """Resolve the harness the ``/model`` readout should describe.
 
     Prefers the session's actual bound harness
@@ -4122,11 +4995,22 @@ def _build_model_readout_lines(
         PI_SURFACE,
         describe_active_credential,
         harness_family,
+        harness_owns_its_credential,
         load_providers,
         provider_families,
     )
 
     lines: list[str] = []
+    if harness and harness_owns_its_credential(harness):
+        # The external agent authenticates itself, so there is no Omnigent
+        # credential to name. An in-session override is still shown (it's
+        # real, and e.g. goose applies it as GOOSE_MODEL); whether it reaches
+        # the agent varies per ACP agent, so no claim is made either way.
+        model_label = model_override or "(the agent's own model)"
+        return [
+            f"Active:  {model_label}  ·  🤖 ACP agent (agent's own auth)",
+            "usage: /model <name> · /model default | off | reset to clear",
+        ]
     cred = describe_active_credential(config, harness, model_override=model_override)
     if cred is None:
         # Nothing resolves for this harness's surface — not in the explicit
@@ -4191,8 +5075,7 @@ def _build_model_readout_lines(
         # provider; switching the active provider mid-session is not wired,
         # so it goes through `configure harnesses` + a restart.
         lines.append(
-            "  /model <name> changes the model. To switch provider: "
-            "omnigent setup --no-internal-beta (then restart)."
+            "  /model <name> changes the model. To switch provider: omnigent setup (then restart)."
         )
     return lines
 
@@ -4293,7 +5176,7 @@ def _model_validation_warning(model: str) -> str | None:
 @_cmd("/model", "Show/set the LLM model for this session")
 async def _cmd_model(
     arg: str,
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,  # noqa: ARG001 — dispatch-contract params
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -4313,8 +5196,7 @@ async def _cmd_model(
     """
     from rich.text import Text
 
-    value = arg.strip()
-    if not value:
+    def _emit_model_readout() -> None:
         from omnigent.onboarding.detected import effective_config_with_detected
         from omnigent.onboarding.provider_config import load_config
 
@@ -4325,6 +5207,12 @@ async def _cmd_model(
         config = effective_config_with_detected(load_config())
         for line in _build_model_readout_lines(config, harness, current):
             host.output(Text.from_markup(f"  [{fmt.muted}]{line}[/{fmt.muted}]"))
+
+    value = arg.strip()
+    # Bare `/model` and the display keywords both just show the readout — never
+    # persist `show`/`list`/`status`/`current` as a literal model override.
+    if not value or value.lower() in _MODEL_SHOW_ALIASES:
+        _emit_model_readout()
         return
 
     if value.lower() in _MODEL_CLEAR_ALIASES:
@@ -4362,7 +5250,12 @@ async def _cmd_model(
 
     candidate = value.split("/", 1)[0] if "/" in value else value
     matched = _match_configured_provider(config, candidate)
-    if matched is not None and active_name is not None and matched != active_name:
+    if (
+        matched is not None
+        and active is not None
+        and active_name is not None
+        and matched != active_name
+    ):
         active_label = f"{kind_glyph(active.kind)} {provider_display_name(active_name)}".strip()
         target_label = f"{provider_display_name(matched)}"
         host.output(
@@ -4428,7 +5321,7 @@ async def _cmd_model(
 
 
 async def _start_new_conversation(
-    session: Session,
+    session: _ReplSession,
     host: TerminalHost,
     fmt: RichBlockFormatter,  # noqa: ARG001 — reserved for future banner styling
 ) -> bool:
@@ -4439,23 +5332,25 @@ async def _start_new_conversation(
     """
     from rich.text import Text
 
-    starter = getattr(session, "start_new_conversation", None)
-    if callable(starter):
+    if isinstance(session, _SessionsChatReplAdapter):
         try:
-            await starter()
+            await session.start_new_conversation()
         except Exception as exc:  # noqa: BLE001 — REPL boundary
             _log.exception("New conversation failed")
             host.output(Text.from_markup(f"  [bold red]New conversation failed: {exc}[/]"))
             return False
     else:
         session.reset()
+    # Drop the prior conversation's sub-agent tree so its agents don't linger
+    # in the badge / ↓ menu under the fresh session.
+    host.clear_subagents()
     return True
 
 
 @_cmd("/new", "Start a new conversation (keeps scrollback)")
 async def _cmd_new(
     arg: str,  # noqa: ARG001 — dispatch-contract params
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,  # noqa: ARG001
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -4475,7 +5370,7 @@ async def _cmd_new(
 @_cmd("/clear", "Clear the screen and start a new conversation")
 async def _cmd_clear(
     arg: str,  # noqa: ARG001 — dispatch-contract params
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,  # noqa: ARG001
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -4497,12 +5392,12 @@ async def _cmd_clear(
 @_cmd("/switch", "List or switch conversations")
 async def _cmd_switch(
     arg: str,
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     fmt: RichBlockFormatter,
 ) -> None:
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     from rich.table import Table
     from rich.text import Text
@@ -4517,7 +5412,11 @@ async def _cmd_switch(
             table.add_column("Status", style="dim")
             table.add_column("Created", style="dim")
             for i, s in enumerate(sessions_list, 1):
-                when = datetime.fromtimestamp(s.created_at).strftime("%b %d %H:%M")
+                when = (
+                    datetime.fromtimestamp(s.created_at, tz=timezone.utc)
+                    .astimezone()
+                    .strftime("%b %d %H:%M")
+                )
                 table.add_row(str(i), s.id, s.title or "(untitled)", s.status, when)
             host.output(table)
             host.output(
@@ -4545,7 +5444,12 @@ async def _cmd_switch(
             # session.reset() / resume_from_response() are no-ops
             # in sessions mode, so without this the REPL keeps
             # sending to the original session.
-            await session.switch_to_session(arg)  # type: ignore[attr-defined]
+            if not isinstance(session, _SessionsChatReplAdapter):
+                raise RuntimeError("Session switching requires the sessions API.")
+            await session.switch_to_session(arg)
+            # Drop the prior session's sub-agent tree so its agents don't
+            # linger under the switched-to session's root.
+            host.clear_subagents()
 
             # ``/switch`` runs mid-session, so the user already
             # has prior-conversation transcript on screen —
@@ -4567,7 +5471,7 @@ async def _cmd_switch(
 
 async def _attach_to_conversation(
     conversation_id: str,
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -4639,9 +5543,8 @@ async def _attach_to_conversation(
     # local REPL right away — without this, they only surface after
     # the local user sends a message and triggers the lazy bind.
     # Idempotent: a later ``send()`` short-circuits in ``_ensure_session``.
-    ensure = getattr(session, "_ensure_session", None)
-    if callable(ensure):
-        await ensure()
+    if isinstance(session, _SessionsChatReplAdapter):
+        await session._ensure_session()
 
     items = await _list_all_conversation_items(client, conversation_id)
 
@@ -4705,8 +5608,10 @@ async def _attach_to_conversation(
 
             effective = _items_for_context_token_count(items)
             llm = getattr(session, "llm_model", None) or getattr(session, "_agent_name", "")
+            if not isinstance(llm, str):
+                llm = ""
             tokens = count_tokens(
-                [dict(i) for i in effective],  # type: ignore[arg-type]
+                [dict(i) for i in effective],
                 llm,
             )
         host.update_context_usage(tokens, cw)
@@ -4715,7 +5620,7 @@ async def _attach_to_conversation(
 @_cmd("/fork", "Fork the current conversation into a new session")
 async def _cmd_fork(
     arg: str,
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -4776,7 +5681,7 @@ async def _cmd_fork(
 @_cmd("/history", "Show current conversation history")
 async def _cmd_history(
     arg: str,  # noqa: ARG001 — dispatch-contract params
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -4850,7 +5755,7 @@ class _ContextItems:
 
 
 async def _fetch_context_items(
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
 ) -> _ContextItems:
     """
@@ -4942,7 +5847,7 @@ def _items_for_context_token_count(
 
 
 async def _refresh_session_metadata(
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -4995,7 +5900,7 @@ async def _refresh_session_metadata(
 
 
 async def _update_context_ring_estimate(
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     context_window: int,
@@ -5029,7 +5934,7 @@ async def _update_context_ring_estimate(
     # time, not captured at task-spawn time, so they stay current.
     llm = getattr(session, "llm_model", None) or session.model
     tokens = count_tokens(
-        [dict(i) for i in effective],  # type: ignore[arg-type]
+        [dict(i) for i in effective],
         llm,
     )
     host.update_context_usage(tokens, context_window)
@@ -5104,8 +6009,12 @@ def _render_context_tree(
         + _CONTEXT_COIN_BUF * buf_coins
     )
 
-    free_tokens = max(context_window - message_tokens, 0)
     buf_tokens = int(context_window * buf_frac)
+    # Free space excludes the compaction buffer so the three rows partition the
+    # window (Messages + Free + Buffer = window) and each row's token count
+    # agrees with its own percentage. (Previously free omitted the buffer, so it
+    # read e.g. "920,150 tokens (72%)" — a count that is 92% of the window.)
+    free_tokens = max(context_window - message_tokens - buf_tokens, 0)
     used_pct = used_frac * 100.0
 
     tree.add(
@@ -5140,7 +6049,7 @@ def _render_context_tree(
 @_cmd("/compact", "Compact conversation context now")
 async def _cmd_compact(
     arg: str,  # noqa: ARG001 — dispatch-contract params
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,  # noqa: ARG001 — dispatch-contract params
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -5179,7 +6088,7 @@ async def _cmd_compact(
 @_cmd("/context", "Show context window usage")
 async def _cmd_context(
     arg: str,  # noqa: ARG001 — dispatch-contract params
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -5234,7 +6143,7 @@ async def _cmd_context(
         # recognised LLM identifier — good enough for an estimate.
         effective_items = _items_for_context_token_count(result.items)
         message_tokens = count_tokens(
-            [dict(item) for item in effective_items],  # type: ignore[arg-type]
+            [dict(item) for item in effective_items],
             llm_model or agent_name,
         )
     _render_context_tree(agent_name, llm_model, message_tokens, context_window, host, fmt)
@@ -5243,7 +6152,7 @@ async def _cmd_context(
 @_cmd("/cancel", "Cancel the current response")
 async def _cmd_cancel(
     arg: str,  # noqa: ARG001 — dispatch-contract params
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,  # noqa: ARG001
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -5318,7 +6227,7 @@ def _build_github_issue_url(
 @_cmd("/logs", "Collect current session logs into a zip")
 async def _cmd_logs(
     arg: str,
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -5383,7 +6292,7 @@ async def _cmd_logs(
 @_cmd("/report", "Open a pre-filled GitHub issue for this session")
 async def _cmd_report(
     arg: str,
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,  # noqa: ARG001 — dispatch-contract param
     host: TerminalHost,
     fmt: RichBlockFormatter,
@@ -5429,7 +6338,7 @@ async def _cmd_report(
 @_cmd("/quit", "Exit")
 async def _cmd_quit(
     arg: str,  # noqa: ARG001 — dispatch-contract params
-    session: Session,  # noqa: ARG001
+    session: _ReplSession,  # noqa: ARG001
     client: OmnigentClient,  # noqa: ARG001
     host: TerminalHost,
     fmt: RichBlockFormatter,  # noqa: ARG001
@@ -5482,9 +6391,133 @@ async def _list_all_conversation_items(
     return all_items
 
 
+def _should_discover_subagents(
+    root_id: str | None,
+    *,
+    has_active_subagents: bool,
+    observing_subagent: bool,
+    last_polled_root: str | None,
+) -> bool:
+    """Decide whether the background loop should (re-)fetch the sub-agent tree.
+
+    Re-fetches while there is live work to track, AND runs a one-shot discovery
+    when the ROOT just changed. Concretely, polls when:
+
+    * ``has_active_subagents`` — a sub-agent anywhere in the tree is still
+      running, so its (and any grandchild's) status keeps changing; or
+    * ``observing_subagent`` — the user has dived into a child (read-only or
+      co-driving). The active stream is then the child's own, which carries the
+      child's events but NOT a ``session.child_session.updated`` about itself,
+      so the poll is the only thing that keeps the dived-into child's row (and
+      the badge) fresh while chatting; or
+    * ``last_polled_root != root_id`` — the root just changed: a one-shot
+      discovery that repopulates the selector for a resumed / ``/switch``-ed
+      session that already has children (no fresh SSE to seed them).
+
+    Deliberately keyed on *active* work, NOT merely "any node exists": finished
+    sub-agents are retained in the selector indefinitely (web parity), but a
+    terminal child's status no longer changes, so polling it forever is pure
+    waste. Once everything settles at the top level the loop goes quiet; a child
+    that later resumes does so on the active (root) stream, whose SSE
+    ``session.child_session.updated`` re-arms ``has_active_subagents`` and the
+    poll wakes again.
+
+    :param root_id: The current tree root (top-level session id), or ``None``.
+    :param has_active_subagents: Whether any sub-agent is still running.
+    :param observing_subagent: Whether the user is currently viewing/co-driving
+        a child (so the parent-rooted poll is what keeps that child fresh).
+    :param last_polled_root: The root the loop last ran discovery for.
+    :returns: ``True`` to fetch the tree this tick.
+    """
+    if root_id is None:
+        return False
+    return has_active_subagents or observing_subagent or last_polled_root != root_id
+
+
+def _apply_child_session_event(
+    event: object,
+    *,
+    active_conversation_id: str | None,
+    host: TerminalHost,
+) -> bool:
+    """Apply a child-session SSE event to the host's sub-agent registry.
+
+    Handles ``session.created`` (register a launching child) and
+    ``session.child_session.updated`` (merge the partial summary), but only
+    when the event's carrier ``conversation_id`` is the active session — so a
+    relayed grandchild event riding an ancestor stream doesn't get attached
+    to the wrong parent. Deeper tree levels are populated by the recursive
+    ``child_sessions`` poll (:func:`_refresh_subagent_tree`), not these events.
+
+    :param event: The decoded SSE event from the stream pump.
+    :param active_conversation_id: The session the REPL is currently
+        streaming, used both as the filter and as the new child's parent.
+    :param host: The :class:`TerminalHost` whose registry is mutated.
+    :returns: ``True`` if *event* was a child-session event (so the caller
+        stops dispatching it), ``False`` otherwise.
+    """
+    from omnigent.server.schemas import (
+        SessionChildSessionUpdatedEvent as _ChildUpdated,
+    )
+    from omnigent.server.schemas import (
+        SessionCreatedEvent as _ChildCreated,
+    )
+
+    if isinstance(event, _ChildCreated):
+        if event.conversation_id == active_conversation_id:
+            host.upsert_subagent(
+                event.child_session_id,
+                parent_id=active_conversation_id,
+                child={"current_task_status": "launching"},
+            )
+        return True
+    if isinstance(event, _ChildUpdated):
+        if event.conversation_id == active_conversation_id:
+            host.upsert_subagent(
+                event.child_session_id,
+                parent_id=active_conversation_id,
+                child=event.child,
+            )
+        return True
+    return False
+
+
+async def _refresh_subagent_tree(
+    client: OmnigentClient,
+    host: TerminalHost,
+    root_id: str,
+    *,
+    max_depth: int = _MAX_SUBAGENT_TREE_DEPTH,
+    generation: int | None = None,
+) -> None:
+    """Recursively fetch the sub-agent tree under *root_id* and push it into
+    the host registry.
+
+    Delegates the recursion to :meth:`SessionsNamespace.child_sessions_tree`
+    (the same helper the SDK ``subtree_busy`` rollup uses), which walks
+    ``GET …/child_sessions`` breadth-first capped at ``MAX_TREE_DEPTH`` and tags
+    each row with the parent it was queried under so the host can reconstruct
+    the hierarchy. The SSE stream only delivers the active session's direct
+    children, so this poll is what keeps grandchildren live. A failed fetch is
+    swallowed, leaving the prior tree in place rather than crashing the REPL.
+
+    :param generation: :attr:`TerminalHost.subagent_generation` captured before
+        the fetch began. Passed through to :meth:`TerminalHost.seed_subagent_tree`
+        so a snapshot whose tree was cleared (``/switch`` / ``/new`` / ``/clear``)
+        mid-fetch is dropped instead of resurrecting the cleared nodes.
+    """
+    try:
+        # Recursion + parent_id tagging now live in the shared SDK helper so the
+        # CLI tree and the SDK rollup (subtree_busy) walk identical data.
+        nodes = await client.sessions.child_sessions_tree(root_id, max_depth=max_depth)
+    except Exception:  # noqa: BLE001 — best-effort poll: a failed fetch leaves the prior tree in place rather than crashing the REPL
+        return
+    host.seed_subagent_tree(root_id, nodes, generation=generation)
+
+
 async def _collect_overview_targets(
     client: OmnigentClient,
-    session: Session,
+    session: _ReplSession,
 ) -> list[OverlayTarget]:
     """
     Enumerate the debug overview's sidebar targets.
@@ -6393,7 +7426,7 @@ async def _build_debug_overview(
     target: OverlayTarget,
     *,
     client: OmnigentClient,
-    session: Session,
+    session: _ReplSession,
     agent_name: str,
     fmt: RichBlockFormatter,
     server_log_path: pathlib.Path | None = None,
@@ -6448,7 +7481,7 @@ async def _build_debug_overview(
     :param server_log_path: Optional path to the local server log.
     :param event_log_path: Optional path to the JSONL event log.
     :param cli_log_path: Optional path to the always-on CLI
-        diagnostics log (``~/.omnigent/logs/cli-*.log``).
+        diagnostics log (``~/.omnigent/logs/cli/cli-*.log``).
     :returns: A Rich :class:`Group` suitable for passing to
         :meth:`TerminalHost.add_overlay`'s ``builder`` contract.
     """
@@ -7291,6 +8324,13 @@ def _render_history_item(
 _SLASH_COMMAND_ALIASES: frozenset[str] = frozenset({"/?", "/exit"})
 
 
+# A skill name must read as a slash-command token: an alphanumeric start then
+# word chars, ``:`` (Claude ``plugin:skill``), or ``-`` (Cursor ``plugin--skill``).
+# Rejects whitespace, ``/``, and control characters. Mirrors the web composer's
+# SLASH_COMMAND_RE so the terminal and the menu agree on what is a command.
+_SKILL_COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9][\w:-]*$")
+
+
 def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     """
     Auto-register each discovered skill as a REPL slash command.
@@ -7300,6 +8340,12 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     global :data:`COMMANDS` registry. Collisions are skipped with a
     warning log so built-in commands always win.
 
+    Skills marked ``user-invocable: false`` are skipped — they are
+    internal orchestration skills, not user-typeable slash commands, so
+    they must not appear in the REPL's slash-command/autocomplete surface
+    (the same contract the web composer menu honors). The skill stays
+    loadable by the agent itself; only the user-facing command is hidden.
+
     :param skills: The agent's parsed skill list.
     :returns: List of registered command names (e.g. ``["/code-review"]``).
         Callers should pass this to :func:`unregister_skill_commands`
@@ -7307,6 +8353,17 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     """
     registered: list[str] = []
     for skill in skills:
+        if not skill.user_invocable:
+            continue
+        if not _SKILL_COMMAND_NAME_RE.match(skill.name):
+            # A name with whitespace, ``/``, or control chars yields an
+            # uninvocable or colliding command — skip + warn rather than
+            # register garbage. Mirrors the web composer's SLASH_COMMAND_RE.
+            _log.warning(
+                "Skill %r skipped: name is not a valid slash-command token",
+                skill.name,
+            )
+            continue
         cmd_name = f"/{skill.name}"
         if cmd_name in COMMANDS:
             _log.warning(
@@ -7321,13 +8378,12 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
 
             async def _skill_handler(
                 arg: str,
-                session: Session,
+                session: _ReplSession,
                 client: OmnigentClient,  # noqa: ARG001 — dispatch-contract params
                 host: TerminalHost,
                 fmt: RichBlockFormatter,
             ) -> None:
-                send_skill = getattr(session, "send_skill_slash_command", None)
-                if not callable(send_skill):
+                if not isinstance(session, _SessionsChatReplAdapter):
                     raise RuntimeError("Skill slash commands require the sessions API adapter")
                 if arg:
                     host.output(Text.from_markup(f"  [{fmt.muted}]/{sk.name}[/{fmt.muted}]"))
@@ -7339,7 +8395,7 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
                     )
                 host.start_timer()
                 await asyncio.sleep(0)
-                async for _ in send_skill(sk.name, arg):
+                async for _ in session.send_skill_slash_command(sk.name, arg):
                     pass
 
             return _skill_handler
@@ -7397,12 +8453,32 @@ class _SlashCommandCompleter(Completer):
         if "/" in text_before[1:]:
             return
 
-        prefix = text_before.lower()
+        # Match the web UI's rule (slashCommandMatches in
+        # SlashCommandMenu.tsx): a case-insensitive substring of the
+        # command name (sans the leading "/"), so a namespaced skill is
+        # reachable by its leaf name (``/using-superpowers`` ->
+        # ``/superpowers:using-superpowers``). Name only, not the
+        # description — kept identical to the web menu, which never shows
+        # descriptions inline.
+        #
+        # Prefix matches rank ahead of mid-string matches (mirrors the web
+        # menu's ``rankedSlashCommandNames``): ``/e`` surfaces ``/effort``
+        # (a prefix) before ``/context`` (which merely contains "e"), so
+        # the first, auto-selectable completion is the intended one. Each
+        # tier keeps ``COMMANDS`` insertion order (an empty query — lone
+        # "/" — puts every command in the prefix tier, unchanged).
+        query = text_before[1:].lower()
+        prefix_hits: list[tuple[str, str]] = []
+        substring_hits: list[tuple[str, str]] = []
         for name, (desc, _) in COMMANDS.items():
             if name in _SLASH_COMMAND_ALIASES:
                 continue
-            if not name.startswith(prefix):
-                continue
+            body = name[1:].lower()
+            if body.startswith(query):
+                prefix_hits.append((name, desc))
+            elif query in body:
+                substring_hits.append((name, desc))
+        for name, desc in (*prefix_hits, *substring_hits):
             yield Completion(
                 text=name,
                 # Replace everything typed so far so the splice
@@ -7413,9 +8489,230 @@ class _SlashCommandCompleter(Completer):
             )
 
 
+# ── "!" shell passthrough ──────────────────────────────────────────────
+# A line beginning with "!" runs the rest in the user's shell; its output is
+# shown and folded into the next agent turn so the agent can reason about it.
+# Env-overridable knobs (Claude Code-parity defaults).
+_BANG_TIMEOUT_S: float = float(os.environ.get("OMNIGENT_BANG_TIMEOUT_S") or 120.0)
+_BANG_DISPLAY_MAX: int = int(os.environ.get("OMNIGENT_BANG_DISPLAY_MAX") or 30_000)
+_BANG_CONTEXT_MAX: int = int(os.environ.get("OMNIGENT_BANG_CONTEXT_MAX") or 16_000)
+
+# The omnigent-logo green. Marks a "!" shell command consistently: the composer
+# while it's being typed, and the echoed command line once it runs.
+_BANG_GREEN = "#26a079"
+_BANG_INPUT_STYLE = f"fg:{_BANG_GREEN} bold"  # prompt-toolkit composer style
+# Rich-markup style for the echoed "! <cmd>" line (see _run_bang_command).
+_BANG_ECHO_MARKUP = f"bold {_BANG_GREEN}"
+
+
+class _BangInputLexer(Lexer):
+    """
+    Color the composer green while the current line is a "!" shell command.
+
+    A line that begins with ``!`` (but not the ``!!`` literal-escape) runs in
+    the shell via the passthrough; painting it in the omnigent-logo green is
+    live feedback that bang mode is active. Any other input renders unstyled.
+    """
+
+    def lex_document(self, document: Document) -> Callable[[int], StyleAndTextTuples]:
+        text = document.text
+        is_bang = text.startswith("!") and not text.startswith("!!")
+        style = _BANG_INPUT_STYLE if is_bang else ""
+        lines = document.lines
+
+        def get_line(lineno: int) -> StyleAndTextTuples:
+            return [(style, lines[lineno])]
+
+        return get_line
+
+
+def _bang_shell_argv(cmd: str) -> list[str]:
+    """Argv to run ``cmd`` via the platform shell.
+
+    POSIX: ``$SHELL -c <cmd>`` (falling back to ``/bin/sh``). Windows:
+    ``%COMSPEC% /c <cmd>`` (falling back to ``cmd.exe``). ``-c`` (not a login
+    shell) keeps it predictable and avoids ``!``-history expansion, at the cost
+    of not loading interactive-rc aliases.
+    """
+    if os.name == "nt":
+        return [os.environ.get("COMSPEC") or "cmd.exe", "/c", cmd]
+    return [os.environ.get("SHELL") or "/bin/sh", "-c", cmd]
+
+
+def _resolve_cd(cmd: str, cwd: str) -> str | None:
+    """If ``cmd`` is a standalone ``cd`` (no shell operators), return the
+    resolved absolute target directory, else ``None``.
+
+    ``cd`` with no argument resolves to home. Only a lone ``cd`` is handled —
+    a ``cd`` inside a compound command (``cd x && …``) runs in its own subshell
+    and does not persist (lightweight cwd model; full shell-state persistence
+    would need a long-lived shell).
+    """
+    s = cmd.strip()
+    if s != "cd" and not s.startswith("cd "):
+        return None
+    if any(op in s for op in ("&&", "||", ";", "|", ">", "<", "`", "$(", "\n")):
+        return None
+    arg = s[2:].strip().strip("\"'")
+    if not arg or arg == "~":
+        return os.path.expanduser("~")
+    target = os.path.expanduser(arg)
+    if not os.path.isabs(target):
+        target = os.path.join(cwd, target)
+    return os.path.normpath(target)
+
+
+def _clip_text(text: str, limit: int) -> str:
+    """Clip ``text`` to ``limit`` chars, keeping head + tail with a marker."""
+    if len(text) <= limit:
+        return text
+    head = limit * 3 // 4
+    tail = limit - head
+    omitted = len(text) - limit
+    return f"{text[:head]}\n… [{omitted} chars truncated] …\n{text[-tail:]}"
+
+
+def _write_bang_overflow(cmd: str, stdout: str, stderr: str) -> str | None:
+    """
+    When combined output exceeds the model cap, spill the FULL (ANSI-stripped)
+    capture to a temp file and return its path; else ``None``. Lets the agent
+    read everything instead of losing the truncated remainder.
+
+    The overflow is measured on the ANSI-stripped text — the same form the
+    context builder caps — so heavily-styled output doesn't trip the spill when
+    the text the model sees would fit. The file is intentionally left in place
+    for the agent to read on a later turn; the OS temp dir reclaims it.
+    """
+    from rich.text import Text as _RText
+
+    plain_out = _RText.from_ansi(stdout).plain if stdout else ""
+    plain_err = _RText.from_ansi(stderr).plain if stderr else ""
+    if len(plain_out) + len(plain_err) <= _BANG_CONTEXT_MAX:
+        return None
+    fd, path = tempfile.mkstemp(prefix="omnigent-bang-", suffix=".log")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(f"$ {cmd}\n\n")
+        if plain_out:
+            fh.write(plain_out)
+        if plain_err:
+            fh.write("\n--- stderr ---\n")
+            fh.write(plain_err)
+    return path
+
+
+def _build_bang_context(
+    cmd: str,
+    stdout: str,
+    stderr: str,
+    status: str,
+    overflow_path: str | None = None,
+) -> str:
+    """Build the model-facing block for a "!" command: ANSI stripped, capped,
+    with separate stdout/stderr fences. ``status`` is e.g. ``"exit: 0"``. When
+    ``overflow_path`` is given, the full output was spilled there and is noted
+    so the agent can read it in full."""
+    from rich.text import Text as _RText
+
+    parts = [
+        "I ran a shell command in the terminal. Here is the command and its output.",
+        "",
+        f"$ {cmd}",
+        status,
+    ]
+    out = _clip_text(_RText.from_ansi(stdout).plain.rstrip(), _BANG_CONTEXT_MAX)
+    err = _clip_text(_RText.from_ansi(stderr).plain.rstrip(), _BANG_CONTEXT_MAX)
+    if out:
+        parts += ["", "```stdout", out, "```"]
+    if err:
+        parts += ["", "```stderr", err, "```"]
+    if not out and not err:
+        parts += ["", "(no output)"]
+    if overflow_path:
+        parts += ["", f"(output truncated above — full output saved to: {overflow_path})"]
+    return "\n".join(parts)
+
+
+async def _run_bang_command(
+    cmd: str, host: TerminalHost, fmt: RichBlockFormatter, *, cwd: str | None = None
+) -> str:
+    """Run ``cmd`` in the user's shell, render its output, and return a
+    model-facing block to fold into the next turn.
+
+    Best-effort and non-interactive: stdin is ``/dev/null`` (interactive
+    commands fail fast instead of hanging) and the run is bounded by a timeout.
+    Cross-platform (POSIX ``$SHELL -c`` / Windows ``cmd.exe /c``). stdout/stderr
+    are captured separately; ANSI is preserved on screen and stripped for the
+    model; output is capped, with the full capture spilled to a temp file when
+    it overflows.
+    """
+    from rich.text import Text as _RText
+
+    host.output(_RText.from_markup(""))
+    host.output(_RText.from_markup(f"  [{_BANG_ECHO_MARKUP}]! {escape(cmd)}[/]"))
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *_bang_shell_argv(cmd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            cwd=cwd or os.getcwd(),
+        )
+    except OSError as exc:
+        host.output(
+            _RText.from_markup(
+                f"   [{fmt.warning}]! could not run: {escape(str(exc))}[/{fmt.warning}]"
+            ),
+        )
+        return f"$ {cmd}\n(command could not be started: {exc})"
+
+    timed_out = False
+    try:
+        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=_BANG_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        timed_out = True
+        proc.kill()
+        out_b, err_b = await proc.communicate()
+
+    elapsed = loop.time() - start
+    stdout = out_b.decode(errors="replace")
+    stderr = err_b.decode(errors="replace")
+    code = proc.returncode
+
+    if stdout:
+        host.output(_RText.from_ansi(_clip_text(stdout, _BANG_DISPLAY_MAX)))
+    if stderr:
+        host.output(_RText.from_markup(f"  [{fmt.muted}][stderr][/{fmt.muted}]"))
+        host.output(_RText.from_ansi(_clip_text(stderr, _BANG_DISPLAY_MAX)))
+
+    overflow_path = _write_bang_overflow(cmd, stdout, stderr)
+    if overflow_path:
+        host.output(
+            _RText.from_markup(
+                f"   [{fmt.muted}]full output: {escape(overflow_path)}[/{fmt.muted}]"
+            )
+        )
+
+    if timed_out:
+        secs = int(_BANG_TIMEOUT_S)
+        host.output(
+            _RText.from_markup(
+                f"   [{fmt.warning}]⏱ killed after {secs}s (timeout)[/{fmt.warning}]"
+            )
+        )
+        status = f"timed out and was killed after {secs}s"
+    else:
+        style = fmt.muted if code == 0 else fmt.warning
+        host.output(_RText.from_markup(f"   [{style}]exit {code} · {elapsed:.1f}s[/{style}]"))
+        status = f"exit: {code}"
+    return _build_bang_context(cmd, stdout, stderr, status, overflow_path)
+
+
 async def handle_slash_command(
     line: str,
-    session: Session,
+    session: _ReplSession,
     client: OmnigentClient,
     host: TerminalHost,
     fmt: RichBlockFormatter,

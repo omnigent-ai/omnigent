@@ -33,6 +33,18 @@ def test_resolve_reads_api_key_from_env(
     assert selection.credentials["api_key"] == "sk-openai-test"
 
 
+def test_resolve_reads_api_key_from_omnigent_prefixed_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-interactive provider selection accepts ``OMNIGENT_`` key aliases."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("OMNIGENT_ANTHROPIC_API_KEY", "sk-prefixed")
+
+    selection = resolve_provider_from_model("anthropic/claude-sonnet-4-20250514")
+
+    assert selection.credentials["api_key"] == "sk-prefixed"
+
+
 def test_resolve_missing_env_var_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

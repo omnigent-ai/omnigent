@@ -2,10 +2,16 @@
 
 import asyncio
 import json
+import logging
 import os
+import shutil
 import socket
+import tempfile
+import textwrap
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,13 +30,18 @@ from omnigent.inner.executor import (
 from omnigent.inner.pi_executor import (
     PiExecutor,
     _build_models_json,
+    _databricks_model_wire_catalog,
     _generate_extension_js,
     _pi_provider_for_model,
     _PiRpcSession,
+    _redact_argv_for_log,
+    _safe_dumps,
     _sanitize_schema,
+    _split_pi_prompt,
     _ToolServer,
 )
-from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
+from omnigent.model_catalog import ModelEntry
+from omnigent.model_metadata import ModelMetadata, ModelWireAPI
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
@@ -311,7 +322,13 @@ def test_sanitize_real_sys_session_send_args_collapses_to_object() -> None:
     # Structured fields the purpose guard and the per-dispatch model
     # override read must survive the collapse.
     assert sanitized_args["type"] == "object"
-    assert set(sanitized_args["properties"]) == {"input", "purpose", "model"}
+    assert set(sanitized_args["properties"]) == {
+        "input",
+        "purpose",
+        "model",
+        "file_ids",
+        "cost_budget",
+    }
     assert sanitized_args["required"] == ["input"]
     # Exact dict: the chosen object branch minus its stripped
     # additionalProperties — anything else means extra keys leaked or
@@ -327,7 +344,41 @@ def test_sanitize_real_sys_session_send_args_collapses_to_object() -> None:
 
 class TestPiProviderForModel(unittest.TestCase):
     def test_gpt_model(self):
-        self.assertEqual(_pi_provider_for_model("databricks-gpt-5-4-mini"), "databricks")
+        self.assertEqual(_pi_provider_for_model("databricks-gpt-5-4-mini"), "databricks-openai")
+
+    def test_catalog_chat_only_gpt_model(self):
+        self.assertEqual(
+            _pi_provider_for_model(
+                "databricks-gpt-next",
+                frozenset({ModelWireAPI.OPENAI_CHAT}),
+            ),
+            "databricks",
+        )
+
+    def test_catalog_responses_gpt_model(self):
+        self.assertEqual(
+            _pi_provider_for_model(
+                "databricks-gpt-next",
+                frozenset({ModelWireAPI.OPENAI_RESPONSES}),
+            ),
+            "databricks-openai",
+        )
+
+    def test_generic_provider_uses_configured_wire(self):
+        self.assertEqual(
+            _pi_provider_for_model(
+                "gpt-next",
+                generic_openai_wire_api="chat",
+            ),
+            "databricks-completions",
+        )
+        self.assertEqual(
+            _pi_provider_for_model(
+                "gpt-next",
+                generic_openai_wire_api="responses",
+            ),
+            "databricks-openai",
+        )
 
     def test_claude_model(self):
         self.assertEqual(
@@ -342,6 +393,73 @@ class TestPiProviderForModel(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _split_pi_prompt tests
+# ---------------------------------------------------------------------------
+
+
+def test_split_pi_prompt_separates_text_and_images():
+    # #515: multimodal blocks must go to Pi's native message + images, not be
+    # JSON-encoded into the text (which the model reads as a literal blob).
+    message, images = _split_pi_prompt(
+        [
+            {"type": "input_text", "text": "what is in this image?"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+        ]
+    )
+    assert message == "what is in this image?"
+    assert images == [{"type": "image", "data": "AAAA", "mimeType": "image/png"}]
+
+
+def test_split_pi_prompt_text_only_has_no_images():
+    message, images = _split_pi_prompt([{"type": "input_text", "text": "hi"}])
+    assert message == "hi"
+    assert images == []
+
+
+def test_split_pi_prompt_rejects_non_data_uri_image():
+    # A non-data-URI input_image (e.g. a file reference) cannot be forwarded
+    # inline to Pi, so it raises a clear ValueError -- run_turn catches this and
+    # surfaces it as an ExecutorError instead of crashing the turn (#516 review).
+    with pytest.raises(ValueError, match="inline data URI"):
+        _split_pi_prompt([{"type": "input_image", "image_url": "file-abc123"}])
+
+
+def test_split_pi_prompt_inlines_text_input_file():
+    # #516 review: a text-like input_file is decoded into the message (so the
+    # model can read it) rather than dropped or hard-failed — mirroring codex.
+    import base64 as _b64
+
+    payload = _b64.b64encode(b"hello from a file").decode()
+    message, images = _split_pi_prompt(
+        [
+            {"type": "input_text", "text": "summarize:"},
+            {"type": "input_file", "file_data": f"data:text/markdown;base64,{payload}"},
+        ]
+    )
+    assert message == "summarize:\nhello from a file"
+    assert images == []
+
+
+def test_split_pi_prompt_skips_binary_input_file():
+    # A binary input_file (e.g. PDF) can't be inlined as text; it's skipped
+    # (with a logged warning), not raised — the turn still runs.
+    message, images = _split_pi_prompt(
+        [
+            {"type": "input_text", "text": "hi"},
+            {"type": "input_file", "file_data": "data:application/pdf;base64,JVBERi0x"},
+        ]
+    )
+    assert message == "hi"
+    assert images == []
+
+
+def test_split_pi_prompt_rejects_genuinely_unknown_block_type():
+    # A block type Pi can't handle at all still fails loudly rather than
+    # silently vanishing -> run_turn surfaces it as an ExecutorError.
+    with pytest.raises(ValueError, match="Unsupported content block type"):
+        _split_pi_prompt([{"type": "input_audio", "audio": "..."}])
+
+
 # _build_models_json tests
 # ---------------------------------------------------------------------------
 
@@ -353,6 +471,56 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertIn("databricks", providers)
         self.assertIn("databricks-anthropic", providers)
         self.assertIn("databricks-completions", providers)
+
+    def test_dynamic_model_declared_image_capable(self):
+        # #515: a dynamically-registered model must advertise image input, or
+        # Pi's transformMessages strips every image block ("model does not
+        # support images") before the message reaches the provider.
+        model = "databricks-qwen2-5-vl-72b"
+        result = _build_models_json("https://host.example.com", "tok", model=model)
+        provider = result["providers"][_pi_provider_for_model(model)]
+        entry = next(e for e in provider["models"] if e["id"] == model)
+        self.assertEqual(entry.get("input"), ["text", "image"])
+
+    def test_dynamic_reasoning_model_gets_reasoning_flag(self):
+        # DeepSeek streams output on ``reasoning_content``; without
+        # ``reasoning: true`` Pi's openai-completions parser never consumes
+        # that channel and the turn dies with "Stream ended without finish_reason".
+        # GLM now uses the Responses API so it no longer needs this flag.
+        model = "databricks-deepseek-r1"
+        result = _build_models_json("https://host.example.com", "tok", model=model)
+        provider = result["providers"][_pi_provider_for_model(model)]
+        entry = next(e for e in provider["models"] if e["id"] == model)
+        self.assertIs(entry.get("reasoning"), True, model)
+
+    def test_dynamic_non_reasoning_model_has_no_reasoning_flag(self):
+        model = "databricks-mlflow-2-5-pro"
+        result = _build_models_json("https://host.example.com", "tok", model=model)
+        provider = result["providers"][_pi_provider_for_model(model)]
+        entry = next(e for e in provider["models"] if e["id"] == model)
+        self.assertNotIn("reasoning", entry)
+
+    def test_catalog_model_declared_image_capable(self):
+        # A pre-registered catalog model must advertise image input. The
+        # selected-model append is skipped when the id is already listed.
+        for model, wire_api in (
+            ("databricks-gpt-catalog", ModelWireAPI.OPENAI_RESPONSES),
+            ("databricks-claude-catalog", ModelWireAPI.ANTHROPIC_MESSAGES),
+        ):
+            catalog_model = ModelEntry(
+                id=model,
+                family="openai",
+                metadata=ModelMetadata(wire_apis=frozenset({wire_api})),
+            )
+            result = _build_models_json(
+                "https://host.example.com",
+                "tok",
+                model=model,
+                catalog_models=(catalog_model,),
+            )
+            provider = result["providers"][_pi_provider_for_model(model)]
+            entry = next(e for e in provider["models"] if e["id"] == model)
+            self.assertEqual(entry.get("input"), ["text", "image"], model)
 
     def test_base_urls_use_host(self):
         result = _build_models_json("https://host.example.com/", "tok")
@@ -372,9 +540,11 @@ class TestBuildModelsJson(unittest.TestCase):
             },
         )
         p = result["providers"]
+        # The ucode ``openai`` value is the Codex Responses gateway; GPT and the
+        # catch-all re-route to serving-endpoints, claude keeps its gateway.
         self.assertEqual(
             p["databricks"]["baseUrl"],
-            "https://host.example.com/ai-gateway/codex/v1",
+            "https://host.example.com/serving-endpoints",
         )
         self.assertEqual(
             p["databricks-anthropic"]["baseUrl"],
@@ -382,7 +552,113 @@ class TestBuildModelsJson(unittest.TestCase):
         )
         self.assertEqual(
             p["databricks-completions"]["baseUrl"],
-            "https://host.example.com/ai-gateway/codex/v1",
+            "https://host.example.com/serving-endpoints",
+        )
+
+    def test_ucode_codex_gateway_rerouted_off_responses_path(self):
+        # The codex gateway 404s /chat/completions, so it must not survive onto
+        # a completions provider (#241 GPT 404).
+        result = _build_models_json(
+            "https://host.example.com",
+            "tok",
+            {"openai": "https://host.example.com/ai-gateway/codex/v1"},
+        )
+        for name in ("databricks", "databricks-completions"):
+            base_url = result["providers"][name]["baseUrl"]
+            self.assertNotIn("/ai-gateway/codex", base_url)
+            self.assertEqual(base_url, "https://host.example.com/serving-endpoints")
+
+    def test_gemini_model_routed_to_mlflow_gateway(self):
+        # Gemini uses /ai-gateway/mlflow/v1 — system.ai.* ids 404 at serving-endpoints
+        # and the Responses API returns 400 for Gemini.
+        result = _build_models_json(
+            "https://host.example.com",
+            "tok",
+            model="system.ai.gemini-3-flash",
+        )
+        provider = result["providers"][_pi_provider_for_model("system.ai.gemini-3-flash")]
+        self.assertEqual(provider["baseUrl"], "https://host.example.com/ai-gateway/mlflow/v1")
+        self.assertIn(
+            "system.ai.gemini-3-flash",
+            [entry.get("id") for entry in provider["models"]],
+        )
+
+    def test_generic_openai_base_url_used_as_is(self):
+        # A non-ucode openai URL (no ``/ai-gateway/codex``) must pass through so
+        # the re-route never breaks generic gateways.
+        result = _build_models_json(
+            "https://host.example.com",
+            "tok",
+            {"openai": "https://openrouter.ai/api/v1"},
+        )
+        p = result["providers"]
+        self.assertEqual(p["databricks"]["baseUrl"], "https://openrouter.ai/api/v1")
+        self.assertEqual(p["databricks-completions"]["baseUrl"], "https://openrouter.ai/api/v1")
+
+    def test_generic_openai_providers_include_auth_header(self):
+        # Generic (non-Databricks) OpenAI-compatible gateways expect
+        # ``Authorization: Bearer <token>``.  The "databricks" and
+        # "databricks-completions" provider entries must carry
+        # ``authHeader: True`` so Pi sends that header rather than the
+        # Databricks-native auth scheme which the gateway does not recognise
+        # (resulting in a 401 "Missing Authentication header").
+        result = _build_models_json(
+            "https://host.example.com",
+            "tok",
+            {"openai": "https://openrouter.ai/api/v1"},
+        )
+        p = result["providers"]
+        self.assertTrue(p["databricks"].get("authHeader"), "databricks entry missing authHeader")
+        self.assertTrue(
+            p["databricks-completions"].get("authHeader"),
+            "databricks-completions entry missing authHeader",
+        )
+
+    def test_databricks_native_providers_omit_auth_header(self):
+        # On the Databricks-native path (no openai base_url), the "databricks"
+        # and "databricks-completions" entries must NOT carry ``authHeader``
+        # (the workspace endpoint uses a different auth scheme).
+        result = _build_models_json("https://host.example.com", "tok")
+        p = result["providers"]
+        self.assertNotIn("authHeader", p["databricks"])
+        self.assertNotIn("authHeader", p["databricks-completions"])
+
+    def test_generic_openai_model_uses_configured_responses_wire(self):
+        result = _build_models_json(
+            "https://unused.example.com",
+            "tok",
+            {"openai": "https://gateway.example.com/v1"},
+            model="vendor/model-next",
+            openai_wire_api="responses",
+        )
+
+        responses = result["providers"]["databricks-openai"]
+        self.assertEqual(responses["baseUrl"], "https://gateway.example.com/v1")
+        self.assertIn("vendor/model-next", [entry["id"] for entry in responses["models"]])
+
+    def test_dedicated_gateway_uses_catalog_wire_and_workspace_chat_url(self):
+        result = _build_models_json(
+            "https://workspace.cloud.databricks.com",
+            "tok",
+            {
+                "openai": "https://123.ai-gateway.cloud.databricks.com/codex/v1",
+            },
+            model="databricks-gpt-next",
+            model_wire_apis={
+                "databricks-gpt-next": frozenset({ModelWireAPI.OPENAI_CHAT}),
+            },
+            openai_wire_api="responses",
+        )
+
+        chat = result["providers"]["databricks"]
+        self.assertEqual(
+            chat["baseUrl"],
+            "https://workspace.cloud.databricks.com/serving-endpoints",
+        )
+        self.assertIn("databricks-gpt-next", [entry["id"] for entry in chat["models"]])
+        self.assertEqual(
+            result["providers"]["databricks-openai"]["baseUrl"],
+            "https://123.ai-gateway.cloud.databricks.com/codex/v1",
         )
 
     def test_api_key_set(self):
@@ -472,6 +748,89 @@ class TestToolServer(unittest.TestCase):
         finally:
             probe.close()
 
+    async def _run_generated_bridge_tool(
+        self,
+        *,
+        port: int,
+        token: str,
+        timeout: float = 5.0,
+    ) -> dict:
+        """Run the generated JS extension under Node and execute one tool.
+
+        This is intentionally cross-runtime: Python starts the real loopback
+        server, while Node loads the generated Pi extension, captures the
+        registered tool, and calls its ``execute`` method. It exercises the
+        same JSONL/TCP boundary Pi uses without needing a live Pi process.
+        """
+        node_path = shutil.which("node")
+        if node_path is None:
+            self.skipTest("node is required for generated Pi bridge e2e tests")
+
+        schema = [
+            {
+                "name": "exotic",
+                "description": "exercise generated bridge",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            extension_path = tmp_path / "omnigent_tools.js"
+            runner_path = tmp_path / "run_bridge.js"
+            extension_path.write_text(_generate_extension_js(port, schema, token))
+            runner_path.write_text(
+                textwrap.dedent(
+                    """
+                    const extension = require(process.argv[2]);
+                    let registered;
+                    const fakePi = {
+                      on() {},
+                      registerTool(tool) { registered = tool; },
+                    };
+
+                    (async () => {
+                      extension(fakePi);
+                      if (!registered) {
+                        throw new Error("tool was not registered");
+                      }
+                      const result = await registered.execute(
+                        "call-1",
+                        { input: "hello" },
+                        undefined,
+                        undefined,
+                        {}
+                      );
+                      process.stdout.write(JSON.stringify(result));
+                    })().catch((err) => {
+                      process.stderr.write(err && err.stack ? err.stack : String(err));
+                      process.exit(1);
+                    });
+                    """
+                )
+            )
+
+            proc = await asyncio.create_subprocess_exec(
+                node_path,
+                str(runner_path),
+                str(extension_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                stdout, stderr = await proc.communicate()
+                stderr_text = stderr.decode("utf-8", errors="replace")
+                self.fail(f"generated Pi bridge did not resolve within {timeout}s: {stderr_text}")
+            self.assertEqual(
+                proc.returncode,
+                0,
+                stderr.decode("utf-8", errors="replace"),
+            )
+            return json.loads(stdout.decode("utf-8"))
+
     def test_start_and_stop(self):
         async def _test():
             server = _ToolServer()
@@ -560,6 +919,134 @@ class TestToolServer(unittest.TestCase):
 
             writer.close()
             await server.stop()
+
+        _run(_test())
+
+    def test_non_json_serializable_result_returns_error_frame(self):
+        """A tool result ``json.dumps`` can't encode yields an error frame.
+
+        Regression for F03: serialization happens on the response path
+        *outside* ``_execute``'s try, so a tool returning a ``datetime`` (or
+        ``set``) used to raise ``TypeError`` there, close the socket with zero
+        bytes, and hang the JS ``callTool`` promise — wedging the whole turn.
+        The handler must instead always write a valid frame: here an
+        ``{"error": ...}`` envelope, correlated by ``id``, delivered well
+        within the timeout (proving it did not hang).
+        """
+
+        async def _test():
+            server = _ToolServer()
+            await server.start()
+
+            async def executor(name, args):
+                # A dict carrying values json.dumps rejects by default.
+                return {
+                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc),
+                    "tags": {1, 2, 3},
+                }
+
+            server._tool_executor = executor
+
+            reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+            request = (
+                json.dumps({"id": "req6", "token": server.token, "tool": "exotic", "args": {}})
+                + "\n"
+            )
+            writer.write(request.encode())
+            await writer.drain()
+
+            # The key assertion is that a frame arrives at all (no hang): a
+            # short timeout would fire if the response path crashed/closed.
+            response_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            self.assertTrue(response_line, "tool server closed without writing a frame (hang)")
+            response = json.loads(response_line)
+            self.assertEqual(response["id"], "req6")
+            self.assertIn("unserializable tool result", response["error"])
+            self.assertNotIn("result", response)
+
+            writer.close()
+            await server.stop()
+
+        _run(_test())
+
+    def test_safe_dumps_with_non_serializable_req_id_does_not_raise(self):
+        """``_safe_dumps`` never raises, even on a non-serializable ``req_id``.
+
+        The fallback envelope serializes ``req_id`` too, so a future caller
+        passing an id ``json.dumps`` can't encode (here a ``datetime``) must
+        still yield a valid frame rather than re-raising the very crash the
+        guard exists to prevent. The id is stringified in that envelope.
+        """
+        bad_id = datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc)
+        out = _safe_dumps({"id": bad_id, "result": {"k": "v"}}, bad_id)  # type: ignore[arg-type]
+        payload = json.loads(out)
+        self.assertEqual(payload["id"], str(bad_id))
+        self.assertIn("unserializable tool result", payload["error"])
+        self.assertNotIn("result", payload)
+
+    def test_generated_bridge_returns_error_for_unserializable_tool_result(self):
+        """End-to-end: Node bridge + Python server return an error result.
+
+        The previous unit test proves the TCP server writes an error frame.
+        This test follows the actual Pi bridge path too: generated JS running
+        in Node receives that frame and returns a Pi tool result with
+        ``isError=true`` instead of hanging or throwing.
+        """
+
+        async def _test():
+            server = _ToolServer()
+            await server.start()
+
+            async def executor(name, args):
+                return {
+                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc),
+                    "tags": {1, 2, 3},
+                }
+
+            server._tool_executor = executor
+            try:
+                result = await self._run_generated_bridge_tool(
+                    port=server.port,
+                    token=server.token,
+                )
+            finally:
+                await server.stop()
+
+            self.assertTrue(result["isError"])
+            self.assertEqual(result["content"][0]["type"], "text")
+            payload = json.loads(result["content"][0]["text"])
+            self.assertIn("unserializable tool result", payload["error"])
+
+        _run(_test())
+
+    def test_generated_bridge_resolves_on_bare_socket_close(self):
+        """End-to-end: a zero-byte close resolves the generated JS callTool.
+
+        This exercises the defense-in-depth close handler. If the generated
+        bridge only resolved on ``data`` or ``error`` events, the Node process
+        would hang here until ``wait_for`` timed out.
+        """
+
+        async def _test():
+            async def close_without_response(reader, writer):
+                await reader.readline()
+                writer.close()
+                await writer.wait_closed()
+
+            server = await asyncio.start_server(close_without_response, "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            try:
+                result = await self._run_generated_bridge_tool(
+                    port=port,
+                    token="close-token",
+                )
+            finally:
+                server.close()
+                await server.wait_closed()
+
+            self.assertTrue(result["isError"])
+            payload = json.loads(result["content"][0]["text"])
+            self.assertIn("closed connection without a response", payload["error"])
 
         _run(_test())
 
@@ -1124,7 +1611,8 @@ class TestResolveModel(unittest.TestCase):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor(model="constructor-default")
         self.assertEqual(
-            executor._resolve_model(ExecutorConfig(model="cfg-override")), "cfg-override"
+            _run(executor._resolve_model(ExecutorConfig(model="cfg-override"))),
+            "cfg-override",
         )
 
     def test_constructor_default_used_when_no_cfg_override(self):
@@ -1134,7 +1622,8 @@ class TestResolveModel(unittest.TestCase):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor(model="constructor-default")
         self.assertEqual(
-            executor._resolve_model(ExecutorConfig(model=None)), "constructor-default"
+            _run(executor._resolve_model(ExecutorConfig(model=None))),
+            "constructor-default",
         )
 
     def test_cfg_model_used_when_no_constructor_default(self):
@@ -1145,7 +1634,8 @@ class TestResolveModel(unittest.TestCase):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         self.assertEqual(
-            executor._resolve_model(ExecutorConfig(model="config-model")), "config-model"
+            _run(executor._resolve_model(ExecutorConfig(model="config-model"))),
+            "config-model",
         )
 
 
@@ -1168,11 +1658,17 @@ class TestBuildEnvAndDir(unittest.TestCase):
         config = executor._build_env_and_dir([], None, None, None)
         try:
             self.assertIn("PI_CODING_AGENT_DIR", config.env)
-            models_path = os.path.join(config.env["PI_CODING_AGENT_DIR"], "models.json")
-            self.assertTrue(os.path.exists(models_path))
+            managed_dir = Path(config.env["PI_CODING_AGENT_DIR"])
+            models_path = managed_dir / "models.json"
+            self.assertTrue(models_path.is_file())
             with open(models_path) as f:
                 data = json.load(f)
             self.assertIn("providers", data)
+            settings_path = managed_dir / "settings.json"
+            self.assertTrue(settings_path.is_file())
+            with open(settings_path) as f:
+                settings = json.load(f)
+            self.assertIn("retry", settings)
         finally:
             import shutil
 
@@ -1205,6 +1701,42 @@ class TestBuildEnvAndDir(unittest.TestCase):
             import shutil
 
             shutil.rmtree(config.tmp_dir, ignore_errors=True)
+
+
+def test_gateway_seeds_managed_settings_from_global_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gateway mode copies global Pi settings into the managed agent dir."""
+    global_agent = tmp_path / "pi-agent"
+    global_agent.mkdir()
+    (global_agent / "settings.json").write_text(
+        json.dumps({"extensions": ["/ext/demo.ts"], "packages": ["npm:@x/y"]}),
+        encoding="utf-8",
+    )
+    (global_agent / "npm").mkdir()
+    monkeypatch.setattr(
+        "omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR",
+        global_agent,
+    )
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+    ):
+        executor = PiExecutor(gateway=True)
+
+    config = executor._build_env_and_dir([], None, None, None)
+    try:
+        managed_dir = Path(config.env["PI_CODING_AGENT_DIR"])
+        settings = json.loads((managed_dir / "settings.json").read_text(encoding="utf-8"))
+        assert settings["extensions"] == ["/ext/demo.ts"]
+        assert settings["packages"] == ["npm:@x/y"]
+        assert (managed_dir / "npm").is_symlink()
+    finally:
+        shutil.rmtree(config.tmp_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1655,14 +2187,17 @@ class TestRunTurn(unittest.TestCase):
             fake_rpc.process.stdin = _FakeStreamWriter()
             fake_rpc._stderr_lines = []
 
+            errored = {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": "Rate limited",
+            }
             lines = [
                 json.dumps({"type": "response", "success": True}),
-                json.dumps(
-                    {
-                        "type": "message_end",
-                        "message": {"stopReason": "error", "errorMessage": "Rate limited"},
-                    }
-                ),
+                json.dumps({"type": "message_end", "message": errored}),
+                # Pi's agent loop always emits agent_end after an errored call.
+                json.dumps({"type": "agent_end", "messages": [errored]}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -1684,6 +2219,136 @@ class TestRunTurn(unittest.TestCase):
             self.assertEqual(len(events), 1)
             self.assertIsInstance(events[0], ExecutorError)
             self.assertIn("Rate limited", events[0].message)
+
+        _run(_test())
+
+    def test_message_end_error_with_stream_eof_fails_with_real_error(self):
+        """If pi dies after reporting the errored message (no agent_end ever
+        arrives), the turn still fails with pi's error message rather than
+        the generic ended-without-response fallback.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            fake_rpc.process.stdin = _FakeStreamWriter()
+            fake_rpc._stderr_lines = []
+
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_end",
+                        "message": {"stopReason": "error", "errorMessage": "boom"},
+                    }
+                ),
+            ]
+
+            async def fake_read_line(timeout=120.0):
+                del timeout
+                if lines:
+                    return lines.pop(0)
+                return None  # EOF: process died without agent_end.
+
+            fake_rpc.read_line = fake_read_line
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            self.assertEqual(len(events), 1)
+            self.assertIsInstance(events[0], ExecutorError)
+            self.assertEqual(events[0].message, "boom")
+
+        _run(_test())
+
+    def test_post_tool_error_drains_agent_end_before_failing(self):
+        """A message_end error after a successful tool call fails the turn
+        with pi's error message, but only after consuming the trailing
+        ``agent_end`` — leaving it queued would make the next turn on the
+        same RPC session read the stale terminal event as its own end.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            fake_rpc.process.stdin = _FakeStreamWriter()
+            fake_rpc._stderr_lines = []
+
+            parse_error = "Expected property name or '}' in JSON at position 1 (line 1 column 2)"
+            errored_assistant = {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": parse_error,
+            }
+            lines = [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "sys_os_shell",
+                        "isError": False,
+                        "result": {"content": [{"type": "text", "text": "ok"}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message_end",
+                        "message": errored_assistant,
+                    }
+                ),
+                # Pi always emits agent_end after the errored LLM call ends
+                # the agent loop; it carries the errored message.
+                json.dumps({"type": "agent_end", "messages": [errored_assistant]}),
+            ]
+            for line in lines:
+                fake_rpc._line_queue.put_nowait(line)
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "run smoke"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
+            self.assertEqual(len(tool_completes), 1)
+            self.assertEqual(tool_completes[0].status, ToolCallStatus.SUCCESS)
+            # The turn fails with pi's real error — no fabricated assistant
+            # text, no synthetic TurnComplete.
+            errors = [e for e in events if isinstance(e, ExecutorError)]
+            self.assertEqual([e.message for e in errors], [parse_error])
+            self.assertFalse(any(isinstance(e, TurnComplete) for e in events))
+            self.assertFalse(any(isinstance(e, TextChunk) for e in events))
+            # The trailing agent_end was consumed: nothing stale is left for
+            # the next turn on this RPC session.
+            self.assertTrue(fake_rpc._line_queue.empty())
 
         _run(_test())
 
@@ -2324,6 +2989,10 @@ def test_profile_gateway_resolves_databricks_default_model() -> None:
     Failure means pi falls back to its own host default — an
     Anthropic-direct id the Databricks AI gateway rejects, surfacing as a
     model error on the agent's first turn.
+
+    Live discovery is stubbed unavailable so the resolver drops to the bundled
+    catalog (its documented last resort); the discovery-first path is covered
+    by ``test_profile_gateway_uses_discovered_model``.
     """
     with (
         patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
@@ -2333,7 +3002,73 @@ def test_profile_gateway_resolves_databricks_default_model() -> None:
         ),
     ):
         executor = PiExecutor(gateway=True)
-    assert executor._resolve_model(ExecutorConfig(model=None)) == DATABRICKS_CLAUDE_DEFAULT_MODEL
+    with patch(
+        "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+        side_effect=RuntimeError("live listing unavailable"),
+    ):
+        assert _run(executor._resolve_model(ExecutorConfig(model=None))) == (
+            "catalog-databricks-claude-default"
+        )
+
+
+def test_profile_gateway_uses_discovered_model() -> None:
+    """Unset model resolves to the workspace's live Claude model, not the catalog.
+
+    ``_resolve_model`` prefers the live Unity Catalog listing (via the shared
+    claude-sdk resolver, walking ``opus > sonnet > haiku > fable``) over the
+    bundled ``databricks-*`` catalog default.
+    """
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+    ):
+        executor = PiExecutor(gateway=True)
+    with (
+        patch(
+            "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+            return_value=SimpleNamespace(host="https://h.example.com", token="tok"),
+        ),
+        patch(
+            "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+            return_value=SimpleNamespace(families={"opus": "system.ai.claude-opus-5"}),
+        ),
+    ):
+        resolved = _run(executor._resolve_model(ExecutorConfig(model=None)))
+    assert resolved == "system.ai.claude-opus-5"
+
+
+def test_catalog_default_is_registered_in_models_json() -> None:
+    """Pi registers a catalog-selected gateway default before launch."""
+    catalog_default = "databricks-claude-catalog-default"
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+        # Live discovery unavailable → the bundled catalog default is used.
+        patch(
+            "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+            side_effect=RuntimeError("live listing unavailable"),
+        ),
+        patch(
+            "omnigent.model_catalog.resolve_catalog_model",
+            return_value=SimpleNamespace(model_id=catalog_default),
+        ),
+    ):
+        executor = PiExecutor(gateway=True)
+        resolved = _run(executor._resolve_model(ExecutorConfig(model=None)))
+
+    models = _build_models_json("https://h.example.com", "tok", model=resolved)
+    anthropic_ids = {
+        entry["id"] for entry in models["providers"]["databricks-anthropic"]["models"]
+    }
+
+    assert resolved == catalog_default
+    assert catalog_default in anthropic_ids
 
 
 def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
@@ -2352,7 +3087,158 @@ def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
         ),
     ):
         executor = PiExecutor(gateway=True, model="databricks-gpt-5-4")
-    assert executor._resolve_model(ExecutorConfig(model=None)) == "databricks-gpt-5-4"
+    assert _run(executor._resolve_model(ExecutorConfig(model=None))) == "databricks-gpt-5-4"
+
+
+def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
+    """Pi reuses UC availability and enriches aliases with MLflow limits."""
+    responses = frozenset({ModelWireAPI.OPENAI_RESPONSES})
+    entries = (
+        ModelEntry(
+            id="system.ai.gpt-next",
+            family="openai",
+            metadata=ModelMetadata(wire_apis=responses),
+        ),
+    )
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+        patch(
+            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            return_value=entries,
+        ) as fetch,
+        patch(
+            "omnigent.model_catalog.catalog_model_entries",
+            return_value=(
+                ModelEntry(
+                    id="databricks-gpt-next",
+                    family="openai",
+                    metadata=ModelMetadata(
+                        context_window=400_000,
+                        max_output_tokens=128_000,
+                    ),
+                ),
+            ),
+        ) as enrich,
+    ):
+        executor = PiExecutor(gateway=True)
+        first = _run(executor._load_gateway_model_wire_apis())
+        second = _run(executor._load_gateway_model_wire_apis())
+
+    assert first["databricks-gpt-next"] == responses
+    assert second is first
+    assert executor._gateway_model_entries is not None
+    assert executor._gateway_model_entries[0].metadata.context_window == 400_000
+    assert executor._gateway_model_entries[0].metadata.max_output_tokens == 128_000
+    fetch.assert_called_once_with("https://h.example.com", "tok")
+    enrich.assert_called_once_with("databricks")
+
+
+def test_gateway_wire_catalog_failure_is_cached() -> None:
+    """A catalog outage does not delay every later Pi subprocess startup."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+        patch(
+            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            side_effect=OSError("offline"),
+        ) as fetch,
+    ):
+        executor = PiExecutor(gateway=True)
+        assert _run(executor._load_gateway_model_wire_apis()) == {}
+        assert _run(executor._load_gateway_model_wire_apis()) == {}
+
+    fetch.assert_called_once_with("https://h.example.com", "tok")
+
+
+def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails() -> None:
+    """MLflow downtime does not erase workspace-discovered picker models."""
+    entries = (
+        ModelEntry(
+            id="system.ai.gpt-live",
+            family="openai",
+            metadata=ModelMetadata(wire_apis=frozenset({ModelWireAPI.OPENAI_RESPONSES})),
+        ),
+    )
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+        patch(
+            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            return_value=entries,
+        ),
+        patch(
+            "omnigent.model_catalog.catalog_model_entries",
+            side_effect=OSError("offline"),
+        ),
+    ):
+        executor = PiExecutor(gateway=True)
+        wire_catalog = _run(executor._load_gateway_model_wire_apis())
+
+    assert wire_catalog["system.ai.gpt-live"] == frozenset({ModelWireAPI.OPENAI_RESPONSES})
+    assert executor._gateway_model_entries == entries
+
+
+def test_dedicated_gateway_fetches_wire_catalog_from_workspace_host() -> None:
+    """Dedicated gateway hosts resolve their workspace before UC discovery."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._fetch_shell_command_token",
+            return_value="gateway-token",
+        ),
+        patch(
+            "omnigent.pi_native_credentials.resolve_databricks_workspace",
+            return_value=SimpleNamespace(host="https://workspace.cloud.databricks.com"),
+        ),
+        patch(
+            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            return_value=(),
+        ) as fetch,
+        patch("omnigent.model_catalog.catalog_model_entries", return_value=()),
+    ):
+        executor = PiExecutor(
+            gateway=True,
+            gateway_host="https://123.ai-gateway.cloud.databricks.com",
+            base_urls_override={"claude": "https://123.ai-gateway.cloud.databricks.com/anthropic"},
+            gateway_auth_command="printf token",
+        )
+        _run(executor._load_gateway_model_wire_apis())
+
+    fetch.assert_called_once_with(
+        "https://workspace.cloud.databricks.com",
+        "gateway-token",
+    )
+
+
+def test_generic_anthropic_gateway_skips_databricks_wire_catalog() -> None:
+    """A generic provider must not receive Databricks workspace API requests."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._fetch_shell_command_token",
+            return_value="provider-key",
+        ),
+        patch("omnigent.model_catalog.fetch_databricks_model_service_entries") as fetch,
+    ):
+        executor = PiExecutor(
+            gateway=True,
+            gateway_host="https://anthropic.example.com",
+            base_urls_override={"claude": "https://anthropic.example.com/v1"},
+            gateway_auth_command="printf token",
+        )
+        assert _run(executor._load_gateway_model_wire_apis()) == {}
+
+    fetch.assert_not_called()
 
 
 def test_ucode_gateway_host_path_does_not_inject_default_model() -> None:
@@ -2377,7 +3263,7 @@ def test_ucode_gateway_host_path_does_not_inject_default_model() -> None:
             gateway_host="https://example.databricks.com",
             gateway_auth_command="printf token",
         )
-    assert executor._resolve_model(ExecutorConfig(model=None)) is None
+    assert _run(executor._resolve_model(ExecutorConfig(model=None))) is None
 
 
 def test_non_gateway_path_does_not_inject_default_model() -> None:
@@ -2388,49 +3274,100 @@ def test_non_gateway_path_does_not_inject_default_model() -> None:
     """
     with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor()
-    assert executor._resolve_model(ExecutorConfig(model=None)) is None
+    assert _run(executor._resolve_model(ExecutorConfig(model=None))) is None
 
 
-def test_databricks_default_model_is_resolvable_in_models_json() -> None:
-    """
-    The shared Databricks default must route to the anthropic provider AND
-    be listed in that provider's models — otherwise the default the
-    producer/executor inject can't be resolved by pi at spawn time.
-
-    Failure means the default-model constant and pi's models.json drifted
-    apart: every modelless gateway agent would fail its first turn with a
-    pi "unknown model" error.
-    """
-    assert _pi_provider_for_model(DATABRICKS_CLAUDE_DEFAULT_MODEL) == "databricks-anthropic"
-    models = _build_models_json("https://host.example.com", "tok")
-    anthropic_ids = [m["id"] for m in models["providers"]["databricks-anthropic"]["models"]]
-    assert DATABRICKS_CLAUDE_DEFAULT_MODEL in anthropic_ids
-
-
-def test_models_json_lists_only_gateway_verified_models() -> None:
-    """
-    The hardcoded model lists match the set verified live against the
-    Databricks gateway on the API paths pi uses (Anthropic Messages for
-    Claude, Chat Completions for GPT).
-
-    Failure direction matters: a missing working id silently shrinks pi's
-    model menu; a reintroduced broken id (``sonnet-4-5-v2`` rejects
-    Anthropic passthrough, the llama endpoint 404s) fails at request time
-    for anyone who selects it.
-    """
-    models = _build_models_json("https://host.example.com", "tok")
+def test_models_json_lists_only_live_gateway_models() -> None:
+    """Pi's picker mirrors live workspace models and their wire surfaces."""
+    catalog_models = (
+        ModelEntry(
+            id="system.ai.claude-catalog",
+            family="claude",
+            metadata=ModelMetadata(wire_apis=frozenset({ModelWireAPI.ANTHROPIC_MESSAGES})),
+        ),
+        ModelEntry(
+            id="databricks-gpt-chat-catalog",
+            family="openai",
+            metadata=ModelMetadata(wire_apis=frozenset({ModelWireAPI.OPENAI_CHAT})),
+        ),
+        ModelEntry(
+            id="system.ai.gpt-responses-catalog",
+            family="openai",
+            metadata=ModelMetadata(wire_apis=frozenset({ModelWireAPI.OPENAI_RESPONSES})),
+        ),
+        ModelEntry(
+            id="system.ai.llama-catalog",
+            family="other",
+            metadata=ModelMetadata(wire_apis=frozenset({ModelWireAPI.OPENAI_CHAT})),
+        ),
+    )
+    models = _build_models_json(
+        "https://host.example.com",
+        "tok",
+        catalog_models=catalog_models,
+    )
     providers = models["providers"]
     anthropic_ids = [m["id"] for m in providers["databricks-anthropic"]["models"]]
-    assert anthropic_ids == [
-        "databricks-claude-opus-4-8",
-        "databricks-claude-sonnet-4-6",
-        "databricks-claude-sonnet-4-5",
+    assert anthropic_ids == ["system.ai.claude-catalog"]
+    openai_completions_ids = [m["id"] for m in providers["databricks"]["models"]]
+    assert openai_completions_ids == ["databricks-gpt-chat-catalog"]
+    openai_responses_ids = [m["id"] for m in providers["databricks-openai"]["models"]]
+    assert openai_responses_ids == ["system.ai.gpt-responses-catalog"]
+    assert [m["id"] for m in providers["databricks-mlflow"]["models"]] == [
+        "system.ai.llama-catalog"
     ]
-    openai_ids = [m["id"] for m in providers["databricks"]["models"]]
-    assert openai_ids == ["databricks-gpt-5-4-mini", "databricks-gpt-5-4"]
-    # The llama serving endpoint no longer exists; the provider stays as
-    # the routing home for future non-Claude/GPT endpoints.
-    assert providers["databricks-completions"]["models"] == []
+
+
+def test_models_json_unknown_gpt_metadata_fails_toward_responses() -> None:
+    """An offline catalog never sends a newly released GPT to Chat by guess."""
+    models = _build_models_json(
+        "https://host.example.com",
+        "tok",
+        model="databricks-gpt-uncatalogued",
+    )
+
+    assert models["providers"]["databricks"]["models"] == []
+    assert [model["id"] for model in models["providers"]["databricks-openai"]["models"]] == [
+        "databricks-gpt-uncatalogued",
+    ]
+
+
+def test_databricks_wire_catalog_indexes_system_and_endpoint_aliases() -> None:
+    """UC system ids supply wire metadata for serving-endpoint aliases."""
+    wire_apis = frozenset({ModelWireAPI.OPENAI_RESPONSES})
+    catalog = _databricks_model_wire_catalog(
+        [
+            ModelEntry(
+                id="system.ai.gpt-next",
+                family="openai",
+                metadata=ModelMetadata(wire_apis=wire_apis),
+            )
+        ]
+    )
+
+    assert catalog["system.ai.gpt-next"] == wire_apis
+    assert catalog["databricks-gpt-next"] == wire_apis
+
+
+def test_models_json_uses_catalog_token_limits() -> None:
+    """MLflow-enriched token limits are rendered into Pi's schema."""
+    catalog_model = ModelEntry(
+        id="databricks-gpt-catalog",
+        family="openai",
+        metadata=ModelMetadata(
+            context_window=400_000,
+            max_output_tokens=128_000,
+            wire_apis=frozenset({ModelWireAPI.OPENAI_RESPONSES}),
+        ),
+    )
+    models = _build_models_json(
+        "https://host.example.com",
+        "tok",
+        catalog_models=(catalog_model,),
+    )
+    by_id = {m["id"]: m for m in models["providers"]["databricks-openai"]["models"]}
+    assert by_id["databricks-gpt-catalog"]["contextWindow"] == 400_000
+    assert by_id["databricks-gpt-catalog"]["maxTokens"] == 128_000
 
 
 if __name__ == "__main__":
@@ -2459,9 +3396,12 @@ def test_build_models_json_registers_unknown_model_with_routed_provider() -> Non
         model="moonshotai/kimi-k2.6",
     )
     completions = result["providers"]["databricks-completions"]
-    # The run model is registered (bare-id entry, the shape ucode writes)
-    # under the provider _pi_provider_for_model routes it to…
-    assert {"id": "moonshotai/kimi-k2.6"} in completions["models"]
+    # The run model is registered (so Pi resolves it) under the provider
+    # _pi_provider_for_model routes it to, advertising image input so Pi
+    # doesn't strip attached images (#515).
+    entry = next((e for e in completions["models"] if e["id"] == "moonshotai/kimi-k2.6"), None)
+    # Non-Databricks kimi on OpenRouter uses completions path (no reasoning flag needed).
+    assert entry == {"id": "moonshotai/kimi-k2.6", "input": ["text", "image"]}
     # …and that provider points at the generic gateway with the
     # Chat-Completions dialect OpenRouter speaks.
     assert completions["baseUrl"] == "https://openrouter.ai/api/v1"
@@ -2474,26 +3414,61 @@ def test_build_models_json_registers_unknown_model_with_routed_provider() -> Non
     )
 
 
-def test_build_models_json_known_model_not_duplicated_and_lists_not_mutated() -> None:
-    """A model already in a static list is not re-registered, and the static
-    module-level lists never absorb a run's model id.
-
-    The second build (no model) must not contain the first build's foreign
-    id — if it does, the registration mutated the shared module-level list
-    instead of rebinding, leaking one run's model into every later
-    subprocess config.
-    """
+def test_build_models_json_known_catalog_model_not_duplicated() -> None:
+    """The selected model is not appended when live discovery listed it."""
+    model_id = "databricks-claude-catalog"
+    catalog_models = (
+        ModelEntry(
+            id=model_id,
+            family="claude",
+            metadata=ModelMetadata(wire_apis=frozenset({ModelWireAPI.ANTHROPIC_MESSAGES})),
+        ),
+    )
     result = _build_models_json(
-        "https://host.example.com", "tok", model="databricks-claude-sonnet-4-6"
+        "https://host.example.com",
+        "tok",
+        model=model_id,
+        catalog_models=catalog_models,
     )
     anthropic_ids = [m["id"] for m in result["providers"]["databricks-anthropic"]["models"]]
-    # Exactly one entry for the already-listed id — no duplicate appended.
-    assert anthropic_ids.count("databricks-claude-sonnet-4-6") == 1
+    assert anthropic_ids.count(model_id) == 1
 
+
+def test_build_models_json_registers_selected_catalog_alias_once() -> None:
+    """An equivalent live alias is rewritten to the exact launch selector."""
+    selected_model = "databricks-claude-catalog"
+    catalog_models = (
+        ModelEntry(
+            id="system.ai.claude-catalog",
+            family="claude",
+            metadata=ModelMetadata(
+                context_window=200_000,
+                wire_apis=frozenset({ModelWireAPI.ANTHROPIC_MESSAGES}),
+            ),
+        ),
+    )
+
+    result = _build_models_json(
+        "https://host.example.com",
+        "tok",
+        model=selected_model,
+        catalog_models=catalog_models,
+    )
+
+    anthropic_models = result["providers"]["databricks-anthropic"]["models"]
+    assert anthropic_models == [
+        {
+            "id": selected_model,
+            "input": ["text", "image"],
+            "contextWindow": 200_000,
+        }
+    ]
+
+
+def test_build_models_json_does_not_leak_selected_model_between_builds() -> None:
+    """A selected model from one build never appears in a later build."""
     _build_models_json("https://host.example.com", "tok", model="moonshotai/kimi-k2.6")
     fresh = _build_models_json("https://host.example.com", "tok")
-    # A model-less build after a foreign-model build is pristine: empty
-    # catch-all list, exactly the static Databricks ids elsewhere.
     assert fresh["providers"]["databricks-completions"]["models"] == []
 
 
@@ -2580,6 +3555,28 @@ def test_clean_pi_env_passes_pi_and_proxy_config(monkeypatch) -> None:
     assert env.get("NODE_EXTRA_CA_CERTS") == "/etc/ssl/corp-ca.pem"
 
 
+def test_clean_pi_env_includes_omnigent_session_marker(monkeypatch) -> None:
+    """The ``OMNIGENT`` session marker survives the Pi env scrub.
+
+    The marker (set once on the runner) must reach the Pi CLI so the
+    shell commands Pi runs can detect they are inside an Omnigent
+    session, like ``CLAUDE_CODE`` / ``CODEX``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.pi_executor import _clean_pi_env
+    from omnigent.runner.identity import (
+        OMNIGENT_SESSION_ENV_VALUE,
+        OMNIGENT_SESSION_ENV_VAR,
+    )
+
+    monkeypatch.setenv(OMNIGENT_SESSION_ENV_VAR, OMNIGENT_SESSION_ENV_VALUE)
+
+    env = _clean_pi_env()
+
+    assert env.get(OMNIGENT_SESSION_ENV_VAR) == OMNIGENT_SESSION_ENV_VALUE
+
+
 def test_rpc_start_spawns_with_exact_env(monkeypatch) -> None:
     """``_PiRpcSession.start`` passes the caller's env dict verbatim.
 
@@ -2614,6 +3611,189 @@ def test_rpc_start_spawns_with_exact_env(monkeypatch) -> None:
 
     # Exactly the executor-built env — nothing merged from os.environ.
     assert captured["env"] == {"PATH": "/usr/bin", "PI_CODING_AGENT_DIR": "/tmp/pi-agent"}
+
+
+def test_redact_argv_for_log_hides_system_prompt() -> None:
+    """``_redact_argv_for_log`` replaces the system-prompt value with a
+    length-only placeholder while leaving every other flag visible."""
+    secret = "SUPER SECRET SYSTEM PROMPT that must never hit the logs"
+    args = [
+        "/fake/pi",
+        "--mode",
+        "rpc",
+        "--no-session",
+        "--model",
+        "databricks/some-model",
+        "--append-system-prompt",
+        secret,
+        "--extension",
+        "/tmp/ext.js",
+    ]
+
+    redacted = _redact_argv_for_log(args)
+
+    rendered = " ".join(redacted)
+    assert secret not in rendered
+    assert f"[system prompt {len(secret)} chars]" in redacted
+    # Other flags stay visible for debugging.
+    assert "--mode" in redacted
+    assert "rpc" in redacted
+    assert "--model" in redacted
+    assert "databricks/some-model" in redacted
+    assert "--extension" in redacted
+    assert "/tmp/ext.js" in redacted
+
+
+def test_redact_argv_for_log_hides_two_token_system_prompt_flag() -> None:
+    """The two-token ``--system-prompt <value>`` form is redacted too, not just
+    ``--append-system-prompt``."""
+    secret = "REPLACEMENT SYSTEM PROMPT that must never hit the logs"
+    args = ["/fake/pi", "--system-prompt", secret, "--mode", "rpc"]
+
+    redacted = _redact_argv_for_log(args)
+
+    assert secret not in " ".join(redacted)
+    assert f"[system prompt {len(secret)} chars]" in redacted
+    assert "--system-prompt" in redacted
+    assert "--mode" in redacted
+    assert "rpc" in redacted
+
+
+def test_redact_argv_for_log_hides_equals_joined_system_prompt() -> None:
+    """``_redact_argv_for_log`` redacts the equals-joined
+    ``--append-system-prompt=<value>`` / ``--system-prompt=<value>`` forms while
+    keeping the flag name visible."""
+    secret = "SUPER SECRET SYSTEM PROMPT that must never hit the logs"
+    for flag in ("--append-system-prompt", "--system-prompt"):
+        args = ["/fake/pi", "--mode", "rpc", f"{flag}={secret}", "--extension", "/tmp/ext.js"]
+
+        redacted = _redact_argv_for_log(args)
+
+        rendered = " ".join(redacted)
+        assert secret not in rendered
+        assert f"{flag}=[system prompt {len(secret)} chars]" in redacted
+        # Flag name and other tokens stay visible for debugging.
+        assert "--mode" in redacted
+        assert "rpc" in redacted
+        assert "--extension" in redacted
+        assert "/tmp/ext.js" in redacted
+
+
+def test_rpc_start_log_does_not_leak_system_prompt(monkeypatch, caplog) -> None:
+    """``_PiRpcSession.start`` must not write the full ``--append-system-prompt``
+    value to the debug log; it should be redacted to a length placeholder.
+
+    Guards F92: the old code logged ``" ".join(args)`` verbatim, leaking the
+    entire system prompt into debug logs.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Pytest log-capture fixture.
+    """
+    from omnigent.inner import pi_executor as pi_mod
+
+    test_prompt = "TOP-SECRET-SYSTEM-PROMPT-DO-NOT-LOG-12345"
+
+    async def _fake_spawn(*args, **kwargs):
+        return _FakeProcess(stdout_lines=[], stderr_lines=[])
+
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
+
+    async def _test():
+        rpc = _PiRpcSession()
+        await rpc.start(
+            "/fake/pi",
+            env={"PATH": "/usr/bin"},
+            model="some-model",
+            system_prompt=test_prompt,
+            extra_args=["--extension", "/tmp/ext.js"],
+        )
+        await rpc.close()
+
+    with caplog.at_level(logging.DEBUG, logger="omnigent.inner.pi_executor"):
+        _run(_test())
+
+    spawn_logs = [
+        r.getMessage() for r in caplog.records if "PiExecutor: spawning" in r.getMessage()
+    ]
+    assert spawn_logs, "expected a 'PiExecutor: spawning' debug log line"
+    spawn_line = spawn_logs[0]
+
+    assert test_prompt not in spawn_line
+    assert f"[system prompt {len(test_prompt)} chars]" in spawn_line
+    # Non-sensitive flags remain visible for debugging.
+    assert "--mode" in spawn_line
+    assert "--extension" in spawn_line
+
+
+def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog) -> None:
+    """The normal ``PiExecutor.run_turn`` path must pass the system prompt to
+    Pi without leaking it into the spawn debug log.
+
+    This drives the real executor wiring from ``run_turn`` through
+    ``_ensure_rpc`` and ``_PiRpcSession.start`` with only subprocess creation
+    stubbed, so it catches regressions at the behavior boundary users hit.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Pytest log-capture fixture.
+    """
+    from omnigent.inner import pi_executor as pi_mod
+
+    test_prompt = "END-TO-END-SYSTEM-PROMPT-LEAK-SENTINEL-67890"
+    captured: dict[str, list[str]] = {}
+
+    async def _fake_spawn(*args, **kwargs):
+        captured["argv"] = list(args)
+        return _FakeProcess(
+            stdout_lines=[
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": "hi"},
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ],
+            stderr_lines=[],
+        )
+
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
+
+    async def _test():
+        executor = PiExecutor(pi_path="/usr/bin/pi")
+        try:
+            return [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    test_prompt,
+                )
+            ]
+        finally:
+            await executor.close()
+
+    with caplog.at_level(logging.DEBUG, logger="omnigent.inner.pi_executor"):
+        events = _run(_test())
+
+    turn_complete = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(turn_complete) == 1
+    assert turn_complete[0].response == "hi"
+
+    argv = captured["argv"]
+    assert "--append-system-prompt" in argv
+    assert argv[argv.index("--append-system-prompt") + 1] == test_prompt
+
+    spawn_logs = [
+        r.getMessage() for r in caplog.records if "PiExecutor: spawning" in r.getMessage()
+    ]
+    assert spawn_logs, "expected a 'PiExecutor: spawning' debug log line"
+    spawn_line = spawn_logs[0]
+
+    assert test_prompt not in spawn_line
+    assert f"[system prompt {len(test_prompt)} chars]" in spawn_line
+    assert "--append-system-prompt" in spawn_line
+    assert "--mode" in spawn_line
 
 
 def test_run_turn_spawn_env_has_no_host_secrets(monkeypatch) -> None:
@@ -2768,16 +3948,25 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
         captured["policy"] = sandbox
         return "/fake/launcher"
 
+    def _fake_resolve_sandbox(_os_env: OSEnvSpec, cwd: Path) -> SandboxPolicy:
+        return SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=[cwd.resolve(strict=False)],
+            write_roots=[cwd.resolve(strict=False)],
+            write_files=[],
+            allow_network=False,
+        )
+
     # ``_try_sandbox_pi`` resolves this name from the module at call
     # time (function-local ``from .sandbox import ...``), so patching
     # the module attribute intercepts the real call.
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve_sandbox)
     monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_create_exec_launcher)
 
     with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor(
             cwd=str(tmp_path),
-            # linux_bwrap policy resolution is pure-Python (the binary
-            # is only needed at wrap time), so this runs anywhere.
             os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
         )
 

@@ -22,7 +22,6 @@ import os
 import shutil
 import signal
 import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -32,9 +31,9 @@ import httpx
 import pytest
 
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
-
-_CODEX_NATIVE_AGENT_NAME = "codex-native-ui"
 
 # Marker file the cwd-resolution tests ask Codex to read back. It is placed
 # only in the session's intended cwd (worktree / picked workspace) and never
@@ -66,14 +65,18 @@ def _spawn_host_daemon(
     daemon_log = tmp_path / "host-daemon.log"
     with open(daemon_log, "w") as log_fh:
         return subprocess.Popen(
+            # Compat-aware: pinned OLD host venv in runner compat mode (Config 2).
+            # apply_runner_env drops this test's repo_root PYTHONPATH in that mode
+            # so the old host build resolves; no-op in normal runs.
             [
-                sys.executable,
+                runner_executable(),
                 "-m",
                 "omnigent.host._daemon_entry",
                 "--server",
                 live_server,
             ],
-            env=env,
+            env=apply_runner_env(env),
+            cwd=compat_runner_cwd(),
             stdout=subprocess.DEVNULL,
             stderr=log_fh,
         )
@@ -110,10 +113,10 @@ def _codex_native_agent_id(client: httpx.Client) -> str:
     resp = client.get("/v1/agents")
     resp.raise_for_status()
     for agent in resp.json()["data"]:
-        if agent["name"] == _CODEX_NATIVE_AGENT_NAME:
+        if agent["name"] == CODEX_NATIVE_AGENT_NAME:
             return str(agent["id"])
     raise AssertionError(
-        f"{_CODEX_NATIVE_AGENT_NAME!r} not registered on the server "
+        f"{CODEX_NATIVE_AGENT_NAME!r} not registered on the server "
         "(expected from _ensure_default_agents at startup)"
     )
 
@@ -199,6 +202,34 @@ def _content_types(item: dict[str, object]) -> list[object]:
     return [block.get("type") for block in content if isinstance(block, dict)]
 
 
+def _send_user_text(
+    client: httpx.Client,
+    *,
+    session_id: str,
+    text: str,
+) -> None:
+    """
+    Post a user text message to a session (the web "send" action).
+
+    :param client: HTTP client pointed at the test server.
+    :param session_id: Session/conversation id.
+    :param text: User message text to deliver to the agent.
+    :returns: None.
+    """
+    resp = client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        },
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+
+
 def _poll_for_assistant_marker(
     client: httpx.Client,
     *,
@@ -232,6 +263,24 @@ def _poll_for_assistant_marker(
         f"No assistant message containing {marker!r} within {timeout}s — "
         "the codex-native message was not answered."
     )
+
+
+def _poll_for_child_session(
+    client: httpx.Client,
+    *,
+    parent_session_id: str,
+    timeout: float,
+) -> dict[str, object]:
+    """Poll until a Codex-native child appears under its parent."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp = client.get(f"/v1/sessions/{parent_session_id}/child_sessions")
+        if resp.status_code == 200:
+            children = resp.json().get("data", [])
+            if children:
+                return children[0]
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"No child session appeared within {timeout}s")
 
 
 def _poll_for_assistant_reply(
@@ -454,16 +503,16 @@ def test_codex_native_builtin_registered_at_startup(
     """
     The server auto-registers ``codex-native-ui`` as a built-in agent.
 
-    ``_ensure_default_codex_agent`` runs during lifespan startup and
+    ``_ensure_default_native_agents`` runs during lifespan startup and
     inserts the agent into the store. ``GET /v1/agents`` must list it
     so the Web UI new-session picker can offer Codex alongside Claude.
     """
     resp = http_client.get("/v1/agents")
     resp.raise_for_status()
     agent_names = {a["name"] for a in resp.json()["data"]}
-    assert _CODEX_NATIVE_AGENT_NAME in agent_names, (
-        f"Expected {_CODEX_NATIVE_AGENT_NAME!r} in built-in agents "
-        f"{agent_names}. _ensure_default_codex_agent did not run or "
+    assert CODEX_NATIVE_AGENT_NAME in agent_names, (
+        f"Expected {CODEX_NATIVE_AGENT_NAME!r} in built-in agents "
+        f"{agent_names}. _ensure_default_native_agents did not run or "
         f"used a different name."
     )
 
@@ -479,7 +528,7 @@ def test_codex_native_builtin_session_can_be_created(
     resp.raise_for_status()
     agent_id = None
     for agent in resp.json()["data"]:
-        if agent["name"] == _CODEX_NATIVE_AGENT_NAME:
+        if agent["name"] == CODEX_NATIVE_AGENT_NAME:
             agent_id = agent["id"]
             break
     assert agent_id is not None
@@ -612,6 +661,73 @@ def test_codex_native_builtin_session_round_trip(
         assert marker in _user_text(messages[first_user]), (
             f"user message text missing the prompt marker {marker!r}; "
             f"got {_user_text(messages[first_user])!r}"
+        )
+    finally:
+        daemon.send_signal(signal.SIGTERM)
+        try:
+            daemon.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+            daemon.wait()
+
+
+@pytest.mark.skipif(
+    os.environ.get("OMNIGENT_E2E_CODEX_NATIVE") != "1" or shutil.which("codex") is None,
+    reason=(
+        "codex-native subagent e2e needs `codex` on PATH and OMNIGENT_E2E_CODEX_NATIVE=1 to run"
+    ),
+)
+def test_codex_native_spawn_creates_child_session(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """A real Codex native spawn appears as an Omnigent child session."""
+    workspace = tmp_path / "codex_subagent_ws"
+    workspace.mkdir()
+    child_marker = f"CHILD_{uuid.uuid4().hex[:6].upper()}"
+    parent_marker = f"PARENT_{uuid.uuid4().hex[:6].upper()}"
+
+    daemon = _spawn_host_daemon(tmp_path=tmp_path, live_server=live_server)
+    try:
+        host_id = _online_host_id(http_client, timeout=30.0)
+        agent_id = _codex_native_agent_id(http_client)
+        session_id = _create_codex_host_session(
+            http_client,
+            agent_id=agent_id,
+            host_id=host_id,
+            workspace=str(workspace),
+        )
+        _send_user_text(
+            http_client,
+            session_id=session_id,
+            text=(
+                "Use your native multi-agent tool to spawn exactly one subagent. "
+                f"Ask it to reply with exactly {child_marker}. Wait for it, then reply "
+                f"with exactly {parent_marker}."
+            ),
+        )
+
+        child = _poll_for_child_session(
+            http_client,
+            parent_session_id=session_id,
+            timeout=180.0,
+        )
+        child_id = str(child["id"])
+        labels = child.get("labels", {})
+        assert isinstance(labels, dict)
+        assert labels.get("omnigent.codex_native.subagent_thread_id")
+        _poll_for_assistant_marker(
+            http_client,
+            session_id=child_id,
+            marker=child_marker,
+            timeout=180.0,
+        )
+        _poll_for_assistant_marker(
+            http_client,
+            session_id=session_id,
+            marker=parent_marker,
+            timeout=180.0,
         )
     finally:
         daemon.send_signal(signal.SIGTERM)
@@ -1189,6 +1305,142 @@ def test_codex_native_image_only_persists_user_bubble_and_does_not_bleed(
             "the later text-only message absorbed the earlier image — the "
             "image-only turn's pending entry leaked and was folded into the "
             f"next message. content_types={_content_types(text_user_items[0])}"
+        )
+    finally:
+        daemon.send_signal(signal.SIGTERM)
+        try:
+            daemon.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+            daemon.wait()
+
+
+@pytest.mark.skipif(
+    os.environ.get("OMNIGENT_E2E_CODEX_NATIVE") != "1" or shutil.which("codex") is None,
+    reason=(
+        "codex-native model/effort override e2e needs `codex` on PATH and "
+        "OMNIGENT_E2E_CODEX_NATIVE=1 to run"
+    ),
+)
+def test_codex_native_web_model_effort_override_survives_turn(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """
+    A web model/effort pick applied mid-session does not break the turn.
+
+    A model or reasoning-effort change
+    made in the Omnigent web picker reaches the runner as
+    ``ExecutorConfig.model`` / ``extra["reasoning_effort"]``, and
+    ``CodexNativeExecutor.run_turn`` now applies it via a
+    ``thread/settings/update`` request (whose ``ThreadSettingsUpdateParams``
+    carries ``model`` / ``effort``) ahead of a bare ``turn/start``.
+
+    The original fix tried to send ``model``/``effort`` ON ``turn/start`` —
+    where the app-server schema does not accept them. If those fields are
+    rejected by the real app-server (``client.request`` raises ->
+    ``ExecutorError``), *every web turn after a picker change fails*. This
+    test exercises the real codex app-server: it switches the model and
+    reasoning effort via ``PATCH /v1/sessions`` (exactly what the SPA does),
+    then sends a turn and asserts it runs to a reply. A reply proves the
+    app-server accepted the ``thread/settings/update`` the override path
+    emits — i.e. the catastrophic "every web turn fails" mode is gone.
+
+    The exact RPC shape (``thread/settings/update`` precedes a bare
+    ``turn/start``, with overrides omitted when unset and invalid effort
+    dropped) is pinned deterministically by
+    ``tests/inner/test_codex_native_executor.py``; this is the live
+    counterpart that the unit fake cannot provide — that the override is
+    *honored*, not rejected.
+
+    The target model defaults to the session's own running model (always a
+    valid id, profile-independent) so the override path is exercised on any
+    profile; set ``OMNIGENT_E2E_CODEX_SWITCH_MODEL`` to a different valid
+    codex model to drive a genuine cross-model switch.
+
+    :param live_server: Test server URL.
+    :param http_client: HTTP client pointed at the test server.
+    :param tmp_path: Per-test temp dir for the workspace and daemon log.
+    :returns: None.
+    """
+    workspace = tmp_path / "codex_ws"
+    workspace.mkdir()
+    boot_marker = f"BOOT_{uuid.uuid4().hex[:6].upper()}"
+    switched_marker = f"CODEX_{uuid.uuid4().hex[:6].upper()}"
+
+    daemon = _spawn_host_daemon(tmp_path=tmp_path, live_server=live_server)
+    try:
+        host_id = _online_host_id(http_client, timeout=30.0)
+        agent_id = _codex_native_agent_id(http_client)
+        session_id = _create_codex_host_session(
+            http_client,
+            agent_id=agent_id,
+            host_id=host_id,
+            workspace=str(workspace),
+        )
+
+        # Turn 1 establishes the native thread on its launch-pinned model,
+        # so the override below is a genuine mid-session change (the only
+        # path that must ride thread/settings/update — a fresh thread could
+        # otherwise be launch-pinned).
+        _send_user_text(
+            http_client,
+            session_id=session_id,
+            text=f"Reply with exactly one word: {boot_marker}",
+        )
+        _poll_for_assistant_marker(
+            http_client, session_id=session_id, marker=boot_marker, timeout=180.0
+        )
+
+        # Resolve a valid target model: an explicit env override, else the
+        # session's current running model (guaranteed valid on any profile).
+        session = http_client.get(f"/v1/sessions/{session_id}")
+        session.raise_for_status()
+        session_data = session.json()
+        current_model = session_data.get("model_override") or session_data.get("llm_model")
+        target_model = os.environ.get("OMNIGENT_E2E_CODEX_SWITCH_MODEL") or current_model
+        assert target_model, (
+            "could not resolve a model to override with — the session reported "
+            f"neither model_override nor llm_model: {session_data!r}"
+        )
+
+        # The web picker action: PATCH the session's model + reasoning effort.
+        # "high" is a valid codex effort (CODEX_EFFORTS) and a real settings
+        # change, so run_turn emits thread/settings/update with both fields.
+        patch = http_client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"model_override": target_model, "reasoning_effort": "high"},
+            timeout=30.0,
+        )
+        patch.raise_for_status()
+
+        # Turn 2 carries the override. run_turn sends thread/settings/update
+        # {model, effort} before turn/start; if the app-server rejected those
+        # fields (the pre-fix turn-path behavior), this turn would raise an
+        # ExecutorError and the marker would never arrive.
+        _send_user_text(
+            http_client,
+            session_id=session_id,
+            text=f"Reply with exactly one word: {switched_marker}",
+        )
+        text = _poll_for_assistant_marker(
+            http_client, session_id=session_id, marker=switched_marker, timeout=180.0
+        )
+        assert switched_marker in text, (
+            f"override turn produced no marker {switched_marker!r} — the web "
+            "model/effort pick broke the turn. response: "
+            f"{text!r}"
+        )
+
+        # The picked model persisted on the session (keeps the web dropdown
+        # and the cost gate in sync). With target == the running model, the
+        # inbound forwarder mirror re-affirms the same id, so this is stable.
+        after = http_client.get(f"/v1/sessions/{session_id}")
+        after.raise_for_status()
+        assert after.json().get("model_override") == target_model, (
+            "model_override did not persist after the override turn; got "
+            f"{after.json().get('model_override')!r}, expected {target_model!r}"
         )
     finally:
         daemon.send_signal(signal.SIGTERM)

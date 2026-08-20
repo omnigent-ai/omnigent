@@ -1,0 +1,421 @@
+{
+  "schema_version": 6,
+  "generated_at": "2026-07-08T18:30:00+00:00",
+  "git_sha": "0000000000000000000000000000000000000000",
+  "git_branch": "main",
+  "host": {
+    "platform": "macOS-15.5-arm64-arm-64bit",
+    "python": "3.12.8",
+    "cpu_count": 12
+  },
+  "harness": "http-only",
+  "config": {
+    "iterations": 100,
+    "requests": 500,
+    "concurrency": 1,
+    "runs": 3,
+    "warmup": 10,
+    "with_runner": false,
+    "backend": "sqlite",
+    "network_delay_ms": 0.0
+  },
+  "resource_usage": {
+    "cpu_pct": {
+      "mean": 77.71818181818182,
+      "min": 0.0,
+      "max": 91.5,
+      "samples": 11
+    },
+    "rss_bytes": {
+      "mean": 178731566.54545453,
+      "min": 173686784,
+      "max": 180011008,
+      "samples": 11
+    }
+  },
+  "journeys": {
+    "list_sessions": {
+      "runs": [
+        {
+          "n_success": 100,
+          "n_failures": 0,
+          "failures": {},
+          "wall_time_s": 0.14539083300041966,
+          "mean_ms": 1.4531342103146017,
+          "p50_ms": 1.3800830056425184,
+          "p95_ms": 1.9147919956594706,
+          "p99_ms": 2.307249989826232,
+          "max_ms": 2.3295840073842555,
+          "rps": 687.8012728609331,
+          "http_requests": 100,
+          "http_requests_per_op": 1.0,
+          "route_requests": {
+            "GET /v1/sessions": 100
+          }
+        },
+        {
+          "n_success": 100,
+          "n_failures": 0,
+          "failures": {},
+          "wall_time_s": 0.14492745799361728,
+          "mean_ms": 1.4485845307353884,
+          "p50_ms": 1.3238340034149587,
+          "p95_ms": 1.99408401385881,
+          "p99_ms": 4.43670799722895,
+          "max_ms": 4.886500013526529,
+          "rps": 690.0003724925892,
+          "http_requests": 100,
+          "http_requests_per_op": 1.0,
+          "route_requests": {
+            "GET /v1/sessions": 100
+          }
+        },
+        {
+          "n_success": 100,
+          "n_failures": 0,
+          "failures": {},
+          "wall_time_s": 0.13697420799871907,
+          "mean_ms": 1.368980410916265,
+          "p50_ms": 1.3387500075623393,
+          "p95_ms": 1.7172090010717511,
+          "p99_ms": 1.8671669822651893,
+          "max_ms": 1.9677499949466437,
+          "rps": 730.0644512646875,
+          "http_requests": 100,
+          "http_requests_per_op": 1.0,
+          "route_requests": {
+            "GET /v1/sessions": 100
+          }
+        }
+      ],
+      "summary": {
+        "runs_total": 3,
+        "runs_ok": 3,
+        "avg_mean_ms": 1.4235663839887518,
+        "avg_p50_ms": 1.3475556722066055,
+        "avg_p95_ms": 1.8753616701966773,
+        "avg_p99_ms": 2.8703749897734574,
+        "avg_rps": 702.6220322060699,
+        "avg_http_requests_per_op": 1.0,
+        "network_routes": [
+          {
+            "route": "GET /v1/sessions",
+            "requests": 300,
+            "per_op": 1.0
+          }
+        ]
+      },
+      "kind": "latency",
+      "backend": "sqlite",
+      "needs_runner": false
+    },
+    "create_session": {
+      "runs": [
+        {
+          "n_success": 100,
+          "n_failures": 0,
+          "failures": {},
+          "wall_time_s": 1.6592429590236861,
+          "mean_ms": 16.59096085233614,
+          "p50_ms": 16.146292007761076,
+          "p95_ms": 19.581041007768363,
+          "p99_ms": 21.494417014764622,
+          "max_ms": 24.84037500107661,
+          "rps": 60.26844920821055,
+          "http_requests": 200,
+          "http_requests_per_op": 2.0,
+          "route_requests": {
+            "POST /v1/sessions": 100,
+            "DELETE /v1/sessions/{session_id}": 100
+          }
+        },
+        {
+          "n_success": 100,
+          "n_failures": 0,
+          "failures": {},
+          "wall_time_s": 1.675092332996428,
+          "mean_ms": 16.749450869683642,
+          "p50_ms": 16.362750000553206,
+          "p95_ms": 20.069208985660225,
+          "p99_ms": 22.160249995067716,
+          "max_ms": 22.810291993664578,
+          "rps": 59.69820172307674,
+          "http_requests": 200,
+          "http_requests_per_op": 2.0,
+          "route_requests": {
+            "POST /v1/sessions": 100,
+            "DELETE /v1/sessions/{session_id}": 100
+          }
+        },
+        {
+          "n_success": 100,
+          "n_failures": 0,
+          "failures": {},
+          "wall_time_s": 1.6948266669933219,
+          "mean_ms": 16.94665289745899,
+          "p50_ms": 16.35474999784492,
+          "p95_ms": 20.578667026711628,
+          "p99_ms": 21.13654199638404,
+          "max_ms": 21.60887501668185,
+          "rps": 59.00308388314617,
+          "http_requests": 200,
+          "http_requests_per_op": 2.0,
+          "route_requests": {
+            "POST /v1/sessions": 100,
+            "DELETE /v1/sessions/{session_id}": 100
+          }
+        }
+      ],
+      "summary": {
+        "runs_total": 3,
+        "runs_ok": 3,
+        "avg_mean_ms": 16.76235487315959,
+        "avg_p50_ms": 16.287930668719735,
+        "avg_p95_ms": 20.076305673380073,
+        "avg_p99_ms": 21.597069668738794,
+        "avg_rps": 59.65657827147782,
+        "avg_http_requests_per_op": 2.0,
+        "network_routes": [
+          {
+            "route": "DELETE /v1/sessions/{session_id}",
+            "requests": 300,
+            "per_op": 1.0
+          },
+          {
+            "route": "POST /v1/sessions",
+            "requests": 300,
+            "per_op": 1.0
+          }
+        ]
+      },
+      "kind": "latency",
+      "backend": "sqlite",
+      "needs_runner": false
+    },
+    "get_session": {
+      "runs": [
+        {
+          "n_success": 100,
+          "n_failures": 0,
+          "failures": {},
+          "wall_time_s": 0.618162291997578,
+          "mean_ms": 6.180601690721232,
+          "p50_ms": 5.8322090189903975,
+          "p95_ms": 7.893667003372684,
+          "p99_ms": 8.871707977959886,
+          "max_ms": 9.131124999839813,
+          "rps": 161.76981562050992,
+          "http_requests": 100,
+          "http_requests_per_op": 1.0,
+          "route_requests": {
+            "GET /v1/sessions/{session_id}": 100
+          }
+        },
+        {
+          "n_success": 100,
+          "n_failures": 0,
+          "failures": {},
+          "wall_time_s": 0.6758431250054855,
+          "mean_ms": 6.7572175012901425,
+          "p50_ms": 6.478499999502674,
+          "p95_ms": 8.380832994589582,
+          "p99_ms": 8.837792003760114,
+          "max_ms": 8.995375013910234,
+          "rps": 147.96333098629708,
+          "http_requests": 100,
+          "http_requests_per_op": 1.0,
+          "route_requests": {
+            "GET /v1/sessions/{session_id}": 100
+          }
+        },
+        {
+          "n_success": 100,
+          "n_failures": 0,
+          "failures": {},
+          "wall_time_s": 0.6910586670273915,
+          "mean_ms": 6.909306258603465,
+          "p50_ms": 6.664832995738834,
+          "p95_ms": 8.377791004022583,
+          "p99_ms": 9.534541983157396,
+          "max_ms": 10.113791009644046,
+          "rps": 144.70551455515758,
+          "http_requests": 100,
+          "http_requests_per_op": 1.0,
+          "route_requests": {
+            "GET /v1/sessions/{session_id}": 100
+          }
+        }
+      ],
+      "summary": {
+        "runs_total": 3,
+        "runs_ok": 3,
+        "avg_mean_ms": 6.61570848353828,
+        "avg_p50_ms": 6.325180671410635,
+        "avg_p95_ms": 8.21743033399495,
+        "avg_p99_ms": 9.081347321625799,
+        "avg_rps": 151.47955372065485,
+        "avg_http_requests_per_op": 1.0,
+        "network_routes": [
+          {
+            "route": "GET /v1/sessions/{session_id}",
+            "requests": 300,
+            "per_op": 1.0
+          }
+        ]
+      },
+      "kind": "latency",
+      "backend": "sqlite",
+      "needs_runner": false
+    },
+    "load_conversation_history": {
+      "runs": [
+        {
+          "n_success": 100,
+          "n_failures": 0,
+          "failures": {},
+          "wall_time_s": 0.25584779199562036,
+          "mean_ms": 2.5575782902888022,
+          "p50_ms": 2.469791012117639,
+          "p95_ms": 3.0598339799325913,
+          "p99_ms": 3.6600840103346854,
+          "max_ms": 5.426874995464459,
+          "rps": 390.85738915312515,
+          "http_requests": 100,
+          "http_requests_per_op": 1.0,
+          "route_requests": {
+            "GET /v1/sessions/{session_id}/items": 100
+          }
+        },
+        {
+          "n_success": 100,
+          "n_failures": 0,
+          "failures": {},
+          "wall_time_s": 0.2574428749794606,
+          "mean_ms": 2.5735091799288057,
+          "p50_ms": 2.51016701804474,
+          "p95_ms": 3.0513330129906535,
+          "p99_ms": 3.5724999906960875,
+          "max_ms": 3.6185409990139306,
+          "rps": 388.43568697707497,
+          "http_requests": 100,
+          "http_requests_per_op": 1.0,
+          "route_requests": {
+            "GET /v1/sessions/{session_id}/items": 100
+          }
+        },
+        {
+          "n_success": 100,
+          "n_failures": 0,
+          "failures": {},
+          "wall_time_s": 0.27459433299372904,
+          "mean_ms": 2.7449333196273074,
+          "p50_ms": 2.635875018313527,
+          "p95_ms": 3.485749999526888,
+          "p99_ms": 3.7029579980298877,
+          "max_ms": 3.9087080222088844,
+          "rps": 364.173575287454,
+          "http_requests": 100,
+          "http_requests_per_op": 1.0,
+          "route_requests": {
+            "GET /v1/sessions/{session_id}/items": 100
+          }
+        }
+      ],
+      "summary": {
+        "runs_total": 3,
+        "runs_ok": 3,
+        "avg_mean_ms": 2.6253402632816383,
+        "avg_p50_ms": 2.5386110161586353,
+        "avg_p95_ms": 3.198972330816711,
+        "avg_p99_ms": 3.6451806663535535,
+        "avg_rps": 381.1555504725514,
+        "avg_http_requests_per_op": 1.0,
+        "network_routes": [
+          {
+            "route": "GET /v1/sessions/{session_id}/items",
+            "requests": 300,
+            "per_op": 1.0
+          }
+        ]
+      },
+      "kind": "latency",
+      "backend": "sqlite",
+      "needs_runner": false
+    },
+    "search_sessions": {
+      "runs": [
+        {
+          "n_success": 100,
+          "n_failures": 0,
+          "failures": {},
+          "wall_time_s": 0.2137124160071835,
+          "mean_ms": 2.1360725004342385,
+          "p50_ms": 2.031207986874506,
+          "p95_ms": 2.719917014474049,
+          "p99_ms": 3.0205000075511634,
+          "max_ms": 3.032750013517216,
+          "rps": 467.9185321485426,
+          "http_requests": 100,
+          "http_requests_per_op": 1.0,
+          "route_requests": {
+            "GET /v1/sessions": 100
+          }
+        },
+        {
+          "n_success": 100,
+          "n_failures": 0,
+          "failures": {},
+          "wall_time_s": 0.17307583297952078,
+          "mean_ms": 1.7299287702189758,
+          "p50_ms": 1.677958993241191,
+          "p95_ms": 2.166459016734734,
+          "p99_ms": 2.794750005705282,
+          "max_ms": 3.016250004293397,
+          "rps": 577.7814168419026,
+          "http_requests": 100,
+          "http_requests_per_op": 1.0,
+          "route_requests": {
+            "GET /v1/sessions": 100
+          }
+        },
+        {
+          "n_success": 100,
+          "n_failures": 0,
+          "failures": {},
+          "wall_time_s": 0.15361558299628086,
+          "mean_ms": 1.5353992290329188,
+          "p50_ms": 1.4499580138362944,
+          "p95_ms": 1.987833995372057,
+          "p99_ms": 2.2785839973948896,
+          "max_ms": 2.3655000259168446,
+          "rps": 650.9756240186978,
+          "http_requests": 100,
+          "http_requests_per_op": 1.0,
+          "route_requests": {
+            "GET /v1/sessions": 100
+          }
+        }
+      ],
+      "summary": {
+        "runs_total": 3,
+        "runs_ok": 3,
+        "avg_mean_ms": 1.800466833228711,
+        "avg_p50_ms": 1.7197083313173305,
+        "avg_p95_ms": 2.2914033421936133,
+        "avg_p99_ms": 2.6979446702171117,
+        "avg_rps": 565.558524336381,
+        "avg_http_requests_per_op": 1.0,
+        "network_routes": [
+          {
+            "route": "GET /v1/sessions",
+            "requests": 300,
+            "per_op": 1.0
+          }
+        ]
+      },
+      "kind": "latency",
+      "backend": "sqlite",
+      "needs_runner": false
+    }
+  }
+}

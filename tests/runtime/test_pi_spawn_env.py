@@ -30,6 +30,10 @@ def _isolate_global_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     :param tmp_path: Temporary directory for the isolated config.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_catalog_default_model",
+        lambda provider_name, family, *, context: f"catalog-{provider_name}-{family}-default",
+    )
 
 
 def _make_spec(*, model: str | None = None, profile: str | None = None) -> AgentSpec:
@@ -55,6 +59,24 @@ def _make_spec(*, model: str | None = None, profile: str | None = None) -> Agent
         executor=ExecutorSpec(type="omnigent", config=config, model=model),
         llm=LLMConfig(model=model) if model is not None else None,
     )
+
+
+def test_pi_spawn_env_threads_cwd_separately_from_bundle_dir(tmp_path: Path) -> None:
+    """
+    Pi gets the session workspace as ``HARNESS_PI_CWD``.
+
+    ``workdir`` is the extracted agent bundle, not the user's project
+    workspace. If these are conflated, Pi launches in the wrong repository.
+    """
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    bundle_dir = tmp_path / "runner-specs" / "ag_pi-v1"
+    bundle_dir.mkdir(parents=True)
+
+    env = _build_pi_spawn_env(_make_spec(), cwd=workspace, workdir=bundle_dir)
+
+    assert env["HARNESS_PI_CWD"] == str(workspace)
+    assert env["HARNESS_PI_BUNDLE_DIR"] == str(bundle_dir)
 
 
 def _ucode_state_for_pi(
@@ -123,7 +145,7 @@ def test_ucode_state_without_model_falls_back_to_databricks_default(
 
     assert env["HARNESS_PI_GATEWAY"] == "true"
     # The verified routable gateway endpoint name, not pi's own default.
-    assert env["HARNESS_PI_MODEL"] == "databricks-claude-opus-4-8"
+    assert env["HARNESS_PI_MODEL"] == "catalog-databricks-claude-default"
 
 
 def test_ucode_state_with_model_is_not_overridden_by_default(

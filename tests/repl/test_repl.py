@@ -25,6 +25,7 @@ from omnigent.repl._repl import (
     _build_startup_header,
     _consume_pending_local_skill_slash_command,
     _decode_terminal_target_key,
+    _fetch_server_version,
     _is_recoverable_sse_transport_error,
     _parse_sub_agent_handle,
     _parse_terminal_tool_output,
@@ -1468,6 +1469,249 @@ def test_render_startup_banner_without_header_is_name_only() -> None:
     assert "~/" not in plain
 
 
+def test_startup_header_shows_server_version_on_url_line() -> None:
+    """A resolved server version renders inline on the URL row: ``<url>  ·  server <ver>``.
+
+    What this proves: the version the user asked to surface (the headline
+    of this change) actually reaches the box and sits on the SAME line as
+    the URL as one "which server / what version" block. A regression that
+    stopped threading ``server_version`` into ``_render_startup_banner_ansi``
+    would drop it and fail the membership assert; one that split it onto its
+    own row would put the URL and version on different lines, failing the
+    same-line assert. The width assert guards the combined row against
+    pushing the 80-column box into a wrap.
+    """
+    import re
+
+    header = _StartupHeader(
+        folder="~/omnigent",
+        description=None,
+        model_label=None,
+        credential=None,
+        creds_line=None,
+    )
+    remote = "https://omnigent.example.com"
+    plain = re.sub(
+        r"\x1b\[[0-9;]*m",
+        "",
+        _render_startup_banner_ansi(
+            "polly", server_url=remote, server_version="0.3.0.dev0", header=header
+        ),
+    )
+    assert "server 0.3.0.dev0" in plain
+    # URL and version share one line — find the row carrying the URL and
+    # assert the version is on that same row.
+    url_line = next(line for line in plain.split("\n") if remote in line)
+    assert "server 0.3.0.dev0" in url_line
+    widths = [len(line) for line in plain.split("\n")]
+    assert max(widths) < 80, f"combined URL+version row widened the box to {max(widths)} cols"
+
+
+def test_startup_header_shows_local_server_url_with_version() -> None:
+    """A loopback server URL IS shown in the header, inline with the version.
+
+    What this proves: unlike the minimal banner (which hides loopback URLs
+    as noise), the header surfaces a local ``http://127.0.0.1:<port>`` dev
+    server so the combined ``<url>  ·  server <ver>`` line appears for local
+    sessions too. A regression that re-gated the header URL row on
+    ``_is_remote_server_url`` would drop the URL and fail the membership
+    assert.
+    """
+    import re
+
+    header = _StartupHeader(
+        folder="~/omnigent",
+        description=None,
+        model_label=None,
+        credential=None,
+        creds_line=None,
+    )
+    local = "http://127.0.0.1:7393"
+    plain = re.sub(
+        r"\x1b\[[0-9;]*m",
+        "",
+        _render_startup_banner_ansi(
+            "polly", server_url=local, server_version="0.3.0.dev0", header=header
+        ),
+    )
+    # The loopback URL and the version share one row in the header box.
+    url_line = next(line for line in plain.split("\n") if local in line)
+    assert "server 0.3.0.dev0" in url_line
+
+
+def test_startup_header_shows_databricks_workspace_url_not_api_mount() -> None:
+    """A Databricks server shows the ``/omnigent`` SPA URL and NO version.
+
+    What this proves two things for a workspace mount: (1) the header maps
+    the internal ``/api/2.0/omnigent`` proxy mount to the recognizable
+    workspace ``/omnigent`` URL — a regression rendering the raw
+    ``server_url`` would leak the API path; and (2) the server-version row
+    is suppressed even when a version is passed, because a workspace build
+    has no meaningful version string to show (its ``/api/version`` returns a
+    placeholder like ``"source"``).
+    """
+    import re
+
+    header = _StartupHeader(
+        folder="~",
+        description=None,
+        model_label=None,
+        credential="Subscription",
+        creds_line=None,
+    )
+    api_mount = "https://e2-dogfood.staging.cloud.databricks.com/api/2.0/omnigent"
+    plain = re.sub(
+        r"\x1b\[[0-9;]*m",
+        "",
+        # Pass a version to prove the renderer suppresses it for a workspace
+        # mount regardless of what the caller hands in.
+        _render_startup_banner_ansi(
+            "polly", server_url=api_mount, server_version="0.3.0.dev0", header=header
+        ),
+    )
+    # The clean workspace URL is shown, the internal API path is NOT.
+    assert "https://e2-dogfood.staging.cloud.databricks.com/omnigent" in plain
+    assert "/api/2.0/omnigent" not in plain
+    # No version row for a Databricks workspace server.
+    assert "server " not in plain
+    assert "0.3.0.dev0" not in plain
+
+
+def test_startup_header_omits_server_version_when_unresolved() -> None:
+    """No ``server <ver>`` row when the version probe returned ``None``.
+
+    What this proves: the row is purely additive — an unreachable or old
+    server (probe → ``None``) yields the same box as before, never a bare
+    ``server`` label or blank row.
+    """
+    import re
+
+    header = _StartupHeader(
+        folder="~/omnigent",
+        description=None,
+        model_label=None,
+        credential=None,
+        creds_line=None,
+    )
+    plain = re.sub(
+        r"\x1b\[[0-9;]*m",
+        "",
+        _render_startup_banner_ansi("polly", server_url=None, server_version=None, header=header),
+    )
+    assert "server " not in plain
+
+
+def _run(coro):
+    """Drive an async helper to completion from a sync test."""
+    import asyncio
+
+    return asyncio.run(coro)
+
+
+def _fake_version_client(by_path: dict[str, dict]) -> tuple[object, list[str]]:
+    """Build a fake ``OmnigentClient`` whose ``_http.get`` serves per-path JSON.
+
+    :param by_path: Maps a request path suffix (e.g. ``"/v1/info"``) to the
+        JSON body its response should return.
+    :returns: ``(client, targets)`` — the fake client, and a list that
+        records each full URL the helper requested, in order.
+    """
+    targets: list[str] = []
+
+    class _FakeResp:
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def json(self) -> dict:
+            return self._body
+
+    class _FakeHttp:
+        async def get(self, target: str, timeout: object = None):
+            targets.append(target)
+            for suffix, body in by_path.items():
+                if target.endswith(suffix):
+                    return _FakeResp(body)
+            return _FakeResp({})
+
+    class _FakeClient:
+        _base_url = "https://omnigent.example.com"
+        _http = _FakeHttp()
+
+    return _FakeClient(), targets
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        # Happy path: server_version present in the /v1/info body.
+        ({"server_version": "0.3.0.dev0"}, "0.3.0.dev0"),
+        # Server too old to report the field → falls through, None here.
+        ({"accounts_enabled": False}, None),
+        # Non-string / empty values are rejected rather than rendered.
+        ({"server_version": ""}, None),
+        ({"server_version": 3}, None),
+    ],
+)
+def test_fetch_server_version_parses_info(payload, expected) -> None:
+    """``_fetch_server_version`` extracts a non-empty string ``server_version`` from /v1/info.
+
+    What this proves: only a usable version string reaches the header; a
+    missing field, empty string, or non-string is treated as "unknown" and
+    falls through (here ``/api/version`` also has nothing, so the result is
+    ``None``) so the banner never shows a garbage version. Also pins the
+    probe to go through the client's AUTHENTICATED ``_http`` (so a hosted,
+    auth-gated server answers instead of 401-ing), trying ``/v1/info`` first.
+    """
+    client, targets = _fake_version_client({"/v1/info": payload, "/api/version": {}})
+    assert _run(_fetch_server_version(client)) == expected
+    # The richer capabilities probe is always tried first, via the authed _http.
+    assert targets[0] == "https://omnigent.example.com/v1/info"
+
+
+def test_fetch_server_version_falls_back_to_api_version() -> None:
+    """When ``/v1/info`` lacks ``server_version``, fall back to ``/api/version``.
+
+    What this proves: an older server (e.g. a staging deploy that predates
+    ``server_version`` landing in ``/v1/info`` but still serves the
+    long-standing ``/api/version``) still fills the version row instead of
+    showing the URL alone. Pins the order: ``/v1/info`` first, then the
+    legacy endpoint only when the first yields no usable version.
+    """
+    client, targets = _fake_version_client(
+        {
+            # Modern endpoint present but without the field (older server).
+            "/v1/info": {"accounts_enabled": False},
+            # Legacy endpoint still reports the installed version.
+            "/api/version": {"version": "0.1.2"},
+        }
+    )
+    assert _run(_fetch_server_version(client)) == "0.1.2"
+    assert targets == [
+        "https://omnigent.example.com/v1/info",
+        "https://omnigent.example.com/api/version",
+    ]
+
+
+def test_fetch_server_version_never_raises() -> None:
+    """Any probe error yields ``None`` (boot must not fail).
+
+    What this proves: the version probe is a non-blocking nicety — an
+    ``httpx`` error mid-probe (including a 401 from an auth-gated server
+    that the client somehow can't satisfy, or a network drop) returns
+    ``None`` instead of propagating and taking down REPL boot.
+    """
+
+    class _BoomHttp:
+        async def get(self, *_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("network down")
+
+    class _FakeClient:
+        _base_url = "https://omnigent.example.com"
+        _http = _BoomHttp()
+
+    assert _run(_fetch_server_version(_FakeClient())) is None
+
+
 @pytest.mark.parametrize(
     "raw,expected",
     [
@@ -1573,6 +1817,48 @@ def test_build_startup_header_subscription_credential(tmp_path, monkeypatch) -> 
     assert header.creds_line is None
     # The description is summarized for the box.
     assert header.description == "A test agent"
+
+
+def test_build_startup_header_creds_line_hints_first_available(tmp_path, monkeypatch) -> None:
+    """
+    A surface with no default names the credential the launch will fall back to.
+
+    The Databricks-only GPT-head scenario: a multi-family agent (anthropic +
+    openai) where the ``openai`` surface has NO default, but a Databricks
+    workspace that serves openai is configured. The creds line must not read a
+    bare "not configured" — the head WILL launch through that workspace (the
+    runtime spawn-env fallback), so the header names it: "no default → will use
+    …". Header and launch resolve it through the same
+    :func:`first_available_provider`, so the readout cannot disagree with what
+    actually launches.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  claude-subscription:\n"
+        "    kind: subscription\n"
+        "    cli: claude\n"
+        "    default: anthropic\n"
+        "  databricks:\n"  # serves openai, but is NOT marked the openai default
+        "    kind: databricks\n"
+        "    profile: gtm-ws\n"
+    )
+    # Hermetic: ignore a dev machine's ambient providers. A running local Ollama
+    # (TCP-probed at localhost:11434) serves openai and would outrank the
+    # Databricks fallback under test, so pin detection to none.
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    header = _build_startup_header(
+        "claude-sdk", "Two-headed brainstorming partner.", ["anthropic", "openai"]
+    )
+    assert header.creds_line is not None
+    # anthropic has its explicit default; openai has none → the hint names the
+    # first-available credential the launch falls back to (the Databricks ws).
+    assert "Claude → Subscription" in header.creds_line
+    assert "Codex → no default → will use 🧱 Databricks (gtm-ws)" in header.creds_line
 
 
 def test_build_startup_header_creds_line_includes_pi_surface(tmp_path, monkeypatch) -> None:
@@ -1876,6 +2162,20 @@ def test_completer_plain_text_yields_nothing() -> None:
     assert _completions_for("hello world") == []
 
 
+def _noop_handler(*_args: object, **_kwargs: object) -> None:
+    """Stand-in handler for synthetic COMMANDS entries in completer tests."""
+    return
+
+
+_FAKE_COMMANDS = {
+    "/superpowers:using-superpowers": (
+        "Establishes how to find and use skills",
+        _noop_handler,
+    ),
+    "/context": ("Show context window usage", _noop_handler),
+}
+
+
 def test_completer_lone_slash_lists_all_canonical_commands() -> None:
     """
     Claim: hitting ``/`` shows every canonical command in
@@ -1903,49 +2203,115 @@ def test_completer_lone_slash_lists_all_canonical_commands() -> None:
     assert actual == expected
 
 
-def test_completer_filters_by_prefix() -> None:
+def test_completer_substring_filters_real_registry() -> None:
     """
-    Claim: typing ``/h`` narrows the popup to commands whose
-    canonical name starts with ``/h``. With the current command
-    set that is ``/help`` and ``/history``.
+    Claim: the substring filter narrows the REAL ``COMMANDS`` registry
+    (not just a monkeypatched fake) and matches mid-name, not only as a
+    prefix. ``heme`` sits inside ``/theme`` but is a prefix of no
+    command, so a hit proves substring matching runs against the live
+    registry the REPL actually ships.
 
-    Failure modes:
-      - Empty result → the prefix-startswith filter is broken
-        (e.g. the completer is comparing against the description).
-      - Returning every command → the filter is being bypassed.
-      - Including ``/quit`` or ``/cancel`` → the prefix match
-        is doing substring matching instead of startswith.
+    The monkeypatched tests below replace ``COMMANDS`` wholesale, so this
+    is the only filtering test that touches the real set. It uses
+    membership assertions rather than an exact list so it stays green as
+    commands are added or removed — the claim is "filtering happens and
+    narrows," not "these exact commands exist."
     """
-    actual = _completions_for("/h")
+    all_names = [name for name, _, _ in _completions_for("/")]
+    names = [name for name, _, _ in _completions_for("/heme")]
+    # Mid-name match against the live registry (substring, not prefix).
+    assert "/theme" in names
+    # A command with no "heme" is excluded — the filter really narrows.
+    assert "/quit" not in names
+    # Narrowing genuinely happened: a non-empty strict subset of the full
+    # list. Catches both "filter bypassed" (== all) and "filter too
+    # greedy" (empty) regressions against the real registry.
+    assert 0 < len(names) < len(all_names)
+
+
+def test_completer_ranks_prefix_before_substring(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Claim: prefix matches surface before mid-string matches (mirrors the
+    web menu's ``rankedSlashCommandNames``). Typing ``/e`` offers
+    ``/effort`` (a prefix) before ``/context`` (which merely contains
+    "e"), so the first completion is the one the user most likely meant —
+    not an unrelated command that happens to contain the letter.
+    """
+    fake = {
+        "/compact": ("Compact", _noop_handler),
+        "/context": ("Context", _noop_handler),
+        "/effort": ("Effort", _noop_handler),
+        "/model": ("Model", _noop_handler),
+    }
+    monkeypatch.setattr("omnigent.repl._repl.COMMANDS", fake)
+    names = [name for name, _, _ in _completions_for("/e")]
+    # /effort is the only prefix match; /context and /model merely contain
+    # "e" (/compact has none), so they rank after it.
+    assert names[0] == "/effort"
+    assert set(names) == {"/effort", "/context", "/model"}
+
+
+def test_completer_ranks_prefix_first_real_registry() -> None:
+    """
+    Claim: against the live registry, ``/m`` surfaces a prefix match
+    (e.g. ``/model``) first, ahead of commands that merely contain "m"
+    (e.g. ``/theme``, ``/compact``). Pins prefix-priority on the real
+    command set without coupling to the exact command list.
+    """
+    names = [name for name, _, _ in _completions_for("/m")]
+    assert "/model" in names
+    # The top completion is a genuine prefix match, not a mid-string one.
+    assert names[0][1:].lower().startswith("m")
+
+
+def test_completer_matches_name_leaf_after_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Claim: typing a namespaced skill's leaf name surfaces the full
+    command — the core fix. `/using-superpowers` must find
+    `/superpowers:using-superpowers` even though the name starts with
+    `superpowers:`. Failure means the completer is still prefix-only.
+    """
+    monkeypatch.setattr("omnigent.repl._repl.COMMANDS", _FAKE_COMMANDS)
+    actual = _completions_for("/using-superpowers")
     names = [name for name, _, _ in actual]
-    assert names == ["/help", "/history"], (
-        f"expected ['/help', '/history'] for prefix '/h', got {names}. "
-        f"If empty, the prefix filter no longer matches; if longer, "
-        f"the filter is broader than startswith."
-    )
-    # Every match replaces the full typed prefix (``/h`` == 2 chars).
-    # If start_position drifts, the completion will splice into the
-    # buffer wrong (e.g. produce ``//help``).
+    assert names == ["/superpowers:using-superpowers"]
+    # The completion replaces the full typed prefix so the splice
+    # yields the canonical name, not a doubled slash.
     for _, _, start in actual:
-        assert start == -2
+        assert start == -len("/using-superpowers")
 
 
-def test_completer_exact_match_still_yields_itself() -> None:
+def test_completer_does_not_match_description(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Claim: when the user has typed an entire command (``/help``),
-    that command itself is still offered — picking it from the
-    popup is a no-op replacement that lets the user press Enter
-    to submit without retyping.
-
-    Failure here would mean the popup vanishes the moment the
-    typed text equals a command, which is jarring during
-    keyboard-driven completion.
+    Claim: matching is name-only — a query that appears only in a command's
+    description does NOT surface it. Kept identical to the web menu, which
+    never shows descriptions inline, so a description-driven hit would look
+    unexplained. `window` appears in `/context`'s blurb but not its name, so
+    it must yield nothing.
     """
-    actual = _completions_for("/help")
-    names = [name for name, _, _ in actual]
-    # ``/help`` is a strict prefix of itself; no other current
-    # command starts with the full string ``/help``.
-    assert names == ["/help"]
+    monkeypatch.setattr("omnigent.repl._repl.COMMANDS", _FAKE_COMMANDS)
+    assert _completions_for("/window") == []
+
+
+def test_completer_no_match_yields_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Claim: a query present in no command name yields no rows (the popup
+    closes) — proves matching is a real containment test, not "always show
+    everything".
+    """
+    monkeypatch.setattr("omnigent.repl._repl.COMMANDS", _FAKE_COMMANDS)
+    assert _completions_for("/zzz") == []
+
+
+def test_completer_full_name_still_yields_itself(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Claim: a fully-typed command name still offers itself, so the user
+    can press Enter to submit without the popup vanishing. `/context`
+    is a substring of its own name.
+    """
+    monkeypatch.setattr("omnigent.repl._repl.COMMANDS", _FAKE_COMMANDS)
+    names = [name for name, _, _ in _completions_for("/context")]
+    assert names == ["/context"]
 
 
 def test_completer_display_meta_matches_command_help() -> None:
@@ -1993,6 +2359,10 @@ class _StubHost:
     def start_timer(self) -> None:
         """Record timer start calls like the real host."""
         self.output_calls.append("<start_timer>")
+
+    def clear_subagents(self) -> None:
+        """Drop the sub-agent tree like the real host (no-op for the stub)."""
+        self.output_calls.append("<clear_subagents>")
 
 
 class _StubFmt:
@@ -2058,7 +2428,7 @@ def test_render_history_item_renders_slash_command_metadata() -> None:
     assert "/grill-me review this plan" in rendered
 
 
-class _StubSkillSession:
+class _StubSkillSession(_SessionsChatReplAdapter):
     """Session stub that records structured skill slash-command sends."""
 
     model = "agent"
@@ -2106,6 +2476,41 @@ async def test_registered_skill_command_uses_structured_slash_command() -> None:
     rendered = "\n".join(str(item) for item in host.output_calls)
     assert "review this plan" in rendered
     assert "load_skill" not in rendered
+
+
+def test_register_skill_commands_skips_non_user_invocable() -> None:
+    """``user-invocable: false`` skills are not registered as REPL slash commands."""
+    from omnigent.repl import _repl as repl_mod
+
+    invocable = SkillSpec(name="visible-skill", description="d", content="c")
+    internal = SkillSpec(name="internal-skill", description="d", content="c", user_invocable=False)
+    registered = repl_mod.register_skill_commands([invocable, internal])
+    try:
+        assert "/visible-skill" in registered
+        assert "/internal-skill" not in registered
+        assert "/internal-skill" not in repl_mod.COMMANDS
+    finally:
+        repl_mod.unregister_skill_commands(registered)
+
+
+def test_register_skill_commands_skips_invalid_command_names() -> None:
+    """Skill names that aren't valid slash-command tokens are skipped + not registered."""
+    from omnigent.repl import _repl as repl_mod
+
+    valid = SkillSpec(name="superpowers:using-superpowers", description="d", content="c")
+    namespaced = SkillSpec(name="fe-innovate--innovate", description="d", content="c")
+    spacey = SkillSpec(name="bad name", description="d", content="c")
+    slashy = SkillSpec(name="etc/hosts", description="d", content="c")
+    registered = repl_mod.register_skill_commands([valid, namespaced, spacey, slashy])
+    try:
+        assert "/superpowers:using-superpowers" in registered  # ``:`` namespace ok
+        assert "/fe-innovate--innovate" in registered  # ``--`` namespace ok
+        assert "/bad name" not in registered
+        assert "/etc/hosts" not in registered
+        assert "/bad name" not in repl_mod.COMMANDS
+        assert "/etc/hosts" not in repl_mod.COMMANDS
+    finally:
+        repl_mod.unregister_skill_commands(registered)
 
 
 def test_consume_pending_local_skill_slash_command_only_suppresses_match() -> None:
@@ -2203,15 +2608,16 @@ async def test_new_command_resets_session_without_clearing_screen(
     )
 
 
-class _StubSessionsModeSession:
+class _StubSessionsModeSession(_SessionsChatReplAdapter):
     """``_StubSession`` plus the async ``start_new_conversation`` hook the
     sessions-mode adapter exposes. Used to assert the slash-command
     handlers prefer the new async method over sync ``reset()``."""
 
+    model = "agent"
+
     def __init__(self, *, raise_on_start: Exception | None = None) -> None:
         self.reset_calls = 0
         self.start_new_calls = 0
-        self.model = "agent"
         self._raise_on_start = raise_on_start
 
     def reset(self) -> None:
@@ -2646,3 +3052,96 @@ def test_resume_hint_appends_resume_flag_to_invocation_parts() -> None:
         "--harness claude-sdk "
         "--resume conv_abc"
     )
+
+
+def _openai_key_default_config() -> dict[str, object]:
+    """A config whose openai key default the unmapped fallback used to fabricate."""
+    return {
+        "providers": {
+            "openai": {
+                "kind": "key",
+                "default": "openai",
+                "openai": {
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "$OPENAI_API_KEY",
+                    "models": {"default": "gpt-5.5"},
+                },
+            }
+        }
+    }
+
+
+def test_model_readout_own_auth_acp_harness_reports_agent_not_provider() -> None:
+    """
+    Own-auth ACP harnesses must not report an Omnigent provider credential.
+
+    ``acp``/``acp:<slug>`` and ``goose`` spawn without any Omnigent provider
+    wiring, but ``default_provider_for_harness`` used to fall through to the
+    configured key/gateway default for them (the unmapped pi-style fallback),
+    so the readout named a model and credential the session never touches.
+    A failure here means that fabrication is back.
+    """
+    from omnigent.repl._repl import _build_model_readout_lines
+
+    config = _openai_key_default_config()
+    for harness in ("acp", "acp:droid", "goose"):
+        lines = _build_model_readout_lines(config, harness, None)
+        assert any("ACP agent" in line for line in lines), (harness, lines)
+        assert not any("API Key" in line for line in lines), (harness, lines)
+        assert not any("gpt-5.5" in line for line in lines), (harness, lines)
+
+
+def test_model_readout_own_auth_acp_harness_shows_live_override() -> None:
+    """
+    An in-session ``/model`` override is real state and must stay visible.
+
+    The runner forwards it to these harnesses (``model_env_keys()`` covers
+    acp/goose; goose applies it as ``GOOSE_MODEL``), so the readout may not
+    hide it or claim the model can't be changed.
+    """
+    from omnigent.repl._repl import _build_model_readout_lines
+
+    config = _openai_key_default_config()
+    for harness in ("acp", "goose"):
+        lines = _build_model_readout_lines(config, harness, "qwen3-coder-plus")
+        assert any("qwen3-coder-plus" in line for line in lines), (harness, lines)
+        assert not any("does not reach" in line for line in lines), (harness, lines)
+
+
+def test_model_readout_qwen_still_names_routed_provider() -> None:
+    """
+    qwen is provider-routed, so its readout keeps naming the openai default.
+
+    ``_build_qwen_spawn_env`` injects the configured openai-family default
+    into the qwen subprocess (see ``test_qwen_uses_openai_global_default``),
+    so for qwen — unlike acp/goose — the credential readout is truthful and
+    must not be declined as "own auth".
+    """
+    from omnigent.repl._repl import _build_model_readout_lines
+
+    lines = _build_model_readout_lines(_openai_key_default_config(), "qwen", None)
+    assert any("OpenAI API Key" in line for line in lines), lines
+    assert not any("ACP agent" in line for line in lines), lines
+
+
+def test_describe_active_credential_declines_own_auth_acp_harnesses() -> None:
+    """
+    The resolver, not just the readout, must decline own-auth ACP harnesses.
+
+    ``_resolve_startup_header`` calls ``describe_active_credential``
+    independently of the ``/model`` readout, so fixing only the readout
+    would leave the startup banner naming the same wrong credential. The
+    config uses a key-kind default — the kind the unmapped fallback actually
+    fabricated (a subscription default was already skipped, so it can't pin
+    this fix).
+    """
+    from omnigent.onboarding.provider_config import describe_active_credential
+
+    config = _openai_key_default_config()
+    for harness in ("acp", "acp:droid", "goose"):
+        assert describe_active_credential(config, harness) is None, harness
+    # Provider-routed harnesses on the same config still resolve, proving the
+    # short-circuit is scoped to own-auth ACP spawns and didn't blank the
+    # resolver: qwen consumes the openai family at spawn.
+    qwen_cred = describe_active_credential(config, "qwen")
+    assert qwen_cred is not None and qwen_cred.provider_name == "openai"

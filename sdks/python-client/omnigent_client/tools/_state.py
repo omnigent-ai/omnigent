@@ -24,7 +24,6 @@ and nothing else.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import threading
@@ -32,6 +31,16 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised on native Windows
+    _fcntl = None  # type: ignore[assignment]
+
+if os.name == "nt":
+    import msvcrt as _msvcrt
+else:  # pragma: no cover - exercised on POSIX
+    _msvcrt = None  # type: ignore[assignment]
 
 # Subdirectory segments reserved by the framework — JSON key files
 # live at ``{root}/{key}.json``. Keys must not contain path
@@ -81,11 +90,11 @@ class ToolState:
         with path.open("r") as f:
             # Shared lock: allow parallel reads, block concurrent writers
             # briefly so we see a complete JSON payload.
-            fcntl.flock(f, fcntl.LOCK_SH)
+            _lock_file(f, exclusive=False)
             try:
                 return json.loads(f.read() or "null")
             finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+                _unlock_file(f)
 
     def set(self, key: str, value: Any) -> None:
         """Replace (or create) the value at ``key``. JSON-serialized.
@@ -174,13 +183,13 @@ class ToolState:
         # when the file doesn't exist yet, which is a common first-
         # call case for a tool.
         with thread_lock, path.open("a+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+            _lock_file(f, exclusive=True)
             try:
                 value = _read_transaction_value(f, default)
                 yield value
                 _write_transaction_value(f, value)
             finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+                _unlock_file(f)
 
     # ── Internals ────────────────────────────────────────────
 
@@ -242,6 +251,33 @@ def _write_transaction_value(f: Any, value: Any) -> None:
     # the lock and read stale on-disk contents, losing the prior update.
     f.flush()
     os.fsync(f.fileno())
+
+
+def _lock_file(f: Any, *, exclusive: bool) -> None:
+    """Acquire an advisory file lock for ``f``.
+
+    POSIX uses ``fcntl.flock``. Native Windows has no ``fcntl`` module, so it
+    locks one byte with ``msvcrt.locking``; that API is exclusive-only, which
+    is conservative for reads but preserves cross-process serialization.
+    """
+    if _fcntl is not None:
+        _fcntl.flock(f, _fcntl.LOCK_EX if exclusive else _fcntl.LOCK_SH)
+        return
+    if _msvcrt is None:  # pragma: no cover - defensive for unusual platforms
+        return
+    f.seek(0)
+    _msvcrt.locking(f.fileno(), _msvcrt.LK_LOCK, 1)
+
+
+def _unlock_file(f: Any) -> None:
+    """Release a lock acquired by :func:`_lock_file`."""
+    if _fcntl is not None:
+        _fcntl.flock(f, _fcntl.LOCK_UN)
+        return
+    if _msvcrt is None:  # pragma: no cover - defensive for unusual platforms
+        return
+    f.seek(0)
+    _msvcrt.locking(f.fileno(), _msvcrt.LK_UNLCK, 1)
 
 
 def _get_thread_lock(path: Path) -> threading.Lock:

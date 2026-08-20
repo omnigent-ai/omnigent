@@ -1,0 +1,12 @@
+Omnigent is the mobile companion for your Omnigent server: an open-source workspace for supervising AI agents across coding, research, automation, and other technical workflows.
+
+Connect to a server you run, sign in, and continue the same sessions you use from desktop or browser. Follow agent work from your phone, send messages, review outputs, and switch between sessions without losing context.
+
+Use Omnigent to:
+
+- Keep agent chats, sub-agents, terminals, and files in sync across devices
+- Supervise multiple agents from one interface
+- Work with custom YAML agents and shared team sessions
+- Reach self-hosted or cloud-hosted Omnigent deployments
+
+This app is a native iOS shell for the Omnigent web UI. You need access to an Omnigent server to use it. For local or private deployments, configure your server URL on the first screen and connect securely.

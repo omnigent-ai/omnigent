@@ -1,0 +1,93 @@
+# repro-agent (local) — reproduce a bug live in YOUR running Omnigent app and
+# capture it as a durable e2e test.
+#
+# This is the local-dev variant of the repro-agent: it runs against whatever
+# Omnigent server you already have (the local server `omnigent run` spins up, or
+# one you pass with `--server`), driving the real user journey until the failure
+# happens, then authoring the reproduction as an e2e test in THIS checkout.
+#
+# Invoke it with just the bug — a `bug_url` (a GitHub issue or Linear ticket
+# link). Reproducing the bug is the agent's job, so the session and logs are
+# OUTPUTS it produces, not inputs. It always reproduces against the running
+# build (latest main), so there's no version to pass.
+#
+# Usage (run from the root of your omnigent-ai/omnigent checkout, so the agent's
+# working directory is this repo and it can author tests into tests/e2e_ui/ or
+# tests/e2e/):
+#
+#   # Against the local server omnigent run spins up:
+#   omnigent run dev/repro-agent \
+#     -p '{"bug_url":"https://github.com/omnigent-ai/omnigent/issues/1234"}'
+#
+#   # Against a specific local/remote server you already run:
+#   omnigent run dev/repro-agent --server http://localhost:6767 \
+#     -p '{"bug_url":"https://linear.app/omnigent/issue/OMNI-1234"}'
+#
+# The brain runs on the Claude Agent SDK, so configure a Claude provider first
+# (`omnigent setup` — an Anthropic key, a Claude subscription, an
+# OpenAI-compatible gateway, or a Databricks workspace). It drives the app via
+# the framework browser tools (auto-registered) and sys_session_* / HTTP.
+
+spec_version: 1
+name: repro_agent
+description: >-
+  Reproduces a bug live in a running Omnigent app and captures it as a durable
+  end-to-end test. Given just the bug — a bug_url (a GitHub issue or Linear
+  ticket link) — it reconstructs the user journey from the linked report, drives
+  the app it is connected to (a local server, or one passed with --server)
+  through the journey until the failure happens live, and
+  authors an e2e test (Playwright tests/e2e_ui/ for UI bugs, or tests/e2e/ for
+  backend) as the regression artifact. Reproducing is its job, so its session
+  and logs are outputs it produces. It does not fix the bug or run a fix proof —
+  it hands off the reproduction (its session: journey, e2e test, root-cause
+  leads) to a fix step. It does not merge or push.
+
+# Runs on the Claude Agent SDK. No model is pinned, so the configured provider's
+# default model is used. The large context window holds the bug report, the app
+# interaction transcript, and the test it authors together.
+executor:
+  type: omnigent
+  context_window: 1000000
+  config:
+    harness: claude-sdk
+
+# The full operating procedure lives in AGENTS.md, read at startup.
+instructions: AGENTS.md
+
+# Grant sys_session_share authority to grant the __public__ sentinel (anonymous
+# read-only). Locally your session is already yours to browse, so sharing is
+# opt-in: the agent only shares when invoked with `public: true` (the
+# `dev/repro.py --public` flag). Useful when watching a live run or reproducing
+# against a shared --server. Still gated by the server's own public-sharing
+# switch.
+agent_session_sharing: public
+
+async: true
+cancellable: true
+
+# Declaring os_env registers sys_os_read / sys_os_write / sys_os_edit /
+# sys_os_shell. The agent uses the shell for `gh` (reading the linked GitHub
+# issue) and to write the e2e test file into this checkout; it drives the app
+# via the auto-registered browser_* tools and sys_session_* / HTTP. `cwd: .`
+# runs in the caller's working directory — run `omnigent run dev/repro-agent`
+# from the root of your omnigent checkout so the agent lands in this repo.
+# `sandbox: none` runs unsandboxed with unrestricted network so it can reach the
+# app and the bug tracker.
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+# Block only the catastrophic shell set (force-push, `rm -rf /`, hard reset to
+# a remote ref); everything else runs without an ASK gate so the agent stays
+# non-interactive. This agent never pushes, so `gate_pushes: false` is safe.
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false

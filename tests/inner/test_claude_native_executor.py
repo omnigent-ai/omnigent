@@ -13,7 +13,7 @@ import pytest
 from omnigent.claude_native_bridge import REQUEST_SESSION_ID_ENV_VAR
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
-from omnigent.inner.executor import ExecutorError, TurnComplete
+from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
 _TINY_PNG_B64 = (
@@ -545,13 +545,16 @@ async def test_run_turn_image_only_no_text_still_injects(
 
 
 @pytest.mark.asyncio
-async def test_run_turn_unresolved_file_id_skipped_gracefully(
+async def test_run_turn_unresolved_file_id_emits_visible_marker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
     An ``input_image`` block with only a ``file_id`` (content resolver
-    did not run) is skipped. The text portion is still injected.
+    did not run) injects a visible could-not-load marker with the text.
+
+    Silently skipping the block made the model hallucinate the image;
+    the marker tells both the model and the user the attachment is gone.
     """
     sent: list[dict[str, Any]] = []
     monkeypatch.setattr(
@@ -580,8 +583,8 @@ async def test_run_turn_unresolved_file_id_skipped_gracefully(
 
     assert events == [TurnComplete(response=None)]
     assert len(sent) == 1
-    # The unresolved image block is skipped; only text survives.
-    assert sent[0]["content"] == "analyze this"
+    # The unresolved image block becomes a visible marker, not a silent drop.
+    assert sent[0]["content"] == ("[Attachment file_abc123 could not be loaded]\n\nanalyze this")
     # No uploads directory created — nothing to materialize.
     assert not (tmp_path / "uploads").exists()
 
@@ -592,8 +595,9 @@ async def test_run_turn_dedup_same_filename(
     tmp_path: Path,
 ) -> None:
     """
-    Two image blocks with the same filename produce distinct files
-    (the second gets a unique suffix to avoid overwriting the first).
+    Two different images under the same filename produce distinct files
+    (the second gets a unique suffix instead of overwriting the first).
+    Identical bytes would instead reuse the existing file.
     """
     sent: list[dict[str, Any]] = []
     monkeypatch.setattr(
@@ -602,9 +606,15 @@ async def test_run_turn_dedup_same_filename(
         _stub_inject(sent),
     )
 
+    other_bytes = b"not-the-same-png"
     image_block = {
         "type": "input_image",
         "image_url": _TINY_PNG_DATA_URI,
+        "filename": "dup.png",
+    }
+    other_block = {
+        "type": "input_image",
+        "image_url": "data:image/png;base64," + base64.b64encode(other_bytes).decode(),
         "filename": "dup.png",
     }
     executor = ClaudeNativeExecutor(tmp_path)
@@ -614,7 +624,7 @@ async def test_run_turn_dedup_same_filename(
             messages=[
                 {
                     "role": "user",
-                    "content": [image_block, image_block],
+                    "content": [image_block, other_block],
                 }
             ],
             tools=[],
@@ -630,9 +640,8 @@ async def test_run_turn_dedup_same_filename(
         f"Expected 2 files (dedup suffix), got {len(written)}. "
         "If 1, the second image overwrote the first."
     )
-    # Both contain the same PNG bytes.
-    for f in written:
-        assert f.read_bytes() == _TINY_PNG_BYTES
+    # Both payloads survive, each in its own file.
+    assert {f.read_bytes() for f in written} == {_TINY_PNG_BYTES, other_bytes}
 
 
 @pytest.mark.asyncio
@@ -720,13 +729,13 @@ async def test_enqueue_session_message_materializes_image(
 
 
 @pytest.mark.asyncio
-async def test_run_turn_malformed_data_uri_skipped(
+async def test_run_turn_malformed_data_uri_emits_visible_marker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
-    An image block with a malformed data URI is skipped gracefully.
-    The text portion is still injected without error.
+    An image block with a malformed data URI injects a visible
+    could-not-load marker with the text; the turn does not error.
     """
     sent: list[dict[str, Any]] = []
     monkeypatch.setattr(
@@ -756,10 +765,10 @@ async def test_run_turn_malformed_data_uri_skipped(
         )
     ]
 
-    # Turn completes — the bad image is skipped, text is injected.
+    # Turn completes — the bad image becomes a marker, text is injected.
     assert events == [TurnComplete(response=None)]
     assert len(sent) == 1
-    assert sent[0]["content"] == "still send this"
+    assert sent[0]["content"] == ("[Attachment attachment could not be loaded]\n\nstill send this")
     # No file written for the malformed URI.
     assert not (tmp_path / "uploads").exists()
 
@@ -806,3 +815,412 @@ async def test_run_turn_path_traversal_filename_sanitized(
     assert len(written) == 1
     assert written[0].name == ".bashrc"
     assert written[0].parent == uploads
+
+
+@pytest.mark.asyncio
+async def test_run_turn_applies_routed_model_before_message_under_one_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A routed model is switched via ``/model`` BEFORE the message, in order.
+
+    Intelligent routing delivers the picked model on the turn (adapter maps
+    ``request.model_override`` -> ``config.model``). The executor must type
+    ``/model <routed>`` and then inject the message as one sequence under
+    ``_inject_lock`` — never as a separate racing writer. This test records
+    the call order across both injectors and asserts ``/model`` lands first,
+    then the message, exactly once each. A regression that dropped the switch
+    (or ran it concurrently) would fail the ordering assertion.
+
+    The typed argument is the session's alias for the routed catalog id:
+    ``/model`` rejects a bare gateway id and silently keeps the old model.
+    """
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    bridge_dir = tmp_path / "bridge"
+    calls: list[tuple[str, str]] = []
+
+    def fake_inject_slash_command(
+        bridge_dir_arg: Path,
+        *,
+        command: str,
+        timeout_s: float = 30.0,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        """Record the ``/model`` switch keystroke and its auto_confirm flag."""
+        del bridge_dir_arg, timeout_s
+        calls.append(("slash", command, auto_confirm))
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+    ) -> None:
+        """Record the message inject."""
+        del bridge_dir_arg, timeout_s
+        calls.append(("message", content))
+
+    # No ucode profile at launch -> unknown baseline -> the routed model is
+    # treated as a change and switched.
+    monkeypatch.setattr(claude_native_executor, "read_launch_model", lambda _bridge: None)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_model_env",
+        lambda _bridge: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
+    )
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "review this function"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(model="databricks-claude-sonnet-5"),
+        )
+    ]
+
+    assert calls == [
+        # auto_confirm=True mirrors the manual picker path so the switch is
+        # accepted if the CLI ever pops a confirmation dialog.
+        ("slash", "/model sonnet", True),
+        ("message", "review this function"),
+    ], f"Expected /model (auto_confirm) then message, in order; got {calls}."
+    assert events == [TurnComplete(response=None)]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_uses_the_custom_model_slot_id_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A model pinned to the custom picker slot is applied exactly."""
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    slash_calls: list[str] = []
+
+    def fake_inject_slash_command(
+        bridge_dir_arg: Path,
+        *,
+        command: str,
+        timeout_s: float = 30.0,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint
+        slash_calls.append(command)
+
+    monkeypatch.setattr(claude_native_executor, "read_launch_model", lambda _bridge: None)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_model_env",
+        lambda _bridge: {
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-4-6",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": "databricks-claude-sonnet-5",
+        },
+    )
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        lambda bridge_dir_arg, *, content, timeout_s=30.0: None,
+    )
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(model="databricks-claude-sonnet-5"),
+        )
+    ]
+
+    assert slash_calls == ["/model databricks-claude-sonnet-5"]
+    assert events == [TurnComplete(response=None)]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_skips_switch_for_untranslatable_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A routed id this session can't spell fails open — message still sent.
+
+    Typing a value ``/model`` doesn't accept leaves the pane on its old
+    model while reporting success, so the switch is skipped instead.
+    """
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    slash_calls: list[str] = []
+    msg_calls: list[str] = []
+
+    def fake_inject_slash_command(
+        bridge_dir_arg: Path,
+        *,
+        command: str,
+        timeout_s: float = 30.0,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint
+        slash_calls.append(command)
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
+    ) -> None:
+        del bridge_dir_arg, timeout_s
+        msg_calls.append(content)
+
+    monkeypatch.setattr(claude_native_executor, "read_launch_model", lambda _bridge: None)
+    # Only opus is pinned, so a sonnet id has no spelling this pane accepts:
+    # the bare "sonnet" alias would resolve to a vendor id the gateway rejects.
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_model_env",
+        lambda _bridge: {"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8"},
+    )
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(model="databricks-claude-sonnet-5"),
+        )
+    ]
+
+    assert slash_calls == []
+    assert msg_calls == ["hello"]
+    assert events == [TurnComplete(response=None)]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_skips_switch_when_the_family_pin_drifted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A mismatched family pin must not be spoken as its alias.
+
+    The workspace serves two opus generations and ``opus`` is pinned to the
+    newer one, so ``/model opus`` would move the pane off the routed model
+    while the transcript claimed it ran.
+    """
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    slash_calls: list[str] = []
+    msg_calls: list[str] = []
+
+    monkeypatch.setattr(claude_native_executor, "read_launch_model", lambda _bridge: None)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_model_env",
+        lambda _bridge: {"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5"},
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_slash_command",
+        lambda bridge_dir_arg, *, command, timeout_s=30.0, auto_confirm=False, confirm_hint=None: (
+            slash_calls.append(command)
+        ),
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        lambda bridge_dir_arg, *, content, timeout_s=30.0: msg_calls.append(content),
+    )
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(model="databricks-claude-opus-4-8"),
+        )
+    ]
+
+    assert slash_calls == []
+    assert msg_calls == ["hello"]
+    assert events == [TurnComplete(response=None)]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_without_model_override_injects_message_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    No routed model -> no ``/model`` typed, message injected as before.
+
+    A non-routing turn (config.model None) must not touch the model at all —
+    typing ``/model`` on every turn would be wrong and noisy.
+    """
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    bridge_dir = tmp_path / "bridge"
+    slash_calls: list[str] = []
+    msg_calls: list[str] = []
+
+    def fake_inject_slash_command(
+        bridge_dir_arg: Path,
+        *,
+        command: str,
+        timeout_s: float = 30.0,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint
+        slash_calls.append(command)
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
+    ) -> None:
+        del bridge_dir_arg, timeout_s
+        msg_calls.append(content)
+
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(model=None),
+        )
+    ]
+
+    assert slash_calls == [], f"No /model expected without a routed model; got {slash_calls}."
+    assert msg_calls == ["hi"]
+    assert events == [TurnComplete(response=None)]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_skips_model_switch_when_already_on_that_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A routed model equal to the pane's launch model types no ``/model``.
+
+    ``read_launch_model`` reports what Claude booted with; if routing picks
+    that same model there is nothing to switch, so the executor must inject
+    the message only. Prevents a pointless ``/model`` (and the turn churn it
+    would add) when the pane is already correct.
+    """
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    bridge_dir = tmp_path / "bridge"
+    slash_calls: list[str] = []
+    msg_calls: list[str] = []
+
+    def fake_inject_slash_command(
+        bridge_dir_arg: Path,
+        *,
+        command: str,
+        timeout_s: float = 30.0,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint
+        slash_calls.append(command)
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
+    ) -> None:
+        del bridge_dir_arg, timeout_s
+        msg_calls.append(content)
+
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_launch_model",
+        lambda _bridge: "databricks-claude-opus-4-8",
+    )
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(model="databricks-claude-opus-4-8"),
+        )
+    ]
+
+    assert slash_calls == [], f"No /model expected when already on that model; got {slash_calls}."
+    assert msg_calls == ["hello"]
+    assert events == [TurnComplete(response=None)]
+
+
+@pytest.mark.asyncio
+async def test_a_routed_first_message_switches_the_model_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    The replay of a routed first message must not re-issue ``/model``.
+
+    First-message routing blocks the prompt, types the switch itself, then
+    replays the prompt with the same ``model_override``. Seeding the baseline
+    from ``launch_model`` (written once at bridge prepare) made the replay
+    compare against the PRE-switch model and type a second, redundant
+    ``/model`` — visible in the transcript ahead of the very first turn.
+    """
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    bridge_dir = tmp_path / "bridge"
+    slash_calls: list[str] = []
+    msg_calls: list[str] = []
+
+    def fake_inject_slash_command(bridge_dir_arg: Path, *, command: str, **kwargs: object) -> None:
+        del bridge_dir_arg, kwargs
+        slash_calls.append(command)
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
+    ) -> None:
+        del bridge_dir_arg, timeout_s
+        msg_calls.append(content)
+
+    # The launch model is stale — the turn router already moved the pane, and
+    # only the statusLine capture knows it.
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_launch_model",
+        lambda _bridge: "databricks-claude-sonnet-5",
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_claude_status_model",
+        lambda _bridge: "claude-opus-4-8",
+    )
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(model="databricks-claude-opus-4-8"),
+        )
+    ]
+
+    assert slash_calls == [], (
+        f"The router already switched the pane; the replay must type nothing. Got {slash_calls}."
+    )
+    assert msg_calls == ["hello"]
+    assert events == [TurnComplete(response=None)]

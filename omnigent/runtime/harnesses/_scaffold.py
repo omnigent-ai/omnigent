@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import logging
 import os
 import time
@@ -46,10 +47,12 @@ from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, FastAPI, Request, Response, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from omnigent import _native_forwarder_health as native_forwarder_health
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
     CompletedEvent,
@@ -88,18 +91,36 @@ _HEARTBEAT_INTERVAL_S = 15.0
 _SHUTDOWN_GRACE_S = 4.5
 
 # Timeout for the policy evaluation round-trip (harness → runner →
-# Omnigent server → runner → harness). Fail-open on expiry so a stalled
-# round-trip doesn't hang the executor indefinitely. Must be ≥
-# DEFAULT_POLICY_CLASSIFIER_TIMEOUT (30 s) since PromptPolicy
-# classifiers make their own LLM call on the Omnigent server side.
-_POLICY_EVAL_TIMEOUT_S = 35.0
+# Omnigent server → runner → harness). Held at one day (86400s) — matching
+# the deciding policy's default ``ask_timeout``: a TOOL_CALL/REQUEST ASK parks
+# server-side until a human answers, and this gate must block until the
+# verdict arrives rather than auto-resolve on a short cut (the cost-policy
+# bug). The server caps the real wait via the policy's ``ask_timeout``. On the
+# (now rare) expiry the fallback below is phase-aware — TOOL_CALL fails CLOSED
+# (DENY), advisory LLM/TOOL_RESULT phases fail OPEN (ALLOW).
+_POLICY_EVAL_TIMEOUT_S = 86400.0
+
+# Stable, client-visible error code for a turn-context desync (the inner SDK
+# generation outlived its turn — an orphaned tool/policy callback, or a turn
+# torn down on a dead harness channel). Deliberately ABSENT from AP's
+# retryable-harness-error allowlist so the L2 retry classifier treats it as
+# terminal rather than retry-looping into the same wedge. Mirrors the runner's
+# ``_RUNNER_TURN_CONTEXT_DESYNC_CODE`` and the harness adapter's orphaned-
+# callback safe-fail ``code``.
+_TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
 
 # Per-turn IDLE watchdog: max gap WITHOUT progress before a wedged
 # ``run_turn`` becomes ``response.failed`` (vs heartbeating forever).
 # Every non-heartbeat ``ctx.emit`` resets the deadline (see
 # ``_guarded_run_turn``), so a long-but-active turn is never killed.
+# The window must clear the longest single progress-free ``await`` a
+# healthy turn can make — notably context compaction, whose summarizing
+# LLM call runs as one long ``await`` emitting no non-heartbeat events
+# (see ``runtime/compaction.py``). On a near-full context that call can
+# exceed the old 240s cap, tripping the watchdog and wedging the session
+# in a "Prompt is too long" → compaction → 240s-timeout loop.
 # Env var name kept for the ops knob; ``<= 0`` disables.
-_TURN_IDLE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_TIMEOUT_S", "240"))
+_TURN_IDLE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_TIMEOUT_S", "600"))
 
 # Absolute per-turn ceiling: a hard cap on TOTAL turn duration, backstop
 # to the idle watchdog above. The idle watchdog never trips a turn that
@@ -638,12 +659,26 @@ class TurnContext:
         try:
             return await asyncio.wait_for(future, timeout=_POLICY_EVAL_TIMEOUT_S)
         except asyncio.TimeoutError:
+            # Phase-aware default: advisory LLM phases and TOOL_RESULT (the
+            # tool already ran) fail OPEN so a missing verdict never hangs the
+            # turn, but TOOL_CALL is the authoritative gate for
+            # connector-native tools and fails CLOSED.
+            _fail_closed = phase in FAIL_CLOSED_PHASES
+            _action = "POLICY_ACTION_DENY" if _fail_closed else "POLICY_ACTION_ALLOW"
             _logger.warning(
-                "Policy evaluation %s timed out after %ds; defaulting to ALLOW",
+                "Policy evaluation %s timed out after %ds; defaulting to %s",
                 evaluation_id,
                 _POLICY_EVAL_TIMEOUT_S,
+                _action,
             )
-            return PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+            return PolicyVerdictPayload(
+                action=_action,
+                reason=(
+                    f"Policy evaluation timed out; failing closed for {phase}."
+                    if _fail_closed
+                    else None
+                ),
+            )
         finally:
             self._pending_policy_evaluations.pop(evaluation_id, None)
 
@@ -823,6 +858,16 @@ class HarnessApp:
         """
         from omnigent.server.schemas import ErrorDetail
 
+        # P2.11: a turn-context desync (the inner generation outlived its turn)
+        # carries the stable ``runner_turn_context_desync`` code. Surface it
+        # verbatim — it is intentionally absent from AP's retryable-harness-
+        # error allowlist, so the L2 classifier treats it as terminal instead
+        # of retry-looping into the same wedge. Keyed off the exception's
+        # ``code`` attribute so a harness-side raise (vs. the class name) maps
+        # consistently.
+        if getattr(exception, "code", None) == _TURN_CONTEXT_DESYNC_CODE:
+            return ErrorDetail(code=_TURN_CONTEXT_DESYNC_CODE, message=str(exception))
+
         return ErrorDetail(code=type(exception).__name__, message=str(exception))
 
     def build(self) -> FastAPI:
@@ -848,6 +893,12 @@ class HarnessApp:
             be served by ``omnigent.runtime.harnesses._runner``.
         """
         app = FastAPI(title="omnigent-harness", lifespan=self._lifespan)
+        # Instrument the harness ASGI app so HTTP calls from the runner
+        # (over the per-conversation Unix socket) continue the caller's
+        # trace rather than rooting a fresh one.
+        from omnigent.runtime import telemetry
+
+        telemetry.instrument_fastapi_app(app)
         # FastAPI / Starlette types add_exception_handler narrowly
         # (Callable[[Request, Exception], ...]) — the OmnigentError
         # subclass annotation is what we actually want at runtime, but
@@ -857,6 +908,39 @@ class HarnessApp:
         app.add_api_route("/health", _health, methods=["GET"])
         app.include_router(self._build_v1_router(), prefix="/v1")
         return app
+
+    def _check_auth(self, request: Request) -> Response | None:
+        """
+        Authenticate a ``/v1`` request with the per-spawn bearer token (S1).
+
+        The harness control channel is a uid-isolated Unix socket on POSIX but a
+        loopback-TCP listener on Windows, where any local process can connect.
+        The ``/v1`` event endpoint starts turns, runs tools, and satisfies
+        approval / policy verdicts, so it must not be reachable by an
+        unauthenticated peer that merely learns the (non-secret)
+        ``conversation_id``. The runner stashes the expected token on
+        ``app.state.harness_auth_token``; the parent (process_manager) presents
+        it as ``Authorization: Bearer <token>``. Comparison is constant-time.
+
+        Checked in the event handler rather than via middleware so the SSE
+        ``StreamingResponse`` and lifespan teardown are untouched
+        (``BaseHTTPMiddleware`` interferes with both). ``/health`` is never
+        gated. When no token is configured — the app was built outside the
+        runner, e.g. a unit test calling ``create_app()`` directly — the gate is
+        inert, preserving those callers' direct access.
+
+        :param request: The inbound request, for ``Authorization`` + app.state.
+        :returns: A 401 :class:`Response` to short-circuit on failure, or
+            ``None`` to proceed.
+        """
+        expected = getattr(request.app.state, "harness_auth_token", None)
+        if not expected:
+            return None
+        header = request.headers.get("Authorization", "")
+        scheme, _, token = header.partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(token, expected):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        return None
 
     @contextlib.asynccontextmanager
     async def _lifespan(self, _app: FastAPI) -> AsyncIterator[None]:
@@ -1043,6 +1127,9 @@ class HarnessApp:
             unknown elicitation_id, or interrupt with no
             in-flight turn; 503 on shutdown for fresh turns.
         """
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
         self._check_conversation_id(request, conversation_id)
         if isinstance(body, MessageEvent):
             return await self._start_or_inject_turn(body.to_create_request())
@@ -1186,6 +1273,13 @@ class HarnessApp:
                     code=ErrorCode.CONFLICT,
                 )
 
+            model = request.model
+            if model is None:
+                raise OmnigentError(
+                    "model is required when starting a new turn",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+
             response_id = f"resp_{uuid.uuid4().hex[:24]}"
             event_queue: asyncio.Queue[HarnessStreamEvent | None] = asyncio.Queue()
             cancelled = asyncio.Event()
@@ -1198,12 +1292,12 @@ class HarnessApp:
             self._active_turn_ctx = ctx
 
         return StreamingResponse(
-            self._stream_turn(request, ctx),
+            self._stream_turn(request, ctx, model),
             media_type="text/event-stream",
         )
 
     async def _stream_turn(
-        self, request: CreateResponseRequest, ctx: TurnContext
+        self, request: CreateResponseRequest, ctx: TurnContext, model: str
     ) -> AsyncIterator[bytes]:
         """
         Drive ``run_turn`` and yield SSE-formatted events.
@@ -1226,9 +1320,7 @@ class HarnessApp:
             HTTP response.
         """
         sequence = 0
-        for initial_event in self._initial_envelope_events(
-            ctx, model=request.model, start_seq=sequence
-        ):
+        for initial_event in self._initial_envelope_events(ctx, model=model, start_seq=sequence):
             yield _format_sse_event(initial_event)
             sequence += 1
 
@@ -1272,7 +1364,7 @@ class HarnessApp:
                 sequence += 1
                 yield _format_sse_event(event)
             terminal = await self._build_terminal_event(
-                ctx, model=request.model, run_task=run_task, sequence=sequence
+                ctx, model=model, run_task=run_task, sequence=sequence
             )
             # Clear before yielding the terminal event so the next
             # request (continuation turn) sees _active_turn_ctx as
@@ -1428,10 +1520,26 @@ class HarnessApp:
                     ctx.response_id,
                     idle_timeout,
                 )
+                # A native forwarder that can't reach the server (e.g.
+                # ``No route to host``) starves the turn of progress events, so
+                # the idle watchdog — not the connectivity error — is what fails
+                # the turn. If such a POST failure was recorded recently, attach
+                # it so the user sees the real cause rather than a generic
+                # "wedged LLM" reason. The window is twice the
+                # idle timeout: the failure that began the stall is already
+                # ~idle_timeout old when the watchdog fires, so a window equal
+                # to the stall would race past it; 2x captures it while still
+                # ignoring a long-resolved earlier blip.
+                forwarder_failure = native_forwarder_health.recent_post_failure(idle_timeout * 2)
+                cause = (
+                    f"likely a wedged LLM or tool call; "
+                    f"recent forwarder POST failure ({forwarder_failure})"
+                    if forwarder_failure is not None
+                    else "likely a wedged LLM or tool call"
+                )
                 raise RuntimeError(
                     f"turn exceeded the {idle_timeout:.0f}s harness idle watchdog "
-                    f"(run_turn emitted no events for {idle_timeout:.0f}s; "
-                    f"likely a wedged LLM or tool call)"
+                    f"(run_turn emitted no events for {idle_timeout:.0f}s; {cause})"
                 ) from exc
             if absolute_wd.expired():
                 _logger.warning(
@@ -1503,9 +1611,29 @@ class HarnessApp:
             minimal — AP's persistence path constructs the
             authoritative ResponseObject.
         """
-        # ``run_task.exception()`` is ``None`` on clean return, an
-        # exception instance otherwise.
-        exception = run_task.exception() if run_task.done() and not run_task.cancelled() else None
+        # The sentinel that gets us here is queued from ``run_turn``'s
+        # ``finally`` block, so the streaming side can observe it before the
+        # task is fully terminal. Wait for that last scheduling tick before
+        # inspecting task state; otherwise a cancel/error race can make the
+        # terminal-event builder raise while trying to classify the result.
+        exception: BaseException | None = None
+        if not run_task.done():
+            try:
+                await asyncio.shield(run_task)
+            except asyncio.CancelledError:
+                if not run_task.done():
+                    raise
+            except Exception as exc:
+                exception = exc
+        if exception is None and run_task.done() and not run_task.cancelled():
+            try:
+                # ``run_task.exception()`` is ``None`` on clean return, an
+                # exception instance otherwise. It can still raise
+                # CancelledError for cancellation races; classify that as a
+                # cancelled terminal instead of letting terminal synthesis fail.
+                exception = run_task.exception()
+            except asyncio.CancelledError:
+                exception = None
         cancelled = run_task.cancelled() or ctx.cancelled.is_set()
         if cancelled:
             status_value = "cancelled"
@@ -1533,6 +1661,9 @@ class HarnessApp:
                 cache_creation_input_tokens=u.get("cache_creation_input_tokens") or 0,
                 # Harness-reported model for cost pricing (ResponseObject.model is the agent name).
                 model=u.get("model"),
+                # Authoritative per-turn cost reported by the harness (e.g. Copilot
+                # AI credits); preferred over the catalog estimate. None if absent.
+                cost_usd=u.get("cost_usd"),
             )
         response = ResponseObject(
             id=ctx.response_id,

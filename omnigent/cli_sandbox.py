@@ -17,7 +17,9 @@ from pathlib import Path
 
 import click
 
+from omnigent.inner import ui
 from omnigent.onboarding.sandboxes import (
+    SandboxHostLauncher,
     SandboxLauncher,
     available_providers,
     get_launcher,
@@ -81,7 +83,7 @@ def _resolve_repo_root(repo_root: Path | None) -> Path:
     return resolved
 
 
-def _require_cli_bootstrap(launcher: SandboxLauncher) -> None:
+def _require_cli_bootstrap(launcher: SandboxHostLauncher) -> SandboxLauncher:
     """
     Reject managed-only providers up front with an actionable message.
 
@@ -91,10 +93,11 @@ def _require_cli_bootstrap(launcher: SandboxLauncher) -> None:
     opaque capability error after real work already ran.
 
     :param launcher: The resolved provider launcher.
+    :returns: The same launcher narrowed to the CLI bootstrap contract.
     :raises click.ClickException: When the provider has no CLI
         bootstrap flow.
     """
-    if not launcher.supports_cli_bootstrap:
+    if not launcher.capabilities.cli_bootstrap or not isinstance(launcher, SandboxLauncher):
         raise click.ClickException(
             f"The '{launcher.provider}' provider supports server-managed "
             "sessions only — create one with "
@@ -102,6 +105,7 @@ def _require_cli_bootstrap(launcher: SandboxLauncher) -> None:
             "UI's New Sandbox option) against a server configured with "
             f"`sandbox.provider: {launcher.provider}`."
         )
+    return launcher
 
 
 def _normalize_server_url(server_url: str) -> str:
@@ -139,9 +143,12 @@ def _print_ready_banner(provider: str, sandbox_id: str, server_url: str) -> None
     :param server_url: Server URL for the connect hint (``--server``
         is required on create, so it is always known here).
     """
-    click.secho("\n✓ Sandbox ready.\n", fg="green", bold=True)
-    click.echo(f"Sandbox:  {sandbox_id}  (provider: {provider})")
-    click.echo(f"Server:   {server_url}\n")
+    ui.console.print()
+    ui.success("Sandbox ready.")
+    ui.console.print()
+    ui.kv("Sandbox", f"{sandbox_id}  (provider: {provider})")
+    ui.kv("Server", server_url)
+    ui.console.print()
     click.echo("To register the sandbox as a host with your server:")
     click.echo(
         f"  omnigent sandbox connect --provider {provider} --sandbox-id {sandbox_id} "
@@ -265,14 +272,13 @@ def sandbox_create(
 
     app_url = _normalize_server_url(server_url)
     workspace = derive_workspace(app_url)
-    launcher = get_launcher(
-        provider, workspace_host=workspace.host if workspace is not None else None
+    launcher = _require_cli_bootstrap(
+        get_launcher(provider, workspace_host=workspace.host if workspace is not None else None)
     )
-    _require_cli_bootstrap(launcher)
     # The in-sandbox login only exists for providers that can forward
     # the browser's callback port — others skip it automatically, no
     # --no-auth acknowledgement required.
-    if not launcher.supports_local_port_forward:
+    if not launcher.capabilities.local_port_forward:
         skip_auth = True
     sandbox_id = bootstrap_sandbox_host(
         launcher,
@@ -325,17 +331,18 @@ def sandbox_auth(
 
     app_url = _normalize_server_url(server_url)
     workspace = derive_workspace(app_url)
-    launcher = get_launcher(
-        provider, workspace_host=workspace.host if workspace is not None else None
+    launcher = _require_cli_bootstrap(
+        get_launcher(provider, workspace_host=workspace.host if workspace is not None else None)
     )
-    _require_cli_bootstrap(launcher)
     login_app_oauth_in_sandbox(
         launcher,
         sandbox_id,
         server_url=app_url,
         workspace=workspace,
     )
-    click.secho("\n✓ Sandbox logged in.\n", fg="green", bold=True)
+    ui.console.print()
+    ui.success("Sandbox logged in.")
+    ui.console.print()
 
 
 @sandbox.command("connect")
@@ -389,10 +396,9 @@ def sandbox_connect(
     # there) — the local `lakebox ssh` transport must resolve through
     # the same workspace to find it.
     workspace = derive_workspace(app_url)
-    launcher = get_launcher(
-        provider, workspace_host=workspace.host if workspace is not None else None
+    launcher = _require_cli_bootstrap(
+        get_launcher(provider, workspace_host=workspace.host if workspace is not None else None)
     )
-    _require_cli_bootstrap(launcher)
     connect_sandbox_host(
         launcher,
         sandbox_id,

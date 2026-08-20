@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+import httpx
 import pytest
 
 from omnigent.host import local_server
@@ -32,13 +33,13 @@ def test_local_server_url_if_healthy_returns_url_when_alive_and_healthy(
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_PID_PATH", pid_file)
     monkeypatch.setattr(local_server, "_pid_alive", lambda pid: pid == 4242)
 
-    health_targets: list[str] = []
+    health_targets: list[tuple[str, bool]] = []
 
     class _Resp:
         status_code = 200
 
-    def _fake_get(url: str, *, timeout: float) -> _Resp:
-        health_targets.append(url)
+    def _fake_get(url: str, *, timeout: float, trust_env: bool) -> _Resp:
+        health_targets.append((url, trust_env))
         return _Resp()
 
     monkeypatch.setattr("httpx.get", _fake_get)
@@ -46,7 +47,36 @@ def test_local_server_url_if_healthy_returns_url_when_alive_and_healthy(
     assert local_server.local_server_url_if_healthy() == "http://127.0.0.1:8123"
     # The probe must hit the recorded port's /health, proving the port from
     # the pidfile (not a hardcoded default) was used.
-    assert health_targets == ["http://127.0.0.1:8123/health"]
+    assert health_targets == [("http://127.0.0.1:8123/health", False)]
+
+
+def test_wait_for_local_server_bypasses_environment_proxies(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The readiness poll must connect to loopback without system proxies."""
+
+    class _Proc:
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    class _Resp:
+        status_code = 200
+
+    health_targets: list[tuple[str, bool]] = []
+
+    def _fake_get(url: str, *, timeout: float, trust_env: bool) -> _Resp:
+        health_targets.append((url, trust_env))
+        return _Resp()
+
+    monkeypatch.setattr("httpx.get", _fake_get)
+
+    local_server._wait_for_local_omnigent_server(
+        "http://127.0.0.1:8123", _Proc(), tmp_path / "server.log"
+    )
+
+    assert health_targets == [("http://127.0.0.1:8123/health", False)]
 
 
 def test_local_server_url_if_healthy_none_when_pid_dead(
@@ -175,6 +205,57 @@ def test_ensure_local_omnigent_server_respawns_on_config_drift(
     assert (tmp_path / "local_server.sig").read_text().strip() == (
         local_server.server_config_signature()
     )
+
+
+def test_server_config_signature_changes_with_features(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Changing the startup feature set forces a managed-server respawn."""
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    sig_off = local_server.server_config_signature()
+
+    monkeypatch.setenv("OMNIGENT_FEATURES", "usage_page")
+    sig_on = local_server.server_config_signature()
+
+    assert sig_off != sig_on
+    assert sig_on == local_server.server_config_signature()
+
+
+def test_remote_daemon_signature_ignores_local_server_features(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remote host daemons do not parse config for a server they do not own."""
+    monkeypatch.setenv("OMNIGENT_FEATURES", "not-a-feature")
+
+    assert local_server.server_config_signature(include_features=False)
+
+
+def test_server_config_signature_changes_with_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A package-version bump changes the signature (auth held constant).
+
+    This is what makes ``omni upgrade`` (and a manual ``uv tool upgrade``)
+    cycle a running local server: the recorded signature no longer matches
+    the upgraded CLI's, so ``ensure_local_omnigent_server`` respawns it on
+    the new code through the existing config-drift path.
+    """
+    import importlib.metadata
+
+    from omnigent.server import auth as auth_mod
+
+    # Pin auth so only the version varies between the two signatures.
+    monkeypatch.setattr(auth_mod, "resolve_auth_source", lambda: "noauth")
+
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "1.0.0")
+    sig_old = local_server.server_config_signature()
+
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "1.0.1")
+    sig_new = local_server.server_config_signature()
+
+    assert sig_old != sig_new
+    # Same version → stable signature (no spurious respawns on every call).
+    assert sig_new == local_server.server_config_signature()
 
 
 def test_ensure_local_omnigent_server_spawns_when_none_healthy(
@@ -545,7 +626,7 @@ def test_clear_local_server_record_leaves_other_pids_alone(
 
 
 # ---------------------------------------------------------------------------
-# Server log-path sidecar — so `server start`/`status` name the exact log
+# Server log-path sidecar — so `server --background`/`status` name the exact log
 # ---------------------------------------------------------------------------
 
 
@@ -555,7 +636,7 @@ def test_ensure_local_omnigent_server_spawn_records_and_returns_log_path(
 ) -> None:
     """A spawned server returns its captured-log path and records it for status.
 
-    ``omnigent server start`` used to be a black box — it printed only the
+    ``omnigent server --background`` used to be a black box — it printed only the
     URL. The spawn now threads the captured stdout/stderr log file out via
     ``LocalServerStartup.log_path`` AND into the log-path sidecar, so both
     the spawning call and a later ``server status`` can name the exact file.
@@ -595,7 +676,7 @@ def test_ensure_local_omnigent_server_spawn_records_and_returns_log_path(
     # The captured log lives under the per-user server log dir as a .log file.
     assert result.log_path.parent == tmp_path / ".omnigent" / "logs" / "server"
     assert result.log_path.suffix == ".log"
-    assert result.log_path.name.startswith("local-server-")
+    assert result.log_path.name.startswith("server-")
     # Recorded in the sidecar so a later status/reuse names the same file.
     assert log_ref.read_text().strip() == str(result.log_path)
 
@@ -617,7 +698,7 @@ def test_ensure_local_omnigent_server_reuse_reads_log_path_sidecar(
 
     The reuse path never sees the original spawn's ``log_path`` variable, so
     it must read the recorded path back from the sidecar — otherwise a
-    ``server start`` that reuses an existing background server could not name
+    ``server --background`` that reuses an existing background server could not name
     its log. Popen must not fire (the stub fails the test if it does).
     """
     monkeypatch.setattr(
@@ -626,7 +707,7 @@ def test_ensure_local_omnigent_server_reuse_reads_log_path_sidecar(
     sig_file = tmp_path / "local_server.sig"
     sig_file.write_text(local_server.server_config_signature() + "\n")
     log_ref = tmp_path / "local_server.logpath"
-    recorded = tmp_path / ".omnigent" / "logs" / "server" / "local-server-cd34.log"
+    recorded = tmp_path / ".omnigent" / "logs" / "server" / "server-cd34.log"
     log_ref.write_text(str(recorded) + "\n")
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", sig_file)
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_LOG_REF_PATH", log_ref)
@@ -724,9 +805,12 @@ def test_stop_untracked_local_server_kills_orphan_on_default_port(
     confirm it's our server via ``/health``, resolve its PID via lsof, and
     terminate it — returning the PID so the off-switch can report it.
     """
-    monkeypatch.setattr(
-        "httpx.get", lambda url, *, timeout: _FakeHealthResp(200, {"status": "ok"})
-    )
+
+    def _healthy(url: str, *, timeout: float, trust_env: bool) -> _FakeHealthResp:
+        assert trust_env is False
+        return _FakeHealthResp(200, {"status": "ok"})
+
+    monkeypatch.setattr("httpx.get", _healthy)
     monkeypatch.setattr(local_server, "subprocess", _fake_subprocess(stdout="93359\n93360\n"))
     monkeypatch.setattr(local_server, "_pid_alive", lambda pid: True)
     terminated: list[int] = []
@@ -749,7 +833,8 @@ def test_stop_untracked_local_server_noop_when_nothing_listening(
     """
     import httpx
 
-    def _refused(url: str, *, timeout: float) -> Any:
+    def _refused(url: str, *, timeout: float, trust_env: bool) -> Any:
+        assert trust_env is False
         raise httpx.ConnectError("connection refused")
 
     monkeypatch.setattr("httpx.get", _refused)
@@ -767,9 +852,12 @@ def test_stop_untracked_local_server_noop_on_non_omnigent_listener(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A 200 that isn't ``{"status": "ok"}`` is some other app — never killed."""
-    monkeypatch.setattr(
-        "httpx.get", lambda url, *, timeout: _FakeHealthResp(200, {"hello": "world"})
-    )
+
+    def _foreign(url: str, *, timeout: float, trust_env: bool) -> _FakeHealthResp:
+        assert trust_env is False
+        return _FakeHealthResp(200, {"hello": "world"})
+
+    monkeypatch.setattr("httpx.get", _foreign)
     monkeypatch.setattr(local_server, "_terminate_pid", _raise_if_called)
 
     assert local_server.stop_untracked_local_server(port=8000) is None
@@ -783,9 +871,12 @@ def test_stop_untracked_local_server_noop_when_lsof_unavailable(
     Without a PID we can't terminate, so the sweep returns ``None`` rather
     than crashing — the off-switch then leaves a manual hint to the user.
     """
-    monkeypatch.setattr(
-        "httpx.get", lambda url, *, timeout: _FakeHealthResp(200, {"status": "ok"})
-    )
+
+    def _healthy(url: str, *, timeout: float, trust_env: bool) -> _FakeHealthResp:
+        assert trust_env is False
+        return _FakeHealthResp(200, {"status": "ok"})
+
+    monkeypatch.setattr("httpx.get", _healthy)
     monkeypatch.setattr(
         local_server, "subprocess", _fake_subprocess(raises=FileNotFoundError("lsof"))
     )
@@ -1057,3 +1148,135 @@ def test_ensure_does_not_advertise_pidfile_before_ownership_confirmed(
     assert result.url == "http://127.0.0.1:6767"
     # Once confirmed, the record IS advertised for reuse/discovery.
     assert pid_file.read_text() == "9001\n6767\n"
+
+
+def test_wait_adopts_a_slow_boot_while_the_process_is_alive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A server that outlives the ready timeout but is still booting is adopted.
+
+    A first boot (cold imports + DB migrations) has taken ~40s in the
+    wild — past the ready timeout. While the child process is alive the
+    wait must extend to the boot ceiling instead of failing a server
+    that is seconds from healthy (and then leaking it).
+    """
+
+    class _Proc:
+        pid = 4321
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    class _Resp:
+        status_code = 200
+
+    calls = {"n": 0}
+
+    def _fake_get(url: str, *, timeout: float, trust_env: bool) -> _Resp:
+        del url, timeout, trust_env
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.ConnectError("not ready yet")
+        return _Resp()
+
+    monkeypatch.setattr("httpx.get", _fake_get)
+
+    local_server._wait_for_local_omnigent_server(
+        "http://127.0.0.1:8123",
+        _Proc(),
+        tmp_path / "server.log",
+        timeout=0.05,
+        boot_ceiling=30.0,
+    )
+
+    assert calls["n"] == 3
+
+
+def test_wait_stops_the_spawned_server_when_the_boot_ceiling_expires(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Exhausting the wait stops our own child before raising.
+
+    Raising while the spawned server keeps running leaves a healthy but
+    untracked orphan (the failure path clears the pidfile record) — the
+    exact leak behind background servers accumulating on a dev box.
+    """
+
+    class _Proc:
+        pid = 4321
+
+        def __init__(self) -> None:
+            self.terminated = False
+            self.killed = False
+            self._exited = False
+
+        def poll(self) -> int | None:
+            return 0 if self._exited else None
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self._exited = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+    def _fake_get(url: str, *, timeout: float, trust_env: bool) -> None:
+        del url, timeout, trust_env
+        raise httpx.ConnectError("never ready")
+
+    monkeypatch.setattr("httpx.get", _fake_get)
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_PID_PATH", tmp_path / "local_server.pid")
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", tmp_path / "local_server.sig")
+    proc = _Proc()
+
+    with pytest.raises(click.ClickException):
+        local_server._wait_for_local_omnigent_server(
+            "http://127.0.0.1:8123",
+            proc,
+            tmp_path / "server.log",
+            timeout=0.05,
+            boot_ceiling=0.3,
+        )
+
+    assert proc.terminated is True
+    assert proc.killed is False
+
+
+def test_wait_fails_fast_without_stopping_a_child_that_already_died(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A dead child fails immediately; there is nothing left to stop."""
+
+    class _Proc:
+        pid = 4321
+        terminated = False
+
+        @staticmethod
+        def poll() -> int:
+            return 1
+
+        def terminate(self) -> None:
+            type(self).terminated = True
+
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_PID_PATH", tmp_path / "local_server.pid")
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", tmp_path / "local_server.sig")
+    proc = _Proc()
+
+    with pytest.raises(click.ClickException):
+        local_server._wait_for_local_omnigent_server(
+            "http://127.0.0.1:8123",
+            proc,
+            tmp_path / "server.log",
+            timeout=5.0,
+            boot_ceiling=5.0,
+        )
+
+    assert proc.terminated is False

@@ -9,7 +9,7 @@ import re
 import tarfile
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 import click
@@ -24,6 +24,7 @@ from omnigent.onboarding.sandboxes import (
 )
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime import session_stream
+from omnigent.server.smart_routing import RoutingResult, RoutingSettings
 
 # Sentinel ready event so a stream collector's registration is a
 # deterministic sync point (first delivered item) rather than a
@@ -151,6 +152,9 @@ class FakeSandboxLauncher(SandboxLauncher):
         command raise ``click.ClickException``, e.g. ``"git clone"``
         (simulates an in-sandbox command failing). ``None`` disables.
     :param home: ``$HOME`` the fake sandbox reports, e.g. ``"/root"``.
+    :param can_resume: Whether this fake advertises in-place sandbox resume.
+    :param fail_on_resume: When ``True``, ``resume`` raises
+        ``click.ClickException``.
     :param provision_gate: When set, ``provision`` blocks until the
         event is set — a deterministic hold-the-launch-mid-provision
         point for tests of the background managed launch (``provision``
@@ -168,6 +172,8 @@ class FakeSandboxLauncher(SandboxLauncher):
         fail_on_host_start: bool = False,
         fail_on_command: str | None = None,
         home: str = "/root",
+        can_resume: bool = False,
+        fail_on_resume: bool = False,
         provision_gate: threading.Event | None = None,
     ) -> None:
         self._on_host_start = on_host_start
@@ -176,13 +182,22 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.fail_on_host_start = fail_on_host_start
         self._fail_on_command = fail_on_command
         self._home = home
+        self.can_resume = can_resume
+        self.fail_on_resume = fail_on_resume
         self._provision_gate = provision_gate
         # Image reference / secret names / env names the production code
         # constructed the launcher with (captured by the
         # ctor-monkeypatch shims).
         self.image: str | None = None
+        self.template: str | None = None
         self.secrets: list[str] | None = None
         self.env: list[str] | None = None
+        self.region: str | None = None
+        self.ttl: str | None = None
+        self.endpoint: str | None = None
+        self.home_dir: str | None = None
+        self.registry: dict[str, object] | None = None
+        self.disk_size_gb: int | None = None
         self.base_url: str | None = None
         self.gateway_profile: str | None = None
         self.snapshot_name: str | None = None
@@ -190,11 +205,24 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.vcpus: int | None = None
         self.memory_mb: int | None = None
         self.disk_gb: int | None = None
+        self.idle_pause_after_s: int | None = None
+        self.cluster: str | None = None
+        # Kubernetes ctor wiring (captured by install_fake_kubernetes_launcher).
+        self.namespace: str | None = None
+        self.secret_name: str | None = None
+        self.service_account: str | None = None
+        self.node_selector: dict[str, str] | None = None
+        self.kubeconfig: str | None = None
+        self.in_cluster: bool | None = None
+        self.resources: dict[str, object] | None = None
+        self.pvc_mounts: list[dict[str, object]] | None = None
+        self.secret_mounts: list[dict[str, object]] | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
         self.host_starts: list[HostStartInvocation] = []
         self.terminated: list[str] = []
+        self.resumed: list[str] = []
 
     def prepare(self) -> None:
         """Record the preflight call (no real SDK/credential check)."""
@@ -257,6 +285,12 @@ class FakeSandboxLauncher(SandboxLauncher):
     def terminate(self, sandbox_id: str) -> None:
         """Record the termination."""
         self.terminated.append(sandbox_id)
+
+    def resume(self, sandbox_id: str) -> None:
+        """Record the resume."""
+        if self.fail_on_resume:
+            raise click.ClickException("simulated provider resume failure")
+        self.resumed.append(sandbox_id)
 
 
 def _parse_host_start(command: str) -> HostStartInvocation:
@@ -339,6 +373,68 @@ def install_fake_daytona_launcher(
     monkeypatch.setattr(daytona_mod, "DaytonaSandboxLauncher", _ctor)
 
 
+def install_fake_blaxel_launcher(
+    monkeypatch: Any,
+    fake: FakeSandboxLauncher,
+) -> None:
+    """Substitute the fake for ``BlaxelSandboxLauncher``."""
+    import omnigent.onboarding.sandboxes.blaxel as blaxel_mod
+
+    def _ctor(
+        *,
+        image: str | None = None,
+        env: list[str] | None = None,
+        region: str | None = None,
+        memory_mb: int | None = None,
+        ttl: str | None = None,
+    ) -> FakeSandboxLauncher:
+        fake.image = image
+        fake.env = env
+        fake.region = region
+        fake.memory_mb = memory_mb
+        fake.ttl = ttl
+        return fake
+
+    monkeypatch.setattr(blaxel_mod, "BlaxelSandboxLauncher", _ctor)
+
+
+def install_fake_boxlite_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``BoxliteSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``BoxliteSandboxLauncher(endpoint=…,
+    image=…, env=…)``; the shim records all three on the fake and hands
+    the fake back, so production code runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.boxlite as boxlite_mod
+
+    def _ctor(
+        *,
+        endpoint: str | None = None,
+        image: str | None = None,
+        env: list[str] | None = None,
+        home_dir: str | None = None,
+        registry: dict[str, object] | None = None,
+        disk_size_gb: int | None = None,
+    ) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.endpoint = endpoint
+        fake.image = image
+        fake.env = env
+        fake.home_dir = home_dir
+        fake.registry = registry
+        fake.disk_size_gb = disk_size_gb
+        return fake
+
+    monkeypatch.setattr(boxlite_mod, "BoxliteSandboxLauncher", _ctor)
+
+
 def install_fake_islo_launcher(
     monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
     fake: FakeSandboxLauncher,
@@ -348,9 +444,9 @@ def install_fake_islo_launcher(
 
     The managed flow constructs ``IsloSandboxLauncher(image=…, env=…,
     base_url=…, gateway_profile=…, snapshot_name=…, workdir=…,
-    vcpus=…, memory_mb=…, disk_gb=…)``; the shim records those
-    constructor args on the fake and hands it back, so production code
-    runs unmodified against it.
+    vcpus=…, memory_mb=…, disk_gb=…, idle_pause_after_s=…)``; the shim
+    records those constructor args on the fake and hands it back, so
+    production code runs unmodified against it.
 
     :param monkeypatch: The test's ``pytest.MonkeyPatch``.
     :param fake: The fake launcher to substitute.
@@ -368,6 +464,7 @@ def install_fake_islo_launcher(
         vcpus: int | None = None,
         memory_mb: int | None = None,
         disk_gb: int | None = None,
+        idle_pause_after_s: int | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
@@ -379,9 +476,121 @@ def install_fake_islo_launcher(
         fake.vcpus = vcpus
         fake.memory_mb = memory_mb
         fake.disk_gb = disk_gb
+        fake.idle_pause_after_s = idle_pause_after_s
         return fake
 
     monkeypatch.setattr(islo_mod, "IsloSandboxLauncher", _ctor)
+
+
+def install_fake_e2b_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``E2BSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``E2BSandboxLauncher(template=…, env=…)``;
+    the shim records the template name and env names on the fake and
+    hands the fake back, so production code runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.e2b as e2b_mod
+
+    def _ctor(*, template: str | None = None, env: list[str] | None = None) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.template = template
+        fake.env = env
+        # Report the e2b provider so managed-host teardown's provider match
+        # (launcher.provider vs host.sandbox_provider) exercises the real path
+        # instead of the FakeSandboxLauncher default ("modal").
+        fake.provider = "e2b"  # type: ignore[misc]  # shadow the ClassVar per-instance
+        return fake
+
+    monkeypatch.setattr(e2b_mod, "E2BSandboxLauncher", _ctor)
+
+
+def install_fake_openshell_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``OpenShellSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``OpenShellSandboxLauncher(image=…,
+    env=…, cluster=…)``; the shim records those constructor args on the
+    fake and hands it back, so production code runs unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.openshell as openshell_mod
+
+    def _ctor(
+        *,
+        image: str | None = None,
+        env: list[str] | None = None,
+        cluster: str | None = None,
+        workspace: str | None = None,
+    ) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.image = image
+        fake.env = env
+        fake.cluster = cluster
+        fake.workspace = workspace
+        return fake
+
+    monkeypatch.setattr(openshell_mod, "OpenShellSandboxLauncher", _ctor)
+
+
+def install_fake_kubernetes_launcher(
+    monkeypatch: Any,  # pytest.MonkeyPatch — Any avoids importing pytest in a helpers module
+    fake: FakeSandboxLauncher,
+) -> None:
+    """
+    Substitute the fake for ``KubernetesSandboxLauncher`` at its public seam.
+
+    The managed flow constructs ``KubernetesSandboxLauncher(image=…, env=…,
+    namespace=…, secret_name=…, service_account=…, node_selector=…,
+    kubeconfig=…, in_cluster=…, resources=…, pvc_mounts=…)``; the shim records those
+    constructor args on the fake and hands it back, so production code runs
+    unmodified against it.
+
+    :param monkeypatch: The test's ``pytest.MonkeyPatch``.
+    :param fake: The fake launcher to substitute.
+    """
+    import omnigent.onboarding.sandboxes.kubernetes as kubernetes_mod
+
+    def _ctor(
+        *,
+        image: str | None = None,
+        env: list[str] | None = None,
+        namespace: str | None = None,
+        secret_name: str | None = None,
+        service_account: str | None = None,
+        node_selector: dict[str, str] | None = None,
+        kubeconfig: str | None = None,
+        in_cluster: bool | None = None,
+        resources: dict[str, object] | None = None,
+        pvc_mounts: list[dict[str, object]] | None = None,
+        secret_mounts: list[dict[str, object]] | None = None,
+    ) -> FakeSandboxLauncher:
+        """Stand-in constructor recording the construction wiring."""
+        fake.image = image
+        fake.env = env
+        fake.namespace = namespace
+        fake.secret_name = secret_name
+        fake.service_account = service_account
+        fake.node_selector = node_selector
+        fake.kubeconfig = kubeconfig
+        fake.in_cluster = in_cluster
+        fake.resources = resources
+        fake.pvc_mounts = pvc_mounts
+        fake.secret_mounts = secret_mounts
+        return fake
+
+    monkeypatch.setattr(kubernetes_mod, "KubernetesSandboxLauncher", _ctor)
 
 
 async def wait_for_completion(
@@ -399,15 +608,6 @@ async def wait_for_completion(
             return body
         await asyncio.sleep(0.1)
     raise AssertionError(f"Response {response_id} did not reach terminal status")
-
-
-@dataclass
-class ApiResponse:
-    """Result of an API call — avoids returning positional tuples."""
-
-    status_code: int
-    # Any: JSON response bodies are inherently heterogeneous dicts.
-    body: dict[str, Any]
 
 
 class FakeRunnerWebSocket:
@@ -478,13 +678,14 @@ def build_agent_bundle(
     skills: list[dict[str, str]] | None = None,
     guardrails: dict[str, Any] | None = None,
     terminals: dict[str, Any] | None = None,
+    include_llm: bool = True,
 ) -> bytes:
     """
     Build a minimal valid agent bundle (tar.gz) for testing.
 
     The bundle contains a single config.yaml with the given spec
     fields. When ``sub_agents`` is provided, each entry is added as
-    ``agents/<name>/config.yaml`` and the parent's
+    ``agents/<dir>/config.yaml`` and the parent's
     ``tools.agents`` list is populated.
 
     :param name: Agent name, e.g. ``"test-agent"``.
@@ -511,6 +712,8 @@ def build_agent_bundle(
     :param terminals: Optional ``terminals:`` block written verbatim
         into the spec, e.g. ``{"shell": {"command": "bash"}}``.
         ``None`` omits it (the agent has no terminal access).
+    :param include_llm: Whether to include the default ``llm:`` block.
+        Set ``False`` for model-less harness tests.
     :returns: A gzipped tar archive containing the generated
         ``config.yaml`` plus optional sub-agent and skill files.
     """
@@ -518,16 +721,16 @@ def build_agent_bundle(
     config: dict[str, Any] = {
         "spec_version": 1,
         "name": name,
+    }
+    if include_llm:
         # LLM config is required for the real workflow to execute.
-        # The model value must match the agent name used in
-        # create_test_response(model=...).
-        "llm": {
+        # The model value must match the agent name used by tests.
+        config["llm"] = {
             "model": name,
             # api_key is required by spec validation; the workflow
             # uses the mock LLM client so it's never actually sent.
             "connection": {"api_key": "test-key"},
-        },
-    }
+        }
     if description is not None:
         config["description"] = description
     if guardrails is not None:
@@ -570,6 +773,12 @@ def build_agent_bundle(
                     "model": sa["name"],
                     "connection": {"api_key": "test-key"},
                 },
+                # A ``config.yaml`` sub-agent goes through the strict
+                # spec_version:1 parser, which requires an explicit
+                # harness for an omnigent executor. Default to the same
+                # harness the parent uses; callers may override via
+                # ``sa["executor"]``.
+                "executor": sa.get("executor", {"config": {"harness": "claude-sdk"}}),
             }
             if "description" in sa:
                 sa_config["description"] = sa["description"]
@@ -610,6 +819,8 @@ async def create_test_agent(
     skills: list[dict[str, str]] | None = None,
     user: str | None = None,
     guardrails: dict[str, Any] | None = None,
+    include_llm: bool = True,
+    sub_agents: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Create an agent via multipart session create and return the agent JSON.
@@ -635,6 +846,13 @@ async def create_test_agent(
     :param guardrails: Optional ``guardrails:`` block for the agent
         spec (e.g. a ``cost_budget`` policy). Passed verbatim to
         :func:`build_agent_bundle`. ``None`` omits guardrails.
+    :param include_llm: Whether to include the default ``llm:`` block.
+        Set ``False`` for model-less harness tests.
+    :param sub_agents: Optional sub-agent config dicts declared in the
+        bundle, each with at least a ``"name"`` key, e.g.
+        ``[{"name": "worker"}]``. Required for tests that create a child
+        session with a ``sub_agent_name`` — the create route rejects an
+        undeclared name.
     :returns: Parsed agent response body from the session agent
         endpoint, with an extra ``_session_id`` key for the owning
         session.
@@ -646,6 +864,8 @@ async def create_test_agent(
         executor=executor,
         skills=skills,
         guardrails=guardrails,
+        include_llm=include_llm,
+        sub_agents=sub_agents,
     )
     metadata: dict[str, Any] = {}
     headers: dict[str, str] = {}
@@ -727,53 +947,6 @@ async def create_test_session(
     return snapshot.json()
 
 
-async def create_test_response(
-    client: httpx.AsyncClient,
-    model: str = "test-agent",
-    input_text: str = "Hello",
-    background: bool = True,
-    stream: bool = False,
-    instructions: str | None = None,
-    previous_response_id: str | None = None,
-    store: bool | None = None,
-    conversation: dict[str, str] | None = None,
-    reasoning: dict[str, str] | None = None,
-    tools: list[dict[str, Any]] | None = None,
-) -> ApiResponse:
-    """
-    Create a response via the API and return an ApiResponse.
-
-    Defaults to background=True so the endpoint returns immediately
-    without blocking on task completion.
-
-    :param tools: Optional list of client-side tool schemas in
-        standard OpenAI function format, e.g.
-        ``[{"type": "function", "function": {"name": "get_weather", ...}}]``.
-    """
-    payload: dict[str, Any] = {
-        "model": model,
-        "input": input_text,
-        "background": background,
-        "stream": stream,
-    }
-    if instructions is not None:
-        payload["instructions"] = instructions
-    if previous_response_id is not None:
-        payload["previous_response_id"] = previous_response_id
-    if store is not None:
-        payload["store"] = store
-    if conversation is not None:
-        payload["conversation"] = conversation
-    if reasoning is not None:
-        payload["reasoning"] = reasoning
-    if tools is not None:
-        payload["tools"] = tools
-    resp = await client.post("/v1/responses", json=payload)
-    body = resp.json()
-    assert "id" in body, f"POST /v1/responses returned {resp.status_code}: {body}"
-    return ApiResponse(status_code=resp.status_code, body=body)
-
-
 class CapturingRunnerClient:
     """
     Real stub for the in-process runner client used by popup-forward tests.
@@ -813,3 +986,73 @@ class CapturingRunnerClient:
         if body.get("type") == "cost_approval_popup":
             self.popup_seen.set()
         return httpx.Response(202, request=httpx.Request("POST", f"http://runner{url}"))
+
+
+# ── Routing stubs ───────────────────────────────────────────────────
+#
+# Shared by the routing suites (unit, endpoint, integration) so the
+# router double has one definition instead of one per file.
+
+
+class FakeRoutingClient:
+    """Routing-client double: canned verdict, recorded offers, optional error.
+
+    :param result: The verdict :meth:`route` returns, or ``None`` for a
+        no-decision (router declined).
+    :param error: Raised from :meth:`route` instead of returning, to
+        exercise the fail-open paths.
+    :param last_error: Seeds the protocol's ``last_error`` reason field.
+    :ivar calls: ``(message, offered_models)`` per :meth:`route` call.
+    :ivar offered: The ``available_models`` mapping per call.
+    """
+
+    def __init__(
+        self,
+        result: RoutingResult | None = None,
+        *,
+        error: Exception | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        self._result = result
+        self._error = error
+        self.last_error = last_error
+        self.calls: list[tuple[str, dict[str, list[str]]]] = []
+        self.offered: list[dict[str, list[str]]] = []
+
+    async def route(
+        self, message: str, available_models: dict[str, list[str]]
+    ) -> RoutingResult | None:
+        """Record the offer and return the canned verdict (or raise)."""
+        offer = dict(available_models)
+        self.calls.append((message, offer))
+        self.offered.append(offer)
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+
+@dataclass
+class FakeCaps:
+    """Caps double carrying only what the routing code reads off it.
+
+    ``routing_backends`` left ``None`` makes the routing seam derive the pair
+    from ``routing_client``, which classifies any non-``ExternalRoutingClient``
+    as the built-in judge — the shape most tests want.
+    """
+
+    routing_client: Any = None  # type: ignore[explicit-any]
+    routing_backends: Any = None  # type: ignore[explicit-any]
+    routing_settings: Any = field(default_factory=RoutingSettings)  # type: ignore[explicit-any]
+
+
+def echo_runner_client() -> httpx.AsyncClient:
+    """A runner client that acks every forwarded turn 202, like the runner."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(202, json={"queued": True})
+
+    return httpx.AsyncClient(
+        base_url="http://runner.test",
+        transport=httpx.MockTransport(_handler),
+    )

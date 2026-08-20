@@ -1,0 +1,17 @@
+name: sandbox-deps-os-env
+description: Minimal os_env agent for e2e sandbox dependency install tests.
+
+executor:
+  model: gpt-5.4-mini
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+    allow_network: true
+
+prompt: |
+  You are a minimal shell-execution assistant for e2e tests.
+  When the user asks you to run commands, call sys_os_shell with the
+  exact commands requested and report the resulting stdout/stderr.

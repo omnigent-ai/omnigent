@@ -1,0 +1,36 @@
+{
+  // Omnigent server on Cloudflare Containers, backed by D1 (database) and
+  // R2 (artifact store, via omnigent's native S3 backend over the R2 S3 API).
+  // Full walkthrough: deploy/cloudflare/README.md.
+  "name": "omnigent",
+  "main": "src/index.js",
+  "compatibility_date": "2026-06-01",
+
+  // Built from ./Dockerfile (omnigent-server + D1 dialect + boto3). Single
+  // replica only (in-memory runner registry) — do NOT raise max_instances.
+  // "basic" = 0.25 vCPU / 1 GiB; bump to "standard" for faster cold starts.
+  "containers": [
+    {
+      "class_name": "OmnigentServer",
+      "image": "./Dockerfile",
+      "instance_type": "basic",
+      "max_instances": 1
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [{ "class_name": "OmnigentServer", "name": "OMNIGENT" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["OmnigentServer"] }
+  ],
+
+  // Non-secret config. Replace <YOUR_CLOUDFLARE_ACCOUNT_ID> with your account ID
+  // (it's in the R2 S3 endpoint). DATABASE_URL, OMNIGENT_ACCOUNTS_COOKIE_SECRET,
+  // AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are SECRETS — set them with
+  // `wrangler secret put` (see README).
+  "vars": {
+    "OMNIGENT_ARTIFACT_URI": "s3://omnigent-artifacts",
+    "AWS_ENDPOINT_URL_S3": "https://<YOUR_CLOUDFLARE_ACCOUNT_ID>.r2.cloudflarestorage.com"
+  }
+}

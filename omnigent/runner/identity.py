@@ -13,11 +13,28 @@ RUNNER_ID_ENV_VAR = "OMNIGENT_RUNNER_ID"
 RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
 # Signal the CLI sends to "adopt" a runner: stop watching the parent
 # pid so the runner survives an intentional CLI exit (tmux detach) and
-# keeps serving the web UI. SIGUSR1 is unused elsewhere
-# in the runner and is POSIX-only, which matches the runner's platforms.
-RUNNER_ADOPT_SIGNAL = signal.SIGUSR1
+# keeps serving the web UI. SIGUSR1 is unused elsewhere in the runner.
+# Some platforms (notably native Windows) do not define SIGUSR1; keep
+# imports working there and let callers skip adopt signaling.
+RUNNER_ADOPT_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR1", None)
 RUNNER_WORKSPACE_ENV_VAR = "OMNIGENT_RUNNER_WORKSPACE"
 RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"
+# A host-launched runner uses this bearer for its initial server connection,
+# then falls back to its own refreshable auth when the bearer is rejected.
+RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN"
+# Host-launched runners use their binding token to obtain a short-lived,
+# owner-scoped server bearer instead of resolving the host user's credentials.
+RUNNER_DELEGATED_AUTH_ENV_VAR = "OMNIGENT_RUNNER_DELEGATED_AUTH"
+# Replica-routing key the runner stamps on its tunnel handshake so it
+# co-locates with the host that launched it (value = that host's host_id). The
+# host injects it when spawning the runner; absent for CLI-local runners, which
+# then leave routing to the default.
+RUNNER_SLICE_KEY_ENV_VAR = "OMNIGENT_RUNNER_SLICE_KEY"
+# Canonical harness of the session this runner is being launched for (e.g.
+# "claude-native"), stamped by the host from the launch frame so the runner
+# can start harness-specific prewarms before session init arrives. Absent
+# for CLI-local runners and hosts that predate the stamp.
+RUNNER_LAUNCH_HARNESS_ENV_VAR = "OMNIGENT_RUNNER_LAUNCH_HARNESS"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
 # Sentinel ``Origin`` header that the project's own non-browser WebSocket
 # clients (runner -> server tunnel, host/daemon -> server tunnel,
@@ -33,13 +50,30 @@ OMNIGENT_INTERNAL_WS_ORIGIN = "omnigent://internal"
 # CLI flows leave it unset (agent sees the project root directly).
 RUNNER_ISOLATE_SESSION_ENV_VAR = "OMNIGENT_RUNNER_ISOLATE_SESSION"
 
+# Marker env var stamped into every agent-facing environment so any
+# process launched inside an Omnigent agent session can detect it is
+# running under Omnigent. This is the analog of Claude Code's
+# ``CLAUDE_CODE`` / ``CLAUDECODE`` and Codex's ``CODEX``. It is set once
+# on the runner process (see :mod:`omnigent.runner._entry`) and inherited
+# by harness workers, terminals, and the in-process SDK harnesses. The
+# deny-by-default env scrubbers (os_env sandbox, codex CLI, pi CLI) name
+# it in their passthrough allowlists so this one marker survives the
+# scrub.
+OMNIGENT_SESSION_ENV_VAR = "OMNIGENT"
+OMNIGENT_SESSION_ENV_VALUE = "1"
+
 # Env vars carrying the runner's control-plane auth secret. The tunnel
 # binding token is seeded into the runner process by the launcher and
 # reused as the runner-side request auth token, but must never reach a
 # spawned child: the agent payload there could use it to impersonate the
 # runner. Stripped at every runner→child spawn boundary via
 # :func:`strip_runner_auth_secrets`.
-RUNNER_AUTH_SECRET_ENV_VARS: frozenset[str] = frozenset({RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR})
+RUNNER_AUTH_SECRET_ENV_VARS: frozenset[str] = frozenset(
+    {
+        RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+    }
+)
 
 
 def strip_runner_auth_secrets(env: Mapping[str, str]) -> dict[str, str]:

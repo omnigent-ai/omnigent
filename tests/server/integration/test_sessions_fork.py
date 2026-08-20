@@ -56,6 +56,22 @@ async def _fork_session(
     )
 
 
+async def _list_builtin_agent_ids(client: httpx.AsyncClient) -> set[str]:
+    """
+    Return the ids of all built-in agents (``GET /v1/agents``).
+
+    The endpoint lists only ``session_id IS NULL`` rows, so this is the
+    set a leaked fork clone would wrongly join. ``limit=100`` covers the
+    handful of built-ins plus any (regression) leak.
+
+    :param client: The test HTTP client.
+    :returns: Set of built-in agent ids.
+    """
+    resp = await client.get("/v1/agents?limit=100")
+    assert resp.status_code == 200, f"GET /v1/agents failed: {resp.status_code} {resp.text}"
+    return {a["id"] for a in resp.json()["data"]}
+
+
 async def _get_session_items(
     client: httpx.AsyncClient,
     session_id: str,
@@ -303,6 +319,45 @@ async def test_fork_nonexistent_session_returns_404(
     body = resp.json()
     assert body["error"]["code"] == "not_found", (
         f"Error code should be 'not_found', got {body['error']['code']!r}."
+    )
+
+
+async def test_failed_fork_leaves_no_ghost_in_builtin_agents(
+    client: httpx.AsyncClient,
+) -> None:
+    """A fork that fails mid-flight adds nothing to ``GET /v1/agents``.
+
+    Regression for the duplicate-agent bug: the route pre-created the
+    cloned agent in its own committed transaction, so when
+    ``fork_conversation`` then raised — e.g. a stale ``up_to_response_id``
+    from "Fork from this response" — the clone was orphaned as a
+    ``session_id IS NULL`` row, which ``GET /v1/agents`` returns. Each
+    failed fork thus leaked a phantom "Claude Code"/"Codex" entry into the
+    picker. The clone is now created inside the fork transaction, so a
+    failed fork rolls it back and the built-in agent list is unchanged.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], initial_message="hi")
+    await _wait_for_idle(client, session["id"])
+
+    # The test agent is session-scoped, so the built-in list starts empty;
+    # a leaked clone (session_id IS NULL) would be the only thing to appear.
+    before = await _list_builtin_agent_ids(client)
+
+    # "Fork from this response" with a response id that doesn't exist: the
+    # store raises ValueError → the route returns 400, AFTER the point where
+    # the buggy route had already committed the clone.
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/fork",
+        json={"up_to_response_id": "resp_does_not_exist"},
+    )
+    assert resp.status_code == 400, (
+        f"Stale up_to_response_id should 400, got {resp.status_code}: {resp.text}"
+    )
+
+    after = await _list_builtin_agent_ids(client)
+    assert after == before, (
+        f"A failed fork must not register any built-in agent; leaked: {sorted(after - before)}"
     )
 
 

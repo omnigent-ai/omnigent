@@ -11,8 +11,10 @@ SQLite file and tears it down automatically.
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import event
 
 from omnigent.entities import SessionPermission
+from omnigent.server.auth import RESERVED_USER_PUBLIC
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -276,13 +278,14 @@ def test_list_for_session_returns_all_grants(
     store.grant("alice@test.com", conv_id, level=1)
     store.grant("bob@test.com", conv_id, level=3)
 
-    grants = store.list_for_session(conv_id)
+    grants, next_cursor = store.list_for_session(conv_id)
 
     # Both grants must be present.
     assert len(grants) == 2, (
         f"Expected 2 grants for session, got {len(grants)}. "
         "list_for_session is not returning all grants."
     )
+    assert next_cursor is None
     user_ids = {g.user_id for g in grants}
     assert user_ids == {"alice@test.com", "bob@test.com"}, (
         f"Expected users alice and bob, got {user_ids}"
@@ -297,9 +300,10 @@ def test_list_for_session_empty(store: SqlAlchemyPermissionStore, db_uri: str) -
     """``list_for_session`` returns [] for a session with no grants."""
     conv_id = _create_conversation(db_uri)
 
-    result = store.list_for_session(conv_id)
+    grants, next_cursor = store.list_for_session(conv_id)
 
-    assert result == [], f"Expected [] for a session with no grants, got {result!r}"
+    assert grants == [], f"Expected [] for a session with no grants, got {grants!r}"
+    assert next_cursor is None
 
 
 def test_list_for_session_isolation(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
@@ -313,11 +317,37 @@ def test_list_for_session_isolation(store: SqlAlchemyPermissionStore, db_uri: st
 
     store.grant("alice@test.com", conv_a, level=2)
 
-    b_grants = store.list_for_session(conv_b)
+    b_grants, next_cursor = store.list_for_session(conv_b)
     assert b_grants == [], (
         f"Expected no grants for conv_b, got {b_grants}. "
         "Grants are leaking across session boundaries."
     )
+    assert next_cursor is None
+
+
+def test_list_for_session_pagination(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """``list_for_session`` pages through grants via the user_id cursor."""
+    conv_id = _create_conversation(db_uri)
+    # Zero-padded so lexical order is deterministic and predictable.
+    user_ids = [f"user{i:02d}@test.com" for i in range(5)]
+    for uid in user_ids:
+        _ensure_user(store, uid)
+        store.grant(uid, conv_id, level=1)
+
+    # First page: limit=2 → 2 grants + a cursor (the last returned user_id).
+    page1, cursor1 = store.list_for_session(conv_id, limit=2)
+    assert [g.user_id for g in page1] == user_ids[:2]
+    assert cursor1 == user_ids[1]
+
+    # Second page continues after the cursor.
+    page2, cursor2 = store.list_for_session(conv_id, limit=2, after_user_id=cursor1)
+    assert [g.user_id for g in page2] == user_ids[2:4]
+    assert cursor2 == user_ids[3]
+
+    # Final page returns the remainder with a null cursor.
+    page3, cursor3 = store.list_for_session(conv_id, limit=2, after_user_id=cursor2)
+    assert [g.user_id for g in page3] == user_ids[4:]
+    assert cursor3 is None
 
 
 # ── list_for_user ────────────────────────────────────────────────────────────
@@ -430,6 +460,50 @@ def test_ensure_user_does_not_overwrite_admin_flag(
     )
 
 
+# ── list_users ───────────────────────────────────────────────────────────────
+
+
+def test_list_users_returns_real_users_with_admin_flag(
+    store: SqlAlchemyPermissionStore,
+) -> None:
+    """``list_users`` returns every real user with the admin flag set.
+
+    Backs the OIDC/header admin user list — the analog of the
+    accounts-mode ``account_store.list_users()``.
+    """
+    store.ensure_user("alice@test.com", is_admin=True)
+    store.ensure_user("bob@test.com")
+
+    users = {u.id: u for u in store.list_users()}
+    assert set(users) == {"alice@test.com", "bob@test.com"}
+    assert users["alice@test.com"].is_admin is True
+    assert users["bob@test.com"].is_admin is False
+    # Header/OIDC rows have no password — the Account shape must reflect that.
+    assert users["bob@test.com"].has_password is False
+
+
+def test_list_users_excludes_reserved_sentinels(
+    store: SqlAlchemyPermissionStore,
+) -> None:
+    """``list_users`` hides the ``local`` and ``__public__`` sentinels.
+
+    They aren't real, actionable actors, matching
+    ``account_store.list_users()`` so the admin list is identical
+    across auth modes.
+    """
+    store.ensure_user("local", is_admin=True)
+    store.ensure_user("__public__")
+    store.ensure_user("real@test.com")
+
+    ids = {u.id for u in store.list_users()}
+    assert ids == {"real@test.com"}
+
+
+def test_list_users_empty(store: SqlAlchemyPermissionStore) -> None:
+    """``list_users`` returns an empty list when there are no real users."""
+    assert store.list_users() == []
+
+
 # ── is_admin ─────────────────────────────────────────────────────────────────
 
 
@@ -507,14 +581,13 @@ def test_has_any_grants_false_after_revoke(store: SqlAlchemyPermissionStore, db_
 # ── cascade delete ───────────────────────────────────────────────────────────
 
 
-def test_cascade_delete_removes_permissions_when_conversation_deleted(
+def test_permissions_not_auto_deleted_when_conversation_deleted(
     store: SqlAlchemyPermissionStore, db_uri: str
 ) -> None:
-    """When a conversation row is deleted, FK CASCADE removes permission rows.
+    """Without DB FK cascade, deleting a conversation leaves its permission rows intact.
 
-    The session_permissions table has ``ON DELETE CASCADE`` on
-    ``conversation_id``. Deleting the conversation must clean up all
-    associated grants without explicit permission-store calls.
+    The application (delete_conversation) is responsible for explicitly
+    deleting session_permissions rows when a conversation is removed.
     """
     _ensure_user(store, "alice@test.com")
     _ensure_user(store, "bob@test.com")
@@ -523,10 +596,9 @@ def test_cascade_delete_removes_permissions_when_conversation_deleted(
     store.grant("alice@test.com", conv_id, level=2)
     store.grant("bob@test.com", conv_id, level=1)
 
-    # Verify grants exist before delete.
     assert store.has_any_grants(conv_id) is True, "Pre-condition: grants must exist"
 
-    # Delete the conversation directly via SQLAlchemy to trigger FK CASCADE.
+    # Delete the conversation directly — no FK cascade fires.
     from sqlalchemy import delete as sa_delete
 
     from omnigent.db.db_models import SqlConversation
@@ -537,13 +609,9 @@ def test_cascade_delete_removes_permissions_when_conversation_deleted(
     with session_maker() as session:
         session.execute(sa_delete(SqlConversation).where(SqlConversation.id == conv_id))
 
-    # All grants on the deleted conversation must be gone.
-    assert store.has_any_grants(conv_id) is False, (
-        "Expected no grants after conversation CASCADE delete, but "
-        "grants still exist. The FK ON DELETE CASCADE is not working."
-    )
-    assert store.list_for_session(conv_id) == [], (
-        "Expected [] after CASCADE delete, but grants remain."
+    # Grants remain — the application must clean them up explicitly.
+    assert store.has_any_grants(conv_id) is True, (
+        "Without FK cascade, permission rows must persist after conversation deletion."
     )
 
 
@@ -945,7 +1013,7 @@ def test_check_access_public_grant_fallback(store: SqlAlchemyPermissionStore, db
 
 def test_check_access_none_user(store: SqlAlchemyPermissionStore) -> None:
     """check_access returns False when user_id is None."""
-    assert store.check_access(None, "conv_any", required_level=1) is False
+    assert store.check_access(None, "483e55280c4ee1d3ddf0492148f9eeb5", required_level=1) is False
 
 
 def test_check_access_no_grants(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
@@ -995,7 +1063,7 @@ def test_get_permission_level_public_fallback(
 
 def test_get_permission_level_none_user(store: SqlAlchemyPermissionStore) -> None:
     """get_permission_level returns None for None user_id."""
-    assert store.get_permission_level(None, "conv_any") is None
+    assert store.get_permission_level(None, "483e55280c4ee1d3ddf0492148f9eeb5") is None
 
 
 def test_get_permission_level_no_grants(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
@@ -1055,3 +1123,226 @@ def test_list_for_sessions_no_grants(store: SqlAlchemyPermissionStore, db_uri: s
     conv = _create_conversation(db_uri)
     result = store.list_for_sessions([conv])
     assert result == {conv: []}
+
+
+# ── resolve_access short-lived cache ──────────────────────────────────────────
+
+
+def _checkout_counter(store: SqlAlchemyPermissionStore) -> tuple[list[int], object]:
+    """Count pool checkouts on the store's engine.
+
+    Attach *after* any setup writes so only the reads under test are counted.
+
+    :returns: ``(count, detach)`` — a one-element list incremented per checkout,
+        and a zero-arg callable that removes the listener.
+    """
+    count = [0]
+
+    def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+        count[0] += 1
+
+    event.listen(store._engine, "checkout", _on_checkout)
+    return count, lambda: event.remove(store._engine, "checkout", _on_checkout)
+
+
+def test_resolve_access_caches_positive_result(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A repeat resolve for a granted user is served from cache — no DB checkout."""
+    _ensure_user(store, "alice@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant("alice@test.com", conv_id, level=2)
+
+    count, detach = _checkout_counter(store)
+    try:
+        first = store.resolve_access("alice@test.com", conv_id)
+        second = store.resolve_access("alice@test.com", conv_id)
+    finally:
+        detach()
+
+    assert first.user_grant_level == 2
+    assert second == first
+    assert count[0] == 1, f"second resolve must hit cache (no checkout), got {count[0]}"
+
+
+def test_resolve_access_does_not_cache_no_access(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A no-access result is never cached, so a freshly granted user is
+    authorized on their very next request rather than after the TTL."""
+    _ensure_user(store, "bob@test.com")
+    conv_id = _create_conversation(db_uri)
+
+    denied = store.resolve_access("bob@test.com", conv_id)
+    assert denied.user_grant_level is None
+
+    store.grant("bob@test.com", conv_id, level=1)
+    # No stale "deny" is cached — the grant is visible immediately.
+    granted = store.resolve_access("bob@test.com", conv_id)
+    assert granted.user_grant_level == 1
+
+
+def test_grant_evicts_resolve_cache(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """Re-granting at a new level evicts the cached decision."""
+    _ensure_user(store, "carol@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant("carol@test.com", conv_id, level=1)
+
+    assert store.resolve_access("carol@test.com", conv_id).user_grant_level == 1
+    store.grant("carol@test.com", conv_id, level=3)
+    assert store.resolve_access("carol@test.com", conv_id).user_grant_level == 3
+
+
+def test_revoke_evicts_resolve_cache(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """A revoke evicts the cache so the removed user is denied on the next check."""
+    _ensure_user(store, "dave@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant("dave@test.com", conv_id, level=2)
+
+    assert store.resolve_access("dave@test.com", conv_id).user_grant_level == 2
+    store.revoke("dave@test.com", conv_id)
+    assert store.resolve_access("dave@test.com", conv_id).user_grant_level is None
+
+
+def test_revoking_public_grant_evicts_all_users_for_session(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """The shared __public__ grant is session-scoped, so revoking it evicts
+    every user's cached decision for that session."""
+    _ensure_user(store, "erin@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant(RESERVED_USER_PUBLIC, conv_id, level=1)
+
+    # erin has no personal grant but is allowed via the public grant — cached.
+    assert store.resolve_access("erin@test.com", conv_id).public_grant_level == 1
+    store.revoke(RESERVED_USER_PUBLIC, conv_id)
+    assert store.resolve_access("erin@test.com", conv_id).public_grant_level is None
+
+
+def test_set_admin_evicts_resolve_cache(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """Flipping the admin flag evicts cached decisions across all sessions."""
+    _ensure_user(store, "frank@test.com")
+    store.set_admin("frank@test.com", True)
+    conv_id = _create_conversation(db_uri)
+
+    assert store.resolve_access("frank@test.com", conv_id).is_admin is True
+    store.set_admin("frank@test.com", False)
+    assert store.resolve_access("frank@test.com", conv_id).is_admin is False
+
+
+def test_resolve_access_cache_expires_after_ttl(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """Once the TTL elapses the entry is dropped and the next resolve re-reads."""
+    now = [1000.0]
+    store._resolve_cache_clock = lambda: now[0]
+    _ensure_user(store, "grace@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant("grace@test.com", conv_id, level=2)
+
+    count, detach = _checkout_counter(store)
+    try:
+        store.resolve_access("grace@test.com", conv_id)  # miss → read + cache
+        store.resolve_access("grace@test.com", conv_id)  # hit
+        assert count[0] == 1, "within TTL the repeat must be a cache hit"
+        now[0] += store._resolve_cache_ttl_s + 1.0
+        store.resolve_access("grace@test.com", conv_id)  # expired → re-read
+        assert count[0] == 2, "after TTL the entry must be re-read from the DB"
+    finally:
+        detach()
+
+
+def test_resolve_access_cache_disabled_when_ttl_zero(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """With the cache disabled every resolve reads the DB (no staleness at all)."""
+    store._resolve_cache_ttl_s = 0.0
+    _ensure_user(store, "heidi@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant("heidi@test.com", conv_id, level=2)
+
+    count, detach = _checkout_counter(store)
+    try:
+        store.resolve_access("heidi@test.com", conv_id)
+        store.resolve_access("heidi@test.com", conv_id)
+    finally:
+        detach()
+    assert count[0] == 2, "a disabled cache must read on every call"
+
+
+def test_reassign_user_grants_evicts_resolve_cache(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """Moving grants between users evicts both users' cached decisions."""
+    _ensure_user(store, "local")
+    _ensure_user(store, "alice@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant("local", conv_id, level=3)
+
+    assert store.resolve_access("local", conv_id).user_grant_level == 3  # cached
+    store.reassign_user_grants("local", "alice@test.com")
+    # The grant moved: local must be denied and alice granted, both fresh.
+    assert store.resolve_access("local", conv_id).user_grant_level is None
+    assert store.resolve_access("alice@test.com", conv_id).user_grant_level == 3
+
+
+def test_resolve_access_cache_refuses_store_racing_a_write(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A reader whose rows predate a revoke must not re-cache that stale positive.
+
+    The read and the eviction are separate operations, so a resolve that read
+    the old grant can finish *after* the revoke evicted. Storing then would
+    keep the removed user authorized for a full TTL on the very instance that
+    performed the revoke. The generation guard drops that store instead.
+    """
+    _ensure_user(store, "judy@test.com")
+    conv_id = _create_conversation(db_uri)
+    store.grant("judy@test.com", conv_id, level=2)
+
+    original_store = store._resolve_cache_store
+
+    def _revoke_then_store(
+        conversation_id: str, user_id: str, access: object, generation: int
+    ) -> None:
+        """Land the revoke between this reader's DB read and its cache store."""
+        store.revoke(user_id, conversation_id)
+        original_store(conversation_id, user_id, access, generation)  # type: ignore[arg-type]
+
+    store._resolve_cache_store = _revoke_then_store  # type: ignore[assignment]
+    racing = store.resolve_access("judy@test.com", conv_id)
+    store._resolve_cache_store = original_store  # type: ignore[assignment]
+
+    # The read legitimately saw the pre-revoke grant...
+    assert racing.user_grant_level == 2
+    # ...but it must not have been cached on top of the revoke's eviction.
+    assert len(store._resolve_cache) == 0, "a read racing a write must not re-poison the cache"
+    assert store.resolve_access("judy@test.com", conv_id).user_grant_level is None
+
+
+def test_resolve_access_cache_evicts_least_recently_used_over_cap(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """The LRU entry cap bounds the cache — the oldest entry is dropped and
+    must be re-read, so a long-lived replica cannot grow it without limit."""
+    store._resolve_cache_max_entries = 2
+    _ensure_user(store, "ivan@test.com")
+    # Distinct conversations so grants don't evict each other's cache entries.
+    conv_a = _create_conversation(db_uri)
+    conv_b = _create_conversation(db_uri)
+    conv_c = _create_conversation(db_uri)
+    for conv_id in (conv_a, conv_b, conv_c):
+        store.grant("ivan@test.com", conv_id, level=1)
+
+    # Populate in order a, b, c → with cap 2, conv_a (oldest) is evicted.
+    for conv_id in (conv_a, conv_b, conv_c):
+        store.resolve_access("ivan@test.com", conv_id)
+    assert len(store._resolve_cache) == 2, "cache must not exceed its entry cap"
+
+    count, detach = _checkout_counter(store)
+    try:
+        store.resolve_access("ivan@test.com", conv_a)  # evicted → re-read
+        store.resolve_access("ivan@test.com", conv_c)  # still cached → hit
+    finally:
+        detach()
+    assert count[0] == 1, f"only the LRU-evicted entry should re-read, got {count[0]}"

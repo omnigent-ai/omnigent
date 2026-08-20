@@ -48,7 +48,6 @@ def _minimal_spec(**overrides: object) -> AgentSpec:
                 model=llm.model,
                 connection=llm.connection if executor.connection is None else executor.connection,
                 context_window=executor.context_window,
-                supervisor_tools=executor.supervisor_tools,
             )
         defaults["executor"] = executor
     return AgentSpec(**defaults)  # type: ignore[arg-type]
@@ -393,6 +392,26 @@ def test_omnigent_executor_accepts_valid_harness() -> None:
     assert result.valid, f"Expected valid spec, got errors: {result.errors}"
 
 
+def test_omnigent_executor_accepts_antigravity_native_harness() -> None:
+    """
+    ``omnigent`` executor with ``config.harness == "antigravity-native"``
+    validates cleanly.
+
+    Failure here means the antigravity-native harness is missing from
+    ``OMNIGENT_HARNESSES``, which would cause every spec that targets it
+    to be rejected at load time with an "unknown harness" validation error.
+    """
+    spec = _minimal_spec(
+        llm=LLMConfig(model="databricks-claude-sonnet-4-6"),
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "antigravity-native"},
+        ),
+    )
+    result = validate(spec)
+    assert result.valid, f"Expected valid spec, got errors: {result.errors}"
+
+
 def test_omnigent_executor_rejects_missing_harness() -> None:
     """
     ``omnigent`` executor without ``config.harness`` is rejected.
@@ -550,56 +569,6 @@ def test_mcp_http_with_stdio_field_invalid() -> None:
     assert any("not allowed when transport is 'http'" in e.message for e in result.errors)
 
 
-# ── Supervisor harness validator tests ────────────────────────────
-
-
-def test_supervisor_harness_minimal_valid() -> None:
-    """
-    A minimal supervisor harness spec (omnigent type with
-    ``config.harness == "databricks_supervisor"``) validates cleanly.
-
-    Failure here means the validator rejects every valid
-    supervisor spec — a complete break of the supervisor path.
-    """
-    spec = _minimal_spec(
-        llm=LLMConfig(
-            model="databricks-claude-sonnet-4-6",
-            connection={"api_key": "sk-test"},
-        ),
-        executor=ExecutorSpec(
-            type="omnigent",
-            config={"harness": "databricks_supervisor"},
-            profile="dev",
-        ),
-    )
-    result = validate(spec)
-    assert result.valid, f"Expected valid spec, got errors: {result.errors}"
-
-
-def test_supervisor_harness_rejects_compaction() -> None:
-    """
-    The omnigent executor (which hosts the supervisor harness)
-    forbids ``compaction`` — the harness manages context internally
-    so any compaction directive would be silently ignored.
-    """
-    spec = _minimal_spec(
-        llm=LLMConfig(
-            model="databricks-claude-sonnet-4-6",
-            connection={"api_key": "sk-test"},
-        ),
-        executor=ExecutorSpec(
-            type="omnigent",
-            config={"harness": "databricks_supervisor"},
-        ),
-        compaction=CompactionConfig(),
-    )
-    result = validate(spec)
-    assert not result.valid
-    assert any("compaction" in e.path for e in result.errors), (
-        f"Expected compaction error, got: {result.errors}"
-    )
-
-
 # ---------------------------------------------------------------------------
 # os_env sandbox combo checks.
 # ---------------------------------------------------------------------------
@@ -634,8 +603,11 @@ def test_os_env_egress_rules_requires_hard_enforcing_backend() -> None:
     assert not result.valid
     matches = [e for e in result.errors if e.path == "os_env.sandbox.egress_rules"]
     assert matches, f"expected egress_rules error, got: {result.errors}"
-    assert "linux_bwrap" in matches[0].message
-    assert "darwin_seatbelt" in matches[0].message
+    message = matches[0].message
+    assert "linux_bwrap" in message
+    assert "darwin_seatbelt" in message
+    assert "Fix:" in message
+    assert "do not use sandbox.type=none with egress_rules" in message
 
 
 def test_os_env_egress_rules_accepted_for_bwrap() -> None:

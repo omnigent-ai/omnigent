@@ -48,6 +48,7 @@ from omnigent.inner.seatbelt_sandbox import (
     _per_user_dyld_cache_subpath,
     _quote,
     _resolve_root,
+    _symlink_hop_literals,
 )
 
 # ---------------------------------------------------------------------------
@@ -74,6 +75,8 @@ def _make_policy(
     read_roots: list[Path] | None = None,
     egress_relay_port: int | None = None,
     egress_socket_path: str | None = None,
+    cwd_hidden_scan_recursive: bool | None = None,
+    mask_paths: list[Path] | None = None,
 ) -> SandboxPolicy:
     """
     Build a :class:`SandboxPolicy` directly without going through the
@@ -97,20 +100,30 @@ def _make_policy(
         Unix-socket allow rules.
     :param egress_socket_path: Filesystem path of the parent-side
         Unix socket the relay forwards to.
+    :param cwd_hidden_scan_recursive: Override for the recursive-walk
+        flag; ``None`` keeps the dataclass default (``False``,
+        top-level only).
+    :param mask_paths: Explicit absolute paths to mask; ``None`` keeps
+        the dataclass default (no explicit masks).
     :returns: A populated :class:`SandboxPolicy`.
     """
     del cwd
-    return SandboxPolicy(
-        backend_type="darwin_seatbelt",
-        active=True,
-        read_roots=read_roots,
-        write_roots=write_roots if write_roots is not None else [],
-        write_files=[],
-        allow_network=allow_network,
-        cwd_allow_hidden=allow_hidden,
-        egress_relay_port=egress_relay_port,
-        egress_socket_path=egress_socket_path,
-    )
+    kwargs: dict[str, object] = {
+        "backend_type": "darwin_seatbelt",
+        "active": True,
+        "read_roots": read_roots,
+        "write_roots": write_roots if write_roots is not None else [],
+        "write_files": [],
+        "allow_network": allow_network,
+        "cwd_allow_hidden": allow_hidden,
+        "egress_relay_port": egress_relay_port,
+        "egress_socket_path": egress_socket_path,
+    }
+    if cwd_hidden_scan_recursive is not None:
+        kwargs["cwd_hidden_scan_recursive"] = cwd_hidden_scan_recursive
+    if mask_paths is not None:
+        kwargs["mask_paths"] = mask_paths
+    return SandboxPolicy(**kwargs)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -756,6 +769,73 @@ def test_profile_dotfile_mask_uses_deny_rules(tmp_path: Path) -> None:
     )
 
 
+def test_profile_dotfile_mask_non_recursive_default(tmp_path: Path) -> None:
+    """
+    With the production default (``cwd_hidden_scan_recursive=False``)
+    the SBPL profile denies top-level dotfiles but does NOT emit a
+    deny for a dotfile nested below the top level.
+    """
+    (tmp_path / ".env").write_text("TOP=1")
+    nested = tmp_path / "services" / "api"
+    nested.mkdir(parents=True)
+    (nested / ".env").write_text("DB=1")
+
+    cwd = tmp_path.resolve(strict=False)
+    policy = _make_policy(tmp_path, allow_hidden=[".venv"])
+    profile = _build_profile(policy, cwd)
+
+    top_deny = f'(deny file-read* file-write* (literal "{cwd / ".env"}"))'
+    nested_deny = f'(deny file-read* file-write* (literal "{cwd / "services" / "api" / ".env"}"))'
+    assert top_deny in profile, "Top-level .env must still be denied in non-recursive mode."
+    assert nested_deny not in profile, (
+        "Non-recursive default must not descend into subdirectories; "
+        "nested .env must stay visible."
+    )
+
+
+def test_profile_dotfile_mask_recursive_opt_in(tmp_path: Path) -> None:
+    """
+    Opting into ``cwd_hidden_scan_recursive=True`` restores the deep
+    walk: a nested dotfile gets its own literal deny.
+    """
+    nested = tmp_path / "services" / "api"
+    nested.mkdir(parents=True)
+    (nested / ".env").write_text("DB=1")
+
+    cwd = tmp_path.resolve(strict=False)
+    policy = _make_policy(tmp_path, allow_hidden=[".venv"], cwd_hidden_scan_recursive=True)
+    profile = _build_profile(policy, cwd)
+
+    nested_deny = f'(deny file-read* file-write* (literal "{cwd / "services" / "api" / ".env"}"))'
+    assert nested_deny in profile, "Recursive opt-in should deny the nested .env."
+
+
+def test_profile_mask_paths_denies_explicit_file_and_dir(tmp_path: Path) -> None:
+    """
+    Explicit ``mask_paths`` entries produce denies regardless of name
+    or depth: a plain file gets a ``(literal ...)`` deny and a
+    directory gets a ``(subpath ...)`` deny.
+    """
+    secret_file = tmp_path / "config" / "production.key"
+    secret_file.parent.mkdir(parents=True)
+    secret_file.write_text("KEY")
+    secret_dir = tmp_path / "private"
+    secret_dir.mkdir()
+
+    cwd = tmp_path.resolve(strict=False)
+    policy = _make_policy(
+        tmp_path,
+        allow_hidden=[".venv"],
+        mask_paths=[secret_file.resolve(strict=False), secret_dir.resolve(strict=False)],
+    )
+    profile = _build_profile(policy, cwd)
+
+    file_deny = f'(deny file-read* file-write* (literal "{secret_file.resolve(strict=False)}"))'
+    dir_deny = f'(deny file-read* file-write* (subpath "{secret_dir.resolve(strict=False)}"))'
+    assert file_deny in profile, "Explicit mask_paths file must get a literal deny."
+    assert dir_deny in profile, "Explicit mask_paths directory must get a subpath deny."
+
+
 # ---------------------------------------------------------------------------
 # Ancestor traversal (realpath() / lstat() walks)
 #
@@ -1149,6 +1229,77 @@ def test_helper_boots_when_interpreter_lives_under_home_uv_layout(
         _shutil.rmtree(fake_install_root, ignore_errors=True)
 
 
+def test_ensure_executable_visible_two_hop_proxy_finds_cpython_install_root(
+    tmp_path: Path,
+) -> None:
+    """
+    Regression for uv tool-install two-hop symlink layout (issue #3237).
+
+    ``uv tool install omnigent`` creates:
+      ~/.local/share/uv/tools/omnigent/bin/python  →  (proxy symlink)
+          ~/.local/share/uv/python/cpython-3.12.X-.../bin/python3.12
+
+    The LITERAL path grandparent (``tools/omnigent/``) has no CPython
+    ``lib/`` markers.  The RESOLVED target grandparent
+    (``cpython-3.12.X-.../``) does.  Pre-fix, ``_interpreter_install_root``
+    was called only on the literal path, returned ``None``, and
+    ``_add_topmost`` raised OSError.  Post-fix, the resolved path is retried
+    as a fallback, and the narrow CPython install root is returned.
+
+    This test uses ``_ensure_executable_visible`` directly (not the full
+    wrap) so we can construct a fully fake three-layer layout under
+    ``tmp_path`` without touching the real ``sys.executable``.
+    """
+    import uuid
+
+    home = Path.home()
+
+    # Layer 1 — CPython install root (the real target).  Lives under HOME
+    # so topmost ancestor is in _UNSAFE_WIDEN_ANCESTORS and the narrow-
+    # fallback path is exercised.
+    cpython_root = home / f".omnigent-test-cpython-{uuid.uuid4().hex}"
+    (cpython_root / "bin").mkdir(parents=True)
+    py_major_minor = f"python{sys.version_info[0]}.{sys.version_info[1]}"
+    (cpython_root / "lib" / py_major_minor).mkdir(parents=True)
+
+    # Layer 2 — tool-venv proxy root (no CPython markers — this is the
+    # layout that causes the literal-path check to return None).
+    tool_root = home / f".omnigent-test-tool-{uuid.uuid4().hex}"
+    (tool_root / "bin").mkdir(parents=True)
+    # Deliberately no lib/python* here.
+
+    import shutil as _shutil
+
+    try:
+        # Fake interpreter binary in the CPython install root.
+        cpython_exe = cpython_root / "bin" / "python3"
+        cpython_exe.touch()
+
+        # Proxy symlink: tool_root/bin/python → cpython_root/bin/python3
+        tool_exe = tool_root / "bin" / "python"
+        tool_exe.symlink_to(cpython_exe)
+
+        cwd = tmp_path
+        argv = [str(tool_exe), "-c", "pass"]
+        extras = _ensure_executable_visible(argv, cwd.resolve(strict=False))
+
+        cpython_resolved = cpython_root.resolve(strict=False)
+        assert cpython_resolved in extras, (
+            f"Expected the CPython install root {cpython_resolved!r} in extras "
+            f"({extras!r}). The two-hop proxy fallback did not resolve to the "
+            "real CPython install root; without this grant the kernel EPERMs "
+            "the exec inside the sandbox."
+        )
+        for extra in extras:
+            assert str(extra) not in _UNSAFE_WIDEN_ANCESTORS, (
+                f"_ensure_executable_visible granted an unsafe broad ancestor "
+                f"{extra!r} instead of the narrow CPython install root."
+            )
+    finally:
+        _shutil.rmtree(cpython_root, ignore_errors=True)
+        _shutil.rmtree(tool_root, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Security hardening regression tests
 #
@@ -1497,7 +1648,7 @@ def test_ensure_executable_visible_still_raises_for_non_python_home_layouts(
             _ensure_executable_visible(argv, cwd)
 
     msg = str(exc.value)
-    assert "Auto-detection of a narrow Python install root" in msg, (
+    assert "Auto-detection of a narrow CPython install root" in msg, (
         f"OSError should explain that the install-root fallback was "
         f"attempted; got message: {msg!r}. Without this hint, an "
         "operator hitting a near-miss layout (e.g. they forgot to "
@@ -2079,4 +2230,462 @@ def test_s5_read_paths_dedup_skips_paths_under_cwd(tmp_path: Path) -> None:
     assert profile.count(env_deny) == 1, (
         ".env masked more than once — the dedup that skips "
         "read_paths roots at-or-under cwd regressed."
+    )
+
+
+def test_write_paths_dotfile_masking_masks_external_write_root(tmp_path: Path) -> None:
+    """
+    A ``write_paths`` root outside cwd is dotfile-masked just like a
+    ``read_paths`` root: its top-level ``.env`` gets a ``(literal ...)``
+    deny and its ``.aws/`` a ``(subpath ...)`` deny, even though the
+    grant is for writing. Without scanning write roots the helper could
+    read (and clobber) secrets in a writable directory outside cwd.
+    """
+    external = tmp_path / "shared"
+    external.mkdir()
+    (external / ".env").write_text("SECRET=1")
+    (external / ".aws").mkdir()
+    (external / ".aws" / "credentials").write_text("[default]")
+    (external / "notes.txt").write_text("ok")  # non-dotfile stays visible
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+
+    policy = _make_policy(
+        cwd,
+        write_roots=[external.resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    profile = _build_profile(policy, cwd.resolve(strict=False))
+
+    ext = external.resolve(strict=False)
+    env_deny = f'(deny file-read* file-write* (literal "{ext / ".env"}"))'
+    aws_deny = f'(deny file-read* file-write* (subpath "{ext / ".aws"}"))'
+    notes_deny = f'(deny file-read* file-write* (literal "{ext / "notes.txt"}"))'
+    assert env_deny in profile, (
+        ".env under a write_paths root must be masked — write grants are scanned too."
+    )
+    assert aws_deny in profile, ".aws/ under a write_paths root must get a (subpath ...) deny."
+    assert notes_deny not in profile, "Non-dotfiles under a write_paths root must stay visible."
+
+
+def test_read_write_overlap_masked_once(tmp_path: Path) -> None:
+    """
+    A path granted as BOTH a read and a write root is walked once —
+    ``merge_scan_roots`` dedupes the grant lists, so its ``.env`` deny
+    lands a single time, not once per grant list.
+    """
+    external = tmp_path / "shared"
+    external.mkdir()
+    (external / ".env").write_text("SECRET=1")
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    ext = external.resolve(strict=False)
+
+    policy = _make_policy(
+        cwd,
+        read_roots=[ext],
+        write_roots=[ext],
+        allow_hidden=[".venv"],
+    )
+    profile = _build_profile(policy, cwd.resolve(strict=False))
+
+    env_deny = f'(deny file-read* file-write* (literal "{ext / ".env"}"))'
+    assert profile.count(env_deny) == 1, (
+        f"Expected a single .env deny across overlapping read+write grants, "
+        f"got {profile.count(env_deny)}."
+    )
+
+
+def test_nested_grant_masked_in_non_recursive_default(tmp_path: Path) -> None:
+    """
+    Regression: a ``write_paths`` grant nested below a ``read_paths``
+    root must still have its top-level dotfiles denied in the default
+    (non-recursive) mode. A non-recursive walk of the parent masks only
+    the parent's immediate children, so the nested grant must be walked
+    in its own right rather than dropped as "subsumed".
+    """
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    a = tmp_path / "a"
+    (a / "deep" / "nested").mkdir(parents=True)
+    (a / ".env").write_text("SECRET_A")
+    (a / "deep" / "nested" / ".env").write_text("SECRET_NESTED")
+
+    policy = _make_policy(
+        cwd,
+        read_roots=[a.resolve(strict=False)],
+        write_roots=[(a / "deep" / "nested").resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    profile = _build_profile(policy, cwd.resolve(strict=False))
+
+    top_env = f'(deny file-read* file-write* (literal "{a.resolve(strict=False) / ".env"}"))'
+    nested_env = (
+        "(deny file-read* file-write* (literal "
+        f'"{(a / "deep" / "nested").resolve(strict=False) / ".env"}"))'
+    )
+    assert top_env in profile, "Top-level .env of the read_paths root must be denied."
+    assert nested_env in profile, (
+        "Nested write_paths grant's .env must be denied in non-recursive mode; "
+        "dropping the nested root as subsumed would leak it."
+    )
+
+
+def test_framework_write_root_dotfiles_not_masked(tmp_path: Path) -> None:
+    """
+    Regression: a framework write root added via
+    ``with_additional_write_roots`` (the per-helper scratch tmpdir) is
+    excluded from the dotfile scan, so the egress ``.egress.sock`` in it
+    gets NO deny rule. Denying that socket cut off the relay endpoint and
+    reset every egress connection. A genuine user write root is still
+    scanned.
+    """
+    from omnigent.inner.sandbox import with_additional_write_roots
+
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    scratch = tmp_path / "scratch"  # framework runtime dir
+    scratch.mkdir()
+    (scratch / ".egress.sock").write_text("")  # dotfile the sandbox needs
+    user_root = tmp_path / "shared"  # real user write grant
+    user_root.mkdir()
+    (user_root / ".env").write_text("SECRET=1")
+
+    policy = _make_policy(
+        cwd,
+        write_roots=[user_root.resolve(strict=False)],
+        allow_hidden=[".venv"],
+    )
+    # Mirror the real launch: the parent folds the scratch tmpdir in as a
+    # framework write root just before building the profile.
+    policy = with_additional_write_roots(policy, [scratch])
+    profile = _build_profile(policy, cwd.resolve(strict=False))
+
+    sock = scratch.resolve(strict=False) / ".egress.sock"
+    sock_deny = f'(deny file-read* file-write* (literal "{sock}"))'
+    assert sock_deny not in profile, (
+        "The framework scratch tmpdir must be excluded from the dotfile scan; "
+        "denying .egress.sock breaks the egress relay."
+    )
+    user_env = (
+        f'(deny file-read* file-write* (literal "{user_root.resolve(strict=False) / ".env"}"))'
+    )
+    assert user_env in profile, "A genuine user write root must still have its dotfiles denied."
+
+
+# ---------------------------------------------------------------------------
+# Exec-chain symlink hops + launcher target visibility (bwrap parity)
+# ---------------------------------------------------------------------------
+
+
+def _uv_style_layout(base: Path) -> tuple[Path, Path, Path]:
+    """
+    Stage uv's tool-venv → versionless-hop → real-install layout.
+
+    Mirrors what ``uv tool install omnigent`` produces: the tool
+    venv's ``bin/python`` symlinks to a path that traverses the
+    version-floating ``cpython-3.12`` directory symlink before
+    landing on the real ``cpython-3.12.13`` install. Both roots get
+    the venv/install shape (``bin/`` + ``lib/python3.12``) so the
+    narrow install-root fallback matches them.
+
+    :param base: Directory to stage the fake ``$HOME`` layout under.
+    :returns: ``(tool_exe, versionless_dir, real_install_root)``.
+    """
+    real_root = base / ".local" / "share" / "uv" / "python" / "cpython-3.12.13-macos"
+    (real_root / "bin").mkdir(parents=True)
+    (real_root / "lib" / "python3.12").mkdir(parents=True)
+    real_exe = real_root / "bin" / "python3.12"
+    real_exe.write_text("#!fake\n")
+    real_exe.chmod(0o755)
+    versionless = base / ".local" / "share" / "uv" / "python" / "cpython-3.12-macos"
+    versionless.symlink_to("cpython-3.12.13-macos")
+    tool_root = base / ".local" / "share" / "uv" / "tools" / "omnigent"
+    (tool_root / "bin").mkdir(parents=True)
+    (tool_root / "lib" / "python3.12").mkdir(parents=True)
+    tool_exe = tool_root / "bin" / "python"
+    tool_exe.symlink_to(versionless / "bin" / "python3.12")
+    return tool_exe, versionless, real_root
+
+
+def test_wrap_launcher_argv_grants_uv_versionless_hop_literal(tmp_path: Path) -> None:
+    """
+    The uv boot regression: the helper interpreter is reached through
+    uv's version-floating directory symlink
+    (``cpython-3.12 -> cpython-3.12.13``). The profile grants a
+    subpath on the RESOLVED install root, but execve reads the
+    versionless symlink at its LITERAL path — without a literal
+    grant for the hop, ``sandbox-exec``'s execvp of the helper dies
+    with EPERM and every jailed helper spawn fails at boot.
+    """
+    tool_exe, versionless, real_root = _uv_style_layout(tmp_path / "fake-home")
+    cwd = tmp_path / "workspace"
+    cwd.mkdir()
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, allow_hidden=[".venv"])
+    argv = backend.wrap_launcher_argv(
+        [str(tool_exe), "-m", "omnigent.inner.os_env", "helper", "X"], policy, cwd
+    )
+    profile = Path(argv[2]).read_text()
+
+    hop_literal = f"(allow file-read* (literal {_quote(str(versionless))}))"
+    assert hop_literal in profile, (
+        f"Missing literal read grant for the versionless symlink hop "
+        f"{str(versionless)!r}. Subpath rules match only canonical "
+        "paths, so without this literal the kernel denies reading the "
+        "symlink during execve resolution and the helper interpreter "
+        "never boots (execvp EPERM)."
+    )
+    resolved_subpath = (
+        f"(allow file-read* (subpath {_quote(str(real_root.resolve(strict=False)))}))"
+    )
+    assert resolved_subpath in profile, (
+        "The resolved install root must keep its narrow subpath grant "
+        "— the hop literal complements it, never replaces it."
+    )
+
+
+def test_wrap_launcher_argv_target_grants_claude_cli_install(tmp_path: Path) -> None:
+    """
+    The launcher target (e.g. the claude CLI wrapped by
+    ``prepare_claude_cli_path``) must be readable inside the sandbox:
+    the standalone installer puts a symlink at ``~/.local/bin/claude``
+    pointing into ``~/.local/share/claude/versions/<v>/``. The wrap
+    must grant a literal read on the symlink and a subpath on the
+    version directory — and nothing wider — instead of discarding
+    ``target`` (which crashed the whole native-tool wrap with
+    ``PermissionError`` at connect time).
+    """
+    fake_home = tmp_path / "fake-home"
+    version_dir = fake_home / ".local" / "share" / "claude" / "versions" / "1.0.61"
+    version_dir.mkdir(parents=True)
+    cli_real = version_dir / "claude"
+    cli_real.write_bytes(b"\x00fakebun")
+    cli_real.chmod(0o755)
+    bin_dir = fake_home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    cli_link = bin_dir / "claude"
+    cli_link.symlink_to(cli_real)
+    cwd = tmp_path / "workspace"
+    cwd.mkdir()
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, allow_hidden=[".venv"])
+    argv = backend.wrap_launcher_argv(_safe_helper_argv(cwd), policy, cwd, target=str(cli_link))
+    profile = Path(argv[2]).read_text()
+
+    assert f"(allow file-read* (literal {_quote(str(cli_link))}))" in profile, (
+        "The target symlink needs a literal read grant — the kernel "
+        "reads it at its literal path when the launcher execs the CLI."
+    )
+    assert f"(allow file-read* (subpath {_quote(str(version_dir))}))" in profile, (
+        "The resolved CLI's own directory needs a subpath grant so the "
+        "in-sandbox exec can read the binary."
+    )
+    dotlocal = fake_home / ".local"
+    assert f"(allow file-read* (subpath {_quote(str(dotlocal))}))" not in profile, (
+        "The grant must stay scoped to the CLI install — widening to "
+        "~/.local would expose sibling tool state."
+    )
+    assert f"(allow file-read-metadata (literal {_quote(str(bin_dir))}))" in profile, (
+        "The literal grant's ancestors need stat-only traversal allows "
+        "or realpath() walks to the CLI EPERM under deny-default."
+    )
+
+
+def test_wrap_launcher_argv_target_under_cwd_changes_nothing(tmp_path: Path) -> None:
+    """
+    A target already covered by the cwd subpath must not change the
+    profile — no redundant grants, profile contents byte-identical to
+    the no-target wrap (mirrors the bwrap no-op-target behaviour).
+    """
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, allow_hidden=[".venv"])
+    tool = tmp_path / "tools" / "cli"
+    tool.parent.mkdir()
+    tool.write_text("#!fake\n")
+    tool.chmod(0o755)
+    helper_argv = _safe_helper_argv(tmp_path)
+
+    argv_no_target = backend.wrap_launcher_argv(helper_argv, policy, tmp_path)
+    argv_with_target = backend.wrap_launcher_argv(helper_argv, policy, tmp_path, target=str(tool))
+    assert Path(argv_no_target[2]).read_text() == Path(argv_with_target[2]).read_text(), (
+        "A cwd-covered target must be a no-op for the profile; extra "
+        "grants here mean the coverage check regressed."
+    )
+
+
+def test_wrap_launcher_argv_target_with_unsafe_parent_degrades_not_raises(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    The target lane must NEVER raise (parity with the crash-instead-
+    of-degrade complaint): when the resolved target's parent directory
+    is too broad to grant — an unsafe ancestor, ``$HOME``, or above —
+    the wrap degrades to a literal read on the binary plus an audit
+    WARNING instead of failing the spawn.
+    """
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir()
+    binary = fake_home / "claude"
+    binary.write_bytes(b"\x00fakebun")
+    binary.chmod(0o755)
+    cwd = tmp_path / "workspace"
+    cwd.mkdir()
+
+    backend = _make_backend()
+    policy = _make_policy(cwd, allow_hidden=[".venv"])
+    with patch(
+        "omnigent.inner.seatbelt_sandbox._UNSAFE_WIDEN_ANCESTORS",
+        frozenset({str(fake_home)}),
+    ):
+        with caplog.at_level("WARNING", logger="omnigent.inner.seatbelt_sandbox"):
+            argv = backend.wrap_launcher_argv(
+                _safe_helper_argv(cwd), policy, cwd, target=str(binary)
+            )
+    profile = Path(argv[2]).read_text()
+
+    assert f"(allow file-read* (literal {_quote(str(binary))}))" in profile, (
+        "The degraded path must still grant a literal read on the "
+        "binary itself — best effort beats a guaranteed crash."
+    )
+    assert f"(allow file-read* (subpath {_quote(str(fake_home))}))" not in profile, (
+        "The refused parent must NOT get a subpath grant — that's the "
+        "sandbox-defeating widening the guard exists to prevent."
+    )
+    assert any("too broad" in record.message for record in caplog.records), (
+        "The degrade must be auditable via a WARNING naming the refused parent."
+    )
+
+
+def test_symlink_hop_literals_survives_cycles(tmp_path: Path) -> None:
+    """
+    A symlink cycle (``a -> b -> a``) must terminate via the
+    visited-set (same contract as the bwrap walk) and still report
+    the symlinks it saw.
+    """
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.symlink_to(b)
+    b.symlink_to(a)
+
+    literals = _symlink_hop_literals(a, [])
+
+    assert a in literals and b in literals, (
+        f"Cycle members should each be collected once; got {literals!r}."
+    )
+    assert len(literals) == 2, f"Cycle must not duplicate entries or spin; got {literals!r}."
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="darwin_seatbelt requires macOS")
+def test_run_launcher_spawn_wrap_private_tmpdir_boots_under_seatbelt(
+    tmp_path: Path,
+) -> None:
+    """
+    End-to-end regression for the spawn-time-wrap private-tmpdir grant.
+
+    Drives the FULL ``create_exec_launcher`` -> ``run_launcher``
+    two-pass re-exec (the host pass builds the ``sandbox-exec`` wrap and
+    ``execvp``s into it; the in-wrap pass activates and runs the target).
+    This is the path claude-sdk / terminals / the other spawn-wrap
+    harnesses use — distinct from the direct ``wrap_launcher_argv``
+    calls the rest of this file exercises.
+
+    Reproduces the reported failure: inside the wrap, the launcher mints
+    a private scratch tmpdir via ``tempfile.mkdtemp()``, which targets
+    ``$TMPDIR``. On macOS ``$TMPDIR`` is the system tempdir *root*
+    (``/var/folders/.../T``), and the seatbelt profile — baked before
+    the re-exec — only grants a *subpath* of it, so the in-wrap
+    ``mkdtemp`` died with ``FileNotFoundError: No usable temporary
+    directory``. (bwrap masked this via its ``--tmpfs /tmp`` fallback,
+    so Linux CI never saw it.) The fix mints + grants the scratch dir on
+    the host BEFORE the wrap and hands it to the in-wrap pass, so
+    ``mkdtemp`` lands in a profile-granted, writable location.
+
+    The target is a tiny script that calls ``tempfile.mkdtemp()`` and
+    writes a file into it — the exact operation that failed. We force
+    ``TMPDIR`` to the system tempdir root to reproduce the macOS
+    condition deterministically. Pre-fix: the in-wrap launcher exits
+    non-zero with the ``FileNotFoundError`` before the target ever runs.
+    Post-fix: the target runs and prints ``TMPOK``.
+    """
+    import os
+    import shutil as _shutil
+    import subprocess
+    import tempfile
+
+    from omnigent.inner.sandbox import _project_root, create_exec_launcher
+
+    if _shutil.which("sandbox-exec") is None:
+        pytest.skip("sandbox-exec not on PATH")
+
+    cwd = tmp_path
+    # A target that exercises the scratch tmpdir the way real helpers do:
+    # mkdtemp() (honours $TMPDIR) then write into it. This is what raised
+    # FileNotFoundError inside the wrap pre-fix.
+    target = cwd / "tmp_probe.py"
+    target.write_text(
+        "import tempfile, pathlib\n"
+        "d = tempfile.mkdtemp()\n"
+        "p = pathlib.Path(d) / 'scratch.txt'\n"
+        "p.write_text('ok')\n"
+        "assert p.read_text() == 'ok'\n"
+        "print('TMPOK', d)\n"
+    )
+
+    # cwd is READ-ONLY — the seatbelt default, and the condition that
+    # makes this a real reproduction: with no writable cwd, Python's
+    # tempfile fallback chain ($TMPDIR -> /tmp -> ... -> os.getcwd())
+    # has NO writable entry, so a private-tmpdir mkdtemp that targets an
+    # un-granted $TMPDIR fails outright. (If cwd were writable, mkdtemp
+    # would silently fall back to it and mask the bug.) ``.venv`` allowed
+    # so the dotfile mask doesn't fight the interpreter symlink
+    # convention. The project root is a read root so the inline re-exec
+    # can import ``omnigent.inner`` — in production that import is
+    # covered by the interpreter install-root grant or by cwd; here cwd
+    # is pytest's tmp_path, so grant it explicitly.
+    policy = _make_policy(
+        cwd.resolve(strict=False),
+        allow_hidden=[".venv"],
+        read_roots=[_project_root()],
+    )
+
+    # The launcher script re-execs run_launcher under sandbox-exec. Its
+    # shebang is ``sys.executable``; run it as a plain argv so the
+    # two-pass flow (host -> execvp sandbox-exec -> in-wrap) happens for
+    # real. ``target`` is the interpreter here, exec'd inside the jail.
+    launcher = create_exec_launcher(str(Path(sys.executable).resolve(strict=True)), policy)
+    try:
+        env = dict(os.environ)
+        # Reproduce the macOS failure condition explicitly: $TMPDIR is
+        # the system tempdir ROOT, which the profile only grants a
+        # subpath of. Pre-fix this is exactly what broke the in-wrap
+        # mkdtemp.
+        env["TMPDIR"] = tempfile.gettempdir()
+        result = subprocess.run(
+            [launcher, str(target)],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+    finally:
+        os.unlink(launcher)
+
+    assert "No usable temporary directory" not in result.stderr, (
+        "In-wrap mkdtemp could not find a writable $TMPDIR — the private "
+        "scratch tmpdir was not granted in the baked seatbelt profile. "
+        f"rc={result.returncode}\nstdout={result.stdout!r}\n"
+        f"stderr={result.stderr!r}"
+    )
+    assert result.returncode == 0, (
+        f"Wrapped launcher exited {result.returncode}.\n"
+        f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    )
+    assert "TMPOK" in result.stdout, (
+        "Target ran but didn't reach the scratch-write marker; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )

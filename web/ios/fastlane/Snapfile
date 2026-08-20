@@ -1,0 +1,24 @@
+project("Omnigent.xcodeproj")
+scheme("Omnigent")
+test_target_name("Omnigent")
+only_testing(["OmnigentUITests/OmnigentUITests/testLocalServerSnapshot"])
+configuration("Debug")
+
+devices([
+  "iPhone 17 Pro Max"
+])
+
+languages([
+  "en-US"
+])
+
+output_directory("fastlane/screenshots")
+clear_previous_screenshots(true)
+reinstall_app(true)
+override_status_bar(true)
+skip_open_summary(true)
+concurrent_simulators(false)
+result_bundle(true)
+number_of_retries(0)
+stop_after_first_error(true)
+xcodebuild_formatter("")

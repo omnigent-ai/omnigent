@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins._arguments import parse_json_object_arguments
 
 
 class LoadSkillTool(Tool):
@@ -123,10 +123,16 @@ class LoadSkillTool(Tool):
         :returns: The skill content string, or an error
             message if the skill is not found.
         """
-        args: dict[str, str] = json.loads(arguments)
+        args, error = parse_json_object_arguments(arguments)
+        if error is not None:
+            return f"Error: {error}"
+        assert args is not None
+
         skill_name = args.get("name")
-        if skill_name is None:
+        if skill_name is None or skill_name == "":
             return "Error: missing required 'name' argument"
+        if not isinstance(skill_name, str):
+            return "Error: 'name' must be a string"
         skill = self._skills_by_name.get(skill_name)
         if skill is None:
             available = list(self._skills_by_name.keys())

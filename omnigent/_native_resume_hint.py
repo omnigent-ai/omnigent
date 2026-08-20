@@ -55,3 +55,41 @@ def echo_native_resume_hint(
         server=server,
     )
     click.echo(f"Resume with: {command}", err=True)
+
+
+def echo_native_cold_resume_hint(
+    *,
+    agent_label: str = "Cursor",
+    restored: bool = False,
+) -> None:
+    """
+    Tell the user a cold resume is relaunching the agent's TUI.
+
+    Fires only when the session terminal has exited and we are
+    cold-starting a new TUI (the reattach-to-a-live-terminal path is
+    unaffected). Two outcomes, selected by *restored*:
+
+    - ``restored=False`` (default): the wrapper cannot reattach to the
+      prior chat, so ``--resume`` relaunches a *fresh* agent with none of
+      the prior turns. Used by wrappers that record no resumable chat id.
+    - ``restored=True``: the wrapper captured a resumable chat id and is
+      reloading the prior conversation into the new TUI (e.g. Cursor,
+      which reuses its chat store across ``cursor-agent --resume``).
+
+    :param agent_label: Human-readable agent name for the message,
+        e.g. ``"Cursor"``.
+    :param restored: Whether the prior conversation is being reloaded.
+    :returns: None.
+    """
+    if restored:
+        click.echo(
+            f"Terminal not running - relaunching {agent_label} and "
+            "resuming the prior conversation.",
+            err=True,
+        )
+        return
+    click.echo(
+        f"Terminal not running - starting a fresh {agent_label} session "
+        "(prior chat not restored).",
+        err=True,
+    )

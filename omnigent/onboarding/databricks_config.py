@@ -6,10 +6,39 @@ import configparser
 import importlib.util
 import logging
 from pathlib import Path
+from urllib.parse import urlparse
 
 _logger = logging.getLogger(__name__)
 
 _DATABRICKSCFG_PATH = Path.home() / ".databrickscfg"
+
+
+def normalize_workspace_url(raw: str) -> str:
+    """Reduce a Databricks workspace URL to its bare ``scheme://host`` origin.
+
+    Users routinely paste the URL straight from a browser address bar, which
+    carries a path and query the workspace host does not — e.g.
+    ``https://my-ws.cloud.databricks.com/browse?o=1234567890``. Both the
+    ``~/.databrickscfg`` profile host and ``ucode configure --workspaces``
+    need the bare origin: the Databricks CLI keys its OAuth token cache by
+    host, so a path-laden value resolves to "no access token" and
+    ``ucode configure`` then exits non-zero.
+
+    :param raw: A workspace URL, possibly carrying a path/query/fragment
+        and/or a trailing slash, e.g.
+        ``"https://my-ws.cloud.databricks.com/browse?o=1"``.
+    :returns: ``scheme://host`` with no path, query, fragment, or trailing
+        slash (e.g. ``"https://my-ws.cloud.databricks.com"``). When *raw* has
+        no parseable scheme+host (e.g. a bare ``"host/path"`` with no scheme),
+        the input is returned trimmed of surrounding whitespace and a trailing
+        slash — matching the prior ``rstrip("/")`` behavior so callers that
+        pre-add a scheme never regress.
+    """
+    parsed = urlparse(raw.strip())
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return raw.strip().rstrip("/")
+
 
 # The install command surfaced wherever a Databricks flow is gated on the
 # `databricks` extra (the add-provider menu, `setup --internal-beta`).
@@ -47,13 +76,6 @@ def databricks_sdk_installed() -> bool:
         # namespace package first; when even that is absent it raises
         # instead of returning None.
         return False
-
-
-# Fallback Claude model for the Databricks AI gateway when neither the spec
-# nor the workspace's ucode state names one. Must be a ``databricks-*``
-# endpoint name — the gateway rejects Anthropic-direct ids like the CLI's
-# own ``opus[1m]`` default.
-DATABRICKS_CLAUDE_DEFAULT_MODEL = "databricks-claude-opus-4-8"
 
 
 def list_databricks_profiles() -> list[str]:
@@ -112,13 +134,15 @@ def get_workspace_url_for_profile(profile: str) -> str | None:
                 return host.rstrip("/")
 
     try:
-        from omnigent.onboarding.internal_beta import DEFAULT_PROFILES
+        import omnigent.onboarding.internal_beta as internal_beta  # type: ignore[import-not-found]
     except ModuleNotFoundError:
         # The internal-beta catalog is intentionally absent from the OSS
         # build; without it there are no bundled-profile fallbacks.
         return None
 
-    for spec in DEFAULT_PROFILES:
+    for spec in internal_beta.DEFAULT_PROFILES:
         if spec.name == profile:
-            return spec.host.rstrip("/")
+            host = spec.host
+            if isinstance(host, str):
+                return host.rstrip("/")
     return None

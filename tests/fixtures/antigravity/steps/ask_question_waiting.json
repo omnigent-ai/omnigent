@@ -1,0 +1,107 @@
+{
+  "type": "CORTEX_STEP_TYPE_ASK_QUESTION",
+  "status": "CORTEX_STEP_STATUS_WAITING",
+  "metadata": {
+    "stepGenerationVersion": 1,
+    "createdAt": "2026-06-23T00:01:20.724438Z",
+    "viewableAt": "2026-06-23T00:01:20.887335Z",
+    "finishedGeneratingAt": "2026-06-23T00:01:20.887335Z",
+    "lastCompletedChunkAt": "2026-06-23T00:01:20.887323Z",
+    "startedAt": "2026-06-23T00:01:20.887931Z",
+    "source": "CORTEX_STEP_SOURCE_MODEL",
+    "toolCall": {
+      "id": "jfizoalt",
+      "name": "ask_question",
+      "argumentsJson": "{\"questions\":[{\"is_multi_select\":false,\"options\":[\"(Recommended) Create a new modern web application using HTML, CSS, and JavaScript.\",\"Build a command-line interface (CLI) tool or helper script.\",\"Set up automated testing for existing scratch scripts.\",\"Analyze and refactor the files in the current scratch directory.\"],\"question\":\"What type of project or improvement would you like to focus on?\"}],\"toolAction\":\"Asking the user to select a project focus\",\"toolSummary\":\"Project focus selection\"}",
+      "thinkingSignature": "Eq4ICqsIAQw51seT9UyndccEk6tJXRlq2a1giGxI5xIBip7BZKmAlYUjQpHzCIvDufv4c2Z4kWxnYeeAML7X3JHUJvnePFpu9x6grHDGJlddoO+oSlWtqt8t9LWPeQ5tC3ak0LxvGXk54o5iuj+ikd7aTOgtw5hInFSzA9JDpQdq6hhgA35jPgflQvuAuJyqVVfVYLvEpW3oC7i8N8aMSelJkWQGsaDGXZ7Rkppz8cAcqbXAkiFU+d5lkB/ZAet7Ve+A6YOjHo1CiSj4WsKniGZk/fqB74KudvbqDHF1Uaq1xElJYFtxZ047tVR3WyX9ZvltUZEZf3bufFNUdzZawKN4to4wwhAFkBq/80EPxB4aDfTPq2csEW4lcW4lo39iIdmRzrwpg0BJNysVWl1HK67O3yHrOfUgFrrU0O8VadgzILtIJO9biUDKGresANvm+NHP03MzyTr6maHIY3umEd5J/Xx0bTs4/7Me88mHkjd3YTxZN07rWiqa8y3WqR9qxtFkiuBYLxC4Jh5b0PZV8DZ2R14RfKgz/Eblp/DZA6G3tTEZe+iEOL3ddcjJ+DwMIZncJ9jFP3Z32W54Fat0DfBmeVJ216W8R28VFt/TPKFerOmevoifCNFE/srXNC9VKd1KFuyud9AV1wszxhGWVXRCZyqy1MOizPdsO/D+ooIcyzyFMOB8f0VYSxtnOYCC+vOPNR8Z+bA9CtQCNP/u9xha4iVvz5IkrfCLTVkmES0ToPBmD8WtHnfj9SDZceWNVdaU1B9HVvkUXWZBxnNB49RPLIjkVj7IWow8dWFiWc37sDvu970qDmf1924cNAi5+Tx3qm4Sq/OWkBTWTubeg8tdwh+FLeGy6j6NbB853Okf6usyR9YWPMDiD43tEnzQ1hs6oMCEmXb6LNfrLfs9xJ63qqPORBEartPydkbG1KZgYKX3KzzxmDvrmiVd9zvidwReHVTcDKwLepajAkXZHvh8ayVZkDkJC9NS2Sin0lCt2A5fqbHG9K7WnvPBUGbc+dluHHLTiKpzYKyBehyaD4+bfl8li8jqdrcoAvvmGK1vFj8u8/l4UjboeS5dMLr7UQD6Q6pq279h0swjIvE5RJYeYV2IAHYClyGSHCtFNJTEQSkUgUgEbuGlm17xA9OUAIeh398O73fpM+ajAJmk633yG7ffl7Wi1H7wspSXQDfvbwvmbAtyap99uQAG+o1cIn/5F09SCaBl02nv79cY4MG3PnQ6vwr93BLQPHJuZMvWRfXL5Za6pIr5tVU9NvHZNf7hy+3fuMXmUmIXIJsyU3qvoG/ZFri1lxhMYI7glvOIudiXzfSl5oatIoaZvn9CNLlkv8nijrqWMPyR1mqrQFsfR4E6Clozq4tRlDM93unNAO4wS8EEgNWYEazJgceCcjP5aGzj19FtOZA7lwnOhV4=",
+      "originalName": "ask_question"
+    },
+    "argumentsOrder": [
+      "questions",
+      "toolAction",
+      "toolSummary"
+    ],
+    "generatorModel": "MODEL_PLACEHOLDER_M20",
+    "requestedModel": {
+      "model": "MODEL_PLACEHOLDER_M20"
+    },
+    "executionId": "6351e014-60a2-4c2e-a08d-c2d285ad2577",
+    "toolCallOutputTokens": 124,
+    "sourceTrajectoryStepInfo": {
+      "trajectoryId": "efb134b2-d69f-43de-bb54-c9ece346d8a3",
+      "stepIndex": 12,
+      "metadataIndex": 4,
+      "cascadeId": "2399249c-4a48-40f1-bf3b-4c6e5d3a5a0e"
+    },
+    "internalMetadata": {
+      "statusTransitions": [
+        {
+          "updatedStatus": "CORTEX_STEP_STATUS_PENDING",
+          "timestamp": "2026-06-23T00:01:20.887432Z"
+        },
+        {
+          "updatedStatus": "CORTEX_STEP_STATUS_RUNNING",
+          "timestamp": "2026-06-23T00:01:20.888081Z"
+        },
+        {
+          "updatedStatus": "CORTEX_STEP_STATUS_WAITING",
+          "timestamp": "2026-06-23T00:01:20.888207Z"
+        }
+      ]
+    },
+    "toolSummary": "Project focus selection",
+    "toolAction": "Asking the user to select a project focus"
+  },
+  "askQuestion": {
+    "questions": [
+      {
+        "question": "What type of project or improvement would you like to focus on?",
+        "options": [
+          {
+            "id": "1",
+            "text": "(Recommended) Create a new modern web application using HTML, CSS, and JavaScript."
+          },
+          {
+            "id": "2",
+            "text": "Build a command-line interface (CLI) tool or helper script."
+          },
+          {
+            "id": "3",
+            "text": "Set up automated testing for existing scratch scripts."
+          },
+          {
+            "id": "4",
+            "text": "Analyze and refactor the files in the current scratch directory."
+          }
+        ]
+      }
+    ]
+  },
+  "requestedInteraction": {
+    "askQuestion": {
+      "questions": [
+        {
+          "question": "What type of project or improvement would you like to focus on?",
+          "options": [
+            {
+              "id": "1",
+              "text": "(Recommended) Create a new modern web application using HTML, CSS, and JavaScript."
+            },
+            {
+              "id": "2",
+              "text": "Build a command-line interface (CLI) tool or helper script."
+            },
+            {
+              "id": "3",
+              "text": "Set up automated testing for existing scratch scripts."
+            },
+            {
+              "id": "4",
+              "text": "Analyze and refactor the files in the current scratch directory."
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -7,7 +7,10 @@ from typing import Any, Literal, overload
 
 import httpx
 
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+
 from ._files import FilesNamespace
+from ._http import is_loopback_url
 from ._query import QueryResult, QueryStream
 from ._responses import ResponsesNamespace
 from ._session import Session
@@ -49,7 +52,9 @@ class OmnigentClient:
         authentication. When set, the auth handler runs on every
         request, allowing transparent token refresh for OAuth
         flows. ``None`` (default) relies on static ``headers``.
-    :param timeout: Default timeout for HTTP requests in seconds.
+    :param timeout: Default timeout for non-streaming HTTP requests in
+        seconds. SSE streams use a 600-second read timeout so server-side
+        tool execution can pause the stream for several minutes.
     """
 
     def __init__(
@@ -58,27 +63,26 @@ class OmnigentClient:
         *,
         headers: dict[str, str] | None = None,
         auth: httpx.Auth | None = None,
-        # Public SDK API surface. Removing would be a breaking
-        # change for downstream consumers; leaving it
-        # accepted-but-ignored preserves compatibility while the
-        # SSE client internally uses a fixed 600s read timeout
-        # (tool calls can legitimately hold the stream open for
-        # minutes).
         timeout: float = 30.0,
     ) -> None:
         self._base_url = base_url.rstrip("/")
-        # Long read timeout for SSE streams (tool execution can
-        # pause the stream for minutes).
-        sse_timeout = httpx.Timeout(
-            connect=30.0,
-            read=600.0,
-            write=30.0,
-            pool=30.0,
-        )
+        # Announce this as a first-party non-browser client via the sentinel
+        # Origin. The server's require_trusted_origin CSRF guard on the
+        # multipart routes (POST /v1/sessions bundle create, file upload)
+        # requires a trusted Origin; the SDK sends none of its own, so the
+        # sentinel is what lets it through. Caller-supplied headers win on
+        # conflict (so an explicit Origin override is still honored).
+        default_headers = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+        if headers:
+            default_headers.update(headers)
         self._http = httpx.AsyncClient(
-            headers=headers or {},
+            headers=default_headers,
             auth=auth,
-            timeout=sse_timeout,
+            timeout=httpx.Timeout(timeout),
+            # A proxy cannot reach our loopback server, so bypass the
+            # environment for local targets. Loopback is plain HTTP with
+            # explicit headers, so losing netrc/CA env with it costs nothing.
+            trust_env=not is_loopback_url(self._base_url),
         )
 
         self.sessions = SessionsNamespace(self._http, self._base_url)

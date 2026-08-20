@@ -11,17 +11,29 @@ from __future__ import annotations
 import os
 import re
 import sys
+from pathlib import Path
+
+# Share the Markdown-section + changelog parsing with the release-time harvester
+# (.github/scripts/changelog/generate.py) so the gate and the harvester can
+# never disagree on what the "## Changelog" section means.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _md import changelog_description
+from _md import checked_labels as _checked_labels
+from _md import heading_spans as _heading_spans
+from _md import section as _section
+from _md import strip_html_comments as _strip_html_comments
 
 REQUIRED_HEADINGS = (
     "Summary",
+    "Test Plan",
     "Type of change",
     "Test coverage",
-    "Coverage rationale",
 )
 
 TYPE_LABELS = (
     "Bug fix",
     "Feature",
+    "UI / frontend change",
     "Refactor / chore",
     "Docs",
     "Test / CI",
@@ -40,10 +52,8 @@ TEST_LABELS = (
 PLACEHOLDER_FRAGMENTS = (
     "what changed and why",
     "check all that apply",
-    "describe the exact commands",
     "describe below",
-    "explain why",
-    "if you did not add or run tests",
+    "how was this change tested",
 )
 
 
@@ -53,41 +63,7 @@ class ValidationResult:
         self.errors = errors
 
 
-_HEADING_RE = re.compile(r"(?im)^\s*##\s+(.+?)\s*$")
 _CHECKBOX_RE = re.compile(r"(?im)^\s*-\s*\[(?P<mark>[ xX])\]\s*(?P<label>.+?)\s*$")
-
-
-def _strip_html_comments(text: str) -> str:
-    return re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
-
-
-def _heading_spans(body: str) -> dict[str, tuple[int, int]]:
-    matches = list(_HEADING_RE.finditer(body))
-    spans: dict[str, tuple[int, int]] = {}
-    for idx, match in enumerate(matches):
-        title = match.group(1).strip().lower()
-        start = match.end()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(body)
-        spans[title] = (start, end)
-    return spans
-
-
-def _section(body: str, spans: dict[str, tuple[int, int]], heading: str) -> str:
-    span = spans.get(heading.lower())
-    if span is None:
-        return ""
-    return body[span[0] : span[1]]
-
-
-def _checked_labels(section: str, expected_labels: tuple[str, ...]) -> set[str]:
-    expected_by_lower = {label.lower(): label for label in expected_labels}
-    checked: set[str] = set()
-    for match in _CHECKBOX_RE.finditer(section):
-        label = match.group("label").strip()
-        canonical = expected_by_lower.get(label.lower())
-        if canonical and match.group("mark").lower() == "x":
-            checked.add(canonical)
-    return checked
 
 
 def _missing_labels(section: str, expected_labels: tuple[str, ...]) -> list[str]:
@@ -107,6 +83,7 @@ def _contains_placeholder(text: str) -> bool:
 
 
 def validate_pr_body(body: str) -> ValidationResult:
+    body = body.lstrip("\ufeff")
     errors: list[str] = []
 
     spans = _heading_spans(body)
@@ -120,6 +97,12 @@ def validate_pr_body(body: str) -> ValidationResult:
     elif _contains_placeholder(summary):
         errors.append("Summary still contains template placeholder text.")
 
+    test_plan = _meaningful_text(_section(body, spans, "Test Plan"))
+    if not test_plan:
+        errors.append("Test Plan must describe how the change was tested.")
+    elif _contains_placeholder(test_plan):
+        errors.append("Test Plan still contains template placeholder text.")
+
     type_section = _section(body, spans, "Type of change")
     missing_type_labels = _missing_labels(type_section, TYPE_LABELS)
     if missing_type_labels:
@@ -129,6 +112,19 @@ def validate_pr_body(body: str) -> ValidationResult:
     checked_types = _checked_labels(type_section, TYPE_LABELS)
     if not checked_types:
         errors.append("Check at least one Type of change checkbox.")
+
+    # The Demo section is mandatory for UI / frontend changes — reviewers need
+    # a screenshot or recording of the new behaviour. It stays optional for
+    # everything else.
+    if "UI / frontend change" in checked_types:
+        demo = _meaningful_text(_section(body, spans, "Demo"))
+        if not demo:
+            errors.append(
+                "Demo is required for UI / frontend changes — attach a screenshot "
+                "or screen recording demonstrating the new behaviour."
+            )
+        elif _contains_placeholder(demo):
+            errors.append("Demo still contains template placeholder text.")
 
     test_section = _section(body, spans, "Test coverage")
     missing_test_labels = _missing_labels(test_section, TEST_LABELS)
@@ -140,31 +136,31 @@ def validate_pr_body(body: str) -> ValidationResult:
     if not checked_tests:
         errors.append("Check at least one Test coverage checkbox.")
 
-    rationale = _meaningful_text(_section(body, spans, "Coverage rationale"))
-    if not rationale:
-        errors.append(
-            "Coverage rationale must explain tests run/added, or why more coverage is not needed."
-        )
-    elif _contains_placeholder(rationale):
-        errors.append("Coverage rationale still contains template placeholder text.")
-
-    automated_tests = {
-        "Unit tests added / updated",
-        "Integration tests added / updated",
-        "E2E tests added / updated",
-        "Existing tests cover this change",
-    }
-    if checked_tests and checked_tests.isdisjoint(automated_tests):
-        if len(rationale.split()) < 8:
+    # Coverage notes are optional in general, but required whenever "Manual
+    # verification completed" or "Not applicable" is checked — those choices
+    # need a written justification.
+    if checked_tests & {"Manual verification completed", "Not applicable"}:
+        coverage_notes = _meaningful_text(_section(body, spans, "Coverage notes"))
+        if not coverage_notes:
             errors.append(
-                "When no automated test coverage checkbox is selected, "
-                "the rationale must explain why."
+                "Coverage notes are required when 'Manual verification completed' or "
+                "'Not applicable' is selected — describe what you verified or why "
+                "automated coverage is not needed."
             )
+        elif _contains_placeholder(coverage_notes):
+            errors.append("Coverage notes still contains template placeholder text.")
 
-    if "Not applicable" in checked_tests and rationale and len(rationale.split()) < 8:
-        errors.append(
-            "Not applicable test coverage requires a concrete explanation in Coverage rationale."
-        )
+    # The Changelog section is optional — an author deletes it (or leaves the
+    # `<…>` placeholder) when the change isn't noteworthy, and the PR is simply
+    # omitted from the changelog. The one exception: a Breaking change is always
+    # noteworthy, so it must carry a real description line.
+    if "Breaking change" in checked_types:
+        changelog_section = _section(body, spans, "Changelog") if "changelog" in spans else ""
+        if not changelog_description(changelog_section):
+            errors.append(
+                "A Breaking change must describe the change in the Changelog section "
+                "(otherwise it would be omitted from the changelog)."
+            )
 
     return ValidationResult(ok=not errors, errors=errors)
 

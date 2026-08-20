@@ -31,27 +31,49 @@ Environment (Databricks):
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hmac
 import json
 import logging
 import os
 import pathlib
+import re
 import secrets
 import shutil
 import subprocess
 import tempfile
 from asyncio import Queue, Task
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
-from typing import Any, TypeAlias
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from typing import Any, NotRequired, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
+from omnigent import model_catalog
+from omnigent.inner.agent_env import clean_agent_env
+from omnigent.inner.native_attachments import parse_data_uri
+from omnigent.json_types import JsonObject as _JsonObject
+from omnigent.json_types import JsonValue
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
+from omnigent.model_metadata import ModelWireAPI
+from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
+from omnigent.pi_model_compatibility import (
+    SYSTEM_AI_RESPONSES_KEYWORDS,
+    databricks_model_aliases,
+    enrich_databricks_model_catalog,
+    pi_model_is_reasoning,
+    pi_model_json_entry,
+    unsupported_in_pi,
+)
+from omnigent.pi_native_credentials import (
+    _databricks_workspace_url_for_gateway,
+    _is_databricks_ai_gateway_url,
+)
+from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_subprocess_transport
+from .async_utils import run_sync_on_thread
 from .databricks_executor import _read_databrickscfg
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
@@ -115,13 +137,67 @@ NativePolicyGate: TypeAlias = Callable[  # type: ignore[explicit-any]
     Awaitable[dict[str, Any]] | dict[str, Any],
 ]
 
-# Plain JSON value — recursive union used by ``_check_blocked`` to walk
-# parsed Pi tool-result payloads.
-JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
+
+class _PiProviderConfig(TypedDict):
+    baseUrl: str
+    apiKey: str
+    api: str
+    models: list[_JsonObject]
+    authHeader: NotRequired[bool]
+    compat: NotRequired[_JsonObject]
+
+
+class _PiModelsConfig(TypedDict):
+    providers: dict[str, _PiProviderConfig]
+
+
+class _PiMessageUsage(TypedDict):
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cache_read_input_tokens: int
+    cache_creation_input_tokens: int
+    model: str | None
+
+
+class _PiTurnUsage(_PiMessageUsage):
+    context_tokens: int
+
 
 # ---------------------------------------------------------------------------
 # TCP tool server — serves Omnigent tools to the Pi extension
 # ---------------------------------------------------------------------------
+
+
+def _safe_dumps(response: dict[str, Any], req_id: str | None) -> str:  # type: ignore[explicit-any]
+    """Serialize a tool-server response, never raising on bad payloads.
+
+    Tool callbacks may return values ``json.dumps`` can't encode (a
+    ``datetime``, ``set``, ``bytes``, custom object, ...). Encoding happens
+    on the response path *outside* :meth:`_ToolServer._execute`'s try, so an
+    unguarded ``json.dumps`` would propagate and the connection would close
+    with zero bytes written — leaving the JS ``callTool`` promise pending and
+    hanging the entire Pi turn. Mirrors codex's ``_result_text`` guard: on a
+    serialization failure, fall back to an ``{"error": ...}`` envelope so the
+    client always receives a valid frame.
+
+    :param response: The response dict to serialize.
+    :param req_id: The originating request id, echoed back on the error
+        envelope so the client correlates the failure with its call.
+    :returns: A compact JSON string (no trailing newline).
+    """
+    try:
+        return json.dumps(response, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        # Stringify ``req_id`` so the fallback envelope itself can never raise
+        # on a non-serializable id (the caller passes a ``str`` today, but the
+        # guard must hold for any future caller). ``None`` stays ``None`` so the
+        # client still sees a null id rather than the literal "None".
+        safe_id: str | None = req_id if req_id is None or isinstance(req_id, str) else str(req_id)
+        return json.dumps(
+            {"id": safe_id, "error": f"unserializable tool result: {exc}"},
+            separators=(",", ":"),
+        )
 
 
 class _ToolServer:
@@ -213,7 +289,14 @@ class _ToolServer:
                 else:
                     response = await self._execute(raw_tool_name, tool_args)
                     response["id"] = raw_req_id
-                out = json.dumps(response, separators=(",", ":")) + "\n"
+                # Serialize defensively: a tool result may carry a value
+                # ``json.dumps`` can't encode (e.g. ``datetime``/``set``).
+                # If it raises here — outside ``_execute``'s try — the frame
+                # is never written and the JS ``callTool`` promise hangs the
+                # whole turn (no ``data``/``error`` event). Always emit a JSON
+                # frame: a serializable error envelope when the response can't
+                # be encoded, mirroring codex's ``_result_text`` guard.
+                out = _safe_dumps(response, raw_req_id) + "\n"
                 writer.write(out.encode("utf-8"))
                 await writer.drain()
         except (asyncio.CancelledError, ConnectionError):
@@ -371,7 +454,17 @@ const TOKEN = {token_json};
 
 /** Send a tool call request over TCP and return the result. */
 function callTool(toolName, args) {{
-  return new Promise((resolve, reject) => {{
+  return new Promise((resolve) => {{
+    // Idempotent settle: a tool call must resolve exactly once. Route every
+    // resolve through finish() so a late "close" after a real "data" response
+    // can't clobber the result, and a bare close with no data still resolves
+    // (rather than hanging Pi's agent loop forever).
+    let settled = false;
+    const finish = (v) => {{ if (!settled) {{ settled = true; resolve(v); }} }};
+    const errorResult = (text) => ({{
+      content: [{{ type: "text", text: JSON.stringify({{ error: text }}) }}],
+      isError: true
+    }});
     const client = net.createConnection({{ port: PORT, host: "127.0.0.1" }}, () => {{
       const id = Math.random().toString(36).slice(2);
       const req = JSON.stringify({{ id, token: TOKEN, tool: toolName, args }}) + "\\n";
@@ -384,39 +477,33 @@ function callTool(toolName, args) {{
             const resp = JSON.parse(buf.slice(0, nl));
             client.end();
             if (resp.error) {{
-              resolve({{
-                content: [{{ type: "text", text: JSON.stringify({{ error: resp.error }}) }}],
-                isError: true
-              }});
+              finish(errorResult(resp.error));
             }} else {{
               const text = typeof resp.result === "string"
                 ? resp.result
                 : JSON.stringify(resp.result);
               const isError = resp.result && (resp.result.error || resp.result.blocked);
-              resolve({{ content: [{{ type: "text", text }}], isError: !!isError }});
+              finish({{ content: [{{ type: "text", text }}], isError: !!isError }});
             }}
           }} catch (e) {{
             client.end();
-            resolve({{
-              content: [{{ type: "text", text: JSON.stringify({{ error: e.message }}) }}],
-              isError: true
-            }});
+            finish(errorResult(e.message));
           }}
         }}
       }});
       client.on("error", (err) => {{
-        resolve({{
-          content: [{{ type: "text", text: JSON.stringify({{ error: err.message }}) }}],
-          isError: true
-        }});
+        finish(errorResult(err.message));
+      }});
+      // A clean FIN with no bytes (e.g. the server failed to serialize the
+      // result and closed) emits neither "data" nor "error"; without this
+      // the promise would hang forever. finish() is a no-op if already settled.
+      client.on("close", () => {{
+        finish(errorResult("tool server closed connection without a response"));
       }});
       client.write(req);
     }});
     client.on("error", (err) => {{
-      resolve({{
-        content: [{{ type: "text", text: JSON.stringify({{ error: err.message }}) }}],
-        isError: true
-      }});
+      finish(errorResult(err.message));
     }});
   }});
 }}
@@ -502,49 +589,8 @@ def _find_pi_cli() -> str | None:
 # Databricks models.json generation
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Databricks model definitions for Pi's models.json
-# ---------------------------------------------------------------------------
-# Databricks exposes API styles at different URL paths. ucode state can
-# override these provider URLs; the host-derived defaults remain for legacy
-# profile-only usage.
-
-_DATABRICKS_RESPONSES_MODELS = [
-    {
-        "id": "databricks-gpt-5-4-mini",
-        "name": "GPT-5.4 Mini",
-        "contextWindow": 1047576,
-        "maxTokens": 32768,
-    },
-    {"id": "databricks-gpt-5-4", "name": "GPT-5.4", "contextWindow": 1047576, "maxTokens": 32768},
-]
-
-_DATABRICKS_ANTHROPIC_MODELS = [
-    {
-        "id": "databricks-claude-opus-4-8",
-        "name": "Claude Opus 4.8",
-        # Gateway-verified caps: >1000000 input rejects, 128001+ output rejects.
-        "contextWindow": 1000000,
-        "maxTokens": 128000,
-    },
-    {
-        "id": "databricks-claude-sonnet-4-6",
-        "name": "Claude Sonnet 4.6",
-        "contextWindow": 1000000,
-        "maxTokens": 128000,
-    },
-    {
-        "id": "databricks-claude-sonnet-4-5",
-        "name": "Claude Sonnet 4.5",
-        # Gateway rejects this model past ~200k input.
-        "contextWindow": 200000,
-        "maxTokens": 16384,
-    },
-]
-
-# Empty: the only listed endpoint (meta-llama-3.3-70b) no longer exists on
-# the gateway. The provider stays so non-Claude/GPT ids keep a routing home.
-_DATABRICKS_COMPLETIONS_MODELS: list[dict[str, str | int]] = []
+# Databricks exposes API styles at different URL paths. Live Unity Catalog
+# model services populate each provider; MLflow metadata adds token limits.
 
 # Prefix-matched env var names allowed into the Pi subprocess. Only
 # known-safe categories pass: Pi's own config knobs, proxy settings,
@@ -578,9 +624,51 @@ _PI_ENV_ALLOW_EXACT: frozenset[str] = frozenset(
         "LOGNAME",
         "SHELL",
         "TZ",
+        OMNIGENT_SESSION_ENV_VAR,  # "inside Omnigent" marker (CLAUDE_CODE/CODEX analog)
     }
 )
 _STREAM_READ_CHUNK_SIZE = 65536
+
+# CLI flags whose values are sensitive (e.g. the full system prompt) and must
+# not be written to logs verbatim. The value following these flags is replaced
+# with a length-only placeholder.
+_REDACTED_ARGV_FLAGS = frozenset({"--append-system-prompt", "--system-prompt"})
+
+
+def _redact_argv_for_log(args: Sequence[str]) -> list[str]:
+    """
+    Return a copy of ``args`` with sensitive flag values redacted for logging.
+
+    The system prompt value (e.g. passed via ``--append-system-prompt``) is
+    replaced with a ``[system prompt N chars]`` placeholder so it never leaks
+    into debug logs. Two argv forms are handled:
+
+    * the two-token form ``--append-system-prompt <value>`` (what the current
+      spawn code emits), and
+    * the equals-joined form ``--append-system-prompt=<value>`` (not emitted
+      today, but redacted defensively in case a future refactor switches to it).
+
+    All other tokens are preserved so the command remains useful for debugging.
+    """
+    redacted: list[str] = []
+    redact_next = False
+    for arg in args:
+        if redact_next:
+            redacted.append(f"[system prompt {len(arg)} chars]")
+            redact_next = False
+            continue
+        if arg in _REDACTED_ARGV_FLAGS:
+            # Two-token form: redact the following value token.
+            redacted.append(arg)
+            redact_next = True
+            continue
+        flag, sep, value = arg.partition("=")
+        if sep and flag in _REDACTED_ARGV_FLAGS:
+            # Equals-joined form: redact the inline value, keep the flag name.
+            redacted.append(f"{flag}=[system prompt {len(value)} chars]")
+            continue
+        redacted.append(arg)
+    return redacted
 
 
 def _build_models_json(
@@ -588,20 +676,18 @@ def _build_models_json(
     token: str,
     base_urls: dict[str, str] | None = None,
     model: str | None = None,
-) -> dict[str, Any]:  # type: ignore[explicit-any]
+    catalog_models: Sequence[model_catalog.ModelEntry] = (),
+    model_wire_apis: Mapping[str, frozenset[ModelWireAPI]] | None = None,
+    openai_wire_api: str | None = None,
+) -> _PiModelsConfig:
     # Pi's models.json mixes str/int/bool/list/dict across provider configs;
-    # see _DATABRICKS_*_MODELS and the compat/authHeader shapes below. The
-    # schema is owned by the Pi CLI and not worth a TypedDict tree here.
-    """Build a Pi ``models.json`` with three gateway providers.
+    """Build a Pi ``models.json`` with protocol-specific gateway providers.
 
     Each provider targets a different API gateway path and wire format so
-    the correct protocol is used for each model family. The static model
-    lists cover the known Databricks-gateway ids; *model* additionally
-    registers the resolved run model so a gateway model outside those
-    lists (an OpenRouter/LiteLLM id like ``moonshotai/kimi-k2.6``, or a
-    Databricks id newer than the static list) resolves instead of Pi
-    failing with "Model not found" — Pi only accepts ``provider/<model>``
-    selectors whose id is registered under that provider.
+    the correct protocol is used for each model family. Live catalog models
+    populate Pi's picker; *model* additionally registers the resolved run
+    model so an offline catalog or generic gateway still launches. Pi only
+    accepts ``provider/<model>`` selectors whose id is registered there.
 
     :param host: Databricks workspace URL used for legacy profile-only
         defaults.
@@ -613,31 +699,94 @@ def _build_models_json(
         ``"moonshotai/kimi-k2.6"``; registered (bare ``{"id": ...}``, the
         same shape ucode writes) under the provider
         :func:`_pi_provider_for_model` routes it to when absent from the
-        static list. ``None`` skips registration (Pi picks its default).
+        catalog. ``None`` skips registration (Pi picks its default).
+    :param catalog_models: Live Databricks model-service entries, optionally
+        enriched with MLflow limits. Empty leaves only *model* registered.
+    :param model_wire_apis: Databricks model ids mapped to catalog-reported
+        wire surfaces. Missing GPT metadata defaults to Responses.
+    :param openai_wire_api: Configured wire for a generic OpenAI-compatible
+        provider. ``None`` defaults generic providers to Chat Completions.
     :returns: Pi ``models.json`` contents.
     """
     h = host.rstrip("/")
-    openai_base_url = (base_urls or {}).get("openai") or f"{h}/serving-endpoints"
+    serving_endpoints_url = f"{h}/serving-endpoints"
+    codex_gateway_url = f"{h}/ai-gateway/codex/v1"
+    mlflow_gateway_url = f"{h}/ai-gateway/mlflow/v1"
+    raw_openai_base_url = (base_urls or {}).get("openai")
+    is_databricks_openai_gateway = bool(
+        raw_openai_base_url
+        and (
+            "/ai-gateway/" in raw_openai_base_url
+            or _is_databricks_ai_gateway_url(raw_openai_base_url)
+        )
+    )
+    # Databricks Codex URLs only accept Responses; Chat uses the workspace.
+    if raw_openai_base_url and is_databricks_openai_gateway:
+        openai_base_url = serving_endpoints_url
+    else:
+        openai_base_url = raw_openai_base_url or serving_endpoints_url
+    # For non-Databricks providers (e.g. OpenAI API key, LiteLLM) the
+    # /ai-gateway/* paths don't exist — use the generic base URL for all paths.
+    is_generic_provider = bool(raw_openai_base_url and not is_databricks_openai_gateway)
+    generic_openai_wire_api = openai_wire_api or CHAT_WIRE_API if is_generic_provider else None
+    wire_catalog = model_wire_apis or {}
+    if is_databricks_openai_gateway:
+        assert raw_openai_base_url is not None
+        codex_gateway_url = raw_openai_base_url
+    elif is_generic_provider:
+        codex_gateway_url = openai_base_url
+        mlflow_gateway_url = openai_base_url
     claude_base_url = (base_urls or {}).get("claude") or f"{h}/serving-endpoints/anthropic"
-    config: dict[str, Any] = {  # type: ignore[explicit-any]  # Pi-owned schema, see note above
+    _openai_responses_compat: _JsonObject = {
+        "supportsDeveloperRole": False,
+        "supportsStore": False,
+        "supportsStrictMode": False,
+        "supportsReasoningEffort": False,
+    }
+    provider_models: dict[str, list[_JsonObject]] = {
+        "databricks-openai": [],
+        "databricks": [],
+        "databricks-anthropic": [],
+        "databricks-mlflow": [],
+        "databricks-completions": [],
+    }
+    for catalog_model in catalog_models:
+        model_id = catalog_model.id
+        if unsupported_in_pi(model_id.lower()):
+            continue
+        wire_apis = wire_catalog.get(model_id.lower(), catalog_model.metadata.wire_apis)
+        provider_name = _pi_provider_for_model(model_id, wire_apis)
+        registered_model = catalog_model
+        if model is not None and model.lower() in databricks_model_aliases(model_id):
+            registered_model = replace(catalog_model, id=model)
+        # ``JsonObject`` is the open bag this builder assembles; a TypedDict is
+        # not assignable to it (dict value types are invariant), so copy.
+        entry: _JsonObject = dict(pi_model_json_entry(registered_model))
+        provider_models[provider_name].append(entry)
+    config: _PiModelsConfig = {
         "providers": {
-            # GPT models → OpenAI Chat Completions API.
-            # We use completions (not responses) because the Databricks
-            # Responses API rejects tool-result chaining on subsequent turns.
-            # The ``compat`` settings ensure Pi uses ``system`` role (not
-            # ``developer``) and avoids other OpenAI-specific features that
-            # Databricks doesn't support.
+            # Models advertising Responses support use the AI Gateway's Codex
+            # surface, including tool-result chaining on subsequent turns.
+            "databricks-openai": {
+                "baseUrl": codex_gateway_url,
+                "apiKey": token,
+                "api": "openai-responses",
+                "authHeader": True,
+                "compat": _openai_responses_compat,
+                "models": provider_models["databricks-openai"],
+            },
+            # Older GPT models → OpenAI Chat Completions at serving-endpoints.
             "databricks": {
                 "baseUrl": openai_base_url,
                 "apiKey": token,
                 "api": "openai-completions",
-                "compat": {
-                    "supportsDeveloperRole": False,
-                    "supportsStore": False,
-                    "supportsStrictMode": False,
-                    "supportsReasoningEffort": False,
-                },
-                "models": _DATABRICKS_RESPONSES_MODELS,
+                # Generic (non-Databricks) OpenAI-compatible gateways expect
+                # ``Authorization: Bearer <token>``; the Databricks workspace
+                # endpoint uses a different auth scheme so authHeader is omitted
+                # on the native path.
+                **({"authHeader": True} if is_generic_provider else {}),
+                "compat": _openai_responses_compat,
+                "models": provider_models["databricks"],
             },
             # Claude models → Anthropic Messages API.
             # ``authHeader`` sends ``Authorization: Bearer <token>`` instead
@@ -647,41 +796,132 @@ def _build_models_json(
                 "apiKey": token,
                 "api": "anthropic-messages",
                 "authHeader": True,
-                "models": _DATABRICKS_ANTHROPIC_MODELS,
+                "models": provider_models["databricks-anthropic"],
+            },
+            # system.ai.* models not needing Responses API (Gemini, Llama) → mlflow gateway.
+            "databricks-mlflow": {
+                "baseUrl": mlflow_gateway_url,
+                "apiKey": token,
+                "api": "openai-completions",
+                "authHeader": True,
+                "compat": {
+                    "supportsDeveloperRole": False,
+                    "supportsStore": False,
+                    "supportsStrictMode": False,
+                    "supportsReasoningEffort": False,
+                    "supportsUsageInStreaming": False,
+                },
+                "models": provider_models["databricks-mlflow"],
             },
             # Everything else (Llama, etc.) → same endpoint, same API
             "databricks-completions": {
                 "baseUrl": openai_base_url,
                 "apiKey": token,
                 "api": "openai-completions",
+                # Same rationale as the "databricks" entry above.
+                **({"authHeader": True} if is_generic_provider else {}),
                 "compat": {
                     "supportsDeveloperRole": False,
                     "supportsStore": False,
                     "supportsStrictMode": False,
                     "supportsReasoningEffort": False,
+                    # Gemini/Qwen/Llama/inkling models reject stream_options
+                    # (which carries include_usage) with 400 "unknown field".
+                    "supportsUsageInStreaming": False,
                 },
-                "models": _DATABRICKS_COMPLETIONS_MODELS,
+                "models": provider_models["databricks-completions"],
             },
         },
     }
     if model is not None:
-        provider = config["providers"][_pi_provider_for_model(model)]
+        # Explicit selections must launch even when picker compatibility
+        # filtering hides the equivalent discovered entry.
+        provider = config["providers"][
+            _pi_provider_for_model(
+                model,
+                wire_catalog.get(model.lower()),
+                generic_openai_wire_api=generic_openai_wire_api,
+            )
+        ]
         if not any(entry.get("id") == model for entry in provider["models"]):
-            # Rebind (don't append): the static lists are module-level
-            # constants shared across builds, so in-place mutation would
-            # leak this run's model id into every later models.json.
-            provider["models"] = [*provider["models"], {"id": model}]
+            # Declare image input: Pi's transformMessages drops every image
+            # block ("model does not support images") unless the model entry
+            # advertises it, so a dynamically-registered vision model would
+            # silently lose its images (#515). We assert capability for ALL
+            # dynamically-routed ids (no per-model vision metadata here): for a
+            # genuinely text-only model this turns a silent image drop into a
+            # provider-side 400 on image turns — a deliberate trade (loud error
+            # over silent loss), since most current gateway models are
+            # multimodal and text-only turns are unaffected.
+            entry: _JsonObject = {"id": model, "input": ["text", "image"]}
+            if pi_model_is_reasoning(model):
+                entry["reasoning"] = True
+            provider["models"] = [*provider["models"], entry]
     return config
 
 
-def _pi_provider_for_model(model: str) -> str:
+# Model-id fragments of completions-gateway models that stream their output on
+# the ``reasoning_content`` channel (DeepSeek-R1, ...). Pi's openai-completions
+# parser only consumes that channel when the model entry declares
+# ``reasoning: true``; without it the stream carries no ``content`` and the
+# turn dies with "Stream ended without finish_reason".
+# Note: GLM, kimi, and inkling now route via Responses API (system.ai.* ids)
+# so they no longer need this flag.
+def _pi_needs_responses_api(
+    model: str,
+    wire_apis: frozenset[ModelWireAPI] | None = None,
+) -> bool:
+    """Return whether Pi should use the Databricks Responses surface.
+
+    Catalog metadata is authoritative when available. The system-model family
+    fallback remains for endpoints whose documented chat surface omits the
+    finish reason Pi requires. Unknown GPT metadata fails toward Responses,
+    which is the forward-compatible tool-capable surface.
+    """
+    lower = model.lower()
+    if lower.startswith("system.ai.") and any(
+        keyword in lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS
+    ):
+        return True
+    if wire_apis is not None:
+        return ModelWireAPI.OPENAI_RESPONSES in wire_apis
+    return "gpt" in lower
+
+
+def _pi_provider_for_model(
+    model: str,
+    wire_apis: frozenset[ModelWireAPI] | None = None,
+    *,
+    generic_openai_wire_api: str | None = None,
+) -> str:
     """Return the Pi provider name to use for a given Databricks model."""
     lower = model.lower()
     if "claude" in lower:
         return "databricks-anthropic"
+    if generic_openai_wire_api is not None:
+        if generic_openai_wire_api == RESPONSES_WIRE_API:
+            return "databricks-openai"
+        return "databricks-completions"
+    if lower.startswith("system.ai."):
+        return (
+            "databricks-openai"
+            if _pi_needs_responses_api(model, wire_apis)
+            else "databricks-mlflow"
+        )
     if "gpt" in lower:
-        return "databricks"
+        return "databricks-openai" if _pi_needs_responses_api(model, wire_apis) else "databricks"
     return "databricks-completions"
+
+
+def _databricks_model_wire_catalog(
+    models: Sequence[model_catalog.ModelEntry],
+) -> dict[str, frozenset[ModelWireAPI]]:
+    """Index UC wire metadata by both system and serving-endpoint aliases."""
+    catalog: dict[str, frozenset[ModelWireAPI]] = {}
+    for model in models:
+        for alias in databricks_model_aliases(model.id):
+            catalog[alias] = model.metadata.wire_apis
+    return catalog
 
 
 async def _create_subprocess_exec(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:  # type: ignore[explicit-any]
@@ -707,30 +947,24 @@ def _clean_pi_env(extra_allowed: Sequence[str] | None = None) -> dict[str, str]:
     """
     Build a filtered copy of ``os.environ`` for the Pi subprocess.
 
-    Deny-by-default allowlist mirroring the codex path's
-    :func:`omnigent.inner.codex_executor._clean_codex_env`. The previous
-    additive ``{**os.environ, **env}`` merge leaked every host secret
+    Thin wrapper over :func:`omnigent.inner.agent_env.clean_agent_env`. The
+    previous additive ``{**os.environ, **env}`` merge leaked every host secret
     — cloud tokens, API keys — into the Pi process, sandboxed or not.
-    Credential families are deliberately not allowlisted:
-    gateway runs authenticate through the generated ``models.json``,
-    and a spec that legitimately needs a variable inside the Pi
-    process opts in via ``os_env.sandbox.env_passthrough``.
+    Credential families are deliberately not allowlisted: gateway runs
+    authenticate through the generated ``models.json``, and a spec that
+    legitimately needs a variable inside the Pi process opts in via
+    ``os_env.sandbox.env_passthrough``.
 
-    :param extra_allowed: Extra exact names to pass through, e.g. the
-        spec's ``os_env.sandbox.env_passthrough`` entries
-        (``["ANTHROPIC_API_KEY"]`` for an env-key-authenticated
-        non-gateway run). ``None`` means no extras.
-    :returns: Filtered environment dict, ready to extend with the
-        executor's own variables (``PI_CODING_AGENT_DIR``, ...).
+    :param extra_allowed: Extra exact names to pass through, e.g. the spec's
+        ``os_env.sandbox.env_passthrough`` entries. ``None`` means no extras.
+    :returns: Filtered environment dict, ready to extend with the executor's
+        own variables (``PI_CODING_AGENT_DIR``, ...).
     """
-    allow_exact = set(_PI_ENV_ALLOW_EXACT)
-    if extra_allowed is not None:
-        allow_exact.update(extra_allowed)
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if key in allow_exact or key.startswith(_PI_ENV_ALLOW_PREFIXES)
-    }
+    return clean_agent_env(
+        allow_prefixes=_PI_ENV_ALLOW_PREFIXES,
+        allow_exact=_PI_ENV_ALLOW_EXACT,
+        extra_allowed=extra_allowed or (),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -775,7 +1009,7 @@ class _PiRpcSession:
         :param cwd: Working directory for the subprocess, or ``None``
             to inherit the parent's.
         :param model: Pi model selector, e.g.
-            ``"databricks-anthropic/databricks-claude-sonnet-4-6"``.
+            ``"databricks-anthropic/gateway-model-id"``.
             ``None`` lets Pi pick its default.
         :param system_prompt: Text appended to Pi's default system
             prompt via ``--append-system-prompt``. ``None`` skips it.
@@ -802,7 +1036,7 @@ class _PiRpcSession:
         if extra_args:
             args.extend(extra_args)
 
-        logger.debug("PiExecutor: spawning %s", " ".join(args))
+        logger.debug("PiExecutor: spawning %s", " ".join(_redact_argv_for_log(args)))
         self.process = await _create_subprocess_exec(
             *args,
             stdin=asyncio.subprocess.PIPE,
@@ -979,7 +1213,7 @@ def _extract_text(msg: Message) -> str:
 
 def _extract_latest_user_content(
     messages: list[Message],
-) -> str | list[dict[str, Any]]:
+) -> str | list[_JsonObject]:
     """
     Extract the latest user message content.
 
@@ -998,14 +1232,90 @@ def _extract_latest_user_content(
             if isinstance(content, str):
                 return content
             if isinstance(content, list):
-                return content
+                return cast(list[_JsonObject], content)
             return str(content)
     return ""
 
 
-def _build_pi_prompt(
-    messages: list[Message], *, is_first_turn: bool
-) -> str | list[dict[str, Any]]:
+def _split_pi_prompt(blocks: list[_JsonObject]) -> tuple[str, list[dict[str, str]]]:
+    """Split content blocks into Pi's prompt ``message`` text and ``images``.
+
+    Pi's RPC ``prompt`` command carries text in ``message`` and images in a
+    native ``images`` field (``ImageContent = {type, data, mimeType}``), which
+    the ``openai-completions`` provider converts to ``image_url`` blocks.
+    JSON-encoding the blocks into ``message`` instead (the previous behavior)
+    makes Pi forward the image data URI as literal text, so the model never
+    sees the image (#515).
+
+    :param blocks: Responses-API content block dicts. ``input_text`` →
+        message text; ``input_image`` → Pi ``images``; ``input_file`` (a
+        resolved attachment data URI) → its text payload is decoded into the
+        message for text-like MIME types and skipped (with a warning) for
+        binary ones, mirroring the Codex harness — Pi has no native file
+        channel, but a text file's content is still useful inline, and the
+        old ``json.dumps(prompt)`` path surfaced it as text, so neither a
+        silent drop nor a hard failure is the right default here. A genuinely
+        unknown block type raises ``ValueError`` (→ ``ExecutorError`` in
+        ``run_turn``) so a new shape fails loudly rather than vanishing.
+    :returns: ``(message, images)`` — joined text and a list of Pi
+        ``ImageContent`` dicts.
+    :raises ValueError: On a malformed ``input_image`` or an unhandled
+        block type.
+    """
+    text_parts: list[str] = []
+    images: list[dict[str, str]] = []
+    for block in blocks:
+        block_type = block.get("type")
+        if block_type in ("input_text", "output_text", "text"):
+            text_parts.append(str(block.get("text") or ""))
+        elif block_type == "input_image":
+            image_url = block.get("image_url")
+            if not isinstance(image_url, str) or not image_url.startswith("data:"):
+                raise ValueError(
+                    "input_image 'image_url' must be an inline data URI "
+                    "('data:<mime>;base64,...'); Pi forwards images inline and "
+                    "cannot fetch external URLs or resolve file references "
+                    f"(got {str(image_url)[:48]!r})."
+                )
+            parsed = parse_data_uri(image_url)
+            images.append(
+                {"type": "image", "data": parsed.base64_payload, "mimeType": parsed.mime_type}
+            )
+        elif block_type == "input_file":
+            # Pi has no file channel, so inline text-like files into the
+            # message (the model can still reason about them) and skip binary
+            # ones. Matches codex_executor's input_file fallback.
+            file_data = block.get("file_data") or ""
+            if isinstance(file_data, str) and file_data.startswith("data:"):
+                parsed = parse_data_uri(file_data)
+                if not parsed.mime_type.startswith("text/"):
+                    logger.warning(
+                        "Pi harness: skipping non-text input_file (%s) — Pi "
+                        "cannot consume binary attachments inline.",
+                        parsed.mime_type,
+                    )
+                    continue
+                try:
+                    decoded = base64.b64decode(parsed.base64_payload).decode("utf-8", "replace")
+                except ValueError as exc:  # binascii.Error subclasses ValueError
+                    raise ValueError(
+                        f"input_file has an undecodable base64 payload: {exc}"
+                    ) from exc
+                text_parts.append(decoded)
+            elif isinstance(file_data, str) and file_data:
+                # Already-inline text (no data: wrapper).
+                text_parts.append(file_data)
+        else:
+            raise ValueError(
+                f"Unsupported content block type {block_type!r} for the Pi "
+                "harness: only 'input_text', 'input_image', and 'input_file' "
+                "blocks can be forwarded. Dropping it silently would lose the "
+                "attachment, so the turn fails loudly instead."
+            )
+    return "\n".join(text_parts), images
+
+
+def _build_pi_prompt(messages: list[Message], *, is_first_turn: bool) -> str | list[_JsonObject]:
     """
     Build the prompt to send to Pi.
 
@@ -1095,9 +1405,12 @@ def _try_sandbox_pi(
         # Pi needs to read its own installation + node_modules.
         pi_dir = pathlib.Path(pi_path).resolve().parent.parent
         sandbox = with_additional_read_roots(sandbox, [pi_dir])
-        # Pi writes to ~/.pi and to /tmp.
+        # Pi writes to ~/.pi, /tmp, and $TMPDIR (on macOS $TMPDIR is a
+        # per-user dir under /var/folders/, not /tmp — grant both so
+        # PI_CODING_AGENT_DIR (created via tempfile.mkdtemp) is reachable.
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
-        sandbox = with_additional_write_roots(sandbox, [home_pi, pathlib.Path("/tmp")])
+        sys_tmpdir = pathlib.Path(tempfile.gettempdir())
+        sandbox = with_additional_write_roots(sandbox, [home_pi, pathlib.Path("/tmp"), sys_tmpdir])
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
         launcher = create_exec_launcher(pi_path, sandbox)
         return SandboxedPiCli(launch_path=launcher, sandboxed=True)
@@ -1181,12 +1494,12 @@ def _resolve_pi_skill_args(
 def _extract_pi_turn_usage(
     message: object,
     fallback_model: str | None,
-) -> dict[str, Any] | None:  # type: ignore[explicit-any]
+) -> _PiMessageUsage | None:
     """Map a Pi assistant message's ``usage`` object onto the wire shape
     that :class:`TurnComplete` consumes, so pi sub-agent cost is priced
     the same way as ``claude-sdk`` and ``codex`` turns.
 
-    Pi (``@mariozechner/pi-coding-agent``) forwards assistant messages
+    Pi (``@earendil-works/pi-coding-agent``) forwards assistant messages
     whose ``usage`` dict carries ``input`` / ``output`` / ``cacheRead`` /
     ``cacheWrite`` / ``totalTokens`` token counts, and the message itself
     carries the resolved ``model``. This translates those into omnigent's
@@ -1221,9 +1534,9 @@ def _extract_pi_turn_usage(
 
 
 def _aggregate_pi_turn_usage(
-    message_usages: list[dict[str, Any]],  # type: ignore[explicit-any]
+    message_usages: list[_PiMessageUsage],
     fallback_model: str | None,
-) -> dict[str, Any] | None:  # type: ignore[explicit-any]
+) -> _PiTurnUsage | None:
     """Aggregate per-message Pi usage into one turn-level usage dict.
 
     A single Omnigent turn drives Pi's full agent loop, which may make
@@ -1241,7 +1554,7 @@ def _aggregate_pi_turn_usage(
         reported no usage for the turn.
     :param fallback_model: The executor's configured model id, used only
         when no captured message carried a ``model``,
-        e.g. ``"databricks-claude-sonnet-4-6"``.
+        e.g. ``"gateway-model-id"``.
     :returns: A turn-level usage dict for ``TurnComplete.usage`` carrying
         summed ``input_tokens`` / ``output_tokens`` / ``total_tokens`` /
         ``cache_read_input_tokens`` / ``cache_creation_input_tokens``, a
@@ -1300,6 +1613,7 @@ class PiExecutor(Executor):
         gateway_host: str | None = None,
         base_url_override: str | None = None,
         base_urls_override: dict[str, str] | None = None,
+        openai_wire_api: str | None = None,
         gateway_auth_command: str | None = None,
         retry_policy: RetryPolicy | None = None,
         bundle_dir: pathlib.Path | None = None,
@@ -1312,7 +1626,7 @@ class PiExecutor(Executor):
         :param os_env: Optional OS environment / sandbox spec.  When set, the
             Pi subprocess is wrapped in the same sandbox other
             harnesses use.
-        :param model: Override the model name, e.g. ``"databricks-claude-sonnet-4-6"``.
+        :param model: Override the model name, e.g. ``"gateway-model-id"``.
         :param pi_path: Absolute path to a ``pi`` CLI binary.  When ``None``
             the executor searches ``PATH``.
         :param gateway: When ``True``, write a ``models.json`` pointing Pi
@@ -1335,6 +1649,9 @@ class PiExecutor(Executor):
             the Databricks profile credentials.
         :param base_urls_override: ucode-provided Pi gateway URLs keyed by
             model family, e.g. ``{"claude": "...", "openai": "..."}``.
+        :param openai_wire_api: Configured generic-provider OpenAI wire,
+            ``"responses"`` or ``"chat"``. Databricks ignores this and uses
+            live Unity Catalog metadata.
         :param gateway_auth_command: Shell command that prints a bearer token,
             e.g.
             ``"databricks auth token --host https://example.databricks.com ..."``
@@ -1347,7 +1664,7 @@ class PiExecutor(Executor):
             budget. ``None`` resolves to ``RetryPolicy()`` defaults.
             See Phase 1f of ``designs/RETRY_ACROSS_HARNESSES.md``.
         :param bundle_dir: The agent bundle's extracted on-disk path.
-            When set, ``<bundle_dir>/skills/<name>/SKILL.md`` files
+            When set, ``<bundle_dir>/skills/<dir>/SKILL.md`` files
             are exposed to Pi via ``--skill <path>`` based on
             *skills_filter*. ``None`` skips bundle-skill wiring.
         :param agent_name: Optional agent display name. Reserved for
@@ -1375,6 +1692,11 @@ class PiExecutor(Executor):
         self._gateway_host_override = gateway_host.rstrip("/") if gateway_host else None
         self._base_url_override = base_url_override
         self._base_urls_override = base_urls_override
+        if openai_wire_api not in (None, RESPONSES_WIRE_API, CHAT_WIRE_API):
+            raise ValueError(f"unsupported Pi OpenAI wire API: {openai_wire_api!r}")
+        self._openai_wire_api = openai_wire_api
+        self._gateway_model_entries: tuple[model_catalog.ModelEntry, ...] | None = None
+        self._gateway_model_wire_apis: dict[str, frozenset[ModelWireAPI]] | None = None
         self._gateway_auth_command = gateway_auth_command
         # Retry policy → Pi's .pi/settings.json before subprocess spawn.
         # See ``RetryPolicy.pi.settings()`` for the schema. Pi natively
@@ -1395,7 +1717,15 @@ class PiExecutor(Executor):
         # off (they don't route through Omnigent policies / history and
         # can 400 against the Databricks Responses API), and the bridge
         # extension's tools are explicitly allowlisted.
+        from omnigent.pi_native import pi_supports_approve
+
         self._extra_args: list[str] = ["--no-tools"]
+        if pi_supports_approve(self._pi_path):
+            # Pre-accept the project-folder trust dialog. Pi 0.79+ shows a
+            # blocking TUI prompt on first launch in a directory with .pi/
+            # resources. In a runner-driven session there is nobody at the
+            # terminal to answer it, so we approve when the flag is supported.
+            self._extra_args.append("--approve")
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
@@ -1449,6 +1779,9 @@ class PiExecutor(Executor):
         # generic-provider paths the producer resolves a concrete model.
         self._gateway_uses_databricks_profile = bool(
             gateway and self._gateway_host_override is None and base_url_override is None
+        )
+        self._gateway_workspace_url = (
+            self._gateway_model_service_workspace_url() if gateway else None
         )
 
         # Apply sandbox.
@@ -1551,16 +1884,15 @@ class PiExecutor(Executor):
                 return str(meta["session_id"])
         return "__default__"
 
-    def _resolve_model(self, config: ExecutorConfig | None) -> str | None:
+    async def _resolve_model(self, config: ExecutorConfig | None) -> str | None:
         """
         Determine the model name to pass to Pi.
 
         ``cfg.model`` (per-request /model override) wins over the spec
         default (``HARNESS_PI_MODEL`` → ``self._model_override``). On the
-        Databricks-profile gateway path a missing model falls back to
-        :data:`DATABRICKS_CLAUDE_DEFAULT_MODEL` — Pi's own default is an
-        Anthropic-direct id the gateway rejects. Elsewhere ``None`` falls
-        through to let Pi pick its own default.
+        Databricks-profile gateway path a missing model resolves from the
+        Databricks Claude catalog — Pi's own default may be a direct-provider
+        id the gateway rejects. Elsewhere ``None`` lets Pi pick its own default.
 
         :param config: Optional :class:`ExecutorConfig` whose ``model``
             takes precedence when set.
@@ -1570,8 +1902,93 @@ class PiExecutor(Executor):
         cfg = config or ExecutorConfig()
         model = cfg.model or self._model_override
         if model is None and self._gateway_uses_databricks_profile:
-            return DATABRICKS_CLAUDE_DEFAULT_MODEL
+            # DATABRICKS-PATCH(pi-live-model-discovery): resolve from the
+            # workspace, not the bundled catalog whose legacy `databricks-` ids
+            # the gateway answers with `501 … Use Unity Catalog model services`.
+            from omnigent.inner.claude_sdk_executor import _resolve_databricks_claude_model
+
+            model_id = await run_sync_on_thread(
+                _resolve_databricks_claude_model, self._databricks_profile
+            )
+            if not isinstance(model_id, str):
+                raise TypeError("Databricks model resolution returned a non-string model id")
+            return model_id
+        # Strip bracket suffixes (e.g. "[1m]") — context-window hints accepted
+        # by the direct Anthropic API but not by the Databricks AI Gateway.
+        if model and self._gateway:
+            model = re.sub(r"\[.*?\]$", "", model)
         return model
+
+    def _generic_openai_wire_api(self) -> str | None:
+        """Return the configured wire only for a non-Databricks gateway."""
+        openai_base_url = (self._base_urls_override or {}).get("openai")
+        if openai_base_url:
+            is_databricks_gateway = (
+                "/ai-gateway/" in openai_base_url or _is_databricks_ai_gateway_url(openai_base_url)
+            )
+            if not is_databricks_gateway:
+                return self._openai_wire_api or CHAT_WIRE_API
+        return None
+
+    def _gateway_model_service_workspace_url(self) -> str | None:
+        """Return the workspace API origin for Databricks catalog discovery."""
+        if self._gateway_uses_databricks_profile:
+            return self._databricks_host
+        candidates = [
+            *(self._base_urls_override or {}).values(),
+            self._base_url_override,
+            self._gateway_host_override,
+        ]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            workspace_url = _databricks_workspace_url_for_gateway(
+                candidate,
+                profile=self._databricks_profile,
+            )
+            if workspace_url is not None:
+                return workspace_url
+        return None
+
+    async def _load_gateway_model_wire_apis(self) -> dict[str, frozenset[ModelWireAPI]]:
+        """Fetch and cache the live Databricks model catalog."""
+        if self._gateway_model_wire_apis is not None:
+            return self._gateway_model_wire_apis
+        workspace_url = self._gateway_workspace_url if self._gateway else None
+        if workspace_url is None:
+            self._gateway_model_entries = ()
+            self._gateway_model_wire_apis = {}
+            return self._gateway_model_wire_apis
+        try:
+            models = await run_sync_on_thread(
+                model_catalog.fetch_databricks_model_service_entries,
+                workspace_url,
+                self._databricks_token,
+            )
+        except Exception:  # noqa: BLE001 — catalog outage uses conservative routing
+            logger.warning(
+                "Pi could not fetch Databricks model metadata; "
+                "the picker will show only the selected model",
+                exc_info=True,
+            )
+            self._gateway_model_entries = ()
+            self._gateway_model_wire_apis = {}
+            return self._gateway_model_wire_apis
+        try:
+            metadata_models = await run_sync_on_thread(
+                model_catalog.catalog_model_entries,
+                "databricks",
+            )
+        except Exception:  # noqa: BLE001 — live availability remains authoritative
+            logger.info(
+                "Pi could not enrich the live Databricks model list with MLflow metadata",
+                exc_info=True,
+            )
+        else:
+            models = enrich_databricks_model_catalog(models, metadata_models)
+        self._gateway_model_entries = tuple(models)
+        self._gateway_model_wire_apis = _databricks_model_wire_catalog(models)
+        return self._gateway_model_wire_apis
 
     async def _ensure_tool_server(self, tools: list[ToolSpec]) -> int | None:
         """Start the TCP tool server if there are Omnigent tools to bridge."""
@@ -1644,50 +2061,56 @@ class PiExecutor(Executor):
         extra_args: list[str] = list(self._extra_args)
 
         if self._gateway:
+            effective_model = model
             models_json = _build_models_json(
-                self._databricks_host,
+                self._gateway_workspace_url or self._databricks_host,
                 self._databricks_token,
                 self._base_urls_override,
-                model=model,
+                model=effective_model,
+                catalog_models=self._gateway_model_entries or (),
+                model_wire_apis=self._gateway_model_wire_apis,
+                openai_wire_api=self._openai_wire_api,
             )
             models_path = os.path.join(tmp_dir, "models.json")
             with open(models_path, "w") as f:
                 json.dump(models_json, f)
             env["PI_CODING_AGENT_DIR"] = tmp_dir
+            # Gateway mode relocates Pi's agent root — copy the user's global
+            # settings (extensions, packages, …) and symlink install trees so
+            # ``pi install`` packages still resolve. See #1423.
+            from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
+
+            prepare_managed_pi_agent_dir(
+                pathlib.Path(tmp_dir),
+                overlay=self._retry_policy.pi.settings(),
+            )
 
         # Pi natively supports retry config via ``.pi/settings.json``
-        # (see ``RetryPolicy.pi.settings()`` for schema). Write the
-        # retry block to ``<tmp_dir>/.pi/settings.json`` so Pi picks
-        # it up when spawned with ``cwd=tmp_dir`` (when the user
-        # didn't override cwd) or merge into ``<cwd>/.pi/settings.json``
-        # when they did. This sets max_retries, backoff base/cap from
-        # the spec policy.
-        retry_settings = self._retry_policy.pi.settings()
-        # Decide where to write. Project-level (cwd/.pi/settings.json)
-        # is Pi's documented project override; merge into existing
-        # file if present, else create.
-        settings_dir_root = self._cwd or tmp_dir
-        settings_path = os.path.join(settings_dir_root, ".pi", "settings.json")
-        try:
-            if os.path.exists(settings_path):
-                with open(settings_path) as f:
-                    existing_settings = json.load(f)
-                if not isinstance(existing_settings, dict):
+        # (see ``RetryPolicy.pi.settings()`` for schema). On the non-gateway
+        # path, merge the retry block into ``<cwd>/.pi/settings.json``.
+        # Gateway runs apply retry via :func:`prepare_managed_pi_agent_dir`
+        # into the managed agent dir instead.
+        if not self._gateway:
+            retry_settings = self._retry_policy.pi.settings()
+            settings_dir_root = self._cwd or tmp_dir
+            settings_path = os.path.join(settings_dir_root, ".pi", "settings.json")
+            try:
+                if os.path.exists(settings_path):
+                    with open(settings_path) as f:
+                        existing_settings = json.load(f)
+                    if not isinstance(existing_settings, dict):
+                        existing_settings = {}
+                else:
                     existing_settings = {}
-            else:
-                existing_settings = {}
-            existing_settings.update(retry_settings)
-            os.makedirs(os.path.dirname(settings_path), exist_ok=True)
-            with open(settings_path, "w") as f:
-                json.dump(existing_settings, f, indent=2)
-        except OSError:
-            # If we can't write to the user's cwd (read-only fs,
-            # permissions), fall back to tmp_dir; Pi will use its
-            # own defaults if neither location works.
-            fallback_path = os.path.join(tmp_dir, ".pi", "settings.json")
-            os.makedirs(os.path.dirname(fallback_path), exist_ok=True)
-            with open(fallback_path, "w") as f:
-                json.dump(retry_settings, f, indent=2)
+                existing_settings.update(retry_settings)
+                os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+                with open(settings_path, "w") as f:
+                    json.dump(existing_settings, f, indent=2)
+            except OSError:
+                fallback_path = os.path.join(tmp_dir, ".pi", "settings.json")
+                os.makedirs(os.path.dirname(fallback_path), exist_ok=True)
+                with open(fallback_path, "w") as f:
+                    json.dump(retry_settings, f, indent=2)
 
         # Generate the Omnigent tool bridge extension if tools are available.
         if tools and tool_server_port is not None:
@@ -1736,14 +2159,18 @@ class PiExecutor(Executor):
         """Get or create a Pi RPC subprocess for the given session."""
         state = self._session_states.setdefault(session_key, _PiSessionState())
 
+        effective_model = model
+
         if (
             state.rpc is not None
             and state.rpc.process is not None
             and state.rpc.process.returncode is None
             and state.system_prompt == system_prompt
-            and state.model == model
+            and state.model == effective_model
         ):
             return state.rpc
+
+        wire_catalog = await self._load_gateway_model_wire_apis()
 
         if state.rpc is not None:
             await state.rpc.close()
@@ -1751,7 +2178,7 @@ class PiExecutor(Executor):
         tool_server_port = await self._ensure_tool_server(tools)
         tool_server_token = self._tool_server.token if self._tool_server is not None else None
         subprocess_config = self._build_env_and_dir(
-            tools, tool_server_port, tool_server_token, model
+            tools, tool_server_port, tool_server_token, effective_model
         )
         env = subprocess_config.env
         tmp_dir = subprocess_config.tmp_dir
@@ -1763,11 +2190,15 @@ class PiExecutor(Executor):
         # For Databricks models, prefix with the provider name so Pi resolves
         # the model from our custom provider in models.json.
         pi_model: str | None
-        if self._gateway and model:
-            provider = _pi_provider_for_model(model)
-            pi_model = f"{provider}/{model}"
+        if self._gateway and effective_model:
+            provider = _pi_provider_for_model(
+                effective_model,
+                wire_catalog.get(effective_model.lower()),
+                generic_openai_wire_api=self._generic_openai_wire_api(),
+            )
+            pi_model = f"{provider}/{effective_model}"
         else:
-            pi_model = model
+            pi_model = effective_model
 
         await rpc.start(
             self._pi_launch_path,
@@ -1779,7 +2210,7 @@ class PiExecutor(Executor):
         )
         state.rpc = rpc
         state.system_prompt = system_prompt
-        state.model = model
+        state.model = effective_model
         state._has_sent_prompt = False
         return rpc
 
@@ -1801,7 +2232,7 @@ class PiExecutor(Executor):
                 if token:
                     self._databricks_token = token
         session_key = self._session_key(messages)
-        model = self._resolve_model(config)
+        model = await self._resolve_model(config)
 
         try:
             rpc = await self._ensure_rpc(session_key, system_prompt, model, tools)
@@ -1828,24 +2259,26 @@ class PiExecutor(Executor):
         if state is not None:
             state._has_sent_prompt = True
 
-        # Send prompt command. Pi's JSONL protocol requires
-        # ``message`` to be a string. When the prompt carries
-        # multimodal content blocks, JSON-encode them so the
-        # LLM sees the image data URIs in its context.
+        # Send prompt command. Pi's JSONL protocol carries text in ``message``
+        # and images in a native ``images`` field. Split multimodal blocks into
+        # both (rather than JSON-encoding them into the text) so the model
+        # actually receives attached images instead of a base64 text blob (#515).
         message: str
+        images: list[dict[str, str]] = []
         if isinstance(prompt, list):
-            message = json.dumps(prompt)
+            try:
+                message, images = _split_pi_prompt(prompt)
+            except Exception as exc:  # noqa: BLE001 — prompt-prep boundary: any failure (malformed/unsupported block, bad data URI) surfaces as ExecutorError, never an uncaught crash, matching the send_command path below
+                yield ExecutorError(message=f"Failed to prepare prompt for Pi: {exc}")
+                return
         else:
             message = prompt
         cmd_id = f"turn_{id(messages)}"
+        command: CodexEvent = {"type": "prompt", "message": message, "id": cmd_id}
+        if images:
+            command["images"] = images
         try:
-            await rpc.send_command(
-                {
-                    "type": "prompt",
-                    "message": message,
-                    "id": cmd_id,
-                }
-            )
+            await rpc.send_command(command)
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces prompt-send errors as ExecutorError
             yield ExecutorError(message=f"Failed to send prompt to Pi: {exc}")
             return
@@ -1858,12 +2291,19 @@ class PiExecutor(Executor):
         # fallback). Summed into a turn-level usage dict at completion so a
         # multi-step (tool-loop) turn bills for every call, not just the
         # last. Empty when pi reports no usage — cost tracking is skipped.
-        message_usages: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+        message_usages: list[_PiMessageUsage] = []
+        # Error reported by a ``message_end`` (stopReason=error); surfaced at
+        # ``agent_end`` so the terminal event is consumed off the RPC stream.
+        pending_error: str | None = None
 
         while True:
-            line = await rpc.read_line(timeout=120.0)
+            # After an errored message the only thing left to drain is the
+            # already-emitted agent_end, so don't wait the full idle budget.
+            line = await rpc.read_line(timeout=120.0 if pending_error is None else 10.0)
             if line is None:
-                if not streamed_any and not response_text:
+                if pending_error is not None:
+                    yield ExecutorError(message=pending_error)
+                elif not streamed_any and not response_text:
                     stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
                     stderr_suffix = f" Stderr: {stderr}" if stderr else ""
                     yield ExecutorError(
@@ -1872,7 +2312,10 @@ class PiExecutor(Executor):
                 else:
                     turn_usage = _aggregate_pi_turn_usage(message_usages, model)
                     _notify_usage_from_dict(model=model, usage=turn_usage)
-                    yield TurnComplete(response=response_text, usage=turn_usage)
+                    yield TurnComplete(
+                        response=response_text,
+                        usage=dict(turn_usage) if turn_usage is not None else None,
+                    )
                 return
 
             try:
@@ -1996,6 +2439,9 @@ class PiExecutor(Executor):
 
             # Agent ended — the turn is complete.
             if event_type == "agent_end":
+                if pending_error is not None:
+                    yield ExecutorError(message=pending_error)
+                    return
                 end_messages = event.get("messages", [])
                 if not response_text:
                     for m in reversed(end_messages):
@@ -2025,7 +2471,10 @@ class PiExecutor(Executor):
                             break
                 turn_usage = _aggregate_pi_turn_usage(message_usages, model)
                 _notify_usage_from_dict(model=model, usage=turn_usage)
-                yield TurnComplete(response=response_text, usage=turn_usage)
+                yield TurnComplete(
+                    response=response_text,
+                    usage=dict(turn_usage) if turn_usage is not None else None,
+                )
                 return
 
             # message_end carries one completed assistant message, whose
@@ -2039,10 +2488,17 @@ class PiExecutor(Executor):
                         message_usages.append(captured)
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
-                    if stop in ("error", "aborted"):
+                    if stop == "aborted":
                         err = msg.get("errorMessage", stop)
                         yield ExecutorError(message=str(err))
                         return
+                    if stop == "error":
+                        # Pi emits the turn-terminal ``agent_end`` after an
+                        # errored LLM call; returning here would leave it
+                        # queued, so the next turn on this RPC session reads
+                        # the stale event as its own end. Record the error
+                        # and keep draining until ``agent_end``.
+                        pending_error = str(msg.get("errorMessage", stop))
                 continue
 
             logger.debug("PiExecutor: ignoring event type=%s", event_type)

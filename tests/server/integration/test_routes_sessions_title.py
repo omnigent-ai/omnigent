@@ -8,7 +8,7 @@ test fixture mounted the legacy responses router which drove
 execution in-process; with that path gone, the route returns 503
 ``runner_unavailable`` before reaching the title-seed helper. Coverage
 for first-message title seeding lives at the e2e level (the REPL and
-ap-web flows exercise it against a real runner).
+web flows exercise it against a real runner).
 """
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 # Render blueprint: web service (pulls the CI image — it ships the gitignored
-# web UI bundle a source build can't) + managed Postgres + artifact disk.
+# web UI bundle a source build can't) + managed Postgres + data disk.
 # Defaults to built-in `accounts` auth (multi-user, no IdP). Full walkthrough:
 # deploy/render/README.md.
 
@@ -15,7 +15,7 @@ services:
     healthCheckPath: /health
     disk:
       name: artifact-data
-      mountPath: /data/artifacts
+      mountPath: /data
       sizeGB: 10
     envVars:
       - key: DATABASE_URL
@@ -24,11 +24,16 @@ services:
           property: connectionString
       - key: ARTIFACT_DIR
         value: /data/artifacts
-      # Keep the first-boot admin password on the disk across redeploys.
+      # Anchor the server's data dir on the persistent disk (this path's
+      # parent, /data) so file-backed operator config and the auto-minted
+      # cookie secret survive redeploys. No credentials file is written here.
       - key: OMNIGENT_ADMIN_CREDENTIALS_PATH
         value: /data/admin-credentials
       - key: HOST
         value: 0.0.0.0
+      # Comma-separated deployment-wide release features; empty is all off.
+      - key: OMNIGENT_FEATURES
+        value: ""
       - key: OMNIGENT_AUTH_PROVIDER
         value: accounts
       - key: OMNIGENT_ACCOUNTS_AUTO_OPEN

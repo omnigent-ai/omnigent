@@ -8,16 +8,23 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-# Attachment path markers the native executors prepend to prompt text
+from omnigent.inner.native_attachments import UNRESOLVED_ATTACHMENT_MARKER_PATTERN
+from omnigent.llms.adapters._content import redact_binary_payloads
+
+# Attachment markers the native executors prepend to prompt text
 # ("[Attached: /tmp/.../x.png]" from claude-native's _content_to_text,
-# "[Attached file: /tmp/...]" from codex-native's _file_block_to_input_item).
+# "[Attached file: /tmp/...]" from codex-native's _file_block_to_input_item,
+# "[Attachment <name> could not be loaded]" from native_attachments'
+# unresolved_attachment_marker).
 # Those markers round-trip through the vendor transcript as user-message
 # text, so without filtering them a session started with an image is
 # titled by a temp-file path instead of what the user typed. Matched per
-# line by synthesize_conversation_title; keep in sync with
-# omnigent/inner/claude_native_executor.py and
-# omnigent/inner/codex_native_executor.py.
-_ATTACHMENT_MARKER_RE = re.compile(r"^\[Attached(?: file)?: .+\]$")
+# line by synthesize_conversation_title; keep the Attached variants in
+# sync with attachment_reference_line in omnigent/inner/native_attachments.py
+# and omnigent/inner/codex_native_executor.py.
+_ATTACHMENT_MARKER_RE = re.compile(
+    rf"^(?:\[Attached(?: file)?: .+\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN})$"
+)
 
 # ── Conversation ──────────────────────────────────────
 
@@ -101,7 +108,7 @@ class Conversation:
         default from the spec's ``llm.model``. Mutable via
         ``PATCH /v1/sessions/{id}`` and the REPL's ``/model``
         command. Mirrors the persistence shape of
-        ``reasoning_effort`` so the ap-web UI and the TUI stay
+        ``reasoning_effort`` so the web UI and the TUI stay
         in sync — both read it from the session snapshot and
         write it through the same PATCH endpoint.
     :param cost_control_mode_override: Per-session cost-control
@@ -109,9 +116,17 @@ class Conversation:
         mode, ``"off"`` disables cost control for this session, and
         ``None`` (unset) defers to the spec default. Set at session
         creation via ``POST /v1/sessions`` and mutable via
-        ``PATCH /v1/sessions/{id}`` (the ap-web "Cost Optimized"
+        ``PATCH /v1/sessions/{id}`` (the web "Cost Optimized"
         toggle). Read by the cost-control advisor pipeline at turn
         start; mirrors the persistence shape of ``model_override``.
+    :param subagent_routing_override: Per-session subagent-routing
+        switch, two-state: ``"on"`` routes native/SDK subagent spawns,
+        and ``"off"`` or ``None`` (unset) both leave them on the parent's
+        model. A session created on Smart Routing is stamped ``"on"`` by
+        the create route, so unset reads as Default and inherits nothing.
+        Mutable via ``PATCH /v1/sessions/{id}`` at any time; read per
+        spawn by the route-subagent relay, so a change takes effect on
+        the next spawn.
     :param harness_override: Per-session harness override for the
         bound agent's brain, e.g. ``"pi"`` or ``"openai-agents"``.
         ``None`` means use the harness declared in the agent spec
@@ -121,9 +136,13 @@ class Conversation:
         first turn, so a later switch would orphan the running
         process. Only valid for ``executor.type: omnigent`` agents;
         the create route validates against ``OMNIGENT_HARNESSES``.
-        Sub-agent sessions never inherit it (their own rows stay
-        ``None``), so e.g. polly's workers keep their declared
-        harnesses when the brain is overridden.
+        Sub-agent sessions never *inherit* the parent brain's override,
+        so e.g. polly's workers keep their declared harnesses when the
+        brain is overridden. A sub-agent session MAY, however, carry its
+        own create-time override when ``sys_session_send`` supplied an
+        allowlisted ``args.harness`` (gated by the sub-agent spec's
+        ``executor.config.allowed_harnesses``); that value is set on the
+        child's own row, not inherited.
     :param sub_agent_name: For sub-agent sessions (``kind="sub_agent"``),
         the sub-agent type name within the parent's spec tree,
         e.g. ``"summarizer"``. The runner uses this to resolve the
@@ -176,6 +195,15 @@ class Conversation:
         listing (and the sidebar), surfacing only when the caller
         passes ``include_archived=True``. ``False`` for normal
         sessions; toggled via ``PATCH /v1/sessions/{id}``.
+    :param project_id: The first-class project this session is filed
+        under, or ``None`` if unfiled. Owner-private membership; see
+        ``designs/PROJECTS_PRD.md``.
+    :param search_snippet: Transient, list-only excerpt of the chat
+        content that matched a ``search_query`` — set by
+        ``list_conversations`` whenever the query hit an item's body (even
+        if the title also matched), so the search UI can show *where* the
+        session matched. Never persisted (not a DB column) and ``None`` on
+        every non-search read path and title-only matches.
     """
 
     id: str
@@ -194,13 +222,26 @@ class Conversation:
     reasoning_effort: str | None = None
     model_override: str | None = None
     cost_control_mode_override: str | None = None
+    subagent_routing_override: str | None = None
     harness_override: str | None = None
     sub_agent_name: str | None = None
+    task_summary: str | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
+    # Live-state fields written by the replica holding the runner tunnel
+    # so any replica's session list can serve them. ``live_status`` is the
+    # last relay-observed turn status ("idle"/"running"/"waiting"/"failed",
+    # None = never reported); ``pending_elicitation_count`` is the
+    # outstanding approval-prompt count (None = never written).
+    live_status: str | None = None
+    pending_elicitation_count: int | None = None
+    project_id: str | None = None
+    # Transient: populated only by list_conversations on a content search;
+    # never read from or written to the DB.
+    search_snippet: str | None = None
 
 
 # ── Conversation item data types ───────────────────────
@@ -374,6 +415,21 @@ class ReasoningData(BaseModel):
     encrypted_content: str | None = None
 
 
+def _binary_payload_omitted(media_type: str, _payload_length: int) -> str:
+    """
+    Build the marker written over a dropped compaction-snapshot payload.
+
+    The payload length is deliberately unused: a compaction row is
+    re-validated on every read, so a length would describe the previous
+    marker on the second pass and the strip would stop being idempotent.
+
+    :param media_type: The block's declared media type, if any.
+    :param _payload_length: Unused.
+    :returns: The replacement text.
+    """
+    return f"[{media_type or 'binary'} content omitted from the compaction snapshot]"
+
+
 class CompactionData(BaseModel):
     """
     Data payload for a compaction summary item.
@@ -400,8 +456,33 @@ class CompactionData(BaseModel):
 
     summary: str
     last_item_id: str
-    model: str
+    model: str | None = None
     token_count: int
+    compacted_messages: list[dict[str, Any]] | None = None
+    window_id: int | None = None
+
+    @field_validator("compacted_messages")
+    @classmethod
+    def strip_binary_payloads(
+        cls,
+        value: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]] | None:
+        """
+        Drop base64 payloads from the compaction snapshot.
+
+        Every harness builds the snapshot by copying its vendor transcript
+        verbatim, so a single screenshot turns one compaction item into
+        megabytes of base64 that is stored forever and re-read on every
+        session load. Stripping here rather than in each forwarder covers
+        every producer through one seam. Only newly written rows shrink —
+        a row already on disk keeps its size, and validation runs on the
+        way out, not back into the store.
+
+        :param value: The compacted message list, or ``None``.
+        :returns: The list with binary payloads replaced by a marker,
+            or ``None`` unchanged.
+        """
+        return redact_binary_payloads(value, _binary_payload_omitted)
 
 
 class NativeToolData(BaseModel):
@@ -477,6 +558,90 @@ class TerminalCommandData(BaseModel):
     stderr: str | None = None
 
 
+class RoutingDecisionData(BaseModel):
+    """
+    Data payload for an intelligent model-router decision item.
+
+    Emitted by the server-side smart routing path at the START of an
+    advised turn and persisted
+    as a display-only transcript item so the model the router chose shows
+    in the conversation flow the moment the turn begins. Listed in
+    :data:`NON_CONTENT_ITEM_TYPES` so the agent loop's history filter
+    skips it — the brain never sees (or answers) its own router note. The
+    runner's harness-input builder also drops every non
+    message/function_call type, a second guarantee it stays out of the
+    model's context.
+
+    :param model: The concrete brain model the router chose, e.g.
+        ``"databricks-claude-opus-4-8"``.
+    :param applied: ``True`` when the brain actually ran on
+        :attr:`model` this turn (optimize mode, no user pin); ``False``
+        when the router only WOULD have picked it (advise/shadow mode, or
+        a user model pin won) — the UI renders "would have picked".
+    :param rationale: The router's one-line explanation, shown as muted
+        secondary text, e.g. ``"Multi-file refactor needs deep
+        reasoning."``.
+    :param harness: Harness the decision applies to, e.g.
+        ``"claude-native"`` or ``"codex"``. ``None`` when the decision
+        picked a model only (no harness dimension).
+    :param scope: What the decision governs — ``"session"`` (auto-harness
+        session routing), ``"turn"`` (per-turn routing), ``"child_session"``
+        (an Omnigent-spawned sub-agent) or ``"native_subagent"`` (a Task /
+        ``spawn_agent`` spawn routed inside the harness). Defaults to
+        ``"turn"`` so rows persisted before this field deserialize.
+    :param decision_id: Router decision identifier, e.g.
+        ``"3f1c…"``. Correlates the transcript item with the routing
+        telemetry event and the child-sessions API row. ``None`` for
+        decisions made before decision ids existed.
+    :param raw_model: The router-vocabulary pick before resolution to a
+        servable catalog id, e.g. ``"gpt-5-6-sol"``. ``None`` when the
+        pick needed no resolution.
+    :param attempted_override: Model the spawning agent asked for and the
+        router overrode, e.g. ``"databricks-gpt-5-5"`` — an LLM-supplied
+        ``args.model`` on a child session, or a native spawn's own
+        ``requested_model``. ``None`` when nothing was asked for, or when
+        the router's pick names the same arm as the ask.
+    :param router_source: Which router produced the decision —
+        ``"databricks-aigw"`` for the external AI-Gateway ``task_v1``
+        service, ``"oss-llm"`` for the built-in judge. Deliberately a
+        plain ``str`` rather than a ``Literal``: a source added later
+        must still round-trip through stored rows and the wire instead
+        of failing validation. ``None`` on rows written before the
+        field existed.
+    """
+
+    model: str
+    applied: bool
+    rationale: str
+    #: Sub-agent name when this decision was made for a child session and the
+    #: item is being mirrored into the parent's transcript, e.g. ``"claude_code"``.
+    #: ``None`` for session-local routing decisions (the usual case).
+    agent: str | None = None
+    harness: str | None = None
+    scope: Literal["session", "turn", "child_session", "native_subagent"] = "turn"
+    decision_id: str | None = None
+    raw_model: str | None = None
+    attempted_override: str | None = None
+    router_source: str | None = None
+
+    @field_validator("model")
+    @classmethod
+    def require_non_empty_model(cls, value: str) -> str:
+        """
+        Validate that the router named a non-empty model.
+
+        :param value: The chosen model id, e.g.
+            ``"databricks-claude-opus-4-8"``.
+        :returns: The stripped non-empty model id.
+        :raises ValueError: If the model id is empty or whitespace-only —
+            a routing decision with no model is meaningless to render.
+        """
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("routing_decision model must be non-empty")
+        return stripped
+
+
 class SlashCommandData(BaseModel):
     """
     Data payload for a slash-command invocation observed in a
@@ -519,6 +684,7 @@ ItemData = (
     | CompactionData
     | NativeToolData
     | ResourceEventData
+    | RoutingDecisionData
     | SlashCommandData
     | TerminalCommandData
 )
@@ -532,6 +698,7 @@ ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
     "compaction": CompactionData,
     "native_tool": NativeToolData,
     "resource_event": ResourceEventData,
+    "routing_decision": RoutingDecisionData,
     "slash_command": SlashCommandData,
     "terminal_command": TerminalCommandData,
 }
@@ -544,6 +711,7 @@ NON_CONTENT_ITEM_TYPES: frozenset[str] = frozenset(
         "compaction",
         "error",
         "resource_event",
+        "routing_decision",
         "slash_command",
         "terminal_command",
     }
@@ -678,6 +846,7 @@ class ConversationItem(BaseModel):
 
             {"id": "msg_abc", "response_id": "resp_xyz",
              "type": "message", "status": "completed",
+             "created_at": 1753900000,
              "role": "assistant",
              "content": [{"type": "output_text", "text": "hi"}],
              "model": "databricks-gpt-5-4"}
@@ -687,6 +856,7 @@ class ConversationItem(BaseModel):
             "response_id": self.response_id,
             "type": self.type,
             "status": self.status,
+            "created_at": self.created_at,
             **self.data.model_dump(exclude_none=True, by_alias=True),
             # created_by is present only for human-authored items;
             # omitted (not null) for agent/tool/system messages so the

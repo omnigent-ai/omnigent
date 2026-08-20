@@ -42,7 +42,6 @@ import os
 import signal
 import socket
 import subprocess
-import sys
 import tarfile
 import tempfile
 import time
@@ -52,6 +51,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+
+from tests._helpers.compat import apply_server_env, compat_server_cwd, server_executable
 
 # Project root — this file lives at tests/_helpers/live_server.py.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -157,23 +158,21 @@ def start_live_server(
     """
     port = find_free_port()
     harness_env = _compute_harness_env(creds)
-    env = {
-        **os.environ,
-        **harness_env,
-        # Force the subprocess to import from the worktree, not
-        # whatever's installed in the venv. Otherwise a branch with
-        # schema/model changes runs against a stale installed copy
-        # and fails with cryptic "no such column" errors.
-        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-    }
+    env = {**os.environ, **harness_env}
+    # Force the subprocess to import from the worktree, not whatever's
+    # installed in the venv — otherwise a branch with schema/model changes
+    # runs against a stale installed copy and fails with cryptic "no such
+    # column" errors. In compat mode (OMNIGENT_COMPAT_SERVER_PYTHON set) this
+    # prepend is dropped so the pinned older build in the compat venv wins.
+    apply_server_env(env, _REPO_ROOT)
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime
     proc = subprocess.Popen(
         [
-            # ``sys.executable`` so the subprocess uses the same
-            # interpreter pytest runs under. Bare ``"python"``
-            # resolves against the subprocess PATH which on macOS
-            # often picks up system Python 2.7 and SyntaxErrors.
-            sys.executable,
+            # The test process's own interpreter normally; in compat mode the
+            # pinned old server's venv python (server_executable()). Never bare
+            # "python" — that resolves against PATH and on macOS can pick up
+            # system Python 2.7 and SyntaxError.
+            server_executable(),
             "-m",
             "omnigent.cli",
             "server",
@@ -185,6 +184,9 @@ def start_live_server(
             str(artifact_dir),
         ],
         env=env,
+        # Compat mode: neutral CWD so the worktree's omnigent/ on sys.path[0]
+        # doesn't shadow the pinned old install. None (inherit) otherwise.
+        cwd=compat_server_cwd(),
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )

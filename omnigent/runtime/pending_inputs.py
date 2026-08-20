@@ -122,6 +122,14 @@ class DrainedInput:
 
 
 @dataclass
+class MatchedDrain:
+    """Result from draining pending inputs up to a text-matched entry."""
+
+    matched: DrainedInput | None
+    skipped: list[DrainedInput]
+
+
+@dataclass
 class _Entry:
     """
     One un-consumed web-composer user message.
@@ -276,6 +284,51 @@ def resolve_oldest(conversation_id: str) -> DrainedInput | None:
         )
 
 
+def resolve_matching_text(conversation_id: str, text: str) -> MatchedDrain:
+    """
+    Drain through the first pending entry whose text matches ``text``.
+
+    Kiro persists accepted web prompts as structured ``Prompt`` records. If an
+    earlier injected web message errors before Kiro records a prompt, FIFO
+    draining would consume that failed entry when the next successful prompt is
+    mirrored, leaving the successful prompt stuck pending. This resolver lets
+    Kiro match the accepted prompt text and returns any older skipped entries so
+    the caller can surface them as failed web injections.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param text: Accepted prompt text mirrored from Kiro's structured JSONL.
+    :returns: Matched entry plus older skipped entries, or no match with an
+        empty skipped list when the text was typed directly in the TUI.
+    """
+    needle = _normalize_text(text)
+    if not needle:
+        return MatchedDrain(matched=None, skipped=[])
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entries = _pending.get(conversation_id)
+        if entries is None:
+            return MatchedDrain(matched=None, skipped=[])
+        ordered = list(entries.items())
+        match_index: int | None = None
+        for index, (_pending_id, entry) in enumerate(ordered):
+            entry_text = _normalize_text(_content_text(entry.content))
+            if entry_text and (needle == entry_text or needle.endswith(entry_text)):
+                match_index = index
+                break
+        if match_index is None:
+            return MatchedDrain(matched=None, skipped=[])
+        skipped_entries = ordered[:match_index]
+        _matched_id, matched_entry = ordered[match_index]
+        for pending_id, _entry in ordered[: match_index + 1]:
+            entries.pop(pending_id, None)
+        if not entries:
+            _pending.pop(conversation_id, None)
+        return MatchedDrain(
+            matched=_drained_input(matched_entry),
+            skipped=[_drained_input(entry) for _pending_id, entry in skipped_entries],
+        )
+
+
 def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
     """
     Return un-consumed messages for one session, for snapshot replay.
@@ -314,6 +367,34 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
             }
             for entry in entries.values()
         ]
+
+
+def _drained_input(entry: _Entry) -> DrainedInput:
+    """Copy a pending entry into the public drained shape."""
+    return DrainedInput(
+        pending_id=entry.pending_id,
+        content=copy.deepcopy(entry.content),
+        created_by=entry.created_by,
+    )
+
+
+def _content_text(content: list[dict[str, Any]]) -> str:
+    """Extract text blocks from a pending-input content list."""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type in {"input_text", "text", "output_text"}:
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def _normalize_text(text: str) -> str:
+    """Normalize text enough to compare pending input with Kiro Prompt text."""
+    return " ".join(text.split())
 
 
 def reset_for_tests() -> None:

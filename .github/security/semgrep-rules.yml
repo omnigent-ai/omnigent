@@ -1,0 +1,63 @@
+# Custom semgrep rules for the contributor Security Scan (pass 1).
+# Run LOCALLY (semgrep --config this-file) so the scan needs no network to the
+# semgrep registry. These target code-execution / exfiltration shapes that an
+# untrusted PR might smuggle in; registry packs (p/ci, p/secrets) can be added
+# later as an additive, network-permitting step.
+rules:
+  - id: exec-on-decoded-payload
+    languages: [python]
+    severity: ERROR
+    message: >
+      Executing a decoded/deobfuscated payload (base64/hex/zlib -> eval/exec).
+      This is the canonical way to hide a backdoor from review.
+    patterns:
+      - pattern-either:
+          - pattern: eval(...)
+          - pattern: exec(...)
+      - pattern-either:
+          - pattern: eval(base64.$F(...))
+          - pattern: exec(base64.$F(...))
+          - pattern: eval(bytes.fromhex(...))
+          - pattern: exec(bytes.fromhex(...))
+          - pattern: eval(codecs.decode(...))
+          - pattern: exec(codecs.decode(...))
+          - pattern: eval(zlib.decompress(...))
+          - pattern: exec(zlib.decompress(...))
+          - pattern: eval($X.decode(...))
+          - pattern: exec($X.decode(...))
+
+  - id: python-shell-pipe-to-interpreter
+    languages: [python]
+    severity: ERROR
+    message: >
+      A subprocess/os.system call pipes a downloaded script straight into a
+      shell/interpreter (curl|wget ... | sh/bash/python). Runs arbitrary
+      remote code.
+    patterns:
+      - pattern-either:
+          - pattern: os.system($CMD)
+          - pattern: os.popen($CMD)
+          - pattern: subprocess.$F($CMD, ...)
+          - pattern: subprocess.$F($CMD)
+      - metavariable-regex:
+          metavariable: $CMD
+          regex: (?i).*(curl|wget)\b.*\|\s*(sudo\s+)?(sh|bash|zsh|python[0-9.]*|node|ruby|perl)\b.*
+
+  - id: shell-pipe-to-interpreter
+    languages: [bash]
+    severity: ERROR
+    message: >
+      Piping a downloaded script straight into a shell/interpreter. Runs
+      arbitrary remote code in CI.
+    patterns:
+      - pattern-regex: (?i)(curl|wget)\b[^\n|]*\|\s*(sudo\s+)?(sh|bash|zsh|python[0-9.]*|node|ruby|perl)\b
+
+  - id: dynamic-import-from-network
+    languages: [python]
+    severity: WARNING
+    message: >
+      Dynamic import / module loading at runtime. Verify the source is trusted
+      and not attacker-controlled.
+    pattern-either:
+      - pattern: importlib.import_module($X)
+      - pattern: __import__($X)

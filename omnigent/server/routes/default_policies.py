@@ -25,6 +25,8 @@ from sqlalchemy.exc import IntegrityError
 from omnigent.entities import Policy
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.registry import is_registered_handler, validate_factory_params
+from omnigent.runtime import get_caps
+from omnigent.runtime.policies.builder import invalidate_default_policy_specs_cache
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id
 from omnigent.server.schemas import (
@@ -32,17 +34,22 @@ from omnigent.server.schemas import (
     CreateDefaultPolicyRequest,
     UpdateDefaultPolicyRequest,
 )
+from omnigent.spec.types import FunctionPolicySpec
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
+from omnigent.telemetry import emit as _tel_emit
+from omnigent.telemetry.events import PolicyDeletedEvent as _TelPolicyDeletedEvent
+from omnigent.telemetry.events import PolicyRegisteredEvent as _TelPolicyRegisteredEvent
+from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 
 
 def _generate_default_policy_id() -> str:
     """Generate a unique default policy identifier.
 
-    :returns: A string of the form ``"pol_<32-char hex>"``,
-        e.g. ``"pol_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+    :returns: A bare 32-char hex uuid,
+        e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
     """
-    return f"pol_{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 def _entity_to_response(policy: Policy) -> dict[str, Any]:
@@ -64,6 +71,41 @@ def _entity_to_response(policy: Policy) -> dict[str, Any]:
     }
     if policy.factory_params is not None:
         result["factory_params"] = policy.factory_params
+    return result
+
+
+def _config_policies_to_response() -> list[dict[str, Any]]:
+    """Return config-file policies from :class:`RuntimeCaps` as response dicts.
+
+    These are YAML-loaded policies that are applied server-wide but not stored
+    in the database. They appear in the list as read-only entries (``source:
+    "config"``) so operators can see what the server config contributes.
+
+    Only :class:`~omnigent.spec.types.FunctionPolicySpec` entries are included
+    — those are the only type the admin UI knows how to display.
+
+    :returns: List of response dicts, one per config-file policy.
+    """
+    caps = get_caps()
+    result = []
+    for spec in caps.default_policies:
+        if not isinstance(spec, FunctionPolicySpec) or spec.function is None:
+            continue
+        entry: dict[str, Any] = {
+            "id": None,
+            "object": "default_policy",
+            "source": "config",
+            "name": spec.name,
+            "type": "python",
+            "handler": spec.function.path,
+            "enabled": True,
+            "created_at": None,
+            "updated_at": None,
+            "created_by": None,
+        }
+        if spec.function.arguments:
+            entry["factory_params"] = spec.function.arguments
+        result.append(entry)
     return result
 
 
@@ -145,23 +187,28 @@ def create_default_policies_router(
             already exists.
         """
         user_id = await _require_admin(request, auth_provider, permission_store)
-        if body.type == "python":
-            # Restrict handlers to the registry allowlist.
-            # Admins are not exempt: a custom handler must be added via
-            # the ``policy_modules`` config so it appears in the registry,
-            # rather than being named ad hoc here. This keeps a single
-            # allowlist and blocks arbitrary callable injection.
-            if not is_registered_handler(body.handler):
-                raise OmnigentError(
-                    f"Policy handler '{body.handler}' is not registered. Add the "
-                    f"module that declares it to the server's 'policy_modules' "
-                    f"config so it appears in the policy registry.",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            # Validate factory_params against the registry schema.
-            validation_error = validate_factory_params(body.handler, body.factory_params)
-            if validation_error:
-                raise OmnigentError(validation_error, code=ErrorCode.INVALID_INPUT)
+        if body.type != "python":
+            raise OmnigentError(
+                f"Default policies only support type='python'; type={body.type!r} "
+                f"cannot be evaluated. URL policy evaluation is a future extension.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        # Restrict handlers to the registry allowlist.
+        # Admins are not exempt: a custom handler must be added via
+        # the ``policy_modules`` config so it appears in the registry,
+        # rather than being named ad hoc here. This keeps a single
+        # allowlist and blocks arbitrary callable injection.
+        if not is_registered_handler(body.handler):
+            raise OmnigentError(
+                f"Policy handler '{body.handler}' is not registered. Add the "
+                f"module that declares it to the server's 'policy_modules' "
+                f"config so it appears in the policy registry.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        # Validate factory_params against the registry schema.
+        validation_error = validate_factory_params(body.handler, body.factory_params)
+        if validation_error:
+            raise OmnigentError(validation_error, code=ErrorCode.INVALID_INPUT)
         policy_id = _generate_default_policy_id()
         try:
             policy = store.create_default(
@@ -177,6 +224,27 @@ def create_default_policies_router(
                 f"Default policy with name '{body.name}' already exists",
                 code=ErrorCode.CONFLICT,
             ) from exc
+        invalidate_default_policy_specs_cache()
+        try:
+            import hashlib as _hashlib
+
+            _srv_id = _get_installation_id()
+            _anon: str | None = None
+            if user_id is not None:
+                _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _tel_emit(
+                _TelPolicyRegisteredEvent(
+                    installation_id=_srv_id,
+                    handler=policy.handler,
+                    policy_type=policy.type,
+                    scope="admin",
+                    session_id=None,
+                    anon_user_id=_anon,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return _entity_to_response(policy)
 
     @router.get("/policies")
@@ -201,7 +269,9 @@ def create_default_policies_router(
                 code=ErrorCode.UNAUTHORIZED,
             )
         policies = store.list_defaults()
-        return {"object": "list", "data": [_entity_to_response(p) for p in policies]}
+        data = [_entity_to_response(p) for p in policies]
+        data.extend(_config_policies_to_response())
+        return {"object": "list", "data": data}
 
     @router.get("/policies/{policy_id}")
     async def get_policy(
@@ -291,6 +361,7 @@ def create_default_policies_router(
             ) from exc
         if policy is None:
             raise OmnigentError("Policy not found", code=ErrorCode.NOT_FOUND)
+        invalidate_default_policy_specs_cache()
         return _entity_to_response(policy)
 
     @router.delete("/policies/{policy_id}")
@@ -311,8 +382,27 @@ def create_default_policies_router(
         :raises OmnigentError: 401/403 if the user lacks admin
             privileges.
         """
-        await _require_admin(request, auth_provider, permission_store)
+        user_id = await _require_admin(request, auth_provider, permission_store)
         store.delete_default(policy_id)
+        invalidate_default_policy_specs_cache()
+        try:
+            import hashlib as _hashlib
+
+            _srv_id = _get_installation_id()
+            _anon: str | None = None
+            if user_id is not None:
+                _salt = f"{_srv_id}:{user_id}" if _srv_id else user_id
+                _anon = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _tel_emit(
+                _TelPolicyDeletedEvent(
+                    installation_id=_srv_id,
+                    scope="admin",
+                    session_id=None,
+                    anon_user_id=_anon,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return {"deleted": True}
 
     return router

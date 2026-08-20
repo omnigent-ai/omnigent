@@ -6,9 +6,13 @@ import asyncio
 import contextvars
 import logging
 import os
-import resource
 import sys
 import time
+
+try:
+    import resource  # POSIX-only; absent on Windows.
+except ImportError:  # pragma: no cover - exercised only on Windows
+    resource = None  # type: ignore[assignment]
 from collections import deque
 from dataclasses import dataclass
 from threading import Lock
@@ -18,11 +22,25 @@ from opentelemetry import metrics as otel_metrics
 from opentelemetry.util.types import Attributes
 from uvicorn.logging import AccessFormatter
 
+from omnigent.process_logging import log_record_display_fields
+
 _DEFAULT_WINDOWS_SECONDS = (1.0, 10.0, 30.0)
 _BYTES_PER_MIB = 1024 * 1024
 _OTEL_METER_NAME = "omnigent.server.performance"
 _REQUEST_DURATION_CONTEXT: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "omnigent_request_duration_seconds",
+    default=None,
+)
+_REQUEST_ID_CONTEXT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "omnigent_request_id",
+    default=None,
+)
+_REQUEST_USER_AGENT_CONTEXT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "omnigent_request_user_agent",
+    default=None,
+)
+_REQUEST_SESSION_ID_CONTEXT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "omnigent_request_session_id",
     default=None,
 )
 
@@ -171,6 +189,23 @@ class MeterLike(Protocol):
         ...
 
 
+def _sanitize_access_log_value(value: str) -> str:
+    """
+    Make a client-controlled string safe to embed in an access-log line.
+
+    The ``User-Agent`` header and the session ID parsed from the URL path
+    are both attacker-controlled. Replaces control characters (CR, LF,
+    NUL, ANSI escape sequences, ...) and the double-quote delimiter with
+    ``?`` so a crafted value cannot forge additional log records, corrupt
+    the quoted ``ua`` field, or smuggle terminal escapes into log viewers
+    (CWE-117).
+
+    :param value: Raw, untrusted string to embed in the access log.
+    :returns: Value containing only printable, non-quote characters.
+    """
+    return "".join(char if char.isprintable() and char != '"' else "?" for char in value)
+
+
 class RequestDurationAccessFormatter(AccessFormatter):
     """
     Uvicorn access formatter that appends Omnigent request duration.
@@ -182,23 +217,56 @@ class RequestDurationAccessFormatter(AccessFormatter):
     line keeps Uvicorn's standard access-log shape.
     """
 
+    _MAX_USER_AGENT_LENGTH = 80
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Apply Omnigent's standard source and level display fields."""
+        fmt = getattr(self._style, "_fmt", "")
+        with log_record_display_fields(
+            record,
+            use_colors=self.use_colors,
+            format_level="%(levelprefix)" not in fmt,
+        ):
+            return super().format(record)
+
     def formatMessage(self, record: logging.LogRecord) -> str:
         """
-        Format one Uvicorn access record with optional duration.
+        Format one Uvicorn access record with request context.
+
+        Appends duration, request ID, User-Agent, and session ID when
+        available.  Example output::
+
+            GET /v1/sessions/conv_abc HTTP/1.1 200 2.5ms rid=a1b2c3d4 ua="httpx/0.27" sid=conv_abc
 
         :param record: Logging record emitted by Uvicorn's access
             logger.
-        :returns: Uvicorn's access message with a millisecond suffix when
-            Omnigent recorded a duration for the current request.
+        :returns: Enriched access message.
         """
         message = super().formatMessage(record)
-        duration_seconds = _REQUEST_DURATION_CONTEXT.get()
-        if duration_seconds is None:
-            return message
+        parts: list[str] = [message]
         try:
-            return f"{message} {duration_seconds * 1000.0:.1f}ms"
+            duration_seconds = _REQUEST_DURATION_CONTEXT.get()
+            if duration_seconds is not None:
+                parts.append(f"{duration_seconds * 1000.0:.1f}ms")
+
+            request_id = _REQUEST_ID_CONTEXT.get()
+            if request_id is not None:
+                parts.append(f"rid={request_id}")
+
+            user_agent = _REQUEST_USER_AGENT_CONTEXT.get()
+            if user_agent is not None:
+                truncated = user_agent[: self._MAX_USER_AGENT_LENGTH]
+                parts.append(f'ua="{_sanitize_access_log_value(truncated)}"')
+
+            session_id = _REQUEST_SESSION_ID_CONTEXT.get()
+            if session_id is not None:
+                parts.append(f"sid={_sanitize_access_log_value(session_id)}")
         finally:
             _REQUEST_DURATION_CONTEXT.set(None)
+            _REQUEST_ID_CONTEXT.set(None)
+            _REQUEST_USER_AGENT_CONTEXT.set(None)
+            _REQUEST_SESSION_ID_CONTEXT.set(None)
+        return " ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -496,6 +564,7 @@ class ServerPerformanceMetrics:
         self._active_websockets = 0
         self._total_processing_seconds = 0.0
         self._max_processing_seconds = 0.0
+        self._route_counts: dict[str, int] = {}
         self._last_snapshot_wall = clock()
         self._last_snapshot_cpu = process_time_fn()
 
@@ -544,6 +613,33 @@ class ServerPerformanceMetrics:
             )
             self._prune_locked(now)
         return duration_seconds
+
+    def record_route(self, method: str, route: str) -> None:
+        """
+        Increment the per-route request counter for ``"METHOD route"``.
+
+        The route is the low-cardinality FastAPI template (e.g.
+        ``"/v1/sessions/{session_id}"``), so the key space is bounded by the
+        number of registered routes and the map stays small. Used only for
+        offline analysis (the benchmark harness's per-journey request
+        breakdown); the aggregate counters above drive live metrics.
+
+        :param method: HTTP request method, e.g. ``"GET"``.
+        :param route: Matched route template, e.g. ``"/v1/sessions"``.
+        """
+        key = f"{method} {route}"
+        with self._lock:
+            self._route_counts[key] = self._route_counts.get(key, 0) + 1
+
+    def route_counts(self) -> dict[str, int]:
+        """
+        Return a copy of the cumulative per-route request counts.
+
+        :returns: ``"METHOD route"`` mapped to the number of requests handled
+            since process start.
+        """
+        with self._lock:
+            return dict(self._route_counts)
 
     def websocket_connected(self) -> None:
         """
@@ -967,6 +1063,37 @@ def set_request_duration_for_access_log(duration_seconds: float | None) -> None:
     _REQUEST_DURATION_CONTEXT.set(duration_seconds)
 
 
+def set_request_id_for_access_log(request_id: str | None) -> None:
+    """
+    Store the request correlation ID for Uvicorn access formatting.
+
+    :param request_id: UUID hex identifying this request, or ``None``
+        to clear.
+    """
+    _REQUEST_ID_CONTEXT.set(request_id)
+
+
+def set_request_user_agent_for_access_log(user_agent: str | None) -> None:
+    """
+    Store the User-Agent header for Uvicorn access formatting.
+
+    :param user_agent: Raw ``User-Agent`` header value, or ``None``
+        to clear.
+    """
+    _REQUEST_USER_AGENT_CONTEXT.set(user_agent)
+
+
+def set_request_session_id_for_access_log(session_id: str | None) -> None:
+    """
+    Store the session ID for Uvicorn access formatting.
+
+    :param session_id: Session/conversation ID extracted from the
+        request path, or ``None`` when the path does not target a
+        session.
+    """
+    _REQUEST_SESSION_ID_CONTEXT.set(session_id)
+
+
 async def publish_server_metrics_periodically(
     metrics: ServerPerformanceMetrics,
     *,
@@ -1009,10 +1136,11 @@ def _current_rss_bytes() -> int:
     """
     Return process resident memory in bytes.
 
-    Linux exposes current RSS in ``/proc/self/status``. Other
-    supported platforms fall back to ``resource.getrusage``; that
-    value is maximum resident set size, which is the best stdlib-only
-    option available on macOS.
+    Linux exposes current RSS in ``/proc/self/status``. macOS falls
+    back to ``resource.getrusage().ru_maxrss`` (maximum RSS, the best
+    stdlib-only option there). Windows has no ``resource`` module, so it
+    falls back to :mod:`psutil` (a core dependency), which reports true
+    current RSS.
 
     :returns: Resident memory in bytes.
     """
@@ -1027,7 +1155,12 @@ def _current_rss_bytes() -> int:
     except (FileNotFoundError, OSError, ValueError):
         pass
 
-    usage = resource.getrusage(resource.RUSAGE_SELF)
-    if sys.platform == "darwin":
-        return int(usage.ru_maxrss)
-    return int(usage.ru_maxrss) * 1024
+    if resource is not None:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        if sys.platform == "darwin":
+            return int(usage.ru_maxrss)
+        return int(usage.ru_maxrss) * 1024
+
+    import psutil  # type: ignore[import-untyped]
+
+    return int(psutil.Process().memory_info().rss)

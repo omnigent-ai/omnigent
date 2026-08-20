@@ -37,7 +37,7 @@ import contextlib
 import io
 import json
 import tarfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -143,6 +143,14 @@ class FakeProcessManager:
 
     def has_active_turn(self, conversation_id: str) -> bool:
         return conversation_id in self._in_flight
+
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        # Mirror the real manager: the runner registers the live turn on
+        # response.created so the idle reaper spares it.
+        self._in_flight[conversation_id] = response_id
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        self._in_flight.pop(conversation_id, None)
 
     async def release(self, conversation_id: str) -> None:
         client = self._clients.pop(conversation_id, None)
@@ -440,6 +448,7 @@ async def tunnel_three_layer_stack(tmp_path: Path) -> AsyncIterator[_TunnelStack
             coro_qualname = getattr(task.get_coro(), "__qualname__", "")
             if (
                 task.get_name().startswith("runner-relay-")
+                or task.get_name().startswith("runner-disconnect-grace-")
                 or "_relay_runner_stream" in coro_qualname
             ):
                 loop_tasks.append(task)
@@ -813,6 +822,7 @@ async def test_repl_adapter_resume_rebinds_via_ws_tunnel(
 @pytest.mark.asyncio
 async def test_on_runner_connect_restarts_relay_via_router(
     tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reconnect hook restarts relays via the router.
 
@@ -831,6 +841,12 @@ async def test_on_runner_connect_restarts_relay_via_router(
     from omnigent.server.routes import sessions as sessions_routes
     from omnigent.server.routes.sessions import _runner_relay_tasks
 
+    # Zero the reconnect grace: this test needs the deregistered relay to
+    # die promptly so the reconnect hook's restart path is what revives it.
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
     ap_client = tunnel_three_layer_stack.ap_client
     ap_app = tunnel_three_layer_stack.ap_app
     fake_pm = tunnel_three_layer_stack.fake_pm
@@ -1030,7 +1046,501 @@ async def test_on_runner_connect_restarts_relay_via_router(
                 await new_communicator.wait(timeout=2.0)
 
 
+@contextlib.asynccontextmanager
+async def _reconnect_fires_connect_hook(
+    ap_app: FastAPI,
+    fake_pm: Any,
+    *,
+    wait_for_recover: str,
+) -> AsyncIterator[list[str]]:
+    """Drive a real tunnel disconnect/reconnect so ``_on_runner_connect`` fires.
+
+    Deregisters ``_RUNNER_ID`` then opens a fresh WS + hello, which is
+    the production trigger for the connect hook. Stubs the router
+    resolver + ``_ensure_runner_relay`` so the hook does not spawn a real
+    SSE relay against a stub client, and wraps the REAL
+    ``_publish_runner_recovered_status`` with a spy that records
+    completion (the closure re-imports it from the module on each call,
+    so the patch is picked up). Waits until the recovery helper has run
+    to completion for ``wait_for_recover`` before yielding, so callers
+    can assert on the post-recovery state.
+
+    :yields: The list of session ids the recovery helper ran for.
+    """
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.server.routes import sessions as sessions_routes
+
+    router = ap_app.state.runner_router
+    real_resolver = router.client_for_session_resources
+
+    class _StubResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class _StubClient:
+        async def post(self, *args: Any, **kwargs: Any) -> _StubResponse:
+            return _StubResponse()
+
+    def _spy_resolver(conv_id: str):  # type: ignore[no-untyped-def]
+        real_routed = real_resolver(conv_id)
+        return RoutedRunner(runner_id=real_routed.runner_id, client=_StubClient())  # type: ignore[arg-type]
+
+    router.client_for_session_resources = _spy_resolver  # type: ignore[method-assign]
+
+    real_ensure = sessions_routes._ensure_runner_relay
+
+    def _stub_ensure(sid, rid, client, store=None):  # type: ignore[no-untyped-def]
+        return None
+
+    sessions_routes._ensure_runner_relay = _stub_ensure  # type: ignore[assignment]
+
+    # Wrap (not replace) the real recovery helper so the narrowed
+    # disconnect-vs-failure guard is exercised, and record completion so
+    # the test can wait for a deterministic signal rather than sleeping.
+    real_recover = sessions_routes._publish_runner_recovered_status
+    recovered_calls: list[str] = []
+
+    async def _spy_recover(sid, store, **kwargs):  # type: ignore[no-untyped-def]
+        await real_recover(sid, store, **kwargs)
+        recovered_calls.append(sid)
+
+    sessions_routes._publish_runner_recovered_status = _spy_recover  # type: ignore[assignment]
+
+    communicator: ApplicationCommunicator | None = None
+    forwarder_task: asyncio.Task[None] | None = None
+    try:
+        ap_app.state.tunnel_registry.deregister(_RUNNER_ID)
+
+        communicator = await _connect_runner_tunnel(ap_app, _RUNNER_ID)
+        await _send_hello_and_wait(
+            communicator,
+            ap_app,
+            _RUNNER_ID,
+            harnesses=[_TEST_HARNESS_NAME],
+        )
+
+        async def _resolve_spec(agent_id: str) -> Any:
+            return None
+
+        new_runner_app = create_runner_app(
+            process_manager=fake_pm,
+            spec_resolver=_resolve_spec,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+        )
+        forwarder_task = asyncio.create_task(
+            _forward_requests_to_runner(communicator, new_runner_app),
+            name="tunnel-recover-reconnect-forwarder",
+        )
+
+        async def _recovered() -> None:
+            while wait_for_recover not in recovered_calls:
+                await asyncio.sleep(0.02)
+
+        try:
+            await asyncio.wait_for(_recovered(), timeout=5.0)
+        except asyncio.TimeoutError:
+            raise AssertionError(
+                "Reconnect did not drive _on_runner_connect to call "
+                f"_publish_runner_recovered_status for {wait_for_recover!r} "
+                f"within 5s. recovered_calls={recovered_calls}"
+            ) from None
+
+        yield recovered_calls
+    finally:
+        router.client_for_session_resources = real_resolver  # type: ignore[method-assign]
+        sessions_routes._ensure_runner_relay = real_ensure  # type: ignore[assignment]
+        sessions_routes._publish_runner_recovered_status = real_recover  # type: ignore[assignment]
+        if forwarder_task is not None:
+            forwarder_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await forwarder_task
+        if communicator is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await communicator.send_input(
+                    {"type": "websocket.disconnect", "code": 1000},
+                )
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                await communicator.wait(timeout=2.0)
+
+
+async def _bind_failed_session(
+    ap_client: httpx.AsyncClient,
+    *,
+    error_code: str,
+    error_message: str,
+) -> str:
+    """Create a session, bind it to ``_RUNNER_ID`` (no relay), mark it failed.
+
+    Binds via the store directly (like the sibling session in
+    ``test_on_runner_connect_restarts_relay_via_router``) because a
+    PATCH-bind would spawn a relay whose teardown races the reconnect.
+    Then stamps the ``failed`` cache status + persisted
+    ``last_task_error`` labels a real disconnect / task failure leaves
+    behind, so the reconnect hook sees an authentic pre-recovery state.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+
+    store = get_conversation_store()
+    store.replace_runner_id(session_id, _RUNNER_ID)
+    sessions_module._session_status_cache[session_id] = "failed"
+    await sessions_module._persist_session_status_error_labels(
+        session_id,
+        ErrorDetail(code=error_code, message=error_message),
+        store,
+    )
+    return session_id
+
+
+@pytest.fixture()
+def _isolated_session_status_cache() -> Iterator[None]:
+    """Snapshot + clear + restore the module-global session-status cache.
+
+    ``_session_status_cache`` lives at module scope in the sessions
+    route, so it survives across tests while each test rebuilds its own
+    conversation store on a fresh ``tmp_path`` DB. A prior test can leave
+    entries behind (and per-test session ids can collide), which makes
+    the reconnect-recovery assertions non-deterministic when the whole
+    suite runs. Start each guarded test from an empty cache and restore
+    the pre-test contents afterward so nothing leaks in either direction.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    saved = dict(sessions_module._session_status_cache)
+    sessions_module._session_status_cache.clear()
+    try:
+        yield
+    finally:
+        sessions_module._session_status_cache.clear()
+        sessions_module._session_status_cache.update(saved)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_on_runner_connect_clears_disconnect_failure_on_idle_reconnect(
+    tunnel_three_layer_stack: _TunnelStack,
+) -> None:
+    """Reconnect-to-idle clears a persisted ``runner_disconnected`` failure.
+
+    A transient WS blip drops and reconnects a runner whose process
+    survived, with no new turn. The disconnect left the session marked
+    ``failed`` with persisted ``runner_disconnected`` labels; before this
+    wiring nothing cleared them until the next user message, so the
+    Subagents panel kept the grey "Disconnected" dot forever. Drives a
+    real tunnel reconnect (which fires ``_on_runner_connect``) and asserts
+    the session leaves ``failed`` and the disconnect labels are cleared —
+    WITHOUT sending any message.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+    fake_pm = tunnel_three_layer_stack.fake_pm
+
+    session_id = await _bind_failed_session(
+        ap_client,
+        error_code="runner_disconnected",
+        error_message="Runner disconnected unexpectedly.",
+    )
+    store = get_conversation_store()
+
+    # Sanity: this is the exact state a real tunnel drop leaves behind.
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    assert sessions_module._last_task_error_from_labels(conv.labels) == {
+        "code": "runner_disconnected",
+        "message": "Runner disconnected unexpectedly.",
+    }
+    assert sessions_module._session_status_cache.get(session_id) == "failed"
+
+    try:
+        # Assert INSIDE the block: the context manager's teardown closes
+        # the tunnel, which re-fires ``_on_runner_disconnect`` and would
+        # re-mark the session failed. We want the reconnect-recovery state.
+        async with _reconnect_fires_connect_hook(ap_app, fake_pm, wait_for_recover=session_id):
+            # No message was sent — the reconnect alone cleared the stale
+            # disconnect failure.
+            assert sessions_module._session_status_cache.get(session_id) != "failed"
+            cleared = store.get_conversation(session_id)
+            assert cleared is not None
+            assert sessions_module._last_task_error_from_labels(cleared.labels) is None
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_on_runner_connect_preserves_genuine_failure_on_reconnect(
+    tunnel_three_layer_stack: _TunnelStack,
+) -> None:
+    """Reconnect must NOT erase a genuine (non-disconnect) task failure.
+
+    A runner reconnect proves the tunnel is healthy again, which
+    invalidates a benign disconnect failure — but says nothing about a
+    real task error. A session that genuinely failed (a
+    ``last_task_error`` code other than ``runner_disconnected``) must keep
+    its ``failed`` state and error labels across the reconnect. Drives the
+    real ``_on_runner_connect`` and asserts the failure survives.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+    fake_pm = tunnel_three_layer_stack.fake_pm
+
+    session_id = await _bind_failed_session(
+        ap_client,
+        error_code="runner_error",
+        error_message="Turn failed: agent raised.",
+    )
+    store = get_conversation_store()
+
+    try:
+        async with _reconnect_fires_connect_hook(ap_app, fake_pm, wait_for_recover=session_id):
+            # The recovery helper ran (the hook called it) but self-guarded:
+            # a genuine failure is not a stale disconnect, so status + labels
+            # are untouched.
+            assert sessions_module._session_status_cache.get(session_id) == "failed"
+            survived = store.get_conversation(session_id)
+            assert survived is not None
+            assert sessions_module._last_task_error_from_labels(survived.labels) == {
+                "code": "runner_error",
+                "message": "Turn failed: agent raised.",
+            }
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_runner_disconnect_grace_defers_failed_marking(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel drop marks sessions failed only after the reconnect grace.
+
+    Drives a real WS disconnect for a dedicated runner whose session is
+    seeded mid-turn (``running`` — offline reconciliation only fails
+    interrupted turns) and asserts (a) the session is NOT failed inside
+    the grace, (b) it IS failed once the grace expires with the runner
+    still gone, and (c) a reconnect inside the grace suppresses the
+    marking entirely.
+    """
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+
+    grace = 0.4
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+
+    # The connect hook fires on every hello for the bound session; stub
+    # the resolver + relay spawn so it cannot hang on this pump-less WS.
+    class _StubResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class _StubClient:
+        async def post(self, *args: Any, **kwargs: Any) -> _StubResponse:
+            return _StubResponse()
+
+    router = ap_app.state.runner_router
+    real_resolver = router.client_for_session_resources
+
+    def _stub_resolver(conv_id: str):  # type: ignore[no-untyped-def]
+        real_routed = real_resolver(conv_id)
+        return RoutedRunner(runner_id=real_routed.runner_id, client=_StubClient())  # type: ignore[arg-type]
+
+    monkeypatch.setattr(router, "client_for_session_resources", _stub_resolver)
+
+    def _stub_ensure(sid, rid, client, store=None):  # type: ignore[no-untyped-def]
+        return None
+
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay", _stub_ensure)
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    # Bind via the store (no relay) to a runner whose WS this test owns.
+    runner_id = "runner-grace-timer"
+    get_conversation_store().replace_runner_id(session_id, runner_id)
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+
+    reconnect_communicator: ApplicationCommunicator | None = None
+    try:
+        # (a) Drop the tunnel. The disconnect hook has completed by the
+        # time the ASGI app exits, so the grace timer is armed — but the
+        # failed flip must not have happened yet.
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await communicator.wait(timeout=2.0)
+        assert sessions_module._session_status_cache.get(session_id) != "failed", (
+            "session failed immediately on disconnect — the grace window "
+            "is not deferring the failed-marking"
+        )
+
+        # (b) Past the grace with the runner still gone, the marking lands.
+        async def _marked_failed() -> None:
+            while sessions_module._session_status_cache.get(session_id) != "failed":
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(_marked_failed(), timeout=grace * 10)
+
+        # (c) Drop again, but reconnect inside the grace: no failed flip.
+        communicator2 = await _connect_runner_tunnel(ap_app, runner_id)
+        await _send_hello_and_wait(
+            communicator2, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
+        )
+        sessions_module._session_status_cache[session_id] = "running"
+        await communicator2.send_input({"type": "websocket.disconnect", "code": 1000})
+        await communicator2.wait(timeout=2.0)
+        reconnect_communicator = await _connect_runner_tunnel(ap_app, runner_id)
+        await _send_hello_and_wait(
+            reconnect_communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
+        )
+        await asyncio.sleep(grace * 2)
+        assert sessions_module._session_status_cache.get(session_id) != "failed", (
+            "reconnect inside the grace did not suppress the failed-marking"
+        )
+    finally:
+        if reconnect_communicator is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reconnect_communicator.send_input(
+                    {"type": "websocket.disconnect", "code": 1000},
+                )
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                await reconnect_communicator.wait(timeout=2.0)
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
 # TODO: factor ``FakeProcessManager`` and ``_build_harness_agent_bundle``
 # out of ``test_sessions_three_layer.py`` + this file into a shared
 # ``_three_layer_helpers.py`` module once a third caller arrives. Kept
 # duplicated for now to keep this PR scoped to fixture + tests only.
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_on_runner_disconnect_spares_idle_sessions_and_labels_interrupted_ones(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real tunnel drop fails only the mid-turn session, with its cause.
+
+    Sub-agents ride their parent's runner, so ``_on_runner_disconnect``
+    sees every session bound to it. It used to mark them all ``failed``
+    with no ``ErrorDetail``, which painted finished sub-agents red and
+    left a failure the UI could not tell from a real one (and that
+    ``_publish_runner_recovered_status`` could not clear, since it
+    matches on the disconnect code). Drives a genuine WS close on a
+    dedicated runner and asserts the idle session is untouched while the
+    running one carries ``runner_disconnected``.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+    runner_id = "runner-offline-reconcile-test"
+
+    # Shrink the reconnect grace so the deferred reconciliation lands
+    # within the test's wait window.
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", 0.05)
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(
+        communicator,
+        ap_app,
+        runner_id,
+        harnesses=[_TEST_HARNESS_NAME],
+    )
+
+    store = get_conversation_store()
+    session_ids: list[str] = []
+    for _ in range(2):
+        create_resp = await ap_client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps({})},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    _build_harness_agent_bundle(),
+                    "application/gzip",
+                ),
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        session_id = create_resp.json()["session_id"]
+        # Bind through the store (not a PATCH) so no relay spawns: this test
+        # is about the app-level fan-out, and a relay would also react to the
+        # close, making the assertion ambiguous about which path ran.
+        store.replace_runner_id(session_id, runner_id)
+        session_ids.append(session_id)
+
+    running_id, idle_id = session_ids
+    sessions_module._session_status_cache[running_id] = "running"
+    sessions_module._session_status_cache[idle_id] = "idle"
+
+    try:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+
+        async def _hook_ran() -> None:
+            while sessions_module._session_status_cache.get(running_id) != "failed":
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_hook_ran(), timeout=5.0)
+
+        # The interrupted turn is failed AND carries the cause, so the client
+        # renders a recoverable "Disconnected" and recovery can clear it.
+        running_conv = store.get_conversation(running_id)
+        assert running_conv is not None
+        assert sessions_module._last_task_error_from_labels(running_conv.labels) == {
+            "code": "runner_disconnected",
+            "message": "Runner disconnected unexpectedly.",
+        }
+
+        # The idle session had no turn to fail: status and labels untouched.
+        assert sessions_module._session_status_cache.get(idle_id) == "idle"
+        idle_conv = store.get_conversation(idle_id)
+        assert idle_conv is not None
+        assert sessions_module._last_task_error_from_labels(idle_conv.labels) is None
+    finally:
+        with contextlib.suppress(asyncio.TimeoutError, Exception):
+            await communicator.wait(timeout=2.0)
+        for session_id in session_ids:
+            sessions_module._session_status_cache.pop(session_id, None)

@@ -5,24 +5,32 @@ The endpoint resolves the opaque terminal resource id back to the
 runner-local registry entry and bridges PTY bytes to the
 browser-facing WebSocket via ``tmux attach``. These tests pin the
 route boundary and registry lookup; the actual PTY bridge is
-exercised by stubbing ``pty.fork`` / ``os.execve`` (the bridge
-logic itself is unit-tested elsewhere via the shared helper).
+exercised by stubbing the bridge spawn boundary or PTY fd (the
+bridge logic itself is unit-tested elsewhere via the shared helper).
 """
 
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
+from omnigent.runner.direct_attach import (
+    allowed_origin_for_server,
+    create_direct_attach_app,
+    start_direct_attach_listener,
+)
 from omnigent.runner.resource_registry import (
     OMNIGENT_REPL_TERMINAL_ROLE,
+    QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
 from omnigent.terminals import TerminalRegistry
@@ -55,6 +63,19 @@ def _seed_registry(
     slot[(instance.name, instance.session_key)] = instance
 
 
+def _patch_attach_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+    on_spawn: Callable[[str, list[str], dict[str, str]], None],
+) -> None:
+    """Patch tmux attach spawn at the bridge boundary."""
+
+    def fake_fork_exec(tmux_path: str, argv: list[str], env: dict[str, str]) -> object:
+        on_spawn(tmux_path, argv, env)
+        raise RuntimeError("child exited")
+
+    monkeypatch.setattr("omnigent.terminals.ws_bridge._fork_exec_pty", fake_fork_exec)
+
+
 def test_runner_resource_attach_spawns_tmux_for_running_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -63,11 +84,9 @@ def test_runner_resource_attach_spawns_tmux_for_running_terminal(
     With a running registry entry, the runner spawns ``tmux attach``
     against the entry's local socket path.
 
-    Intercepts ``pty.fork`` to act as the child branch (returning 0)
-    so ``execve`` runs in the test process; ``execve`` is stubbed to
-    capture argv and the child env. ``_exit`` is raised as an exception so the child
-    branch terminates the test rather than continuing into the
-    parent path.
+    Intercepts the bridge's tmux attach spawn helper to capture argv
+    and child env, then raises so the websocket route unwinds without
+    touching a real PTY or tmux process.
 
     :param tmp_path: Pytest tmp directory.
     :param monkeypatch: Pytest monkeypatch fixture.
@@ -84,28 +103,17 @@ def test_runner_resource_attach_spawns_tmux_for_running_terminal(
     # argv (list) and the child env (dict) land under separate keys.
     captured: dict[str, object] = {}
 
-    def fake_fork() -> tuple[int, int]:
-        return 0, 0
-
-    def fake_execve(path: str, argv: list[str], env: dict[str, str]) -> None:
+    def record_spawn(_path: str, argv: list[str], env: dict[str, str]) -> None:
         captured["argv"] = argv
         captured["env"] = env
-        raise OSError("stop child path")
 
-    exit_exc = RuntimeError("child exited")
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.pty.fork", fake_fork)
-    # Production resolves the absolute tmux path and builds the child env
-    # in the parent; the child calls os.execve (no PATH search, explicit
-    # env) — patch execve, not execv/execvp.
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.os.execve", fake_execve)
-    monkeypatch.setattr(
-        "omnigent.terminals.ws_bridge.os._exit",
-        lambda code: (_ for _ in ()).throw(exit_exc),
-    )
+    _patch_attach_spawn(monkeypatch, record_spawn)
 
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach"
+            # ``?transport=pty`` pins this to the PTY bridge (the one that forks
+            # tmux attach) independent of the global control-mode default.
+            "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?transport=pty"
         ):
             pass
 
@@ -144,33 +152,75 @@ def test_runner_resource_attach_passes_read_only_to_tmux(
     # argv (list) and the child env (dict) land under separate keys.
     captured: dict[str, object] = {}
 
-    def fake_fork() -> tuple[int, int]:
-        return 0, 0
-
-    def fake_execve(path: str, argv: list[str], env: dict[str, str]) -> None:
+    def record_spawn(_path: str, argv: list[str], env: dict[str, str]) -> None:
         captured["argv"] = argv
         captured["env"] = env
-        raise OSError("stop child path")
 
-    exit_exc = RuntimeError("child exited")
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.pty.fork", fake_fork)
-    # Production resolves the absolute tmux path and builds the child env
-    # in the parent; the child calls os.execve (no PATH search, explicit
-    # env) — patch execve, not execv/execvp.
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.os.execve", fake_execve)
-    monkeypatch.setattr(
-        "omnigent.terminals.ws_bridge.os._exit",
-        lambda code: (_ for _ in ()).throw(exit_exc),
-    )
+    _patch_attach_spawn(monkeypatch, record_spawn)
 
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach?read_only=true"
+            "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach"
+            "?read_only=true&transport=pty"
         ):
             pass
 
     assert "-r" in captured["argv"], (
         f"Expected -r with read_only=true, got argv={captured['argv']!r}"
+    )
+
+
+def test_runner_resource_attach_selects_control_bridge_on_transport_query(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``?transport=control`` dispatches to the control-mode bridge, not the PTY one.
+
+    Both bridges share the same signature and browser wire protocol, so the
+    route just picks one. Patch each to record which was invoked and close the
+    socket cleanly, then assert on the selection per query.
+
+    :param tmp_path: Pytest tmp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    registry = TerminalRegistry()
+    _seed_registry(registry, "conv_abc", _make_running_instance("bash", "s1", tmp_path))
+    app = create_runner_app(
+        terminal_registry=registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    calls: list[str] = []
+
+    async def fake_control(websocket, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append("control")
+        await websocket.close()
+
+    async def fake_pty(websocket, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append("pty")
+        await websocket.close()
+
+    monkeypatch.setattr("omnigent.runner.app.bridge_tmux_control_to_websocket", fake_control)
+    monkeypatch.setattr("omnigent.runner.app.bridge_tmux_pty_to_websocket", fake_pty)
+    # Point config resolution at an empty scratch dir so the no-query case is
+    # deterministic regardless of the developer's real ~/.omnigent/config.yaml.
+    # With no terminal.transport configured, control mode is the product default.
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+
+    base = "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/attach"
+    client = TestClient(app)
+    with contextlib.suppress(WebSocketDisconnect):
+        with client.websocket_connect(f"{base}?transport=control"):
+            pass
+    with contextlib.suppress(WebSocketDisconnect):
+        with client.websocket_connect(f"{base}?transport=pty"):
+            pass
+    with contextlib.suppress(WebSocketDisconnect):
+        with client.websocket_connect(base):  # no query → control default
+            pass
+
+    assert calls == ["control", "pty", "control"], (
+        f"transport query did not select the expected bridge: {calls!r}"
     )
 
 
@@ -305,8 +355,8 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
     _seed_registry(registry, "conv_abc", stale)
 
     resource_registry = SessionResourceRegistry(terminal_registry=registry)
-    # Role stamped at auto-create time in production (launch_terminal's
-    # resource_role); seeded directly here to avoid spawning real tmux.
+    # Role stamped at auto-create time in production (resource_role);
+    # seeded directly here to avoid spawning real tmux.
     resource_registry._terminal_roles[("conv_abc", "terminal_tui_main")] = (
         OMNIGENT_REPL_TERMINAL_ROLE
     )
@@ -331,6 +381,7 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
         publish_event: object,
         *,
         server_client: object,
+        agent_spec: object = None,
     ) -> SessionResourceView:
         """
         Stand-in for ``_auto_create_repl_terminal`` that registers a
@@ -340,6 +391,9 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
         :param rr: The runner's resource registry (unused by the stub).
         :param publish_event: Per-session SSE emitter (unused).
         :param server_client: Omnigent server client (unused).
+        :param agent_spec: Resolved session agent spec threaded by the
+            recreate path so the REPL terminal inherits the agent sandbox
+            (unused by the stub).
         :returns: Terminal resource view for the fresh pane.
         """
         auto_create_sessions.append(session_id)
@@ -355,37 +409,16 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
 
     attach_argvs: list[list[str]] = []
 
-    def fake_fork() -> tuple[int, int]:
-        """Drive the child branch of ``pty.fork`` in-process.
-
-        :returns: ``(0, 0)`` — pid 0 selects the child path.
-        """
-        return 0, 0
-
-    def fake_execve(path: str, argv: list[str], env: dict[str, str]) -> None:
-        """Capture the tmux attach argv instead of exec'ing.
-
-        :param path: Absolute tmux binary path (unused).
-        :param argv: Full attach argv, recorded per-attach so the
-            test can assert which socket each bridge targeted.
-        :param env: Child env built in the parent (unused here; the
-            TERM pin is asserted by the spawns_tmux test above).
-        """
+    def record_spawn(_path: str, argv: list[str], _env: dict[str, str]) -> None:
+        """Capture the tmux attach argv instead of spawning."""
         attach_argvs.append(argv)
-        raise OSError("stop child path")
 
-    exit_exc = RuntimeError("child exited")
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.pty.fork", fake_fork)
-    monkeypatch.setattr("omnigent.terminals.ws_bridge.os.execve", fake_execve)
-    monkeypatch.setattr(
-        "omnigent.terminals.ws_bridge.os._exit",
-        lambda code: (_ for _ in ()).throw(exit_exc),
-    )
+    _patch_attach_spawn(monkeypatch, record_spawn)
 
     # First attach: dead pane → recreate → bridge the fresh pane.
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach"
+            "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach?transport=pty"
         ):
             pass
 
@@ -407,12 +440,120 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
     # unconditionally, killing the user's running REPL on every attach.
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
-            "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach"
+            "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach?transport=pty"
         ):
             pass
 
     assert auto_create_sessions == ["conv_abc"]
     assert str(fresh_dir / "tui-main.sock") in attach_argvs[1]
+
+
+def test_runner_resource_attach_recreates_dead_qwen_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A dead qwen-native terminal is recreated on attach, not rejected.
+
+    Pins the same crash-recovery gap the REPL already covered:
+    qwen's TUI can die while the registry still holds a stale running
+    entry, and before the fix the attach route would close 4404 and
+    leave the embedded qwen pane blank for the rest of the session.
+    The route should tear down the dead terminal, rerun qwen auto-
+    create, and bridge the fresh pane on the same attach that noticed
+    the crash.
+
+    :param tmp_path: Pytest tmp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    registry = TerminalRegistry()
+    stale = _make_running_instance("qwen", "main", tmp_path)
+
+    async def dead_tmux() -> bool:
+        """
+        Simulate ``tmux has-session`` reporting the qwen pane gone.
+
+        :returns: ``False`` after flipping the optimistic running flag.
+        """
+        stale.running = False
+        return False
+
+    stale.is_alive = dead_tmux  # type: ignore[method-assign]
+    _seed_registry(registry, "conv_abc", stale)
+
+    resource_registry = SessionResourceRegistry(terminal_registry=registry)
+    resource_registry._terminal_roles[("conv_abc", "terminal_qwen_main")] = (
+        QWEN_NATIVE_TERMINAL_ROLE
+    )
+
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=resource_registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    fresh_dir = tmp_path / "fresh"
+    fresh_dir.mkdir()
+    fresh = _make_running_instance("qwen", "main", fresh_dir)
+    auto_create_sessions: list[str] = []
+
+    async def fake_auto_create(
+        session_id: str,
+        rr: SessionResourceRegistry,
+        publish_event: object,
+        *,
+        server_client: object,
+        ensure_comment_relay: object = None,
+    ) -> SessionResourceView:
+        """
+        Stand-in for ``_auto_create_qwen_terminal`` that registers a
+        live pane without spawning real tmux.
+
+        :param session_id: Session being recreated, e.g. ``"conv_abc"``.
+        :param rr: The runner's resource registry (unused by the stub).
+        :param publish_event: Per-session SSE emitter (unused).
+        :param server_client: Omnigent server client (unused).
+        :param ensure_comment_relay: Comment relay hook threaded by the
+            recreate path (unused by the stub).
+        :returns: Terminal resource view for the fresh pane.
+        """
+        auto_create_sessions.append(session_id)
+        _seed_registry(registry, session_id, fresh)
+        return SessionResourceView(
+            id="terminal_qwen_main",
+            type="terminal",
+            session_id=session_id,
+            name="qwen",
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._auto_create_qwen_terminal", fake_auto_create)
+
+    attach_argvs: list[list[str]] = []
+
+    def record_spawn(_path: str, argv: list[str], _env: dict[str, str]) -> None:
+        """Capture the tmux attach argv instead of spawning."""
+        attach_argvs.append(argv)
+
+    _patch_attach_spawn(monkeypatch, record_spawn)
+
+    with pytest.raises(RuntimeError, match="child exited"):
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach?transport=pty"
+        ):
+            pass
+
+    assert auto_create_sessions == ["conv_abc"]
+    assert str(fresh_dir / "qwen-main.sock") in attach_argvs[0]
+    assert registry.get("conv_abc", "qwen", "main") is fresh
+
+    with pytest.raises(RuntimeError, match="child exited"):
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv_abc/resources/terminals/terminal_qwen_main/attach?transport=pty"
+        ):
+            pass
+
+    assert auto_create_sessions == ["conv_abc"]
+    assert str(fresh_dir / "qwen-main.sock") in attach_argvs[1]
 
 
 def test_runner_resource_attach_dead_non_repl_terminal_keeps_4404(
@@ -570,3 +711,130 @@ def test_runner_resource_attach_closes_4404_when_pty_ends(
         "Without 4404, the client's reconnect loop will spin on 'Claude "
         "session connection closed by server; reconnecting...' indefinitely."
     )
+
+
+# ── Loopback direct-attach listener (runner/direct_attach.py) ─────────
+
+
+def _make_direct_app(
+    events: list[tuple[str, str, bool, str | None]],
+) -> FastAPI:
+    """A direct-attach app whose attach handler records its arguments.
+
+    The stub stands in for the runner app's real
+    ``terminal_resource_attach_ws`` so these tests pin the listener's
+    auth gate and parameter forwarding without touching tmux.
+    """
+
+    async def stub_handler(
+        websocket: object,
+        session_id: str,
+        terminal_id: str,
+        read_only: bool = False,
+        transport: str | None = None,
+    ) -> None:
+        events.append((session_id, terminal_id, read_only, transport))
+        await websocket.accept()  # type: ignore[attr-defined]
+        await websocket.close()  # type: ignore[attr-defined]
+
+    return create_direct_attach_app(
+        stub_handler,
+        token="sekret-token",
+        allowed_origins=frozenset({"https://app.example"}),
+    )
+
+
+def test_direct_attach_probe_accepts_valid_token_without_origin() -> None:
+    """Non-browser handshakes (no Origin header) pass on the token alone."""
+    app = _make_direct_app([])
+    with TestClient(app).websocket_connect("/probe?token=sekret-token"):
+        pass
+
+
+def test_direct_attach_probe_accepts_allow_listed_origin() -> None:
+    app = _make_direct_app([])
+    with TestClient(app).websocket_connect(
+        "/probe?token=sekret-token",
+        headers={"origin": "https://app.example"},
+    ):
+        pass
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/probe",
+        "/probe?token=wrong",
+        "/v1/sessions/conv1/resources/terminals/t1/attach",
+        "/v1/sessions/conv1/resources/terminals/t1/attach?token=wrong",
+    ],
+)
+def test_direct_attach_rejects_missing_or_wrong_token(path: str) -> None:
+    events: list[tuple[str, str, bool, str | None]] = []
+    app = _make_direct_app(events)
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with TestClient(app).websocket_connect(path):
+            pass
+    assert exc_info.value.code == 1008
+    assert events == []
+
+
+def test_direct_attach_rejects_foreign_origin_despite_valid_token() -> None:
+    """A DNS-rebinding-style page presents its own origin — refused."""
+    events: list[tuple[str, str, bool, str | None]] = []
+    app = _make_direct_app(events)
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv1/resources/terminals/t1/attach?token=sekret-token",
+            headers={"origin": "https://evil.example"},
+        ):
+            pass
+    assert exc_info.value.code == 1008
+    assert events == []
+
+
+def test_direct_attach_forwards_attach_params_to_handler() -> None:
+    """The attach wrapper hands session/terminal/query through unchanged."""
+    events: list[tuple[str, str, bool, str | None]] = []
+    app = _make_direct_app(events)
+    with contextlib.suppress(WebSocketDisconnect):
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv1/resources/terminals/terminal_bash_s1/attach"
+            "?token=sekret-token&read_only=true&transport=control",
+            headers={"origin": "https://app.example"},
+        ):
+            pass
+    assert events == [("conv1", "terminal_bash_s1", True, "control")]
+
+
+def test_allowed_origin_for_server_strips_path_and_keeps_port() -> None:
+    assert (
+        allowed_origin_for_server("https://omnigents.example.databricksapps.com/some/base")
+        == "https://omnigents.example.databricksapps.com"
+    )
+    assert allowed_origin_for_server("http://127.0.0.1:6767") == "http://127.0.0.1:6767"
+    assert allowed_origin_for_server("not a url") is None
+    assert allowed_origin_for_server("ftp://example.com") is None
+
+
+@pytest.mark.asyncio
+async def test_direct_attach_listener_serves_probe_on_loopback() -> None:
+    """The uvicorn listener binds 127.0.0.1:0 and answers the probe route."""
+    import websockets
+
+    events: list[tuple[str, str, bool, str | None]] = []
+    listener = await start_direct_attach_listener(_make_direct_app(events))
+    assert listener is not None, "listener failed to start on loopback"
+    try:
+        assert listener.port > 0
+        # Valid token: the handshake completes (the route accepts then
+        # closes, which is the probe contract).
+        async with websockets.connect(f"ws://127.0.0.1:{listener.port}/probe?token=sekret-token"):
+            pass
+        # Wrong token: rejected before accept — an HTTP 403 handshake
+        # denial, which the client surfaces as InvalidStatus.
+        with pytest.raises(websockets.exceptions.InvalidStatus):
+            async with websockets.connect(f"ws://127.0.0.1:{listener.port}/probe?token=wrong"):
+                pass
+    finally:
+        await listener.stop()

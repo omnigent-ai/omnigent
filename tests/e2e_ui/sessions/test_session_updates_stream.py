@@ -21,7 +21,7 @@ of that claim against a real server + real browser:
   regression that restored ``refetchInterval: 4000`` would light it up.
 
 Selectors: the sidebar renders each session as ``<a href="/c/{id}">``
-whose text is the session title (``ap-web/src/shell/Sidebar.tsx`` — the
+whose text is the session title (``web/src/shell/Sidebar.tsx`` — the
 ``Link to={`/c/${conversation.id}`}`` row). The default pytest-playwright
 viewport (1280×720) is desktop, so the sidebar is shown without a toggle.
 """
@@ -31,11 +31,13 @@ from __future__ import annotations
 import uuid
 
 import httpx
+import pytest
 from playwright.sync_api import Browser, Page, Request, expect
 
 from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 
+@pytest.mark.compat_smoke
 def test_session_rename_streams_to_open_tabs(
     browser: Browser,
     seeded_session: tuple[str, str],
@@ -127,6 +129,7 @@ def _count_session_list_requests(page: Page) -> list[str]:
     return hits
 
 
+@pytest.mark.compat_smoke
 def test_idle_sidebar_does_not_poll_sessions_list(
     page: Page,
     seeded_session: tuple[str, str],
@@ -172,6 +175,7 @@ def test_idle_sidebar_does_not_poll_sessions_list(
     )
 
 
+@pytest.mark.compat_smoke
 def test_session_created_elsewhere_appears_via_push(
     page: Page,
     seeded_session: tuple[str, str],

@@ -1,0 +1,39 @@
+/* Comment decorations for the Monaco code editor. Colors mirror the Shiki
+   CodeViewer overlays (yellow), with dark-mode variants under `.dark`. Class
+   names are applied by Monaco to its own DOM, so they must be real CSS rules
+   (not Tailwind utilities). */
+
+/* Saved comment range — dim highlight. */
+.oa-comment {
+  background-color: rgba(250, 204, 21, 0.2);
+}
+/* The active comment, or a not-yet-saved selection — stronger highlight. */
+.oa-comment-active {
+  background-color: rgba(250, 204, 21, 0.38);
+}
+/* The dim highlight reads the same in dark mode, so only the active color
+   needs a dark override (softer so it doesn't overpower the dark canvas). */
+.dark .oa-comment-active {
+  background-color: rgba(250, 204, 21, 0.3);
+}
+
+/* Paint Monaco surfaces with the active Omnigent card tone so the file editor
+   follows both the app mode and palette instead of the syntax theme's fixed
+   background. The gutter uses a separate Monaco variable. */
+html .monaco-editor,
+html .monaco-diff-editor,
+html .monaco-component {
+  --vscode-editor-background: var(--card);
+  --vscode-editorGutter-background: var(--card);
+}
+
+/* Suppress the keyboard-hint tooltips Monaco attaches to its widget buttons
+   (e.g. the find widget's "Close (Escape)"). They render detached on <body> and
+   overlap the small floating find widget, reading as flaky. Monaco is the only
+   source of .monaco-hover in this app (the rest of the UI uses its own tooltip),
+   and this editor ships no language services, so no useful content hovers are
+   lost. The pointer caret element is hidden alongside it. */
+.monaco-hover.workbench-hover,
+.workbench-hover-pointer {
+  display: none !important;
+}

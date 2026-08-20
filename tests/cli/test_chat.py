@@ -15,7 +15,6 @@ from omnigent_client import QueryResult
 
 import omnigent.chat as chat_module
 from omnigent.chat import (
-    _DEFAULT_AD_HOC_MODEL,
     _SERVER_READY_BACKOFF_POLL_SECONDS,
     _SERVER_READY_FAST_POLL_WINDOW_SECONDS,
     _SERVER_READY_INITIAL_POLL_SECONDS,
@@ -42,6 +41,7 @@ from omnigent.chat import (
 )
 from omnigent.cli import _build_resume_parts
 from omnigent.inner.databricks_executor import DatabricksCredentials
+from omnigent.model_resolver import ModelResolutionError
 from omnigent.spec import load as load_spec
 from omnigent.spec import validate as validate_spec
 
@@ -71,6 +71,35 @@ def test_is_url_relative() -> None:
 def test_is_url_absolute() -> None:
     """Absolute paths are not URLs."""
     assert _is_url("/home/user/my-agent") is False
+
+
+def test_redirect_native_resume_routes_kiro_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A kiro-native wrapper session redirects to ``run_kiro_native``."""
+    monkeypatch.setattr(
+        chat_module,
+        "_wrapper_label_for_conversation",
+        lambda *, base_url, conversation_id: "kiro-native-ui",
+    )
+    captured: dict[str, object] = {}
+
+    def _capture(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.kiro_native.run_kiro_native", _capture)
+
+    redirected = chat_module._redirect_native_resume_if_needed(
+        base_url="https://example.com",
+        conversation_id="conv_kiro",
+        auto_open_conversation=True,
+    )
+
+    assert redirected is True
+    assert captured == {
+        "server": "https://example.com",
+        "session_id": "conv_kiro",
+        "extra_args": (),
+        "auto_open_conversation": True,
+    }
 
 
 # ── _extract_agent_name ──────────────────────────────
@@ -1153,7 +1182,9 @@ def test_chat_via_daemon_hands_daemon_runner_to_chat_with_server(
     ``runner_recover=None`` (no CLI-side restart).
     """
     agent_yaml = tmp_path / "hello.yaml"
-    agent_yaml.write_text("name: hello\nprompt: Say hi.\n")
+    agent_yaml.write_text(
+        "name: hello\nprompt: Say hi.\nexecutor:\n  model: databricks-gpt-test-model\n"
+    )
     captured: dict[str, object] = {}
 
     async def _fake_prepare(**kwargs: object) -> _DaemonChatSession:
@@ -1265,7 +1296,7 @@ def _patch_daemon_launch(monkeypatch: pytest.MonkeyPatch, captured: dict[str, ob
         return None
 
     async def _fake_launch(
-        client: object, *, host_id: str, session_id: str, workspace: str
+        client: object, *, host_id: str, session_id: str, workspace: str, fresh: bool = False
     ) -> str:
         captured["launch"] = {"host_id": host_id, "session_id": session_id, "workspace": workspace}
         return "runner_daemon"
@@ -1413,33 +1444,144 @@ def test_prepare_chat_session_via_daemon_fork_wins_over_resume(
     assert launch["session_id"] == "conv_forked"
 
 
-# ── OMNIGENT_MODEL env-var fallback ───────────────────
-#
-# These tests pin the env-var contract on the
-# ``omnigent/cli.py`` → ``run_chat`` direct path. Without
-# them, ``OMNIGENT_MODEL=foo`` was silently dropped on the
-# ``omnigent`` console-script default Omnigent path because
-# ``_apply_overrides_to_raw`` used the hardcoded
-# ``_DEFAULT_AD_HOC_MODEL`` instead of the env-var-aware
-# helper. See ``designs/RUN_OMNIGENT_REPL_PARITY.md``.
-
-
-def test_default_cli_model_returns_hardcoded_default_when_env_unset(
+def test_prepare_chat_session_via_daemon_reports_create_failure_as_click_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    With ``OMNIGENT_MODEL`` unset, the helper returns the
-    hardcoded ``_DEFAULT_AD_HOC_MODEL``.
+    """A failed session create is a ``ClickException`` naming the server URL.
 
-    What this proves: the existing default behavior (the model
-    that ships in the README example) is preserved when no env
-    var is set. If this fails, users running
-    ``omnigent run hello.yaml`` without setting the env var
-    would suddenly land on a different model than they did
-    before — silently breaking their workflows.
+    A base URL that answers ``/health`` but exposes no session API (e.g. one
+    carrying the workspace web-UI path) fails here. Letting the SDK's
+    ``OmnigentError`` escape turns that wrong-URL case into a crash-handler
+    traceback, which hides the one detail that identifies it: the URL.
     """
+    captured: dict[str, object] = {}
+    _patch_daemon_launch(monkeypatch, captured)
+
+    async def _boom(_self: object, _bundle: bytes, *, filename: str, workspace: str) -> object:
+        raise ClientOmnigentError({"detail": "Method Not Allowed"}, 405, "")
+
+    monkeypatch.setattr(_FakeSessionsApi, "create", _boom)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        asyncio.run(
+            _prepare_chat_session_via_daemon(
+                base_url="https://example.databricks.com/omnigent",
+                headers={},
+                auth=None,
+                host_id="host_x",
+                bundle=b"bundle-bytes",
+                resume_conversation_id=None,
+                fork_session_id=None,
+                workspace="/tmp/proj",
+            )
+        )
+
+    # The URL is what tells the user their server target is wrong.
+    assert "https://example.databricks.com/omnigent" in str(excinfo.value)
+    # No runner is launched for a session that was never created.
+    assert "launch" not in captured
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        httpx.ConnectError("All connection attempts failed"),
+        httpx.ConnectTimeout("timed out establishing a connection"),
+        httpx.ProxyError("proxy refused the tunnel"),
+    ],
+    ids=["connect-error", "connect-timeout", "proxy-error"],
+)
+@pytest.mark.parametrize(
+    ("server_url", "expected_hint"),
+    [
+        # A local server that stopped — the user restarts it.
+        ("http://127.0.0.1:6767", "omnigent stop"),
+        # A remote target — the URL, the network, or a proxy is at fault.
+        ("https://example.databricksapps.com", "proxy"),
+    ],
+)
+def test_prepare_chat_session_via_daemon_reports_unreachable_server_as_click_error(
+    server_url: str,
+    expected_hint: str,
+    transport_error: httpx.HTTPError,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused connection is a ``ClickException``, not a crash screen.
+
+    These are transport failures, so they never reach the SDK's
+    ``OmnigentError`` handling above and used to escape all the way to the
+    crash handler — turning "the server isn't reachable" into a branded crash
+    report with a traceback and no actionable advice. All three are siblings
+    under ``TransportError``, so catching one does not cover the others.
+    """
+    captured: dict[str, object] = {}
+    _patch_daemon_launch(monkeypatch, captured)
+
+    async def _refused(_self: object, _bundle: bytes, *, filename: str, workspace: str) -> object:
+        raise transport_error
+
+    monkeypatch.setattr(_FakeSessionsApi, "create", _refused)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        asyncio.run(
+            _prepare_chat_session_via_daemon(
+                base_url=server_url,
+                headers={},
+                auth=None,
+                host_id="host_x",
+                bundle=b"bundle-bytes",
+                resume_conversation_id=None,
+                fork_session_id=None,
+                workspace="/tmp/proj",
+            )
+        )
+
+    message = str(excinfo.value)
+    # The URL identifies which server was unreachable.
+    assert server_url in message
+    # The advice has to differ: restarting a local server is not the fix for
+    # an unreachable remote one.
+    assert expected_hint in message
+    # No runner is launched against a server we could not reach.
+    assert "launch" not in captured
+
+
+# ── OMNIGENT_MODEL env-var fallback ───────────────────
+#
+# These tests pin explicit-environment and discovered-default precedence on
+# the ``omnigent/cli.py`` → ``run_chat`` path.
+
+
+def test_default_cli_model_resolves_catalog_when_env_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unconfigured ad-hoc run resolves its Databricks catalog default."""
     monkeypatch.delenv("OMNIGENT_MODEL", raising=False)
-    assert _default_cli_model() == _DEFAULT_AD_HOC_MODEL
+    calls: list[tuple[str, str | None]] = []
+
+    def _resolve(provider: str, *, family: str | None = None) -> SimpleNamespace:
+        calls.append((provider, family))
+        return SimpleNamespace(model_id="catalog-default")
+
+    monkeypatch.setattr(chat_module, "resolve_catalog_model", _resolve)
+
+    assert _default_cli_model() == "catalog-default"
+    assert calls == [("databricks", "openai")]
+
+
+def test_default_cli_model_fails_clearly_without_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unavailable catalog directs users to explicit configuration."""
+    monkeypatch.delenv("OMNIGENT_MODEL", raising=False)
+
+    def _fail(*args: object, **kwargs: object) -> None:
+        raise ModelResolutionError("catalog unavailable")
+
+    monkeypatch.setattr(chat_module, "resolve_catalog_model", _fail)
+
+    with pytest.raises(click.ClickException, match="Pass --model, set OMNIGENT_MODEL"):
+        _default_cli_model()
 
 
 def test_default_cli_model_honors_omnigent_model_env_var(
@@ -1449,9 +1591,7 @@ def test_default_cli_model_honors_omnigent_model_env_var(
     With ``OMNIGENT_MODEL=foo`` set, the helper returns
     ``"foo"``.
 
-    What this proves: the env-var override fires. If the helper
-    returns ``_DEFAULT_AD_HOC_MODEL`` here, the env var was
-    silently dropped — exactly the regression this gap closed.
+    What this proves: the env-var override fires without consulting discovery.
     """
     monkeypatch.setenv("OMNIGENT_MODEL", "databricks-claude-sonnet-4-6")
     assert _default_cli_model() == "databricks-claude-sonnet-4-6"
@@ -1460,19 +1600,7 @@ def test_default_cli_model_honors_omnigent_model_env_var(
 def test_apply_overrides_uses_env_var_when_yaml_has_no_model_or_harness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A YAML that declares neither ``executor.model`` nor
-    ``executor.harness``, processed with empty overrides and
-    ``OMNIGENT_MODEL=foo`` set, lands with ``executor.model =
-    "foo"``.
-
-    What this proves: the env var traverses
-    ``_apply_overrides_to_raw`` to the executor block. If this
-    fails with the assertion showing ``databricks-gpt-5-4``
-    (the hardcoded default), the helper isn't being called —
-    line 756 of ``omnigent/chat.py`` reverted to the literal
-    ``_DEFAULT_AD_HOC_MODEL`` and the env var is dropped again.
-    """
+    """A harness-less YAML receives the explicit environment model."""
     monkeypatch.setenv("OMNIGENT_MODEL", "databricks-claude-sonnet-4-6")
     raw: dict[str, object] = {"name": "ad_hoc", "prompt": "hi"}
 
@@ -1486,12 +1614,33 @@ def test_apply_overrides_uses_env_var_when_yaml_has_no_model_or_harness(
     )
     assert executor.get("model") == "databricks-claude-sonnet-4-6", (
         f"Expected env-var override 'databricks-claude-sonnet-4-6' to "
-        f"land in executor.model; got {executor.get('model')!r}. If "
-        f"this is 'databricks-gpt-5-4' (the hardcoded default), line "
-        f"756 of omnigent/chat.py is back to the literal "
-        f"_DEFAULT_AD_HOC_MODEL and OMNIGENT_MODEL is silently dropped "
-        f"on the omnigent/cli.py → run_chat path."
+        f"land in executor.model; got {executor.get('model')!r}."
     )
+
+
+def test_apply_overrides_yaml_model_wins_over_env_and_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A YAML model remains authoritative over fallback sources."""
+    monkeypatch.setenv("OMNIGENT_MODEL", "from-env")
+    monkeypatch.setattr(
+        chat_module,
+        "resolve_catalog_model",
+        lambda *args, **kwargs: pytest.fail(
+            f"catalog fallback called for explicit YAML model: {args=}, {kwargs=}"
+        ),
+    )
+    raw: dict[str, object] = {
+        "name": "configured",
+        "prompt": "hi",
+        "executor": {"model": "from-yaml"},
+    }
+
+    _apply_overrides_to_raw(raw, ChatOverrides())
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["model"] == "from-yaml"
 
 
 def test_apply_overrides_explicit_model_wins_over_env_var(
@@ -1501,10 +1650,7 @@ def test_apply_overrides_explicit_model_wins_over_env_var(
     A ``--model`` override takes precedence over
     ``OMNIGENT_MODEL``.
 
-    What this proves: the precedence chain is
-    ``--model`` > ``executor.model`` in YAML > ``OMNIGENT_MODEL``
-    > ``_DEFAULT_AD_HOC_MODEL``. If this fails, the env var is
-    overriding an explicit CLI flag — surprising and broken.
+    What this proves: explicit CLI arguments remain the highest precedence.
     """
     monkeypatch.setenv("OMNIGENT_MODEL", "from-env")
     raw: dict[str, object] = {"name": "ad_hoc", "prompt": "hi"}
@@ -1519,6 +1665,21 @@ def test_apply_overrides_explicit_model_wins_over_env_var(
         f"precedence chain inverted and explicit CLI args lost to "
         f"environment values — a surprising regression."
     )
+
+
+def test_apply_overrides_harness_uses_explicit_env_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CLI harness override keeps an explicit environment model pin."""
+    monkeypatch.setenv("OMNIGENT_MODEL", "from-env")
+    raw: dict[str, object] = {"name": "ad_hoc", "prompt": "hi"}
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="openai-agents"))
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["harness"] == "openai-agents"
+    assert executor["model"] == "from-env"
 
 
 def test_apply_overrides_canonicalizes_claude_harness_alias() -> None:
@@ -1668,6 +1829,32 @@ def test_apply_overrides_harness_and_model_together_for_spec_version_bundle() ->
     assert executor["model"] == "databricks-claude-sonnet-4-6"
 
 
+def test_apply_overrides_harness_only_clears_pinned_model() -> None:
+    """
+    ``--harness`` alone drops a prior ``executor.model`` pin.
+
+    A brain with a Claude-only model pin must not keep that id when swapped
+    to ``pi`` / ``openai-agents``. Pair with ``--model`` to keep a pin.
+    """
+    raw: dict[str, object] = {
+        "spec_version": 1,
+        "name": "polly",
+        "prompt": "orchestrate",
+        "executor": {
+            "type": "omnigent",
+            "model": "sonnet",
+            "config": {"harness": "claude-sdk"},
+        },
+    }
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="pi"))
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["config"]["harness"] == "pi"
+    assert executor.get("model") is None
+
+
 def test_apply_overrides_rejects_harness_for_non_omnigent_executor_type() -> None:
     """
     A spec_version bundle with a non-omnigent ``executor.type`` fails
@@ -1781,8 +1968,8 @@ def test_nested_config_harness_skips_ad_hoc_model_fallback(
     """
     A single-file spec that declares its harness under the bundle-style
     ``executor.config.harness`` (no flat ``harness:``, no ``model:``) must
-    NOT trigger the ``_DEFAULT_AD_HOC_MODEL`` fallback — this is the polly
-    shape (``examples/polly/config.yaml`` run as a file).
+    not trigger ad-hoc model resolution — this is the polly shape
+    (``examples/polly/config.yaml`` run as a file).
 
     Regression guard for the ``databricks-gpt-5-4`` injection: before
     ``_spec_declares_harness_or_model`` looked under ``config``, an unpinned
@@ -1935,8 +2122,19 @@ def test_materialize_directory_bundle_with_override_keeps_nested_harness_unpinne
 @pytest.mark.parametrize(
     ("bundle_name", "expected_workers"),
     [
-        ("polly", {"claude_code": "claude-native", "codex": "codex-native", "pi": "pi"}),
-        ("debby", {"claude": "claude-sdk", "gpt": "openai-agents"}),
+        (
+            "polly",
+            {
+                "claude_code": "claude-native",
+                "codex": "codex-native",
+                "opencode": "opencode-native",
+                "cursor": "cursor-native",
+                "hermes": "hermes-native",
+                "pi": "pi",
+                "agy": "antigravity-native",
+            },
+        ),
+        ("debby", {"claude": "claude-sdk", "gpt": "codex"}),
     ],
 )
 def test_materialize_bundle_overrides_brain_harness(
@@ -2015,7 +2213,7 @@ def test_materialize_bundle_overrides_brain_harness(
         assert worker_harnesses == expected_workers, (
             f"Sub-agent harnesses changed under a brain-only override: "
             f"{worker_harnesses}. The override must rewrite only the "
-            f"top-level config.yaml, never agents/<name>/config.yaml."
+            f"top-level config.yaml, never agents/<dir>/config.yaml."
         )
     finally:
         _cleanup_materialized_override_bundle(materialized)
@@ -2227,7 +2425,7 @@ def test_remote_headers_prefers_explicit_remote_token_env(monkeypatch: pytest.Mo
         lambda _profile: DatabricksCredentials(host="https://x", token="ambient-token"),
     )
 
-    assert _remote_headers(server_url="https://srv.example.com") == {
+    assert _remote_headers(server_url="https://srv.example.com", host_id=None) == {
         "Authorization": "Bearer env-token"
     }
 
@@ -2255,13 +2453,88 @@ def test_remote_headers_falls_back_to_ambient_databricks_creds(
 
     monkeypatch.setattr(chat_module, "_read_databrickscfg", _fake_read)
 
-    headers = _remote_headers(server_url="https://srv.example.com")
+    headers = _remote_headers(server_url="https://srv.example.com", host_id=None)
 
     # The ambient token reached the Authorization header.
     assert headers == {"Authorization": "Bearer ambient-token"}
     # Ambient resolution: exactly one lookup, with no profile threaded
     # (None) — a non-None value here means profile plumbing came back.
     assert read_calls == [None]
+
+
+def test_remote_headers_adds_org_id_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A recorded ?o= selector rides every ad-hoc request.
+
+    These probes (session info, agent pick, runner status, native
+    forwarders) carry no httpx Auth, so the workspace-routing header must be
+    added here or the request routes to the account. It accompanies
+    whichever bearer the resolution chain produced.
+    """
+    monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: "rec-tok")
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_org_id", lambda _url: "2850744067564480"
+    )
+
+    headers = _remote_headers(
+        server_url="https://acme.databricks.com/api/2.0/omnigent", host_id=None
+    )
+
+    assert headers == {
+        "Authorization": "Bearer rec-tok",
+        "X-Databricks-Org-Id": "2850744067564480",
+    }
+
+
+def test_remote_headers_omits_org_when_no_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No recorded ?o= selector → the request URL/headers carry no org header.
+
+    Guards the "unchanged when nothing recorded" claim: a single-workspace
+    or Databricks Apps server (no stored org id) must produce only the
+    bearer, so the runtime replay never appends a routing header where none
+    was recorded.
+    """
+    monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: "rec-tok")
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+
+    headers = _remote_headers(
+        server_url="https://single.databricks.com/api/2.0/omnigent", host_id=None
+    )
+
+    assert headers == {"Authorization": "Bearer rec-tok"}
+    assert "X-Databricks-Org-Id" not in headers
+
+
+def test_remote_headers_keys_by_host_id_on_workspace_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host_id rides as the slice-key header on a host-sharded mount.
+
+    The native attach WebSocket handshake (claude / codex / antigravity) and
+    its reconnects build their headers here, so the host_id must surface as the
+    routing header to reach the replica holding the runner's tunnel. It is
+    emitted only on a host-sharded mount; no host_id, or an unsharded server,
+    sends none.
+    """
+    monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: "rec-tok")
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+
+    mount = "https://acme.databricks.com/api/2.0/omnigent"
+    assert (
+        _remote_headers(server_url=mount, host_id="host_abc")["X-Databricks-Omnigent-Slice-Key"]
+        == "host_abc"
+    )
+    # No host_id → no slice-key header on the same mount.
+    assert "X-Databricks-Omnigent-Slice-Key" not in _remote_headers(server_url=mount, host_id=None)
+    # Unsharded server → no slice-key header even with a host_id.
+    assert "X-Databricks-Omnigent-Slice-Key" not in _remote_headers(
+        server_url="http://127.0.0.1:6767", host_id="host_abc"
+    )
 
 
 def test_server_headers_do_not_encode_runner_affinity() -> None:
@@ -2564,7 +2837,9 @@ def _stub_run_repl_deps(
     monkeypatch.setattr(_repl_pkg, "run_repl", _fake_run_repl)
     monkeypatch.setattr("omnigent.repl._repl.run_repl", _fake_run_repl)
     monkeypatch.setattr("omnigent.chat.OmnigentClient", _FakeClientCtx)
-    monkeypatch.setattr("omnigent.chat._server_auth", lambda server_url=None: None)
+    monkeypatch.setattr(
+        "omnigent.chat._server_auth", lambda server_url=None, *, session_id=None: None
+    )
     monkeypatch.setattr(
         "omnigent.repl._tmux_pane.register_pane",
         lambda **_kw: None,
@@ -2781,6 +3056,38 @@ def test_databricks_token_auth_resolves_sdk_once(
     # authenticate() runs per request (4) — cheap in-memory SDK cache hits,
     # NOT CLI shell-outs. That's the behavior the fix preserves.
     assert cfg.authenticate_calls == 4
+
+
+def test_databricks_token_auth_sets_org_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every SDK-client request carries the workspace-routing header.
+
+    The header is set at the top of ``auth_flow`` — independent of which
+    credential branch runs — so the workspace-routing signal rides even when
+    a request carries no bearer.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.databricks_request_headers",
+        lambda _url, *, host_id=None: {"X-Databricks-Org-Id": "2850744067564480"},
+    )
+    # Isolate from real Databricks SDK resolution: the bearer is irrelevant
+    # here — only the routing header is under test.
+    monkeypatch.setattr(chat_module._DatabricksTokenAuth, "_sdk_token", lambda self: None)
+
+    auth = chat_module._DatabricksTokenAuth(
+        server_url="https://acme.databricks.com/api/2.0/omnigent"
+    )
+    flow = auth.auth_flow(
+        httpx.Request("GET", "https://acme.databricks.com/api/2.0/omnigent/v1/sessions")
+    )
+    request = next(flow)
+    flow.close()
+
+    assert request.headers["X-Databricks-Org-Id"] == "2850744067564480"
 
 
 # ── _spec_used_families (startup-header creds line) ──────
@@ -3146,6 +3453,23 @@ def _item_assistant(text: str, *, status: str = "completed") -> dict[str, object
     }
 
 
+def _item_error(message: str) -> dict[str, object]:
+    """
+    Build a persisted terminal ``error`` item (harness start-failure shape).
+
+    :param message: The error text, e.g.
+        ``"inner executor error: Failed to start cursor-sdk agent: ..."``.
+    :returns: An item dict matching the flat API shape for an error item.
+    """
+    return {
+        "type": "error",
+        "status": "completed",
+        "source": "execution",
+        "code": "RuntimeError",
+        "message": message,
+    }
+
+
 class _FakeSessionsNamespace:
     """
     Minimal stand-in for ``client.sessions`` used by the reconcile tests.
@@ -3236,6 +3560,8 @@ class _FakeAPClient:
 
 def _fake_sessions_chat_cls(
     query_impl: Callable[[str], object],
+    *,
+    extra_turns: list[str] | None = None,
 ) -> type:
     """
     Build a ``SessionsChat`` replacement whose ``query`` is ``query_impl``.
@@ -3248,15 +3574,36 @@ def _fake_sessions_chat_cls(
     :param query_impl: Async callable taking the prompt and returning a
         :class:`QueryResult` or raising, e.g. one that raises
         ``OmnigentError("turn failed")``.
+    :param extra_turns: Optional list of text strings to return from
+        successive ``await_turn()`` calls, simulating async orchestrator
+        auto-wakes. When exhausted ``await_turn`` returns empty text and
+        ``last_turn_saw_waiting`` returns ``False``.
     :returns: A class usable as a drop-in for ``SessionsChat``.
     """
+    _extra = list(extra_turns or [])
 
     class _FakeSessionsChat:
         def __init__(self, **_kwargs: object) -> None:
-            pass
+            self._pending = list(_extra)
 
-        async def query(self, prompt: str) -> object:
-            return await query_impl(prompt)
+        @property
+        def status(self) -> str:
+            # Mirrors the real snapshot: "running" while sub-agents are pending
+            # (the runner emits "waiting" → relay collapses to "running"),
+            # "idle" when done.
+            return "running" if self._pending else "idle"
+
+        async def refresh(self) -> None:
+            pass  # status is derived from _pending; no fetch needed.
+
+        async def query(self, prompt: str) -> QueryResult:
+            return await query_impl(prompt)  # type: ignore[return-value]
+
+        async def await_turn(self, *, timeout: float | None = None) -> QueryResult:
+            if self._pending:
+                text = self._pending.pop(0)
+                return QueryResult(text=text, files=[])
+            return QueryResult(text="", files=[])
 
     return _FakeSessionsChat
 
@@ -3354,6 +3701,36 @@ async def test_query_sessions_once_reraises_when_no_persisted_text(
         await _run_one_shot(client, _raise_genuine_failure, monkeypatch)
 
 
+async def test_query_sessions_once_surfaces_persisted_error_when_no_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn that produced no assistant text but persisted a terminal error
+    (e.g. cursor's invalid-model start failure) surfaces that error instead of
+    returning None. If this fails, headless ``-p`` renders a failed turn as a
+    silent, exit-0 empty success.
+    """
+    client = _FakeAPClient(
+        [
+            _item_user("say hi"),
+            _item_error("inner executor error: Failed to start cursor-sdk agent: bad model"),
+        ]
+    )
+    with pytest.raises(ClientOmnigentError, match="Failed to start cursor-sdk agent"):
+        await _run_one_shot(client, _return_empty, monkeypatch)
+
+
+async def test_query_sessions_once_returns_none_when_no_text_and_no_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No assistant text and no persisted error item → None (the caller prints
+    nothing). Guards against the error-surfacing path raising spuriously when a
+    turn genuinely produced nothing and recorded no error.
+    """
+    client = _FakeAPClient([_item_user("unanswered")])
+    result = await _run_one_shot(client, _return_empty, monkeypatch)
+    assert result is None
+
+
 async def test_query_sessions_once_returns_text_without_reconcile_on_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3366,6 +3743,141 @@ async def test_query_sessions_once_returns_text_without_reconcile_on_success(
     result = await _run_one_shot(client, _return_text, monkeypatch)
     assert result == "direct answer"
     assert client.sessions.list_items_calls == 0  # no reconcile on success
+
+
+async def test_query_sessions_once_multi_turn_async_orchestrator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Extra auto-woken turns are collected and joined with the first turn's text.
+
+    Simulates an async orchestrator (e.g. polly) that dispatches sub-agents
+    in turn 1, then is auto-woken for turn 2 when they complete. The headless
+    ``-p`` path must not exit after turn 1 — it must follow the session until
+    idle and concatenate all turns.
+
+    If this fails, multi-turn orchestrators like polly will always produce
+    partial output (only turn 1's narration, never the final synthesis).
+    """
+    monkeypatch.setattr(
+        "omnigent_client.SessionsChat",
+        _fake_sessions_chat_cls(
+            _return_text,
+            extra_turns=["<!-- POLLY_REVIEW_START -->\n## Summary\nLooks good."],
+        ),
+    )
+    client = _FakeAPClient([], list_items_must_not_be_called=True)
+    result = await _query_sessions_once(
+        client=client,
+        agent_name="polly",
+        tool_handler=None,
+        prompt="review this PR",
+        session_bundle=b"bundle-bytes",
+        session_bundle_filename="agent.tar.gz",
+        runner_id="runner_test",
+    )
+    assert result is not None
+    assert "direct answer" in result
+    assert "<!-- POLLY_REVIEW_START -->" in result
+    assert "Looks good." in result
+
+
+async def _never_return(_prompt: str) -> QueryResult:
+    """Simulate the lost-terminal-event race: heartbeats keep the SSE
+    iterator alive, so ``query`` neither returns nor raises."""
+    await asyncio.Event().wait()
+    raise AssertionError("unreachable")
+
+
+async def test_query_sessions_once_reconciles_on_lost_terminal_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The third race variant — ``query`` never returns because the terminal
+    event was lost while heartbeats keep the subscription alive — recovers
+    the persisted text once the guard fires and the session reports idle.
+
+    If this fails, a lost terminal event hangs headless ``-p`` forever.
+    """
+    monkeypatch.setattr(chat_module, "_PER_TURN_TIMEOUT_S", 0.05)
+    client = _FakeAPClient([_item_user("say hi"), _item_assistant("hi there")])
+    result = await asyncio.wait_for(_run_one_shot(client, _never_return, monkeypatch), timeout=10)
+    assert result == "hi there"
+
+
+async def test_query_sessions_once_raises_on_lost_terminal_event_without_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A guard trip on an idle session with no persisted output raises loud.
+
+    If this fails, a turn that genuinely produced nothing would be
+    reported as a silent empty success after the guard fires.
+    """
+    monkeypatch.setattr(chat_module, "_PER_TURN_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(chat_module, "_LOOP_TIMEOUT_S", 5.0)
+    client = _FakeAPClient([_item_user("say hi")])
+    with pytest.raises(RuntimeError, match=r"no\s+persisted assistant text"):
+        await asyncio.wait_for(_run_one_shot(client, _never_return, monkeypatch), timeout=10)
+
+
+async def test_query_sessions_once_slow_first_turn_not_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A healthy first turn that outlasts the guard is not cut short.
+
+    The server persists each assistant item as it completes, so a
+    mid-turn fragment is already readable when the guard fires. The
+    recovery path must keep waiting while the session reports
+    ``running`` and reconcile only once it goes idle — returning the
+    whole turn's output, not the fragment.
+
+    If this fails, headless ``-p`` silently truncates any first turn
+    longer than the guard window (exit 0, partial answer).
+    """
+    monkeypatch.setattr(chat_module, "_PER_TURN_TIMEOUT_S", 0.05)
+    client = _FakeAPClient(
+        [_item_user("do the big refactor"), _item_assistant("intermediate note")]
+    )
+
+    class _SlowTurnChat:
+        """Turn still in flight when the guard fires; finishes two
+        status polls later, appending its final message to the
+        transcript like the server's incremental item persistence."""
+
+        def __init__(self, **_kwargs: object) -> None:
+            self._polls_left = 2
+            self._status = "running"
+
+        @property
+        def status(self) -> str:
+            return self._status
+
+        async def refresh(self) -> None:
+            pass
+
+        async def query(self, prompt: str) -> QueryResult:
+            return await _never_return(prompt)
+
+        async def await_turn(self, *, timeout: float | None = None) -> QueryResult:
+            self._polls_left -= 1
+            if self._polls_left <= 0:
+                client.sessions._items.append(_item_assistant("FULL final answer"))
+                self._status = "idle"
+            return QueryResult(text="", files=[])
+
+    monkeypatch.setattr("omnigent_client.SessionsChat", _SlowTurnChat)
+    result = await asyncio.wait_for(
+        _query_sessions_once(
+            client=client,
+            agent_name="hello_world",
+            tool_handler=None,
+            prompt="do the big refactor",
+            session_bundle=b"bundle-bytes",
+            session_bundle_filename="agent.tar.gz",
+            runner_id="runner_test",
+        ),
+        timeout=10,
+    )
+    assert result is not None
+    assert "FULL final answer" in result
 
 
 async def test_persisted_turn_text_anchors_on_last_user_message() -> None:
@@ -3534,3 +4046,151 @@ def test_env_auth_injection_applies_when_nothing_configured(
     # The bake carries the actual key value so the uploaded bundle is
     # self-contained for the secret-less runner.
     assert executor["auth"] == {"type": "api_key", "api_key": "sk-ambient-shell-key"}
+
+
+def test_redirect_native_resume_handles_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cursor-native resume hands off to ``omnigent cursor`` (direct attach).
+
+    Regression: without a cursor branch in ``_redirect_native_resume_if_needed``
+    the resume fell through to the Omnigent REPL, which drove an Omnigent turn
+    per message (persisting its own user item) *while* the cursor forwarder
+    mirrored the same message from the cursor store — recording each user
+    message twice. The redirect keeps the TUI the single source of turns.
+    """
+    from omnigent._wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE
+
+    monkeypatch.setattr(
+        chat_module,
+        "_wrapper_label_for_conversation",
+        lambda **_kw: CURSOR_NATIVE_WRAPPER_VALUE,
+    )
+    captured: dict[str, object] = {}
+
+    def _fake_run_cursor_native(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.cursor_native.run_cursor_native", _fake_run_cursor_native)
+
+    handled = chat_module._redirect_native_resume_if_needed(
+        base_url="https://example.com",
+        conversation_id="conv_abc123",
+        auto_open_conversation=True,
+    )
+
+    assert handled is True
+    assert captured == {
+        "server": "https://example.com",
+        "session_id": "conv_abc123",
+        "extra_args": (),
+        "auto_open_conversation": True,
+    }
+
+
+def test_redirect_native_resume_covers_every_native_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every native wrapper redirects — the seam closed the old 6-of-11 gap.
+
+    The hand-written dispatch only covered claude/codex/pi/kiro/cursor/kimi, so a
+    goose/hermes/antigravity/qwen/opencode resume fell through to the Omnigent
+    REPL and double-posted. Routing through the provider seam covers all of them;
+    goose stands in for the formerly-uncovered set here.
+    """
+    from omnigent._wrapper_labels import GOOSE_NATIVE_WRAPPER_VALUE
+
+    monkeypatch.setattr(
+        chat_module,
+        "_wrapper_label_for_conversation",
+        lambda **_kw: GOOSE_NATIVE_WRAPPER_VALUE,
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.goose_native.run_goose_native",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    handled = chat_module._redirect_native_resume_if_needed(
+        base_url="https://example.com",
+        conversation_id="conv_goose",
+        auto_open_conversation=False,
+    )
+
+    assert handled is True
+    assert captured == {
+        "server": "https://example.com",
+        "session_id": "conv_goose",
+        "extra_args": (),
+        "auto_open_conversation": False,
+    }
+
+
+def test_redirect_native_resume_ignores_non_native_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-native (or absent) wrapper label leaves the resume to the REPL."""
+    monkeypatch.setattr(
+        chat_module,
+        "_wrapper_label_for_conversation",
+        lambda **_kw: None,
+    )
+
+    handled = chat_module._redirect_native_resume_if_needed(
+        base_url="https://example.com",
+        conversation_id="conv_plain",
+        auto_open_conversation=False,
+    )
+
+    assert handled is False
+
+
+def test_cursor_native_resume_never_drives_an_omnigent_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resuming a cursor-native conversation must not enter the turn-driving REPL.
+
+    This is the behavior that makes the user's message appear exactly once. The
+    duplicate had two sources: (1) the Omnigent turn the REPL drives, which
+    persists its own user item, and (2) the cursor forwarder mirroring the same
+    message back from the cursor store. ``_chat_with_server`` must short-circuit
+    on the wrapper redirect *before* either ``_run_repl`` or ``_run_one_shot``
+    is reached, so source (1) never happens and only the forwarder records the
+    turn.
+    """
+    from omnigent._wrapper_labels import CURSOR_NATIVE_WRAPPER_VALUE
+
+    monkeypatch.setattr(
+        chat_module,
+        "_wrapper_label_for_conversation",
+        lambda **_kw: CURSOR_NATIVE_WRAPPER_VALUE,
+    )
+    redirected: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.cursor_native.run_cursor_native",
+        lambda **kwargs: redirected.update(kwargs),
+    )
+
+    def _fail_repl(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("_run_repl drove an Omnigent turn for a cursor-native resume")
+
+    def _fail_one_shot(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("_run_one_shot drove an Omnigent turn for a cursor-native resume")
+
+    monkeypatch.setattr(chat_module, "_run_repl", _fail_repl)
+    monkeypatch.setattr(chat_module, "_run_one_shot", _fail_one_shot)
+    # _pick_agent runs only on the non-redirect path; tripping it also signals
+    # the redirect failed to short-circuit.
+    monkeypatch.setattr(
+        chat_module,
+        "_pick_agent",
+        lambda *_a, **_k: pytest.fail("reached the non-redirect path"),
+    )
+
+    # Returns cleanly via the redirect; the AssertionError stubs above fire if
+    # it ever falls through to a turn-driving path.
+    chat_module._chat_with_server(
+        "https://example.com",
+        None,
+        resume_conversation_id="conv_abc123",
+    )
+
+    assert redirected["session_id"] == "conv_abc123"

@@ -64,16 +64,40 @@ deploy/
 │   ├── modal_app.py
 │   └── README.md
 │
+├── cloudflare/        ← Cloudflare Containers + D1 + R2 (serverless, scale-to-zero)
+│   ├── Dockerfile        server image + D1 dialect
+│   ├── src/index.js      the Worker that fronts the container
+│   ├── wrangler.jsonc
+│   └── README.md
+│
 ├── trycloudflare/     ← Cloudflare quick tunnel (public URL for a LOCAL server)
 │   └── README.md
+│
+├── tailscale/         ← Tailscale (private access from phone/tablet/laptop
+│   └── README.md         via tailnet; Funnel for cloud sandbox dial-back)
 │
 ├── daytona/           ← Daytona sandbox-provider guide + the Cloudflare
 │   ├── wrangler.toml     Worker egress relay for its free tier; NOT a
 │   ├── src/index.js      server deploy target. See its README.md.
 │   └── README.md
 │
+├── blaxel/            ← Blaxel sandbox-provider guide + managed-host config;
+│   └── README.md         NOT a server deploy target.
+│
 ├── islo/              ← Islo sandbox-provider guide (gateway credential
 │   └── README.md         injection); NOT a server deploy target.
+│
+├── e2b/               ← E2B sandbox-provider guide (boots from a pre-built
+│   └── README.md         E2B template); NOT a server deploy target.
+│
+├── openshell/         ← NVIDIA OpenShell sandbox-provider guide (self-hosted
+│   └── README.md         gRPC gateway, on-prem/air-gapped); NOT a server target.
+│
+├── databricks/        ← Databricks Apps (Lakebase + UC Volumes)
+│   ├── databricks.yml     bundle declarative config
+│   ├── deploy.py          build + `bundle deploy`/`run` orchestrator
+│   ├── src/app.py         app entrypoint (Lakebase + UC Volumes)
+│   └── README.md
 │
 └── docker/            ← common Docker image + compose stack
     ├── Dockerfile         multi-stage slim image (node web build → python builder → runtime)
@@ -93,13 +117,26 @@ deploy/
 | Run on any host you already have (VPS, home server, on-prem) | Docker compose | [`docker/README.md`](docker/README.md): copy the compose stack, `./bootstrap.sh`, then `docker compose up -d` |
 | Deploy to Fly.io | Fly | [`fly/README.md`](fly/README.md): `fly deploy`, SQLite on a volume |
 | Deploy to Modal (durable artifact Volume) | Modal | [`modal/README.md`](modal/README.md): `modal deploy`, BYO Neon Postgres |
+| Deploy serverless (scale-to-zero, no VM/Postgres to manage) | Cloudflare Containers + D1 + R2 | [`cloudflare/README.md`](cloudflare/README.md): `wrangler deploy` |
 | Stand up a quick demo (no DB to provision) | HF Spaces | [`hf-spaces/README.md`](hf-spaces/README.md): Docker Space, SQLite |
 | Share a server running on your **laptop**: demo it to teammates, or let remote runners & cloud sandboxes connect back to it (nothing to deploy) | Cloudflare quick tunnel | `cloudflared tunnel --url http://localhost:6767` |
+| Access your server privately from **your phone, tablet, or other personal devices** without exposing it to the internet | Tailscale | [`tailscale/README.md`](tailscale/README.md): `tailscale serve https / http://localhost:8000` |
 | Cloud Run / Kubernetes / other | Docker image | [`docker/README.md`](docker/README.md), then point your platform at the image |
+| Deploy on a Databricks workspace (Lakebase + UC Volumes), self-managed | Databricks Apps | [`databricks/README.md`](databricks/README.md): uses Asset Bundles |
 
-All deploy paths share the same image (`docker/Dockerfile`): a slim Python
-container running the FastAPI / WebSocket coordinator, with Postgres or
-SQLite as the datastore.
+> **On Databricks?** The fully managed
+> [Omnigent on Databricks](https://docs.databricks.com/aws/en/omnigent/)
+> (Beta) is the recommended path: Databricks operates the server for
+> you, wired to workspace identity, Foundation Models, AI Gateway, and
+> MLflow Tracing. Enable the **Omnigent** preview in your workspace
+> settings. The self-managed Databricks Apps bundle above is for when
+> you need control the managed service does not expose yet.
+
+All non-Databricks deploy paths share the same image (`docker/Dockerfile`): a
+slim Python container running the FastAPI / WebSocket coordinator, with Postgres
+or SQLite as the datastore. The Databricks Apps path uses a separate entrypoint
+(`databricks/src/app.py`) that swaps Postgres for Lakebase (managed PostgreSQL)
+and the artifact store for UC Volumes.
 
 ## Database: Postgres or SQLite
 
@@ -142,6 +179,39 @@ remote DB.
 (512 MB), Railway (usage-scaled), and HF Spaces clear it automatically; Fly's
 256 MB default does not, so the Fly config pins a 1 GB machine, and the
 Modal app pins `memory=1024` for the same reason.
+
+## Serving: put an HTTP/2 proxy in front for many concurrent views
+
+Each open session in the web UI holds a long-lived streaming HTTP
+response (`GET /v1/sessions/{id}/stream`, `text/event-stream`) for as
+long as the view is on screen. Over **HTTP/1.1 browsers cap concurrent
+connections at ~6 per origin**, and every open stream occupies one of
+those slots. Open a handful of windows or tabs against the same server
+and the pool fills with held-open streams — then every *other* request
+the UI makes (sending a message, the session list, `/health`, auth)
+queues behind the cap and never fires. The symptom is the whole UI
+appearing to freeze across all windows while the server itself is idle;
+in DevTools → Network the stuck requests sit in **Stalled/Queued**, not
+"waiting for server".
+
+**Fix: serve over HTTP/2.** HTTP/2 multiplexes every stream over one
+connection, so the per-origin cap stops mattering. `uvicorn` (the
+server's ASGI server) speaks HTTP/1.1 only, so HTTP/2 comes from a
+reverse proxy that terminates TLS in front of it — which most real
+deploys already have:
+
+- **The bundled Caddy overlay** (`docker/docker-compose.https.yaml`)
+  gives you this for free — Caddy negotiates HTTP/2 (and HTTP/3) over
+  TLS via ALPN with no extra config. See
+  [`docker/README.md`](docker/README.md#multi-user-mode-oidc).
+- **The one-click platforms** (Render, Railway, Fly, Cloudflare) and
+  managed **Databricks** terminate TLS with HTTP/2 at their edge, so
+  they're already covered.
+
+The gap is only when you expose the raw `:8000` HTTP/1.1 port directly
+to browsers (e.g. `docker compose up` with no proxy, reached over
+plain HTTP). That's fine for a single window; put a proxy in front once
+you or your team routinely open several.
 
 ## Execution model
 
@@ -195,13 +265,10 @@ omnigent run path/to/agent.yaml --server https://your-host
 
 Don't want a laptop to be the host? Run the host in a cloud sandbox instead.
 
-**From the CLI (Modal, Daytona, or Islo).** Install the provider extra when
-needed (`pip install 'omnigent[modal]'` or `'omnigent[daytona]'`; Islo uses the
-built-in HTTP client), authenticate (`modal token new`, `DAYTONA_API_KEY`, or
-`ISLO_API_KEY`), then:
+**From the CLI (Modal, Daytona, Blaxel, Islo, or E2B).** Install the provider extra when needed (`pip install 'omnigent[modal]'`, `'omnigent[daytona]'`, `'omnigent[blaxel]'`, or `'omnigent[e2b]'`; Islo uses the built-in HTTP client). Authenticate with `modal token new`, `DAYTONA_API_KEY`, Blaxel's `BL_WORKSPACE` and `BL_API_KEY`, `ISLO_API_KEY`, or `E2B_API_KEY`. Then run:
 
 ```bash
-omnigent sandbox create --provider modal     # or --provider daytona / islo
+omnigent sandbox create --provider modal     # or --provider daytona / blaxel / islo / e2b
 omnigent sandbox connect --provider modal --sandbox-id <id> --server https://your-host
 ```
 
@@ -209,9 +276,12 @@ omnigent sandbox connect --provider modal --sandbox-id <id> --server https://you
 > Modal caps sandbox lifetime at 24 hours. Re-run `create` + `connect` to
 > roll the host onto a fresh sandbox. Daytona and Islo have no Omnigent-imposed
 > lifetime cap; Daytona free-tier orgs restrict egress to an allowlist; see
-> [`daytona/README.md`](daytona/README.md) for the relay workaround.
+> [`daytona/README.md`](daytona/README.md) for the relay workaround. E2B
+> shares Modal's 24-hour cap **and** boots from a pre-built E2B *template*
+> rather than a registry image — build it once first; see
+> [`e2b/README.md`](e2b/README.md).
 
-**Server-managed (Modal, Daytona, or Islo).** With *managed hosts*, creating a
+**Server-managed (Modal, Daytona, Blaxel, Islo, or E2B).** With *managed hosts*, creating a
 session with `"host_type": "managed"` (e.g.
 `POST /v1/sessions {"agent_id": ..., "host_type": "managed"}`) makes the
 server provision a sandbox, start a host in it, and run the session there.
@@ -227,19 +297,11 @@ sandbox:
 
 Modal credentials come from the server's environment (`MODAL_TOKEN_ID` /
 `MODAL_TOKEN_SECRET`, or a mounted `~/.modal.toml`), not the config file.
-Daytona reads `DAYTONA_API_KEY`; Islo reads `ISLO_API_KEY` (and optional
-`ISLO_BASE_URL`) from the server environment.
+Daytona reads `DAYTONA_API_KEY`. Blaxel reads `BL_WORKSPACE` and `BL_API_KEY`. Islo reads `ISLO_API_KEY` and optional `ISLO_BASE_URL`. E2B reads `E2B_API_KEY` from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
 
-**The host image.** Sandboxes boot from the official prebaked host image
-(`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host`
-target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in
-seconds instead of installing Omnigent at boot. The image ships the
-coding-harness CLIs (`claude`, `codex`, `pi`), so agents on any harness run
-in the sandbox with nothing extra to install. To run sandboxes from your own
-image instead (a fork, or extra tooling baked in), build the same `host`
-target and point the config at it:
+**The host image.** Most sandboxes boot from the official prebaked host image (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host` target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in seconds instead of installing Omnigent at boot. The image ships the coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`). Blaxel uses `blaxel/omnigent-host:latest`, which combines this host runtime with Blaxel's required `sandbox-api`. E2B uses its provider template. To use a custom image instead, build the same `host` target and point the provider config at it:
 
 ```bash
 docker build -f docker/Dockerfile --target host \
@@ -255,11 +317,7 @@ sandbox:
     image: docker.io/<you>/omnigent-host:latest
 ```
 
-For private registries, set `OMNIGENT_MODAL_REGISTRY_SECRET` on the server
-to the name of a Modal secret holding `REGISTRY_USERNAME` /
-`REGISTRY_PASSWORD`; for CLI-launched sandboxes, `OMNIGENT_MODAL_HOST_IMAGE`
-(or `OMNIGENT_DAYTONA_HOST_IMAGE` / `OMNIGENT_ISLO_HOST_IMAGE`) overrides the
-image ref.
+For private registries, set `OMNIGENT_MODAL_REGISTRY_SECRET` on the server to the name of a Modal secret holding `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`. For CLI-launched sandboxes, `OMNIGENT_MODAL_HOST_IMAGE`, `OMNIGENT_DAYTONA_HOST_IMAGE`, `OMNIGENT_BLAXEL_HOST_IMAGE`, or `OMNIGENT_ISLO_HOST_IMAGE` overrides the image.
 
 **LLM credentials for managed sessions.** A fresh sandbox has no API keys.
 Park your provider credentials in a [Modal secret](https://modal.com/secrets)
@@ -267,12 +325,17 @@ and list it in the config. Its env vars are injected into every managed
 sandbox, and the in-sandbox host forwards the standard harness credential
 vars (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
 `CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_ACCESS_TOKEN`, `OPENAI_API_KEY`,
-`OPENAI_BASE_URL`, `GEMINI_API_KEY`) to its runners:
+`OPENAI_BASE_URL`, `GEMINI_API_KEY`, plus their `OMNIGENT_`-prefixed
+aliases) to its runners:
 
 ```bash
 modal secret create omnigent-llm \
-  ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-…
+  OMNIGENT_ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-…
 ```
+
+Prefer `OMNIGENT_ANTHROPIC_API_KEY` for Claude Code API-key auth. Omnigent
+resolves it into Claude Code's `apiKeyHelper`, avoiding a raw
+`ANTHROPIC_API_KEY` in the Claude CLI process.
 
 ```yaml
 sandbox:
@@ -282,9 +345,7 @@ sandbox:
     secrets: [omnigent-llm]
 ```
 
-For Daytona and Islo, list server environment variable names under
-`sandbox.daytona.env` or `sandbox.islo.env`; the launcher copies the current
-server env values into each sandbox:
+For Daytona, Blaxel, and Islo, list server environment variable names under `sandbox.daytona.env`, `sandbox.blaxel.env`, or `sandbox.islo.env`. The launcher copies the current server values into each sandbox:
 
 ```yaml
 sandbox:
@@ -309,11 +370,7 @@ a Modal secret (GitLab: add `GIT_USERNAME=oauth2`). The host image's git
 credential helper picks it up for the clone and for the agent's later
 fetch/push.
 
-The full Modal guide (CLI sandboxes, custom images, LLM and git credentials,
-troubleshooting) lives at [`modal/README.md`](modal/README.md); the Daytona
-guide lives at [`daytona/README.md`](daytona/README.md); the Islo guide
-(including its gateway credential-injection model) lives at
-[`islo/README.md`](islo/README.md).
+See the [`modal`](modal/README.md), [`daytona`](daytona/README.md), [`blaxel`](blaxel/README.md), and [`islo`](islo/README.md) guides for provider setup and troubleshooting.
 
 ## Auth
 
@@ -332,7 +389,14 @@ overrides this auto-selection.
 |---|---|---|
 | `accounts` (deploy default) | Standalone deploy, no external IdP: built-in username/password with first-user-is-admin bootstrap and UI-based invites. Opt in with `OMNIGENT_AUTH_ENABLED=1` (and no OIDC vars). | Set `OMNIGENT_ACCOUNTS_COOKIE_SECRET` (or let `bootstrap.sh` mint it) and `OMNIGENT_ACCOUNTS_BASE_URL` (public URL). On first boot, set the admin password via the web Create-admin form, the terminal prompt, or `--admin-password` / `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`. |
 | `oidc` | Standalone deploy with your own IdP: server handles the full login flow | Set `OMNIGENT_AUTH_ENABLED=1` and the `OMNIGENT_OIDC_*` env vars; the presence of `OMNIGENT_OIDC_ISSUER` selects OIDC (or pin `OMNIGENT_AUTH_PROVIDER=oidc`). Requires HTTPS (the session cookie uses the `__Host-` prefix). |
-| `header` | Behind an existing SSO proxy (oauth2-proxy, AWS ALB OIDC, Tailscale Funnel, …) that injects `X-Forwarded-Email` | The default when `OMNIGENT_AUTH_ENABLED` is off; or pin `OMNIGENT_AUTH_PROVIDER=header`. Proxy MUST strip any inbound copy of the header from clients. Missing headers are always rejected. |
+| `header` | Behind an existing SSO proxy (oauth2-proxy, AWS ALB OIDC, Cloudflare Access, Tailscale Funnel, …) that injects an identity header | The default when `OMNIGENT_AUTH_ENABLED` is off; or pin `OMNIGENT_AUTH_PROVIDER=header`. Reads `X-Forwarded-Email` by default; set `OMNIGENT_AUTH_HEADER` for proxies that use another name (e.g. `Cf-Access-Authenticated-User-Email`), and `OMNIGENT_AUTH_HEADER_STRIP_PREFIX=accounts.google.com:` for Google IAP. Proxy MUST strip any inbound copy of the header from clients. Missing headers are always rejected. |
+
+> [!NOTE]
+> **Managed sandboxes need `header`/`oidc` or single-user auth.** Each session's
+> runner dials back with the *user's* identity, which the built-in `accounts` mode
+> (the deploy default above) can't supply over the runner WebSocket — it returns
+> `403` even though the host connects. Framework-level; applies to every sandbox
+> provider (Modal / Daytona / Islo / Kubernetes / …).
 
 ### Single sign-on (OIDC)
 
@@ -392,18 +456,40 @@ generic OIDC), see
 > reverse proxy.
 
 `header` mode (`OMNIGENT_AUTH_PROVIDER=header`) takes the caller's identity
-from the `X-Forwarded-Email` request header. It exists for deployments that
-sit behind an SSO proxy (oauth2-proxy, Cloudflare Access, an ALB/OIDC
-listener, Databricks Apps) that authenticates the user and injects that
-header on every request.
+from a trusted request header — `X-Forwarded-Email` by default. It exists for
+deployments that sit behind an SSO proxy (oauth2-proxy, Cloudflare Access, an
+ALB/OIDC listener, Databricks Apps) that authenticates the user and injects
+that header on every request.
+
+Proxies that authenticate with a different header name set
+`OMNIGENT_AUTH_HEADER` to that name instead of standing up an extra hop to
+rename it. For example, behind **Cloudflare Access** (which provides the
+authenticated email in `Cf-Access-Authenticated-User-Email`):
+
+```dotenv
+OMNIGENT_AUTH_PROVIDER=header
+OMNIGENT_AUTH_HEADER=Cf-Access-Authenticated-User-Email
+```
+
+Some proxies namespace the identity they inject. **Google IAP** forwards the
+email in `X-Goog-Authenticated-User-Email` prefixed with `accounts.google.com:`
+(e.g. `accounts.google.com:user@example.com`). Set
+`OMNIGENT_AUTH_HEADER_STRIP_PREFIX` to drop that prefix and recover the bare
+email:
+
+```dotenv
+OMNIGENT_AUTH_PROVIDER=header
+OMNIGENT_AUTH_HEADER=X-Goog-Authenticated-User-Email
+OMNIGENT_AUTH_HEADER_STRIP_PREFIX=accounts.google.com:
+```
 
 In header mode **the server trusts whatever that header says**. If no proxy
 sets it, requests are rejected (`401`) rather than silently sharing one
 identity. But a *misconfigured* proxy is still dangerous: if the proxy
-doesn't **strip** any client-supplied `X-Forwarded-Email` before forwarding,
-anyone can impersonate anyone by sending the header themselves. Getting this
-wrong exposes every user's sessions, conversation history, tool output, and
-files to every other caller.
+doesn't **strip** any client-supplied copy of the identity header before
+forwarding, anyone can impersonate anyone by sending the header themselves.
+Getting this wrong exposes every user's sessions, conversation history, tool
+output, and files to every other caller.
 
 **For almost everyone, use built-in `accounts` (the default in these
 deploys) or `oidc`**; both authenticate users at the server with no proxy to
@@ -411,6 +497,40 @@ get right. Only choose `header` when you already operate a proxy you trust
 to set and sanitize the identity header, and read
 [`docker/README.md#header-proxy-mode-for-deploys-behind-an-existing-sso-proxy`](docker/README.md#header-proxy-mode-for-deploys-behind-an-existing-sso-proxy)
 first.
+
+## Branding (white-labeling)
+
+Customize the app name, landing heading, and logos with a `branding:` block in
+the server config (`omnigent server -c config.yaml`, or `<data_dir>/config.yaml`
+— `/data/config.yaml` in the Docker stack). Takes effect on the next server
+start.
+
+```yaml
+branding:
+  app_name: "Acme Agent"        # tab title, sidebar wordmark, login screen
+  heading: "How can I help?"     # landing hero; "" hides it, omit to keep the default
+  logo:                          # a bare string sets `main`; or per-variant:
+    main: logo.png               # branding-assets/logo.png
+    loading: loading.webp        # working indicator (falls back to main)
+    favicon: favicon.png         # browser-tab icon
+  powered_by: true               # "Powered by Omnigent" credit; false to hide
+```
+
+Logo files must live under a dedicated `branding-assets/` directory beside the
+config file (for example, `/data/branding-assets/logo.png`). PNG, JPEG, GIF,
+WebP, and ICO files up to 5 MiB are accepted only after full decoder validation.
+ICO files must contain only PNG-backed entries; every directory entry is bounded
+and decoded independently, while DIB/BMP-backed entries are rejected. Malformed,
+truncated, oversized, overlapping, trailing-payload, SVG, symlinked, escaped, and
+non-image files are ignored. Images are also bounded to 4096 pixels per side,
+128 frames, 16 megapixels per frame, and 64 megapixels across all decoded frames.
+The values are served over the unauthenticated `GET /v1/info` and
+`GET /v1/branding/logo/<variant>` endpoints so the login screen is branded before
+sign-in. Any unset field keeps its built-in default, so a partial block is fine.
+
+The small "Powered by Omnigent" credit under the landing composer appears only
+once you set custom branding; `powered_by: false` hides it even then. It always
+shows the Omnigent mascot, never your logo.
 
 ## Adding a new deploy target
 

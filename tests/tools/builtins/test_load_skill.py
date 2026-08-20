@@ -103,6 +103,34 @@ def test_load_skill_missing_name_argument(
     assert "missing required 'name'" in result
 
 
+@pytest.mark.parametrize("arguments", ["not-json", "[]"])
+def test_load_skill_rejects_invalid_arguments(
+    arguments: str,
+    skill_no_resources: SkillSpec,
+    tool_ctx: ToolContext,
+) -> None:
+    """
+    Malformed or non-object arguments return an error string.
+    """
+    tool = LoadSkillTool([skill_no_resources])
+    result = tool.invoke(arguments, tool_ctx)
+
+    assert result.startswith("Error:")
+
+
+def test_load_skill_rejects_non_string_name(
+    skill_no_resources: SkillSpec,
+    tool_ctx: ToolContext,
+) -> None:
+    """
+    ``name`` must be a string skill name.
+    """
+    tool = LoadSkillTool([skill_no_resources])
+    result = tool.invoke(json.dumps({"name": 123}), tool_ctx)
+
+    assert result == "Error: 'name' must be a string"
+
+
 def test_load_skill_schema_lists_skill_names(
     skill_no_resources: SkillSpec,
     skill_with_resources: SkillSpec,

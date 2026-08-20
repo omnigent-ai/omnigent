@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins._arguments import parse_json_object_arguments
 
 _SCHEMA: dict[str, Any] = {
     "type": "function",
@@ -105,10 +106,13 @@ class UploadFileTool(Tool):
         :param ctx: Execution context with ``workspace`` path.
         :returns: JSON string with ``file_id``, ``filename``, ``content_type``.
         """
-        parsed: dict[str, Any] = json.loads(arguments) if arguments else {}
+        parsed, error = parse_json_object_arguments(arguments)
+        if error is not None:
+            return f"Error: {error}"
+        assert parsed is not None
         rel_path = parsed.get("path", "")
-        if not rel_path:
-            return "Error: empty path"
+        if not isinstance(rel_path, str) or not rel_path:
+            return "Error: path must be a non-empty string"
 
         if ctx.workspace is None:
             return "Error: no workspace available"

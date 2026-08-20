@@ -76,6 +76,29 @@ class _StubConversationStore:
         return None
 
 
+def _engine_factory_expecting_preload(engine: object):
+    """Return a `_build_policy_engine_from_spec` double that requires the row.
+
+    Every production caller of that wrapper has already loaded the
+    conversation to resolve the spec, and passes it so the builder can skip
+    its own read and confirm the agent binding. A double that merely
+    *accepts* ``conversation=None`` asserts nothing: dropping the preload at
+    the call site leaves every test here green, which is exactly what
+    happened. This one fails if the row does not arrive, so the contract is
+    observed by all seven tests rather than described by none.
+    """
+
+    def _factory(spec, session_id, conversation_store, conversation=None):
+        assert conversation is not None, (
+            "the handler must pass the conversation row it already read; "
+            "without it the builder re-reads and loses the agent-binding check"
+        )
+        assert conversation.id == session_id, (conversation.id, session_id)
+        return engine
+
+    return _factory
+
+
 @dataclass
 class _StubAgentStore:
     """
@@ -209,7 +232,7 @@ async def test_forged_retry_with_deny_policy_is_rejected(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: deny_engine,
+        _engine_factory_expecting_preload(deny_engine),
     )
 
     response = await _handle_mcp_tools_call(
@@ -254,7 +277,7 @@ async def test_forged_retry_with_ask_policy_rejects_unknown_elicitation(
         result=PolicyResult(
             action=PolicyAction.ASK,
             reason="approval required",
-            deciding_policy="test-gate",
+            deciding_policies=["test-gate"],
         )
     )
 
@@ -266,7 +289,7 @@ async def test_forged_retry_with_ask_policy_rejects_unknown_elicitation(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: ask_engine,
+        _engine_factory_expecting_preload(ask_engine),
     )
 
     forged_eid = "elicit_FORGED_never_issued"
@@ -318,7 +341,7 @@ async def test_retry_with_allow_policy_falls_through(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: allow_engine,
+        _engine_factory_expecting_preload(allow_engine),
     )
 
     response = await _handle_mcp_tools_call(
@@ -374,7 +397,7 @@ async def test_retry_session_mismatch_still_rejected(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: deny_engine,
+        _engine_factory_expecting_preload(deny_engine),
     )
 
     params = _forged_retry_params()
@@ -420,7 +443,7 @@ async def test_legitimate_retry_with_pending_entry_proceeds(
         result=PolicyResult(
             action=PolicyAction.ASK,
             reason="approval required",
-            deciding_policy="test-gate",
+            deciding_policies=["test-gate"],
         )
     )
 
@@ -432,7 +455,7 @@ async def test_legitimate_retry_with_pending_entry_proceeds(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: ask_engine,
+        _engine_factory_expecting_preload(ask_engine),
     )
 
     eid = "elicit_LEGITIMATE_server_issued"
@@ -533,8 +556,8 @@ async def test_non_mcp_entry_popped_by_events_handler_on_accept(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: _FixedPolicyEngine(
-            result=PolicyResult(action=PolicyAction.ALLOW, reason=None)
+        _engine_factory_expecting_preload(
+            _FixedPolicyEngine(result=PolicyResult(action=PolicyAction.ALLOW, reason=None))
         ),
     )
 
@@ -553,3 +576,80 @@ async def test_non_mcp_entry_popped_by_events_handler_on_accept(
         )
     finally:
         _pending_policy_ask_writes.pop(eid, None)
+
+
+# ---------------------------------------------------------------------------
+# Actor threading tests
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _CapturingPolicyEngine:
+    """
+    Policy engine stub that records the :class:`EvaluationContext` it
+    receives and returns ALLOW so execution proceeds.
+
+    :param captured: Mutable list; the first ``evaluate`` call appends
+        the context it received. Using a list avoids ``nonlocal``.
+    """
+
+    captured: list[EvaluationContext]
+
+    async def evaluate(self, ctx: EvaluationContext) -> PolicyResult:
+        """Record ``ctx`` and return ALLOW.
+
+        :param ctx: The evaluation context passed by the handler.
+        :returns: ``ALLOW`` so the handler proceeds past the gate.
+        """
+        self.captured.append(ctx)
+        return PolicyResult(action=PolicyAction.ALLOW)
+
+    def apply_label_writes(self, set_labels: dict[str, str]) -> None:
+        """No-op."""
+
+    def apply_state_updates(self, updates: list[Any]) -> None:
+        """No-op."""
+
+
+@pytest.mark.asyncio
+async def test_mcp_proxy_runner_supplied_actor_reaches_policy_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When the runner includes ``actor`` in the JSON-RPC body, the policy
+    engine receives that identity in ``EvaluationContext.actor`` rather
+    than ``None`` (the request has no authenticated user in this path).
+
+    Verifies the fix for shared multi-user sessions where the MCP proxy
+    must gate on the human who triggered the turn, not the runner's
+    service-account credential.
+    """
+    captured: list[EvaluationContext] = []
+    engine = _CapturingPolicyEngine(captured=captured)
+
+    monkeypatch.setattr(
+        sessions_mod,
+        "_load_agent_spec_for_session",
+        lambda conv, agent_store: "fake_spec",
+    )
+    monkeypatch.setattr(
+        sessions_mod,
+        "_build_policy_engine_from_spec",
+        _engine_factory_expecting_preload(engine),
+    )
+
+    params = {"name": "sys_os_shell", "arguments": {"command": "echo hi"}}
+    await _handle_mcp_tools_call(
+        rpc_id=1,
+        session_id=_SESSION_ID,
+        params=params,
+        conversation_store=_StubConversationStore(_make_conversation()),  # type: ignore[arg-type]
+        agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+        runner_router=None,
+        actor={"run_as": "alice@example.com"},
+    )
+
+    assert captured, "policy engine was not called"
+    assert captured[0].actor == {"run_as": "alice@example.com"}, (
+        f"expected actor from runner body, got: {captured[0].actor!r}"
+    )

@@ -195,6 +195,26 @@ class InvalidPath(ResourceError):
     code = "invalid_path"
 
 
+class PathUnreachable(ResourceError):
+    """An absolute path lies outside everything this environment can reach.
+
+    Distinct from :class:`InvalidPath`: the path is well-formed, it is
+    simply not covered by any sandbox grant, and the environment is
+    confined so no broader browsing is permitted. Carries the reachable
+    roots so a caller can say what IS available without a second request.
+
+    :param message: Description of the violation.
+    :param reachable_roots: Absolute paths the environment can reach,
+        e.g. ``["/Users/corey/project"]``.
+    """
+
+    code = "path_unreachable"
+
+    def __init__(self, message: str, reachable_roots: list[str]) -> None:
+        super().__init__(message)
+        self.reachable_roots = reachable_roots
+
+
 class ResourceNotFound(ResourceError):
     """A resource (session, environment, terminal) was not found.
 
@@ -249,14 +269,14 @@ class ShellResult:
 
     :param stdout: Standard output of the command.
     :param stderr: Standard error of the command.
-    :param exit_code: Process exit code.
+    :param exit_code: Process exit code, or ``None`` when no status exists.
     :param timed_out: Whether the command was killed by timeout.
     :param cwd: Working directory the command ran in, if known.
     """
 
     stdout: str
     stderr: str
-    exit_code: int
+    exit_code: int | None
     timed_out: bool
     cwd: str | None = None
 

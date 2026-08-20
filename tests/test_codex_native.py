@@ -14,6 +14,7 @@ from typing import Any
 import click
 import httpx
 import pytest
+import tomllib
 import yaml
 
 from omnigent import codex_native, codex_native_app_server, codex_native_forwarder
@@ -26,6 +27,254 @@ from omnigent.codex_native_bridge import (
 )
 from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.spec import load
+
+
+@pytest.fixture(autouse=True)
+def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: SimpleNamespace(
+            model_id=f"catalog-{provider_name}-{family}-default"
+        ),
+    )
+
+
+def _write_codex_auth(path: Path, payload: object) -> None:
+    """Write a test Codex auth.json payload."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _point_codex_auth_check_at(
+    monkeypatch: pytest.MonkeyPatch,
+    auth_path: Path,
+    *,
+    binary_present: bool,
+    launch: Any | None = None,
+) -> None:
+    """Redirect Codex availability checks away from the real machine state.
+
+    ``launch`` pins what :func:`resolve_native_codex_launch` returns; the default
+    is the defer-to-Codex-login shape (``profile=None``, ``model_provider`` not
+    set → resolves to ``"openai"``), which is exactly the case where
+    ``auth.json`` is the credential that decides availability. Provider-routed
+    tests pass an explicit launch.
+    """
+    if launch is None:
+        launch = codex_native_app_server.NativeCodexLaunch(
+            config_overrides=[], model=None, profile=None
+        )
+    # Isolate the shared codex config.toml the config-default launch reads, so a
+    # defer-to-login test doesn't pick up the real machine's provider default.
+    monkeypatch.setenv("CODEX_HOME", str(auth_path.parent))
+    monkeypatch.setattr(codex_native, "resolve_native_codex_launch", lambda model=None: launch)
+    monkeypatch.setattr(
+        codex_native,
+        "_resolve_codex_auth_source",
+        lambda: codex_native._CodexAuthSource(auth_path=auth_path),
+    )
+    monkeypatch.setattr(
+        codex_native,
+        "_find_codex_cli",
+        lambda: "/tmp/codex" if binary_present else None,
+    )
+    if binary_present:
+        # The auth check now also validates the installed version. Treat a
+        # present binary as satisfying the version check so the tests focus
+        # on the auth-path decision.
+        monkeypatch.setattr(
+            "omnigent.onboarding.harness_install.harness_cli_installed",
+            lambda _key, **_kw: True,
+        )
+
+
+def test_codex_auth_unavailable_reason_binary_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Missing codex binary reports binary-missing before reading auth.json."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=False)
+
+    assert codex_native._codex_auth_unavailable_reason() == "binary-missing"
+
+
+def test_codex_auth_unavailable_reason_absent_auth_json_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Installed codex without auth.json reports needs-auth."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_chatgpt_tokens_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A real ChatGPT/OAuth auth.json (tokens block) is available.
+
+    Mirrors the openai/codex ``AuthDotJson`` shape: ``auth_mode=chatgpt`` with a
+    ``tokens`` object. There is no top-level expiry field — access-token expiry
+    lives in the JWT and is refreshed via ``refresh_token`` — so presence of the
+    tokens is what marks the credential configured.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+    _write_codex_auth(
+        auth_path,
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": "header.payload.sig",
+                "access_token": "header.payload.sig",
+                "refresh_token": "opaque-refresh",
+                "account_id": "org_test",
+            },
+            "last_refresh": "2026-06-25T15:04:05Z",
+        },
+    )
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_api_key_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A real API-key auth.json (``auth_mode=api``) is available."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+    _write_codex_auth(auth_path, {"auth_mode": "api", "OPENAI_API_KEY": "sk-test"})
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_no_credential_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A parseable auth.json with no credential field reports needs-auth.
+
+    e.g. a stub that records ``auth_mode`` but carries neither an
+    ``OPENAI_API_KEY`` nor a ``tokens`` block — there is nothing to authenticate
+    with, so the picker should warn rather than show Codex as ready.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+    _write_codex_auth(auth_path, {"auth_mode": "chatgpt"})
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_malformed_auth_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Installed codex with malformed auth.json reports needs-auth."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_path.write_text("{not json", encoding="utf-8")
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_databricks_profile_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A Databricks-profile launch is available even with an EMPTY auth.json.
+
+    The reported bug: the launch mints its bearer via ``databricks auth token``
+    and never reads ``auth.json``, so gating on it is a false negative. auth.json
+    is deliberately absent here — availability must come from the launch.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    launch = codex_native_app_server.NativeCodexLaunch(
+        config_overrides=[], model=None, profile="my-profile"
+    )
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True, launch=launch)
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_provider_override_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A launch pinning a non-openai model_provider is available sans auth.json."""
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    launch = codex_native_app_server.NativeCodexLaunch(
+        config_overrides=['model_provider="omnigent_databricks"'], model=None, profile=None
+    )
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True, launch=launch)
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_config_default_provider_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An empty-override launch routed by the config.toml provider default is ready.
+
+    omnigent pins no provider (empty overrides, profile None, meta "openai") but
+    defers to Codex's own config.toml top-level ``model_provider`` default — a
+    Databricks AIGW provider. auth.json is deliberately absent; availability must
+    come from the resolvable launch base URL.
+    """
+    codex_home = tmp_path / "codex-home"
+    auth_path = codex_home / "auth.json"  # never created
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+    from omnigent.onboarding import detected
+
+    monkeypatch.setattr(detected, "codex_config_provider_dismissed", lambda _config: False)
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "config.toml").write_text(
+        'model_provider = "Databricks"\n[model_providers.Databricks]\n'
+        'base_url = "https://example.cloud.databricks.com/ai-gateway/codex/v1"\n',
+        encoding="utf-8",
+    )
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+def test_codex_auth_unavailable_reason_explicit_openai_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An explicit ``model_provider="openai"`` launch still gates on auth.json.
+
+    Even with a Databricks provider default in config.toml, an explicit openai
+    pin is Codex's built-in login — a logged-out openai user must report
+    needs-auth, never read the config default.
+    """
+    codex_home = tmp_path / "codex-home"
+    auth_path = codex_home / "auth.json"  # never created
+    launch = codex_native_app_server.NativeCodexLaunch(
+        config_overrides=['model_provider="openai"'], model=None, profile=None
+    )
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True, launch=launch)
+    from omnigent.onboarding import detected
+
+    monkeypatch.setattr(detected, "codex_config_provider_dismissed", lambda _config: False)
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "config.toml").write_text(
+        'model_provider = "Databricks"\n[model_providers.Databricks]\n'
+        'base_url = "https://example.cloud.databricks.com/ai-gateway/codex/v1"\n',
+        encoding="utf-8",
+    )
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
+def test_codex_auth_unavailable_reason_resolver_failure_falls_back_to_auth_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A resolver blow-up fails safe onto the auth.json check (never raises)."""
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+
+    def _boom(model: object = None) -> object:
+        raise RuntimeError("corrupt config")
+
+    monkeypatch.setattr(codex_native, "resolve_native_codex_launch", _boom)
+
+    # No auth.json → falls through to needs-auth rather than propagating.
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
 
 
 class _FakeTerminalClient:
@@ -241,6 +490,14 @@ def test_preload_codex_thread_for_resume_resumes_and_closes(
         codex_native_app_server.preload_codex_thread_for_resume(
             "ws://127.0.0.1:1234",
             "019e96aa-0be2-7343-8d3b-6f914d60936b",
+            terminal_launch_args=[
+                "-c",
+                'default_permissions=":danger-full-access"',
+                "-c",
+                'approval_policy="never"',
+                "-c",
+                'approvals_reviewer="auto_review"',
+            ],
         )
     )
 
@@ -251,10 +508,52 @@ def test_preload_codex_thread_for_resume_resumes_and_closes(
             {
                 "threadId": "019e96aa-0be2-7343-8d3b-6f914d60936b",
                 "excludeTurns": True,
+                "permissions": ":danger-full-access",
+                "approvalPolicy": "never",
+                "approvalsReviewer": "auto_review",
             },
         )
     ]
     assert fake_client.closed is True
+
+
+def test_codex_resume_permission_params_parse_legacy_flags() -> None:
+    """Legacy approval and sandbox flags become preload overrides."""
+    assert codex_native_app_server._codex_resume_permission_params(
+        ["-a", "on-failure", "-s=read-only"]
+    ) == {
+        "approvalPolicy": "on-failure",
+        "sandbox": "read-only",
+    }
+
+
+def test_codex_resume_permission_params_repairs_legacy_full_access_profile() -> None:
+    """An incomplete stored Full Access profile resumes as the matching preset."""
+    args = [
+        "-c",
+        'default_permissions=":danger-full-access"',
+        "-c",
+        'approvals_reviewer="user"',
+    ]
+
+    assert codex_native_app_server._codex_resume_permission_params(args) == {
+        "permissions": ":danger-full-access",
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+    }
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=tuple(args),
+        thread_id="thread_x",
+        remote_url="ws://127.0.0.1:9876",
+    ) == [
+        *args,
+        "-c",
+        'approval_policy="never"',
+        "resume",
+        "--remote",
+        "ws://127.0.0.1:9876",
+        "thread_x",
+    ]
 
 
 def _started_event(turn_id: str) -> dict[str, Any]:
@@ -462,12 +761,18 @@ def _elicitation_tracker() -> codex_native_forwarder._CodexElicitationTaskTracke
     return codex_native_forwarder._CodexElicitationTaskTracker()
 
 
-def test_materialize_codex_agent_spec_uses_codex_native_harness(tmp_path: Path) -> None:
+def test_materialize_codex_agent_spec_uses_codex_native_harness(
+    tmp_path: Path, monkeypatch
+) -> None:
     """
     The generated wrapper spec is self-contained and selects the
     isolated ``codex-native`` harness rather than the existing
     non-TUI ``codex`` harness.
     """
+    # Pin the host shells so the declared terminals are deterministic
+    # ($SHELL=bash → the default/first terminal is ``bash``).
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setenv("SHELL", "/bin/bash")
     spec_path = codex_native._materialize_codex_agent_spec(
         tmp_path,
         model="gpt-test",
@@ -509,13 +814,12 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
     # via ToolManager, so a dropped flag silently removes
     # sys_session_create/send/close from the native CLI.
     assert spec.spawn is True
-    # The native wrapper declares a default shell terminal so the
-    # relay advertises the sys_terminal_* family to the wrapped
-    # codex (the relay gate is a non-empty ``terminals:`` block on
-    # this spec); a dropped block silently removes the terminal
-    # tools from the native CLI.
+    # The native wrapper declares one terminal per installed shell so the
+    # relay advertises the sys_terminal_* family to the wrapped codex (the
+    # relay gate is a non-empty ``terminals:`` block on this spec); a
+    # dropped block silently removes the terminal tools from the native CLI.
     assert spec.terminals is not None
-    assert spec.terminals["shell"].command == "bash"
+    assert spec.terminals["bash"].command == "bash"
 
 
 @pytest.mark.parametrize(
@@ -605,7 +909,7 @@ def test_build_codex_remote_args_passes_transport_verbatim(
             None,
             [
                 "-c",
-                'model="databricks-gpt-5-5"',
+                'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
                 "--remote",
@@ -618,7 +922,7 @@ def test_build_codex_remote_args_passes_transport_verbatim(
             "thread_host",
             [
                 "-c",
-                'model="databricks-gpt-5-5"',
+                'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
                 "resume",
@@ -654,12 +958,240 @@ def test_build_codex_remote_args_emits_config_overrides_before_subcommand(
             thread_id=thread_id,
             remote_url="ws://127.0.0.1:9876",
             config_overrides=(
-                'model="databricks-gpt-5-5"',
+                'model="catalog-databricks-openai-default"',
                 'model_provider="omnigent_databricks"',
             ),
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("codex_args", "expected"),
+    [
+        # ``--flag value`` pair: both dropped.
+        (("--sandbox", "read-only"), []),
+        (("--ask-for-approval", "on-request"), []),
+        # Option-adjacent: the next token is ANOTHER flag, not this flag's
+        # value, so it must survive (the over-match bug dropped --model).
+        (("--sandbox", "--model", "gpt"), ["--model", "gpt"]),
+        # ``--flag=value`` single token: dropped whole, consumes nothing after.
+        (("--ask-for-approval=on-failure",), []),
+        (("--sandbox=read-only", "--model", "gpt"), ["--model", "gpt"]),
+        # Short aliases: ``-a`` (== --ask-for-approval) triggers the SAME codex
+        # startup abort as the long form, so it must be stripped too; ``-s``
+        # (== --sandbox) is harmless but dropped for consistency. Both spellings
+        # (space-separated and ``=value``-joined) are handled.
+        (("-a", "never"), []),
+        (("-a=never",), []),
+        (("-s", "read-only"), []),
+        (("-s=read-only", "--model", "gpt"), ["--model", "gpt"]),
+        # Short alias option-adjacent to another flag: the next flag survives.
+        (("-a", "--model", "gpt"), ["--model", "gpt"]),
+        # Trailing flag at end-of-list: dropped cleanly, no value to consume.
+        (("--model", "gpt", "--sandbox"), ["--model", "gpt"]),
+        # Unrelated arg next to a stripped pair is preserved.
+        (
+            ("--model", "gpt", "--sandbox", "read-only", "--cwd", "/x"),
+            ["--model", "gpt", "--cwd", "/x"],
+        ),
+        # A pre-existing bypass flag is de-duped (the caller re-adds one copy).
+        (("--dangerously-bypass-approvals-and-sandbox", "--model", "gpt"), ["--model", "gpt"]),
+        # No conflicting flags: everything passes through untouched.
+        (("--model", "gpt-5.4-mini"), ["--model", "gpt-5.4-mini"]),
+    ],
+)
+def test_strip_approval_sandbox_flags_only_consumes_real_values(
+    codex_args: tuple[str, ...],
+    expected: list[str],
+) -> None:
+    """
+    ``_strip_approval_sandbox_flags`` drops the conflicting flags without
+    over-matching the token that follows them.
+
+    A ``--sandbox`` / ``--ask-for-approval`` flag consumes the next token as
+    its value ONLY when that token is a real value (does not start with
+    ``-``); a following flag or end-of-list consumes nothing, so unrelated
+    args like ``--model gpt`` are never swallowed. The ``--flag=value``
+    single-token spelling is dropped whole.
+    """
+    assert codex_native_app_server._strip_approval_sandbox_flags(codex_args) == expected
+
+
+def test_build_codex_remote_args_default_keeps_approval_flags_no_bypass() -> None:
+    """
+    Default (``bypass_sandbox=False``) emits NO bypass flag and preserves the
+    approval/sandbox flags the approval-mode presets pass through.
+
+    The web "Full access" / "Read only" presets are sent as
+    ``--sandbox`` / ``--ask-for-approval`` pairs inside ``codex_args``. With
+    bypass off those must reach the TUI verbatim and the dangerous bypass
+    flag must never appear — a regression here would either drop a user's
+    chosen approval preset or silently escalate to full bypass.
+    """
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=("--sandbox", "read-only", "--ask-for-approval", "on-request"),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+    )
+
+    assert "--dangerously-bypass-approvals-and-sandbox" not in args
+    assert args == [
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "on-request",
+        "--remote",
+        "ws://127.0.0.1:9876",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("codex_args", "thread_id", "expected"),
+    [
+        # Fresh thread, no conflicting flags: a single bypass flag is prepended.
+        (
+            (),
+            None,
+            [
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--remote",
+                "ws://127.0.0.1:9876",
+            ],
+        ),
+        # Conflicting approval-preset flags are stripped (flag + its value),
+        # unrelated args (model) survive, and the bypass flag is added once.
+        # codex aborts if the bypass flag is combined with --sandbox /
+        # --ask-for-approval, so leaving them in would break TUI startup.
+        (
+            ("--sandbox", "danger-full-access", "--ask-for-approval", "never", "--model", "gpt"),
+            None,
+            [
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model",
+                "gpt",
+                "--remote",
+                "ws://127.0.0.1:9876",
+            ],
+        ),
+        # Resume path: the bypass flag is a global flag and MUST precede the
+        # ``resume`` subcommand, and a pre-existing bypass flag is de-duped.
+        (
+            ("--dangerously-bypass-approvals-and-sandbox", "--sandbox", "read-only"),
+            "thread_x",
+            [
+                "--dangerously-bypass-approvals-and-sandbox",
+                "resume",
+                "--remote",
+                "ws://127.0.0.1:9876",
+                "thread_x",
+            ],
+        ),
+    ],
+)
+def test_build_codex_remote_args_bypass_emits_flag_and_strips_conflicts(
+    codex_args: tuple[str, ...],
+    thread_id: str | None,
+    expected: list[str],
+) -> None:
+    """
+    ``bypass_sandbox=True`` emits one ``--dangerously-bypass-approvals-and-
+    sandbox`` and strips the conflicting ``--sandbox`` / ``--ask-for-approval``
+    pairs.
+
+    See :func:`omnigent.codex_native_app_server._strip_approval_sandbox_flags`.
+    Asserting the exact argv guards three things: the bypass flag is present
+    exactly once, the conflicting flag pairs are removed (with their values),
+    and the bypass flag lands before any ``resume`` subcommand (codex rejects
+    a global flag placed after a subcommand).
+    """
+    assert (
+        codex_native_app_server.build_codex_remote_args(
+            codex_args=codex_args,
+            thread_id=thread_id,
+            remote_url="ws://127.0.0.1:9876",
+            bypass_sandbox=True,
+        )
+        == expected
+    )
+
+
+def test_build_codex_remote_args_bypass_hook_trust_prepends_flag() -> None:
+    """``bypass_hook_trust=True`` prepends ``--dangerously-bypass-hook-trust``.
+
+    Runner-owned headless sessions pass this flag so the TUI skips the
+    interactive "Hooks need review" prompt that can never be answered without
+    a live terminal user.
+    """
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+        bypass_hook_trust=True,
+    )
+    assert args[0] == "--dangerously-bypass-hook-trust"
+    assert "--remote" in args
+    assert "ws://127.0.0.1:9876" in args
+
+
+def test_build_codex_remote_args_bypass_hook_trust_with_resume() -> None:
+    """``bypass_hook_trust=True`` flag precedes the ``resume`` subcommand."""
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id="thread-abc",
+        remote_url="ws://127.0.0.1:9876",
+        bypass_hook_trust=True,
+    )
+    assert args[0] == "--dangerously-bypass-hook-trust"
+    assert "resume" in args
+    assert args.index("--dangerously-bypass-hook-trust") < args.index("resume")
+
+
+def test_build_codex_remote_args_bypass_hook_trust_default_false() -> None:
+    """``bypass_hook_trust`` defaults to ``False``; flag is absent."""
+    args = codex_native_app_server.build_codex_remote_args(
+        codex_args=(),
+        thread_id=None,
+        remote_url="ws://127.0.0.1:9876",
+    )
+    assert "--dangerously-bypass-hook-trust" not in args
+
+
+def test_trust_codex_project_updates_private_config_only(tmp_path: Path) -> None:
+    """Headless startup trusts the workspace without changing shared config."""
+    source_config = tmp_path / "shared-config.toml"
+    source_text = '[projects."/existing"]\ntrust_level = "untrusted"\n'
+    source_config.write_text(source_text, encoding="utf-8")
+    codex_home = tmp_path / "private-home"
+    codex_home.mkdir()
+    private_config = codex_home / "config.toml"
+    private_config.write_text(source_text, encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    codex_native_app_server._trust_codex_project(codex_home, workspace)
+
+    parsed = tomllib.loads(private_config.read_text(encoding="utf-8"))
+    assert parsed["projects"][str(workspace.resolve())]["trust_level"] == "trusted"
+    assert parsed["projects"]["/existing"]["trust_level"] == "untrusted"
+    assert source_config.read_text(encoding="utf-8") == source_text
+
+
+def test_build_codex_native_server_does_not_trust_project_by_default(
+    tmp_path: Path,
+) -> None:
+    """Interactive Codex launches retain the normal project trust prompt."""
+    app_server = codex_native_app_server.build_codex_native_server(
+        socket_path=tmp_path / "app.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path / "workspace",
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        codex_path="/opt/codex/bin/codex",
+    )
+
+    assert app_server.trust_project is False
 
 
 def test_codex_app_server_client_uses_codex_remote_handshake(
@@ -4879,15 +5411,8 @@ def test_forwarder_skips_user_recovery_when_user_seen_live(tmp_path: Path) -> No
     assert fake_client.requests == []
 
 
-def test_forwarder_posts_codex_turn_plan_update(tmp_path: Path) -> None:
-    """
-    Codex ``turn/plan/updated`` notifications are visible in Omnigent web.
-
-    Plan mode emits plan state through a dedicated app-server
-    notification rather than assistant text. If the forwarder ignores
-    it, the terminal shows the plan while the web transcript appears to
-    skip straight to the final prompt.
-    """
+def test_forwarder_posts_codex_turn_plan_update_only_to_tasks(tmp_path: Path) -> None:
+    """Codex ``turn/plan/updated`` notifications update only the Tasks tab."""
     posted: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -4922,37 +5447,65 @@ def test_forwarder_posts_codex_turn_plan_update(tmp_path: Path) -> None:
                         "threadId": "thread_123",
                         "turnId": "turn_123",
                         "explanation": None,
-                        "plan": [
-                            {"step": "Inspect Codex plan events", "status": "completed"},
-                            {"step": "Mirror plans to web", "status": "inProgress"},
-                            {"step": "Run checks", "status": "pending"},
-                        ],
+                        "plan": [{"step": "Inspect Codex plan events", "status": "pending"}],
                     },
                 },
             )
 
     asyncio.run(run())
 
-    assert len(posted) == 1
-    assert posted[0]["type"] == "external_conversation_item"
-    data = posted[0]["data"]
-    assert data["item_type"] == "message"
-    assert data["response_id"] == "codex_turn_123"
-    assert data["item_data"] == {
-        "role": "assistant",
-        "agent": "codex-native-ui",
-        "content": [
-            {
-                "type": "output_text",
-                "text": (
-                    "Plan:\n"
-                    "- [x] Inspect Codex plan events\n"
-                    "- [~] Mirror plans to web\n"
-                    "- [ ] Run checks"
-                ),
-            }
-        ],
-    }
+    assert [event["type"] for event in posted] == ["external_session_todos"]
+
+
+def test_plan_todos_from_update_maps_steps_and_statuses() -> None:
+    """
+    ``_plan_todos_from_update`` maps Codex plan steps to the todo schema.
+
+    Each step becomes ``{"content", "status", "activeForm"}`` with the
+    status vocabulary normalized (``inProgress`` -> ``in_progress``) and the
+    step text reused for ``activeForm`` since Codex has no gerund form.
+    """
+    todos = codex_native_forwarder._plan_todos_from_update(
+        {
+            "plan": [
+                {"step": "Inspect", "status": "completed"},
+                {"step": "Mirror", "status": "inProgress"},
+                {"step": "Verify", "status": "in_progress"},
+                {"step": "Ship", "status": "pending"},
+                {"step": "Unknown", "status": "weird"},
+            ]
+        }
+    )
+
+    assert todos == [
+        {"content": "Inspect", "status": "completed", "activeForm": "Inspect"},
+        {"content": "Mirror", "status": "in_progress", "activeForm": "Mirror"},
+        {"content": "Verify", "status": "in_progress", "activeForm": "Verify"},
+        {"content": "Ship", "status": "pending", "activeForm": "Ship"},
+        {"content": "Unknown", "status": "pending", "activeForm": "Unknown"},
+    ]
+
+
+def test_plan_todos_from_update_skips_malformed_and_empty() -> None:
+    """
+    ``_plan_todos_from_update`` drops malformed steps and empty plans.
+
+    Non-dict entries and steps without a usable ``step`` string are
+    skipped; a plan that is missing, not a list, or yields no valid
+    items returns ``None`` so the caller posts nothing.
+    """
+    assert codex_native_forwarder._plan_todos_from_update({}) is None
+    assert codex_native_forwarder._plan_todos_from_update({"plan": []}) is None
+    assert codex_native_forwarder._plan_todos_from_update({"plan": "nope"}) is None
+    assert (
+        codex_native_forwarder._plan_todos_from_update(
+            {"plan": ["bad", {"step": ""}, {"status": "pending"}]}
+        )
+        is None
+    )
+    assert codex_native_forwarder._plan_todos_from_update(
+        {"plan": ["bad", {"step": "Keep me", "status": "pending"}]}
+    ) == [{"content": "Keep me", "status": "pending", "activeForm": "Keep me"}]
 
 
 def test_forwarder_posts_completed_codex_plan_item() -> None:
@@ -5107,6 +5660,117 @@ def test_forwarder_posts_codex_command_execution_tool_call() -> None:
     ]
 
 
+def test_forwarder_streams_codex_command_output_before_completed_item(tmp_path: Path) -> None:
+    """Command output deltas update the live tool before its final result."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    posted: list[dict[str, Any]] = []
+    state = codex_native_forwarder._CodexForwarderState()
+    started_item = {
+        "type": "commandExecution",
+        "id": "call_abc123",
+        "command": "pytest -q",
+        "cwd": "/repo",
+        "status": "inProgress",
+    }
+    completed_item = {
+        **started_item,
+        "status": "completed",
+        "aggregatedOutput": "collecting tests...\n1 passed\n",
+        "exitCode": 0,
+    }
+
+    async def run() -> None:
+        """Replay command start, output chunks, and completion."""
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_capture_handler(posted)),
+        ) as client:
+            coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
+                client,
+                "conv_123",
+                flush_interval_seconds=60.0,
+                flush_char_threshold=1000,
+            )
+            events = [
+                {
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": started_item,
+                    },
+                },
+                {
+                    "method": "item/commandExecution/outputDelta",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "itemId": "call_abc123",
+                        "delta": "collecting ",
+                    },
+                },
+                {
+                    "method": "item/commandExecution/outputDelta",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "itemId": "call_abc123",
+                        "delta": "tests...",
+                    },
+                },
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": completed_item,
+                    },
+                },
+            ]
+            for event in events:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=event,
+                    delta_coalescer=coalescer,
+                    forwarder_state=state,
+                )
+            await coalescer.close()
+
+    asyncio.run(run())
+
+    assert [payload["type"] for payload in posted] == [
+        "external_conversation_item",
+        "external_tool_output_delta",
+        "external_conversation_item",
+    ]
+    assert posted[0]["data"]["item_type"] == "function_call"
+    assert posted[1] == {
+        "type": "external_tool_output_delta",
+        "data": {"call_id": "call_abc123", "delta": "collecting tests..."},
+    }
+    assert posted[2]["data"] == {
+        "item_type": "function_call_output",
+        "item_data": {
+            "call_id": "call_abc123",
+            "output": "collecting tests...\n1 passed\n",
+        },
+        "response_id": "codex_turn_123",
+    }
+
+
 def test_forwarder_surfaces_failed_command_exit_code() -> None:
     """
     A non-zero command exit is surfaced in the mirrored output.
@@ -5247,6 +5911,350 @@ def test_forwarder_drops_codex_tool_item_missing_required_field(
     # with a fabricated command, and the drop is logged for diagnosis.
     assert posted == []
     assert "Codex commandExecution missing command" in caplog.text
+
+
+def test_forwarder_posts_codex_image_view_tool_call() -> None:
+    """
+    A completed Codex ``imageView`` becomes a view_image tool card.
+
+    Codex emits an ``imageView`` item when the model opens a local image
+    to look at it. Before this was handled the item was silently dropped,
+    so the web transcript skipped a step the native TUI shows. The only
+    datum is the path, so it is both the argument and the output (the web
+    UI cannot fetch a runner-local path).
+    """
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "imageView",
+                "id": "img_view_1",
+                "path": "/repo/screenshot.png",
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert posted == [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call",
+                "item_data": {
+                    "agent": "codex-native-ui",
+                    "name": "view_image",
+                    "arguments": '{"path": "/repo/screenshot.png"}',
+                    "call_id": "img_view_1",
+                },
+                "response_id": "codex_turn_123",
+            },
+        },
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call_output",
+                "item_data": {
+                    "call_id": "img_view_1",
+                    "output": "/repo/screenshot.png",
+                },
+                "response_id": "codex_turn_123",
+            },
+        },
+    ]
+
+
+def test_forwarder_posts_codex_image_generation_tool_call() -> None:
+    """
+    A completed Codex ``imageGeneration`` becomes a generate_image tool card.
+
+    The raw ``result`` (base64 image bytes) is deliberately NOT mirrored —
+    the web UI has no assistant-side image rendering and the base64 blob
+    would only bloat the transcript. The card carries the revised prompt as
+    the argument and the status plus on-disk save path as the output.
+    """
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "imageGeneration",
+                "id": "img_gen_1",
+                "status": "completed",
+                "revisedPrompt": "a red bicycle on a beach",
+                "result": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
+                "savedPath": "/repo/out.png",
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert [p["data"]["item_type"] for p in posted] == [
+        "function_call",
+        "function_call_output",
+    ]
+    call = posted[0]["data"]["item_data"]
+    assert call["name"] == "generate_image"
+    assert call["call_id"] == "img_gen_1"
+    # The revised prompt is surfaced; the base64 result is never echoed.
+    assert json.loads(call["arguments"]) == {"revised_prompt": "a red bicycle on a beach"}
+    assert "iVBORw0KGgo" not in call["arguments"]
+    output = posted[1]["data"]["item_data"]["output"]
+    assert output == "status: completed\nsaved to /repo/out.png"
+    assert "iVBORw0KGgo" not in output
+
+
+def test_forwarder_drops_codex_image_generation_missing_status(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    An ``imageGeneration`` with no status is dropped, not mirrored blank.
+
+    ``status`` is a required protocol field; its absence means a malformed
+    item, which is logged and skipped rather than mirrored as an empty card.
+    """
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "imageGeneration",
+                "id": "img_gen_bad",
+                "revisedPrompt": "x",
+                "result": "y",
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert posted == []
+    assert "Codex imageGeneration missing status" in caplog.text
+
+
+def test_forwarder_posts_codex_entered_review_mode_marker() -> None:
+    """
+    Codex ``enteredReviewMode`` surfaces a visible review-mode marker.
+
+    Codex ``/review`` brackets a turn with enter/exit thread items. The web
+    UI has no review affordance, so the transition is mirrored as a short
+    assistant-message marker (the same rail used for plan updates), carrying
+    the review subject so the web user sees what is under review.
+    """
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "enteredReviewMode",
+                "id": "review_1",
+                "review": "review the auth changes",
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert posted == [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "codex-native-ui",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Entered review mode: review the auth changes",
+                        }
+                    ],
+                },
+                "response_id": "codex_turn_123",
+            },
+        }
+    ]
+
+
+def test_forwarder_posts_codex_exited_review_mode_marker() -> None:
+    """
+    Codex ``exitedReviewMode`` surfaces a visible exit marker.
+
+    With no review subject the marker is just the header — a terse divider
+    that tells the web user the session left review mode.
+    """
+    posted: list[dict[str, Any]] = []
+    asyncio.run(
+        _replay_completed_item(
+            {
+                "type": "exitedReviewMode",
+                "id": "review_2",
+                "review": "",
+            },
+            _capture_handler(posted),
+        )
+    )
+
+    assert posted == [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "codex-native-ui",
+                    "content": [{"type": "output_text", "text": "Exited review mode"}],
+                },
+                "response_id": "codex_turn_123",
+            },
+        }
+    ]
+
+
+def _turn_diff_event(turn_id: str, diff: str, *, thread_id: str = "thread_123") -> dict[str, Any]:
+    """
+    Build a Codex ``turn/diff/updated`` notification.
+
+    :param turn_id: Codex turn id, e.g. ``"turn_123"``.
+    :param diff: Aggregated unified diff for the turn so far.
+    :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+    :returns: App-server event payload.
+    """
+    return {
+        "method": "turn/diff/updated",
+        "params": {"threadId": thread_id, "turnId": turn_id, "diff": diff},
+    }
+
+
+def test_forwarder_coalesces_and_flushes_turn_diff(tmp_path: Path) -> None:
+    """
+    ``turn/diff/updated`` is coalesced and flushed once at turn end.
+
+    Codex streams the aggregated working-tree diff repeatedly as edits land.
+    Posting each update would spam the transcript with a growing diff, so the
+    forwarder stores only the newest diff and mirrors it once, at the
+    terminal boundary, as a single ``turn_diff`` function-call pair — after
+    the turn's other items and before the idle status edge.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    posted: list[dict[str, Any]] = []
+    forwarder_state = codex_native_forwarder._CodexForwarderState()
+    latest_diff = "--- a/x.py\n+++ b/x.py\n@@\n-old\n+new\n"
+
+    async def run() -> None:
+        """
+        Replay two diff updates followed by the terminal boundary.
+
+        :returns: None.
+        """
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_capture_handler(posted)),
+        ) as client:
+            for event in [
+                _turn_diff_event("turn_123", "--- a/x.py\n+++ b/x.py\n@@\n-old\n"),
+                _turn_diff_event("turn_123", latest_diff),
+                _completed_event("turn_123", thread_id="thread_123"),
+            ]:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=event,
+                    forwarder_state=forwarder_state,
+                )
+
+    asyncio.run(run())
+
+    # The two diff updates post nothing; only the terminal boundary flushes a
+    # single turn_diff pair (carrying the LATEST diff), then the idle edge.
+    assert posted == [
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call",
+                "item_data": {
+                    "agent": "codex-native-ui",
+                    "name": "turn_diff",
+                    "arguments": "{}",
+                    "call_id": "codex_turn_diff_turn_123",
+                },
+                "response_id": "codex_turn_123",
+            },
+        },
+        {
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call_output",
+                "item_data": {
+                    "call_id": "codex_turn_diff_turn_123",
+                    "output": latest_diff,
+                },
+                "response_id": "codex_turn_123",
+            },
+        },
+        {
+            "type": "external_session_status",
+            "data": _expected_status_data("idle", "turn_123"),
+        },
+    ]
+    # The stored diff is consumed on flush — no leak into the next turn.
+    assert forwarder_state.turn_diff_by_turn == {}
+
+
+def test_forwarder_skips_turn_diff_when_none_captured(tmp_path: Path) -> None:
+    """
+    A turn with no ``turn/diff/updated`` posts no turn_diff card.
+
+    Read-only turns never receive a diff notification, so the terminal
+    boundary must emit only the idle status edge — no empty diff artifact.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    posted: list[dict[str, Any]] = []
+    forwarder_state = codex_native_forwarder._CodexForwarderState()
+
+    async def run() -> None:
+        """
+        Replay a terminal boundary with no preceding diff update.
+
+        :returns: None.
+        """
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_capture_handler(posted)),
+        ) as client:
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id="conv_123",
+                bridge_dir=tmp_path,
+                usage_coalescer=_usage_coalescer(client),
+                elicitation_tracker=_elicitation_tracker(),
+                event=_completed_event("turn_123", thread_id="thread_123"),
+                forwarder_state=forwarder_state,
+            )
+
+    asyncio.run(run())
+
+    assert posted == [
+        {
+            "type": "external_session_status",
+            "data": _expected_status_data("idle", "turn_123"),
+        },
+    ]
 
 
 def test_forwarder_skips_item_retry_on_ambiguous_transport_failure(
@@ -5745,6 +6753,113 @@ def test_local_run_prints_resume_hint_after_attach(
     assert resume_hint in captured.err
     assert captured.err.index(web_ui) < captured.err.index(resume_hint)
     assert opened == [("http://127.0.0.1:23456", "conv_codex_fresh", True)]
+
+
+def test_local_run_resume_hint_follows_native_new_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    The resume hint names the session a native ``/new`` rotated into.
+
+    Codex ``/new`` starts a fresh thread and the forwarder rotates
+    Omnigent ownership to a new conversation, recording it in bridge
+    state. A regression that echoes the launch-time ``prepared`` id
+    instead hands the user a command that resumes the session they
+    already cleared away from.
+    """
+    spec_path = tmp_path / "codex.yaml"
+    spec_path.write_text("name: codex-native-ui\nprompt: hi\n", encoding="utf-8")
+    bridge_dir = tmp_path / "bridge"
+
+    class _Proc:
+        """Stub for the local server subprocess."""
+
+        def poll(self) -> None:
+            """
+            Pretend the fake local server is alive.
+
+            :returns: None.
+            """
+
+    def fake_start_server(*args: object, **kwargs: object) -> Any:
+        """
+        Return a minimal server handle without starting a process.
+
+        :param args: Positional startup arguments.
+        :param kwargs: Keyword startup arguments.
+        :returns: Fake local server handle.
+        """
+        del args, kwargs
+        return SimpleNamespace(proc=_Proc(), runner_id="runner_local", log_path=None)
+
+    async def fake_prepare(**kwargs: object) -> codex_native.PreparedCodexTerminal:
+        """
+        Return prepared Codex terminal details without launching Codex.
+
+        :param kwargs: Terminal preparation keyword arguments.
+        :returns: Prepared fake terminal.
+        """
+        del kwargs
+        return codex_native.PreparedCodexTerminal(
+            session_id="conv_codex_first",
+            terminal_id=codex_native.codex_terminal_resource_id(),
+            tmux_socket=None,
+            tmux_target=None,
+            bridge_dir=bridge_dir,
+            thread_id="thread_first",
+            app_server_url="ws://127.0.0.1:9876",
+            app_server=None,
+            event_client=None,
+            reattached=False,
+        )
+
+    async def fake_attach_with_forwarder(**kwargs: object) -> None:
+        """
+        Simulate a session where the user ran a native ``/new``.
+
+        :param kwargs: Attach keyword arguments.
+        :returns: None.
+        """
+        del kwargs
+        write_bridge_state(
+            bridge_dir,
+            CodexNativeBridgeState(
+                session_id="conv_codex_rotated",
+                socket_path="ws://127.0.0.1:9876",
+                thread_id="thread_rotated",
+                codex_home=str(bridge_dir / "codex-home"),
+            ),
+        )
+
+    monkeypatch.setattr("omnigent.chat._find_free_port", lambda: 23456)
+    monkeypatch.setattr("omnigent.chat._start_local_server", fake_start_server)
+    monkeypatch.setattr("omnigent.chat._stop_local_server", lambda server: None)
+    monkeypatch.setattr("omnigent.chat._wait_for_server", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.chat._bundle_agent", lambda path: b"bundle")
+    monkeypatch.setattr(codex_native, "_prepare_codex_terminal", fake_prepare)
+    monkeypatch.setattr(codex_native, "_attach_with_forwarder", fake_attach_with_forwarder)
+    monkeypatch.setattr(
+        codex_native,
+        "open_conversation_link_if_enabled",
+        lambda **kwargs: None,
+    )
+
+    codex_native._run_with_local_server(
+        spec_path,
+        session_id=None,
+        resume_picker=False,
+        codex_args=(),
+        command="codex",
+        model=None,
+        prompt=None,
+        auto_open_conversation=False,
+    )
+
+    captured = capsys.readouterr()
+    assert "Resume with: omnigent codex --resume conv_codex_rotated" in captured.err
+    assert "--resume conv_codex_first" not in captured.err
 
 
 def test_local_resume_does_not_print_redundant_resume_hint(
@@ -7302,6 +8417,84 @@ def test_session_usage_data_without_output_tokens_omits_cumulative_output() -> N
     assert "cumulative_output_tokens" not in data
 
 
+def test_session_usage_data_context_tokens_uses_last_turn_input() -> None:
+    """
+    ``context_tokens`` (the context-ring value) should reflect the LAST
+    turn's input — how much of the window the latest request occupied —
+    not the cumulative total across the whole thread.
+
+    When ``tokenUsage.last`` is present, ``context_tokens`` comes from
+    ``last.inputTokens``; ``cumulative_input_tokens`` still uses
+    ``total.inputTokens`` for cost pricing.
+    """
+    params = {
+        "tokenUsage": {
+            "total": {
+                "inputTokens": 4_800_000,
+                "outputTokens": 200_000,
+                "contextWindow": 1_178_000,
+            },
+            "last": {
+                "inputTokens": 950_000,
+                "outputTokens": 12_000,
+            },
+        },
+    }
+    data = codex_native_forwarder._session_usage_data_from_params(params)
+    assert data is not None
+    # Ring shows current context occupancy from the last turn.
+    assert data["context_tokens"] == 950_000
+    # Cost pricing uses cumulative totals.
+    assert data["cumulative_input_tokens"] == 4_800_000
+    assert data["cumulative_output_tokens"] == 200_000
+    assert data["context_window"] == 1_178_000
+
+
+def test_session_usage_data_context_tokens_falls_back_without_last() -> None:
+    """
+    When ``tokenUsage.last`` is absent (e.g. first frame before a turn
+    completes), ``context_tokens`` falls back to ``total.inputTokens``.
+    """
+    params = {
+        "tokenUsage": {
+            "total": {
+                "inputTokens": 1000,
+                "outputTokens": 250,
+                "contextWindow": 200_000,
+            },
+        },
+    }
+    data = codex_native_forwarder._session_usage_data_from_params(params)
+    assert data is not None
+    assert data["context_tokens"] == 1000
+    assert data["cumulative_input_tokens"] == 1000
+
+
+def test_session_usage_data_context_tokens_falls_back_when_last_missing_input() -> None:
+    """
+    When ``tokenUsage.last`` is present but lacks a usable ``inputTokens``,
+    ``context_tokens`` falls back to ``total.inputTokens`` rather than being
+    omitted (which would leave the UI ring stuck on a stale value from a
+    previous coalescer frame).
+    """
+    params = {
+        "tokenUsage": {
+            "total": {
+                "inputTokens": 3000,
+                "outputTokens": 500,
+                "contextWindow": 200_000,
+            },
+            "last": {
+                "outputTokens": 100,
+                # inputTokens intentionally absent
+            },
+        },
+    }
+    data = codex_native_forwarder._session_usage_data_from_params(params)
+    assert data is not None
+    assert data["context_tokens"] == 3000
+
+
 def test_usage_coalescer_flush_attaches_model_to_every_post() -> None:
     """
     ``flush`` attaches the recorded model to each token-bearing post.
@@ -7418,6 +8611,30 @@ def _collab_item_started_event(
                 "tool": "spawnAgent",
                 "senderThreadId": parent_thread_id,
                 "receiverThreadIds": [child_thread_id],
+            },
+        },
+    }
+
+
+def _subagent_activity_started_event(
+    *,
+    parent_thread_id: str = "thread_parent",
+    child_thread_id: str = "thread_child",
+    item_id: str = "activity_1",
+    method: str = "item/completed",
+) -> dict[str, Any]:
+    """Build the native Codex child-spawn notification."""
+    return {
+        "method": method,
+        "params": {
+            "threadId": parent_thread_id,
+            "turnId": "turn_parent",
+            "item": {
+                "type": "subAgentActivity",
+                "id": item_id,
+                "kind": "started",
+                "agentThreadId": child_thread_id,
+                "agentPath": "root/researcher",
             },
         },
     }
@@ -7676,6 +8893,45 @@ def test_forwarder_dedupes_replay_and_live_child_item(
         f"got {len(child_posts)}. Duplicate write survived dedup."
     )
     assert child_posts[0]["data"]["item_data"]["content"][0]["text"] == "child output"
+
+
+@pytest.mark.parametrize("activity_method", ["item/started", "item/completed"])
+def test_forwarder_registers_subagent_activity_before_child_events(
+    tmp_path: Path,
+    activity_method: str,
+) -> None:
+    """A native spawn activity creates the child before its events arrive."""
+    posted: list[tuple[str, dict[str, Any]]] = []
+    codex_client = _PerThreadFakeCodexClient(
+        thread_responses={"thread_child": _child_resume_response(text="backfilled child output")}
+    )
+    codex_client.events = [
+        _subagent_activity_started_event(method=activity_method),
+        _child_agent_message_event(item_id="child_live", text="live child output"),
+    ]
+
+    async def run() -> None:
+        await codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:8000",
+            headers={},
+            session_id="conv_parent",
+            bridge_dir=tmp_path,
+            app_server_url=str(tmp_path / "app-server.sock"),
+            thread_id="thread_parent",
+            client=codex_client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(_make_omnigent_handler(posted)),
+        )
+
+    asyncio.run(run())
+
+    registrations = _registration_posts(posted, "conv_parent")
+    assert registrations, "subAgentActivity(kind=started) must create an Omnigent child session"
+    assert registrations[0]["data"]["thread_id"] == "thread_child"
+    child_posts = _transcript_posts(posted, "conv_child")
+    assert [post["data"]["item_data"]["content"][0]["text"] for post in child_posts] == [
+        "backfilled child output",
+        "live child output",
+    ]
 
 
 def test_forwarder_does_not_double_write_stable_id_item_delivered_twice(
@@ -8735,3 +9991,356 @@ def test_mint_codex_thread_id_is_uuidv7() -> None:
     parsed = _uuid.UUID(minted)
     assert parsed.version == 7
     assert codex_native._CODEX_THREAD_ID_RE.fullmatch(minted)
+
+
+def test_command_execution_appends_sandbox_bypass_guidance_on_namespace_error() -> None:
+    """A codex shell command that fails because codex's own command sandbox
+    cannot start (no unprivileged user namespaces in a hardened container) gets
+    actionable recovery guidance appended, instead of surfacing only the opaque
+    ``bwrap: No permissions to create new namespace`` output (issue #657)."""
+    item = {
+        "command": "/bin/zsh -lc 'echo hi'",
+        "aggregatedOutput": (
+            "bwrap: No permissions to create new namespace, likely because the "
+            "kernel does not allow non-privileged user namespaces.\n"
+        ),
+        "exitCode": 1,
+    }
+    tool_call = codex_native_forwarder._command_execution_tool_call("call_1", item)
+    assert tool_call is not None
+    # The raw bwrap output and the exit code are preserved verbatim...
+    assert "No permissions to create new namespace" in tool_call.output
+    assert "[exit code: 1]" in tool_call.output
+    # ...with actionable recovery guidance appended (the "Full access" preset
+    # and the config sandbox_mode workaround).
+    assert "Full access" in tool_call.output
+    assert "danger-full-access" in tool_call.output
+
+
+def test_command_execution_leaves_normal_output_untouched() -> None:
+    """A successful command keeps its output verbatim — the guidance only fires
+    on the sandbox-namespace failure, never on ordinary output (issue #657)."""
+    item = {"command": "pwd", "aggregatedOutput": "/repo\n", "exitCode": 0}
+    tool_call = codex_native_forwarder._command_execution_tool_call("call_1", item)
+    assert tool_call is not None
+    assert tool_call.output == "/repo\n"
+    assert "Full access" not in tool_call.output
+    assert "danger-full-access" not in tool_call.output
+
+
+def test_forwarder_mirrors_codex_context_compaction(tmp_path: Path) -> None:
+    """
+    Codex context-compaction surfaces as external_compaction_status (#1255).
+
+    A ``contextCompaction`` item/started shows the spinner (in_progress) and
+    the ``thread/compacted`` notification clears it (completed). Both signals
+    were previously dropped, so the web UI never indicated Codex compacted —
+    increasingly relevant with GPT-5.1-Codex-Max auto-compaction.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_123",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_123",
+        ),
+    )
+    forwarder_state = codex_native_forwarder._CodexForwarderState()
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Record /events bodies; 202 for events, 200 otherwise."""
+        if request.url.path.endswith("/events"):
+            posted.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": False})
+        return httpx.Response(200, json={})
+
+    async def run() -> None:
+        """Drive a compaction start item then the completion notification."""
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            for event in [
+                {
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": {"type": "contextCompaction", "id": "item_c"},
+                    },
+                },
+                {"method": "thread/compacted", "params": {"threadId": "thread_123"}},
+            ]:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    event=event,
+                    forwarder_state=forwarder_state,
+                )
+
+    asyncio.run(run())
+
+    compaction = [p for p in posted if p.get("type") == "external_compaction_status"]
+    assert compaction == [
+        {"type": "external_compaction_status", "data": {"status": "in_progress"}},
+        {"type": "external_compaction_status", "data": {"status": "completed"}},
+    ]
+
+
+def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None:
+    """Compaction items emit a Compacted rollout record and discard prior items."""
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "msg_2",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi there"}],
+            "response_id": "resp_1",
+        },
+        {
+            "id": "cmp_1",
+            "type": "compaction",
+            "summary": "compaction summary",
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                },
+                {
+                    "type": "compaction",
+                    "encrypted_content": "gAAAA_encrypted",
+                },
+            ],
+            "window_id": 2,
+            "response_id": "compact_1",
+        },
+        {
+            "id": "msg_3",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "after compaction"}],
+            "response_id": "resp_2",
+        },
+    ]
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+    )
+    # Should have: session_meta, compacted, turn_context, response_item (msg_3), event_msg
+    types = [r["type"] for r in records]
+    assert "session_meta" in types
+    assert "compacted" in types
+    # Pre-compaction response_items should be gone
+    pre_compaction_items = [
+        r
+        for r in records
+        if r["type"] == "response_item"
+        and r["payload"].get("content") == [{"type": "input_text", "text": "hello"}]
+    ]
+    assert len(pre_compaction_items) == 0, "Pre-compaction items should be discarded"
+    # The compacted record should have replacement_history and window_id
+    compacted_records = [r for r in records if r["type"] == "compacted"]
+    assert len(compacted_records) == 1
+    cp = compacted_records[0]["payload"]
+    assert cp["window_id"] == 2
+    assert len(cp["replacement_history"]) == 2
+    assert cp["replacement_history"][1]["encrypted_content"] == "gAAAA_encrypted"
+    # Post-compaction message should still be present
+    post_items = [
+        r
+        for r in records
+        if r["type"] == "response_item"
+        and r["payload"].get("content") == [{"type": "input_text", "text": "after compaction"}]
+    ]
+    assert len(post_items) == 1
+
+
+def test_codex_event_msg_record_ignores_non_list_content() -> None:
+    """Malformed message content is skipped as it was before type narrowing."""
+    assert (
+        codex_native._codex_event_msg_record_for_message(
+            {"type": "message", "role": "user", "content": "not-a-list"},
+            timestamp="2026-08-02T00:00:00.000Z",
+        )
+        is None
+    )
+
+
+def test_codex_event_msg_record_reports_non_string_text_cleanly() -> None:
+    """Malformed block text produces a user-facing CLI error."""
+    with pytest.raises(
+        click.ClickException,
+        match="Codex message content text must be a string",
+    ):
+        codex_native._codex_event_msg_record_for_message(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": 42}],
+            },
+            timestamp="2026-08-02T00:00:00.000Z",
+        )
+
+
+def test_rollout_records_without_compaction_item_has_no_compacted_entry() -> None:
+    """Sessions without compaction produce no Compacted rollout record."""
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "response_id": "resp_1",
+        },
+    ]
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+    )
+    types = [r["type"] for r in records]
+    assert "compacted" not in types
+
+
+@pytest.mark.parametrize(
+    "terminal_launch_args",
+    [
+        ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+        ["-c", 'default_permissions=":danger-full-access"'],
+    ],
+)
+def test_rollout_records_use_terminal_launch_permission_args(
+    terminal_launch_args: list[str],
+) -> None:
+    """Cold-resume turn_context preserves the persisted Codex permission mode."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "response_id": "resp_1",
+            }
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+        terminal_launch_args=terminal_launch_args,
+    )
+
+    turn_context = next(r for r in records if r["type"] == "turn_context")["payload"]
+    assert turn_context["approval_policy"] == "never"
+    assert turn_context["sandbox_policy"] == {"type": "danger-full-access"}
+
+
+# --- #2745: routing summary surfaced in the startup-timeout error ---
+
+
+def test_native_codex_launch_summary_defaults_empty() -> None:
+    """The new summary field defaults to empty so existing call sites stay valid."""
+    launch = codex_native_app_server.NativeCodexLaunch(
+        config_overrides=[], model=None, profile=None
+    )
+    assert launch.summary == ""
+
+
+def test_resolve_native_codex_launch_no_provider_sets_login_fallback_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No configured provider -> summary names the login fallback (#2745)."""
+    from omnigent.onboarding import ambient, detected, provider_config
+    from omnigent.runtime import workflow
+
+    monkeypatch.setattr(provider_config, "load_config", dict)
+    monkeypatch.setattr(ambient, "codex_config_detection", lambda: None)
+    monkeypatch.setattr(detected, "dismissed_detection_names", lambda cfg: frozenset())
+    monkeypatch.setattr(detected, "effective_config_with_detected", lambda cfg: {})
+    monkeypatch.setattr(provider_config, "default_provider_for_harness", lambda cfg, harness: None)
+    monkeypatch.setattr(workflow, "_load_global_auth", lambda: None)
+
+    launch = codex_native_app_server.resolve_native_codex_launch(model=None)
+
+    assert launch.profile is None
+    assert "no provider configured" in launch.summary
+    assert "sign-in" in launch.summary
+
+
+def test_resolve_native_codex_launch_databricks_provider_sets_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Databricks provider default -> summary names the ucode profile (#2745)."""
+    from omnigent.onboarding import ambient, detected, provider_config
+
+    entry = SimpleNamespace(kind=provider_config.DATABRICKS_KIND, profile="my-profile")
+    monkeypatch.setattr(provider_config, "load_config", dict)
+    monkeypatch.setattr(ambient, "codex_config_detection", lambda: None)
+    monkeypatch.setattr(detected, "dismissed_detection_names", lambda cfg: frozenset())
+    monkeypatch.setattr(
+        provider_config, "default_provider_for_harness", lambda cfg, harness: entry
+    )
+
+    launch = codex_native_app_server.resolve_native_codex_launch(model="gpt-5.5")
+
+    assert launch.profile == "my-profile"
+    assert launch.summary == "Databricks ucode profile 'my-profile'"
+
+
+def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A startup timeout records the launch routing summary in the bridge error (#2745)."""
+    from omnigent import codex_native_forwarder as _fwd
+    from omnigent.codex_native_bridge import read_bridge_startup_error
+    from omnigent.runner.native import orchestration as native_orch
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    async def _timeout(_client: object) -> str:
+        raise TimeoutError("no thread event")
+
+    monkeypatch.setattr(_fwd, "wait_for_thread_started", _timeout)
+
+    class _FakeClient:
+        async def close(self) -> None:
+            return None
+
+    asyncio.run(
+        native_orch._codex_discover_thread_and_forward(
+            session_id="conv_test",
+            bridge_dir=bridge_dir,
+            codex_ws_url="ws://127.0.0.1:9999",
+            codex_home=tmp_path / "codex-home",
+            event_client=_FakeClient(),
+            routing_summary="Codex CLI login (no provider configured) -- SENTINEL",
+        )
+    )
+
+    err = read_bridge_startup_error(bridge_dir)
+    assert err is not None
+    assert "Launch routing: Codex CLI login (no provider configured) -- SENTINEL" in err
+    assert "startup timed out" in err

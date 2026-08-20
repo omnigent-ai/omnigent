@@ -1,0 +1,3 @@
+provider: generic
+url: http://127.0.0.1:8765/
+updaterCacheDirName: omnigent-desktop-electron-updater-dev

@@ -154,9 +154,12 @@ def _write_secrets_file(secrets: dict[str, str]) -> None:
     """
     path = _secrets_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    # Open with 0600 from the start (umask is applied by the OS, so chmod
-    # after the write guarantees the final mode regardless of umask).
-    with open(path, "w", encoding="utf-8") as f:
+    # Create the file 0600 from the start via os.open(O_CREAT, 0o600) rather than
+    # a plain open()+chmod-after: the latter briefly leaves a freshly-created
+    # secrets file group/world-readable until the chmod lands. The trailing chmod
+    # still tightens an already-existing file a prior run may have created wider.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(secrets, f, indent=2)
     os.chmod(path, 0o600)
 

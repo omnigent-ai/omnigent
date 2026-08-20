@@ -1,0 +1,57 @@
+spec_version: 1
+name: scanner
+description: >-
+  Read-only repo explorer for Sentinel. Reads source, dependency manifests, git
+  history, and diffs to surface security-relevant patterns (hardcoded secrets,
+  injection, unsafe deserialization, weak crypto) and returns a findings report.
+  Never edits files.
+
+# Read-only explorer on the Claude Agent SDK. No model is pinned, so it runs on
+# whatever Claude provider you configured (`omnigent setup`).
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+# Filesystem access so the scanner can read files, grep, and inspect git
+# history. Sandboxed by default: omitting `sandbox.type` auto-selects the
+# platform backend (`linux_bwrap` / `darwin_seatbelt`), binding cwd read-only
+# so shell writes are contained. Linux needs `bwrap` installed (fails loud with
+# a hint if missing); macOS uses the built-in sandbox-exec. See the orchestrator
+# config. `read_only_os` below is defense-in-depth (refuses the file-write tools
+# early); add `sandbox: {type: none}` only for code you fully trust.
+os_env:
+  type: caller_process
+  cwd: .
+
+# Same guardrails the rest of the bundle uses: blast_radius bounds shell, and
+# read_only_os denies the file-write/edit tools (best-effort; shell not gated).
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false
+    read_only_os:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.read_only_os
+
+prompt: |
+  You are Sentinel's scanner: a read-only security explorer. You answer audit
+  questions by READING the codebase — source, config, dependency manifests, git
+  history, diffs — and reporting what you find. You never write or edit files;
+  your report is the deliverable.
+
+  Use your `sys_os_*` tools to read and search: `sys_os_read` for files,
+  `sys_os_shell` for `grep`/`rg`, `git log`, `git show`, and `git diff`. Go to
+  the actual code and history — never answer from assumption or stale
+  knowledge.
+
+  Return a structured findings report keyed by severity
+  (Critical/High/Medium/Low/Info) with file:line evidence and a recommendation.
+  If you cannot confirm a finding from the code, say so plainly — do not guess.

@@ -194,6 +194,13 @@ class GeminiAdapter(BaseAdapter):
                 json=payload,
             ) as resp,
         ):
+            # Buffer error bodies before raising: a streamed response
+            # is unread, so exc.response.text would raise
+            # ResponseNotRead and error classification (e.g.
+            # context-overflow detection) would never see the
+            # provider's message.
+            if resp.status_code >= 400:
+                await resp.aread()
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
@@ -501,6 +508,13 @@ def _gemini_stream_chunk_to_chat(
     parts = candidate.get("content", {}).get("parts", [])
     finish_reason = _normalize_finish_reason(candidate.get("finishReason"))
 
+    # Each parallel function call needs a distinct ``tool_calls`` index. The
+    # downstream accumulator (``chat_stream_to_response_events``) keys tool
+    # calls by this index, overwriting name/id and *appending* arguments for a
+    # repeated index. Gemini returns parallel calls as multiple ``functionCall``
+    # parts in one chunk, so a fixed ``0`` would collapse them into a single
+    # corrupted call. Count tool calls so each gets its own index.
+    tool_call_index = 0
     for part in parts:
         if "text" in part:
             yield {
@@ -530,7 +544,7 @@ def _gemini_stream_chunk_to_chat(
                         "delta": {
                             "tool_calls": [
                                 {
-                                    "index": 0,
+                                    "index": tool_call_index,
                                     "id": f"call_{call_id}",
                                     "type": "function",
                                     "function": {
@@ -544,6 +558,7 @@ def _gemini_stream_chunk_to_chat(
                     }
                 ],
             }
+            tool_call_index += 1
 
     if finish_reason:
         yield {

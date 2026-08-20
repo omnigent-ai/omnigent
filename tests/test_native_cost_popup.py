@@ -348,3 +348,118 @@ def test_wait_for_tmux_client_times_out_when_no_client(
     # timeout_s=0.0 → the deadline has already passed, so it returns without
     # sleeping (keeps the test fast and free of time.sleep).
     assert native_cost_popup.wait_for_tmux_client("/tmp/x.sock", "main", timeout_s=0.0) is False
+
+
+def test_main_notice_mode_needs_no_config_and_no_resolve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--notice`` shows a hard-block reason and exits 0 without any server call.
+
+    The hard-DENY path (e.g. an opencode cost cap) has nothing to resolve — it
+    must not require the AP-routing config and must not POST a verdict.
+    """
+    posted: list[Any] = []
+    monkeypatch.setattr(request, "urlopen", lambda *a, **k: posted.append(a))  # type: ignore[arg-type]
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "")
+    rc = native_cost_popup.main(
+        ["--notice", "--message", "You've hit the $0.0001 budget.", "--policy-name", "cost-budget"]
+    )
+    assert rc == 0
+    assert posted == [], "notice mode must not POST a resolution"
+
+
+def test_launch_blocked_notice_spawns_notice_popup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``launch_blocked_notice`` pops a ``--notice`` popup (no config/elicitation)."""
+    monkeypatch.setattr(native_cost_popup, "_list_tmux_clients", lambda _s, _t: ["/dev/pts/9"])
+    spawned: list[list[str]] = []
+
+    class _FakePopen:
+        def __init__(self, cmd: list[str], **_kw: Any) -> None:
+            spawned.append(cmd)
+
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    native_cost_popup.launch_blocked_notice(
+        "/tmp/x.sock", "main", message="over budget", policy_name="cost-budget"
+    )
+    assert len(spawned) == 1
+    inner = spawned[0][-1]  # the shell-string passed to display-popup
+    assert "--notice" in inner and "over budget" in inner
+    assert "--config-file" not in inner and "--elicitation-id" not in inner
+
+
+def test_launch_blocked_notice_skips_without_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No attached client → nothing to render on → no popup spawned."""
+    monkeypatch.setattr(native_cost_popup, "_list_tmux_clients", lambda _s, _t: [])
+    import subprocess
+
+    def _boom(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("must not spawn a popup with no client")
+
+    monkeypatch.setattr(subprocess, "Popen", _boom)
+    native_cost_popup.launch_blocked_notice("/tmp/x.sock", "main", message="x")
+
+
+def test_tmux_window_activity_at_tracks_a_live_server() -> None:
+    """
+    A live tmux window reports recent activity; a killed server reports None.
+
+    The pane reaper uses this as primary evidence that a terminal is
+    producing output, so the live reading must be a fresh epoch timestamp
+    and a dead server must read as "no evidence", never as an error.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    import time
+
+    if shutil.which("tmux") is None:
+        pytest.skip("tmux not installed")
+    # A short socket dir: pytest's tmp_path exceeds the Unix sun_path limit.
+    tmp_dir = tempfile.mkdtemp(prefix="omni-wa-")
+    socket_path = str(Path(tmp_dir) / "t.sock")
+    try:
+        subprocess.run(
+            ["tmux", "-S", socket_path, "new-session", "-d", "-s", "main", "-x", "20", "-y", "5"],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+        try:
+            activity_at = native_cost_popup._tmux_window_activity_at(socket_path, "main")
+            assert activity_at is not None
+            assert abs(time.time() - activity_at) < 120.0
+        finally:
+            subprocess.run(
+                ["tmux", "-S", socket_path, "kill-server"],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+        assert native_cost_popup._tmux_window_activity_at(socket_path, "main") is None
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_tmux_window_activity_at_none_on_unparseable_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Garbage from tmux is treated as "no evidence", not a crash.
+
+    An old tmux that doesn't know the format variable echoes it back
+    verbatim; the reaper must fall back to its other signals rather than
+    treat that as activity (or blow up mid-scan).
+    """
+    import subprocess
+
+    def _fake_run(*_a: Any, **_k: Any) -> Any:
+        return types.SimpleNamespace(returncode=0, stdout="#{window_activity}\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    assert native_cost_popup._tmux_window_activity_at("/tmp/x.sock", "main") is None

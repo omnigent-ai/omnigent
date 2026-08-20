@@ -1,5 +1,0 @@
-node_modules/
-dist/
-# The root .gitignore ignores every build/ dir, but this one holds
-# checked-in electron-builder resources (entitlements), not build output.
-!build/

@@ -70,7 +70,6 @@ import shutil
 import signal
 import stat
 import subprocess
-import sys
 import time
 import uuid
 from collections.abc import Iterator
@@ -80,6 +79,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
 
 # Opt-in only. claude-native needs a real *interactive* Claude login
@@ -96,10 +97,6 @@ pytestmark = pytest.mark.skipif(
         "OMNIGENT_E2E_CLAUDE_NATIVE=1 (and have `claude` installed + logged in) to run"
     ),
 )
-
-# The built-in agent the server auto-registers for the Web UI's
-# "Claude Code" option (see server.app._ensure_default_agents).
-_CLAUDE_NATIVE_AGENT_NAME = "claude-native-ui"
 
 # Seconds the claude wrapper sleeps before exec'ing the real binary.
 # Must comfortably exceed the runner's launch→inject latency so that,
@@ -201,8 +198,10 @@ def _spawn_host_daemon(
     daemon_log = tmp_path / "host-daemon.log"
     with open(daemon_log, "w") as log_fh:
         return subprocess.Popen(
-            [sys.executable, "-m", "omnigent.host._daemon_entry", "--server", live_server],
-            env=env,
+            # Compat-aware: pinned OLD host venv in runner compat mode (Config 2).
+            [runner_executable(), "-m", "omnigent.host._daemon_entry", "--server", live_server],
+            env=apply_runner_env(env),
+            cwd=compat_runner_cwd(),
             stdout=subprocess.DEVNULL,
             stderr=log_fh,
         )
@@ -263,10 +262,10 @@ def _claude_native_agent_id(client: httpx.Client) -> str:
     resp = client.get("/v1/agents")
     resp.raise_for_status()
     for agent in resp.json()["data"]:
-        if agent["name"] == _CLAUDE_NATIVE_AGENT_NAME:
+        if agent["name"] == CLAUDE_NATIVE_AGENT_NAME:
             return str(agent["id"])
     raise AssertionError(
-        f"{_CLAUDE_NATIVE_AGENT_NAME!r} not registered on the server "
+        f"{CLAUDE_NATIVE_AGENT_NAME!r} not registered on the server "
         "(expected from _ensure_default_agents at startup)"
     )
 

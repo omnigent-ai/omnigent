@@ -51,13 +51,13 @@ from omnigent.inner.tools import (
 from omnigent.llms.routing import infer_harness_from_model as _infer_harness_from_model
 from omnigent.spec.types import (
     AgentSpec,
-    ApiKeyAuth,
-    DatabricksAuth,
+    ExecutorAuth,
     ExecutorSpec,
     GuardrailsSpec,
     LLMConfig,
     LocalToolInfo,
     MCPServerConfig,
+    SharePolicy,
     ToolRuntime,
     ToolsConfig,
 )
@@ -95,17 +95,6 @@ _SYNTHETIC_SPEC_VERSION = 1
 # each child as an independent task — no live parent session
 # exists at runtime to walk.
 _OS_ENV_INHERIT_SENTINEL = "inherit"
-
-# Omnigent → omnigent mapping for the ``monotonic`` label
-# schema field. Omnigent uses ``max`` / ``min`` / ``none``
-# (datamodel.LabelSchemaRule.monotonic); omnigent uses
-# ``increasing`` / ``decreasing`` / absent (types.LabelDef.monotonic).
-# ``max`` is monotonically increasing (each write must be ≥ current);
-# ``min`` is monotonically decreasing (each write must be ≤ current).
-_OMNI_TO_AP_MONOTONIC: dict[str, str] = {
-    "max": "increasing",
-    "min": "decreasing",
-}
 
 # Omnigent loader policy-type discriminators. Used to dispatch
 # per-policy-type translation from the raw YAML dict.
@@ -177,7 +166,7 @@ def agent_spec_to_agent_def(spec: AgentSpec) -> AgentDef:
     # ``"inherit"`` sentinel at translation time so it never
     # reaches the forward path as a string.
     # Bundle root: derived from any bundled skill's ``skill_dir``
-    # (each lives at ``<bundle>/skills/<name>/`` per AGENTSPEC.md).
+    # (each lives at ``<bundle>/skills/<dir>/`` per AGENTSPEC.md).
     # Without it the Claude SDK harness can't expose bundled skills
     # via ``--plugin-dir``. ``None`` when the spec has no skills —
     # nothing to expose, nothing to set.
@@ -222,10 +211,10 @@ def _reject_unsupported_concepts(spec: AgentSpec) -> None:
     # a spec field" because the field is consumed upstream and
     # has no meaning to the harness.
 
-    # Sandbox declarations (omnigent ``tools.sandbox.docker_image``
+    # Sandbox declarations (omnigent ``tools.sandbox.container_image``
     # and the omnigent OSEnvSandboxSpec) are unsupported. Fail loud
     # if either is populated.
-    if spec.tools.sandbox.docker_image is not None:
+    if spec.tools.sandbox.container_image is not None:
         raise OmnigentError(
             "tools.sandbox translation to omnigent OSEnvSpec is unsupported; "
             "the adapter rejects specs with sandbox rather than silently dropping it",
@@ -411,6 +400,7 @@ def _mcp_server_to_mcp_tool(config: MCPServerConfig) -> MCPTool:
             command=config.command,
             args=list(config.args) if config.args else None,
             env=dict(config.env) if config.env else None,
+            tools=list(config.tools) if config.tools else None,
         )
     if config.url is None:
         raise OmnigentError(
@@ -421,6 +411,7 @@ def _mcp_server_to_mcp_tool(config: MCPServerConfig) -> MCPTool:
     return MCPTool(
         url=config.url,
         headers=dict(config.headers) if config.headers else None,
+        tools=list(config.tools) if config.tools else None,
     )
 
 
@@ -666,20 +657,16 @@ def _translate_labels_yaml(
     ``label_schema:`` (schemas) into Omnigent' unified
     ``guardrails.labels:`` shape.
 
-    Agent-plane's :class:`LabelDef` bundles ``initial``,
-    ``values``, and ``monotonic`` into one entry per key. The
-    omnigent ``monotonic: none`` sentinel maps to "no
-    monotonic constraint" on omnigent (field simply omitted
-    from the dict).
+    Agent-plane's :class:`LabelDef` bundles ``initial`` and
+    ``values`` into one entry per key.
 
     :param raw_labels: Initial values map, e.g.
         ``{"integrity": "1", "confidentiality": "0"}``.
     :param raw_label_schema: Schema map, e.g.
-        ``{"integrity": {"values": ["0", "1"], "monotonic": "min"}}``.
+        ``{"integrity": {"values": ["0", "1"]}}``.
     :returns: Agent-plane-shaped labels dict, e.g.
-        ``{"integrity": {"initial": "1", "values": ["0", "1"],
-        "monotonic": "decreasing"}}``. Empty dict when both
-        inputs are empty.
+        ``{"integrity": {"initial": "1", "values": ["0", "1"]}}``.
+        Empty dict when both inputs are empty.
     """
     initials = raw_labels or {}
     schemas = raw_label_schema or {}
@@ -693,14 +680,6 @@ def _translate_labels_yaml(
         if isinstance(schema, dict):
             if "values" in schema:
                 entry["values"] = schema["values"]
-            monotonic_raw = schema.get("monotonic")
-            if monotonic_raw in _OMNI_TO_AP_MONOTONIC:
-                entry["monotonic"] = _OMNI_TO_AP_MONOTONIC[monotonic_raw]
-            elif monotonic_raw not in (None, "none"):
-                # Unknown monotonic value — let the omnigent
-                # parser produce its own error downstream. We
-                # don't silently drop.
-                entry["monotonic"] = monotonic_raw
         out[key] = entry
     return out
 
@@ -905,8 +884,7 @@ def _translate_prompt_policy_yaml(
       ``model: databricks-claude-sonnet-4`` parses as provider
       ``"openai"`` and the request hits ``api.openai.com``.
     - Other fields (``on``, ``condition``, ``prompt``,
-      ``action``, ``set_labels``, ``ask_timeout``) pass through
-      unchanged.
+      ``set_labels``, ``ask_timeout``) pass through unchanged.
 
     :param raw_entry: Raw YAML mapping for one ``type: prompt``
         policy, e.g. ``{"type": "prompt", "on": ["request"],
@@ -1176,6 +1154,10 @@ def agent_def_to_agent_spec(
         terminals=terminals,
         timers=agent_def.timers,
         spawn=agent_def.spawn,
+        # AgentDef.agent_session_sharing is the raw YAML string
+        # ("none"/"non-public"/"public"); map it to the SharePolicy enum
+        # AgentSpec expects.
+        agent_session_sharing=SharePolicy(agent_def.agent_session_sharing),
         skills_filter=skills_filter,
     )
 
@@ -1367,6 +1349,17 @@ def _agent_tool_to_sub_spec(
         resolved os_env is also ``None`` and the sub-agent boots
         without filesystem access (matching legacy behavior when
         the parent itself has no os_env).
+    :param raw_executor: The raw ``executor:`` dict for this inline
+        AgentTool taken directly from the parent's YAML (before
+        omnigent' dataclass parsing dropped unknown keys). When set,
+        fields the omnigent :class:`~omnigent.inner.datamodel.ExecutorSpec`
+        datamodel does not expose — ``auth`` and ``use_responses`` —
+        are read from this dict and forwarded into the child's
+        :class:`ExecutorSpec` via :func:`_translate_executor_from_def`.
+        Without this, an ``executor.auth`` block declared on an inline
+        AgentTool is silently ignored, causing child sub-agents to fall
+        back to the ambient ``OPENAI_BASE_URL`` rather than the explicitly
+        declared mock/gateway URL.
     :returns: A nested :class:`AgentSpec` representing the
         sub-agent.
     """
@@ -1704,7 +1697,16 @@ def _translate_executor_from_def(
     harness = oa_executor.harness if oa_executor is not None else None
     if harness is None:
         harness = ""
-    harness = canonicalize_harness(harness) or ""
+    # A namespaced generic-ACP id (``acp:<slug>``) canonicalizes to the base
+    # ``acp`` harness, but the slug is what selects which user-configured ACP
+    # agent to spawn — ``_build_acp_spawn_env`` reads it back off
+    # ``config["harness"]`` at spawn time (see the dispatch note in
+    # ``runner/app.py``). Canonicalizing it away here silently spawned the first
+    # configured agent instead of the requested one, so keep the full id for
+    # ``acp:`` and canonicalize everything else (so aliases still resolve).
+    # Mirrors ``_materialize_harness_launcher_file`` in ``omnigent/cli.py``.
+    _canonical_harness = canonicalize_harness(harness) or ""
+    harness = harness if _canonical_harness == "acp" and ":" in harness else _canonical_harness
     profile = oa_executor.profile if oa_executor is not None else None
     if profile is None:
         profile = ""
@@ -1747,21 +1749,32 @@ def _translate_executor_from_def(
         "harness": harness,
         "profile": profile,
     }
-    # ``use_responses`` is not a field on the omnigent inner
-    # ExecutorSpec (the loader drops unknown keys), so we read it
-    # from the raw YAML dict and carry it forward explicitly.
+    # ``use_responses`` and ``acp_agent`` are not fields on the omnigent inner
+    # ExecutorSpec (the loader drops unknown keys), so read them from the raw
+    # YAML dict and carry them forward explicitly.
     # The openai-agents harness spawn-env builder reads
     # ``spec.executor.config["use_responses"]`` to set
     # ``HARNESS_OPENAI_AGENTS_USE_RESPONSES``, which controls
     # whether the inner executor uses /responses or /chat/completions.
-    auth: ApiKeyAuth | DatabricksAuth | None = None
+    # ``use_responses`` is carried via raw_executor when present
     if raw_executor is not None:
         use_responses_raw = raw_executor.get("use_responses")
         if use_responses_raw is not None:
             config["use_responses"] = bool(use_responses_raw)
-        # ``auth:`` is also not in the omnigent datamodel — parse it
-        # directly from the raw YAML so YAML-declared auth is not
-        # silently dropped and overridden by the global config default.
+        if "acp_agent" in raw_executor:
+            config["acp_agent"] = raw_executor["acp_agent"]
+    # ``auth`` is now parsed by the loader into OmniExecutorSpec.auth;
+    # fall back to raw_executor for the top-level agent path that still
+    # goes through _translate_executor_from_def(raw_executor=...).
+    auth: ExecutorAuth | None = None
+    if oa_executor is not None and oa_executor.auth is not None:
+        if not isinstance(oa_executor.auth, ExecutorAuth):
+            raise OmnigentError(
+                "executor auth must be a parsed auth configuration",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        auth = oa_executor.auth
+    elif raw_executor is not None:
         from omnigent.spec.parser import _parse_executor_auth
 
         auth = _parse_executor_auth(raw_executor)
@@ -1773,7 +1786,6 @@ def _translate_executor_from_def(
             f"whose prefix maps to a known harness.",
             code=ErrorCode.INVALID_INPUT,
         )
-    # Supervisor spawn-env reads spec.executor.profile, not config["profile"].
     return ExecutorSpec(
         type=OMNIGENT_EXECUTOR_TYPE,
         config=config,
@@ -1820,6 +1832,7 @@ def _translate_mcp_tool_from_def(
             url=tool.url,
             headers=dict(tool.headers) if tool.headers else {},
             databricks_profile=tool.profile,
+            tools=list(tool.tools) if tool.tools else None,
         )
     if tool.command is not None:
         return MCPServerConfig(
@@ -1828,6 +1841,7 @@ def _translate_mcp_tool_from_def(
             command=tool.command,
             args=list(tool.args) if tool.args else [],
             env=dict(tool.env) if tool.env else {},
+            tools=list(tool.tools) if tool.tools else None,
         )
     raise OmnigentError(
         f"omnigent MCP tool {tool_name!r} has neither 'url' nor "

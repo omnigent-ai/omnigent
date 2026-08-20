@@ -1,0 +1,44 @@
+spec_version: 1
+name: tool-call-policy
+description: >
+  Fixture agent for the tool_call DENY-policy e2e test. The calculate tool
+  ships as Python source under tools/python/ (auto-discovered) so the server
+  loads it by file path from the unpacked bundle on any server version — no
+  dependency on the repo's tests/ tree. The DENY policy below uses an omnigent
+  built-in policy callable (resolves on any server).
+
+# executor.model and an executor.auth api-key block are stamped per-test by
+# register_dir_agent_with_mock_llm. config.harness selects openai-agents.
+executor:
+  type: omnigent
+  model: mock-model
+  config:
+    harness: openai-agents
+
+prompt: |
+  Use calculate to answer. If the tool output starts with '[Denied by policy'
+  or mentions a denial, reply that the calculation was denied. Do not retry.
+
+# tool_call:calculate DENY. In the config.yaml dir-bundle form, policies live
+# under guardrails: — omnigent.spec.parser reads guardrails.policies and ignores
+# a top-level policies: block (unlike the single-YAML form). The reason sentinel
+# must stay in sync with _DENY_REASON in tests/e2e/test_tool_call_policy_e2e.py.
+guardrails:
+  policies:
+    deny_calculate_tool:
+      type: function
+      on:
+        - tool_call:calculate
+      function:
+        path: omnigent.policies.function.make_fixed_action_callable
+        arguments:
+          action: deny
+          reason: TOOL_BAN_TEST_SENTINEL_XYZQ
+          on_phases:
+            - tool_call
+          on_tools:
+            - calculate
+
+os_env:
+  type: caller_process
+  cwd: .

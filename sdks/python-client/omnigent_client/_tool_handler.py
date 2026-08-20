@@ -229,6 +229,9 @@ class ElicitationRequestCtx:
     :param response_id: The in-progress response id — for
         logging / audit purposes only. The client handles the
         elicitation reply POST automatically.
+    :param target_session_id: Session whose resolve endpoint owns
+        the elicitation. Set for mirrored child-session prompts;
+        ``None`` means resolve against the stream's session.
     """
 
     elicitation_id: str
@@ -240,6 +243,7 @@ class ElicitationRequestCtx:
     content_preview: str
     response_id: str
     url: str | None = None
+    target_session_id: str | None = None
 
 
 @dataclass

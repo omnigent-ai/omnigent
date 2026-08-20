@@ -6,7 +6,7 @@ import importlib
 import re
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 
 import yaml
 
@@ -252,6 +252,7 @@ def _parse_agent_def(
     agent.runtime = data.get("runtime", False)
     agent.timers = data.get("timers", False)
     agent.spawn = data.get("spawn", False)
+    agent.agent_session_sharing = data.get("agent_session_sharing", "none")
     agent.os_env = _parse_os_env_spec(data.get("os_env"))
 
     # Executor
@@ -297,14 +298,10 @@ def _parse_agent_def(
     # Label schema
     from .datamodel import LabelSchemaRule
 
-    _MONOTONIC_ALIASES = {"up": "max", "down": "min"}
     for ls_name, ls_data in data.get("label_schema", {}).items():
         if isinstance(ls_data, dict):
-            raw_monotonic = str(ls_data.get("monotonic", "none"))
-            monotonic = _MONOTONIC_ALIASES.get(raw_monotonic, raw_monotonic)
             agent.label_schema[str(ls_name)] = LabelSchemaRule(
                 values=[str(v) for v in ls_data.get("values", [])],
-                monotonic=monotonic,
             )
 
     # Policy transparency
@@ -619,14 +616,39 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
     if isinstance(data, str):
         return ExecutorSpec(model=data)
     if isinstance(data, dict):
+        # ``type:``/``config:`` are the bundle config.yaml nesting — skipped
+        # silently, they'd drop the declared harness and let a different one
+        # be inferred from the model prefix. Only these two are rejected:
+        # other extra keys (``use_responses``, ``extra``, …) are read from
+        # the raw YAML by the compat loader and must keep loading.
+        nested = sorted(key for key in ("config", "type") if key in data)
+        if nested:
+            raise ValueError(
+                f"executor: key(s) {', '.join(nested)} belong to the bundle "
+                "config.yaml format; this format spells the executor flat, "
+                "e.g. executor: {harness: codex-native, model: MODEL_ID}"
+            )
         # ``ExecutorSpec.{model,harness,profile}`` are ``str | None``;
         # missing keys map to ``None`` directly. ``data.get`` happens to
         # already return ``None`` for missing keys, so the assignment
         # flows through unchanged.
+        #
+        # Parse ``executor.auth`` into a typed auth dataclass so that
+        # inline AgentTool sub-agents can declare auth (e.g. api_key +
+        # base_url for mock LLM routing) and have it flow through to the
+        # child spec's executor. Without this, auth blocks on inline
+        # sub-agent executors are silently dropped.
+        auth = None
+        raw_auth = data.get("auth")
+        if isinstance(raw_auth, dict):
+            from omnigent.spec.parser import _parse_executor_auth
+
+            auth = _parse_executor_auth(data, expand_env=True)
         return ExecutorSpec(
             model=data.get("model"),
             harness=data.get("harness"),
             profile=data.get("profile"),
+            auth=auth,
         )
     return None
 
@@ -724,21 +746,22 @@ def _parse_terminal_env_spec(data: YamlData | str | bool | None) -> TerminalEnvS
 
 def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandboxSpec:
     if isinstance(data, str):
-        return OSEnvSandboxSpec(type=data)
+        from .sandbox import _resolve_sandbox_type
+
+        return OSEnvSandboxSpec(type=_resolve_sandbox_type(data))
     if data is False:
         return OSEnvSandboxSpec(type="none")
     if not isinstance(data, dict):
         raise TypeError("os_env.sandbox must be a string, false, or mapping")
-    raw_type = data.get("type")
-    if raw_type is None:
-        # No ``type:`` field -- resolve via the platform default
-        # (same behavior as the Omnigent YAML parser, kept in sync so legacy
-        # and Omnigent loaders agree on what an "untyped" sandbox block means).
-        from .sandbox import _default_sandbox_for_platform
+    from .sandbox import _default_sandbox_for_platform, _resolve_sandbox_type
 
+    if "type" not in data:
         sandbox_type = _default_sandbox_for_platform().type
     else:
-        sandbox_type = raw_type
+        raw_type = data["type"]
+        if raw_type is not None and not isinstance(raw_type, str):
+            raise TypeError("os_env.sandbox.type must be a string or null")
+        sandbox_type = _resolve_sandbox_type(raw_type)
     egress_rules = data.get("egress_rules")
     # Mirror the Omnigent parser's hard reject of ``egress_rules`` paired with
     # a backend that cannot enforce them at spawn time. Without this
@@ -762,6 +785,37 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
             "os_env.sandbox.egress_allow_private_destinations must be a "
             f"boolean, got {type(allow_private).__name__}"
         )
+    # Secretless credential proxy. Reuse the single canonical parser
+    # (``omnigent.spec.parser._parse_credential_proxy``) rather than a
+    # second copy so the single-file omnigent-YAML path and the
+    # bundle/config.yaml path can never drift — a duplicated parser here
+    # is exactly what silently dropped ``credential_proxy`` on this path
+    # before. Lazy-imported to avoid an import-time cycle with the spec
+    # layer (which imports inner.datamodel). The two cross-field guards
+    # below mirror the spec parser so an inert credential_proxy (no
+    # hardened backend / no egress rules) is rejected on both paths.
+    from omnigent.spec.parser import (
+        _credential_proxy_macos_unsupported_reason,
+        _parse_credential_proxy,
+    )
+
+    credential_proxy = _parse_credential_proxy(data.get("credential_proxy"))
+    if credential_proxy is not None and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
+        raise ValueError(
+            "os_env.sandbox.credential_proxy requires sandbox.type=linux_bwrap "
+            "(Linux) or sandbox.type=darwin_seatbelt (macOS) so credentials are "
+            "bound to a hardened helper boundary. "
+            f"Got sandbox.type={sandbox_type!r}."
+        )
+    if credential_proxy is not None and not egress_rules:
+        raise ValueError(
+            "os_env.sandbox.credential_proxy requires os_env.sandbox.egress_rules: "
+            "the MITM egress proxy is what swaps the synthetic placeholder for the "
+            "real credential and rejects placeholder leaks, so it must be active."
+        )
+    macos_reason = _credential_proxy_macos_unsupported_reason(credential_proxy, sandbox_type)
+    if macos_reason is not None:
+        raise ValueError(macos_reason)
     # Defer the absent-field defaults to the dataclass so there is a single
     # source of truth: re-stating literals here (e.g. ``"warn"``, ``50000``)
     # silently drifts the moment the OSEnvSandboxSpec defaults change. An
@@ -769,6 +823,8 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
     fields = OSEnvSandboxSpec.__dataclass_fields__
     max_entries_raw = data.get("cwd_hidden_scan_max_entries")
     overflow_raw = data.get("cwd_hidden_scan_overflow")
+    recursive_raw = data.get("cwd_hidden_scan_recursive")
+    mask_paths_raw = data.get("mask_paths")
     return OSEnvSandboxSpec(
         type=sandbox_type,
         read_paths=data.get("read_paths"),
@@ -787,16 +843,23 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         cwd_hidden_scan_max_entries=(
             int(max_entries_raw)
             if max_entries_raw is not None
-            else fields["cwd_hidden_scan_max_entries"].default
+            else cast(int, fields["cwd_hidden_scan_max_entries"].default)
         ),
         cwd_hidden_scan_overflow=(
             str(overflow_raw)
             if overflow_raw is not None
-            else fields["cwd_hidden_scan_overflow"].default
+            else cast(str, fields["cwd_hidden_scan_overflow"].default)
         ),
+        cwd_hidden_scan_recursive=(
+            bool(recursive_raw)
+            if recursive_raw is not None
+            else cast(bool, fields["cwd_hidden_scan_recursive"].default)
+        ),
+        mask_paths=list(mask_paths_raw) if mask_paths_raw is not None else None,
         env_passthrough=data.get("env_passthrough"),
         egress_rules=egress_rules,
         egress_allow_private_destinations=allow_private,
+        credential_proxy=credential_proxy,
     )
 
 

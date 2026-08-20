@@ -37,6 +37,7 @@ from omnigent.server.accounts_bootstrap import (
 from omnigent.server.accounts_config import AccountsConfig
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.auth import (
+    AuthProvider,
     UnifiedAuthProvider,
     create_auth_provider,
     resolve_auth_source,
@@ -363,6 +364,65 @@ def test_accounts_source_login_url_points_at_spa() -> None:
     assert provider.login_url == "/login"
 
 
+def test_mint_runner_token_round_trips_to_owner() -> None:
+    """A managed runner's minted owner token resolves back to the owner.
+
+    The sandbox runner has no login of its own, so the server mints an
+    owner JWT it presents as ``Authorization: Bearer`` on its HTTP
+    callbacks — ``get_user_id`` (the same check ``require_user`` applies)
+    must resolve it to the owner, else every callback 401s.
+    """
+    cfg = _make_accounts_config()
+    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
+
+    token = provider.mint_runner_token("alice@example.com", 1800)
+    assert token is not None
+
+    request = _FakeReq(headers={"Authorization": f"Bearer {token}"})
+    assert provider.get_user_id(request) == "alice@example.com"
+
+
+def test_mint_runner_token_rejects_empty_and_reserved_owner() -> None:
+    """No token for an empty or reserved owner — never mint reserved-identity creds."""
+    cfg = _make_accounts_config()
+    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
+    assert provider.mint_runner_token("", 1800) is None
+    assert provider.mint_runner_token("local", 1800) is None
+
+
+def test_mint_runner_token_returns_none_for_header_source() -> None:
+    """Header/proxy auth can't be minted server-side, so it returns None.
+
+    Identity there is asserted by the upstream proxy; a managed runner
+    can't synthesize it. The base ``AuthProvider`` default is also None.
+    """
+    header_provider = UnifiedAuthProvider(source="header")
+    assert header_provider.mint_runner_token("alice@example.com", 1800) is None
+
+    class _Base(AuthProvider):
+        def get_user_id(self, request: object) -> str | None:  # type: ignore[override]
+            return None
+
+    assert _Base().mint_runner_token("alice@example.com", 1800) is None
+
+
+def test_mint_runner_token_expired_resolves_to_none() -> None:
+    """A short TTL genuinely expires: past its exp, get_user_id returns None.
+
+    This is what makes the managed-runner auth refreshable rather than a
+    fixed cap — the token expires and the runner re-mints, so there is no
+    static long-lived credential.
+    """
+    cfg = _make_accounts_config()
+    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
+
+    token = provider.mint_runner_token("alice@example.com", -1)
+    assert token is not None
+
+    request = _FakeReq(headers={"Authorization": f"Bearer {token}"})
+    assert provider.get_user_id(request) is None
+
+
 # ── resolve_auth_source (shared resolver used by every spawn path) ──
 
 
@@ -377,7 +437,6 @@ def test_resolve_auth_source_defaults_to_header(
     """
     monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
     monkeypatch.delenv("OMNIGENT_AUTH_ENABLED", raising=False)
-    monkeypatch.delenv("OMNIGENT_ACCOUNTS_ENABLED", raising=False)
     assert resolve_auth_source() == "header"
 
 
@@ -423,40 +482,7 @@ def test_resolve_auth_source_oidc_issuer_ignored_when_auth_disabled(
     """
     monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
     monkeypatch.delenv("OMNIGENT_AUTH_ENABLED", raising=False)
-    monkeypatch.delenv("OMNIGENT_ACCOUNTS_ENABLED", raising=False)
     monkeypatch.setenv("OMNIGENT_OIDC_ISSUER", "https://accounts.google.com")
-    assert resolve_auth_source() == "header"
-
-
-def test_resolve_auth_source_deprecated_alias_still_selects_accounts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The pre-rename ``OMNIGENT_ACCOUNTS_ENABLED`` alias still works.
-
-    Existing deploys that set the old name must keep booting in accounts
-    mode after the rename. If this regressed, an upgrade would silently
-    drop those deploys back to single-user header mode (no login).
-    """
-    monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
-    monkeypatch.delenv("OMNIGENT_AUTH_ENABLED", raising=False)
-    monkeypatch.setenv("OMNIGENT_ACCOUNTS_ENABLED", "1")
-    assert resolve_auth_source() == "accounts"
-
-
-def test_resolve_auth_source_new_var_wins_over_deprecated_alias(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The current name wins when both names are set.
-
-    A deploy migrating to ``OMNIGENT_AUTH_ENABLED`` can leave the old
-    ``OMNIGENT_ACCOUNTS_ENABLED`` in place: an explicit ``=0`` on the
-    new name disables auth even though the old name is truthy. If the
-    alias took precedence the new value would be unsettable while the
-    old one lingered.
-    """
-    monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
-    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
-    monkeypatch.setenv("OMNIGENT_ACCOUNTS_ENABLED", "1")
     assert resolve_auth_source() == "header"
 
 
@@ -491,7 +517,6 @@ def test_factory_defaults_to_header_when_env_unset(
     """
     monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
     monkeypatch.delenv("OMNIGENT_AUTH_ENABLED", raising=False)
-    monkeypatch.delenv("OMNIGENT_ACCOUNTS_ENABLED", raising=False)
 
     provider = create_auth_provider()
 
@@ -1425,7 +1450,7 @@ def test_admin_list_excludes_legacy_local_and_public_sentinels(
     session_maker = make_managed_session_maker(engine)
     with session_maker() as session:
         for sentinel in ("local", "__public__"):
-            if session.get(SqlUser, sentinel) is None:
+            if session.get(SqlUser, (0, sentinel)) is None:
                 session.add(SqlUser(id=sentinel, is_admin=False))
         session.commit()
 
@@ -1523,6 +1548,52 @@ def test_admin_cannot_delete_last_admin(accounts_app: TestClient) -> None:
     resp = admin.delete("/auth/users/admin")
     assert resp.status_code == 400
     assert "self" in resp.json()["error"].lower() or "last admin" in resp.json()["error"].lower()
+
+
+def test_concurrent_deletes_cannot_leave_zero_admins(tmp_path: Path) -> None:
+    """Two concurrent deletes of two *different* admins can't both apply.
+
+    Regression test for a TOCTOU race: a naive read-then-delete
+    ("are there other admins? if so, delete") checks and writes in
+    two separate transactions. If two admins are deleted at once,
+    each request's read can see the *other* as the remaining admin,
+    both checks pass, and the deploy ends up with zero admins and no
+    recovery path. ``AccountStore.delete_user`` closes this by
+    locking the admin set before counting it (``BEGIN IMMEDIATE`` on
+    SQLite), so the second writer blocks and re-observes the
+    up-to-date count instead of the stale one.
+
+    Runs the two deletes as real concurrent threads against the same
+    on-disk SQLite database — not a simulated interleave — so it
+    actually exercises the locking, not just the application logic.
+    """
+    import threading
+
+    db_url = f"sqlite:///{tmp_path}/test.db"
+    store = SqlAlchemyAccountStore(db_url)
+    store.create_user_with_password("alice", hash_password("alice-pw-1234"), is_admin=True)
+    store.create_user_with_password("bob", hash_password("bob-pw-1234"), is_admin=True)
+
+    results: dict[str, bool | None] = {}
+    barrier = threading.Barrier(2)
+
+    def delete(user_id: str) -> None:
+        barrier.wait()  # maximize the chance both threads race the same window
+        results[user_id] = store.delete_user(user_id)
+
+    threads = [threading.Thread(target=delete, args=(uid,)) for uid in ("alice", "bob")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    remaining_admins = {u.id for u in store.list_users() if u.is_admin}
+    assert remaining_admins, (
+        f"last-admin invariant violated: {remaining_admins=} results={results}"
+    )
+    # Exactly one delete should have been refused (whichever ran second
+    # relative to the DB lock); the other applied.
+    assert sorted(results.values()) == [False, True]
 
 
 def test_admin_reset_returns_new_plaintext_once(

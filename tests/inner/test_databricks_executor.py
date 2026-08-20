@@ -3,10 +3,13 @@
 import asyncio
 import json
 import sys
+import threading
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import databricks.sdk.config as _sdk_config_mod
 
@@ -510,14 +513,16 @@ class TestDatabricksExecutorToolCalls(unittest.TestCase):
 
 class TestDatabricksExecutorErrors(unittest.TestCase):
     def test_empty_stream(self):
-        """Stream with no chunks yields a TurnComplete with empty text."""
+        """Stream with no chunks (no finish_reason, no content, no tool calls) is
+        a truncated turn that died mid-stream, so it surfaces an ExecutorError
+        rather than a silent empty TurnComplete (#1118)."""
 
         async def _t():
             executor = DatabricksExecutor(client=FakeClient([]))
             events = [e async for e in executor.run_turn([], [], "")]
             self.assertEqual(len(events), 1)
-            self.assertIsInstance(events[0], TurnComplete)
-            self.assertEqual(events[0].response, "")
+            self.assertIsInstance(events[0], ExecutorError)
+            self.assertEqual(events[0].message, "Stream ended without finish_reason")
 
         _run(_t())
 
@@ -572,17 +577,27 @@ class TestDatabricksExecutorConfig(unittest.TestCase):
         _run(_t())
 
     def test_default_model(self):
-        """When no model is specified, falls back to databricks-claude-sonnet-4-6."""
+        """Catalog default resolution does not block the event-loop thread."""
 
         async def _t():
             chunks = _make_text_stream("ok")
             client = FakeClient(chunks)
             executor = DatabricksExecutor(client=client)
+            event_loop_thread = threading.get_ident()
 
-            [e async for e in executor.run_turn([], [], "", config=ExecutorConfig())]
+            def _resolve_model(provider_name: str, *, family: str) -> SimpleNamespace:
+                self.assertNotEqual(threading.get_ident(), event_loop_thread)
+                self.assertEqual((provider_name, family), ("databricks", "claude"))
+                return SimpleNamespace(model_id="catalog-databricks-claude-default")
+
+            with patch(
+                "omnigent.model_catalog.resolve_catalog_model",
+                side_effect=_resolve_model,
+            ):
+                [e async for e in executor.run_turn([], [], "", config=ExecutorConfig())]
             self.assertEqual(
                 client.chat.completions.last_kwargs["model"],
-                "databricks-claude-sonnet-4-6",
+                "catalog-databricks-claude-default",
             )
 
         _run(_t())
@@ -869,6 +884,67 @@ def test_read_databrickscfg_host_missing_named_profile_does_not_fallback(
     assert _read_databrickscfg_host("missing-profile") is None
 
 
+def test_databricks_gateway_host_ignores_env_override_for_explicit_profile(
+    tmp_path: _Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_databricks_env: None,
+) -> None:
+    """An explicit profile's gateway host must match its ``--profile`` token.
+
+    ``databricks auth token --profile P`` mints a bearer for P's own workspace
+    and ignores ``DATABRICKS_HOST``. If the gateway base URL were resolved via
+    the SDK (which lets ``DATABRICKS_HOST`` override the profile host), the base
+    URL and the token would target different workspaces and the gateway rejects
+    the token. So the host must come from the profile section directly.
+    """
+    from omnigent.inner.databricks_executor import _databricks_gateway_host
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        textwrap.dedent(
+            """
+        [oss]
+        host = https://profile-workspace.cloud.databricks.com
+        auth_type = databricks-cli
+        """
+        ).lstrip()
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("DATABRICKS_HOST", "https://other-workspace.cloud.databricks.com")
+
+    assert _databricks_gateway_host("oss") == "https://profile-workspace.cloud.databricks.com"
+
+
+def test_databricks_gateway_host_missing_profile_falls_back_to_ambient(
+    tmp_path: _Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_databricks_env: None,
+) -> None:
+    """A profile absent from the file falls back to the ambient/env chain.
+
+    Mirrors a spec authored with ``profile: P`` that now runs on a Databricks
+    App container with no matching section: there is no profile-pinned token to
+    diverge from, so ambient ``DATABRICKS_HOST`` is the right host.
+    """
+    from omnigent.inner.databricks_executor import _databricks_gateway_host
+
+    # Stub the SDK's host-metadata probe (a real HTTP GET with retries) so the
+    # ambient-credential resolution stays offline and fast.
+    monkeypatch.setattr(
+        "databricks.sdk.config.get_host_metadata",
+        _raise_offline_host_metadata,
+    )
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text("# no matching profile\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("DATABRICKS_HOST", "https://ambient-workspace.cloud.databricks.com")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-ambient-token")
+
+    assert _databricks_gateway_host("missing-profile") == (
+        "https://ambient-workspace.cloud.databricks.com"
+    )
+
+
 def test_codex_executor_gateway_uses_host_only_oauth_profile(
     tmp_path: _Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -892,10 +968,6 @@ def test_codex_executor_gateway_uses_host_only_oauth_profile(
         ).lstrip()
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
-    monkeypatch.setattr(
-        "omnigent.inner.codex_executor._read_databrickscfg",
-        lambda _profile: None,
-    )
 
     from omnigent.inner.codex_executor import CodexExecutor
 
@@ -1528,17 +1600,10 @@ def test_codex_executor_uses_cli_auth_command_not_env_token(
     def _counting_read(profile=None):
         nonlocal call_count
         call_count += 1
-        return type(
-            "Creds",
-            (),
-            {
-                "host": "https://host",
-                "token": f"tok-{call_count}",
-            },
-        )()
+        return "https://host"
 
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._read_databrickscfg",
+        "omnigent.inner.codex_executor._databricks_gateway_host",
         _counting_read,
     )
 
@@ -1782,3 +1847,30 @@ def test_profiles_for_host_missing_file_returns_empty(
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "absent"))
 
     assert _databrickscfg_profiles_for_host("https://example.databricks.com") == []
+
+
+def test_stream_ended_without_finish_reason_with_content_completes() -> None:
+    """A truncated stream that still produced text surfaces that text as a
+    TurnComplete (not an error) — only the empty case is fatal (#1118)."""
+
+    async def _t() -> None:
+        # Content arrives, then the stream ends without a finish_reason.
+        chunks = [FakeStreamChunk(choices=[FakeStreamChoice(delta=FakeDelta(content="partial"))])]
+        executor = DatabricksExecutor(client=FakeClient(chunks))
+
+        events = [
+            e
+            async for e in executor.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="Be helpful.",
+                config=ExecutorConfig(model="databricks-kimi-k2-6"),
+            )
+        ]
+
+        assert not [e for e in events if isinstance(e, ExecutorError)]
+        turn_events = [e for e in events if isinstance(e, TurnComplete)]
+        assert len(turn_events) == 1
+        assert turn_events[0].response == "partial"
+
+    _run(_t())

@@ -1,0 +1,31 @@
+name: Waiting on Author Test
+
+# Offline unit test for waiting-on-author hygiene. Runs on PR head without
+# secrets or network and only when the workflow logic changes.
+
+on:
+  pull_request:
+    paths:
+      - .github/scripts/waiting_on_author.py
+      - .github/scripts/waiting_on_author_test.py
+      - .github/workflows/waiting-on-author.yml
+      - .github/workflows/waiting-on-author-test.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: waiting-on-author-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Run waiting-on-author unit test
+        run: python3 .github/scripts/waiting_on_author_test.py

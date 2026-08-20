@@ -38,8 +38,8 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
-from typing import Any, Literal
+from dataclasses import dataclass, replace
+from typing import Literal
 
 from omnigent.policies import FunctionPolicy, resolve_function_policy
 from omnigent.policies.types import EvaluationContext, PolicyResult
@@ -98,12 +98,41 @@ class PolicyVerdict:
     deny_text: str | None = None
     policy_name: str | None = None
     reason: str | None = None
-    data: Any = None
+    data: object | None = None
 
 
 # Singleton ALLOW verdict — frozen dataclass, no state, allocate
 # once and share across every fast-path tool call.
 _ALLOW: PolicyVerdict = PolicyVerdict(action="allow")
+
+
+def _resolve_failure_diagnostic(ps: FunctionPolicySpec, exc: BaseException) -> str:
+    """
+    Build an actionable load-failure reason without embedding exception text.
+
+    Factory kwargs (API keys, tokens) can appear in ``str(exc)``; keep only
+    the exception type and the configured function path so operators can fix
+    the spec without secrets landing in tool output.
+    """
+    path = ps.function.path if ps.function is not None else "<missing function>"
+    return (
+        f"policy failed to resolve ({type(exc).__name__}); "
+        f"function path {path!r} could not be loaded; "
+        f"tool calls are denied until this policy is fixed"
+    )
+
+
+def _unresolved_policy_sentinel(
+    ps: FunctionPolicySpec,
+    exc: BaseException,
+) -> FunctionPolicy:
+    """Fail-closed stand-in for a configured policy that failed to resolve."""
+    reason = _resolve_failure_diagnostic(ps, exc)
+
+    def _always_deny(_event: object) -> dict[str, object]:
+        return {"result": "DENY", "reason": reason}
+
+    return FunctionPolicy(ps, _always_deny)
 
 
 class RunnerToolPolicyGate:
@@ -120,7 +149,12 @@ class RunnerToolPolicyGate:
 
     @classmethod
     def from_spec(cls, spec: AgentSpec) -> RunnerToolPolicyGate:
-        """Pick out function-type tool_call/tool_result policies and resolve them."""
+        """Pick out function-type tool_call/tool_result policies and resolve them.
+
+        A configured tool-phase policy that fails to resolve is replaced with
+        a fail-closed sentinel that always DENYs. Skipping would leave an
+        empty gate that ALLOWs every tool call (fail-open).
+        """
         guard = getattr(spec, "guardrails", None)
         if guard is None or not guard.policies:
             return cls([])
@@ -137,12 +171,11 @@ class RunnerToolPolicyGate:
                 continue
             try:
                 policy = resolve_function_policy(ps)
-            except Exception:
-                _logger.exception(
-                    "runner failed to resolve function policy %r; skipping",
-                    ps.name,
-                )
-                continue
+            except Exception as exc:  # noqa: BLE001 - all resolution failures deny
+                diagnostic = _resolve_failure_diagnostic(ps, exc)
+                _logger.error("runner %s", diagnostic)
+                policy = _unresolved_policy_sentinel(ps, exc)
+                phases = frozenset([Phase.TOOL_CALL, Phase.TOOL_RESULT])
             out.append(_GatedPolicy(name=ps.name, policy=policy, phases=phases))
         return cls(out)
 
@@ -159,7 +192,7 @@ class RunnerToolPolicyGate:
     async def evaluate_tool_call(
         self,
         tool_name: str,
-        arguments: dict[str, Any],
+        arguments: dict[str, object],
     ) -> PolicyVerdict:
         """
         Run TOOL_CALL policies; return the first non-ALLOW verdict.
@@ -210,8 +243,11 @@ class RunnerToolPolicyGate:
         )
         verdict = await self._evaluate_policies(ctx, Phase.TOOL_RESULT)
         if verdict.action == "allow":
-            # If the policy returned transformed output, use it instead.
-            return verdict.data if verdict.data is not None else output
+            if verdict.data is None:
+                return output
+            if not isinstance(verdict.data, str):
+                raise TypeError("TOOL_RESULT policy replacement data must be a string")
+            return verdict.data
         if verdict.action == "deny":
             assert verdict.deny_text is not None
             return verdict.deny_text
@@ -252,9 +288,9 @@ class RunnerToolPolicyGate:
             denied.
         """
         pending_ask: PolicyVerdict | None = None
-        # Last non-None data from any ALLOW-or-ASK result. Last write
-        # wins — callers that need chained transforms compose in one callable.
-        composed_data: Any = None
+        # Sequentially accumulated data. Each transformed payload becomes the
+        # next policy's input, matching the server-side policy engine.
+        composed_data: object | None = None
         for gated in self._policies:
             if phase not in gated.phases:
                 continue
@@ -286,6 +322,7 @@ class RunnerToolPolicyGate:
                 )
             if result.data is not None:
                 composed_data = result.data
+                ctx = replace(ctx, content=composed_data)
             if result.action == PolicyAction.ASK and pending_ask is None:
                 pending_ask = PolicyVerdict(
                     action="ask",

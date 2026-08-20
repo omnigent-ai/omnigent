@@ -8,7 +8,7 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import Connection, engine_from_config, pool
 
-from omnigent.db import Base
+from omnigent.db import ConversationBase, OmnigentBase
 
 config = context.config
 
@@ -31,7 +31,9 @@ if config.config_file_name is not None:
     if not _logging.getLogger().isEnabledFor(_logging.DEBUG):
         _logging.getLogger("alembic").setLevel(_logging.WARNING)
 
-target_metadata = Base.metadata
+# Both bases share one physical DB and one migration lineage; autogenerate
+# diffs the union of their metadata so neither side's tables look "extra".
+target_metadata = [OmnigentBase.metadata, ConversationBase.metadata]
 
 # Allow overriding the DB URL via environment variable.
 db_url = os.environ.get("OMNIGENT_DB_URL")

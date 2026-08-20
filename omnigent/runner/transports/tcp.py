@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import signal
 import socket
 import subprocess
 import sys
@@ -22,6 +21,8 @@ import time
 from dataclasses import dataclass
 
 import httpx
+
+from omnigent.inner import _proc
 
 
 def _is_tcp_listening(host: str, port: int) -> bool:
@@ -46,6 +47,8 @@ def _pick_free_port() -> int:
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()
+    if not isinstance(port, int):
+        raise RuntimeError(f"expected an integer TCP port, got {port!r}")
     return port
 
 
@@ -103,8 +106,8 @@ class RunnerTCPSubprocess:
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            start_new_session=True,
             env=env,
+            **_proc.spawn_kwargs(),
         )
         deadline = time.time() + self.startup_timeout_s
         while time.time() < deadline:
@@ -133,16 +136,12 @@ class RunnerTCPSubprocess:
         return f"http://{self.host}:{self.port}"
 
     def _kill(self) -> None:
-        if self._process is None:
+        if self._process is None or self._process.poll() is not None:
             return
+        _proc.terminate_tree(self._process, grace=5)
         if self._process.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(self._process.pid), signal.SIGTERM)
-            try:
-                self._process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(os.getpgid(self._process.pid), signal.SIGKILL)
+            _proc.kill_tree(self._process)
+            with contextlib.suppress(subprocess.TimeoutExpired):
                 self._process.wait(timeout=2)
 
 

@@ -684,8 +684,10 @@ async def test_attach_terminal_local_fallback_spawns_tmux(
 
     with pytest.raises(RuntimeError, match="child exited"):
         with TestClient(app).websocket_connect(
+            # ``?transport=pty`` pins this to the PTY bridge (which forks tmux
+            # attach) independent of the global control-mode default.
             "/v1/sessions/conv_local_attach/resources/terminals/terminal_bash_s1/attach"
-            "?read_only=true"
+            "?read_only=true&transport=pty"
         ):
             pass
 

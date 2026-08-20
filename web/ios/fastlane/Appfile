@@ -1,0 +1,9 @@
+app_identifier("ai.omnigent.ios")  # The bundle identifier of the app
+team_id("8RMX4WU6F8")               # Apple Developer Portal team (Databricks, Inc.)
+
+# App Store Connect team — only needed if the Apple ID belongs to multiple teams.
+itc_team_id(ENV["ASC_TEAM_ID"]) if ENV["ASC_TEAM_ID"]
+
+# Optional: only used for password-based auth. The App Store Connect API key
+# (see .env) is the primary auth path and does not require this.
+apple_dev_portal_id(ENV["APPLE_ID"]) if ENV["APPLE_ID"]

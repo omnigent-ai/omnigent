@@ -29,12 +29,17 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import Any
 
-# Default wait budget for a UI verdict, in seconds. Bounded so a
-# user who walked away doesn't pin a runner task forever; on
-# timeout the caller treats the elicitation as refused.
-_DEFAULT_WAIT_SECONDS: float = 120.0
+# Default wait budget for a UI verdict, in seconds. Held at one day
+# (86400s) — matching the deciding policy's default ``ask_timeout``: an ASK
+# is a human-in-the-loop gate and should outlive a user stepping away rather
+# than auto-refuse on its own. The old 120s default silently refused (treated
+# as DENY) any prompt a user didn't answer within two minutes — the
+# runner-side mirror of the cost-policy auto-resolve bug. Callers that resolve
+# a per-policy ``ask_timeout`` should still pass ``timeout_seconds`` explicitly;
+# this is only the fallback when none is provided. Headless/unattended agents
+# that want a fast fail-closed should pass a finite ``timeout_seconds``.
+_DEFAULT_WAIT_SECONDS: float = 86400.0
 
 # Module-global registry: elicitation_id → asyncio.Future[bool].
 # True = approved, False = declined/timed-out. Future is owned by the
@@ -68,6 +73,11 @@ def has_pending(conversation_id: str) -> bool:
     :returns: ``True`` when at least one approval is parked for the session.
     """
     return _session_pending.get(conversation_id, 0) > 0
+
+
+def has_any_pending() -> bool:
+    """Return whether any unresolved approval verdict is registered."""
+    return any(not fut.done() for fut in _pending.values())
 
 
 def register(elicitation_id: str) -> asyncio.Future[bool]:
@@ -128,7 +138,7 @@ async def wait_for_user_approval(
     *,
     elicitation_id: str,
     conversation_id: str,
-    publish_event: Callable[[str, dict[str, Any]], None],
+    publish_event: Callable[[str, dict[str, object]], None],
     timeout_seconds: float | None = None,
 ) -> bool:
     """

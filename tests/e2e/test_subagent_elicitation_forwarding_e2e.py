@@ -537,7 +537,7 @@ def agent_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     Writes the inlined supervisor + sub-agent specs in the on-disk bundle
     layout ``omnigent run`` expects (``config.yaml`` at the root,
-    ``agents/<name>/config.yaml`` per sub-agent).
+    ``agents/<dir>/config.yaml`` per sub-agent).
 
     :param tmp_path_factory: Pytest tmp-dir factory (module-scoped so all
         parametrized cases share one bundle).
@@ -588,6 +588,7 @@ def test_subagent_prompt_surfaces_on_parent_and_resolves_via_child(
     request: pytest.FixtureRequest,
     sub_agent: str,
     scenario: str,
+    using_mock_llm: bool,
 ) -> None:
     """
     A prompting sub-agent's approval is forwarded to the parent and answered there.
@@ -617,7 +618,14 @@ def test_subagent_prompt_surfaces_on_parent_and_resolves_via_child(
     :param scenario: Which elicitation the worker raises — ``"command"``
         (a gated shell command) or ``"ask_user_question"`` (Claude's
         built-in interactive question tool).
+    :param using_mock_llm: Whether mock LLM mode is active.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "sub-agent elicitation forwarding e2e requires real native CLI "
+            "harnesses (claude/codex) with OAuth authentication; not feasible "
+            "under mock LLM"
+        )
     from tests.e2e._harness_probes import cli_unavailable_reason
 
     # The delegated worker is a real CLI (claude / codex); skip the row if its

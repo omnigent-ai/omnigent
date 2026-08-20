@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -15,10 +16,19 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpe
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner.resource_registry import (
+    _TERMINAL_EXIT_OUTPUT_MAX_CHARS,
+    CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
+    TerminalExitEvent,
+    TerminalLifecycle,
+    _sanitize_session_id,
+    _session_workspace,
+    _terminal_exit_diagnostics,
+    _trim_terminal_exit_output,
 )
 from omnigent.terminals import TerminalRegistry
+from tests.runner.helpers import make_test_terminal_instance
 
 
 @dataclass
@@ -156,13 +166,7 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
     """
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
-    instance = TerminalInstance(
-        name="codex",
-        session_key="main",
-        socket_path=tmp_path / "codex-main.sock",
-        private_dir=tmp_path / "codex-main",
-        running=True,
-    )
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
 
     async def _fake_launch(
         conversation_id: str,
@@ -206,7 +210,7 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
     monkeypatch.setattr(terminal_registry, "launch", _fake_launch)
     monkeypatch.setattr(terminal_registry, "close", _fake_close)
 
-    view = await registry.launch_terminal(
+    view = await registry.launch_auxiliary_terminal(
         "conv_codex",
         "codex",
         "main",
@@ -242,13 +246,7 @@ async def test_terminal_resource_role_moves_on_transfer(
     """
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
-    instance = TerminalInstance(
-        name="codex",
-        session_key="main",
-        socket_path=tmp_path / "codex-main.sock",
-        private_dir=tmp_path / "codex-main",
-        running=True,
-    )
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
 
     async def _fake_launch(
         conversation_id: str,
@@ -284,7 +282,7 @@ async def test_terminal_resource_role_moves_on_transfer(
     monkeypatch.setattr(terminal_registry, "launch", _fake_launch)
     monkeypatch.setattr(instance, "set_conversation_link", _no_status_link)
 
-    view = await registry.launch_terminal(
+    view = await registry.launch_auxiliary_terminal(
         "conv_old",
         "codex",
         "main",
@@ -297,6 +295,670 @@ async def test_terminal_resource_role_moves_on_transfer(
     assert moved is not None
     assert registry.terminal_resource_role("conv_old", view.id) is None
     assert registry.terminal_resource_role("conv_new", view.id) == CODEX_NATIVE_TERMINAL_ROLE
+
+
+@pytest.mark.asyncio
+async def test_terminal_lifecycle_cannot_change_after_observe(tmp_path: Path) -> None:
+    """A terminal cannot silently switch between auxiliary and required lifecycle."""
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("worker", "main", tmp_path)
+
+    await registry.observe_auxiliary_terminal("conv_lifecycle", "worker", "main", instance)
+
+    with pytest.raises(RuntimeError, match="already observed as auxiliary"):
+        await registry.observe_required_terminal("conv_lifecycle", "worker", "main", instance)
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_terminal_exit_publishes_resource_exit_only(tmp_path: Path) -> None:
+    """Auxiliary terminal exit is reported with auxiliary lifecycle metadata."""
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("sidecar", "s1", tmp_path)
+    instance.command = "worker-cli"
+    instance.args = ["--verbose"]
+    instance.launch_cwd = str(tmp_path)
+    instance._remember_pane_snapshot("\x1b[31mstartup failed\x1b[0m\nretry login")
+    terminal_registry._by_conversation.setdefault("conv_exit", {})[("sidecar", "s1")] = instance
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+    callbacks: dict[str, object] = {}
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        on_tick: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s
+        callbacks["on_exit"] = on_exit
+        callbacks["replace"] = replace
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    registry.set_terminal_exit_publisher(_publish_exit)
+
+    await registry.observe_auxiliary_terminal("conv_exit", "sidecar", "s1", instance)
+    on_exit = callbacks["on_exit"]
+    assert callable(on_exit)
+    on_exit()
+    await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+
+    assert [event.lifecycle for event in exits] == [TerminalLifecycle.AUXILIARY]
+    assert exits[0].terminal_id == "terminal_sidecar_s1"
+    assert exits[0].command == "worker-cli"
+    assert exits[0].args_count == 1
+    assert exits[0].cwd == str(tmp_path)
+    assert exits[0].last_output == "startup failed\nretry login"
+    assert terminal_registry.get("conv_exit", "sidecar", "s1") is None
+
+
+async def _observe_native_agent_terminal_and_capture(
+    registry: SessionResourceRegistry,
+    terminal_registry: TerminalRegistry,
+    instance: object,
+    session_id: str,
+) -> dict[str, object]:
+    """Observe *instance* as the native agent terminal, capturing its watcher.
+
+    Returns the captured ``on_idle`` / ``on_activity`` / ``on_exit`` callbacks
+    so a test can drive the PTY-status edges directly.
+    """
+    callbacks: dict[str, object] = {}
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        on_tick: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del idle_threshold_s, poll_interval_s, replace
+        callbacks["on_idle"] = on_idle
+        callbacks["on_activity"] = on_activity
+        callbacks["on_exit"] = on_exit
+        callbacks["on_tick"] = on_tick
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[attr-defined]
+    # A status publisher is required for the native agent terminal's watcher to
+    # wire its running/idle edges (and thus record the PTY status).
+    registry.set_session_status_publisher(lambda _sid, _status, _reason=None: None)
+    await registry.observe_required_terminal(
+        session_id,
+        instance.name,  # type: ignore[attr-defined]
+        instance.session_key,  # type: ignore[attr-defined]
+        instance,
+        resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
+    )
+    return callbacks
+
+
+class _FakeStatusPoller:
+    """Controllable stand-in for the claude-native status-file poller.
+
+    Lets a test flip :attr:`active` (file resolved and therefore owning the
+    session's status, vs. the PTY watcher falling back) and fire status edges
+    through the registry's callback, without touching a real
+    ``sessions/<pid>.json``.
+    """
+
+    def __init__(self, on_status: object) -> None:
+        self._on_status = on_status
+        self.active = False
+        self.blocked_on: str | None = None
+        self.ticks = 0
+        self.retired = False
+        self.resyncs = 0
+
+    def tick(self) -> None:
+        self.ticks += 1
+
+    def retire(self) -> None:
+        self.retired = True
+        self.active = False
+
+    def resync(self) -> None:
+        self.resyncs += 1
+
+    def emit(self, status: str, blocked_on: str | None = None) -> None:
+        """Simulate the file reporting a new status."""
+        self._on_status(status, blocked_on)
+
+
+async def _observe_native_with_fake_poller(
+    tmp_path: Path,
+    session_id: str,
+) -> tuple[dict[str, object], list[str], list[_FakeStatusPoller], SessionResourceRegistry]:
+    """Observe a claude-native terminal with an injected fake poller.
+
+    :returns: ``(callbacks, statuses, pollers, registry)`` — the wired watcher
+        callbacks, the list the status publisher appends to, the
+        single-element list holding the injected poller (so the test can
+        drive ``active`` / ``running_level`` / ``emit``), and the registry
+        itself (so the test can post external status edges).
+    """
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(session_id, {})[("claude", "main")] = instance
+    statuses: list[str] = []
+    pollers: list[_FakeStatusPoller] = []
+    registry.set_session_status_publisher(
+        lambda _sid, status, _reason=None: statuses.append(status)
+    )
+
+    def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:
+        del session_id, instance
+        poller = _FakeStatusPoller(on_status)
+        pollers.append(poller)
+        return poller
+
+    registry._build_claude_native_status_poller = _fake_build  # type: ignore[method-assign]
+
+    callbacks: dict[str, object] = {}
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        on_tick: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del idle_threshold_s, poll_interval_s, replace
+        callbacks["on_idle"] = on_idle
+        callbacks["on_activity"] = on_activity
+        callbacks["on_exit"] = on_exit
+        callbacks["on_tick"] = on_tick
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[attr-defined]
+    await registry.observe_required_terminal(
+        session_id, "claude", "main", instance, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+    )
+    return callbacks, statuses, pollers, registry
+
+
+@pytest.mark.asyncio
+async def test_claude_native_wires_status_poller_tick(tmp_path: Path) -> None:
+    """The claude-native watcher is wired with an ``on_tick`` that drives
+    the status-file poller."""
+    callbacks, _statuses, pollers, _registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_tick"
+    )
+    assert len(pollers) == 1
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    on_tick()
+    on_tick()
+    assert pollers[0].ticks == 2
+
+
+@pytest.mark.asyncio
+async def test_pane_publishes_no_status_while_the_file_owns_it(tmp_path: Path) -> None:
+    """An active file poller is the only status source; the pane publishes none.
+
+    Claude redraws its prompt after a turn and blinks a cursor, so the pane
+    keeps changing once the file has already said ``idle``. Letting both
+    publish is what made that redraw contradict the file and needed a
+    freshness window to arbitrate — so while the file is readable it decides,
+    and the pane's edges are dropped.
+    """
+    callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_file_owns"
+    )
+    poller = pollers[0]
+    poller.active = True
+
+    poller.emit("running")
+    callbacks["on_activity"]()  # pane redraws mid-turn — no second edge
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    poller.emit("idle")
+    callbacks["on_activity"]()  # post-turn prompt redraw is not a new turn
+    callbacks["on_idle"]()  # nor does a quiet pane re-assert idle
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle"]
+
+
+@pytest.mark.asyncio
+async def test_parked_pane_stays_running_then_recovers_on_pane_death(tmp_path: Path) -> None:
+    """A dialog keeps the session running; a dead pane still ends it.
+
+    While Claude is parked on a prompt the pane is quiet but the turn is not
+    over, and only the file knows that — so the quiet pane must not publish
+    ``idle``. But a killed Claude leaves that ``waiting`` record behind, so
+    pane death retires the poller and the PTY side owns the outcome. Without
+    that, the session would spin forever.
+    """
+    callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_parked"
+    )
+    poller = pollers[0]
+    poller.active = True
+
+    poller.emit("running", "permission prompt")
+    callbacks["on_idle"]()  # pane quiet under the dialog — turn is NOT over
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    # Claude is killed at the prompt. Its file survives holding ``waiting``.
+    callbacks["on_exit"]()
+    assert poller.retired is True
+    assert poller.active is False
+
+    # The pane now owns status again, so the session can settle.
+    callbacks["on_idle"]()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle"]
+
+
+@pytest.mark.asyncio
+async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
+    """A forwarder's hook-derived edge rebases the shared dedup baseline.
+
+    ``Stop`` → ``idle`` is posted to the server by the claude-native forwarder,
+    bypassing this watcher. Adopting it as the baseline is what makes the pair
+    idempotent: the file's own ``idle`` lands on the same edge and is collapsed,
+    so the two agree regardless of which arrives first.
+    """
+    callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_resync"
+    )
+    poller = pollers[0]
+    poller.active = True
+
+    poller.emit("running")
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    # The forwarder posts Stop → idle straight to the server.
+    registry.note_external_session_status("conv_resync", "idle")
+
+    # The file catches up moments later with the same edge — deduped away, so
+    # the user sees one idle rather than a flicker.
+    poller.emit("idle")
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    # Next turn: the file reports work again and must publish.
+    poller.emit("running")
+    await asyncio.sleep(0)
+    assert statuses == ["running", "running"]
+    del callbacks
+
+
+@pytest.mark.asyncio
+async def test_reconnect_resync_republishes_a_running_session(tmp_path: Path) -> None:
+    """A server restart mid-turn must not strand the session on a stale status.
+
+    The tunnel reconnecting means the *listener* restarted and lost its status
+    cache. This runner did not, so its dedup baseline still asserts ``running``
+    was delivered — and Claude's file is written only when its value *changes*,
+    so nothing re-asserts on its own. Without the resync the session would show
+    no spinner and no stop button for the rest of the turn.
+    """
+    _callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_restart"
+    )
+    poller = pollers[0]
+    poller.active = True
+
+    poller.emit("running")
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    # Mid-turn, the file's value is unchanged, so a re-read publishes nothing:
+    # this is exactly what leaves the restarted server on a stale status.
+    poller.emit("running")
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    registry.resync_session_statuses()
+    assert poller.resyncs == 1
+
+    # The same value now republishes, so the fresh server learns the truth.
+    poller.emit("running")
+    await asyncio.sleep(0)
+    assert statuses == ["running", "running"]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_resync_keeps_the_exit_classification_memo(tmp_path: Path) -> None:
+    """The resync clears published edges, not the exit memo.
+
+    ``_last_session_status`` decides whether a terminal exit reads as a clean
+    shutdown or a mid-turn crash. It tracks what the PANE last did, not what the
+    server has heard, so a reconnect must leave it alone — clearing it would make
+    a crash right after a reconnect look like a tidy exit.
+    """
+    _callbacks, _statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_memo"
+    )
+    pollers[0].active = True
+    pollers[0].emit("running")
+    await asyncio.sleep(0)
+
+    registry.resync_session_statuses()
+
+    assert registry._take_session_status_memo("conv_memo") == "running"
+
+
+@pytest.mark.asyncio
+async def test_pty_edges_drive_status_when_poller_inactive(tmp_path: Path) -> None:
+    """With no file (poller inactive), the PTY pane edges remain the status
+    source — the fallback path for old Claude versions."""
+    callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_fallback"
+    )
+    # Poller stays inactive (file never resolved).
+    assert pollers[0].active is False
+
+    callbacks["on_activity"]()  # → running
+    callbacks["on_idle"]()  # → idle
+    # Status edges publish via loop.call_soon_threadsafe; let them drain.
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle"]
+
+
+@pytest.mark.asyncio
+async def test_required_terminal_exit_while_idle_is_clean_shutdown(tmp_path: Path) -> None:
+    """A required terminal that exits after going idle is not a failure.
+
+    The native agent terminal is long-lived: it goes ``idle`` when its turn
+    finishes. A pane exit observed while idle means the work was already
+    delivered and the process simply shut down, so the exit event must carry
+    ``session_was_idle=True`` — the runner uses that to avoid flipping the chat
+    to ``failed`` (the spurious-"failed"-session bug).
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    """
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_idle", {})[("claude", "main")] = instance
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    registry.set_terminal_exit_publisher(_publish_exit)
+    callbacks = await _observe_native_agent_terminal_and_capture(
+        registry, terminal_registry, instance, "conv_idle"
+    )
+
+    # The agent worked, then its turn completed (pane quiesced → idle).
+    on_activity = callbacks["on_activity"]
+    on_idle = callbacks["on_idle"]
+    assert callable(on_activity) and callable(on_idle)
+    on_activity()
+    on_idle()
+    # Then the pane disappeared (e.g. Claude Code exited cleanly).
+    on_exit = callbacks["on_exit"]
+    assert callable(on_exit)
+    on_exit()
+    await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+
+    assert len(exits) == 1
+    assert exits[0].lifecycle == TerminalLifecycle.REQUIRED
+    assert exits[0].session_was_idle is True
+
+
+@pytest.mark.asyncio
+async def test_required_terminal_exit_while_running_is_failure(tmp_path: Path) -> None:
+    """A required terminal that vanishes mid-turn is still a failure.
+
+    When the last PTY-status edge was ``running``, the pane disappeared while
+    a turn was in flight — a genuine crash — so the exit event reports
+    ``session_was_idle=False`` and the runner keeps failing the session.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    """
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_run", {})[("claude", "main")] = instance
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    registry.set_terminal_exit_publisher(_publish_exit)
+    callbacks = await _observe_native_agent_terminal_and_capture(
+        registry, terminal_registry, instance, "conv_run"
+    )
+
+    on_activity = callbacks["on_activity"]
+    assert callable(on_activity)
+    on_activity()
+    on_exit = callbacks["on_exit"]
+    assert callable(on_exit)
+    on_exit()
+    await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+
+    assert len(exits) == 1
+    assert exits[0].session_was_idle is False
+
+
+def test_trim_terminal_exit_output_drops_whole_leading_lines() -> None:
+    # Over the char budget: the first surviving line must be a WHOLE line, never
+    # a mid-word fragment (the "rity reasons" cut). The final line — the one that
+    # matters — stays intact.
+    filler = "\n".join(f"line {i} " + "x" * 80 for i in range(200))
+    text = filler + "\n--dangerously-skip-permissions cannot be run for security reasons"
+    trimmed = _trim_terminal_exit_output(text)
+    assert trimmed is not None
+    assert len(trimmed) <= _TERMINAL_EXIT_OUTPUT_MAX_CHARS + 60  # + the omitted-lines marker
+    assert trimmed.startswith("... omitted ")
+    # The last line survived whole (not clipped mid-word).
+    assert trimmed.endswith("for security reasons")
+    # The first content line after the marker is a complete line.
+    first_content = trimmed.splitlines()[1]
+    assert first_content.startswith("line ")
+
+
+def test_trim_terminal_exit_output_hard_clips_single_overlong_line() -> None:
+    # A single line longer than the budget has no line boundary to snap to, so
+    # it's clipped from the tail as a last resort.
+    line = "y" * (_TERMINAL_EXIT_OUTPUT_MAX_CHARS + 500)
+    trimmed = _trim_terminal_exit_output(line)
+    assert trimmed is not None
+    assert len(trimmed) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
+
+
+def test_terminal_exit_diagnostics_reads_exit_status(tmp_path: Path) -> None:
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    instance.command = "claude"
+    instance.args = ["--dangerously-skip-permissions"]
+    instance._remember_pane_snapshot("boom")
+    # Simulate tmux having reported a dead pane with a captured status.
+    instance._remember_exit_status("1 42")
+    command, args_count, _cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
+    assert command == "claude"
+    assert args_count == 1
+    assert last_output == "boom"
+    assert exit_status == 42
+
+
+def test_remember_exit_status_ignores_live_pane() -> None:
+    instance = make_test_terminal_instance("claude", "main", tmp_path=Path("/tmp"))
+    # Live pane: pane_dead=0, empty status → nothing recorded.
+    instance._remember_exit_status("0 ")
+    assert instance.last_exit_status() is None
+
+
+@pytest.mark.asyncio
+async def test_required_terminal_exit_without_observed_status_is_failure(tmp_path: Path) -> None:
+    """A required terminal that never reported a PTY status fails on exit.
+
+    A boot failure (the process dies before producing any pane activity) leaves
+    no recorded status, so the exit defaults to ``session_was_idle=False`` and
+    the session still fails — only a positively-observed ``idle`` suppresses the
+    failure.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    """
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("worker", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_boot", {})[("worker", "main")] = instance
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+    callbacks: dict[str, object] = {}
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        on_tick: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        callbacks["on_exit"] = on_exit
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    registry.set_terminal_exit_publisher(_publish_exit)
+
+    await registry.observe_required_terminal("conv_boot", "worker", "main", instance)
+    on_exit = callbacks["on_exit"]
+    assert callable(on_exit)
+    on_exit()
+    await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+
+    assert len(exits) == 1
+    assert exits[0].session_was_idle is False
+
+
+@pytest.mark.asyncio
+async def test_required_terminal_exit_after_new_turn_is_failure(tmp_path: Path) -> None:
+    """A crash right after a new turn starts (before the watcher's first
+    ``running`` edge) is a failure, not a stale clean shutdown.
+
+    ``note_session_turn_started`` resets the prior turn's ``idle`` memo so the
+    turn-boundary window can't silently swallow a real crash.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    """
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_turn", {})[("claude", "main")] = instance
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    registry.set_terminal_exit_publisher(_publish_exit)
+    callbacks = await _observe_native_agent_terminal_and_capture(
+        registry, terminal_registry, instance, "conv_turn"
+    )
+
+    # The previous turn finished (idle), then a new message starts a turn and
+    # the pane crashes before the watcher emits its next ``running`` edge.
+    on_idle = callbacks["on_idle"]
+    assert callable(on_idle)
+    on_idle()
+    registry.note_session_turn_started("conv_turn")
+    on_exit = callbacks["on_exit"]
+    assert callable(on_exit)
+    on_exit()
+    await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+
+    assert len(exits) == 1
+    assert exits[0].session_was_idle is False
+
+
+@pytest.mark.asyncio
+async def test_cleanup_session_clears_status_memo(tmp_path: Path) -> None:
+    """``cleanup_session`` drops the session's PTY-status memo.
+
+    :param tmp_path: Temporary directory (unused beyond registry construction).
+    """
+    del tmp_path
+    registry = SessionResourceRegistry()
+    registry.note_session_turn_started("conv_cleanup")
+    assert "conv_cleanup" in registry._last_session_status
+
+    await registry.cleanup_session("conv_cleanup")
+
+    assert "conv_cleanup" not in registry._last_session_status
+
+
+@pytest.mark.asyncio
+async def test_transfer_terminal_moves_status_memo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Transferring a terminal moves its PTY-status memo to the new owner.
+
+    Fakes the launch (no real tmux/process) and the conversation-link update,
+    mirroring ``test_terminal_resource_role_moves_on_transfer``.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+
+    async def _fake_launch(
+        conversation_id: str,
+        terminal_name: str,
+        session_key: str,
+        spec: TerminalEnvSpec,
+        **kwargs: object,
+    ) -> TerminalInstance:
+        del spec, kwargs
+        terminal_registry._by_conversation.setdefault(conversation_id, {})[
+            (terminal_name, session_key)
+        ] = instance
+        return instance
+
+    async def _no_status_link(_link: str) -> None:
+        """Avoid tmux calls while transfer updates the conversation link."""
+
+    monkeypatch.setattr(terminal_registry, "launch", _fake_launch)
+    monkeypatch.setattr(instance, "set_conversation_link", _no_status_link)
+
+    view = await registry.launch_auxiliary_terminal(
+        "conv_src",
+        "codex",
+        "main",
+        TerminalEnvSpec(command="codex", args=["--remote", "ws://127.0.0.1:1234"]),
+        resource_role=CODEX_NATIVE_TERMINAL_ROLE,
+    )
+    registry.note_session_turn_started("conv_src")
+
+    moved = await registry.transfer_terminal("conv_src", "conv_dst", view.id)
+
+    assert moved is not None
+    assert "conv_src" not in registry._last_session_status
+    assert registry._last_session_status.get("conv_dst") == "running"
 
 
 def test_get_resource_finds_default() -> None:
@@ -746,3 +1408,119 @@ def test_resolve_environment_runner_workspace_overrides_absolute_spec_cwd(
     # Compare via realpath because tmp_path on macOS goes through
     # /var → /private/var symlinks.
     assert os.path.realpath(env.cwd) == os.path.realpath(workspace)
+
+
+@pytest.mark.asyncio
+async def test_blocked_reason_survives_pane_redraws(tmp_path: Path) -> None:
+    """The parked reason survives the pane redrawing underneath the dialog.
+
+    Claude reports ``waitingFor`` once, when the dialog opens, and the pane
+    keeps redrawing while it is up. Because the file owns status outright the
+    pane publishes nothing, so there is no bare ``running`` to erase the reason
+    — it stands until the file itself drops it.
+    """
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_reason", {})[("claude", "main")] = instance
+    edges: list[tuple[str, str | None]] = []
+    pollers: list[_FakeStatusPoller] = []
+    registry.set_session_status_publisher(
+        lambda _sid, status, reason=None: edges.append((status, reason))
+    )
+
+    def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:
+        del session_id, instance
+        poller = _FakeStatusPoller(on_status)
+        pollers.append(poller)
+        return poller
+
+    registry._build_claude_native_status_poller = _fake_build  # type: ignore[method-assign]
+
+    callbacks: dict[str, object] = {}
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        on_tick: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del idle_threshold_s, poll_interval_s, replace
+        callbacks["on_idle"] = on_idle
+        callbacks["on_activity"] = on_activity
+        callbacks["on_exit"] = on_exit
+        callbacks["on_tick"] = on_tick
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[attr-defined]
+    await registry.observe_required_terminal(
+        "conv_reason", "claude", "main", instance, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+    )
+
+    poller = pollers[0]
+    poller.active = True
+    poller.blocked_on = "permission prompt"
+
+    poller.emit("running", "permission prompt")
+    callbacks["on_activity"]()  # pane redraw under the dialog
+    callbacks["on_idle"]()  # and the quiet spells between redraws
+    await asyncio.sleep(0)
+    assert edges == [("running", "permission prompt")]
+
+    # Dialog answered: the file drops the reason on its own edge.
+    poller.blocked_on = None
+    poller.emit("running", None)
+    await asyncio.sleep(0)
+    assert edges == [("running", "permission prompt"), ("running", None)]
+
+
+@pytest.mark.parametrize(
+    "raw,expected,why",
+    [
+        ("conv_abc123", "conv_abc123", "an ordinary id is untouched"),
+        ("a" * 32, "a" * 32, "a uuid4().hex id is untouched"),
+        ("a/b", "a_b", "a POSIX separator cannot survive"),
+        ("a\\b", "a_b", "a Windows separator cannot survive either"),
+        ("../..", ".._..", "separators go, leaving no traversal component"),
+        ("..", "__", "a bare parent reference never survives"),
+        (".", "_", "a bare self reference never survives"),
+        ("", "_", "an empty id still yields a usable component"),
+        ("a\x00b", "a_b", "a NUL cannot reach os.path.join"),
+        ("a b", "a_b", "whitespace is normalized rather than quoted downstream"),
+    ],
+)
+def test_sanitize_session_id_yields_one_safe_component(raw: str, expected: str, why: str) -> None:
+    """``_sanitize_session_id`` must return a single, non-traversing path component.
+
+    The id reaches the filesystem as a directory name under the runner
+    workspace, so anything that could act as a separator or a parent reference
+    has to be neutralized here. Uses an allowlist: the previous denylist
+    stopped ``/`` and ``..`` but let a backslash through.
+    """
+    got = _sanitize_session_id(raw)
+
+    assert got == expected, why
+    # The invariants that actually matter, restated independently of the
+    # table above so a wrong `expected` cannot make this vacuous.
+    assert got, "must never be empty — it becomes a path component"
+    assert "/" not in got and "\\" not in got, "must be a single component"
+    assert set(got) != {"."}, "must not be '.' or '..'"
+
+
+def test_sanitize_session_id_keeps_traversal_out_of_the_workspace_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A hostile id cannot walk the session workspace out of the runner root.
+
+    The unit test above pins the component; this pins the property callers
+    actually depend on — that the joined path stays under the root.
+    """
+    monkeypatch.setenv("OMNIGENT_RUNNER_OS_ENV_ROOT", str(tmp_path))
+
+    resolved = Path(_session_workspace("../../../../etc")).resolve()
+
+    assert resolved.is_relative_to(tmp_path.resolve()), f"escaped the root: {resolved}"

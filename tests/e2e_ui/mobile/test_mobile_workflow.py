@@ -29,6 +29,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, ViewportSize, expect
 
+from tests.e2e_ui.conftest import configure_mock_llm
+
 # iPhone-12-class portrait viewport — comfortably below the Tailwind
 # ``md`` breakpoint (768px) so every ``md:`` rule resolves to its
 # mobile branch.
@@ -152,8 +154,8 @@ def test_mobile_fab_lists_file_surfaces_and_omits_absent_ones(
     """The FAB menu degrades gracefully to only the available surfaces.
 
     A plain ``hello_world`` session has a workspace (os_env), no child
-    agents, and is not claude-native — so the menu must list Files (the
-    single files surface; its Changed/All scope is an in-panel toggle)
+    agents, and is not claude-native — so the menu must list Files and
+    Changes (the two files surfaces — folder tree and changed-files list)
     and Agents (unconditional — the panel lists at least the main
     agent, badge "1"), and must NOT list Shells or Tasks. The session's
     only terminal is the auto-created embedded Omnigent REPL, which is
@@ -168,6 +170,9 @@ def test_mobile_fab_lists_file_surfaces_and_omits_absent_ones(
     page.get_by_role("button", name="Open session menu").click()
 
     expect(page.get_by_role("menuitem", name="Files", exact=True)).to_be_visible()
+    # Changes is a peer files surface (the changed-files list), listed
+    # alongside Files whenever the workspace is available.
+    expect(page.get_by_role("menuitem", name="Changes", exact=True)).to_be_visible()
     # Agents is always present; "1" = just the main agent. "0" means
     # the main agent was dropped from the count.
     expect(page.get_by_role("menuitem", name=re.compile(r"Agents\s*1"))).to_be_visible()
@@ -175,9 +180,36 @@ def test_mobile_fab_lists_file_surfaces_and_omits_absent_ones(
     # the inventory (reachable via the Chat/Terminal pill instead). An
     # entry here means the REPL leaked back into the FAB gating.
     expect(page.get_by_role("menuitem", name="Shells")).to_have_count(0)
-    # No separate Changes entry (merged into Files) and no todos.
-    expect(page.get_by_role("menuitem", name="Changes")).to_have_count(0)
+    # No todos on a plain hello_world session.
     expect(page.get_by_role("menuitem", name="Tasks")).to_have_count(0)
+
+
+def test_mobile_shells_drawer_exposes_new_shell_before_shells_exist(
+    page: Page,
+    terminal_session: tuple[str, str],
+) -> None:
+    """Shell-capable agents expose the mobile Shells drawer at zero shells.
+
+    Mobile has no tab-strip "+" menu, so the Shells drawer is the create entry
+    point: when the session agent declares a ``terminals:`` block, the FAB lists
+    Shells before any user shell exists, and selecting it opens the full-screen
+    drawer carrying a "+ New shell" row. (On desktop the create affordance lives
+    in the tab strip's "+" menu and the rail's Shells tab only lists existing
+    shells — see AppShell.test.tsx.)
+    """
+    base_url, session_id = terminal_session
+    page.set_viewport_size(_MOBILE_VIEWPORT)
+    page.goto(f"{base_url}/c/{session_id}")
+
+    page.get_by_role("button", name="Open session menu").click()
+
+    shells_entry = page.get_by_role("menuitem", name="Shells", exact=True)
+    expect(shells_entry).to_be_visible(timeout=10_000)
+    shells_entry.click()
+
+    drawer = page.get_by_test_id("shells-panel-drawer")
+    expect(drawer).to_have_attribute("data-state", "open")
+    expect(drawer.get_by_role("button", name="New shell")).to_be_visible()
 
 
 def test_mobile_fab_shows_agents_entry_when_child_agents_exist(
@@ -250,9 +282,17 @@ def test_mobile_files_drawer_opens_seeded_file(
     expect(file_viewer.get_by_text(_SEEDED_FILE_CONTENT).first).to_be_visible(timeout=20_000)
 
 
+# The agent turn is dispatched to the in-process harness, which
+# occasionally produces no assistant output on the first turn (the
+# runner goes idle after dispatch — a nondeterministic harness
+# scheduling stall, not a real-LLM artifact since this drives the mock
+# LLM). Rerun on failure rather than widen the already-generous 60s
+# wait, which a stalled turn would never satisfy.
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_mobile_chat_send_and_response(
     page: Page,
     seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """The composer streams an assistant reply at a phone viewport.
 
@@ -260,14 +300,21 @@ def test_mobile_chat_send_and_response(
     and message list stay usable on a phone (no rail stealing layout).
     """
     base_url, session_id = seeded_session
+    prompt = "Say 'mobile-pong-e2e' in one word."
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "mobile-pong-e2e"}],
+        key="mobile-chat-send-and-response",
+        match=prompt,
+    )
     page.set_viewport_size(_MOBILE_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")
 
     composer = page.get_by_placeholder("Ask the agent anything…")
     expect(composer).to_be_visible()
-    composer.fill("Say 'pong' in one word.")
+    composer.fill(prompt)
     page.get_by_role("button", name="Send", exact=True).click()
 
     assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
     expect(assistant).to_be_visible(timeout=60_000)
-    expect(assistant).to_have_text(re.compile(r"\S"), timeout=60_000)
+    expect(assistant).to_contain_text("mobile-pong-e2e", timeout=60_000)

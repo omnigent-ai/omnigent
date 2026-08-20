@@ -187,14 +187,14 @@ def _create_child_session(
     Create a child conversation under a parent session.
 
     :param db_uri: Test database URI.
-    :param parent_id: Parent session id, e.g. ``"conv_parent"``.
+    :param parent_id: Parent session id, e.g. ``"ead6d59a6b650d19dbdf61ec32426f4e"``.
     :param agent_id: Agent id inherited by the child.
     :param title: Sub-agent title in ``"<agent>:<name>"`` form, e.g.
         ``"codex-child:approval"``. Must be unique per parent — the DB
         enforces ``(parent_conversation_id, title)`` uniqueness, so a
         fan-out test creating multiple children under one parent must
         pass distinct titles.
-    :returns: Child session id, e.g. ``"conv_child"``.
+    :returns: Child session id, e.g. ``"ff5cac23d0beb79fad914046049f32ff"``.
     """
     store = SqlAlchemyConversationStore(db_uri)
     child = store.create_conversation(
@@ -374,6 +374,9 @@ def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
     :param tool_name: Tool Claude wants to call, e.g. ``"Bash"``.
     :returns: JSON-serializable payload mirroring Claude Code's
         published wire shape for the ``PermissionRequest`` event.
+        Deliberately carries no ``tool_use_id``: the real
+        PermissionRequest payload has no per-call id (it is minted only
+        when the tool call is emitted, after this permission check).
     """
     return {
         "session_id": "claude_sess_abc",
@@ -383,7 +386,6 @@ def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
         "hook_event_name": "PermissionRequest",
         "tool_name": tool_name,
         "tool_input": {"command": "ls -la"},
-        "tool_use_id": "tool_use_xyz",
     }
 
 
@@ -420,7 +422,6 @@ def _claude_ask_user_question_payload() -> dict[str, Any]:
                 },
             ],
         },
-        "tool_use_id": "tool_use_ask",
     }
 
 
@@ -972,7 +973,7 @@ class _InputRequiredRunnerClient:
         Record the execute payload and return the scripted response.
 
         :param url: Runner path, e.g.
-            ``"/v1/sessions/conv_child/mcp/execute"``.
+            ``"/v1/sessions/ff5cac23d0beb79fad914046049f32ff/mcp/execute"``.
         :param json: The request body.
         :param timeout: Forward timeout (ignored by the stub).
         :returns: A real ``httpx.Response`` with the scripted JSON.
@@ -1230,6 +1231,33 @@ async def test_resolve_url_decline_round_trip(client: httpx.AsyncClient) -> None
     assert resp.json()["hookSpecificOutput"]["decision"]["behavior"] == "deny"
 
 
+async def test_resolve_url_cancel_round_trip(client: httpx.AsyncClient) -> None:
+    """
+    A ``cancel`` verdict at the URL endpoint maps to Claude's
+    ``deny`` behavior and clears the pending elicitation.
+
+    ``cancel`` is a valid MCP ``ElicitationResult`` action alongside
+    ``accept`` and ``decline``. It represents dismissing the prompt
+    without an explicit choice, so the gated tool must not run.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    agent = await create_test_agent(client, "test-resolve-url-cancel")
+    session_id = await _create_session(client, agent["id"])
+    hook_task, elicitation_id = await _park_permission_hook(client, session_id, tool_name="Bash")
+
+    verdict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "cancel"},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+    assert pending_elicitations.count_for(session_id) == 0
+
+
 async def test_resolve_url_unknown_session_returns_404(
     client: httpx.AsyncClient,
 ) -> None:
@@ -1240,7 +1268,7 @@ async def test_resolve_url_unknown_session_returns_404(
     URL fails loud rather than silently no-op'ing.
     """
     resp = await client.post(
-        "/v1/sessions/conv_does_not_exist/elicitations/elicit_nope/resolve",
+        "/v1/sessions/1d0b12236c77f69f5073a53583de1a3f/elicitations/elicit_nope/resolve",
         json={"action": "accept"},
     )
     assert resp.status_code == 404, resp.text
@@ -1389,7 +1417,7 @@ async def test_elicitation_page_unknown_session_returns_404(
     Requesting the page for a nonexistent session returns 404.
     """
     resp = await client.get(
-        "/v1/sessions/conv_does_not_exist/elicitations/elicit_nope",
+        "/v1/sessions/1d0b12236c77f69f5073a53583de1a3f/elicitations/elicit_nope",
     )
     assert resp.status_code == 404, resp.text
 
@@ -1428,13 +1456,13 @@ def test_mrtr_response_url_mode(monkeypatch: pytest.MonkeyPatch) -> None:
         rpc_id=1,
         elicitation_id="elicit_abc",
         message="Approve?",
-        request_state='{"elicitation_id":"elicit_abc","session_id":"conv_123"}',
-        session_id="conv_123",
+        request_state='{"elicitation_id":"elicit_abc","session_id":"0099dc8be6d82871e2e450424d46d1b7"}',
+        session_id="0099dc8be6d82871e2e450424d46d1b7",
     )
     body = json.loads(resp.body)
     params = body["result"]["inputRequests"]["elicit_abc"]["params"]
     assert params["mode"] == "url"
-    assert params["url"] == "/approve/conv_123/elicit_abc"
+    assert params["url"] == "/approve/0099dc8be6d82871e2e450424d46d1b7/elicit_abc"
     assert params["message"] == "Approve?"
 
 
@@ -1453,7 +1481,7 @@ def test_mrtr_response_form_mode(monkeypatch: pytest.MonkeyPatch) -> None:
         elicitation_id="elicit_abc",
         message="Approve?",
         request_state="{}",
-        session_id="conv_123",
+        session_id="0099dc8be6d82871e2e450424d46d1b7",
     )
     body = json.loads(resp.body)
     params = body["result"]["inputRequests"]["elicit_abc"]["params"]

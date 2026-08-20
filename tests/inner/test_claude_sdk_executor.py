@@ -7,10 +7,11 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -58,6 +59,69 @@ class TestPromptExtraction(unittest.TestCase):
             "Second question",
         )
 
+    def test_resumed_session_includes_all_trailing_user_messages(self):
+        """Batched buffered steers: all trailing user messages must reach the SDK.
+
+        When the runner collapses several buffered steered messages into one
+        continuation turn, history ends in >1 consecutive user message the SDK
+        has never seen. Sending only the last silently drops the earlier ones
+        (the two-steer "second message ignored" bug). All trailing user
+        messages must be concatenated into the prompt.
+        """
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "First question"},
+            {"role": "assistant", "content": "First answer"},
+            {"role": "user", "content": "steer one"},
+            {"role": "user", "content": "steer two"},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertIn("steer one", prompt)
+        self.assertIn("steer two", prompt)
+        # Prior turns are SDK-cached on resume — not replayed.
+        self.assertNotIn("First question", prompt)
+
+    def test_resumed_session_trailing_run_stops_at_assistant(self):
+        """Only the trailing run of user messages (after the last non-user) is sent."""
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "old one"},
+            {"role": "user", "content": "old two"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "new one"},
+            {"role": "user", "content": "new two"},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertIn("new one", prompt)
+        self.assertIn("new two", prompt)
+        self.assertNotIn("old one", prompt)
+        self.assertNotIn("old two", prompt)
+
+    def test_resumed_session_multimodal_trailing_run_preserves_blocks(self):
+        """A multimodal message in the trailing run keeps structured blocks for all."""
+        executor = self._make_executor()
+        messages = [
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "describe this"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,aGVsbG8=",
+                    },
+                    {"type": "input_text", "text": "and this too"},
+                ],
+            },
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertIsInstance(prompt, list)
+        types = [b.get("type") for b in prompt]
+        self.assertIn("image", types)
+        joined = " ".join(b.get("text", "") for b in prompt if b.get("type") == "text")
+        self.assertIn("describe this", joined)
+        self.assertIn("and this too", joined)
+
     def test_empty_messages(self):
         executor = self._make_executor()
         self.assertEqual(executor._build_prompt([], resume_session=False), "")
@@ -84,6 +148,171 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertIn("ZEBRA-99", prompt)
         self.assertIn("Summarize our conversation.", prompt)
 
+    def test_history_unresolved_file_id_becomes_visible_marker(self):
+        # A prior-turn attachment the content resolver never inlined must
+        # not be serialized as raw block JSON — the model reads that as if
+        # the attachment were present and hallucinates its content.
+        executor = self._make_executor()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "file_id": "file_img", "filename": "photo.png"},
+                    {"type": "input_text", "text": "look at this image"},
+                ],
+            },
+            {"role": "assistant", "content": "A photo."},
+            {"role": "user", "content": "What did I show you?"},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=False)
+        self.assertIn("[Attachment photo.png could not be loaded]", prompt)
+        self.assertNotIn("file_id", prompt)
+        self.assertIn("look at this image", prompt)
+
+    def _text_of(self, prompt):
+        """Join the text blocks of a structured prompt for framing assertions."""
+        return "\n".join(block["text"] for block in prompt if block.get("type") == "text")
+
+    def test_cold_reload_replays_historical_image_as_structured_block(self):
+        # A restarted/fresh SDK client must be able to *look at* an image from
+        # an earlier turn. Flattening it into a text marker leaves the model
+        # describing an attachment it cannot see.
+        executor = self._make_executor()
+        image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
+        image_data_uri = f"data:image/png;base64,{image_payload}"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": image_data_uri,
+                        "filename": "screenshot.png",
+                    },
+                    {"type": "input_text", "text": "What is shown here?"},
+                ],
+            },
+            {"role": "assistant", "content": "It shows a test image."},
+            {"role": "user", "content": "Summarize our conversation."},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, list)
+        images = [block for block in prompt if block.get("type") == "image"]
+        self.assertEqual(len(images), 1)
+        self.assertEqual(
+            images[0]["source"],
+            {"type": "base64", "media_type": "image/png", "data": image_payload},
+        )
+        # The bytes travel as a structured block, never as prompt text.
+        text = self._text_of(prompt)
+        self.assertNotIn(image_payload, text)
+        self.assertNotIn("data:", text)
+        # Framing and ordering survive around the replayed image.
+        self.assertIn("Conversation so far:", text)
+        self.assertIn("What is shown here?", text)
+        self.assertIn("Respond to the latest user message", text)
+        self.assertIn("Summarize our conversation.", text)
+
+    def test_cold_reload_replays_historical_file_as_structured_document(self):
+        # The same fidelity requirement applies to non-image attachments: a
+        # resolved PDF must reach the SDK as a document block, not a marker.
+        executor = self._make_executor()
+        file_payload = base64.b64encode(b"synthetic pdf bytes").decode("ascii")
+        file_data_uri = f"data:application/pdf;base64,{file_payload}"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_data": file_data_uri,
+                        "filename": "doc.pdf",
+                    },
+                    {"type": "input_text", "text": "What does this document say?"},
+                ],
+            },
+            {"role": "assistant", "content": "It is a test document."},
+            {"role": "user", "content": "Summarize our conversation."},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, list)
+        documents = [block for block in prompt if block.get("type") == "document"]
+        self.assertEqual(len(documents), 1)
+        self.assertEqual(
+            documents[0]["source"],
+            {"type": "base64", "media_type": "application/pdf", "data": file_payload},
+        )
+        text = self._text_of(prompt)
+        self.assertNotIn(file_payload, text)
+        self.assertIn("What does this document say?", text)
+
+    def test_cold_reload_keeps_unresolved_history_attachment_visible(self):
+        # A resolved and an unresolved attachment in the same history: the
+        # resolved one becomes real bytes, the unresolved one must still say
+        # so out loud rather than vanish from the structured prompt.
+        executor = self._make_executor()
+        image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{image_payload}",
+                        "filename": "resolved.png",
+                    },
+                    {
+                        "type": "input_image",
+                        "file_id": "file_missing",
+                        "filename": "lost.png",
+                    },
+                    {"type": "input_text", "text": "two attachments"},
+                ],
+            },
+            {"role": "assistant", "content": "Noted."},
+            {"role": "user", "content": "What did I send?"},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, list)
+        self.assertEqual(len([b for b in prompt if b.get("type") == "image"]), 1)
+        text = self._text_of(prompt)
+        self.assertIn("[Attachment lost.png could not be loaded]", text)
+        self.assertNotIn("file_id", text)
+        self.assertIn("two attachments", text)
+
+    def test_historical_image_source_block_is_replaced_with_compact_placeholder(self):
+        # The ``Read`` tool returns an image file as an Anthropic content block
+        # ``{"type": "image", "source": {"type": "base64", ...}}`` — raw base64
+        # with no ``data:`` URI prefix. Redaction must catch this shape too, or a
+        # replayed image tool result flattens hundreds of KB into prompt text.
+        from omnigent.inner.claude_sdk_executor import _render_prior_content_blocks
+
+        image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
+        content = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": image_payload,
+                },
+            }
+        ]
+
+        rendered = self._text_of(_render_prior_content_blocks(content))
+
+        self.assertNotIn(image_payload, rendered)
+        self.assertIn(
+            f"[image: image/png, {len(image_payload)} base64 chars]",
+            rendered,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: Constructor and properties
@@ -100,14 +329,19 @@ class TestConstructor(unittest.TestCase):
         self.assertIsNone(executor._os_env_spec)
         self.assertIsNone(executor._cwd)
         self.assertIsNone(executor._model_override)
-        self.assertEqual(executor._permission_mode, "bypassPermissions")
+        self.assertEqual(executor._permission_mode, "auto")
         self.assertIsNone(executor._tool_executor)
         self.assertEqual(executor._clients, {})
         self.assertEqual(executor._crashed_sessions, {})
         self.assertFalse(executor._gateway)
-        # _extra_env carries the default RetryPolicy's CLI env vars
-        # (ANTHROPIC_MAX_RETRIES + ANTHROPIC_REQUEST_TIMEOUT_SECONDS).
-        self.assertEqual(executor._extra_env, RetryPolicy().claude_cli.env())
+        # _extra_env carries Tool Search plus the default RetryPolicy's CLI env.
+        self.assertEqual(
+            executor._extra_env,
+            {
+                "ENABLE_TOOL_SEARCH": "true",
+                **RetryPolicy().claude_cli.env(),
+            },
+        )
 
     def test_os_env_spec_with_no_sandbox_keeps_native_tools_enabled(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -323,12 +557,14 @@ class TestConstructor(unittest.TestCase):
         self.assertIn('databricks auth token --profile "oss"', helper)
         self.assertNotIn("--host", helper)
         # `--force-refresh` only exists in Databricks CLI >= v0.296.0, so it
-        # must be applied via a `--help` capability probe ($force), never
-        # passed unconditionally — an older CLI rejects the unknown flag and
-        # yields an empty token → silent 401.
+        # stays behind a `--help` capability probe — an older CLI rejects the
+        # unknown flag and yields an empty token → silent 401.
         self.assertIn("databricks auth token --help", helper)
-        self.assertIn("force=--force-refresh", helper)
-        self.assertNotIn('oss" --force-refresh', helper)
+        # And even where it exists it is only ATTEMPTED: it fails outright on a
+        # stale refresh token, so an empty result must fall back to the cached
+        # token rather than turning a usable credential into an auth failure.
+        self.assertIn("--force-refresh", helper)
+        self.assertIn('if [ -z "$token" ]; then', helper)
 
     def test_databricks_flag_no_creds_raises(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -364,6 +600,7 @@ class TestConstructor(unittest.TestCase):
             executor._extra_env["OMNIGENT_CLAUDE_API_KEY_HELPER"],
             "printf token",
         )
+        self.assertEqual(executor._extra_env["ENABLE_TOOL_SEARCH"], "true")
 
     def test_databricks_flag_with_host_override_requires_base_url(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -396,9 +633,15 @@ class TestConstructor(unittest.TestCase):
         from omnigent.spec.types import RetryPolicy
 
         executor = ClaudeSDKExecutor(gateway=False)
-        # gateway=False → no Databricks env, but RetryPolicy CLI env
-        # is always merged in. Verify the only entries are the retry env.
-        self.assertEqual(executor._extra_env, RetryPolicy().claude_cli.env())
+        # gateway=False → no Databricks env, but Tool Search and RetryPolicy
+        # CLI env are always merged in.
+        self.assertEqual(
+            executor._extra_env,
+            {
+                "ENABLE_TOOL_SEARCH": "true",
+                **RetryPolicy().claude_cli.env(),
+            },
+        )
 
     def test_databricks_profile_default_model_used_when_unset(self):
         """gateway=True (profile-derived) + no model → Databricks default.
@@ -408,11 +651,68 @@ class TestConstructor(unittest.TestCase):
         model falls back to the Databricks default. The neutral
         generic-provider gateway path never does this (see
         ``test_neutral_gateway_no_model_does_not_inject_databricks_default``).
+
+        Live model discovery is stubbed unavailable here so the resolver drops
+        to the bundled catalog — its documented last resort; the discovery-first
+        path is covered by ``test_databricks_profile_uses_discovered_model``.
         """
-        from omnigent.inner.claude_sdk_executor import (
-            _DATABRICKS_CLAUDE_DEFAULT_MODEL,
-            ClaudeSDKExecutor,
-        )
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        async def _t():
+            with patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                return_value=DatabricksCredentials(
+                    host="https://example.cloud.databricks.com",
+                    token="dapi_test_token",
+                ),
+            ):
+                executor = ClaudeSDKExecutor(gateway=True)
+
+            captured: dict[str, str | None] = {}
+            event_loop_thread = threading.get_ident()
+
+            def _resolve_model(provider_name: str, *, family: str) -> SimpleNamespace:
+                self.assertNotEqual(threading.get_ident(), event_loop_thread)
+                self.assertEqual((provider_name, family), ("databricks", "claude"))
+                return SimpleNamespace(model_id="catalog-databricks-claude-default")
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured["model"] = model
+                raise RuntimeError("stop after model resolution")
+
+            with (
+                patch(
+                    "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+                    side_effect=RuntimeError("live listing unavailable"),
+                ),
+                patch(
+                    "omnigent.model_catalog.resolve_catalog_model",
+                    side_effect=_resolve_model,
+                ),
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
+            ):
+                with self.assertRaises(RuntimeError):
+                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        pass
+
+            self.assertEqual(captured["model"], "catalog-databricks-claude-default")
+
+        _run(_t())
+
+    def test_databricks_profile_uses_discovered_model(self):
+        """gateway=True (profile-derived) + no model → the workspace's live model.
+
+        The resolver prefers the live Unity Catalog listing over the bundled
+        catalog, walking the ``opus > sonnet > haiku > fable`` precedence
+        claude-native falls back to; the bundled ``databricks-*`` catalog is
+        only the last resort (see ``..._default_model_used_when_unset``).
+        """
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.inner.databricks_executor import DatabricksCredentials
 
         async def _t():
@@ -431,16 +731,34 @@ class TestConstructor(unittest.TestCase):
                 captured["model"] = model
                 raise RuntimeError("stop after model resolution")
 
-            with patch.object(
-                executor,
-                "_get_or_create_client",
-                side_effect=fake_get_or_create_client,
+            with (
+                patch(
+                    "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+                    return_value=SimpleNamespace(
+                        host="https://example.cloud.databricks.com", token="dapi_test_token"
+                    ),
+                ),
+                patch(
+                    "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+                    return_value=SimpleNamespace(
+                        families={
+                            "sonnet": "system.ai.claude-sonnet-5",
+                            "opus": "system.ai.claude-opus-5",
+                        }
+                    ),
+                ),
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
             ):
                 with self.assertRaises(RuntimeError):
                     async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
                         pass
 
-            self.assertEqual(captured["model"], _DATABRICKS_CLAUDE_DEFAULT_MODEL)
+            # opus outranks sonnet in the family precedence.
+            self.assertEqual(captured["model"], "system.ai.claude-opus-5")
 
         _run(_t())
 
@@ -695,6 +1013,44 @@ class TestConstructor(unittest.TestCase):
 
         _run(_t())
 
+    def test_force_close_client_handles_sdk_without_stderr_task_group(self):
+        # Regression: claude-agent-sdk >=0.2.x renamed the stderr reader from an
+        # anyio task group (`_stderr_task_group`) to a single `_stderr_task`
+        # TaskHandle. A transport shaped like the current SDK (no
+        # `_stderr_task_group` attribute at all) must not raise AttributeError
+        # out of `_force_close_client` — that exception escaped the runner's
+        # lifespan shutdown and crashed it on every session stop.
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        stderr_task = SimpleNamespace(cancel=Mock())
+
+        class _Transport:
+            def __init__(self):
+                self._process = SimpleNamespace(returncode=None, pid=12345, wait=AsyncMock())
+                self._stdout_stream = object()
+                self._stdin_stream = object()
+                self._stderr_stream = object()
+                self._stderr_task = stderr_task  # current SDK shape
+                self._ready = True
+
+        transport = _Transport()
+        client = SimpleNamespace(_query=None, _transport=transport)
+
+        async def _t():
+            with patch(
+                "omnigent.inner.claude_sdk_executor._terminate_process_tree"
+            ) as terminate_tree:
+                await ClaudeSDKExecutor._force_close_client(client)
+            terminate_tree.assert_called_once()
+
+        _run(_t())
+
+        # New-shape stderr task was cancelled, the missing legacy attribute was
+        # never created, and the handle was cleared.
+        stderr_task.cancel.assert_called_once()
+        self.assertFalse(hasattr(transport, "_stderr_task_group"))
+        self.assertIsNone(transport._stderr_task)
+
     def test_claude_internal_write_files_omits_missing_config(self):
         from omnigent.inner.claude_sdk_executor import _claude_internal_write_files
 
@@ -719,6 +1075,21 @@ class TestConstructor(unittest.TestCase):
                 paths = _claude_internal_write_files()
 
             self.assertEqual(paths, [config_path])
+
+    def test_claude_internal_write_files_includes_credentials_when_present(self):
+        from omnigent.inner.claude_sdk_executor import _claude_internal_write_files
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            config_path = home / ".claude.json"
+            config_path.write_text("{}\n", encoding="utf-8")
+            credentials_path = home / ".claude" / ".credentials.json"
+            credentials_path.parent.mkdir(parents=True, exist_ok=True)
+            credentials_path.write_text("{}\n", encoding="utf-8")
+            with patch("omnigent.inner.claude_sdk_executor.pathlib.Path.home", return_value=home):
+                paths = _claude_internal_write_files()
+
+            self.assertEqual(paths, [config_path, credentials_path])
 
 
 # ---------------------------------------------------------------------------
@@ -872,7 +1243,59 @@ class TestResolveGatewayEnv(unittest.TestCase):
                 'databricks auth token --host "https://example.databricks.com"',
                 env["OMNIGENT_CLAUDE_API_KEY_HELPER"],
             )
+            self.assertEqual(
+                env["ANTHROPIC_CUSTOM_HEADERS"],
+                "x-databricks-use-coding-agent-mode: true",
+            )
             self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
+
+    def test_databricks_gateway_negotiates_betas(self):
+        """A real Databricks AI Gateway base URL negotiates betas, not disables them.
+
+        Blanket-disabling betas makes Claude Code strip ``interleaved-thinking``,
+        which the Databricks gateway then rejects with a thinking-block 400. On a
+        genuine gateway we set ``CLAUDE_CODE_USE_GATEWAY`` and leave the disable
+        flag off (matching claude-native).
+        """
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                return_value=DatabricksCredentials(
+                    host="https://wkspc.cloud.databricks.com",
+                    token="dapi_abc123",
+                ),
+            ),
+        ):
+            env = _resolve_gateway_env()
+        self.assertEqual(env["CLAUDE_CODE_USE_GATEWAY"], "1")
+        self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", env)
+
+    def test_non_databricks_gateway_keeps_beta_disable(self):
+        """A gateway host outside the trusted Databricks domains keeps the workaround.
+
+        A generic gateway (or a mock server) can't negotiate betas, so the
+        original ``CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`` behavior is preserved.
+        """
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                # Not under a trusted Databricks parent domain.
+                return_value=DatabricksCredentials(
+                    host="https://example.databricks.com", token="t"
+                ),
+            ),
+        ):
+            env = _resolve_gateway_env()
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
+        self.assertNotIn("CLAUDE_CODE_USE_GATEWAY", env)
 
     def test_strips_trailing_slash(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
@@ -916,6 +1339,20 @@ class TestResolveGatewayEnv(unittest.TestCase):
             "https://example.databricks.com/ai-gateway/anthropic",
         )
         self.assertEqual(env["OMNIGENT_CLAUDE_API_KEY_HELPER"], "printf token")
+        self.assertEqual(
+            env["ANTHROPIC_CUSTOM_HEADERS"],
+            "x-databricks-use-coding-agent-mode: true",
+        )
+
+    def test_generic_provider_gateway_omits_databricks_header(self):
+        """Non-Databricks gateways must not receive the Databricks mode header."""
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+
+        env = _resolve_gateway_env(
+            base_url_override="https://mock-llm.example/v1",
+            auth_command_override="printf sk-test",
+        )
+        self.assertNotIn("ANTHROPIC_CUSTOM_HEADERS", env)
 
     def test_host_override_requires_base_url(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
@@ -1014,14 +1451,6 @@ class TestSystemMessages(unittest.TestCase):
         shim_upstream: dict[str, str] = {}
 
         async def _t():
-            executor = ClaudeSDKExecutor()
-            executor._gateway = True
-            executor._databricks_profile = "oss"
-            executor._base_url_override = "https://host/ai-gateway/anthropic"
-            executor._extra_env = _resolve_gateway_env(
-                profile="oss",
-                base_url_override="https://host/ai-gateway/anthropic",
-            )
             with (
                 patch(
                     "omnigent.inner.claude_sdk_executor._resolve_gateway_env",
@@ -1029,6 +1458,12 @@ class TestSystemMessages(unittest.TestCase):
                 ),
                 patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK),
             ):
+                executor = ClaudeSDKExecutor(
+                    gateway=True,
+                    gateway_host="https://host",
+                    base_url_override="https://host/ai-gateway/anthropic",
+                    gateway_auth_command="printf token",
+                )
                 events = [
                     e
                     async for e in executor.run_turn(
@@ -1064,6 +1499,7 @@ class TestSystemMessages(unittest.TestCase):
         self.assertTrue(shim_upstream["base_url"].startswith("http://127.0.0.1:"))
         self.assertEqual(shim_upstream["upstream"], "https://host/ai-gateway/anthropic")
         self.assertEqual(captured_options[0].env["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"], "900000")
+        self.assertEqual(captured_options[0].env["ENABLE_TOOL_SEARCH"], "true")
         self.assertNotIn("OMNIGENT_CLAUDE_API_KEY_HELPER", captured_options[0].env)
         self.assertNotIn("ANTHROPIC_AUTH_TOKEN", captured_options[0].env)
 
@@ -1137,6 +1573,96 @@ class TestSystemMessages(unittest.TestCase):
             self.assertIsInstance(events[0], ExecutorError)
             self.assertIn("authentication failed", events[0].message)
             self.assertIn("401", events[0].message)
+            # Non-gateway executor should suggest checking CLI login, not databrickscfg
+            self.assertIn("claude /status", events[0].message)
+            self.assertNotIn("databrickscfg", events[0].message)
+
+        _run(_t())
+
+    def test_auth_retry_databricks_gateway_mentions_databrickscfg(self):
+        """Databricks-profile gateway auth errors should mention ~/.databrickscfg."""
+        from claude_agent_sdk.types import (
+            ClaudeAgentOptions as SDKClaudeAgentOptions,
+        )
+        from claude_agent_sdk.types import (
+            StreamEvent as SDKStreamEvent,
+        )
+        from claude_agent_sdk.types import (
+            SystemMessage as SDKSystemMessage,
+        )
+
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        class _Sentinel:
+            pass
+
+        class _FakeSDK:
+            AssistantMessage = _Sentinel
+            ResultMessage = _Sentinel
+            UserMessage = _Sentinel
+            SystemMessage = SDKSystemMessage
+            StreamEvent = SDKStreamEvent
+            ClaudeAgentOptions = SDKClaudeAgentOptions
+            messages = [
+                SDKSystemMessage(
+                    subtype="api_retry",
+                    data={
+                        "type": "system",
+                        "subtype": "api_retry",
+                        "attempt": 1,
+                        "max_retries": 10,
+                        "retry_delay_ms": 500,
+                        "error_status": 401,
+                        "error": "authentication_failed",
+                    },
+                )
+            ]
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    return None
+
+                async def receive_response(self):
+                    for message in _FakeSDK.messages:
+                        yield message
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            # Create a gateway executor that uses a Databricks profile path.
+            # gateway=True + no host/base_url overrides → _gateway_uses_databricks_profile is True.
+            # Patch _resolve_gateway_env to avoid needing a real ~/.databrickscfg.
+            with patch(
+                "omnigent.inner.claude_sdk_executor._resolve_gateway_env",
+                return_value={
+                    "ANTHROPIC_BASE_URL": "https://host/ai-gateway/anthropic",
+                    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "900000",
+                    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+                    "OMNIGENT_CLAUDE_API_KEY_HELPER": "databricks auth token ...",
+                },
+            ):
+                executor = ClaudeSDKExecutor(gateway=True)
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                events = [
+                    e
+                    async for e in executor.run_turn(
+                        [{"role": "user", "content": "hello"}],
+                        [],
+                        "",
+                    )
+                ]
+            self.assertEqual(len(events), 1)
+            self.assertIsInstance(events[0], ExecutorError)
+            self.assertIn("authentication failed", events[0].message)
+            # Databricks gateway should mention databrickscfg
+            self.assertIn("databrickscfg", events[0].message)
 
         _run(_t())
 
@@ -1265,6 +1791,7 @@ class TestStreamEventStreaming(unittest.TestCase):
                             "extra_args": getattr(self.options, "extra_args", {}),
                             "tools": getattr(self.options, "tools", None),
                             "allowed_tools": getattr(self.options, "allowed_tools", None),
+                            "env": getattr(self.options, "env", None),
                         }
                     )
                     result_session_id = (
@@ -1300,12 +1827,10 @@ class TestStreamEventStreaming(unittest.TestCase):
                 query_calls[0]["extra_args"],
                 {"no-session-persistence": None},
             )
-            # Skill is always in the base tool set so the Skill tool is
-            # actually exposed to the model when ``skills="all"`` (the
-            # SDK only adds Skill to ``allowedTools`` — without listing
-            # it in ``tools`` the CLI passes ``--tools ""`` and zeros
-            # the base set).
-            self.assertEqual(query_calls[0]["tools"], ["Skill"])
+            # Skill remains available for configured skills; ToolSearch
+            # keeps large MCP definitions deferred until they are needed.
+            self.assertEqual(query_calls[0]["tools"], ["Skill", "ToolSearch"])
+            self.assertEqual(query_calls[0]["env"]["ENABLE_TOOL_SEARCH"], "true")
             self.assertEqual(query_calls[0]["allowed_tools"], [])
             self.assertEqual(query_calls[1]["session_id"], "session-b")
             self.assertEqual(query_calls[2]["session_id"], "session-a")
@@ -1408,15 +1933,15 @@ class TestStreamEventStreaming(unittest.TestCase):
                     )
                 ]
             # OS operations route through sys_os_* MCP tools, not SDK
-            # built-ins. Only Skill remains in the native base set.
-            self.assertEqual(captured_options["tools"], ["Skill"])
+            # built-ins. Skill and ToolSearch do not widen OS access.
+            self.assertEqual(captured_options["tools"], ["Skill", "ToolSearch"])
             self.assertIn("mcp__omnigent__sleep", captured_options["allowed_tools"])
             self.assertNotIn("Bash", captured_options["allowed_tools"])
             self.assertIsInstance(events[-1], TurnComplete)
 
         _run(_t())
 
-    def test_mcp_only_session_disables_native_tool_base_set(self):
+    def test_mcp_only_session_keeps_discovery_tools_without_native_os_tools(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
         captured_options = {}
@@ -1494,14 +2019,13 @@ class TestStreamEventStreaming(unittest.TestCase):
                         "",
                     )
                 ]
-            # Default ``skills_filter="all"`` exposes the ``Skill``
-            # tool so the model can invoke discovered skills via
-            # the Claude SDK plugin mechanism. The OS tools
+            # Default ``skills_filter="all"`` exposes the ``Skill`` tool
+            # through the Claude SDK plugin mechanism. ToolSearch defers
+            # MCP definitions until needed. The OS tools
             # (Bash/Read/Edit/Write/Glob/Grep) stay absent — that's
-            # what this test pins. ``Skill`` itself doesn't widen
-            # the FS attack surface; it only loads pre-approved
-            # SKILL.md content.
-            self.assertEqual(captured_options["tools"], ["Skill"])
+            # what this test pins. Neither base tool widens the FS attack
+            # surface.
+            self.assertEqual(captured_options["tools"], ["Skill", "ToolSearch"])
             self.assertEqual(captured_options["allowed_tools"], ["mcp__omnigent__sleep"])
             self.assertIsInstance(events[-1], TurnComplete)
 
@@ -1553,6 +2077,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             class ClaudeSDKClient:
                 def __init__(self, options):
                     captured_options["allowed_tools"] = getattr(options, "allowed_tools", None)
+                    captured_options["system_prompt"] = getattr(options, "system_prompt", None)
 
                 async def connect(self):
                     return None
@@ -1588,10 +2113,109 @@ class TestStreamEventStreaming(unittest.TestCase):
                                 },
                             }
                         ],
-                        "",
+                        "Delegate through `sys_session_send`.",
                     )
                 ]
             self.assertIn("mcp__omnigent__sys_session_send", captured_options["allowed_tools"])
+            self.assertIn(
+                "use `mcp__omnigent__sys_session_send` when instructions say `sys_session_send`",
+                captured_options["system_prompt"],
+            )
+            self.assertIsInstance(events[-1], TurnComplete)
+
+        _run(_t())
+
+    def test_session_rename_tool_uses_exact_sdk_mcp_name(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        captured_options = {}
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = _ResultMessage
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+            messages = []
+
+            @staticmethod
+            def tool(name, desc, params):
+                def decorator(handler):
+                    return type(
+                        "Tool",
+                        (),
+                        {
+                            "name": name,
+                            "description": desc,
+                            "parameters": params,
+                            "handler": handler,
+                        },
+                    )()
+
+                return decorator
+
+            @staticmethod
+            def create_sdk_mcp_server(**kwargs):
+                return kwargs
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    captured_options["allowed_tools"] = getattr(options, "allowed_tools", None)
+                    captured_options["system_prompt"] = getattr(options, "system_prompt", None)
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    _FakeSDK.messages = [_ResultMessage(session_id, "done")]
+
+                async def receive_response(self):
+                    for message in _FakeSDK.messages:
+                        yield message
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                events = [
+                    event
+                    async for event in executor.run_turn(
+                        [{"role": "user", "content": "hi", "session_id": "session-a"}],
+                        [
+                            {
+                                "name": "sys_session_rename",
+                                "description": "Rename current session",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"title": {"type": "string"}},
+                                    "required": ["title"],
+                                },
+                            }
+                        ],
+                        "Call `sys_session_rename` before replying.",
+                    )
+                ]
+            self.assertIn(
+                "mcp__omnigent__sys_session_rename",
+                captured_options["allowed_tools"],
+            )
+            self.assertIn(
+                "use `mcp__omnigent__sys_session_rename` when instructions say "
+                "`sys_session_rename`",
+                captured_options["system_prompt"],
+            )
             self.assertIsInstance(events[-1], TurnComplete)
 
         _run(_t())
@@ -1641,6 +2265,84 @@ class TestStreamEventStreaming(unittest.TestCase):
             self.assertIn("cannot continue in this Session", second_events[0].message)
             self.assertIn("claude subprocess crashed", second_events[0].message)
             self.assertIn("session-a", executor._crashed_sessions)
+
+        _run(_t())
+
+    def test_cancelled_turn_evicts_wedged_client(self):
+        """A cancelled turn evicts the cached client so resume can recover (#2109).
+
+        ``asyncio.CancelledError`` is a ``BaseException``, so the idle-watchdog
+        cancel bypasses run_turn's ``except Exception`` boundary and the
+        wedged client used to stay cached.
+        """
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        created = []
+        wedge_reached = asyncio.Event()
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = _ResultMessage
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    self.options = options
+                    self.index = len(created)
+                    created.append(self)
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    return None
+
+                async def receive_response(self):
+                    if self.index == 0:
+                        # First client wedges like a stuck tool: no events.
+                        wedge_reached.set()
+                        await asyncio.Event().wait()
+                    yield _ResultMessage("claude-session-a", "recovered")
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            messages = [{"role": "user", "content": "hello", "session_id": "session-a"}]
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+
+                async def _consume():
+                    return [e async for e in executor.run_turn(messages, [], "")]
+
+                turn = asyncio.ensure_future(_consume())
+                await asyncio.wait_for(wedge_reached.wait(), timeout=5)
+                turn.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await turn
+
+                # Evicted without a crash mark so the next turn rebuilds
+                # a fresh client.
+                self.assertEqual(executor._clients, {})
+                self.assertNotIn("session-a", executor._crashed_sessions)
+
+                events = [e async for e in executor.run_turn(messages, [], "")]
+
+            self.assertEqual(len(created), 2)
+            self.assertIsInstance(events[-1], TurnComplete)
+            self.assertEqual(events[-1].response, "recovered")
 
         _run(_t())
 
@@ -2369,6 +3071,32 @@ async def test_get_or_create_client_surfaces_cli_stderr_on_connect_timeout(monke
     assert options.stderr is None
 
 
+def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> None:
+    """A relative ``os_env.cwd`` (notably the default ``"."``) resolves
+    against ``OMNIGENT_RUNNER_WORKSPACE`` — not the daemon's process cwd
+    — so the sandbox root matches the tmux terminal and never falls back
+    to ``$HOME``. Absolute paths keep their root and are resolved by
+    ``Path.resolve(strict=False)``."""
+    from omnigent.inner.claude_sdk_executor import _resolve_sandbox_cwd
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "/home/bobby/code/agents")
+    monkeypatch.chdir("/tmp")
+
+    # ``_resolve_sandbox_cwd`` ends in ``Path.resolve(strict=False)``. On macOS,
+    # these literal paths route through firmlinks (``/home`` -> the automounter,
+    # ``/tmp`` -> ``/private/tmp``), so compare against the same resolution
+    # instead of literal strings. On Linux both sides are identical.
+    workspace = Path("/home/bobby/code/agents").resolve(strict=False)
+    assert _resolve_sandbox_cwd(".") == workspace
+    assert _resolve_sandbox_cwd(None) == workspace
+    assert _resolve_sandbox_cwd("src") == (workspace / "src").resolve(strict=False)
+    assert _resolve_sandbox_cwd("/etc/foo") == Path("/etc/foo").resolve(strict=False)
+
+    # No workspace set → falls back to the process cwd (prior behavior).
+    monkeypatch.delenv("OMNIGENT_RUNNER_WORKSPACE", raising=False)
+    assert _resolve_sandbox_cwd(".") == Path("/tmp").resolve(strict=False)
+
+
 @pytest.mark.parametrize("env_value", ["1", "true", "yes"])
 def test_prepare_claude_cli_path_bypasses_wrapper_when_env_set(
     monkeypatch, caplog, env_value: str
@@ -2432,6 +3160,144 @@ def test_prepare_tight_cli_process_path_bypasses_wrapper_when_env_set(monkeypatc
     )
 
     assert prepare_tight_cli_process_path("/usr/bin/claude") == "/usr/bin/claude"
+
+
+def _wrap_probe_spec():
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    return OSEnvSpec(
+        type="caller_process",
+        cwd="/tmp/work",
+        sandbox=OSEnvSandboxSpec(
+            type="linux_bwrap",
+            read_paths=["."],
+            write_paths=["."],
+            allow_network=True,
+        ),
+    )
+
+
+def _active_policy():
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    return SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=[Path("/tmp/work")],
+        write_roots=[Path("/tmp/work")],
+        write_files=[],
+        allow_network=True,
+    )
+
+
+def test_prepare_claude_cli_path_degrades_when_resolve_sandbox_fails(monkeypatch, caplog) -> None:
+    """
+    A ``resolve_sandbox`` failure (e.g. ``sandbox-exec`` missing on the
+    host) must NOT crash the seat at connect time. The prepare degrades
+    to the raw CLI with native tools disabled — the same confinement
+    shape as the ``OMNIGENT_CLAUDE_SDK_NO_SANDBOX`` bypass — and warns.
+    """
+    from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
+
+    def _raise_resolve(*args, **kwargs):
+        raise OSError("darwin_seatbelt requires sandbox-exec on PATH")
+
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor.resolve_sandbox", _raise_resolve)
+
+    def _fail_if_called(*args, **kwargs) -> str:
+        raise AssertionError("create_exec_launcher must not run when resolve failed")
+
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor.create_exec_launcher", _fail_if_called)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.inner.claude_sdk_executor"):
+        prepared = prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
+
+    assert prepared.cli_path == "/usr/bin/claude"
+    assert prepared.enable_native_tools is False
+    assert any(
+        "Cannot resolve the configured sandbox" in record.getMessage() for record in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
+def test_prepare_claude_cli_path_degrades_when_wrap_probe_fails(monkeypatch, caplog) -> None:
+    """
+    When the backend can resolve but the spawn-time wrap can't be built
+    (un-grantable interpreter layout, profile-size cap, cwd-scan
+    overflow), the OSError previously fired inside ``run_launcher`` and
+    killed the CLI spawn with an opaque connect timeout. The prepare-
+    time probe must catch it and degrade — unwrapped CLI, native tools
+    OFF, loud warning — never raise.
+    """
+    from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
+
+    monkeypatch.setattr(
+        "omnigent.inner.claude_sdk_executor.resolve_sandbox",
+        lambda *a, **k: _active_policy(),
+    )
+
+    class _RefusingBackend:
+        def wrap_launcher_argv(self, *args, **kwargs):
+            raise OSError("would require widening the sandbox read view")
+
+    monkeypatch.setattr(
+        "omnigent.inner.claude_sdk_executor.get_backend",
+        lambda name: _RefusingBackend(),
+    )
+
+    def _fail_if_called(*args, **kwargs) -> str:
+        raise AssertionError("create_exec_launcher must not run when the wrap probe failed")
+
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor.create_exec_launcher", _fail_if_called)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.inner.claude_sdk_executor"):
+        prepared = prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
+
+    assert prepared.cli_path == "/usr/bin/claude"
+    assert prepared.enable_native_tools is False
+    assert any("cannot wrap the Claude CLI" in record.getMessage() for record in caplog.records), [
+        r.getMessage() for r in caplog.records
+    ]
+
+
+def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
+    monkeypatch,
+) -> None:
+    """
+    The happy path is unchanged by the probe: the wrap still happens,
+    native tools stay ON, and the probe exercises the same lane the
+    launcher will (``target=<real CLI>``), so a probe pass means the
+    run-time wrap can build the same grants.
+    """
+    from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
+
+    monkeypatch.setattr(
+        "omnigent.inner.claude_sdk_executor.resolve_sandbox",
+        lambda *a, **k: _active_policy(),
+    )
+
+    seen: dict[str, object] = {}
+
+    class _OkBackend:
+        def wrap_launcher_argv(self, argv, policy, cwd, chdir=None, target=None):
+            seen["target"] = target
+            return ["bwrap", "--", *argv]
+
+    monkeypatch.setattr(
+        "omnigent.inner.claude_sdk_executor.get_backend",
+        lambda name: _OkBackend(),
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.claude_sdk_executor.create_exec_launcher",
+        lambda path, sandbox: "/tmp/launcher",
+    )
+
+    prepared = prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
+
+    assert prepared.cli_path == "/tmp/launcher"
+    assert prepared.enable_native_tools is True
+    assert seen["target"] == "/usr/bin/claude", (
+        "The probe must exercise the target lane run_launcher will use."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2678,6 +3544,100 @@ async def test_result_message_usage_populates_turn_complete_usage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_result_message_is_error_yields_executor_error() -> None:
+    """``ResultMessage`` with ``is_error=True`` must surface as ``ExecutorError``.
+
+    When the SDK signals a harness-level failure (e.g. expired login, not logged
+    in), ``is_error`` is ``True`` and ``result`` carries the failure text.  The
+    executor must route this into an ``ExecutorError`` — not store it as the
+    assistant's response.
+
+    Regression guard: before the fix, ``result`` was assigned to ``response_text``
+    unconditionally, so the failure appeared as an assistant message with no error
+    item and no log line.
+    """
+    from unittest.mock import patch
+
+    from claude_agent_sdk.types import (
+        ClaudeAgentOptions as SDKClaudeAgentOptions,
+    )
+    from claude_agent_sdk.types import ResultMessage as SDKResultMessage
+    from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorError, TurnComplete
+
+    class _Sentinel:
+        pass
+
+    sdk_result = SDKResultMessage(
+        subtype="success",  # subtype is unreliable — is_error is the real signal
+        session_id="s1",
+        result="Not logged in · Please run /login",
+        total_cost_usd=0.0,
+        duration_ms=100,
+        duration_api_ms=80,
+        is_error=True,
+        num_turns=1,
+        usage=None,
+    )
+
+    class _FakeSDK:
+        AssistantMessage = _Sentinel
+        UserMessage = _Sentinel
+        SystemMessage = _Sentinel
+        StreamEvent = SDKStreamEvent
+        ResultMessage = SDKResultMessage
+        ClaudeAgentOptions = SDKClaudeAgentOptions
+        messages = [sdk_result]
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                return None
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    executor = ClaudeSDKExecutor()
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        events = [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi"}],
+                [],
+                "",
+            )
+        ]
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert errors, (
+        "Expected at least one ExecutorError for is_error=True ResultMessage, got none. "
+        "The failure text must not be stored as assistant content."
+    )
+    assert "Not logged in" in errors[0].message, (
+        f"ExecutorError.message {errors[0].message!r} does not contain the failure text."
+    )
+
+    # Must not also appear as assistant content
+    turns = [e for e in events if isinstance(e, TurnComplete)]
+    for t in turns:
+        assert "Not logged in" not in (t.response or ""), (
+            "Failure text must not appear in TurnComplete.response"
+            " — it leaked as assistant content."
+        )
+
+
+@pytest.mark.asyncio
 async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_turn() -> None:
     """``context_tokens`` must reflect the LAST API call, not the cumulative sum.
 
@@ -2820,6 +3780,119 @@ async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_t
     assert turn.usage["total_tokens"] == 1050, (
         f"total_tokens {turn.usage.get('total_tokens')} != 1050 (800+250) — total must "
         "be the cumulative input + output for billing."
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_tokens_emitted_when_turn_ends_without_result_message() -> None:
+    """A turn that never reaches ``ResultMessage`` still reports ``context_tokens``.
+
+    ``context_tokens`` (context-window fill) is normally assembled in the
+    ``ResultMessage`` branch at successful completion. But a turn can end the
+    stream without a ``ResultMessage`` — the CLI can close the stream early,
+    or the turn can be cut short before its final usage is reported. Before
+    this fix the executor yielded ``TurnComplete(usage=None)`` in that case,
+    so the occupancy meter froze at the previous successful turn's value and
+    showed a misleadingly low fill exactly when a session was in trouble
+    (#1533).
+
+    The per-call prompt size is already observed mid-turn from each
+    ``message_start`` event, so when no ``ResultMessage`` arrives the executor
+    must fall back to that observed usage and still emit ``context_tokens``.
+
+    Regression guard: pre-fix ``turn.usage`` is ``None`` here because the
+    stream carries only a ``message_start`` and then stops.
+    """
+    from unittest.mock import patch
+
+    from claude_agent_sdk.types import (
+        ClaudeAgentOptions as SDKClaudeAgentOptions,
+    )
+    from claude_agent_sdk.types import ResultMessage as SDKResultMessage
+    from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    class _Sentinel:
+        pass
+
+    # The turn opens one API call (carrying its prompt usage) and then the
+    # stream simply ends — no ResultMessage, mirroring an early CLI stream
+    # close or a turn cut short before final usage is reported.
+    message_start = SDKStreamEvent(
+        uuid="u1",
+        session_id="s1",
+        event={
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 400,
+                    "cache_read_input_tokens": 9000,
+                    "cache_creation_input_tokens": 100,
+                }
+            },
+        },
+    )
+
+    class _FakeSDK:
+        AssistantMessage = _Sentinel
+        UserMessage = _Sentinel
+        SystemMessage = _Sentinel
+        StreamEvent = SDKStreamEvent
+        ResultMessage = SDKResultMessage
+        ClaudeAgentOptions = SDKClaudeAgentOptions
+        messages = [message_start]  # note: no ResultMessage
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                return None
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    executor = ClaudeSDKExecutor()
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        events = [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi"}],
+                [],
+                "",
+            )
+        ]
+
+    turn = next(e for e in events if isinstance(e, TurnComplete))
+    assert turn.usage is not None, (
+        "TurnComplete.usage is None on a turn that ended without a ResultMessage — "
+        "the observed message_start prompt usage was discarded, so the occupancy "
+        "meter freezes at the last successful turn's value (#1533)."
+    )
+
+    # context_tokens = the observed prompt = input + cache_creation + cache_read
+    # (400 + 100 + 9000), so a failed/early-ending turn still refreshes fill.
+    assert turn.usage["context_tokens"] == 9500, (
+        f"context_tokens {turn.usage.get('context_tokens')} != 9500 (400+100+9000) — "
+        "an incomplete turn must report context_tokens from the last observed "
+        "message_start prompt so the occupancy meter does not freeze."
+    )
+    # output_tokens is unknown on an incomplete turn, so it is reported as 0
+    # rather than guessed; the meaningful field here is context_tokens.
+    assert turn.usage["output_tokens"] == 0, (
+        f"output_tokens {turn.usage.get('output_tokens')} != 0 — output is unknown "
+        "on an incomplete turn and must not be fabricated."
+    )
+    assert "model" in turn.usage, (
+        "TurnComplete.usage is missing the 'model' key on the incomplete-turn path."
     )
 
 
@@ -3333,3 +4406,353 @@ class TestToolCallPolicyGate(unittest.TestCase):
             self.assertIsNone(captured["can_use_tool"])
 
         _run(_t())
+
+
+# ---------------------------------------------------------------------------
+# Tests: Compaction detection via PreCompact hook
+# ---------------------------------------------------------------------------
+
+
+def test_precompact_hook_emits_compaction_complete_with_session_messages() -> None:
+    """When PreCompact fires and a ResultMessage carries a session_id,
+    CompactionComplete is emitted with compacted_messages read from
+    the CLI's session transcript."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete
+
+    class _ResultMessage:
+        def __init__(self, session_id, result):
+            self.session_id = session_id
+            self.result = result
+            self.content = []
+            self.model = "claude-test"
+            self.usage = type(
+                "U",
+                (),
+                {
+                    "input_tokens": 500,
+                    "output_tokens": 100,
+                },
+            )()
+
+    class _SystemMessage:
+        def __init__(self, subtype, data, hook_event_name=None):
+            self.subtype = subtype
+            self.data = data
+            self.hook_event_name = hook_event_name
+
+    class _HookEventMessage(_SystemMessage):
+        pass
+
+    class _FakeSessionMessage:
+        def __init__(self, type, message):
+            self.type = type
+            self.message = message
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = _SystemMessage
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+        messages: list = []
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                _FakeSDK.messages = [
+                    _HookEventMessage(
+                        subtype="hook_started",
+                        data={"hook_event": "PreCompact"},
+                        hook_event_name="PreCompact",
+                    ),
+                    _ResultMessage("claude-uuid-123", "compacted result"),
+                ]
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    fake_session_msgs = [
+        _FakeSessionMessage("user", {"content": [{"type": "text", "text": "hi"}]}),
+        _FakeSessionMessage("assistant", {"content": [{"type": "text", "text": "compacted"}]}),
+    ]
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._ensure_sdk",
+                return_value=_FakeSDK,
+            ),
+            patch(
+                "claude_agent_sdk.get_session_messages",
+                return_value=fake_session_msgs,
+            ) as mock_get_msgs,
+        ):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        compaction_events = [e for e in events if isinstance(e, CompactionComplete)]
+        assert len(compaction_events) == 1
+        ce = compaction_events[0]
+        assert ce.compacted_messages is not None
+        assert len(ce.compacted_messages) == 2
+        assert ce.compacted_messages[0]["role"] == "user"
+        assert ce.compacted_messages[1]["role"] == "assistant"
+        mock_get_msgs.assert_called_once_with("claude-uuid-123", directory=None)
+        # CompactionStarted before CompactionComplete before TurnComplete
+        from omnigent.inner.executor import CompactionStarted
+
+        started_events = [e for e in events if isinstance(e, CompactionStarted)]
+        assert len(started_events) == 1
+        turn_completes = [e for e in events if isinstance(e, TurnComplete)]
+        assert len(turn_completes) == 1
+        assert events.index(started_events[0]) < events.index(compaction_events[0])
+        assert events.index(compaction_events[0]) < events.index(turn_completes[0])
+
+    _run(_t())
+
+
+def test_precompact_hook_emits_compaction_started_before_complete() -> None:
+    """CompactionStarted is yielded when PreCompact fires, before CompactionComplete.
+
+    This ensures clients see the in-progress signal while compaction is
+    still happening, rather than both events arriving back-to-back after
+    the turn ends.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete, CompactionStarted
+
+    class _ResultMessage:
+        def __init__(self, session_id, result):
+            self.session_id = session_id
+            self.result = result
+            self.content = []
+            self.model = "claude-test"
+            self.usage = type(
+                "U",
+                (),
+                {"input_tokens": 500, "output_tokens": 100},
+            )()
+
+    class _SystemMessage:
+        def __init__(self, subtype, data, hook_event_name=None):
+            self.subtype = subtype
+            self.data = data
+            self.hook_event_name = hook_event_name
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = _SystemMessage
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+        messages: list = []
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                _FakeSDK.messages = [
+                    _SystemMessage(
+                        subtype="hook_started",
+                        data={"hook_event": "PreCompact"},
+                        hook_event_name="PreCompact",
+                    ),
+                    _ResultMessage("claude-uuid-456", "compacted result"),
+                ]
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._ensure_sdk",
+                return_value=_FakeSDK,
+            ),
+            patch(
+                "claude_agent_sdk.get_session_messages",
+                return_value=[],
+            ),
+        ):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        started = [e for e in events if isinstance(e, CompactionStarted)]
+        completed = [e for e in events if isinstance(e, CompactionComplete)]
+        assert len(started) == 1, "expected exactly one CompactionStarted"
+        assert len(completed) == 1, "expected exactly one CompactionComplete"
+        assert events.index(started[0]) < events.index(completed[0]), (
+            "CompactionStarted must precede CompactionComplete"
+        )
+
+    _run(_t())
+
+
+def test_no_precompact_no_compaction_event() -> None:
+    """When no PreCompact hook fires, no CompactionComplete is yielded."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import CompactionComplete
+
+    class _ResultMessage:
+        def __init__(self, session_id, result):
+            self.session_id = session_id
+            self.result = result
+            self.content = []
+            self.model = "claude-test"
+            self.usage = type(
+                "U",
+                (),
+                {
+                    "input_tokens": 500,
+                    "output_tokens": 100,
+                },
+            )()
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = type("SystemMessage", (), {})
+        ResultMessage = _ResultMessage
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+        )
+        messages: list = []
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return
+
+            async def query(self, prompt, session_id="default"):
+                _FakeSDK.messages = [_ResultMessage(session_id, "normal result")]
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    async def _t():
+        executor = ClaudeSDKExecutor()
+        with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+        compaction_events = [e for e in events if isinstance(e, CompactionComplete)]
+        assert len(compaction_events) == 0
+
+    _run(_t())
+
+
+def test_find_system_claude_delegates_to_shared_resolver(monkeypatch) -> None:
+    """``_find_system_claude`` resolves claude via the shared resolver with the
+    OMNIGENT_CLAUDE_PATH override, so an nvm/npm-installed claude off the host
+    daemon's frozen PATH is still found. (The resolver's PATH/override/fallback
+    behavior is covered in tests/inner/test_proc_and_platform.py.)"""
+    from omnigent.inner import claude_sdk_executor as cse
+
+    captured = {}
+
+    def fake_resolve(name, *, env_var=None):
+        captured["name"] = name
+        captured["env_var"] = env_var
+        return "/opt/homebrew/bin/claude"
+
+    monkeypatch.setattr(cse, "resolve_cli_binary", fake_resolve)
+    assert cse._find_system_claude() == "/opt/homebrew/bin/claude"
+    assert captured == {"name": "claude", "env_var": "OMNIGENT_CLAUDE_PATH"}
+
+
+def test_claude_sdk_does_not_claim_live_message_queue() -> None:
+    """ClaudeSDKExecutor must not advertise live message queue support.
+
+    query() queues a new turn on stdin rather than injecting into the active
+    turn, so returning True from enqueue_session_message caused a permanent
+    one-turn-behind desync (issue #3472). The executor must return False from
+    both methods so the adapter keeps the message buffered and delivers it as
+    a continuation turn after the active turn ends.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+    assert executor.supports_live_message_queue() is False
+
+
+@pytest.mark.asyncio
+async def test_enqueue_session_message_returns_false_without_queuing() -> None:
+    """enqueue_session_message must return False and never call query().
+
+    Calling query() while a turn is active queues a new turn, not an
+    in-turn injection, which produces the desync from issue #3472.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    executor = ClaudeSDKExecutor()
+    query_called = False
+
+    class _FakeClient:
+        async def query(self, *args, **kwargs):
+            nonlocal query_called
+            query_called = True
+
+    # Inject a fake client state so the session key is known.
+    executor._clients["s1"] = SimpleNamespace(client=_FakeClient())
+
+    result = await executor.enqueue_session_message("s1", "hello")
+
+    assert result is False
+    assert not query_called, "query() must not be called during enqueue"

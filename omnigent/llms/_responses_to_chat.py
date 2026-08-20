@@ -216,9 +216,14 @@ def chat_response_to_response(
     choice = chat_dict["choices"][0]
     message = choice["message"]
 
-    # Text content
-    if content := message.get("content"):
-        output.append(MessageOutput(content=[OutputText(text=content)]))
+    # Text content — content may be a plain string or a list of typed
+    # blocks (Claude via Databricks, Kimi, etc.). Flatten via the shared
+    # helper so list-shaped content is joined into a string rather than
+    # stored raw.
+    if raw_content := message.get("content"):
+        text, _reasoning = _extract_delta_content(raw_content)
+        if text:
+            output.append(MessageOutput(content=[OutputText(text=text)]))
 
     # Tool calls
     for tc in message.get("tool_calls") or []:
@@ -349,6 +354,18 @@ async def chat_stream_to_response_events(
             continue
 
         delta = choices[0].get("delta", {})
+
+        # Top-level reasoning content (xAI Grok, DeepSeek) arrives as a sibling
+        # ``reasoning_content`` string while ``content`` is null during the
+        # thinking phase. Surface it as reasoning so Grok thinking is not
+        # dropped — the typed-block path below only handles Kimi-style blocks
+        # nested inside ``content``.
+        reasoning_content = delta.get("reasoning_content")
+        if isinstance(reasoning_content, str) and reasoning_content:
+            if not reasoning_started:
+                yield ResponseReasoningStartedEvent()
+                reasoning_started = True
+            yield ResponseReasoningTextDeltaEvent(delta=reasoning_content)
 
         # Content delta — may be a plain string or a list of typed blocks
         # (Kimi and some Databricks models use typed blocks).

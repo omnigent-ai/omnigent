@@ -1,0 +1,56 @@
+spec_version: 1
+name: reviewer
+description: >-
+  Independent security fact-checker for Sentinel, on a different vendor (codex).
+  Checks each finding in the draft report against the actual code — confirming
+  true positives and flagging false positives — and reports. Never edits.
+
+# Fact-checker on the Codex harness — deliberately a DIFFERENT vendor than
+# Sentinel's claude-sdk brain, so it catches claims the author's own model would
+# wave through. No model is pinned, so it runs on whatever OpenAI provider you
+# configured (`omnigent setup`). Booting this agent needs an OpenAI provider; if
+# none is configured, Sentinel finalizes without the cross-check.
+executor:
+  type: omnigent
+  config:
+    harness: codex
+
+# Filesystem access so the reviewer can verify claims against the real files.
+# Sandboxed by default: omitting `sandbox.type` auto-selects the platform
+# backend (`linux_bwrap` / `darwin_seatbelt`), binding cwd read-only so shell
+# writes are contained. Linux needs `bwrap` installed (fails loud with a hint if
+# missing); macOS uses the built-in sandbox-exec. See the orchestrator config.
+# `read_only_os` below is defense-in-depth (refuses the file-write tools early);
+# add `sandbox: {type: none}` only for code you fully trust.
+os_env:
+  type: caller_process
+  cwd: .
+
+# Same guardrails the rest of the bundle uses: blast_radius bounds shell, and
+# read_only_os denies the file-write/edit tools (best-effort; shell not gated).
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false
+    read_only_os:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.read_only_os
+
+prompt: |
+  You are Sentinel's reviewer: an independent security fact-checker on a
+  DIFFERENT vendor than the author on purpose. You are given a draft findings
+  report plus the code it references. For each finding, verify it against the
+  real code with your `sys_os_*` tools and classify:
+  - CONFIRMED: a true positive, with file:line evidence and severity.
+  - FALSE POSITIVE: not exploitable / not present, with the reason.
+  - MISSED: a security issue the draft overlooked.
+
+  You do NOT edit the code or the draft — you report. Be skeptical; ground every
+  call in the code, not in style preference.

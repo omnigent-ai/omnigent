@@ -5,12 +5,16 @@ implements the "session risk score" pattern from the sample-policies wishlist:
 
 - **Accrue risk** as the agent takes risky actions. Two sources:
   - *Tool calls* — each call to a configured tool adds points
-    (``tool_points``), e.g. a ``web_search`` adds 10.
+    (``tool_points``), e.g. a ``web_search`` adds 10. This source needs no
+    special support from any tool, so it works out of the box.
   - *Tool results* — a result carrying a sensitive data-classification label
-    adds points (``sensitive_labels``), e.g. reading a doc tagged
+    adds points (``sensitive_labels``), e.g. a result tagged
     ``"Highly Confidential"`` adds 30. The label is read out of the tool's
-    result payload, so this works for *any* MCP server whose results carry a
-    classification field (Google Drive returns ``label_classification``).
+    result payload (scanning the keys in ``label_keys``), so this works with
+    *any* MCP server that annotates its results with a classification field —
+    configure ``sensitive_labels`` to match whatever values that server emits.
+    (Not every MCP labels its output; when none do, leave ``sensitive_labels``
+    empty and rely on ``tool_points`` alone.)
 - **Gate sensitive actions** once the accrued score crosses ``threshold``:
   configured ``guarded_tools`` (e.g. ``gmail_message_send``) escalate from
   ALLOW to **ASK** (default) or **DENY**, forcing human oversight on a session
@@ -44,6 +48,7 @@ YAML usage::
           arguments:
             threshold: 50
             tool_points: {web_search: 10, fetch: 5}
+            # Only if your MCP annotates results with these exact label values.
             sensitive_labels: {"Highly Confidential": 30, RESTRICTED: 30}
             guarded_tools: [gmail_message_send, drive_permission_create]
             escalate_action: ASK
@@ -230,9 +235,11 @@ def _current_score(event: PolicyEvent, cfg: _RiskCfg) -> int:
     :returns: The effective integer score (≥ the actor's offset).
     """
     state = event.get("session_state") or {}
-    accumulated = int(state.get(cfg.state_key, 0))
-    actor = (event.get("context") or {}).get("actor") or {}
-    run_as = actor.get("run_as") or ""
+    accumulated_value = state.get(cfg.state_key, 0)
+    accumulated = int(accumulated_value) if isinstance(accumulated_value, int | float | str) else 0
+    context = event.get("context")
+    actor = context.get("actor") if context is not None else None
+    run_as = actor.get("run_as", "") if actor is not None else ""
     actor_offset = cfg.initial_scores_by_actor.get(run_as, 0)
     return actor_offset + accumulated
 

@@ -46,13 +46,15 @@ _PY_FILE_PATH = "comment_target.py"
 # word-select is unambiguous and the stored offset is deterministic.
 _ANCHOR_WORD = "uniqueanchortoken"
 
-# Python source — the anchor word lives in a trailing comment so it sits on its
-# own token and double-clicking selects the whole identifier.
+# Python source. The anchor word sits alone in a short leading comment so it is
+# its own token (double-click selects the whole identifier) AND stays within the
+# visible viewport at any code-font size — a trailing comment on a long line
+# scrolls off-screen at the larger default sizes, leaving the double-click
+# word-select nothing to land on.
 _PY_CONTENT = f"""\
 def greet(name):
-    message = "hello " + name  # {_ANCHOR_WORD}
-    print(message)
-    return message
+    # {_ANCHOR_WORD}
+    return "hello " + name
 """
 
 

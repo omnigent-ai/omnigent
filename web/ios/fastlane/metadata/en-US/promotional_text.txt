@@ -1,0 +1,1 @@
+Connect your iPhone to Omnigent and keep agent sessions, chats, files, and terminals within reach wherever your server is running.

@@ -16,11 +16,12 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, cast
 from urllib.parse import urlencode
 
 import httpx
 import jwt
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from starlette.responses import RedirectResponse, Response
 
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
@@ -49,6 +50,9 @@ _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
 # provider's default invite window (72h) — long enough to share
 # out-of-band, short enough to bound exposure of an unused link.
 _OIDC_INVITE_TTL_SECONDS = 72 * 3600
+
+if TYPE_CHECKING:
+    from omnigent.server.oidc import OIDCConfig
 
 
 @dataclass
@@ -101,9 +105,12 @@ def create_auth_router(
     """
     router = APIRouter()
     config = auth_provider._oidc_config
+    if config is None:
+        raise ValueError("OIDC auth router requires an OIDC-configured auth provider")
 
     # Invites are opt-in AND require the token store. Both must hold.
-    _invites_enabled = config.allow_invites and account_store is not None
+    invite_store = account_store if config.allow_invites else None
+    _invites_enabled = invite_store is not None
 
     # Admission policy: domain allowlist (env ∪ runtime-editable file)
     # with admin-list and (when enabled) invite bypasses. One place
@@ -112,7 +119,7 @@ def create_auth_router(
         env_allowed_domains=config.allowed_domains,
         domains_file_path=resolve_allowed_domains_path(),
         admin_list=admin_list,
-        invited_lookup=account_store if _invites_enabled else None,
+        invited_lookup=invite_store,
         config_allowed_domains=allowed_domains,
     )
 
@@ -279,11 +286,21 @@ def create_auth_router(
                     content={"error": "Token exchange failed"},
                 )
 
-            token_json = token_resp.json()
+            token_json = _json_object(_response_json(token_resp))
+            if token_json is None:
+                _logger.error("Token exchange returned a non-object JSON response")
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "Token exchange returned an invalid response"},
+                )
 
             # Extract user email.
             if config.provider_type == "github":
-                email = await _resolve_github_email(client, token_json.get("access_token", ""))
+                access_token = token_json.get("access_token")
+                email = await _resolve_github_email(
+                    client,
+                    access_token if isinstance(access_token, str) else "",
+                )
             else:
                 email = _resolve_oidc_email(token_json, config)
 
@@ -303,10 +320,10 @@ def create_auth_router(
         # account_tokens row, which doubles as the durable pre-auth that
         # admits the email on subsequent logins. Reserved-name emails are
         # rejected below regardless, so binding one here is harmless.
-        if _invites_enabled:
+        if invite_store is not None:
             invite_token = state_payload.get("invite")
             if invite_token:
-                account_store.redeem_oidc_invite(
+                invite_store.redeem_oidc_invite(
                     str(invite_token), email, now_epoch_seconds=int(time.time())
                 )
 
@@ -407,7 +424,7 @@ def create_auth_router(
         )
         return response
 
-    if _invites_enabled:
+    if invite_store is not None:
 
         @router.post("/invite")
         async def oidc_invite(request: Request) -> Response:
@@ -440,7 +457,7 @@ def create_auth_router(
 
             token_id = secrets.token_urlsafe(32)
             now = int(time.time())
-            account_store.create_token(
+            invite_store.create_token(
                 token_id,
                 kind="invite",
                 user_id=None,
@@ -553,6 +570,60 @@ def create_auth_router(
             },
         )
 
+    # ── Admin: read-only user list ────────────────────────────────
+
+    @router.get("/users")
+    async def list_users(
+        request: Request,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> Response:
+        """List all users (admin only).
+
+        The OIDC analog of the accounts provider's ``GET /auth/users``
+        — same response shape, so the SPA's Members surface renders
+        identically. This is the read-only discovery half of the
+        admin surface: OIDC identities are owned by the IdP, so there
+        are no server-side password actions (invite/reset/delete) to
+        offer here, and the SPA hides those controls in OIDC mode.
+
+        Admin is gated on the same ``is_admin`` flag the rest of the
+        app uses (set by the admin-list promotion at login), with the
+        admin list as a direct fallback — matching the OIDC invite
+        route above.
+
+        :param request: The incoming request (carries the session cookie).
+        :returns: 200 with ``{"users": [...]}``, 401 if unauthenticated,
+            403 if not an admin, or 200 with an empty list if no
+            permission store is wired.
+        """
+        from fastapi.responses import JSONResponse
+
+        caller = auth_provider.get_user_id(request)
+        if caller is None:
+            return JSONResponse(status_code=401, content={"error": "not authenticated"})
+        is_admin = (
+            permission_store is not None and permission_store.is_admin(caller)
+        ) or admin_list.is_admin(caller)
+        if not is_admin:
+            return JSONResponse(status_code=403, content={"error": "admin only"})
+
+        users = permission_store.list_users(limit=limit) if permission_store is not None else []
+        return JSONResponse(
+            status_code=200,
+            content={
+                "users": [
+                    {
+                        "id": u.id,
+                        "is_admin": u.is_admin,
+                        "created_at": u.created_at,
+                        "last_login_at": u.last_login_at,
+                        "has_password": u.has_password,
+                    }
+                    for u in users
+                ]
+            },
+        )
+
     return router
 
 
@@ -584,7 +655,7 @@ def _sanitize_return_to(raw: str | None) -> str:
     the state cookie protects its *integrity* across the IdP round-trip
     but does nothing for its *safety* — the value still originates with
     the caller. This is the server-side mirror of ``sanitizeReturnTo``
-    in ``ap-web/src/pages/LoginPage.tsx``; the accounts flow navigates
+    in ``web/src/pages/LoginPage.tsx``; the accounts flow navigates
     client-side and is already guarded there, but the OIDC redirect
     happens in Python and bypasses that check.
 
@@ -629,12 +700,21 @@ async def _resolve_github_email(
     client: httpx.AsyncClient,
     access_token: str,
 ) -> str | None:
-    """Fetch the primary verified email from GitHub's user API.
+    """Fetch the primary *verified* email from GitHub's user API.
+
+    Only a ``primary`` and ``verified`` address from ``/user/emails`` is
+    returned. GitHub's ``/user.email`` (the public *profile* email) is not
+    guaranteed to be verified or owned by the caller, so it is never used
+    as the sign-in identity — trusting it would let a user log in as an
+    arbitrary address they merely typed into their profile, bypassing the
+    domain allowlist and (if that address is admin-listed) escalating to
+    admin. This mirrors the ``email_verified`` gate the OIDC ``id_token``
+    path already enforces.
 
     :param client: An active ``httpx.AsyncClient``.
     :param access_token: GitHub OAuth access token.
-    :returns: The user's primary verified email, or ``None`` if
-        unavailable.
+    :returns: The user's primary verified email, or ``None`` if none is
+        available (the caller rejects a ``None`` email with 400).
     """
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -648,19 +728,22 @@ async def _resolve_github_email(
         timeout=10.0,
     )
     if emails_resp.status_code == 200:
-        for entry in emails_resp.json():
+        payload = _response_json(emails_resp)
+        if not isinstance(payload, list):
+            return None
+        for raw_entry in payload:
+            entry = _json_object(raw_entry)
+            if entry is None:
+                continue
             if entry.get("primary") and entry.get("verified"):
-                return entry.get("email")
+                email = entry.get("email")
+                if isinstance(email, str) and email:
+                    return email
 
-    # Fallback: try the user profile endpoint.
-    user_resp = await client.get(
-        "https://api.github.com/user",
-        headers=headers,
-        timeout=10.0,
-    )
-    if user_resp.status_code == 200:
-        return user_resp.json().get("email")
-
+    # No primary, verified address. Deliberately do NOT fall back to the
+    # ``/user.email`` profile field: it is unverified and attacker-settable,
+    # so returning it would let a caller assume an identity they do not own.
+    # Fail closed — the caller turns a ``None`` email into a 400.
     return None
 
 
@@ -685,7 +768,7 @@ def _claim_is_verified_true(value: object) -> bool:
 
 
 def _resolve_oidc_email(
-    token_json: dict,
+    token_json: dict[str, object],
     config: OIDCConfig,
 ) -> str | None:
     """Extract the verified email from the OIDC ``id_token``.
@@ -701,17 +784,32 @@ def _resolve_oidc_email(
     allowed domain. This mirrors the GitHub path, which
     requires ``verified`` on the primary email.
 
+    ``config.skip_email_verification`` (from
+    ``OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION``) waives the gate for
+    IdPs that omit the claim for directory-managed users (e.g. Okta
+    without custom API Access Management).
+
+    ``config.email_claim`` (from ``OMNIGENT_OIDC_EMAIL_CLAIM``) names
+    the claim that carries the email identity, for IdPs that omit
+    ``email`` (Microsoft Entra ID commonly issues only
+    ``preferred_username``). ``email_verified`` refers to the ``email``
+    claim, so a custom claim always needs the verification opt-out too.
+
     :param token_json: The token endpoint response JSON containing
         ``id_token``.
     :param config: The OIDC configuration with JWKS URI and
         expected issuer/audience.
     :returns: The user's email from the ``id_token`` when present and
-        marked verified; ``None`` if the token is missing/invalid,
-        the email claim is absent, or ``email_verified`` is not
-        truthy.
+        marked verified; ``None`` if the token is missing/invalid, the
+        email claim is absent or not a non-empty string, or
+        ``email_verified`` is not truthy (and verification is not
+        skipped via config).
     """
     id_token = token_json.get("id_token")
-    if not id_token:
+    if not isinstance(id_token, str) or not id_token:
+        return None
+    if config.jwks_uri is None:
+        _logger.warning("Rejecting id_token: OIDC configuration has no JWKS URI")
         return None
 
     try:
@@ -720,7 +818,7 @@ def _resolve_oidc_email(
         claims = jwt.decode(
             id_token,
             signing_key.key,
-            algorithms=["RS256", "ES256"],
+            algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
             audience=config.client_id,
             issuer=config.issuer,
         )
@@ -728,14 +826,55 @@ def _resolve_oidc_email(
         _logger.warning("id_token validation failed: %s", exc)
         return None
 
-    email = claims.get("email")
-    if not email:
+    email = claims.get(config.email_claim)
+    if not isinstance(email, str) or not email.strip():
+        _logger.warning(
+            "Rejecting id_token: %r claim is missing or not a non-empty string "
+            "(claims present: %s). "
+            "IdPs that use a different claim for the email identity "
+            "can set OMNIGENT_OIDC_EMAIL_CLAIM.",
+            config.email_claim,
+            sorted(claims.keys()),
+        )
+        return None
+    email = email.strip()
+
+    # ``email_verified`` refers to the ``email`` claim (OIDC core), so
+    # it vouches nothing about a custom identity claim — a token can
+    # carry ``email_verified: true`` for a *different* address than the
+    # one being minted. A custom claim therefore always requires the
+    # explicit opt-out, regardless of ``email_verified``.
+    if config.email_claim != "email":
+        if config.skip_email_verification:
+            _logger.info(
+                "Accepting id_token %s %r; the claim has no verified "
+                "marker (OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is set)",
+                config.email_claim,
+                email,
+            )
+            return email
+        _logger.warning(
+            "Rejecting id_token: %s %r has no email_verified marker "
+            "(email_verified refers to the email claim); set "
+            "OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION to accept it",
+            config.email_claim,
+            email,
+        )
         return None
 
     # Reject unless the IdP affirmatively verified the email. A signed
     # token only proves IdP provenance, not mailbox ownership.
-    # Absent/false ``email_verified`` is a hard reject.
+    # Absent/false ``email_verified`` is a hard reject — unless the
+    # operator opted out (OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION) for
+    # IdPs like Okta that omit the claim for directory-managed users.
     if not _claim_is_verified_true(claims.get("email_verified")):
+        if config.skip_email_verification:
+            _logger.info(
+                "Accepting id_token email %r without email_verified "
+                "(OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is set)",
+                email,
+            )
+            return email
         _logger.warning(
             "Rejecting id_token: email %r present but email_verified is not true",
             email,
@@ -745,6 +884,17 @@ def _resolve_oidc_email(
     return email
 
 
-# Forward ref for type annotation.
-if False:  # TYPE_CHECKING
-    from omnigent.server.oidc import OIDCConfig
+def _json_object(value: object) -> dict[str, object] | None:
+    """Return a string-keyed JSON object, or ``None`` for other shapes."""
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        return None
+    return cast("dict[str, object]", value)
+
+
+def _response_json(response: httpx.Response) -> object | None:
+    """Decode a JSON response, returning ``None`` when decoding fails."""
+    try:
+        value: object = response.json()
+    except ValueError:
+        return None
+    return value

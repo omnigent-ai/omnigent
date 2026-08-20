@@ -91,6 +91,267 @@ _EXTRA_MIME_TYPES: dict[str, str] = {
 }
 
 
+# ── Attachment upload limits ──────────────────────────────────────────
+# Uploaded attachments are inlined into the model context as base64 (see
+# :func:`resolve_content_references`) and re-sent every turn, so sizes are
+# bounded well under the model's context budget and the provider's API
+# limits — Anthropic accepts images up to ~5 MB, PDFs up to ~32 MB / 100
+# pages, and ~32 MB per request total. The per-type caps below keep a
+# single attachment usable across a multi-turn conversation; the global
+# ceiling backstops the total request size after base64 inflation (~1.33x).
+# Mirrored client-side in web/src/lib/attachments.ts — keep in sync.
+MAX_IMAGE_UPLOAD_BYTES: int = 5 * 1024 * 1024
+MAX_PDF_UPLOAD_BYTES: int = 20 * 1024 * 1024
+MAX_TEXT_UPLOAD_BYTES: int = 10 * 1024 * 1024
+MAX_ATTACHMENT_UPLOAD_BYTES: int = 25 * 1024 * 1024
+
+# Copy-at-spawn limits (see the ``files:copy`` endpoint). A parent forwarding
+# files to a subagent copies them through the server, which reads each source
+# blob to re-store it under the child. Bounding the count and the summed
+# ``StoredFile.bytes`` — checked against metadata BEFORE any blob is read —
+# stops a single send from spiking shared-server memory. Defaults are the
+# floor; a deployment can raise or lower them via ``server_config`` (see
+# :func:`omnigent.server.server_config.copy_file_count_limit` and
+# :func:`~omnigent.server.server_config.copy_total_bytes_limit`). For
+# reference, OpenAI caps code-interpreter at 20 files, Anthropic Files at
+# 500 MB/file.
+MAX_COPY_FILES: int = 20
+MAX_COPY_TOTAL_BYTES: int = 256 * 1024 * 1024
+
+# ``application/*`` MIME types we treat as text-like. The rest of the
+# text-like surface is ``text/*`` (covered by the prefix check) — these
+# are the text-bearing ``application/*`` types code/data files resolve to.
+_TEXT_LIKE_APPLICATION_MIMES: frozenset[str] = frozenset(
+    {
+        "application/json",
+        "application/javascript",
+        "application/jsonl",
+        "application/x-ndjson",
+        "application/x-ipynb+json",
+    }
+)
+
+
+def attachment_upload_limit(content_type: str) -> int | None:
+    """
+    Max upload size (bytes) for *content_type*, or ``None`` if the type is
+    not an allowed attachment.
+
+    Allowed: images, PDF, and text-like files (``text/*`` plus a few
+    text-bearing ``application/*`` types — JSON, JS, JSONL, notebooks).
+    Office / binary formats (pptx, docx, xlsx, zip, …) return ``None`` and
+    are rejected at upload: the model can't read their raw bytes
+    (Anthropic's base64 ``document`` source accepts only PDF), so inlining
+    them only produces garbled UTF-8 or — for large files — an oversized,
+    context-blowing request. Callers reject ``None`` with HTTP 415.
+
+    :param content_type: The resolved MIME type, e.g. ``"image/png"``.
+        Use :func:`_resolve_content_type` to derive it from the upload's
+        declared type + filename first.
+    :returns: The per-type byte limit (still subject to
+        :data:`MAX_ATTACHMENT_UPLOAD_BYTES`), or ``None`` when the type is
+        not an allowed attachment.
+    """
+    if content_type.startswith("image/"):
+        return MAX_IMAGE_UPLOAD_BYTES
+    if content_type == "application/pdf":
+        return MAX_PDF_UPLOAD_BYTES
+    if content_type.startswith("text/") or content_type in _TEXT_LIKE_APPLICATION_MIMES:
+        return MAX_TEXT_UPLOAD_BYTES
+    return None
+
+
+# Extensions accepted as text/code attachments even when the upload's
+# declared MIME mislabels them as binary — e.g. a ``.csv`` tagged
+# ``application/vnd.ms-excel`` on Windows, or a ``.ts`` tagged
+# ``video/mp2t``. Mirrors TEXT_CODE_EXTENSIONS in
+# web/src/lib/attachments.ts — keep in sync.
+_TEXT_CODE_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".txt",
+        ".log",
+        ".md",
+        ".markdown",
+        ".csv",
+        ".tsv",
+        ".json",
+        ".jsonl",
+        ".ndjson",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".env",
+        ".lock",
+        ".proto",
+        ".graphql",
+        ".gql",
+        ".html",
+        ".htm",
+        ".xml",
+        ".css",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".ts",
+        ".tsx",
+        ".py",
+        ".rb",
+        ".go",
+        ".rs",
+        ".java",
+        ".kt",
+        ".scala",
+        ".swift",
+        ".c",
+        ".h",
+        ".cc",
+        ".cpp",
+        ".hpp",
+        ".cs",
+        ".php",
+        ".pl",
+        ".r",
+        ".jl",
+        ".lua",
+        ".ex",
+        ".exs",
+        ".erl",
+        ".hs",
+        ".clj",
+        ".dart",
+        ".vue",
+        ".svelte",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".fish",
+        ".sql",
+        ".tf",
+        ".hcl",
+        ".gradle",
+        ".dockerfile",
+        ".ipynb",
+    }
+)
+
+
+def attachment_text_type_for_extension(filename: str | None) -> str | None:
+    """
+    Resolve a text-like MIME for *filename* by extension, or ``None``.
+
+    Used as a fallback when the upload's declared MIME mislabels a text/code
+    file as binary (e.g. a ``.csv`` reported as ``application/vnd.ms-excel``):
+    only extensions in :data:`_TEXT_CODE_EXTENSIONS` are honored, so a real
+    binary (``.xls``, ``.pptx``) is never re-admitted. Mirrors the web
+    client's extension allowlist so the two agree on what's attachable.
+
+    :param filename: The original filename, e.g. ``"data.csv"``.
+    :returns: A concrete text-like MIME (e.g. ``"text/csv"``), or ``None``
+        when the extension is not a recognised text/code type.
+    """
+    import mimetypes as _mt
+    from pathlib import PurePath
+
+    if not filename:
+        return None
+    suffix = PurePath(filename).suffix.lower()
+    if suffix not in _TEXT_CODE_EXTENSIONS:
+        return None
+    mapped = _EXTRA_MIME_TYPES.get(suffix)
+    if mapped:
+        return mapped
+    guessed = _mt.guess_type(filename)[0]
+    if guessed and (guessed.startswith("text/") or guessed in _TEXT_LIKE_APPLICATION_MIMES):
+        return guessed
+    return "text/plain"
+
+
+# ── Text-attachment extraction for input-phase policy scanning ─────────
+
+
+def _is_text_like_attachment(content_type: str, filename: str | None) -> bool:
+    """Whether an attachment's content is text the policy layer can scan.
+
+    :param content_type: Resolved MIME, e.g. ``"text/csv"``.
+    :param filename: Original filename, used as an extension fallback.
+    :returns: ``True`` for ``text/*`` and known text-bearing
+        ``application/*`` types (or a text-like extension).
+    """
+    if content_type.startswith("text/"):
+        return True
+    if content_type in _TEXT_LIKE_APPLICATION_MIMES:
+        return True
+    return attachment_text_type_for_extension(filename) is not None
+
+
+def extract_text_attachments(
+    content: list[dict[str, Any]],
+    file_store: FileStore,
+    artifact_store: ArtifactStore,
+    *,
+    session_id: str | None = None,
+) -> list[dict[str, str]]:
+    """Decode text-like ``input_file`` attachments into structured entries.
+
+    Used by the request-phase policy gate so that PII (and other) policies
+    scan the *content* of an attached text file — not just the typed
+    message. Attachments arrive as ``input_file`` blocks that are base64-
+    inlined straight to the model (see :func:`resolve_content_references`),
+    so without this an attached CSV of card numbers reaches the LLM
+    unscanned. Non-text attachments (images, PDFs, binaries) are skipped;
+    text files are decoded in full (uploads are already bounded — text ≤
+    :data:`MAX_TEXT_UPLOAD_BYTES`, 10 MB). Best-effort: a missing/foreign file
+    or a fetch error is skipped, never raised, so a scan failure can't break
+    message delivery.
+
+    :param content: The message's content blocks (``body.data["content"]``).
+    :param file_store: Store for file metadata (``content_type`` / ``filename``).
+    :param artifact_store: Store for the file's binary content.
+    :param session_id: Owning session id, to enforce file ownership.
+    :returns: A list of ``{"filename", "content_type", "text"}`` entries — one
+        per scannable text attachment, in order — or ``[]`` when there are none.
+    """
+    attachments: list[dict[str, str]] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "input_file":
+            continue
+        file_id = block.get("file_id")
+        if not isinstance(file_id, str):
+            continue
+        try:
+            file_meta = file_store.get(file_id)
+        except Exception:  # best-effort scan; never break message delivery
+            continue
+        if file_meta is None:
+            continue
+        if (
+            file_meta.session_id is not None
+            and session_id is not None
+            and file_meta.session_id != session_id
+        ):
+            continue
+        content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
+        if not _is_text_like_attachment(content_type, file_meta.filename):
+            continue
+        try:
+            raw = artifact_store.get(file_id)
+        except Exception:  # best-effort scan; never break message delivery
+            continue
+        if not raw:
+            continue
+        attachments.append(
+            {
+                "filename": file_meta.filename or "",
+                "content_type": content_type,
+                "text": raw.decode("utf-8", errors="replace"),
+            }
+        )
+    return attachments
+
+
 def resolve_content_references(
     items: list[ConversationItem],
     file_store: FileStore,
@@ -343,14 +604,21 @@ def _resolve_content_type(
     :param stored_type: The content_type from file metadata, or
         ``None``.
     :param filename: The original filename, e.g. ``"report.md"``.
+    MIME parameters are stripped and the stored type is lowercased so inline
+    data URIs and upload validation use a canonical bare media type.
+
     :returns: A MIME type string.
     """
     import mimetypes as _mt
     from pathlib import PurePath
 
+    normalized_stored_type = None
+    if stored_type:
+        normalized_stored_type = stored_type.split(";", 1)[0].strip().lower() or None
+
     # Use stored type if it's specific (not the generic fallback).
-    if stored_type and stored_type != "application/octet-stream":
-        return stored_type
+    if normalized_stored_type and normalized_stored_type != "application/octet-stream":
+        return normalized_stored_type
 
     if filename:
         suffix = PurePath(filename).suffix.lower()
@@ -367,4 +635,4 @@ def _resolve_content_type(
         if suffix in {".txt", ".log", ".cfg", ".ini", ".env"}:
             return "text/plain"
 
-    return stored_type or "application/octet-stream"
+    return normalized_stored_type or "application/octet-stream"

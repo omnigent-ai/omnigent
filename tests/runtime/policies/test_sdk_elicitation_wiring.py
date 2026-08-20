@@ -169,6 +169,7 @@ def test_sse_parses_elicitation_request_event() -> None:
     assert event.phase == "tool_call"
     assert event.policy_name == "ask_search"
     assert event.content_preview == "q=classified"
+    assert event.target_session_id is None
 
 
 def test_sse_elicitation_request_tolerates_missing_extras() -> None:
@@ -259,6 +260,56 @@ def test_sse_parses_regular_function_call_as_toolcall() -> None:
 
 
 # ── _handle_elicitation_request: hook + POST wiring ────────
+
+
+@pytest.mark.asyncio
+async def test_target_session_id_routes_elicitation_verdict_to_child_session() -> None:
+    """
+    Mirrored child prompts carry ``params.target_session_id``. The
+    legacy responses stream must preserve that field into the hook
+    context and POST the verdict to the child session's resolve URL,
+    not the ancestor stream's own session id.
+    """
+    http = _FakeHttpClient()
+    seen: list[ElicitationRequestCtx] = []
+
+    async def _hook(ctx: ElicitationRequestCtx) -> bool:
+        seen.append(ctx)
+        return True
+
+    raw = {
+        "type": "response.elicitation_request",
+        "elicitation_id": "elicit_child",
+        "method": "elicitation/create",
+        "params": {
+            "mode": "form",
+            "message": "approve child tool?",
+            "requestedSchema": {},
+            "phase": "tool_call",
+            "policy_name": "child_gate",
+            "content_preview": "child work",
+            "target_session_id": "conv_child",
+        },
+    }
+    event = _sse._parse_event("response.elicitation_request", raw)
+    assert isinstance(event, ElicitationRequest)
+    assert event.target_session_id == "conv_child"
+
+    await _responses._handle_elicitation_request(
+        http,  # type: ignore[arg-type]
+        "http://localhost:8000",
+        StreamHooks(on_elicitation_request=_hook),
+        event,
+        response_id="resp_parent",
+        session_id="conv_parent",
+    )
+
+    assert len(seen) == 1
+    assert seen[0].target_session_id == "conv_child"
+    assert http.post_calls[0]["url"] == (
+        "http://localhost:8000/v1/sessions/conv_child/elicitations/elicit_child/resolve"
+    )
+    assert http.post_calls[0]["json"] == {"action": "accept"}
 
 
 @pytest.mark.asyncio

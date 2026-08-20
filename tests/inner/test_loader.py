@@ -69,6 +69,43 @@ class TestLoadFromDict(unittest.TestCase):
         a = load_agent_def({"name": "t", "executor": {"model": "claude-sonnet-4"}})
         self.assertEqual(a.executor.model, "claude-sonnet-4")
 
+    def test_executor_bundle_nesting_rejected(self):
+        # The bundle config.yaml shape inside a single-file agent used to be
+        # silently dropped, replacing the declared harness with one inferred
+        # from the model prefix.
+        with self.assertRaisesRegex(ValueError, r"config, type.*spells the executor flat"):
+            load_agent_def(
+                {
+                    "name": "t",
+                    "executor": {
+                        "type": "omnigent",
+                        "config": {"harness": "codex-native"},
+                        "model": "databricks-gpt-5-4-mini",
+                    },
+                }
+            )
+
+    def test_executor_extra_keys_tolerated(self):
+        # The compat loader reads raw executor keys this parser doesn't
+        # model (use_responses, extra, …); they must not fail the load.
+        a = load_agent_def({"name": "t", "executor": {"model": "gpt-5", "use_responses": False}})
+        self.assertEqual(a.executor.model, "gpt-5")
+
+    def test_tools_agent_executor_bundle_nesting_rejected(self):
+        with self.assertRaisesRegex(ValueError, r"key\(s\) config belong to the bundle"):
+            load_agent_def(
+                {
+                    "name": "t",
+                    "tools": {
+                        "h": {
+                            "type": "agent",
+                            "prompt": "Help.",
+                            "executor": {"config": {"harness": "codex-native"}},
+                        }
+                    },
+                }
+            )
+
     def test_tools_function(self):
         a = load_agent_def(
             {"name": "t", "tools": {"f": {"type": "function", "catalog_path": "a.b.c"}}}
@@ -406,6 +443,57 @@ class TestLoadFromDict(unittest.TestCase):
                 sandbox=OSEnvSandboxSpec(type="none"),
             ),
         )
+
+    def test_os_env_auto_sandbox_uses_platform_default(self):
+        from omnigent.inner.sandbox import _default_sandbox_for_platform
+
+        agent = load_agent_def(
+            {
+                "name": "t",
+                "os_env": {
+                    "type": "caller_process",
+                    "sandbox": {"type": "auto", "write_paths": ["."]},
+                },
+            }
+        )
+
+        self.assertIsNotNone(agent.os_env)
+        self.assertIsNotNone(agent.os_env.sandbox)
+        self.assertEqual(agent.os_env.sandbox.type, _default_sandbox_for_platform().type)
+        self.assertEqual(agent.os_env.sandbox.write_paths, ["."])
+
+    def test_os_env_omitted_sandbox_type_uses_platform_default(self):
+        from omnigent.inner.sandbox import _default_sandbox_for_platform
+
+        agent = load_agent_def(
+            {
+                "name": "t",
+                "os_env": {
+                    "type": "caller_process",
+                    "sandbox": {"write_paths": ["."]},
+                },
+            }
+        )
+
+        self.assertIsNotNone(agent.os_env)
+        self.assertIsNotNone(agent.os_env.sandbox)
+        self.assertEqual(agent.os_env.sandbox.type, _default_sandbox_for_platform().type)
+        self.assertEqual(agent.os_env.sandbox.write_paths, ["."])
+
+    def test_os_env_null_sandbox_type_disables_sandbox(self):
+        agent = load_agent_def(
+            {
+                "name": "t",
+                "os_env": {
+                    "type": "caller_process",
+                    "sandbox": {"type": None},
+                },
+            }
+        )
+
+        self.assertIsNotNone(agent.os_env)
+        self.assertIsNotNone(agent.os_env.sandbox)
+        self.assertEqual(agent.os_env.sandbox.type, "none")
 
     def test_params(self):
         a = load_agent_def(
@@ -819,6 +907,149 @@ os_env:
             f.flush()
             try:
                 with self.assertRaisesRegex(TypeError, "must be a boolean"):
+                    load_agent_def(f.name)
+            finally:
+                os.unlink(f.name)
+
+    def test_load_agent_def_parses_credential_proxy(self):
+        """Single-file omnigent YAML must parse ``credential_proxy``.
+
+        Regression: this loader (the path ``omnigent run agent.yaml``
+        takes, distinct from the bundle ``parse(config.yaml)`` path)
+        had no ``credential_proxy`` parsing, so the field was silently
+        dropped and the secretless proxy never armed even though the
+        YAML declared it. We assert the entry actually reaches the spec
+        with the right host/scheme/injection — not merely that the
+        sandbox is non-None — because a dropped field would leave
+        ``credential_proxy`` as ``None`` while everything else parsed.
+        """
+        yaml_content = """
+name: t
+prompt: hi
+os_env:
+  type: caller_process
+  sandbox:
+    type: darwin_seatbelt
+    egress_rules:
+      - "* corp.example.com/**"
+    credential_proxy:
+      - type: https_bearer
+        target: corp.example.com/rest
+        source: {env: CORP}
+        env: CORP_TOKEN
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+            try:
+                agent = load_agent_def(f.name)
+            finally:
+                os.unlink(f.name)
+        proxy = agent.os_env.sandbox.credential_proxy
+        self.assertIsNotNone(proxy)
+        # The YAML declares exactly one credential_proxy binding; a
+        # different count would mean the loader dropped it (the original
+        # bug) or duplicated it.
+        self.assertEqual(len(proxy.entries), 1)
+        entry = proxy.entries[0]
+        self.assertEqual(entry.host, "corp.example.com")
+        self.assertEqual(entry.scheme, "bearer")
+        self.assertEqual(entry.inject_env, ["CORP_TOKEN"])
+        self.assertEqual(entry.source.kind, "env")
+        self.assertEqual(entry.source.env, "CORP")
+
+    def test_load_agent_def_rejects_credential_proxy_without_egress_rules(self):
+        """``credential_proxy`` without ``egress_rules`` is rejected here too.
+
+        The MITM egress proxy (driven by egress_rules) is what performs
+        the synthetic->real swap and blocks placeholder leaks; without it
+        the proxy injects a placeholder the agent can't use. The loader
+        must fail loud rather than hand back an inert, half-wired policy
+        — mirroring the bundle parser guard so the two paths can't drift.
+        """
+        yaml_content = """
+name: t
+prompt: hi
+os_env:
+  type: caller_process
+  sandbox:
+    type: darwin_seatbelt
+    credential_proxy:
+      - type: git_https
+        target: github.com
+        source: {env: GH_PAT}
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+            try:
+                with self.assertRaisesRegex(ValueError, r"requires os_env\.sandbox\.egress_rules"):
+                    load_agent_def(f.name)
+            finally:
+                os.unlink(f.name)
+
+    def test_load_agent_def_rejects_credential_proxy_on_soft_backend(self):
+        """``credential_proxy`` requires a network-isolating backend.
+
+        On a soft backend (here ``none``) the egress proxy is not the
+        only way out, so binding credentials to it is unsafe. We omit
+        ``egress_rules`` so the backend guard (checked first) is the one
+        that fires, isolating the credential_proxy-specific backend
+        requirement rather than the generic egress-rules backend guard.
+        """
+        yaml_content = """
+name: t
+prompt: hi
+os_env:
+  type: caller_process
+  sandbox:
+    type: none
+    credential_proxy:
+      - type: git_https
+        target: github.com
+        source: {env: GH_PAT}
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+            try:
+                with self.assertRaisesRegex(
+                    ValueError, r"credential_proxy requires sandbox\.type"
+                ):
+                    load_agent_def(f.name)
+            finally:
+                os.unlink(f.name)
+
+    def test_load_agent_def_rejects_gh_basic_on_macos(self):
+        """Single-file YAML rejects ``gh_basic`` on macOS too.
+
+        ``gh_basic`` wires the GitHub CLI (a Go binary); Go on macOS ignores
+        SSL_CERT_FILE and verifies TLS via the keychain, so it rejects the
+        egress MITM CA and every ``gh`` call fails at runtime with
+        ``certificate is not trusted``. The single-file loader (the
+        ``omnigent run agent.yaml`` path) must fail loud at load time with the
+        same explanation as the bundle parser — sharing one detection helper so
+        the two paths can't drift.
+        """
+        yaml_content = """
+name: t
+prompt: hi
+os_env:
+  type: caller_process
+  sandbox:
+    type: darwin_seatbelt
+    egress_rules:
+      - "* github.com/**"
+      - "* api.github.com/**"
+    credential_proxy:
+      - type: gh_basic
+        source: {env: GH_PAT}
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_content)
+            f.flush()
+            try:
+                with self.assertRaisesRegex(ValueError, r"gh_basic' does not work on macOS"):
                     load_agent_def(f.name)
             finally:
                 os.unlink(f.name)

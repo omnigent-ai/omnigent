@@ -177,6 +177,35 @@ def test_resolve_oldest_returns_content_with_file_blocks() -> None:
     assert drained.content == content
 
 
+def test_resolve_matching_text_skips_older_unmatched_entries() -> None:
+    """Kiro can match the accepted prompt and identify older failed inputs."""
+    first = pending_inputs.record(
+        "conv_a", [_text_block("!!!! XOXOX !!!!")], created_by="alice@example.com"
+    )
+    second = pending_inputs.record("conv_a", [_text_block("tell me a joke")])
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "tell me a joke")
+
+    assert drained.matched is not None
+    assert drained.matched.pending_id == second
+    assert drained.matched.content == [_text_block("tell me a joke")]
+    assert [entry.pending_id for entry in drained.skipped] == [first]
+    assert drained.skipped[0].content == [_text_block("!!!! XOXOX !!!!")]
+    assert drained.skipped[0].created_by == "alice@example.com"
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+
+def test_resolve_matching_text_leaves_entries_when_no_text_matches() -> None:
+    """A direct Kiro TUI prompt must not consume unrelated web pending entries."""
+    first = pending_inputs.record("conv_a", [_text_block("web input")])
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "typed in terminal")
+
+    assert drained.matched is None
+    assert drained.skipped == []
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [first]
+
+
 def test_resolve_removes_entry_idempotently() -> None:
     """
     :func:`resolve` drops an entry by id (forward-failed rollback).

@@ -9,10 +9,11 @@ from pathlib import Path
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
@@ -31,7 +32,7 @@ from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissi
 
 pytestmark = pytest.mark.asyncio
 
-_HOST_ID = "host_api_test"
+_HOST_ID = "33296f9b15e02671c34e013dd711407e"
 
 
 def _websocket_scope(path: str) -> dict[str, object]:
@@ -56,7 +57,8 @@ def _websocket_scope(path: str) -> dict[str, object]:
 
 def _make_hello(
     name: str = "test-laptop",
-    configured_harnesses: dict[str, bool] | None = None,
+    configured_harnesses: dict[str, bool | str] | None = None,
+    gateway_inference: dict[str, bool] | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -64,6 +66,9 @@ def _make_hello(
     :param configured_harnesses: Per-harness readiness map to report,
         e.g. ``{"claude-sdk": True}``; ``None`` mimics an older host
         that doesn't report it.
+    :param gateway_inference: Per-harness AI-Gateway-backed inference map to
+        report, e.g. ``{"claude-native": True}``; ``None`` mimics a host that
+        doesn't report it.
     :returns: JSON-encoded hello frame.
     """
     return encode_host_frame(
@@ -72,6 +77,7 @@ def _make_hello(
             frame_protocol_version=1,
             name=name,
             configured_harnesses=configured_harnesses,
+            gateway_inference=gateway_inference,
         )
     )
 
@@ -81,6 +87,21 @@ def host_api_app(
     db_uri: str,
 ) -> tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore]:
     """FastAPI app with host tunnel + REST routes and stores.
+
+    :param db_uri: SQLite URI from the shared fixture.
+    :returns: Tuple of (app, registry, host_store, conv_store).
+    """
+    return _build_host_api_app(db_uri)
+
+
+def _build_host_api_app(
+    db_uri: str,
+) -> tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore]:
+    """Build one replica's app over *db_uri*.
+
+    Separate from the fixture so a test can stand up a SECOND replica on the
+    same database — a server restart, which keeps every host row but starts with
+    an empty registry.
 
     :param db_uri: SQLite URI from the shared fixture.
     :returns: Tuple of (app, registry, host_store, conv_store).
@@ -97,6 +118,18 @@ def host_api_app(
         create_hosts_router(registry, host_store, conv_store),
         prefix="/v1",
     )
+
+    @app.exception_handler(OmnigentError)
+    async def _handle_omnigent_error(
+        request: Request,
+        exc: OmnigentError,
+    ) -> JSONResponse:
+        """Convert application errors to structured JSON responses."""
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
     return app, registry, host_store, conv_store
 
 
@@ -105,7 +138,8 @@ async def _connect_host(
     registry: HostRegistry,
     host_id: str = _HOST_ID,
     name: str = "test-laptop",
-    configured_harnesses: dict[str, bool] | None = None,
+    configured_harnesses: dict[str, bool | str] | None = None,
+    gateway_inference: dict[str, bool] | None = None,
 ) -> ApplicationCommunicator:
     """Connect a mock host via WebSocket tunnel.
 
@@ -115,6 +149,8 @@ async def _connect_host(
     :param name: Host name for the hello frame.
     :param configured_harnesses: Readiness map for the hello frame,
         e.g. ``{"codex": False}``; ``None`` mimics an older host.
+    :param gateway_inference: Gateway-inference map for the hello frame,
+        e.g. ``{"codex": True}``; ``None`` mimics a host that doesn't report it.
     :returns: Connected ASGI communicator.
     """
     path = f"/v1/hosts/{host_id}/tunnel"
@@ -124,7 +160,10 @@ async def _connect_host(
     assert accepted["type"] == "websocket.accept"
 
     await comm.send_input(
-        {"type": "websocket.receive", "text": _make_hello(name, configured_harnesses)},
+        {
+            "type": "websocket.receive",
+            "text": _make_hello(name, configured_harnesses, gateway_inference),
+        },
     )
     while registry.get(host_id) is None:
         await asyncio.sleep(0.01)
@@ -192,12 +231,12 @@ async def test_list_hosts_reports_sandbox_provider_for_managed_host(
     """
     app, _reg, host_store, _cs = host_api_app
     host_store.register_managed_host(
-        host_id="host_managed_sb",
+        host_id="b8a8862c405a01143b4373e2b155b02a",
         name="sandbox-host",
         # Auth is disabled in this fixture, so list_hosts resolves the
         # caller to the reserved "local" owner — the managed host must
         # belong to it to be visible.
-        owner="local",
+        user_id="local",
         token="launch-token-secret",
         provider="modal",
         sandbox_id="sb-12345",
@@ -214,7 +253,7 @@ async def test_list_hosts_reports_sandbox_provider_for_managed_host(
         "Either register_managed_host didn't persist or the owner "
         "filter excluded it."
     )
-    assert hosts[0]["host_id"] == "host_managed_sb"
+    assert hosts[0]["host_id"] == "b8a8862c405a01143b4373e2b155b02a"
     # Pre-registered managed hosts start offline until the in-sandbox
     # host process dials the tunnel.
     assert hosts[0]["status"] == "offline"
@@ -259,7 +298,7 @@ async def test_hosts_api_surfaces_configured_harnesses(
     _comm = await _connect_host(
         app,
         registry,
-        configured_harnesses={"claude-sdk": True, "codex": False},
+        configured_harnesses={"claude-sdk": True, "codex": "needs-auth"},
     )
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -271,10 +310,10 @@ async def test_hosts_api_surfaces_configured_harnesses(
     # picker warning; a lossy encode/persist would drop it.
     assert listing.json()["hosts"][0]["configured_harnesses"] == {
         "claude-sdk": True,
-        "codex": False,
+        "codex": "needs-auth",
     }
     assert single.status_code == 200
-    assert single.json()["configured_harnesses"] == {"claude-sdk": True, "codex": False}
+    assert single.json()["configured_harnesses"] == {"claude-sdk": True, "codex": "needs-auth"}
 
 
 async def test_hosts_api_configured_harnesses_null_for_older_host(
@@ -298,6 +337,123 @@ async def test_hosts_api_configured_harnesses_null_for_older_host(
     assert resp.json()["hosts"][0]["configured_harnesses"] is None
 
 
+async def test_hosts_api_surfaces_gateway_inference(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify the gateway-inference map a host reports in its hello is held in
+    memory and surfaced by both GET /v1/hosts and GET /v1/hosts/{id}.
+
+    This is the signal the web UI gates Smart Routing on. If it is dropped
+    anywhere along hello → host registry → hosts route, the UI would offer
+    Smart Routing on a host whose apply layer cannot work.
+    """
+    app, registry, _hs, _cs = host_api_app
+    _comm = await _connect_host(
+        app,
+        registry,
+        configured_harnesses={"claude-native": True, "codex": True},
+        gateway_inference={"claude-native": True, "codex": False},
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert listing.status_code == 200
+    assert listing.json()["hosts"][0]["gateway_inference"] == {
+        "claude-native": True,
+        "codex": False,
+    }
+    assert single.status_code == 200
+    assert single.json()["gateway_inference"] == {"claude-native": True, "codex": False}
+
+
+async def test_hosts_api_gateway_inference_null_for_older_host(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify a host that never reported gateway inference lists with
+    ``gateway_inference`` null — unknown, never ``{}``.
+
+    ``{}`` would gate Smart Routing away from every old host; ``null`` is the
+    contract the web helper keys on to leave it enabled.
+    """
+    app, registry, _hs, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert listing.status_code == 200
+    assert listing.json()["hosts"][0]["gateway_inference"] is None
+    assert single.status_code == 200
+    assert single.json()["gateway_inference"] is None
+
+
+async def test_gateway_inference_reconverges_after_a_server_restart(
+    db_uri: str,
+) -> None:
+    """
+    Verify a restarted server re-learns gateway backing from the reconnect, with
+    no database state behind it, and that router selection follows.
+
+    The restart→unknown window is the cost of holding the map in memory, so it
+    has to be bounded by the handshake: while the fresh replica has no report,
+    the unknown-is-backed rule keeps the external router in play; the moment the
+    host reconnects and re-reports "claude is off-gateway", selection drops back
+    to the built-in judge — permanently, with nothing to migrate or backfill.
+    """
+    from omnigent.server.routes._sessions.common import set_server_host_registry
+    from omnigent.server.routing_backend import RoutingBackends, gateway_backs_all, select_router
+
+    external = object()
+    local = object()
+    backends = RoutingBackends(external=external, local=local)  # type: ignore[arg-type]
+
+    def _source(host: object) -> str | None:
+        choice = select_router(
+            backends, gateway_backed=gateway_backs_all(host, ("claude-native",))
+        )
+        return choice.source if choice is not None else None
+
+    app, registry, host_store, _cs = _build_host_api_app(db_uri)
+    set_server_host_registry(registry)
+    try:
+        comm = await _connect_host(app, registry, gateway_inference={"claude-native": False})
+        host = host_store.get_host(_HOST_ID)
+        assert host is not None
+        assert _source(host) == "oss-llm"
+
+        # Restart: the hosts row survives, every in-memory report is gone.
+        with contextlib.suppress(Exception):
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        restarted_app, restarted_registry, restarted_store, _cs2 = _build_host_api_app(db_uri)
+        set_server_host_registry(restarted_registry)
+        restarted_host = restarted_store.get_host(_HOST_ID)
+        assert restarted_host is not None
+        assert restarted_registry.gateway_inference(_HOST_ID) is None
+        assert _source(restarted_host) == "databricks-aigw"
+
+        # The host reconnects and re-reports; the replica converges.
+        _recomm = await _connect_host(
+            restarted_app,
+            restarted_registry,
+            gateway_inference={"claude-native": False},
+        )
+        assert restarted_registry.gateway_inference(_HOST_ID) == {"claude-native": False}
+        assert _source(restarted_host) == "oss-llm"
+
+        async with AsyncClient(
+            transport=ASGITransport(app=restarted_app), base_url="http://test"
+        ) as client:
+            single = await client.get(f"/v1/hosts/{_HOST_ID}")
+        assert single.json()["gateway_inference"] == {"claude-native": False}
+    finally:
+        set_server_host_registry(None)
+
+
 async def test_get_host_404(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
@@ -306,7 +462,7 @@ async def test_get_host_404(
     """
     app, _reg, _hs, _cs = host_api_app
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.get("/v1/hosts/host_nonexistent")
+        resp = await client.get("/v1/hosts/aababcc3941edb738172734a9ab7bb8c")
     assert resp.status_code == 404
 
 
@@ -614,7 +770,7 @@ async def test_launch_runner_404_unknown_host(
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
-            "/v1/hosts/host_nonexistent/runners",
+            "/v1/hosts/aababcc3941edb738172734a9ab7bb8c/runners",
             json={"session_id": conv.id, "workspace": "/tmp"},
         )
     assert resp.status_code == 404
@@ -700,8 +856,10 @@ async def test_list_hosts_filters_by_owner(
     host enumeration is possible across users.
     """
     _app, _reg, host_store, _cs = multi_user_app
-    host_store.upsert_on_connect("host_alice", "alice-laptop", "alice@test.com")
-    host_store.upsert_on_connect("host_bob", "bob-laptop", "bob@test.com")
+    host_store.upsert_on_connect(
+        "f54bb9272002938a3a934bfcb6bb228a", "alice-laptop", "alice@test.com"
+    )
+    host_store.upsert_on_connect("774d8c150c0060ddb61a91b23b64a0d0", "bob-laptop", "bob@test.com")
 
     async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
         # Alice sees only her host.
@@ -711,8 +869,8 @@ async def test_list_hosts_filters_by_owner(
         )
         assert resp.status_code == 200
         host_ids = {h["host_id"] for h in resp.json()["hosts"]}
-        assert host_ids == {"host_alice"}, (
-            f"Alice should only see host_alice, got {host_ids}. "
+        assert host_ids == {"f54bb9272002938a3a934bfcb6bb228a"}, (
+            f"Alice should only see f54bb9272002938a3a934bfcb6bb228a, got {host_ids}. "
             "Owner filtering on GET /v1/hosts is broken."
         )
 
@@ -722,7 +880,9 @@ async def test_list_hosts_filters_by_owner(
             headers={"x-test-user": "bob@test.com"},
         )
         host_ids = {h["host_id"] for h in resp.json()["hosts"]}
-        assert host_ids == {"host_bob"}, f"Bob should only see host_bob, got {host_ids}."
+        assert host_ids == {"774d8c150c0060ddb61a91b23b64a0d0"}, (
+            f"Bob should only see 774d8c150c0060ddb61a91b23b64a0d0, got {host_ids}."
+        )
 
 
 async def test_get_host_403_wrong_owner(
@@ -736,11 +896,13 @@ async def test_get_host_403_wrong_owner(
     which is an information leak.
     """
     _app, _reg, host_store, _cs = multi_user_app
-    host_store.upsert_on_connect("host_alice2", "alice-laptop", "alice@test.com")
+    host_store.upsert_on_connect(
+        "294391bc835cde1130ef2a02dcd2b7b3", "alice-laptop", "alice@test.com"
+    )
 
     async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
         resp = await client.get(
-            "/v1/hosts/host_alice2",
+            "/v1/hosts/294391bc835cde1130ef2a02dcd2b7b3",
             headers={"x-test-user": "bob@test.com"},
         )
     assert resp.status_code == 403, (
@@ -760,11 +922,13 @@ async def test_launch_runner_403_wrong_owner(
     machine — a critical security violation.
     """
     _app, registry, host_store, conv_store = multi_user_app
-    host_store.upsert_on_connect("host_alice3", "alice-laptop", "alice@test.com")
+    host_store.upsert_on_connect(
+        "a20f57f124c33161e2e17a8998af5b1f", "alice-laptop", "alice@test.com"
+    )
     from omnigent.host.frames import HostHelloFrame
 
     registry.register(
-        "host_alice3",
+        "a20f57f124c33161e2e17a8998af5b1f",
         type(
             "FakeWS",
             (),
@@ -780,7 +944,7 @@ async def test_launch_runner_403_wrong_owner(
 
     async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
         resp = await client.post(
-            "/v1/hosts/host_alice3/runners",
+            "/v1/hosts/a20f57f124c33161e2e17a8998af5b1f/runners",
             json={"session_id": conv.id, "workspace": "/tmp"},
             headers={"x-test-user": "bob@test.com"},
         )
@@ -895,7 +1059,7 @@ async def test_tunnel_rejects_unauthenticated_when_auth_enabled(
     hijack or enumerate other users' hosts.
     """
     app, registry, host_store, _cs = multi_user_app
-    host_id = "host_unauth"
+    host_id = "3eeb18892635b9ed8ba2d060c8f58dd4"
     path = f"/v1/hosts/{host_id}/tunnel"
     # No x-test-user header -> stub auth returns None -> unauthenticated.
     comm = ApplicationCommunicator(app, _websocket_scope(path))
@@ -924,7 +1088,7 @@ async def test_tunnel_accepts_authenticated_owner(
     the authenticated happy path.
     """
     app, registry, host_store, _cs = multi_user_app
-    host_id = "host_alice_ws"
+    host_id = "d66146fe4cc6b0dc1d342f6a89475046"
     path = f"/v1/hosts/{host_id}/tunnel"
     scope = _websocket_scope(path)
     # Authenticated as alice via the stub's x-test-user header.
@@ -945,7 +1109,7 @@ async def test_tunnel_accepts_authenticated_owner(
     assert conn.owner == "alice@test.com"
     stored = host_store.get_host(host_id)
     assert stored is not None
-    assert stored.owner == "alice@test.com"
+    assert stored.user_id == "alice@test.com"
 
 
 def _register_fake_host(registry: HostRegistry, host_id: str, owner: str) -> None:
@@ -980,8 +1144,10 @@ async def test_resolve_host_launch_enforces_host_and_session_ownership(
     perm = SqlAlchemyPermissionStore(db_uri)
 
     # Alice owns an online host and a session.
-    host_store.upsert_on_connect("host_alice", "alice-laptop", "alice@test.com")
-    _register_fake_host(registry, "host_alice", "alice@test.com")
+    host_store.upsert_on_connect(
+        "f54bb9272002938a3a934bfcb6bb228a", "alice-laptop", "alice@test.com"
+    )
+    _register_fake_host(registry, "f54bb9272002938a3a934bfcb6bb228a", "alice@test.com")
     conv = conv_store.create_conversation(agent_id=None)
     perm.ensure_user("alice@test.com")
     perm.grant("alice@test.com", conv.id, LEVEL_OWNER)
@@ -996,12 +1162,12 @@ async def test_resolve_host_launch_enforces_host_and_session_ownership(
     # Happy path: Alice owns both → returns the resolved target.
     target = resolve_host_launch(
         user_id="alice@test.com",
-        host_id="host_alice",
+        host_id="f54bb9272002938a3a934bfcb6bb228a",
         session_id=conv.id,
         **stores,
     )
     assert isinstance(target, HostLaunchTarget)
-    assert target.host.owner == "alice@test.com"
+    assert target.host.user_id == "alice@test.com"
     assert target.conv.id == conv.id
 
     # Bob targets Alice's HOST → 403. Blocks the inline-launch RCE
@@ -1009,7 +1175,7 @@ async def test_resolve_host_launch_enforces_host_and_session_ownership(
     with pytest.raises(HTTPException) as exc:
         resolve_host_launch(
             user_id="bob@test.com",
-            host_id="host_alice",
+            host_id="f54bb9272002938a3a934bfcb6bb228a",
             session_id=conv.id,
             **stores,
         )
@@ -1017,12 +1183,12 @@ async def test_resolve_host_launch_enforces_host_and_session_ownership(
 
     # Bob owns his own host but targets Alice's SESSION → 404. Blocks
     # the launch_runner session-hijack (binding her session to his runner).
-    host_store.upsert_on_connect("host_bob", "bob-laptop", "bob@test.com")
-    _register_fake_host(registry, "host_bob", "bob@test.com")
+    host_store.upsert_on_connect("774d8c150c0060ddb61a91b23b64a0d0", "bob-laptop", "bob@test.com")
+    _register_fake_host(registry, "774d8c150c0060ddb61a91b23b64a0d0", "bob@test.com")
     with pytest.raises(HTTPException) as exc:
         resolve_host_launch(
             user_id="bob@test.com",
-            host_id="host_bob",
+            host_id="774d8c150c0060ddb61a91b23b64a0d0",
             session_id=conv.id,
             **stores,
         )
@@ -1033,22 +1199,23 @@ async def test_resolve_host_launch_enforces_host_and_session_ownership(
     with pytest.raises(HTTPException) as exc:
         resolve_host_launch(
             user_id="alice@test.com",
-            host_id="host_missing",
+            host_id="b76b800b737d646b3ae8e06071d622c3",
             session_id=conv.id,
             **stores,
         )
     assert exc.value.status_code == 404
 
     # Host known but offline (in the store, no live connection) → 409.
-    host_store.upsert_on_connect("host_offline", "alice-old", "alice@test.com")
-    with pytest.raises(HTTPException) as exc:
+    host_store.upsert_on_connect("3d9665477127e41f42de3f4109418173", "alice-old", "alice@test.com")
+    host_store.set_offline("3d9665477127e41f42de3f4109418173")
+    with pytest.raises(OmnigentError) as exc:
         resolve_host_launch(
             user_id="alice@test.com",
-            host_id="host_offline",
+            host_id="3d9665477127e41f42de3f4109418173",
             session_id=conv.id,
             **stores,
         )
-    assert exc.value.status_code == 409
+    assert exc.value.code == ErrorCode.CONFLICT
 
 
 async def test_launch_runner_rejects_other_users_session(
@@ -1063,8 +1230,8 @@ async def test_launch_runner_rejects_other_users_session(
     perm = app.state.permission_store
 
     # Bob's own, online host.
-    host_store.upsert_on_connect("host_bob", "bob-laptop", "bob@test.com")
-    _register_fake_host(registry, "host_bob", "bob@test.com")
+    host_store.upsert_on_connect("774d8c150c0060ddb61a91b23b64a0d0", "bob-laptop", "bob@test.com")
+    _register_fake_host(registry, "774d8c150c0060ddb61a91b23b64a0d0", "bob@test.com")
 
     # Alice's session (owned by Alice).
     conv = conv_store.create_conversation(agent_id=None)
@@ -1073,7 +1240,7 @@ async def test_launch_runner_rejects_other_users_session(
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
-            "/v1/hosts/host_bob/runners",
+            "/v1/hosts/774d8c150c0060ddb61a91b23b64a0d0/runners",
             json={"session_id": conv.id, "workspace": "/tmp"},
             headers={"x-test-user": "bob@test.com"},
         )
@@ -1091,43 +1258,48 @@ async def test_failed_connect_does_not_offline_another_users_host(
     multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
     """
-    A peer connecting to another owner's host_id fails the upsert
-    (host_id unique constraint) — and must NOT flip that owner's host
-    offline. Before the fix the broad except called set_offline(host_id)
-    on a connection that never registered, letting any authenticated user
-    repeatedly DoS another user's host.
+    A peer connecting to another owner's host_id is refused, and that
+    refusal must NOT flip the existing owner's host offline.
+
+    The cross-owner conflict is now caught before accept() and answered
+    with a 409 (close fallback when the denial-response extension is
+    absent, as in this raw scope). The DoS guarantee is unchanged and
+    arguably stronger: the peer's connection is never accepted, so the
+    broad except that once called set_offline(host_id) on a never-
+    registered connection cannot run.
     """
     app, _registry, host_store, _cs = multi_user_app
 
     # Alice's host is registered and online.
-    host_store.upsert_on_connect("host_dos", "alice-laptop", "alice@test.com")
-    before = host_store.get_host("host_dos")
+    host_store.upsert_on_connect(
+        "be2a05c6f9530d33276f7c4b34bc39ad", "alice-laptop", "alice@test.com"
+    )
+    before = host_store.get_host("be2a05c6f9530d33276f7c4b34bc39ad")
     assert before is not None
     assert before.status == "online"
 
     # Bob (a different authenticated user) connects to Alice's host_id.
-    scope = _websocket_scope("/v1/hosts/host_dos/tunnel")
+    scope = _websocket_scope("/v1/hosts/be2a05c6f9530d33276f7c4b34bc39ad/tunnel")
     scope["headers"] = [(b"x-test-user", b"bob@test.com")]
     comm = ApplicationCommunicator(app, scope)
     await comm.send_input({"type": "websocket.connect"})
-    accepted = await comm.receive_output(timeout=1.0)
-    assert accepted["type"] == "websocket.accept"
-    await comm.send_input(
-        {"type": "websocket.receive", "text": _make_hello("bob-laptop")},
-    )
-    # The failed upsert tears the connection down — drain to completion.
+    # Refused before accept(); no denial extension in this scope, so the
+    # server falls back to a pre-accept close (code 4009).
+    closed = await comm.receive_output(timeout=1.0)
+    assert closed["type"] == "websocket.close"
+    assert closed["code"] == 4009
     with contextlib.suppress(Exception):
         await comm.wait(timeout=2.0)
 
-    after = host_store.get_host("host_dos")
+    after = host_store.get_host("be2a05c6f9530d33276f7c4b34bc39ad")
     assert after is not None
     # Bob never claimed the host_id...
-    assert after.owner == "alice@test.com"
-    # ...and crucially, Alice's host is still online — set_offline did not
-    # run on Bob's failed (never-registered) connection.
+    assert after.user_id == "alice@test.com"
+    # ...and crucially, Alice's host is still online: the pre-accept
+    # refusal never runs set_offline on Bob's never-registered connection.
     assert after.status == "online", (
         "Bob's failed connect to Alice's host_id flipped her host offline "
-        "(set_offline ran on a connection that never registered) — DoS."
+        "(set_offline ran on a connection that never registered) - DoS."
     )
 
 

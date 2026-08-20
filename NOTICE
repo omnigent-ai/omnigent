@@ -45,8 +45,8 @@ Copyright 2016 Google LLC.
 opentelemetry-instrumentation-openai-agents-v2 - https://pypi.org/project/opentelemetry-instrumentation-openai-agents-v2/
 Copyright The OpenTelemetry Authors.
 
-cel-expr-python - https://github.com/cel-expr/cel-python/
-Copyright The Cel Expr Python Authors.
+cel-python - https://github.com/cloud-custodian/cel-python/
+Copyright The cel-python Authors.
 
 modal - https://pypi.org/project/modal/
 Copyright Modal Labs 2022.

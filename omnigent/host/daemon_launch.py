@@ -20,10 +20,79 @@ import click
 import httpx
 
 from omnigent.claude_native_bridge import url_component
+from omnigent.process_logging import display_log_path, process_log_dir
 
 # Poll cadence while waiting for a daemon-spawned runner to connect its
 # tunnel or for a resource to appear.
 DAEMON_POLL_INTERVAL_S = 0.5
+
+
+def _json_body(resp: httpx.Response) -> dict[str, object]:
+    """Decode a host/runner status response body, tolerating non-JSON.
+
+    The host + runner status endpoints (``GET /v1/hosts/{id}``,
+    ``GET /v1/runners/{id}/status``) are expected to answer JSON. But a
+    server reached over ``--server`` that does not mount the host router
+    (e.g. an API-only deployment, or a misconfigured server) lets these
+    paths fall through to the SPA HTML5-history fallback, which answers
+    ``200 text/html`` with ``index.html``. Calling ``resp.json()`` on that
+    raised an opaque ``json.JSONDecodeError`` that crashed the REPL before
+    it ever became ready. Treat any non-dict / non-JSON 200 body as "no
+    status yet" so the caller keeps polling and ultimately fails with the
+    actionable timeout message instead.
+
+    :param resp: A ``200`` host/runner status response.
+    :returns: The decoded JSON object, or an empty dict when the body is
+        not a JSON object (e.g. the SPA HTML fallback).
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def open_daemon_client(
+    base_url: str,
+    headers: dict[str, str],
+    host_id: str | None,
+    *,
+    auth: httpx.Auth | None = None,
+    timeout: httpx.Timeout | float | None = None,
+) -> httpx.AsyncClient:
+    """Open an httpx client for the host-runner protocol, pinned to *host_id*.
+
+    Every request a caller makes on this client — the launch, runner-status
+    polls, and the session / terminal calls (including a resume-time reattach
+    check) — is scoped to one host, whose control and runner tunnels register
+    on a single server replica. Baking the host_id routing header into the
+    client's headers at construction pins all of them to that replica, ahead
+    of the first request regardless of the caller's call order. The builder
+    (:func:`~omnigent.cli_auth.databricks_request_headers`) emits the header
+    only on a host-sharded mount, so an unsharded server is unaffected.
+
+    :param base_url: Omnigent server base URL, e.g. the workspace API mount.
+    :param headers: Base HTTP headers (auth bearer, workspace routing); not
+        mutated — a fresh dict carries the merged routing headers.
+    :param host_id: The host to pin to, e.g. ``"host_abc123"``; ``None`` (a
+        hostless / local session) leaves routing to the default fallback.
+    :param auth: Optional per-request ``httpx.Auth`` (e.g. token refresh).
+    :param timeout: Optional httpx timeout for the client.
+    :returns: An ``httpx.AsyncClient`` whose requests all name *host_id*.
+    """
+    from omnigent_client._http import is_loopback_url
+
+    from omnigent.cli_auth import databricks_request_headers
+
+    pinned = {**headers, **databricks_request_headers(base_url, host_id=host_id)}
+    # A proxy cannot reach a loopback server, so local targets bypass it.
+    return httpx.AsyncClient(
+        base_url=base_url,
+        headers=pinned,
+        auth=auth,
+        timeout=timeout,
+        trust_env=not is_loopback_url(base_url),
+    )
 
 
 async def wait_for_host_online(
@@ -58,7 +127,7 @@ async def wait_for_host_online(
         except httpx.TransportError as exc:
             last_error = exc
         else:
-            if resp.status_code == 200 and resp.json().get("status") == "online":
+            if resp.status_code == 200 and _json_body(resp).get("status") == "online":
                 return
         await asyncio.sleep(DAEMON_POLL_INTERVAL_S)
     message = (
@@ -79,7 +148,7 @@ async def runner_is_online(client: httpx.AsyncClient, runner_id: str) -> bool:
     :returns: ``True`` when the status endpoint reports ``online``.
     """
     resp = await client.get(f"/v1/runners/{url_component(runner_id)}/status")
-    return resp.status_code == 200 and bool(resp.json().get("online"))
+    return resp.status_code == 200 and bool(_json_body(resp).get("online"))
 
 
 async def wait_for_runner_online(
@@ -119,7 +188,7 @@ async def wait_for_runner_online(
             last_error = exc
         else:
             if resp.status_code == 200:
-                body = resp.json()
+                body = _json_body(resp)
                 if body.get("online"):
                     return
                 exit_error = body.get("error")
@@ -134,7 +203,7 @@ async def wait_for_runner_online(
     message = f"Runner {runner_id!r} did not connect within {timeout_s:.0f}s."
     if last_error is not None:
         message += f" Last connection error: {last_error!r}."
-    message += " Check the host-runner logs under ~/.omnigent/logs/host-runner/."
+    message += f" Check the runner logs under {display_log_path(process_log_dir('runner'))}/."
     raise click.ClickException(message)
 
 
@@ -144,6 +213,7 @@ async def launch_or_reuse_daemon_runner(
     host_id: str,
     session_id: str,
     workspace: str,
+    fresh: bool = False,
 ) -> str:
     """
     Ensure the session is bound to a daemon-spawned runner; return its id.
@@ -158,11 +228,19 @@ async def launch_or_reuse_daemon_runner(
     :param session_id: Session to bind, e.g. ``"conv_abc123"``.
     :param workspace: Absolute host path for the runner cwd, e.g.
         ``"/Users/me/proj"``.
+    :param fresh: When ``True``, skip the ``GET /v1/sessions/{id}``
+        runner-binding check and go straight to launching a new runner.
+        Safe to set when the session was just created in this same startup
+        sequence — a brand-new session can't have a runner bound yet, so
+        the read would always return empty and only add latency (~2-3s).
     :returns: The bound runner id, e.g. ``"runner_abc123"``.
     :raises click.ClickException: If the launch request fails.
     """
-    snap = await client.get(f"/v1/sessions/{url_component(session_id)}")
-    existing = snap.json().get("runner_id") if snap.status_code == 200 else None
+    if fresh:
+        existing = None
+    else:
+        snap = await client.get(f"/v1/sessions/{url_component(session_id)}")
+        existing = _json_body(snap).get("runner_id") if snap.status_code == 200 else None
     if isinstance(existing, str) and existing:
         if await runner_is_online(client, existing):
             return existing

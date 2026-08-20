@@ -46,14 +46,13 @@ import subprocess
 import uuid
 from pathlib import Path
 
-from tests._model_pools import resolve_model
+from tests.e2e.omnigent.conftest import configure_mock_llm
 
-# Same gateway model + harness the other run_omnigent tests use.
 # ``openai-agents`` is picked because it honors
 # ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY`` directly — no
 # ``~/.databrickscfg`` patching required (which would be
 # awkward when HOME is a tmp_path).
-_MODEL = resolve_model("databricks-gpt-5-4-mini", key=__name__)
+_MODEL = "mock-model"
 _HARNESS = "openai-agents"
 
 # Subprocess timeout per ``omnigent run`` invocation.
@@ -79,6 +78,17 @@ def _make_nonce() -> str:
     # leak between conversations even if HOME isolation
     # somehow fails.
     return "nonce" + uuid.uuid4().hex[:12]
+
+
+def _row_id_to_hex(value: object) -> str:
+    """Render a conversation id read via raw sqlite3 as bare 32-char hex.
+
+    The ``id`` column is a Uuid16 (16-byte BLOB), so ``sqlite3`` hands it
+    back as ``bytes``; ``--resume`` expects the hex string form.
+    """
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).hex()
+    return str(value)
 
 
 def _argv_run_omnigent(
@@ -216,7 +226,8 @@ def _isolated_env(
 def test_run_omnigent_continue_carries_history_across_invocations(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
     """
@@ -224,10 +235,10 @@ def test_run_omnigent_continue_carries_history_across_invocations(
     must recover it from the prior conversation.
 
     The proof is end-to-end: two distinct subprocess
-    invocations, a real LLM, a real persistent SQLite store
-    on disk, and the model's reply in run #2 contains a
-    nonce that the model only could have seen via
-    threading onto run #1's conversation.
+    invocations, a real persistent SQLite store on disk,
+    and the model's reply in run #2 contains a nonce that
+    the model only could have seen via threading onto run
+    #1's conversation.
 
     What breaks if this fails: see module-level docstring.
     Each layer's regression — store filter, idempotent
@@ -238,8 +249,11 @@ def test_run_omnigent_continue_carries_history_across_invocations(
     """
     fake_home = tmp_path / "home"
     fake_home.mkdir()
-    env = _isolated_env(omnigent_credentials_env, fake_home)
+    env = _isolated_env(mock_credentials_env, fake_home)
     nonce = _make_nonce()
+    # Run #1: mock returns nonce. Run #2 (--continue): mock
+    # returns nonce again, simulating recall from history.
+    configure_mock_llm(mock_llm_server_url, [{"text": nonce}, {"text": nonce}])
 
     # Run #1: plant the nonce. Use a deliberately-rigid
     # prompt so the model echoes the nonce verbatim, making
@@ -325,8 +339,8 @@ def test_run_omnigent_continue_carries_history_across_invocations(
 def test_run_omnigent_continue_with_no_prior_conversation_exits_nonzero(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
-    tmp_path: Path,
+    mock_credentials_env: dict[str, str],
+    tmp_path: Path,  # no LLM call — exits before reaching mock server
 ) -> None:
     """
     ``--continue`` against a fresh ``$HOME`` (no prior
@@ -345,7 +359,7 @@ def test_run_omnigent_continue_with_no_prior_conversation_exits_nonzero(
     """
     fake_home = tmp_path / "home"
     fake_home.mkdir()
-    env = _isolated_env(omnigent_credentials_env, fake_home)
+    env = _isolated_env(mock_credentials_env, fake_home)
     # ``--continue`` resolution happens at REPL boot before any
     # user input is consumed, so the subprocess exits non-zero
     # immediately. Stdin is closed via ``input=""`` so the REPL
@@ -380,7 +394,8 @@ def test_run_omnigent_continue_with_no_prior_conversation_exits_nonzero(
 def test_run_omnigent_continue_works_across_oneshot_and_interactive_paths(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
     """
@@ -413,8 +428,11 @@ def test_run_omnigent_continue_works_across_oneshot_and_interactive_paths(
     """
     fake_home = tmp_path / "home"
     fake_home.mkdir()
-    env = _isolated_env(omnigent_credentials_env, fake_home)
+    env = _isolated_env(mock_credentials_env, fake_home)
     nonce = _make_nonce()
+    # Plant: mock returns nonce. Recover (--continue): mock returns
+    # nonce again simulating history-aware recall.
+    configure_mock_llm(mock_llm_server_url, [{"text": nonce}, {"text": nonce}])
 
     # Step 1: plant the nonce via -p.
     plant_prompt = (
@@ -494,7 +512,8 @@ def test_run_omnigent_continue_works_across_oneshot_and_interactive_paths(
 def test_run_omnigent_session_id_pins_the_specific_conversation(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
+    mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
     """
@@ -530,10 +549,20 @@ def test_run_omnigent_session_id_pins_the_specific_conversation(
 
     fake_home = tmp_path / "home"
     fake_home.mkdir()
-    env = _isolated_env(omnigent_credentials_env, fake_home)
+    env = _isolated_env(mock_credentials_env, fake_home)
     nonce_a = _make_nonce()
     nonce_b = _make_nonce()
     persistent_db = fake_home / ".omnigent" / "chat.db"
+    # 4 LLM calls: plant A, plant B, recall A (--resume convA), recall B (--resume convB).
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": nonce_a},
+            {"text": nonce_b},
+            {"text": nonce_a},
+            {"text": nonce_b},
+        ],
+    )
 
     # ── Run 1: plant nonce A, fresh conversation (convA).
     plant_a = subprocess.run(
@@ -560,10 +589,15 @@ def test_run_omnigent_session_id_pins_the_specific_conversation(
 
     # Capture convA's id BEFORE planting B so we get the
     # right one — "newest" walks forward as more
-    # conversations are added.
+    # conversations are added. kind = 1 is the "default" enum code (the
+    # column is a SMALLINT; see omnigent.db.enum_codecs.CONVERSATION_KIND).
     with sqlite3.connect(str(persistent_db)) as conn:
         rows = conn.execute(
-            "SELECT id FROM conversations WHERE kind = 'default' ORDER BY updated_at DESC, id DESC"
+            "SELECT c.id FROM conversations c "
+            "JOIN omnigent_conversation_metadata m "
+            "  ON m.workspace_id = c.workspace_id AND m.id = c.id "
+            "WHERE m.kind = 1 "
+            "ORDER BY c.updated_at DESC, c.id DESC"
         ).fetchall()
     assert len(rows) == 1, (
         f"Expected exactly 1 conversation after plant A; got {len(rows)}. "
@@ -571,7 +605,7 @@ def test_run_omnigent_session_id_pins_the_specific_conversation(
         f"store. If >1, an unrelated test polluted the dir or the "
         f"HOME isolation broke."
     )
-    conv_a_id = rows[0][0]
+    conv_a_id = _row_id_to_hex(rows[0][0])
 
     # ── Run 2: plant nonce B, FRESH conversation (no
     # --continue / --session). A regression where -p mode
@@ -603,16 +637,21 @@ def test_run_omnigent_session_id_pins_the_specific_conversation(
     )
     assert nonce_b in plant_b.stdout.lower()
 
+    # kind = 1 is the "default" enum code (SMALLINT column).
     with sqlite3.connect(str(persistent_db)) as conn:
         rows = conn.execute(
-            "SELECT id FROM conversations WHERE kind = 'default' ORDER BY updated_at DESC, id DESC"
+            "SELECT c.id FROM conversations c "
+            "JOIN omnigent_conversation_metadata m "
+            "  ON m.workspace_id = c.workspace_id AND m.id = c.id "
+            "WHERE m.kind = 1 "
+            "ORDER BY c.updated_at DESC, c.id DESC"
         ).fetchall()
     assert len(rows) == 2, (
         f"Expected exactly 2 conversations after plant B; got {len(rows)}. "
         f"If 1, plant B threaded onto convA (the silent-resume "
         f"regression). If >2, leakage from another test."
     )
-    conv_b_id = rows[0][0]
+    conv_b_id = _row_id_to_hex(rows[0][0])
     assert conv_b_id != conv_a_id
 
     # ── Run 3: --resume convA_id must recover nonce A
@@ -694,7 +733,7 @@ def test_run_omnigent_session_id_pins_the_specific_conversation(
 def test_run_omnigent_session_id_unknown_exits_nonzero(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
     tmp_path: Path,
 ) -> None:
     """
@@ -709,7 +748,7 @@ def test_run_omnigent_session_id_unknown_exits_nonzero(
     """
     fake_home = tmp_path / "home"
     fake_home.mkdir()
-    env = _isolated_env(omnigent_credentials_env, fake_home)
+    env = _isolated_env(mock_credentials_env, fake_home)
     result = subprocess.run(
         _argv_run_omnigent_interactive(
             omnigent_python=omnigent_python,
@@ -735,7 +774,7 @@ def test_run_omnigent_session_id_unknown_exits_nonzero(
 def test_run_omnigent_no_session_does_not_pollute_persistent_store(
     omnigent_python: Path,
     omnigent_repo_root: Path,
-    omnigent_credentials_env: dict[str, str],
+    mock_credentials_env: dict[str, str],
     tmp_path: Path,
 ) -> None:
     """
@@ -750,7 +789,7 @@ def test_run_omnigent_no_session_does_not_pollute_persistent_store(
     """
     fake_home = tmp_path / "home"
     fake_home.mkdir()
-    env = _isolated_env(omnigent_credentials_env, fake_home)
+    env = _isolated_env(mock_credentials_env, fake_home)
     result = subprocess.run(
         _argv_run_omnigent(
             omnigent_python=omnigent_python,

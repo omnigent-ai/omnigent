@@ -164,6 +164,29 @@ def test_linkify_composes_with_sgr_styling() -> None:
     assert out == f"\x1b[1mSee \x1b[0m{_wrap('https://example.com')}"
 
 
+def test_linkify_url_followed_by_trailing_sgr_reset() -> None:
+    """
+    A URL immediately followed by an SGR reset (``\\x1b[0m``) — exactly what
+    Rich emits for a styled/underlined autolink (``\\x1b[4;34m<url>\\x1b[0m``)
+    — must NOT swallow the reset into the URL.
+
+    Regression target (the "0m before the URL" bug): ``_URL`` did not exclude
+    ESC, so it matched ``https://example.com\\x1b[0m`` and embedded the reset
+    INSIDE the OSC 8 link target
+    (``\\x1b]8;;https://example.com\\x1b[0m\\x1b\\``) — a malformed hyperlink
+    that terminals render by leaking ``0m`` as visible text before the URL.
+    The URL must end at the ESC, leaving the reset OUTSIDE the link envelope.
+    """
+    inp = "open \x1b[4;38;5;33mhttps://example.com\x1b[0m done"
+    out = linkify_ansi(inp)
+    # URL wrapped cleanly; the styling prefix and the trailing reset are
+    # untouched and sit OUTSIDE the OSC 8 envelope.
+    assert out == f"open \x1b[4;38;5;33m{_wrap('https://example.com')}\x1b[0m done"
+    # The link target must be the bare URL — no escape bytes embedded in it.
+    assert f"{_OSC_OPEN}https://example.com{_OSC_CLOSE}" in out
+    assert f"{_OSC_OPEN}https://example.com\x1b[0m" not in out
+
+
 def test_linkify_no_urls_passes_through_unchanged() -> None:
     """
     Strings without any URLs are returned byte-identical. No

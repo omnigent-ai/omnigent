@@ -29,16 +29,17 @@ import click
 import httpx
 
 from omnigent._wrapper_labels import (
-    CLAUDE_NATIVE_WRAPPER_VALUE as _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
-)
-from omnigent._wrapper_labels import (
-    CODEX_NATIVE_WRAPPER_VALUE as _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
-)
-from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY,
 )
+from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.native_dispatch import resolve_hook_for_key
 
 _logger = logging.getLogger(__name__)
+
+# Characters a copy-paste commonly drags along around an id (sentence
+# punctuation, quoting, brackets). Never valid in any id spelling, so
+# stripping them from the ends cannot change which conversation resolves.
+_PASTE_PUNCTUATION = " \t`'\"()[]{}<>.,;:"
 
 
 def run_resume(
@@ -112,7 +113,12 @@ def _pick_conversation_for_resume(
     from omnigent.repl._resume_picker import pick_conversation_cross_agent_from_sdk
 
     base_url = server.rstrip("/")
-    headers = _remote_headers(server_url=base_url)
+    headers = _remote_headers(server_url=base_url, host_id=None)
+    # Resume is owner-only, so the picker lists only the caller's own
+    # sessions — never ones merely shared with them. Resolve who the
+    # caller is here so the picker can drop shared rows; best-effort, so
+    # an unresolved identity just leaves the list unfiltered.
+    owner_user_id = _resolve_current_user_id(base_url=base_url, headers=headers)
 
     async def _drive() -> str | None:
         """
@@ -127,7 +133,9 @@ def _pick_conversation_for_resume(
         from omnigent_client import OmnigentClient
 
         async with OmnigentClient(base_url=base_url, headers=headers) as client:
-            return await pick_conversation_cross_agent_from_sdk(client)
+            return await pick_conversation_cross_agent_from_sdk(
+                client, owner_user_id=owner_user_id
+            )
 
     try:
         return asyncio.run(_drive())
@@ -147,6 +155,44 @@ def _pick_conversation_for_resume(
         raise click.ClickException(
             f"Picker failed against {base_url!r}: {type(exc).__name__}: {exc}",
         ) from exc
+
+
+def _resolve_current_user_id(
+    *,
+    base_url: str,
+    headers: dict[str, str],
+) -> str | None:
+    """
+    Best-effort ``GET /v1/me`` to learn who the caller is.
+
+    The cross-agent resume picker uses this to drop sessions merely
+    *shared* with the caller (resume is owner-only). It is deliberately
+    best-effort: a permissionless single-user server answers
+    ``user_id: null`` (no sharing — nothing to filter), and a transient
+    lookup failure must never break resume. Both fall back to ``None``,
+    which the picker reads as "no owner filter". Reuses the same header
+    chain the picker's own requests carry, so it authenticates
+    identically.
+
+    :param base_url: Remote server URL without a trailing slash.
+    :param headers: Request headers (auth) shared with the picker.
+    :returns: The caller's ``user_id``, or ``None`` when it can't be
+        resolved (unauthenticated, non-200, non-JSON, or unreachable).
+    """
+    try:
+        resp = httpx.get(f"{base_url}/v1/me", headers=headers, timeout=10.0)
+    except httpx.HTTPError:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    user_id = body.get("user_id")
+    return user_id if isinstance(user_id, str) and user_id else None
 
 
 def _dispatch_by_runtime(
@@ -169,10 +215,24 @@ def _dispatch_by_runtime(
     :param server: Optional remote Omnigent server URL. ``None`` when
         the lookup should hit a freshly-started local server (the
         claude-native wrapper owns its own local server lifecycle).
-    :raises click.ClickException: When the conversation can't be
-        resolved, can't be classified, or is not a terminal-native
-        session.
+    :raises click.ClickException: When *target* is not a valid
+        conversation id, the conversation can't be resolved, can't be
+        classified, or is not a terminal-native session.
     """
+    from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
+
+    # Resolve the id the argument contains, then canonicalize to bare hex
+    # before any lookup: a paste drags punctuation along (trailing period,
+    # wrapping quotes or backticks), and none of it can ever be part of a
+    # valid id — so strip it and resume rather than erroring. A malformed
+    # id would otherwise surface as a raw StatementError traceback from
+    # the local store's Uuid16 bind, and downstream consumers key
+    # sessions on the bare spelling.
+    try:
+        target = uuid_to_bytes(target.strip(_PASTE_PUNCTUATION)).hex()
+    except InvalidUuidError as exc:
+        raise click.ClickException("Invalid session id.") from exc
+
     if server is not None:
         wrapper = _read_wrapper_label_remote(server=server, conv_id=target)
         if _dispatch_wrapper(
@@ -218,25 +278,14 @@ def _dispatch_wrapper(
     :param session_id: Omnigent conversation id.
     :returns: ``True`` when a wrapper handled the session.
     """
-    if wrapper == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
-        from omnigent.claude_native import run_claude_native
-
-        run_claude_native(
-            server=server,
-            session_id=session_id,
-            claude_args=(),
-        )
-        return True
-    if wrapper == _CODEX_NATIVE_WRAPPER_LABEL_VALUE:
-        from omnigent.codex_native import run_codex_native
-
-        run_codex_native(
-            server=server,
-            session_id=session_id,
-            codex_args=(),
-        )
-        return True
-    return False
+    native_agent = native_coding_agent_for_wrapper_label(wrapper)
+    if native_agent is None:
+        return False
+    run_native = resolve_hook_for_key(native_agent.key, "run_native")
+    if run_native is None:
+        return False
+    run_native(server=server, session_id=session_id, extra_args=())
+    return True
 
 
 def _read_wrapper_label_local(*, conv_id: str) -> str | None:
@@ -290,7 +339,7 @@ def _read_wrapper_label_remote(
     from omnigent.chat import _remote_headers
 
     base_url = server.rstrip("/")
-    headers = _remote_headers(server_url=base_url)
+    headers = _remote_headers(server_url=base_url, host_id=None)
     try:
         resp = httpx.get(
             f"{base_url}/v1/sessions/{conv_id}",

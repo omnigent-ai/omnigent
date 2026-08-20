@@ -86,3 +86,41 @@ def test_build_vertex_url_structure() -> None:
         "/locations/us-central1"
         "/publishers/google/models"
     )
+
+
+# ── _get_base_url raises ────────────────────────────────
+
+
+def test_get_base_url_raises() -> None:
+    """VertexAdapter._get_base_url always raises — Vertex requires connection_params."""
+    from omnigent.llms.adapters.vertex import VertexAdapter
+
+    adapter = VertexAdapter()
+    with pytest.raises(OmnigentError, match="requires"):
+        adapter._get_base_url()
+
+
+# ── URL for different regions ────────────────────────────
+
+
+def test_build_vertex_url_different_region() -> None:
+    """URL changes with region."""
+    url = _build_vertex_url("proj-2", "europe-west4")
+    expected_url = (
+        "https://europe-west4-aiplatform.googleapis.com"
+        "/v1/projects/proj-2"
+        "/locations/europe-west4"
+        "/publishers/google/models"
+    )
+    assert url == expected_url
+
+
+# ── Resolve preserves extra keys ─────────────────────────
+
+
+def test_resolve_preserves_extra_connection_keys() -> None:
+    """Extra keys in connection_params are preserved after resolution."""
+    params = {"project": "p", "location": "l", "extra_key": "value"}
+    result = _resolve_vertex_params(params)
+    assert result["extra_key"] == "value"
+    assert "base_url" in result

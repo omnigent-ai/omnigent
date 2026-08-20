@@ -23,6 +23,15 @@ class AgentCache:
 
     On cache miss the bundle is downloaded from the ArtifactStore,
     extracted to disk, parsed, validated, and stored in both tiers.
+
+    This is an **execution** load path, so it loads with
+    ``prune_invalid_sub_agents=True``: a sub-agent that fails
+    validation here means this server is older than whatever produced
+    the bundle and can't run that sub-agent (version skew), so it is
+    dropped (with a WARNING) and the parent agent still dispatches.
+    Authoring/upload validation stays strict elsewhere
+    (:func:`omnigent.server.bundles.validate_agent_bundle`). See
+    :func:`omnigent.spec.load`.
     """
 
     def __init__(self, artifact_store: ArtifactStore, cache_dir: Path) -> None:
@@ -82,7 +91,7 @@ class AgentCache:
 
         # Tier 2: disk cache (directory already extracted)
         if workdir.is_dir():
-            spec = load_spec(workdir, expand_env=expand_env)
+            spec = load_spec(workdir, expand_env=expand_env, prune_invalid_sub_agents=True)
             self._specs[agent_id] = spec
             return LoadedAgent(spec=spec, workdir=workdir)
 
@@ -130,7 +139,12 @@ class AgentCache:
         tmp_path = Path(tmp_name)
         try:
             tmp_path.write_bytes(bundle_bytes)
-            spec = load_spec(tmp_path, dest=staging_dir, expand_env=expand_env)
+            spec = load_spec(
+                tmp_path,
+                dest=staging_dir,
+                expand_env=expand_env,
+                prune_invalid_sub_agents=True,
+            )
         finally:
             tmp_path.unlink()
 
@@ -182,7 +196,12 @@ class AgentCache:
         tmp_path = Path(tmp_name)
         try:
             tmp_path.write_bytes(bundle_bytes)
-            spec = load_spec(tmp_path, dest=workdir, expand_env=expand_env)
+            spec = load_spec(
+                tmp_path,
+                dest=workdir,
+                expand_env=expand_env,
+                prune_invalid_sub_agents=True,
+            )
         finally:
             tmp_path.unlink()
 

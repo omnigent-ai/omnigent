@@ -9,17 +9,25 @@ import sys
 import textwrap
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
-from omnigent.spec.types import LocalToolInfo, SandboxConfig
+from omnigent.spec.types import LocalToolInfo, SandboxConfig, ToolRuntime
 from omnigent.tools.base import ToolContext
 from omnigent.tools.local import (
     LocalPythonTool,
     LocalToolLoadError,
     load_local_python_tools,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clean_container_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure OMNIGENT_CONTAINER_RUNTIME never leaks from the host environment."""
+    monkeypatch.delenv("OMNIGENT_CONTAINER_RUNTIME", raising=False)
+
 
 # ─── Helpers ────────────────────────────────────────────────────────
 
@@ -324,6 +332,29 @@ def test_load_skips_typescript(tmp_path: Path) -> None:
     assert tools == []
 
 
+def test_load_skips_client_runtime_tool(tmp_path: Path) -> None:
+    info = LocalToolInfo(
+        name="client_tool",
+        path=None,
+        language="python",
+        runtime=ToolRuntime.CLIENT,
+    )
+
+    assert load_local_python_tools([info], tmp_path) == []
+
+
+def test_load_server_tool_without_path_fails_loud(tmp_path: Path) -> None:
+    info = LocalToolInfo(
+        name="pathless",
+        path=None,
+        language="python",
+        runtime=ToolRuntime.SERVER,
+    )
+
+    with pytest.raises(LocalToolLoadError, match="no source path"):
+        load_local_python_tools([info], tmp_path, agent_name="testagent")
+
+
 def test_load_missing_file_fails_loud(tmp_path: Path) -> None:
     """A declared-but-nonexistent file raises ``LocalToolLoadError``."""
     info = LocalToolInfo(name="ghost", path="tools/python/ghost.py", language="python")
@@ -415,7 +446,9 @@ def _make_tool(
     *,
     has_inline_deps: bool = False,
     inline_deps: list[str] | None = None,
+    container_image: str | None = None,
     docker_image: str | None = None,
+    container_runtime: str | None = None,
     srt_available: bool = False,
     uv_available: bool = False,
     sandbox_enabled: bool = True,
@@ -430,7 +463,13 @@ def _make_tool(
         has_inline_deps=has_inline_deps,
         inline_deps=inline_deps,
     )
-    sandbox_config = SandboxConfig(docker_image=docker_image)
+    sandbox_kwargs: dict[str, Any] = {
+        "container_image": container_image,
+        "docker_image": docker_image,
+    }
+    if container_runtime is not None:
+        sandbox_kwargs["container_runtime"] = container_runtime
+    sandbox_config = SandboxConfig(**sandbox_kwargs)
     tools = load_local_python_tools(
         [info],
         tmp_path,
@@ -481,13 +520,81 @@ def test_build_command_srt_disabled(tmp_path: Path) -> None:
     assert cmd[0] == sys.executable
 
 
-def test_build_command_docker(tmp_path: Path) -> None:
-    """docker_image set → docker run command."""
-    tool = _make_tool(tmp_path, docker_image="python:3.11")
+def test_build_command_container(tmp_path: Path) -> None:
+    """container_image set → docker run command (default runtime)."""
+    tool = _make_tool(tmp_path, container_image="python:3.11")
     cmd = tool._build_command(state_root=None)
     assert cmd[0] == "docker"
     assert "run" in cmd
     assert "python:3.11" in cmd
+
+
+def test_build_command_docker_image_alias(tmp_path: Path) -> None:
+    """docker_image (deprecated alias) still works."""
+    tool = _make_tool(tmp_path, docker_image="python:3.11")
+    cmd = tool._build_command(state_root=None)
+    assert cmd[0] == "docker"
+    assert "python:3.11" in cmd
+
+
+def test_build_command_podman(tmp_path: Path) -> None:
+    """container_runtime='podman' → podman run command with network isolation."""
+    tool = _make_tool(tmp_path, container_image="python:3.11", container_runtime="podman")
+    cmd = tool._build_command(state_root=None)
+    assert cmd[0] == "podman"
+    assert "run" in cmd
+    assert "python:3.11" in cmd
+    assert "--network" in cmd
+    net_idx = cmd.index("--network")
+    assert cmd[net_idx + 1] == "none"
+
+
+def test_build_command_container_network_isolation(tmp_path: Path) -> None:
+    """Both runtimes include --network none for sandbox isolation."""
+    for runtime in ("docker", "podman"):
+        tool = _make_tool(tmp_path, container_image="python:3.11", container_runtime=runtime)
+        cmd = tool._build_command(state_root=None)
+        assert "--network" in cmd, f"{runtime}: missing --network flag"
+        net_idx = cmd.index("--network")
+        assert cmd[net_idx + 1] == "none", f"{runtime}: --network not set to none"
+
+
+def test_sandbox_config_rejects_invalid_runtime() -> None:
+    """SandboxConfig.__post_init__ rejects unknown container_runtime values."""
+    with pytest.raises(ValueError, match="container_runtime"):
+        SandboxConfig(container_runtime="rkt")  # type: ignore[arg-type]
+
+
+def test_sandbox_config_env_var_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OMNIGENT_CONTAINER_RUNTIME env var overrides the built-in default."""
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "podman")
+    cfg = SandboxConfig()
+    assert cfg.container_runtime == "podman"
+
+
+def test_sandbox_config_explicit_beats_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit constructor argument takes precedence over the env var."""
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "podman")
+    cfg = SandboxConfig(container_runtime="docker")
+    assert cfg.container_runtime == "docker"
+
+
+def test_sandbox_config_env_var_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An invalid env var value is rejected just like an invalid argument."""
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "rkt")
+    with pytest.raises(ValueError, match="container_runtime"):
+        SandboxConfig()
+
+
+def test_build_command_container_env_var(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OMNIGENT_CONTAINER_RUNTIME env var is picked up by the tool command builder."""
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "podman")
+    tool = _make_tool(tmp_path, container_image="python:3.11")
+    cmd = tool._build_command(state_root=None)
+    assert cmd[0] == "podman"
 
 
 # ─── Schema + name plumbing ─────────────────────────────────────────

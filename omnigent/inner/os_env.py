@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import atexit
+import base64
+import codecs
 import contextlib
 import json
 import os
@@ -15,30 +17,45 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
-from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
+from omnigent.json_types import JsonValue
+from omnigent.runner.identity import (
+    OMNIGENT_SESSION_ENV_VAR,
+    strip_runner_auth_secrets,
+)
 
 from .async_utils import run_sync_on_thread
-from .datamodel import OSEnvSpec
+from .credential_proxy import (
+    CredentialProxyRuntime,
+    CredentialRewriteRule,
+    MaterializedFile,
+    prepare_credential_proxy_runtime,
+)
+from .datamodel import CredentialProxySpec, OSEnvSpec
 from .sandbox import (
+    ContainmentHandle,
     SandboxPolicy,
     activate_sandbox,
     cleanup_private_tmpdir,
     create_private_tmpdir,
     get_backend,
+    reachable_roots,
     resolve_sandbox,
     set_temp_env,
     with_additional_write_roots,
 )
+
+if TYPE_CHECKING:
+    import asyncio
+
+    from .egress import EgressProxyHandle
+    from .egress.proxy import EgressProxy
 from .sandbox import (
     run_launcher as _run_launcher,
 )
-
-# Any JSON-shaped leaf — used for the encode/decode serializer helpers that
-# mirror the pattern in ``omnigent/sandbox.py`` and ``omnigent/uc_tools.py``.
-JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
 # Result dict returned by ``read`` / ``write`` / ``edit`` / ``shell`` and the
 # corresponding ``_*_impl`` helpers. Keys vary by op (content/offset/total_lines
@@ -59,6 +76,10 @@ OpRequest: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 EditEntry: TypeAlias = dict[str, str]
 
 
+class _PopenKwargs(TypedDict, total=False):
+    pass_fds: tuple[int, ...]
+
+
 # Environment variables every helper subprocess inherits unconditionally.
 # Names that any reasonable Python program or POSIX shell expects to find
 # in its environment regardless of who is running it. Adding to this list
@@ -77,8 +98,13 @@ EditEntry: TypeAlias = dict[str, str]
 #   non-interactive startup.
 # - ``PROMPT_COMMAND``: arbitrary command run by bash before each prompt.
 # - ``CDPATH``: changes the resolution of relative paths in shell ``cd``.
-# - ``SSH_AUTH_SOCK``: the user's running ssh-agent socket — a
-#   credential surface masquerading as a path.
+# - ``SSH_AUTH_SOCK``: the user's ssh-agent socket. Allowed through the
+#   weaker host→runner and harness-CLI boundaries (a socket path, like
+#   ``KUBECONFIG``), but an ACTIVE sandbox is where the agent is being
+#   deliberately confined, and signing with the user's keys is exactly
+#   what that confinement is for. Opt in per-spec, and grant the socket
+#   path too: under seatbelt / bwrap the name alone points at something
+#   unreachable.
 # - ``DBUS_SESSION_BUS_ADDRESS``: lets the helper talk to the user's
 #   D-Bus session.
 # - ``XDG_RUNTIME_DIR``: per-session socket directory (Wayland, ssh-
@@ -114,6 +140,14 @@ _DEFAULT_ENV_PASSTHROUGH: tuple[str, ...] = (
     "PYTHONUNBUFFERED",
     "PYTHONDONTWRITEBYTECODE",
     "PYTHONFAULTHANDLER",
+    # Omnigent session marker: always pass the "inside Omnigent" marker
+    # through so an agent's sandboxed shell can detect the session, the
+    # way CLAUDE_CODE / CODEX are visible in their agents' shells. Set on
+    # the runner via runner.identity.OMNIGENT_SESSION_ENV_VAR.
+    OMNIGENT_SESSION_ENV_VAR,
+    # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
+    # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
+    *WINDOWS_ENV_PASSTHROUGH,
 )
 
 
@@ -207,6 +241,65 @@ def build_helper_env(
     return strip_runner_auth_secrets(env)
 
 
+def _build_credential_proxy_parent_env(
+    *,
+    helper_env: Mapping[str, str],
+    parent_env: Mapping[str, str],
+    spec: CredentialProxySpec,
+) -> dict[str, str]:
+    """
+    Build the parent-side env used to resolve credential-proxy sources.
+
+    ``file:`` / ``command:`` sources run against the same filtered
+    baseline the sandbox helper gets (so a ``command`` source can't
+    enumerate the parent's full secret-bearing environment), with the
+    one narrow addition that ``env:`` sources need: their referenced
+    variable, lifted from the real parent environment.
+
+    :param helper_env: The filtered helper environment from
+        :func:`build_helper_env`.
+    :param parent_env: The real parent process environment (typically
+        ``os.environ``).
+    :param spec: The credential-proxy policy whose ``env:`` source names
+        are lifted from *parent_env*.
+    :returns: An env map suitable for source resolution.
+    """
+    resolved = dict(helper_env)
+    for entry in spec.entries:
+        if entry.source.kind == "env" and entry.source.env:
+            value = parent_env.get(entry.source.env)
+            if value is not None:
+                resolved[entry.source.env] = value
+    return resolved
+
+
+def _write_credential_proxy_files(
+    env: dict[str, str],
+    files: Sequence[MaterializedFile],
+    tmpdir: Path,
+) -> None:
+    """
+    Write placeholder-only credential-proxy files into the sandbox scratch dir.
+
+    Each file carries only synthetic ``oa_cred_*`` placeholders (never a
+    real secret), so writing it into the sandbox-visible scratch dir is
+    safe. When a file declares an ``env_var``, that variable is pointed at
+    the written file's absolute path so the tool discovers it (e.g.
+    ``DATABRICKS_CONFIG_FILE``).
+
+    :param env: The helper spawn env; pointer vars are set in place.
+    :param files: The files to materialize.
+    :param tmpdir: The sandbox scratch directory (a write root bound into
+        the sandbox).
+    """
+    for spec in files:
+        path = tmpdir / spec.name
+        path.write_text(spec.content, encoding="utf-8")
+        os.chmod(path, spec.mode)
+        if spec.env_var is not None:
+            env[spec.env_var] = str(path)
+
+
 @dataclass
 class OSEnvironment(ABC):
     """Base OS environment interface."""
@@ -220,6 +313,7 @@ class OSEnvironment(ABC):
         path: str,
         offset: int = 1,
         limit: int | None = None,
+        max_binary_bytes: int | None = None,
     ) -> OpResult:
         raise NotImplementedError
 
@@ -289,16 +383,20 @@ class _HelperProcessClient:
         # helper itself. Cleared in :meth:`_stop_egress_proxy_locked`.
         self._egress_relay_port: int | None = None
         self._proc: subprocess.Popen[str] | None = None
+        # Parent-held containment handle from the sandbox backend's
+        # post_spawn hook (e.g. a Windows Job Object). Closed in
+        # ``_stop_locked`` to tear down the helper's process tree.
+        self._sandbox_handle: ContainmentHandle | None = None
         self._tmpdir: Path | None = None
-        self._egress_proxy: Any | None = None  # EgressProxy when active
-        self._egress_loop: Any | None = None  # asyncio event loop for proxy
+        self._egress_proxy: EgressProxy | None = None
+        self._egress_loop: asyncio.AbstractEventLoop | None = None
         self._egress_thread: threading.Thread | None = None
         # Controller handle for unified start/stop. The legacy
         # ``_egress_proxy`` / ``_egress_loop`` / ``_egress_thread``
         # mirrors are kept for back-compat with any tooling that
         # introspects them, but the lifecycle is driven through
         # the handle when present.
-        self._egress_handle: Any | None = None  # EgressProxyHandle
+        self._egress_handle: EgressProxyHandle | None = None
         self._lock = threading.Lock()
         self._closed = False
         atexit.register(self.close)
@@ -360,6 +458,7 @@ class _HelperProcessClient:
         )
 
         helper_cwd = self.cwd
+        credential_runtime: CredentialProxyRuntime | None = None
         if sandbox.active:
             self._tmpdir = create_private_tmpdir()
             sandbox = with_additional_write_roots(sandbox, [self._tmpdir])
@@ -367,13 +466,41 @@ class _HelperProcessClient:
             if self.start_in_scratch:
                 helper_cwd = self._tmpdir
                 env["PWD"] = str(self._tmpdir)
+            if sandbox.credential_proxy is not None:
+                # Resolve real secrets in the parent. Real secrets stay
+                # here and are attached to outbound requests by the egress
+                # proxy (swap-on-access). Only entries that opted into
+                # ``inject_env`` contribute a synthetic placeholder, merged
+                # into the helper env below; nothing else crosses into the
+                # sandbox.
+                credential_parent_env = _build_credential_proxy_parent_env(
+                    helper_env=env,
+                    parent_env=os.environ,
+                    spec=sandbox.credential_proxy,
+                )
+                credential_runtime = prepare_credential_proxy_runtime(
+                    sandbox.credential_proxy,
+                    parent_env=credential_parent_env,
+                )
+                env.update(credential_runtime.helper_env_updates)
+                # Materialize placeholder-only config files (e.g. a
+                # ``.databrickscfg`` listing proxied profiles with
+                # ``oa_cred_*`` tokens) into the scratch dir and point the
+                # tool at them. No real secret is written to the sandbox.
+                _write_credential_proxy_files(env, credential_runtime.sandbox_files, self._tmpdir)
 
         # Start L7 egress proxy if rules are configured. The proxy
         # listens on a Unix socket in the scratch tmpdir; the helper
         # starts a relay inside the network namespace that bridges
         # loopback TCP to this socket.
         if self._egress_rules and self._tmpdir is not None:
-            sandbox = self._start_egress_proxy_locked(sandbox, env)
+            sandbox = self._start_egress_proxy_locked(
+                sandbox,
+                env,
+                credential_rewrites=(
+                    credential_runtime.rewrites if credential_runtime is not None else None
+                ),
+            )
 
         config: dict[str, JsonValue] = {
             "cwd": str(helper_cwd),
@@ -402,23 +529,41 @@ class _HelperProcessClient:
         # secret. Argv is a global side-channel; an inherited fd
         # is private to the parent/child pair.
         config_bytes = json.dumps(config, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        r_fd, w_fd = os.pipe()
-        # We write the entire config synchronously before spawning.
-        # The pipe buffer is typically 64 KiB on macOS/Linux; the
-        # config is well under that (paths + booleans). If a future
-        # change inflates the config past one pipe buffer we'd
-        # deadlock here — replace with a writer thread at that point.
-        try:
-            os.write(w_fd, config_bytes)
-        finally:
-            os.close(w_fd)
+        # Deliver the config off-band — not on argv (readable via
+        # ``/proc/<pid>/cmdline`` / ``ps -ww``) and not in env (readable via
+        # ``ps -E``) — because it may carry the per-helper egress auth token.
+        #
+        # POSIX uses an inherited pipe fd (never touches disk). Windows has no
+        # ``pass_fds`` / fd inheritance in ``subprocess`` (CPython rejects
+        # ``pass_fds`` outright there), so fall back to a short-lived file in the
+        # helper's own private tmpdir, which the helper reads and unlinks
+        # immediately. Egress is POSIX-only (its proxy binds a Unix socket), so
+        # the Windows config carries no secret — only non-sensitive
+        # paths/booleans — but we still keep the file private and ephemeral.
+        r_fd: int | None = None
+        if IS_WINDOWS:
+            assert self._tmpdir is not None
+            config_file = self._tmpdir / "helper-config.json"
+            config_file.write_bytes(config_bytes)
+            config_arg = ["--config-file", str(config_file)]
+        else:
+            r_fd, w_fd = os.pipe()
+            # We write the entire config synchronously before spawning.
+            # The pipe buffer is typically 64 KiB on macOS/Linux; the
+            # config is well under that (paths + booleans). If a future
+            # change inflates the config past one pipe buffer we'd
+            # deadlock here — replace with a writer thread at that point.
+            try:
+                os.write(w_fd, config_bytes)
+            finally:
+                os.close(w_fd)
+            config_arg = ["--config-fd", str(r_fd)]
         helper_argv = [
             sys.executable,
             "-m",
             "omnigent.inner.os_env",
             "helper",
-            "--config-fd",
-            str(r_fd),
+            *config_arg,
         ]
         # Spawn-time backends (e.g. linux_bwrap) wrap helper_argv with
         # their launcher; the no-op ``none`` backend leaves it
@@ -436,6 +581,15 @@ class _HelperProcessClient:
             )
         else:
             spawn_argv = helper_argv
+        # ``pass_fds`` (POSIX only) unsets ``FD_CLOEXEC`` on ``r_fd`` so the
+        # child (and any launcher wrapping it, e.g. bwrap or sandbox-exec)
+        # inherits it across the exec chain. The numeric fd value is preserved
+        # in the child, which is why we can pass it as a plain ``--config-fd``
+        # argv arg. On Windows the config came via ``--config-file`` instead,
+        # so there is no fd to inherit.
+        popen_kwargs: _PopenKwargs = {}
+        if r_fd is not None:
+            popen_kwargs["pass_fds"] = (r_fd,)
         try:
             self._proc = subprocess.Popen(
                 spawn_argv,
@@ -446,13 +600,7 @@ class _HelperProcessClient:
                 bufsize=1,
                 cwd=str(self.cwd),
                 env=env,
-                # ``pass_fds`` unsets ``FD_CLOEXEC`` on ``r_fd`` so
-                # the child (and any launcher wrapping it, e.g.
-                # bwrap or sandbox-exec) inherits it across the
-                # exec chain. The numeric fd value is preserved in
-                # the child, which is why we can pass it as a plain
-                # ``--config-fd`` argv arg.
-                pass_fds=(r_fd,),
+                **popen_kwargs,
             )
         except Exception:
             cleanup_private_tmpdir(self._tmpdir)
@@ -464,8 +612,18 @@ class _HelperProcessClient:
             # has already been written. Leaving the parent's copy
             # open would prevent the child from seeing EOF on the
             # pipe after reading the config.
-            with contextlib.suppress(OSError):
-                os.close(r_fd)
+            if r_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(r_fd)
+
+        # Post-spawn containment (parent side). A no-op for the POSIX
+        # launcher backends (they isolate via wrap_launcher_argv before
+        # exec); on Windows this assigns the helper to a kill-on-close
+        # Job Object so the whole tree is torn down in ``_stop_locked``.
+        if sandbox.active and self._proc.pid is not None:
+            self._sandbox_handle = get_backend(sandbox.backend_type).post_spawn(
+                sandbox, self._proc.pid
+            )
 
     def _helper_exit_detail_locked(self) -> str:
         if self._proc is None:
@@ -510,6 +668,13 @@ class _HelperProcessClient:
                     with contextlib.suppress(Exception):
                         proc.kill()
         finally:
+            # Release the containment handle (Windows Job Object): with
+            # kill-on-close this also reaps any helper descendants that
+            # outlived ``proc.terminate()`` above.
+            if self._sandbox_handle is not None:
+                with contextlib.suppress(Exception):
+                    self._sandbox_handle.close()
+                self._sandbox_handle = None
             self._stop_egress_proxy_locked()
             cleanup_private_tmpdir(self._tmpdir)
             self._tmpdir = None
@@ -519,7 +684,11 @@ class _HelperProcessClient:
     # ------------------------------------------------------------------
 
     def _start_egress_proxy_locked(
-        self, sandbox: SandboxPolicy, env: dict[str, str]
+        self,
+        sandbox: SandboxPolicy,
+        env: dict[str, str],
+        *,
+        credential_rewrites: list[CredentialRewriteRule] | None = None,
     ) -> SandboxPolicy:
         """Start the egress MITM proxy and inject env vars.
 
@@ -570,6 +739,8 @@ class _HelperProcessClient:
             replacement for egress fields).
         :param env: The helper environment dict — proxy/CA env vars
             are added in-place.
+        :param credential_rewrites: Optional synthetic-to-real credential
+            rewrites the proxy applies (secretless ``credential_proxy``).
         :returns: Updated :class:`SandboxPolicy` with egress relay
             port and socket path set. The egress auth token is NOT
             stored on the policy (which serialises to JSON and
@@ -587,11 +758,13 @@ class _HelperProcessClient:
         # ``require_auth=True`` because we have an inherited config
         # FD to deliver the token out of band — see the in-process
         # token injection in :func:`_run_helper`.
+        rules = list(self._egress_rules or [])
         handle = start_egress_proxy(
-            rules=self._egress_rules or [],
+            rules=rules,
             tmpdir=self._tmpdir,
             allow_private_destinations=self._egress_allow_private_destinations,
             require_auth=True,
+            credential_rewrites=credential_rewrites,
         )
 
         # S4 (security): hold the controller refs on the client so
@@ -675,6 +848,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
         path: str,
         offset: int = 1,
         limit: int | None = None,
+        max_binary_bytes: int | None = None,
     ) -> OpResult:
         if offset < 1:
             return {"error": "offset must be >= 1"}
@@ -687,6 +861,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 "path": path,
                 "offset": offset,
                 "limit": limit,
+                "max_binary_bytes": max_binary_bytes,
             },
         )
         return cast(OpResult, result)
@@ -773,7 +948,11 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
             "os_env.start_in_scratch requires an active sandbox; "
             f"resolved sandbox type {sandbox.backend_type!r} is inactive"
         )
-    shell_path = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+    shell_path = shutil.which("bash") or shutil.which("sh")
+    if shell_path is None:
+        # No POSIX shell on PATH. On Windows fall back to cmd.exe; elsewhere
+        # keep the historical /bin/sh default.
+        shell_path = os.environ.get("COMSPEC", "cmd.exe") if IS_WINDOWS else "/bin/sh"
     egress_rules = spec.sandbox.egress_rules if spec.sandbox else None
     egress_allow_private = (
         spec.sandbox.egress_allow_private_destinations if spec.sandbox else False
@@ -817,16 +996,19 @@ def _handle_helper_request(
             return {"error": "path must be a non-empty string"}
         path = _resolve_path(cwd, raw_path)
         try:
-            _assert_within_cwd(cwd, path)
+            _assert_within_reach(cwd, sandbox, path, need_write=False)
             _assert_read_allowed(sandbox, path)
         except PermissionError as exc:
             return {"error": str(exc)}
         offset_raw = request.get("offset", 1)
         offset = offset_raw if isinstance(offset_raw, int) else 1
+        max_binary_raw = request.get("max_binary_bytes")
+        max_binary_bytes = max_binary_raw if isinstance(max_binary_raw, int) else None
         return _read_impl(
             path,
             offset,
             request.get("limit"),
+            max_binary_bytes=max_binary_bytes,
         )
 
     if op == "write":
@@ -835,7 +1017,7 @@ def _handle_helper_request(
             return {"error": "path must be a non-empty string"}
         path = _resolve_path(cwd, raw_path)
         try:
-            _assert_within_cwd(cwd, path)
+            _assert_within_reach(cwd, sandbox, path, need_write=True)
             _assert_write_allowed(sandbox, path)
         except PermissionError as exc:
             return {"error": str(exc)}
@@ -856,7 +1038,7 @@ def _handle_helper_request(
             return {"error": "path must be a non-empty string"}
         path = _resolve_path(cwd, raw_path)
         try:
-            _assert_within_cwd(cwd, path)
+            _assert_within_reach(cwd, sandbox, path, need_write=True)
             _assert_read_allowed(sandbox, path)
             _assert_write_allowed(sandbox, path)
         except PermissionError as exc:
@@ -927,6 +1109,80 @@ def _assert_within_cwd(cwd: Path, resolved: Path) -> None:
         ) from exc
 
 
+def _assert_within_reach(
+    cwd: Path,
+    policy: SandboxPolicy,
+    resolved: Path,
+    *,
+    need_write: bool,
+) -> None:
+    """Confine a file-tool op to *cwd*, extended by declared sandbox grants.
+
+    Replaces the historical cwd-only guard at the read / write / edit sites.
+    The grants come from :func:`omnigent.inner.sandbox.reachable_roots`, which
+    is also what the filesystem APIs advertise as reachable, so what is
+    enforced here and what a caller is told it can reach cannot drift apart.
+    *resolved* is already canonicalised by :func:`_resolve_path` (symlinks
+    followed, ``..`` collapsed) and every grant root is canonicalised at
+    resolve time, so a symlink or ``..`` chain whose real target leaves both
+    *cwd* and every grant is rejected -- the confinement boundary cannot be
+    escaped by traversal.
+
+    Precedence and grant semantics:
+
+    - A path inside *cwd* is always permitted here (the active-sandbox
+      allow-list narrowing in :func:`_assert_read_allowed` /
+      :func:`_assert_write_allowed` still runs afterwards, unchanged).
+    - A path OUTSIDE *cwd* is permitted only when an explicitly declared
+      grant of the right kind covers it. These reuse the SAME grant shapes the
+      active backends already populate -- ``read_paths`` / ``write_paths`` are
+      directory roots (containment match against ``read_roots`` /
+      ``write_roots``) and ``write_files`` is the single-file grant (exact
+      resolved-path match); no new grant vocabulary is introduced. A **write**
+      grant (``write_paths`` / ``write_files``) admits both reads and writes of
+      that subtree (a writable path is readable); a **read** grant
+      (``read_paths``) admits reads only -- so a read grant never confers
+      write. Read grants are directory roots; a single readable file is
+      expressed by rooting a ``read_paths`` entry at that file (an exact-path
+      match still succeeds, but there is no ``read_files`` shape).
+    - With NO grants declared, ``write_roots`` / ``write_files`` are empty and
+      ``read_roots`` is ``None``: nothing outside *cwd* is permitted, byte for
+      byte the previous cwd-confinement behaviour. This default-unchanged
+      property is the security invariant.
+
+    The target is resolved ONCE (by :func:`_resolve_path`) before comparison,
+    so this guard shares the prior cwd-guard's TOCTOU posture: a symlink
+    swapped between this check and the later open could redirect the op. That
+    is unchanged by this diff -- for an ACTIVE sandbox the backend's OS-level
+    mount mask stays the hard boundary, and under ``type: none`` the file tools
+    were never a containment boundary anyway (the co-resident ``sys_os_shell``
+    is unconfined). Widening reach to declared grants does not alter that
+    posture.
+
+    :param cwd: The environment root (resolved inside).
+    :param policy: Resolved sandbox policy carrying the declared grants.
+    :param resolved: Fully-resolved target path (post ``_resolve_path``).
+    :param need_write: ``True`` for write / edit ops (only write grants admit
+        an out-of-cwd path); ``False`` for read ops (read OR write grants
+        admit).
+    :raises PermissionError: If *resolved* is outside *cwd* and no grant of
+        the required kind covers it.
+    """
+    for root in reachable_roots(cwd, policy):
+        # Read grants admit reads only; write grants admit both.
+        if need_write and root.access != "write":
+            continue
+        if root.contains(resolved):
+            return
+    resolved_cwd = cwd.resolve()
+    kind = "write" if need_write else "read"
+    raise PermissionError(
+        f"Access to '{resolved}' is blocked: path is outside the "
+        f"environment root '{resolved_cwd}' and no sandbox {kind} grant "
+        f"covers it"
+    )
+
+
 def _assert_read_allowed(policy: SandboxPolicy, path: Path) -> None:
     roots = policy.read_roots
     if not policy.active or roots is None:
@@ -946,26 +1202,137 @@ def _assert_write_allowed(policy: SandboxPolicy, path: Path) -> None:
     raise PermissionError(f"Write access to '{path}' is blocked by sandbox.")
 
 
-def _read_impl(path: Path, offset: int, limit: JsonValue) -> OpResult:
+# Bytes sampled to classify a file as text vs binary. A NUL byte or an invalid
+# UTF-8 sequence in this prefix marks the file binary (the same prefix-sniff
+# heuristic git uses), so a multi-MB binary is never read in full just to find
+# out it is not text.
+_BINARY_SNIFF_BYTES = 8192
+
+
+def _is_binary_file(path: Path) -> bool:
+    """Classify *path* as binary by inspecting only its first chunk.
+
+    Reads at most :data:`_BINARY_SNIFF_BYTES` and reports binary when those
+    bytes contain a NUL or are not valid UTF-8. The NUL check matters because
+    ``\x00`` *is* valid UTF-8, so a UTF-16/NUL-laden file would otherwise be
+    misread as text; checking for it explicitly matches git's heuristic. An
+    incremental decoder is used with ``final=False`` so a multi-byte character
+    straddling the chunk boundary is treated as *incomplete* (text), not
+    invalid (binary).
+
+    :param path: Absolute path of the file to classify.
+    :returns: ``True`` if the prefix contains a NUL or is not decodable UTF-8.
     """
-    Read lines from a text file.
+    with path.open("rb") as fh:
+        prefix = fh.read(_BINARY_SNIFF_BYTES)
+    if b"\x00" in prefix:
+        return True
+    try:
+        codecs.getincrementaldecoder("utf-8")("strict").decode(prefix, final=False)
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+def _read_binary_impl(path: Path, max_binary_bytes: int | None) -> OpResult:
+    """Read a binary file as base64, bounded by *max_binary_bytes*.
+
+    Only ``stat`` (for the total size) and at most *max_binary_bytes* are read
+    from disk, so a large file neither saturates memory nor inflates IPC.
+
+    :param path: Absolute path of the binary file.
+    :param max_binary_bytes: Byte cap. ``None`` returns a descriptor only (the
+        agent ``sys_os_read`` path); a positive int inlines up to that many
+        base64-encoded bytes (the filesystem-service path).
+    :returns: An :class:`OpResult` with ``encoding="base64"`` (see
+        :func:`_read_impl`).
+    """
+    total = path.stat().st_size
+    if max_binary_bytes is None:
+        # Agent tool path: return a descriptor only — inlining base64 the
+        # model cannot use would waste (and risk saturating) the context.
+        return {
+            "path": str(path),
+            "encoding": "base64",
+            "content": "",
+            "total_bytes": total,
+            # Not truncated — the content was deliberately not inlined.
+            "truncated": False,
+            "note": (
+                f"Binary file not inlined ({total} bytes). "
+                "View or download it via the file viewer."
+            ),
+        }
+    with path.open("rb") as fh:
+        payload = fh.read(max_binary_bytes)
+    return {
+        "path": str(path),
+        "content": base64.b64encode(payload).decode("ascii"),
+        "encoding": "base64",
+        "total_bytes": total,
+        "returned_bytes": len(payload),
+        "truncated": len(payload) < total,
+    }
+
+
+def _read_impl(
+    path: Path,
+    offset: int,
+    limit: JsonValue,
+    max_binary_bytes: int | None = None,
+) -> OpResult:
+    """
+    Read a file as UTF-8 text, or as base64-encoded bytes when it is binary.
+
+    The file's first chunk is sniffed for UTF-8 validity (see
+    :func:`_is_binary_file`). Files that look like text are read and returned
+    with the usual line-oriented ``offset``/``limit`` windowing. Files that do
+    *not* (images, archives, fonts, …) cannot be line-windowed, so they are
+    capped by *bytes* instead, reading at most ``max_binary_bytes`` from disk.
+
+    For binary files the behaviour depends on ``max_binary_bytes``:
+
+    * ``None`` (the default, used by the agent ``sys_os_read`` tool) — the
+      base64 payload is **not** inlined. A model cannot decode base64, and a
+      multi-MB blob would saturate the context window, so only a descriptor
+      (``total_bytes`` + a ``note``) is returned.
+    * a positive int (used by the filesystem service that feeds the web
+      viewer / downloads) — up to that many raw bytes are base64-encoded and
+      returned, with ``truncated`` set when the file was larger.
 
     :param path: Absolute path of the file to read.
-    :param offset: 1-based line number to start reading from.
+    :param offset: 1-based line number to start reading from (text only).
     :param limit: Maximum number of lines to return, or ``None`` for no
         limit (return all lines from *offset* to end of file).  Callers
         that want the default agent-tool cap should pass
-        :data:`_DEFAULT_READ_LIMIT` explicitly.
-    :returns: An :class:`OpResult` dict with ``path``, ``content``,
-        ``offset``, ``limit``, ``returned_lines``, and ``total_lines``.
+        :data:`_DEFAULT_READ_LIMIT` explicitly.  Ignored for binary files.
+    :param max_binary_bytes: Byte cap for binary files (see above). ``None``
+        returns a descriptor only.
+    :returns: For text, an :class:`OpResult` with ``encoding="utf-8"``,
+        ``content``, ``offset``, ``limit``, ``returned_lines``, and
+        ``total_lines``.  For binary, ``encoding="base64"``, ``total_bytes``,
+        ``truncated`` and either ``content`` (the base64 string, byte-capped
+        callers) or a ``note`` (descriptor-only callers).
     """
     if offset < 1:
         return {"error": "offset must be >= 1"}
     if limit is not None:
         if not isinstance(limit, int) or limit < 1:
             return {"error": "limit must be >= 1"}
+    if max_binary_bytes is not None and max_binary_bytes < 1:
+        return {"error": "max_binary_bytes must be >= 1"}
 
-    text = path.read_text(encoding="utf-8", errors="replace")
+    if _is_binary_file(path):
+        return _read_binary_impl(path, max_binary_bytes)
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="strict")
+    except UnicodeDecodeError:
+        # The sniffed prefix decoded cleanly but bytes further in did not (a
+        # file that is text up front and binary later). Fall back to the binary
+        # path so we never return garbled text.
+        return _read_binary_impl(path, max_binary_bytes)
+
     lines = text.splitlines(keepends=True)
     start = offset - 1
     effective_limit = len(lines) if limit is None else limit
@@ -974,6 +1341,7 @@ def _read_impl(path: Path, offset: int, limit: JsonValue) -> OpResult:
     return {
         "path": str(path),
         "content": content,
+        "encoding": "utf-8",
         "offset": offset,
         "limit": effective_limit,
         "returned_lines": max(0, resolved_limit - start),
@@ -1087,6 +1455,7 @@ def _shell_impl(
         completed = subprocess.run(
             argv,
             cwd=str(cwd),
+            env=_child_shell_env(),
             text=True,
             capture_output=True,
             timeout=timeout,
@@ -1101,6 +1470,7 @@ def _shell_impl(
         return {
             "stdout": _truncate_output(stdout, "stdout", max_output),
             "stderr": _truncate_output(stderr, "stderr", max_output),
+            "exit_code": None,
             "timed_out": True,
             "error": f"Command timed out after {timeout} seconds",
             "shell": shell_path,
@@ -1162,8 +1532,12 @@ def _is_within(path: Path, root: Path) -> bool:
 
 
 def _shell_argv(shell_path: str, command: str) -> list[str]:
-    shell_name = Path(shell_path).name
-    if shell_name == "bash":
+    shell_name = Path(shell_path).name.lower()
+    if shell_name in ("cmd.exe", "cmd"):
+        return [shell_path, "/c", command]
+    if shell_name in ("powershell.exe", "powershell", "pwsh.exe", "pwsh"):
+        return [shell_path, "-NoProfile", "-Command", command]
+    if shell_name in ("bash", "bash.exe"):
         return [shell_path, "--noprofile", "--norc", "-c", command]
     return [shell_path, "-c", command]
 
@@ -1172,6 +1546,40 @@ def _project_root() -> Path:
     # File lives at omnigent/inner/os_env.py; climb two levels to the
     # repo root that hosts `omnigent/` as a package.
     return Path(__file__).resolve().parents[2]
+
+
+def _same_path(entry: str, root: Path) -> bool:
+    """True when ``entry`` names the same directory as ``root``."""
+    try:
+        return Path(entry).resolve() == root
+    except OSError:
+        return os.path.normpath(entry) == os.path.normpath(str(root))
+
+
+def _child_shell_env() -> dict[str, str]:
+    """
+    Environment for agent shell commands, minus omnigent's own package root.
+
+    The helper prepends its project root to ``PYTHONPATH`` at spawn (see
+    ``_HelperProcessClient._start_locked``) purely so ``python -m
+    omnigent.inner.os_env`` can import omnigent. That entry has no business in
+    the commands the agent runs: under a tool install it points at omnigent's
+    ``site-packages`` and shadows the project venv's own packages on
+    ``sys.path`` (e.g. a 3.12 ``pydantic_core`` failing to load under a 3.13
+    project). Strip only omnigent's entry — any other ``PYTHONPATH`` the caller
+    set is preserved, in order.
+    """
+    env = os.environ.copy()
+    raw = env.get("PYTHONPATH")
+    if not raw:
+        return env
+    root = _project_root()
+    kept = [entry for entry in raw.split(os.pathsep) if not (entry and _same_path(entry, root))]
+    if kept:
+        env["PYTHONPATH"] = os.pathsep.join(kept)
+    else:
+        env.pop("PYTHONPATH", None)
+    return env
 
 
 def _read_config_from_fd(fd: int) -> JsonValue:
@@ -1206,8 +1614,33 @@ def _read_config_from_fd(fd: int) -> JsonValue:
     return cast(JsonValue, json.loads(raw.decode("utf-8")))
 
 
-def _run_helper(config_fd: int) -> int:
-    config = _read_config_from_fd(config_fd)
+def _read_config_from_file(path: str) -> JsonValue:
+    """Read and unlink the helper config file (Windows config-delivery path).
+
+    The parent writes the config to a file in the helper's private tmpdir when
+    inherited-fd delivery is unavailable (Windows has no ``pass_fds``). Unlink
+    it immediately after reading so a secret-bearing config (none on Windows
+    today — egress is POSIX-only) lives on disk only momentarily.
+
+    :param path: Absolute path to the JSON config file.
+    :returns: Decoded JSON value (always a dict in practice).
+    :raises ValueError: When the file is empty or not valid JSON.
+    """
+    config_path = Path(path)
+    try:
+        raw = config_path.read_bytes()
+    finally:
+        with contextlib.suppress(OSError):
+            config_path.unlink()
+    if not raw:
+        raise ValueError(
+            f"os_env helper got empty config file {path!r}; expected a "
+            "JSON object written by the parent before spawn."
+        )
+    return cast(JsonValue, json.loads(raw.decode("utf-8")))
+
+
+def _run_helper(config: JsonValue) -> int:
     if not isinstance(config, dict):
         raise ValueError("Invalid os_env helper config")
 
@@ -1248,6 +1681,7 @@ def _run_helper(config_fd: int) -> int:
 
     cwd = Path(cwd_value)
     os.chdir(cwd)
+
     sandbox = SandboxPolicy.from_jsonable(sandbox_value)
     activate_sandbox(sandbox)
 
@@ -1279,18 +1713,26 @@ def main(argv: list[str] | None = None) -> int:
 
     command = args[0]
     if command == "helper":
-        # Helper expects ``--config-fd N`` exclusively; the legacy
-        # positional ``<base64-json>`` form was removed (the parent
-        # now passes the config via an inherited pipe). Reject
-        # anything else loudly so a stale launcher script doesn't
-        # silently boot a helper with no config.
-        if len(args) != 3 or args[1] != "--config-fd":
-            raise SystemExit("usage: python -m omnigent.inner.os_env helper --config-fd <fd>")
-        try:
-            fd = int(args[2])
-        except ValueError as exc:
-            raise SystemExit(f"os_env helper: invalid --config-fd value {args[2]!r}") from exc
-        return _run_helper(fd)
+        # Config is delivered off-band so the policy/token never lands on argv:
+        # POSIX via an inherited pipe (``--config-fd N``); Windows via a private
+        # file (``--config-file PATH``), since Windows has no ``pass_fds``. The
+        # legacy positional ``<base64-json>`` form was removed (it leaked the
+        # policy onto the command line). Reject anything else loudly so a stale
+        # launcher script doesn't silently boot a helper with no config.
+        if len(args) != 3 or args[1] not in ("--config-fd", "--config-file"):
+            raise SystemExit(
+                "usage: python -m omnigent.inner.os_env helper "
+                "(--config-fd <fd> | --config-file <path>)"
+            )
+        if args[1] == "--config-fd":
+            try:
+                fd = int(args[2])
+            except ValueError as exc:
+                raise SystemExit(f"os_env helper: invalid --config-fd value {args[2]!r}") from exc
+            config = _read_config_from_fd(fd)
+        else:
+            config = _read_config_from_file(args[2])
+        return _run_helper(config)
 
     if command == "launch":
         if len(args) < 3:

@@ -15,6 +15,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.conftest import switch_markdown_view_mode
+
 # ---------------------------------------------------------------------------
 # Test constants
 # ---------------------------------------------------------------------------
@@ -123,8 +125,8 @@ def test_markdown_renders_rich_constructs_and_source_toggle(
         page.get_by_role("button", name=f"Close {_MARKDOWN_FILE_PATH}", exact=True).first
     ).to_be_visible()
 
-    # Markdown defaults to the rich-text editor; each construct renders as its
-    # semantic HTML element.
+    # Markdown opens in the rich-text editor by default, where each construct
+    # renders as its semantic HTML element.
     editor = file_viewer.locator("[contenteditable='true']")
     expect(editor).to_be_visible(timeout=10_000)
     expect(editor.locator("h1")).to_contain_text("Rich Design Document")
@@ -141,15 +143,15 @@ def test_markdown_renders_rich_constructs_and_source_toggle(
     # Parsed, not dumped verbatim: the heading text is "Goals", never "## Goals".
     expect(editor.locator("h2").filter(has_text="Goals")).not_to_contain_text("##")
 
-    # Source toggle: raw markdown becomes visible, no contenteditable editor.
-    file_viewer.get_by_role("button", name="Source view").click()
+    # Source view: raw markdown becomes visible, no contenteditable editor.
+    switch_markdown_view_mode(page, file_viewer, "Source")
     expect(file_viewer.locator("[contenteditable='true']")).to_have_count(0)
     expect(file_viewer.get_by_text("## Goals", exact=False)).to_be_visible(timeout=10_000)
     expect(file_viewer.get_by_text("```python", exact=False)).to_be_visible()
     expect(file_viewer.get_by_text("| Option | Latency |", exact=False)).to_be_visible()
 
-    # Toggle back to the rich editor.
-    file_viewer.get_by_role("button", name="Rich text editor").click()
+    # Switch back to the rich editor.
+    switch_markdown_view_mode(page, file_viewer, "Edit")
     editor = file_viewer.locator("[contenteditable='true']")
     expect(editor).to_be_visible(timeout=10_000)
     expect(editor.locator("h1")).to_contain_text("Rich Design Document")

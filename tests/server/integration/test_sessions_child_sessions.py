@@ -9,10 +9,11 @@ through the spawn workflow) — the route depends only on
 and the relay-fed ``_session_status_cache``, so direct seeding gives
 fast, deterministic coverage of every response field.
 
-The tasks table has been removed. ``current_task_id``, ``current_task_status``,
-and ``agent_name`` (previously derived from task rows) are now always
-``None``. ``agent_id`` is populated from the conversation row's
-``agent_id`` column.
+The tasks table has been removed. ``current_task_id`` and ``agent_name``
+(previously derived from task rows) are now always ``None``.
+``current_task_status`` is derived from session lifecycle state when
+available, and is otherwise ``None``. ``agent_id`` is populated from the
+conversation row's ``agent_id`` column.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ import yaml
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.routes.sessions import routes_events as routes_events_module
 from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -97,7 +99,7 @@ def _seed_child(
     ``agent_name`` fields in the summary are always ``None``.
 
     :param conv_store: Store for the child conversation.
-    :param parent_id: Parent conversation id, e.g. ``"conv_parent1"``.
+    :param parent_id: Parent conversation id, e.g. ``"0c4b962f26d3fb76dce69d9dade142f5"``.
     :param title: Sub-agent title in the canonical
         ``"{agent_type}:{session_name}"`` format,
         e.g. ``"researcher:auth"``.
@@ -120,7 +122,7 @@ async def test_child_sessions_404_for_nonexistent_session(
     client: httpx.AsyncClient,
 ) -> None:
     """Route returns 404 when the parent session does not exist."""
-    resp = await client.get("/v1/sessions/conv_nonexistent/child_sessions")
+    resp = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/child_sessions")
     assert resp.status_code == 404
 
 
@@ -206,6 +208,7 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     assert row["agent_name"] is None
     assert row["current_task_id"] is None
     assert row["current_task_status"] is None
+    assert row["last_task_error"] is None
     # No cache entry → busy=False.
     assert row["busy"] is False
 
@@ -215,6 +218,51 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     # No outstanding elicitations → 0 (the index is empty for a freshly
     # seeded child that never published an elicitation_request).
     assert row["pending_elicitations_count"] == 0
+
+
+async def test_child_sessions_surfaces_durable_failure_error(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A child with runner-owned failure labels is visibly failed.
+
+    Terminal/native harnesses can fail before a transcript item exists. The
+    session-status relay persists that failure as labels; the child summary
+    must project them as typed ``last_task_error`` so clients do not parse
+    internal labels or render the row as idle.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="researcher:auth",
+        agent_id=session["agent_id"],
+    )
+    conv_store.set_labels(
+        child.id,
+        {
+            sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "required_terminal_exited",
+            sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: (
+                "Required terminal exited unexpectedly"
+            ),
+        },
+    )
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+
+    assert resp.status_code == 200
+    row = resp.json()["data"][0]
+    assert row["busy"] is False
+    assert row["current_task_status"] == "failed"
+    assert row["last_task_error"] == {
+        "code": "required_terminal_exited",
+        "message": "Required terminal exited unexpectedly",
+    }
 
 
 # ── Pending elicitation count ─────────────────────────────
@@ -560,6 +608,55 @@ async def test_child_sessions_busy_reflects_relay_status_cache(
         assert resp.status_code == 200
         row = resp.json()["data"][0]
         assert row["busy"] is expected_busy
+    finally:
+        sessions_module._session_status_cache.pop(child.id, None)
+
+
+@pytest.mark.parametrize(
+    ("cached_status", "expected_task_status"),
+    [
+        ("running", "in_progress"),
+        ("waiting", "in_progress"),
+        ("idle", "completed"),
+        ("failed", "failed"),
+    ],
+)
+async def test_child_sessions_current_task_status_reflects_relay_status_cache(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    cached_status: str,
+    expected_task_status: str,
+) -> None:
+    """
+    ``current_task_status`` mirrors the child lifecycle cache.
+
+    The REST snapshot should use the same public task-status vocabulary as
+    live ``session.child_session.updated`` fan-out events: active children
+    are ``in_progress``, idle children are ``completed``, and failed children
+    are ``failed``.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    :param cached_status: Status value to inject into the cache.
+    :param expected_task_status: Expected ``current_task_status`` in the summary.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="researcher:auth",
+        agent_id=session["agent_id"],
+    )
+
+    sessions_module._session_status_cache[child.id] = cached_status
+    try:
+        resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+        assert resp.status_code == 200
+        row = resp.json()["data"][0]
+        assert row["current_task_status"] == expected_task_status
     finally:
         sessions_module._session_status_cache.pop(child.id, None)
 
@@ -1048,7 +1145,7 @@ def _bundle_with_harnessed_subagents(name: str, sub_agents: list[dict[str, Any]]
 
     ``tests.server.helpers.build_agent_bundle`` writes sub-agent configs
     without an ``executor`` block, so it can't express a native harness.
-    This minimal builder writes ``agents/<name>/config.yaml`` with the
+    This minimal builder writes ``agents/<dir>/config.yaml`` with the
     given ``harness`` so the create-session path can resolve a native
     sub-agent's harness from the parent bundle.
 
@@ -1172,6 +1269,11 @@ async def test_native_subagent_session_stamps_terminal_ui_labels(
             {"yolo": True},
             ["--dangerously-bypass-approvals-and-sandbox"],
         ),
+        (
+            "cursor-native",
+            {"yolo": True},
+            ["--yolo"],
+        ),
     ],
 )
 async def test_native_subagent_yolo_args_derived_from_trusted_spec(
@@ -1185,11 +1287,12 @@ async def test_native_subagent_yolo_args_derived_from_trusted_spec(
 
     The worker sub-agent's own bundle declares its full-bypass intent
     (``permission_mode: bypassPermissions`` for claude-native,
-    ``yolo: true`` for codex-native). On a sub-agent create, the server
-    derives the matching flag list from that trusted, server-loaded spec
-    and persists it as the child session's ``terminal_launch_args`` —
-    which the runner appends to the claude / codex argv so the headless
-    worker can edit without stalling on an ApprovalCard.
+    ``yolo: true`` for codex-native / cursor-native). On a sub-agent create,
+    the server derives the matching flag list from that trusted,
+    server-loaded spec and persists it as the child session's
+    ``terminal_launch_args`` — which the runner appends to the native CLI
+    argv so the headless worker can edit without stalling on an
+    ApprovalCard.
 
     A failure here means the translation seam regressed and the worker
     would launch in its default prompting mode (and hang headless).
@@ -1252,6 +1355,41 @@ async def test_native_subagent_yolo_args_reject_overlong_spec_value(
     error = resp.json()["error"]
     assert error["code"] == "invalid_input"
     assert "invalid terminal_launch_args in sub-agent spec" in error["message"]
+
+
+async def test_subagent_create_rejects_undeclared_name(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A ``sub_agent_name`` the parent's spec does not declare fails the create.
+
+    The downstream spec-swap sites are all guarded by ``if ... is not None``
+    with no ``else``: a name that resolves to nothing would leave the
+    parent's spec, workdir, harness and instructions in place and boot the
+    child as a full clone of the parent — silently escalating a worker to
+    the orchestrator's capability and instruction surface. The create route
+    must reject the undeclared name up front (404) so nothing is persisted,
+    mirroring normal ``sys_session_send`` dispatch and the AGENTSPEC.md
+    contract that unlisted names are rejected.
+    """
+    parent = await _create_parent_with_subagents(
+        client,
+        name="orch-undeclared-subagent",
+        sub_agents=[{"name": "impl", "harness": "claude-native"}],
+    )
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": parent["agent_id"],
+            "parent_session_id": parent["session_id"],
+            "title": "ghost:task",
+            "sub_agent_name": "does-not-exist",
+        },
+    )
+    assert resp.status_code == 404, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "not_found"
+    assert "does-not-exist" in error["message"]
 
 
 @pytest.mark.parametrize(
@@ -1389,7 +1527,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
         """
         Route the native child message to the fake runner.
 
-        :param session_id: Session being routed, e.g. ``"conv_child"``.
+        :param session_id: Session being routed, e.g. ``"ff5cac23d0beb79fad914046049f32ff"``.
         :param runner_router: Real runner router, unused.
         :returns: The fake runner client.
         """
@@ -1426,6 +1564,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
                 "terminal": expected_terminal,
                 "session_key": "main",
                 "ensure_native_terminal": True,
+                "persist_resource_event": True,
             },
         },
         {
@@ -1507,7 +1646,7 @@ async def test_multipart_create_with_parent_links_child(
     # The created agent identifiers prove the response contract the
     # runner's bundle-mode handle depends on; a missing/empty agent_id
     # would make sys_session_create fail loud on the runner side.
-    assert body["agent_id"].startswith("ag_")
+    assert len(body["agent_id"]) == 32
     assert body["agent_name"] == "bundle-child"
 
     snap = await client.get(f"/v1/sessions/{child_id}")
@@ -1538,7 +1677,439 @@ async def test_multipart_create_with_unknown_parent_404s(
     bundle = build_agent_bundle(name="bundle-orphan")
     resp = await client.post(
         "/v1/sessions",
-        data={"metadata": json.dumps({"parent_session_id": "conv_missing"})},
+        data={"metadata": json.dumps({"parent_session_id": "5eca720dc2bc6cdc3a99028d7bd0f917"})},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
     )
     assert resp.status_code == 404, resp.text
+
+
+async def _create_native_child(client: httpx.AsyncClient, name: str) -> dict[str, Any]:
+    """
+    Create a claude-native sub-agent child under a fresh parent.
+
+    :param client: The test HTTP client.
+    :param name: Unique parent agent name for this test.
+    :returns: The created child session JSON.
+    """
+    parent = await _create_parent_with_subagents(
+        client,
+        name=name,
+        sub_agents=[{"name": "impl", "harness": "claude-native"}],
+    )
+    child_resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": parent["agent_id"],
+            "parent_session_id": parent["session_id"],
+            "title": "impl:task-1",
+            "sub_agent_name": "impl",
+        },
+    )
+    assert child_resp.status_code == 201, child_resp.text
+    return child_resp.json()
+
+
+async def test_subagent_idle_forward_recovers_via_parent_when_child_runner_stale(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A sub-agent ``idle`` whose direct forward 503s is re-delivered via recovery.
+
+    Reproduces the production hang's server edge: the child's pinned runner is
+    gone (direct ``_forward_session_change_to_runner`` returns ``None``), so the
+    terminal-status branch must invoke
+    ``_recover_subagent_status_forward_via_parent`` and, when it lands, accept
+    the event (``202`` — the parent gets the child result) instead of the old
+    hard ``503`` that left the parent hanging.
+    """
+    child = await _create_native_child(client, name="orch-recover-ok")
+
+    async def _forward_none(*_args: Any, **_kwargs: Any) -> None:
+        """Child's pinned runner is unreachable — the direct forward fails."""
+        return
+
+    recovered_for: list[str] = []
+
+    async def _recover_spy(child_conv: Any, *_args: Any, **_kwargs: Any) -> Any:
+        """Stand in for recovery: record the child and report a delivered 202."""
+        recovered_for.append(child_conv.id)
+        return sessions_module._RunnerForwardResult(status_code=202, body="")
+
+    monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_none)
+    monkeypatch.setattr(
+        sessions_module, "_recover_subagent_status_forward_via_parent", _recover_spy
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={"type": "external_session_status", "data": {"status": "idle"}},
+    )
+
+    # 202 Accepted is the endpoint's success code; the body confirms the event
+    # was handled (not the old 503 that stranded the parent).
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+    # Recovery was invoked for THIS child (the stale-binding heal path).
+    assert recovered_for == [child["id"]]
+
+
+async def test_subagent_background_task_count_still_delivers_to_parent(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lingering background shell must not strand the parent orchestrator.
+
+    Regression for the parent-orchestrator hang. The ``Stop`` turn-end edge
+    carries the background-shell count, and the terminal-delivery branch fires
+    only for ``idle``/``failed`` — so the edge has to stay ``idle`` and let the
+    count ride alongside. (It used to be relabeled to ``waiting`` for the
+    spinner's sake, which skipped delivery and made the parent wait forever;
+    the spinner now stays lit off the count instead.)
+    """
+    child = await _create_native_child(client, name="orch-bg-waiting")
+
+    async def _forward_none(*_args: Any, **_kwargs: Any) -> None:
+        """Force the direct forward to miss so delivery takes the recovery path."""
+        return
+
+    recovered_for: list[str] = []
+
+    async def _recover_spy(child_conv: Any, *_args: Any, **_kwargs: Any) -> Any:
+        recovered_for.append(child_conv.id)
+        return sessions_module._RunnerForwardResult(status_code=202, body="")
+
+    monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_none)
+    monkeypatch.setattr(
+        sessions_module, "_recover_subagent_status_forward_via_parent", _recover_spy
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "idle", "background_task_count": 1},
+        },
+    )
+
+    # A positive count does not suppress delivery: the terminal-status branch
+    # ran for THIS child (recovery invoked, 202 Accepted) rather than silently
+    # skipping and stranding the parent.
+    assert resp.status_code == 202, resp.text
+    assert recovered_for == [child["id"]]
+
+
+async def test_subagent_idle_forward_503s_when_recovery_also_fails(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When recovery cannot reach a live parent runner either, the 503 is preserved.
+
+    The runner re-posts on a 503, so failing here (rather than acking a
+    delivery that never happened) keeps the at-least-once contract intact.
+    """
+    child = await _create_native_child(client, name="orch-recover-fail")
+
+    async def _forward_none(*_args: Any, **_kwargs: Any) -> None:
+        """Both the direct forward and (below) recovery cannot reach a runner."""
+        return
+
+    async def _recover_none(*_args: Any, **_kwargs: Any) -> None:
+        """Recovery also fails to resolve a live parent runner."""
+        return
+
+    monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", _forward_none)
+    monkeypatch.setattr(
+        sessions_module, "_recover_subagent_status_forward_via_parent", _recover_none
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={"type": "external_session_status", "data": {"status": "idle"}},
+    )
+
+    assert resp.status_code == 503, resp.text
+
+
+# ── message-send stale-runner heal (issue #3067) ─────────────────────────────
+
+
+async def test_subagent_message_heals_stale_runner_binding_via_parent(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Sending a message to a sub-agent with a stale runner_id succeeds when the
+    parent has a live replacement runner.
+
+    Regression for #3067: the message-send path previously returned a permanent
+    503 for any sub-agent whose runner had idle-timed-out, even while the
+    parent's replacement runner was healthy.  After the fix the path calls
+    ``_heal_subagent_runner_binding_via_parent``, which rebinds the child's DB
+    row to the parent's live runner and returns the runner client, allowing
+    normal message dispatch to proceed.
+    """
+    child = await _create_native_child(client, name="msg-heal-ok")
+
+    forwarded: list[dict[str, Any]] = []
+
+    def _runner_handler(request: httpx.Request) -> httpx.Response:
+        forwarded.append({"path": request.url.path, "body": json.loads(request.content)})
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_runner_handler),
+        base_url="http://runner",
+    )
+
+    # _get_runner_client returns None on the first call (the child's stale
+    # runner_id resolves nothing) and the fake runner on subsequent calls
+    # (the heal resolved the parent's live runner).
+    call_count = 0
+
+    async def _runner_client_stub(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient | None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return None
+        return fake_runner
+
+    healed_for: list[str] = []
+
+    async def _heal_spy(child_conv: Any, *_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        healed_for.append(child_conv.id)
+        return fake_runner
+
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _runner_client_stub)
+    monkeypatch.setattr(
+        routes_events_module, "_heal_subagent_runner_binding_via_parent", _heal_spy
+    )
+
+    async def _no_init(*_a: Any, **_k: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(routes_events_module, "_ensure_runner_session_initialized", _no_init)
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+
+    assert resp.status_code in {200, 202}, resp.text
+    assert healed_for == [child["id"]], "heal was not invoked for the stale child"
+
+
+async def test_subagent_message_503s_when_heal_finds_no_live_ancestor(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When both the child's runner and the parent runner are unavailable, the
+    message-send path still returns 503 — recovery must not silently pick an
+    unrelated runner.
+    """
+    child = await _create_native_child(client, name="msg-heal-no-ancestor")
+
+    async def _runner_none(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _heal_none(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _runner_none)
+    monkeypatch.setattr(
+        routes_events_module, "_heal_subagent_runner_binding_via_parent", _heal_none
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+
+    assert resp.status_code == 503, resp.text
+
+
+async def test_non_subagent_session_not_healed_via_parent(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A top-level session with host_id=None (e.g. CLI-launched) is never treated
+    as a recoverable sub-agent child — the heal path is guarded to
+    ``kind == "sub_agent"`` only.
+    """
+    # Create a plain top-level session (no parent).
+    agent = await create_test_agent(client, name="msg-heal-toplevel")
+    session_resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"]},
+    )
+    assert session_resp.status_code == 201, session_resp.text
+    session_id = session_resp.json()["id"]
+
+    heal_called: list[bool] = []
+
+    async def _heal_spy(*_args: Any, **_kwargs: Any) -> None:
+        heal_called.append(True)
+        return
+
+    async def _runner_none(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _runner_none)
+    monkeypatch.setattr(
+        routes_events_module, "_heal_subagent_runner_binding_via_parent", _heal_spy
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert not heal_called, "heal must not run for a top-level session"
+
+
+async def test_sdk_subagent_heal_skips_session_init(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    For SDK (non-native) sub-agents, message-send after heal must NOT call
+    ``_ensure_runner_session_initialized``.
+
+    SDK sub-agent sessions are loaded in-process by the runner on startup; the
+    parent's live runner already holds the child's session state. Calling
+    ``_ensure_runner_session_initialized`` would be a spurious timeout at best.
+    This test pins the contract: the heal path sets
+    ``_runner_needs_session_init = False`` for non-native harnesses.
+    """
+    parent = await _create_parent_with_subagents(
+        client,
+        name="msg-heal-sdk-no-init",
+        sub_agents=[{"name": "impl", "harness": "claude-sdk"}],
+    )
+    child_resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": parent["agent_id"],
+            "parent_session_id": parent["session_id"],
+            "title": "impl:task-sdk",
+            "sub_agent_name": "impl",
+        },
+    )
+    assert child_resp.status_code == 201, child_resp.text
+    child = child_resp.json()
+
+    forwarded: list[dict[str, Any]] = []
+
+    def _runner_handler(request: httpx.Request) -> httpx.Response:
+        forwarded.append({"path": request.url.path})
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_runner_handler),
+        base_url="http://runner",
+    )
+
+    async def _heal_spy(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        return fake_runner
+
+    init_called: list[bool] = []
+
+    async def _init_spy(*_a: Any, **_k: Any) -> bool:
+        init_called.append(True)
+        return False
+
+    async def _runner_none(*_a: Any, **_k: Any) -> None:
+        return None
+
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _runner_none)
+    monkeypatch.setattr(
+        routes_events_module, "_heal_subagent_runner_binding_via_parent", _heal_spy
+    )
+    monkeypatch.setattr(routes_events_module, "_ensure_runner_session_initialized", _init_spy)
+
+    resp = await client.post(
+        f"/v1/sessions/{child['id']}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+
+    assert resp.status_code in {200, 202}, resp.text
+    assert not init_called, (
+        "_ensure_runner_session_initialized must not be called for SDK sub-agents after heal"
+    )
+
+
+# ── Promotion (forking a child) ───────────────────────────
+
+
+async def test_fork_of_child_promotes_it_into_the_sidebar(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Forking a sub-agent yields a session the sidebar lists.
+
+    This is the promotion path end to end. The sidebar asks for
+    ``kind="default"``, which is derived from parent-nullness, so the
+    fork only surfaces there if the copy is genuinely parentless — and
+    the source has to stay put, since promotion copies rather than
+    moves the child out of its parent's tree.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    parent = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=parent["id"],
+        title="researcher:auth",
+        agent_id=parent["agent_id"],
+    )
+
+    resp = await client.post(f"/v1/sessions/{child.id}/fork", json={"title": "Promoted"})
+    assert resp.status_code == 201, f"promoting a sub-agent failed: {resp.text}"
+    promoted = resp.json()
+
+    assert promoted["id"] != child.id, "promotion must produce a new session"
+    assert promoted["parent_session_id"] is None, (
+        f"promoted session must have no parent, got {promoted['parent_session_id']!r}"
+    )
+    assert promoted["kind"] == "default", (
+        f"promoted session must not read as a sub-agent, got {promoted['kind']!r}"
+    )
+
+    # The sidebar's own query (default kind) must now include it.
+    listing = await client.get("/v1/sessions")
+    assert listing.status_code == 200, listing.text
+    listed = {row["id"] for row in listing.json()["data"]}
+    assert promoted["id"] in listed, (
+        f"promoted session {promoted['id']} missing from the sidebar list {listed}"
+    )
+    assert child.id not in listed, "the source child must stay out of the sidebar"
+
+    # The source keeps its place under the parent, and the promoted copy
+    # never joins it there.
+    children = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
+    assert children.status_code == 200, children.text
+    child_ids = {row["id"] for row in children.json()["data"]}
+    assert child_ids == {child.id}, (
+        f"parent's children must be exactly the untouched source, got {child_ids}"
+    )

@@ -33,24 +33,29 @@ import json
 import logging
 import os
 import pathlib
-import shutil
-import signal
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from contextlib import contextmanager, suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
 
+from omnigent import model_catalog
+from omnigent._platform import resolve_cli_binary, stable_user_id
+from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
+from omnigent.inner.hook_scripts import subagent_router
+from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
+from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_anyio_subprocess_transport
+from .async_utils import run_sync_on_thread
 from .claude_gateway_shim import DATABRICKS_CLAUDE_ADAPTIVE_THINKING_PREFIXES, ClaudeGatewayShim
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
@@ -67,9 +72,12 @@ from .executor import (
     ToolSpec,
     TurnComplete,
     classify_tool_result,
+    describe_exception,
 )
+from .native_attachments import unresolved_attachment_marker
 from .sandbox import (
     create_exec_launcher,
+    get_backend,
     resolve_sandbox,
     with_additional_read_roots,
     with_additional_write_files,
@@ -83,6 +91,14 @@ logger = logging.getLogger(__name__)
 # unset. Not Databricks-specific: the same fallback applies to any gateway
 # producer (Databricks AI gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
+_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
+
+# Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
+# request headers. The Databricks AI gateway only serves Claude requests
+# in coding-agent mode when this header is present, so the Databricks
+# gateway env (not the generic-provider gateway env) must carry it.
+_ANTHROPIC_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
+_DATABRICKS_CODING_AGENT_HEADER = "x-databricks-use-coding-agent-mode: true"
 
 # ---------------------------------------------------------------------------
 # TypeAliases for Omnigent JSON-shaped boundary values. The SDK exchanges
@@ -106,7 +122,7 @@ ToolExecutor: TypeAlias = Callable[[str, ToolArgs], Awaitable[ToolResult]]
 
 # Elicitation handler wired in by :class:`ExecutorAdapter`. Kept SDK-agnostic
 # so the adapter does not import ``claude_agent_sdk`` types.
-ElicitationHandler: TypeAlias = Callable[  # type: ignore[explicit-any]
+ElicitationHandler: TypeAlias = Callable[
     [str, ToolArgs],
     Awaitable[bool],
 ]
@@ -123,14 +139,13 @@ SdkOptions: TypeAlias = Any  # type: ignore[explicit-any]
 # ---------------------------------------------------------------------------
 # SDK-private reach Protocols.
 #
-# ``claude_agent_sdk.*`` is listed as ``ignore_missing_imports`` in mypy
-# config, so every SDK-typed value mypy sees is ``Any``. We recover types
-# locally with Protocols for the handful of public and private attributes
-# this executor touches.
+# Some SDK surfaces are dynamic and the lifecycle reaches below its public
+# types. Protocols keep the handful of public and private attributes this
+# executor touches explicit.
 #
 # The private reaches (``_query``, ``_transport``, ``_process``,
-# ``_stderr_task_group``, etc.) are necessary to tear down the CLI
-# subprocess tree when the SDK's own ``disconnect()`` path is unsafe
+# ``_stderr_task`` / ``_stderr_task_group``, etc.) are necessary to tear
+# down the CLI subprocess tree when the SDK's own ``disconnect()`` path is unsafe
 # (different event loop / task) or hangs. The SDK does not expose a
 # supported equivalent, so we treat the private attributes as part of
 # our integration contract and document them here.
@@ -159,6 +174,19 @@ class _CancelScope(Protocol):
 
 class _TaskGroup(Protocol):
     cancel_scope: _CancelScope
+
+
+class _TaskHandle(Protocol):
+    """Private view of the SDK's detached stderr-reader task.
+
+    Current ``claude-agent-sdk`` (>=0.2.x) runs the stderr reader as a
+    single task exposed as ``_stderr_task`` with a ``cancel()`` method;
+    older revs used an anyio task group (``_stderr_task_group``). The
+    executor probes both shapes during force-close, so both are typed
+    optional on ``_ClaudeTransport`` below.
+    """
+
+    def cancel(self) -> None: ...
 
 
 class _ClaudeQuery(Protocol):
@@ -193,6 +221,7 @@ class _ClaudeTransport(Protocol):
     _stdout_stream: _Stream | None
     _stdin_stream: _Stream | None
     _stderr_stream: _Stream | None
+    _stderr_task: _TaskHandle | None
     _stderr_task_group: _TaskGroup | None
     _ready: bool
 
@@ -211,7 +240,11 @@ class _ClaudeClient(Protocol):
 
     async def connect(self) -> None: ...
     async def disconnect(self) -> None: ...
-    async def query(self, prompt: str, session_id: str = ...) -> None: ...
+    async def query(
+        self,
+        prompt: str | AsyncIterator[_JsonObject],
+        session_id: str = "",
+    ) -> None: ...
     async def set_model(self, model: str | None) -> None: ...
     async def interrupt(self) -> None: ...
 
@@ -249,6 +282,7 @@ class _ResultMessageObj(Protocol):
     """Structural view of ``claude_agent_sdk.ResultMessage``."""
 
     result: str | None
+    is_error: bool | None
     usage: dict[str, Any] | None  # type: ignore[explicit-any]
 
 
@@ -261,6 +295,10 @@ class _SystemMessageObj(Protocol):
 
 class _TextBlockObj(Protocol):
     text: str
+
+
+class _ThinkingBlockObj(Protocol):
+    thinking: str
 
 
 class _ToolUseBlockObj(Protocol):
@@ -302,6 +340,7 @@ class _ClaudeSDK(Protocol):
     SystemMessage: type
     ResultMessage: type
     TextBlock: type
+    ThinkingBlock: type
     ToolUseBlock: type
     ToolResultBlock: type
 
@@ -314,6 +353,200 @@ _QUERY_START_TIMEOUT_SECONDS = 30.0
 _STREAM_IDLE_WARN_SECONDS = 600.0
 
 # ── Multimodal content block conversion ──────────────────────
+
+
+def _get_inline_data_uri_info(value: Any) -> tuple[str, int] | None:  # type: ignore[explicit-any]
+    """If ``value`` contains an inline ``data:*;base64,...`` URI, return its
+    ``(media_type, base64_char_count)``; otherwise ``None``.
+
+    A resolved attachment block looks like::
+
+        {"type": "input_image",
+         "filename": "screenshot.png",
+         "image_url": "data:image/png;base64,iVBORw0KGgoAAAANS...=="}   # ~520k chars
+
+    (non-image files carry the same payload under ``file_data`` instead of
+    ``image_url``.) Returns e.g. ``("image/png", 519324)`` — the media type and
+    payload size used to build the compact
+    ``[image: screenshot.png, image/png, 519324 base64 chars]`` placeholder,
+    so the raw base64 never lands in the ``Conversation so far:`` prompt text.
+    """
+    if isinstance(value, str):
+        parsed = _parse_replay_data_uri(value)
+        if parsed is not None:
+            return parsed.media_type, len(parsed.data)
+        return None
+    if isinstance(value, list):
+        for item in value:
+            found = _get_inline_data_uri_info(item)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, dict):
+        for item in value.values():
+            found = _get_inline_data_uri_info(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _redact_inline_base64(value: Any) -> Any:  # type: ignore[explicit-any]
+    """Deep-replace inline base64 attachment payloads with a compact
+    ``[attachment: …]`` marker, recursing through dict/list values. The fallback
+    path for values that reach ``json.dumps`` (nested dicts, non-block content)
+    so a resolver-produced base64 payload does not survive serialization.
+
+    Two shapes are redacted: a whole-string ``data:*;base64,...`` URI (the
+    resolver form under ``image_url`` / ``file_data``), and an Anthropic content
+    block ``{"type": "image"|"document", "source": {"type": "base64", ...}}``
+    (what the ``Read`` tool returns for an image file, carried in a
+    ``function_call_output``). Neither is redacted when it appears as a dict
+    key, tuple member, or substring embedded mid-text (the runner never emits
+    those)."""
+    if isinstance(value, str):
+        parsed = _parse_replay_data_uri(value)
+        if parsed is None:
+            return value
+        return f"[attachment: {parsed.media_type}, {len(parsed.data)} base64 chars]"
+    if isinstance(value, list):
+        return [_redact_inline_base64(item) for item in value]
+    if isinstance(value, dict):
+        source = value.get("source")
+        if (
+            value.get("type") in ("image", "document")
+            and isinstance(source, dict)
+            and source.get("type") == "base64"
+        ):
+            media_type = source.get("media_type") or "application/octet-stream"
+            data = source.get("data")
+            payload_chars = len(data) if isinstance(data, str) else 0
+            kind = "image" if value.get("type") == "image" else "attachment"
+            return {
+                "type": "text",
+                "text": f"[{kind}: {media_type}, {payload_chars} base64 chars]",
+            }
+        return {key: _redact_inline_base64(item) for key, item in value.items()}
+    return value
+
+
+def _text_block(text: str) -> _JsonObject:
+    """Build an Anthropic text content block holding *text*."""
+    return {"type": "text", "text": text}
+
+
+def _coalesce_text_blocks(blocks: list[_JsonObject]) -> list[_JsonObject]:
+    """
+    Merge runs of adjacent text blocks into one newline-joined block.
+
+    Keeps the replayed transcript readable as prose and makes the
+    text-only history render byte-identical to a plain string prompt.
+
+    :param blocks: Anthropic content blocks in transcript order.
+    :returns: The same sequence with consecutive text blocks merged.
+    """
+    merged: list[_JsonObject] = []
+    for block in blocks:
+        if block.get("type") == "text" and merged and merged[-1].get("type") == "text":
+            merged[-1] = _text_block(f"{merged[-1]['text']}\n{block['text']}")
+        else:
+            merged.append(block)
+    return merged
+
+
+def _structured_history_block(block: _JsonObject) -> _JsonObject | None:
+    """
+    Convert a resolved history attachment to a real Anthropic block.
+
+    :param block: A prior-turn content block carrying an inline data URI.
+    :returns: The ``image``/``document`` block, or ``None`` when the block
+        is not a convertible attachment shape — the caller then falls back
+        to the compact text marker rather than dropping the attachment.
+    """
+    if block.get("type") not in ("input_image", "input_file"):
+        return None
+    try:
+        # Covers a malformed data URI and a bad base64 payload alike
+        # (``binascii.Error`` subclasses ``ValueError``).
+        converted = _to_anthropic_content_blocks([block])
+    except ValueError:
+        return None
+    return converted[0] if converted else None
+
+
+def _render_prior_content_blocks(content: object) -> list[_JsonObject]:
+    """Render one prior message's content for the ``Conversation so far:``
+    replay as Anthropic content blocks.
+
+    Why this exists: ``_build_prompt`` only serializes prior history when
+    ``resume_session=False`` — a *fresh* SDK client that must replay existing
+    multimodal history (forked/shared sessions, sub-agents with
+    ``pass_history=True``, or a client restarted mid-session). By that point a
+    historical image/file block's ``file_id`` has already been resolved to a
+    ``data:<media>;base64,...`` URI.
+
+    Those resolved attachments are replayed as **structured** ``image`` /
+    ``document`` blocks, interleaved in order with the surrounding text, so the
+    cold-started client can actually inspect the image instead of reading a
+    description of it. Structured blocks are also what keeps the prompt small:
+    ``json.dumps()``-ing the block flattened the whole base64 payload into
+    prompt TEXT, so the model tokenized the bytes as text rather than counting
+    them as an image — seven ~390KB PNGs expand to ~2.5M tokens, and one real
+    shared session hit a 3.5M-token prompt against a 1M limit.
+
+    Anything that cannot become a structured block never leaks bytes into text.
+    A resolver-produced inline attachment *value* — a whole-string
+    ``data:*;base64,...`` under ``image_url`` / ``file_data``, including nested
+    in dict/list values — is redacted, and an unconvertible attachment falls
+    back to a compact ``[image/attachment: <id>, <media_type>, <N> base64
+    chars]`` marker that preserves *that an attachment was present* without its
+    bytes. An attachment the resolver never inlined renders as the visible
+    "could not be loaded" marker. (This does not attempt to cover non-resolver
+    shapes such as a data URI used as a dict key, a tuple member, or a substring
+    embedded mid-text — the runner never emits those.)
+    """
+    if isinstance(content, str):
+        sanitized = _redact_inline_base64(content)
+        return [_text_block(str(sanitized))]
+    if not isinstance(content, list):
+        return [_text_block(json.dumps(_redact_inline_base64(content), ensure_ascii=True))]
+
+    rendered: list[_JsonObject] = []
+    for raw_block in content:
+        block = cast(_JsonObject, raw_block) if isinstance(raw_block, dict) else None
+        if block is not None:
+            block_type = block.get("type")
+            text = block.get("text")
+            if block_type in ("input_text", "output_text", "text") and isinstance(text, str):
+                rendered.append(_text_block(str(_redact_inline_base64(text))))
+                continue
+
+            inline_data = _get_inline_data_uri_info(block)
+            if inline_data is not None:
+                structured = _structured_history_block(block)
+                if structured is not None:
+                    rendered.append(structured)
+                    continue
+                media_type, payload_chars = inline_data
+                kind = "image" if block_type == "input_image" else "attachment"
+                identifier = block.get("filename") or block.get("file_id") or block_type
+                rendered.append(
+                    _text_block(
+                        f"[{kind}: {identifier}, {media_type}, {payload_chars} base64 chars]"
+                    )
+                )
+                continue
+
+            if block.get("file_id"):
+                # No inline bytes and no resolved payload: the resolver never
+                # inlined this attachment. Serializing the raw block would read
+                # as if the attachment were present; say it was lost instead.
+                rendered.append(_text_block(unresolved_attachment_marker(block)))
+                continue
+
+        rendered.append(
+            _text_block(json.dumps(_redact_inline_base64(raw_block), ensure_ascii=True))
+        )
+    return rendered
 
 
 def _parse_data_uri(uri: str) -> tuple[str, str]:
@@ -333,8 +566,8 @@ def _parse_data_uri(uri: str) -> tuple[str, str]:
 
 
 def _to_anthropic_content_blocks(
-    blocks: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+    blocks: Sequence[object],
+) -> list[_JsonObject]:
     """
     Convert Responses API content blocks to Anthropic Messages
     API content block format.
@@ -350,8 +583,11 @@ def _to_anthropic_content_blocks(
     :param blocks: Responses API content block dicts.
     :returns: Anthropic API content block dicts.
     """
-    result: list[dict[str, Any]] = []
-    for block in blocks:
+    result: list[_JsonObject] = []
+    for raw_block in blocks:
+        if not isinstance(raw_block, dict):
+            raise ValueError("Anthropic content blocks must be objects")
+        block = cast(_JsonObject, raw_block)
         block_type = block.get("type")
         if block_type in ("input_text", "output_text", "text"):
             result.append({"type": "text", "text": block["text"]})
@@ -425,10 +661,10 @@ def _to_anthropic_content_blocks(
 
 
 async def _multimodal_message_iter(
-    content_blocks: list[dict[str, Any]],
+    content_blocks: list[_JsonObject],
     *,
     session_id: str,
-) -> AsyncIterator[dict[str, Any]]:
+) -> AsyncIterator[_JsonObject]:
     """
     Yield a single structured user message dict for the Claude
     SDK's ``AsyncIterable[dict]`` query path.
@@ -455,6 +691,11 @@ async def _multimodal_message_iter(
 # connect hang is sandbox-related vs. inside the binary itself.
 _NO_SANDBOX_ENV = "OMNIGENT_CLAUDE_SDK_NO_SANDBOX"
 
+# Env override for an explicit claude binary, mirroring codex's
+# OMNIGENT_CODEX_PATH. Set this when claude lives on a PATH the host
+# daemon doesn't inherit (e.g. an nvm-managed global bin dir).
+_CLAUDE_PATH_ENV = "OMNIGENT_CLAUDE_PATH"
+
 
 def _sandbox_disabled_by_env() -> bool:
     """``True`` when the diagnostic bypass env var is set to a truthy
@@ -471,27 +712,11 @@ def _sandbox_disabled_by_env() -> bool:
 
 
 def _terminate_process_tree(process: _Process | None) -> None:
-    if process is None or process.returncode is not None:
-        return
-    pid = process.pid
-    if pid is not None:
-        with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGTERM)
-            return
-    with suppress(ProcessLookupError, Exception):
-        process.terminate()
+    _proc.terminate_tree(process)
 
 
 def _kill_process_tree(process: _Process | None) -> None:
-    if process is None or process.returncode is not None:
-        return
-    pid = process.pid
-    if pid is not None:
-        with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGKILL)
-            return
-    with suppress(ProcessLookupError, Exception):
-        process.kill()
+    _proc.kill_tree(process)
 
 
 @contextmanager
@@ -556,8 +781,6 @@ def _best_effort_close(resource: _Stream | _Process) -> None:
 # Default model for the Databricks-profile gateway path (no gateway base URL
 # supplied directly), used when no spec/cfg model is set. On the ucode-cached
 # path the Omnigent producer resolves the model instead (see workflow.py).
-_DATABRICKS_CLAUDE_DEFAULT_MODEL = DATABRICKS_CLAUDE_DEFAULT_MODEL
-
 _CLAUDE_API_KEY_HELPER_ENV_KEY = "OMNIGENT_CLAUDE_API_KEY_HELPER"
 
 
@@ -666,14 +889,95 @@ def _build_mcp_tools(
     return mcp_tools
 
 
-def _find_system_claude() -> str | None:
-    """Find a system-installed ``claude`` CLI binary on PATH.
-
-    Returns the absolute path, or None if not found.  Prefers the system
-    install over the SDK's bundled CLI because the bundled version may be
-    older and send beta flags the Databricks gateway doesn't support.
+def _augment_system_prompt_for_omnigent_mcp_tools(
+    system_prompt: str,
+    tool_schemas: list[ToolSpec],
+) -> str:
     """
-    return shutil.which("claude")
+    Add Claude SDK-specific MCP tool-name guidance to the system prompt.
+
+    Omnigent schemas use bare names such as ``sys_session_send``. The
+    Claude SDK exposes tools from our in-process MCP server to the model
+    as ``mcp__omnigent__<bare_name>``. Bundled agent prompts and skills use
+    bare names because other executors call those directly, so the SDK needs
+    a bridge note to stop the model from trying a non-existent bare tool first.
+    """
+    tool_names = [
+        name for schema in tool_schemas if isinstance((name := schema.get("name")), str) and name
+    ]
+    if not tool_names:
+        return system_prompt
+
+    examples = [
+        name
+        for name in ("sys_session_rename", "sys_session_send", "sys_session_create")
+        if name in tool_names
+    ]
+    if examples:
+        example_text = "; ".join(
+            f"use `mcp__omnigent__{name}` when instructions say `{name}`" for name in examples
+        )
+        note = (
+            "Claude SDK tool naming: Omnigent tools are exposed as MCP tools. "
+            f"{example_text}. For any other Omnigent tool, use "
+            "`mcp__omnigent__<tool_name>` rather than the bare name."
+        )
+    else:
+        note = (
+            "Claude SDK tool naming: Omnigent tools are exposed as MCP tools. "
+            "When instructions mention a bare Omnigent tool name, invoke "
+            "`mcp__omnigent__<tool_name>` rather than the bare name."
+        )
+
+    if not system_prompt:
+        return note
+    return f"{system_prompt.rstrip()}\n\n{note}"
+
+
+def _find_system_claude() -> str | None:
+    """Find a system-installed ``claude`` CLI binary.
+
+    Resolves via the ``OMNIGENT_CLAUDE_PATH`` override, then ``PATH``, then
+    common global install dirs — so an nvm/npm-installed claude off the host
+    daemon's frozen ``PATH`` is still found. Prefers the system install over
+    the SDK's bundled CLI because the bundled version may be older and send
+    beta flags the Databricks gateway doesn't support. Returns the absolute
+    path, or ``None`` if not found.
+    """
+    return resolve_cli_binary("claude", env_var=_CLAUDE_PATH_ENV)
+
+
+# DATABRICKS-PATCH(claude-sdk-live-model-discovery)
+def _resolve_databricks_claude_model(profile: str | None) -> str:
+    """Resolve the launch model from what the workspace serves.
+
+    The bundled MLflow catalog is a third-party listing whose Databricks ids use
+    the legacy ``databricks-`` spelling the gateway now answers with ``501 … Use
+    Unity Catalog model services (v3)``. Resolve from the live Unity Catalog
+    listing as claude-native does, keeping the catalog as the last resort.
+
+    :param profile: Databricks CLI profile backing the gateway.
+    :returns: The model id to launch on.
+    """
+    try:
+        from omnigent.databricks_model_discovery import discover_databricks_claude_catalog
+        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+        creds = resolve_databricks_workspace(profile)
+        families = discover_databricks_claude_catalog(creds.host, creds.token).families
+        # The precedence claude-native itself falls back to.
+        for tier in ("opus", "sonnet", "haiku", "fable"):
+            servable = families.get(tier)
+            if servable:
+                return servable
+    except Exception:  # noqa: BLE001 — the bundled catalog is the last resort
+        logger.warning(
+            "claude-sdk: live Databricks model discovery failed for profile %r; "
+            "falling back to the bundled catalog",
+            profile,
+            exc_info=True,
+        )
+    return model_catalog.resolve_catalog_model("databricks", family="claude").model_id
 
 
 def _resolve_gateway_env(
@@ -721,6 +1025,18 @@ def _resolve_gateway_env(
         corresponding base URL or auth command.
     """
     host = host_override.rstrip("/") if host_override else None
+    if host is None and base_url_override is not None and auth_command_override is not None:
+        # Generic-provider gateway: explicit base_url + auth command,
+        # no Databricks host or profile required (e.g. ApiKeyAuth with
+        # a mock LLM server URL).
+        return {
+            "ANTHROPIC_BASE_URL": base_url_override,
+            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(
+                auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
+            ),
+            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+            _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command_override,
+        }
     if host is None:
         try:
             from .databricks_executor import _read_databrickscfg
@@ -754,45 +1070,44 @@ def _resolve_gateway_env(
         base_url = base_url_override
         auth_command = auth_command_override
 
-    return {
+    gateway_env = {
         "ANTHROPIC_BASE_URL": base_url,
         "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(
             auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
         ),
-        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+        _ANTHROPIC_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
         _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command,
     }
+    # DATABRICKS-PATCH(claude-sdk-gateway-betas)
+    # Blanket-disabling betas makes Claude Code strip `interleaved-thinking`,
+    # after which the Databricks gateway rejects the malformed thinking blocks
+    # with `400 messages.N.content.0.type: Expected 'thinking'`. claude-native
+    # already fixed this by negotiating betas with the gateway instead
+    # (`claude_native.py` CLAUDE_CODE_USE_GATEWAY=1); claude-sdk — the harness
+    # behind Polly and Debby — never got that change. Scope it to a real
+    # Databricks AI Gateway base URL so a generic gateway (or a mock server)
+    # that cannot negotiate betas keeps the original workaround.
+    if is_databricks_ai_gateway_url(base_url):
+        gateway_env["CLAUDE_CODE_USE_GATEWAY"] = "1"
+    else:
+        gateway_env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
+    return gateway_env
 
 
 def _databricks_claude_auth_command(host: str, profile: str | None = None) -> str:
-    """Return the legacy Databricks CLI auth helper command for Claude.
+    """Return the Databricks CLI ``apiKeyHelper`` command for Claude.
 
     :param host: Databricks workspace host, e.g.
         ``"https://example.databricks.com"``.
-    :param profile: Optional ``~/.databrickscfg`` profile name, e.g.
-        ``"oss"``. Preferred over ``--host`` when known: two profiles can
-        share one host, which makes ``databricks auth token --host`` fail
-        ("Use --profile to specify which profile") → empty token → 401.
-        ``--profile`` is always unambiguous.
+    :param profile: Optional ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
+        Preferred over ``--host`` when known; see
+        :func:`~omnigent.inner.databricks_executor.databricks_bearer_token_command`,
+        which owns the command's shape for every harness.
     :returns: Shell command that prints a bearer token.
     """
-    # --profile is unambiguous; --host fails when two profiles share a host.
-    selector = f"--profile {json.dumps(profile)}" if profile else f"--host {json.dumps(host)}"
-    # `--force-refresh` proactively refreshes a still-valid cached token
-    # (guards against a mid-session 401 on long gateway connections) but
-    # only exists in Databricks CLI >= v0.296.0. Probe `--help` and pass it
-    # only when supported: older CLIs reject the unknown flag → empty token
-    # → silent 401. Plain `auth token` still auto-refreshes expired tokens.
-    return (
-        'if [ -n "${DATABRICKS_BEARER:-}" ]; then '
-        'printf "%s\\n" "$DATABRICKS_BEARER"; '
-        "else force=''; "
-        "if databricks auth token --help 2>&1 | grep -q force-refresh; "
-        "then force=--force-refresh; fi; "
-        "env -u DATABRICKS_CONFIG_PROFILE "
-        f"databricks auth token {selector} "
-        "$force --output json | jq -r '.access_token'; fi"
-    )
+    from .databricks_executor import databricks_bearer_token_command
+
+    return databricks_bearer_token_command(host, profile)
 
 
 def _parse_optional_int(value: str | None) -> int | None:
@@ -819,7 +1134,7 @@ def _claude_internal_write_roots() -> list[pathlib.Path]:
         pathlib.Path.home() / ".claude" / "session-env",
         pathlib.Path.home() / ".claude" / "sessions",
         pathlib.Path.home() / ".npm" / "_logs",
-        pathlib.Path(tempfile.gettempdir()) / f"claude-{os.getuid()}",
+        pathlib.Path(tempfile.gettempdir()) / f"claude-{stable_user_id()}",
     ]
     for root in roots:
         root.mkdir(parents=True, exist_ok=True)
@@ -829,8 +1144,37 @@ def _claude_internal_write_roots() -> list[pathlib.Path]:
 def _claude_internal_write_files() -> list[pathlib.Path]:
     """Exact files the Claude CLI updates outside its writable roots."""
 
-    path = pathlib.Path.home() / ".claude.json"
-    return [path] if path.exists() else []
+    # .credentials.json holds the Claude CLI's OAuth token on Linux.
+    candidates = [
+        pathlib.Path.home() / ".claude.json",
+        pathlib.Path.home() / ".claude" / ".credentials.json",
+    ]
+    return [path for path in candidates if path.exists()]
+
+
+def _resolve_sandbox_cwd(spec_cwd: str | None) -> pathlib.Path:
+    """Resolve the sandbox root, rooting relative paths at the session
+    working folder rather than the runner daemon's process cwd.
+
+    A relative ``os_env.cwd`` — notably the default ``"."`` — resolved
+    against ``os.getcwd()`` lands on the runner daemon's ``$HOME`` when
+    no workspace is selected. That both roots the sandbox at the whole
+    home dir and disagrees with the tmux terminal, which uses
+    ``OMNIGENT_RUNNER_WORKSPACE``. Prefer that workspace as the base so
+    the two agree; fall back to the process cwd only when it is unset.
+    An absolute ``spec_cwd`` is honored verbatim.
+
+    :param spec_cwd: The spec's ``os_env.cwd``, or ``None``.
+    :returns: The resolved, absolute sandbox root.
+    """
+    base = os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or os.getcwd()
+    if spec_cwd:
+        path = pathlib.Path(spec_cwd)
+        if not path.is_absolute():
+            path = pathlib.Path(base) / path
+    else:
+        path = pathlib.Path(base)
+    return path.resolve(strict=False)
 
 
 def prepare_claude_cli_path(
@@ -838,6 +1182,15 @@ def prepare_claude_cli_path(
     spec: OSEnvSpec | None,
 ) -> PreparedClaudeCli:
     """Wrap the Claude CLI in the agent's configured sandbox when possible.
+
+    Degrades instead of crashing: when the sandbox can't be resolved or
+    the wrap can't be built (unsupported platform, un-grantable
+    interpreter layout, profile-size overflow), the CLI is returned
+    unwrapped with native tools disabled — the same confinement story
+    as ``OMNIGENT_CLAUDE_SDK_NO_SANDBOX``: file/shell access still goes
+    through the independently sandboxed ``sys_os_*`` helpers (which
+    fail closed on their own), and only the CLI supervisor process
+    runs unwrapped.
 
     :param real_cli_path: Absolute path to the system-installed Claude CLI
         binary, or ``None`` when no CLI is available.
@@ -857,8 +1210,18 @@ def prepare_claude_cli_path(
     if sandbox_spec.type == "none":
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=True)
 
-    cwd = pathlib.Path(spec.cwd or os.getcwd()).resolve(strict=False)
-    sandbox = resolve_sandbox(spec, cwd)
+    cwd = _resolve_sandbox_cwd(spec.cwd)
+    try:
+        sandbox = resolve_sandbox(spec, cwd)
+    except (OSError, NotImplementedError) as exc:
+        logger.warning(
+            "Cannot resolve the configured sandbox for the Claude CLI wrap; "
+            "running the CLI unwrapped with native tools disabled "
+            "(file/shell access stays confined to the sandboxed sys_os_* "
+            "tools): %s",
+            exc,
+        )
+        return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
     if not sandbox.active:
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
     if not sandbox.allow_network:
@@ -869,6 +1232,26 @@ def prepare_claude_cli_path(
     sandbox = with_additional_read_roots(sandbox, _claude_internal_write_roots())
     sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
     sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
+    # Dry-run the spawn-time wrap now, while degrading is still possible.
+    # The real wrap happens later inside run_launcher, where an OSError
+    # (un-grantable interpreter layout, profile-size cap, cwd-scan
+    # overflow) kills the launcher and surfaces as an opaque connect
+    # timeout. By run time native tools are already enabled, so this is
+    # the last point where "skip the wrap" is still safe.
+    try:
+        get_backend(sandbox.backend_type).wrap_launcher_argv(
+            [sys.executable, "-c", "pass"], sandbox, cwd, target=real_cli_path
+        )
+    except OSError as exc:
+        logger.warning(
+            "The configured sandbox cannot wrap the Claude CLI at %s; "
+            "running it unwrapped with native tools disabled (file/shell "
+            "access stays confined to the sandboxed sys_os_* tools). "
+            "Remediation hints in the underlying error: %s",
+            real_cli_path,
+            exc,
+        )
+        return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
     return PreparedClaudeCli(
         cli_path=create_exec_launcher(real_cli_path, sandbox),
         enable_native_tools=True,
@@ -909,7 +1292,7 @@ def prepare_tight_cli_process_path(
         ),
     )
     try:
-        resolved_cwd = pathlib.Path(cwd or os.getcwd()).resolve(strict=False)
+        resolved_cwd = _resolve_sandbox_cwd(cwd)
         sandbox = resolve_sandbox(spec, resolved_cwd)
     except (OSError, NotImplementedError) as exc:
         logger.warning(
@@ -917,12 +1300,12 @@ def prepare_tight_cli_process_path(
             exc,
         )
         return real_cli_path
-
-    if not sandbox.active:
-        return real_cli_path
-    sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
-    sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
-    return create_exec_launcher(real_cli_path, sandbox)
+    else:
+        if not sandbox.active:
+            return real_cli_path
+        sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
+        sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
+        return create_exec_launcher(real_cli_path, sandbox)
 
 
 @dataclass(frozen=True)
@@ -1032,7 +1415,7 @@ class ClaudeSDKExecutor(Executor):
         cwd: str | None = None,
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
-        permission_mode: str = "bypassPermissions",
+        permission_mode: str = "auto",
         gateway: bool = False,
         databricks_profile: str | None = None,
         gateway_host: str | None = None,
@@ -1056,8 +1439,8 @@ class ClaudeSDKExecutor(Executor):
                 sandbox the Claude CLI process itself on supported Linux
                 hosts, but does not enable native OS tools.
             model: Override the model name.
-            permission_mode: SDK permission mode (default: bypassPermissions
-                so the agent can run autonomously).
+            permission_mode: SDK permission mode (default: auto
+                so the agent runs autonomously with background safety checks).
             gateway: If True, route through a vendor-neutral gateway
                 (base URL + bearer-token command + model). Enables the
                 gateway path regardless of which producer fed it (the
@@ -1090,7 +1473,7 @@ class ClaudeSDKExecutor(Executor):
                 ships its own ``skills/`` directory. Used to expose
                 bundled skills to Claude via ``--plugin-dir <bundle>``
                 (the SDK's plugin convention loads SKILL.md files from
-                ``<plugin>/skills/<name>/``). ``None`` for agents
+                ``<plugin>/skills/<dir>/``). ``None`` for agents
                 without a bundled-skill directory — the harness skips
                 the plugin-dir wiring.
             agent_name: Optional agent display name. When *bundle_dir*
@@ -1167,6 +1550,9 @@ class ClaudeSDKExecutor(Executor):
         self._clients: dict[str, _ClaudeClientState] = {}
         # Session keys whose Claude harness process crashed and must not be reused.
         self._crashed_sessions: dict[str, str] = {}
+        # Force-close tasks for clients evicted on turn cancellation, kept
+        # referenced so they are not GC'd mid-close.
+        self._cancel_close_tasks: set[asyncio.Task[None]] = set()
 
         # Prefer system-installed claude over the SDK's bundled CLI.
         # The bundled CLI may be older and send beta flags that the
@@ -1215,19 +1601,21 @@ class ClaudeSDKExecutor(Executor):
         # construction time.
         self._extra_env: dict[str, str] = {}
         if gateway:
-            self._extra_env = _resolve_gateway_env(
+            gateway_env = _resolve_gateway_env(
                 databricks_profile,
                 host_override=self._gateway_host,
                 base_url_override=base_url_override,
                 auth_command_override=self._gateway_auth_command,
                 auth_refresh_interval_ms=self._gateway_auth_refresh_interval_ms,
             )
-            if not self._extra_env:
+            if not gateway_env:
                 raise OSError(
                     "ClaudeSDKExecutor(gateway=True) requires gateway credentials "
                     "from the gateway base URL / auth command or a valid "
                     "~/.databrickscfg profile."
                 )
+            self._extra_env.update(gateway_env)
+        self._extra_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
 
         # Retry policy → Anthropic SDK env vars passed to the Claude
         # CLI subprocess. ``ANTHROPIC_MAX_RETRIES`` and
@@ -1247,9 +1635,10 @@ class ClaudeSDKExecutor(Executor):
             self._extra_env[_CLAUDE_API_KEY_HELPER_ENV_KEY] = api_key_helper
 
     def __del__(self) -> None:
-        if getattr(self, "_cli_wrapper_path", None):
+        wrapper_path = getattr(self, "_cli_wrapper_path", None)
+        if isinstance(wrapper_path, str):
             with suppress(Exception):
-                pathlib.Path(self._cli_wrapper_path).unlink(missing_ok=True)
+                pathlib.Path(wrapper_path).unlink(missing_ok=True)
 
     async def _route_options_through_gateway_shim(self, options: SdkOptions) -> None:
         """
@@ -1317,7 +1706,27 @@ class ClaudeSDKExecutor(Executor):
                 # ``options.settings`` explicitly sets apiKeyHelper and
                 # ``options.env`` sets the Databricks base URL, so the
                 # Claude CLI does not need an inherited Anthropic key.
-                with _unset_env_var("CLAUDECODE"), _unset_env_var("ANTHROPIC_API_KEY"):
+                #
+                # DATABRICKS-PATCH(claude-sdk-gateway-betas): on the Databricks
+                # gateway we negotiate betas rather than disabling them, but
+                # *omitting* CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS from
+                # ``options.env`` does not beat an INHERITED one — Databricks
+                # runners export it (devtools/ai/databricks_auth/gateway_env.py
+                # and the arca/isaac runners), and the merge puts os.environ
+                # under options.env. Without this the child still strips
+                # interleaved-thinking and the gateway still answers 400. Scoped
+                # to launches that negotiate (CLAUDE_CODE_USE_GATEWAY): the
+                # non-gateway branch re-adds the key through ``options.env``,
+                # which wins over os.environ, and a non-gateway session keeps
+                # whatever it inherited.
+                sdk_env = getattr(options, "env", None)
+                with ExitStack() as env_stack:
+                    env_stack.enter_context(_unset_env_var("CLAUDECODE"))
+                    env_stack.enter_context(_unset_env_var("ANTHROPIC_API_KEY"))
+                    if isinstance(sdk_env, dict) and "CLAUDE_CODE_USE_GATEWAY" in sdk_env:
+                        env_stack.enter_context(
+                            _unset_env_var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
+                        )
                     await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
             except asyncio.TimeoutError as exc:
                 await self._force_close_client(client)
@@ -1390,8 +1799,9 @@ class ClaudeSDKExecutor(Executor):
         same_loop = state.loop is None or current_loop is state.loop
         same_task = state.task is None or current_task is state.task
         if not (same_loop and same_task):
-            logger.warning(
-                "Force-closing Claude SDK client for session %s from a different event loop/task",
+            logger.debug(
+                "Force-closing Claude SDK client for session %s (different event loop/task; "
+                "expected once the connecting turn has finished, e.g. idle reap / shutdown)",
                 session_key,
             )
             await self._force_close_client(state.client)
@@ -1401,8 +1811,9 @@ class ClaudeSDKExecutor(Executor):
         except RuntimeError as exc:
             if "different task" not in str(exc):
                 raise
-            logger.warning(
-                "Force-closing Claude SDK client for session %s from a different task",
+            logger.debug(
+                "Force-closing Claude SDK client for session %s (different task; "
+                "expected once the connecting turn has finished, e.g. idle reap / shutdown)",
                 session_key,
             )
             await self._force_close_client(state.client)
@@ -1411,6 +1822,16 @@ class ClaudeSDKExecutor(Executor):
         # call _force_close_client to flip transport._closed before
         # the loop tears down.
         await self._force_close_client(state.client)
+
+    def _evict_client_on_cancel(self, session_key: str) -> None:
+        state = self._clients.pop(session_key, None)
+        if state is None:
+            return
+        # Close in the background: an await here runs under an in-flight
+        # cancellation and could itself be cancelled, leaking the CLI process.
+        task = asyncio.create_task(self._force_close_client(state.client))
+        self._cancel_close_tasks.add(task)
+        task.add_done_callback(self._cancel_close_tasks.discard)
 
     async def close(self) -> None:
         session_keys = list(self._clients)
@@ -1454,26 +1875,14 @@ class ClaudeSDKExecutor(Executor):
 
     async def enqueue_session_message(
         self,
-        session_key: str,
-        content: str | Message,
+        session_key: str,  # noqa: ARG002
+        content: str | Message,  # noqa: ARG002
     ) -> bool:
-        state = self._clients.get(session_key)
-        if state is None:
-            return False
-        try:
-            if isinstance(content, str):
-                prompt = content
-            else:
-                prompt = json.dumps(content, ensure_ascii=True)
-            await state.client.query(prompt, session_id=session_key)
-            return True
-        except Exception as exc:  # noqa: BLE001 — enqueue returns False on any SDK failure
-            logger.warning(
-                "Claude SDK live message enqueue failed for session %s: %s",
-                session_key,
-                exc,
-            )
-            return False
+        # query() queues a NEW turn on the SDK's stdin; it does not inject
+        # into the turn already running. Returning False lets the adapter's
+        # buffer hold the message and re-deliver it as a continuation turn
+        # once the active turn ends, preserving in-order delivery.
+        return False
 
     @staticmethod
     async def _force_close_client(client: _ClaudeClient) -> None:
@@ -1489,10 +1898,21 @@ class ClaudeSDKExecutor(Executor):
 
         transport = getattr(client, "_transport", None)
         if transport is not None:
-            stderr_tg = transport._stderr_task_group
-            if stderr_tg is not None:
+            # The SDK's stderr reader changed shape across revs: current
+            # claude-agent-sdk (>=0.2.x) exposes a single ``_stderr_task``
+            # TaskHandle with ``cancel()``; older revs an anyio
+            # ``_stderr_task_group``. Probe both via getattr so a force-close
+            # never raises AttributeError out of lifespan shutdown (which
+            # crashed the runner on session stop).
+            stderr_task = getattr(transport, "_stderr_task", None)
+            if stderr_task is not None:
                 with suppress(Exception):
-                    stderr_tg.cancel_scope.cancel()
+                    stderr_task.cancel()
+            else:
+                stderr_tg = getattr(transport, "_stderr_task_group", None)
+                if stderr_tg is not None:
+                    with suppress(Exception):
+                        stderr_tg.cancel_scope.cancel()
 
             for stream in (
                 transport._stdout_stream,
@@ -1528,7 +1948,10 @@ class ClaudeSDKExecutor(Executor):
             transport._stdout_stream = None
             transport._stdin_stream = None
             transport._stderr_stream = None
-            transport._stderr_task_group = None
+            if getattr(transport, "_stderr_task", None) is not None:
+                transport._stderr_task = None
+            if getattr(transport, "_stderr_task_group", None) is not None:
+                transport._stderr_task_group = None
             transport._ready = False
 
         client._query = None
@@ -1544,7 +1967,9 @@ class ClaudeSDKExecutor(Executor):
         return True
 
     def supports_live_message_queue(self) -> bool:
-        return True
+        # The SDK has no API to inject into an active turn; claiming this
+        # capability caused the one-turn-behind desync described in #3472.
+        return False
 
     def supports_tool_boundary_interrupt(self) -> bool:
         return True
@@ -1562,12 +1987,69 @@ class ClaudeSDKExecutor(Executor):
                 return str(metadata["session_id"])
         return "default"
 
+    def _install_subagent_router_hook(
+        self,
+        sdk: _ClaudeSDK,
+        options: Any,  # type: ignore[explicit-any]  # ClaudeAgentOptions — avoid a hard sdk import
+        model: str | None,
+    ) -> None:
+        """
+        Register the in-process subagent-routing ``PreToolUse`` hook.
+
+        The claude-agent-sdk runs hook callbacks in this process, so the
+        native hook script's decision logic is imported instead of
+        subprocessed. No-op unless the runner advertises a
+        ``route-subagent`` endpoint, so unrouted sessions register nothing.
+
+        :param sdk: The ``claude_agent_sdk`` module (or a test double).
+        :param options: ``ClaudeAgentOptions`` to mutate.
+        :param model: Model this session runs on, sent as the spawn's
+            parent model.
+        """
+        hook_matcher_cls = getattr(sdk, "HookMatcher", None)
+        if hook_matcher_cls is None:
+            return
+        router_dir = subagent_router.discover_router_dir()
+        if subagent_router.read_router_endpoint(router_dir) is None:
+            return
+
+        async def route_spawn(
+            payload: Any,  # type: ignore[explicit-any]  # HookInput TypedDict
+            tool_use_id: str | None,  # noqa: ARG001 -- HookCallback signature
+            context: Any,  # type: ignore[explicit-any]  # HookContext  # noqa: ARG001 -- HookCallback signature
+        ) -> dict[str, Any]:  # type: ignore[explicit-any]  # HookJSONOutput
+            if not isinstance(payload, dict):
+                return {}
+            output = await asyncio.to_thread(
+                subagent_router.route_pre_tool_use,
+                payload,
+                harness="claude-sdk",
+                router_dir=router_dir,
+                parent_model=model,
+            )
+            return output or {}
+
+        hooks = dict(getattr(options, "hooks", None) or {})
+        entries = list(hooks.get("PreToolUse") or [])
+        entries.append(
+            hook_matcher_cls(
+                matcher=subagent_router.AGENT_TOOL_MATCHER,
+                # Strictly outside the router call's own HTTP budget: equal
+                # numbers let the SDK cancel the hook at the same instant its
+                # request gives up, so the fail-open branch never ran.
+                timeout=subagent_router.HOOK_TIMEOUT_S,
+                hooks=[route_spawn],
+            )
+        )
+        hooks["PreToolUse"] = entries
+        options.hooks = hooks
+
     async def _can_use_tool_for_permission(
         self,
         tool_name: str,
         tool_input: ToolArgs,
-        perm_ctx: Any,  # type: ignore[explicit-any]  # ToolPermissionContext — avoid hard sdk import
-    ) -> Any:  # type: ignore[explicit-any]  # PermissionResult
+        perm_ctx: object,
+    ) -> object:
         """
         Route a Claude SDK permission request through the Omnigent elicitation system.
 
@@ -1613,7 +2095,7 @@ class ClaudeSDKExecutor(Executor):
         self,
         tool_name: str,
         tool_input: ToolArgs,
-    ) -> Any:  # type: ignore[explicit-any]  # PermissionResult | None
+    ) -> object | None:
         """
         Run a pre-execution TOOL_CALL policy evaluation for one tool call.
 
@@ -1708,8 +2190,8 @@ class ClaudeSDKExecutor(Executor):
         self,
         tool_name: str,
         tool_input: ToolArgs,
-        perm_ctx: Any,  # type: ignore[explicit-any]  # ToolPermissionContext
-    ) -> Any:  # type: ignore[explicit-any]  # PermissionResult
+        perm_ctx: object,
+    ) -> object:
         """
         Unified ``options.can_use_tool`` callback for the claude-sdk path.
 
@@ -1798,6 +2280,10 @@ class ClaudeSDKExecutor(Executor):
                 version="1.0.0",
                 tools=mcp_tools,
             )
+            system_prompt = _augment_system_prompt_for_omnigent_mcp_tools(
+                system_prompt,
+                tools,
+            )
 
         # Build allowed_tools list.  OS-environment operations route
         # through Omnigent ``sys_os_*`` MCP tools rather than the
@@ -1805,8 +2291,10 @@ class ClaudeSDKExecutor(Executor):
         # the scaffold's ``dispatch_tool`` path, giving the runner
         # visibility, timeouts, and error recovery.
         #
-        # In ``bypassPermissions`` mode, pre-approve all MCP tools so
-        # the agent can act autonomously without any per-call gate.
+        # In ``auto`` and ``bypassPermissions`` modes, pre-approve all
+        # MCP tools so the agent can act autonomously without a per-call
+        # human-consent gate.  ``auto`` still runs background safety
+        # checks; ``bypassPermissions`` skips all gates entirely.
         # In any other mode (``default``, ``acceptEdits``, etc.), leave
         # ``allowed_tools`` empty so every tool call goes through the
         # SDK's ``can_use_tool`` callback — which routes to the AP
@@ -1814,8 +2302,8 @@ class ClaudeSDKExecutor(Executor):
         # When ``allowed_tools`` is empty the SDK omits ``--allowedTools``
         # entirely, letting Claude's normal permission flow apply.
         allowed_tools: list[str] = []
-        if self._permission_mode == "bypassPermissions":
-            # Allow all Omnigent MCP tools (no per-call gate needed)
+        if self._permission_mode in ("auto", "bypassPermissions"):
+            # Allow all Omnigent MCP tools (no per-call human gate needed)
             for schema in tools:
                 raw_tname = schema.get("name")
                 # Claude SDK's ``allowed_tools`` requires concrete strings;
@@ -1835,7 +2323,9 @@ class ClaudeSDKExecutor(Executor):
         # spawning, so no ``databricks-*`` default is injected there.
         model = cfg.model or self._model_override
         if model is None and self._gateway_uses_databricks_profile:
-            model = _DATABRICKS_CLAUDE_DEFAULT_MODEL
+            model = await run_sync_on_thread(
+                _resolve_databricks_claude_model, self._databricks_profile
+            )
 
         # Build env: Databricks gateway settings derived from profile-backed
         # creds. CLAUDECODE removal happens around the subprocess spawn in
@@ -1885,9 +2375,9 @@ class ClaudeSDKExecutor(Executor):
         # via its own conversation store.
         # OS-environment tools are provided via Omnigent ``sys_os_*``
         # MCP tools (declared via ``os_env`` in the spec), not the
-        # SDK's native Bash/Read/Edit/Write.  Only the Skill tool
-        # needs to be in the SDK's base set.
-        base_tools: list[str] = ["Skill"]
+        # SDK's native Bash/Read/Edit/Write. Keep Skill and ToolSearch in
+        # the base set so MCP definitions can be discovered on demand.
+        base_tools: list[str] = ["Skill", "ToolSearch"]
         # Translate the spec's host-skill filter into the SDK
         # options. Falls back to ``"all"`` semantics when the
         # field is malformed (the parser already validates, so
@@ -1896,7 +2386,7 @@ class ClaudeSDKExecutor(Executor):
             skills="all", setting_sources=None
         )
         # Bundle skills are exposed via the SDK's plugin mechanism.
-        # The bundle's ``<bundle>/skills/<name>/SKILL.md`` files are
+        # The bundle's ``<bundle>/skills/<dir>/SKILL.md`` files are
         # discovered as plugin skills (no ``.claude/`` prefix needed
         # under the plugin convention — see plugin discovery test in
         # tests/inner/test_claude_sdk_executor.py). The plugin's
@@ -1916,6 +2406,7 @@ class ClaudeSDKExecutor(Executor):
             "settings": settings_payload,
             "stderr": _on_stderr,
             "include_partial_messages": True,
+            "include_hook_events": True,
             "skills": resolved.skills,
             "plugins": bundle_plugins,
             "extra_args": {"no-session-persistence": None},
@@ -1937,7 +2428,7 @@ class ClaudeSDKExecutor(Executor):
                 cfg.extra.get("reasoning_effort"), "Claude Agent SDK", CLAUDE_EFFORTS
             )
         except ValueError as exc:
-            yield ExecutorError(message=str(exc), retryable=False)
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
         if reasoning_effort is not None:
             options_kwargs["effort"] = reasoning_effort
@@ -1986,6 +2477,8 @@ class ClaudeSDKExecutor(Executor):
         ):
             options.can_use_tool = self._can_use_tool_gate
 
+        self._install_subagent_router_hook(sdk, options, model)
+
         # Log the full configuration for debugging
         logger.info(
             "ClaudeSDKExecutor: model=%s, gateway=%s, base_url=%s, tools=%d, thinking=%r",
@@ -2011,6 +2504,9 @@ class ClaudeSDKExecutor(Executor):
         observed_model: str | None = None
         system_diagnostics: list[str] = []
         terminal_error: str | None = None
+        compaction_occurred: bool = False
+        claude_session_id: str | None = None
+
         # Track in-flight tool calls so we can emit ToolCallComplete
         # with the tool name and duration when results arrive.
         pending_tools: dict[str, tuple[str, float]] = {}  # id → (name, start_mono)
@@ -2053,13 +2549,13 @@ class ClaudeSDKExecutor(Executor):
             if isinstance(prompt, str):
                 _last_user_msg = prompt[:500]
             elif isinstance(prompt, list):
-                _parts = [
-                    b.get("text", "")
-                    for b in prompt
-                    if isinstance(b, dict) and b.get("type") in ("text", "input_text")
-                ]
+                _parts: list[str] = []
+                for block in prompt:
+                    text = block.get("text")
+                    if block.get("type") in ("text", "input_text") and isinstance(text, str):
+                        _parts.append(text)
                 _last_user_msg = " ".join(_parts)[:500]
-            _req_data: dict[str, Any] = {
+            _req_data: _JsonObject = {
                 "model": model,
                 "messages_count": len(prompt) if isinstance(prompt, list) else 1,
                 "tools_count": len(tools),
@@ -2074,7 +2570,7 @@ class ClaudeSDKExecutor(Executor):
 
         try:
             try:
-                sdk_prompt: str | AsyncIterator[dict[str, Any]]
+                sdk_prompt: str | AsyncIterator[_JsonObject]
                 if isinstance(prompt, list):
                     # Multimodal content blocks — send as a
                     # structured message via the SDK's dict path.
@@ -2234,15 +2730,16 @@ class ClaudeSDKExecutor(Executor):
                                     response_text += text_block.text
                                     yield TextChunk(text=text_block.text)
                                 elif isinstance(block, sdk.ThinkingBlock):
+                                    thinking_block = cast(_ThinkingBlockObj, block)
                                     # Non-streaming counterpart of the
                                     # ``thinking_delta`` path above.
-                                    if block.thinking:
+                                    if thinking_block.thinking:
                                         yield ReasoningChunk(
                                             delta="",
                                             event_type="reasoning_started",
                                         )
                                         yield ReasoningChunk(
-                                            delta=block.thinking,
+                                            delta=thinking_block.thinking,
                                             event_type="reasoning_text",
                                         )
                                 elif isinstance(block, sdk.ToolUseBlock):
@@ -2297,7 +2794,18 @@ class ClaudeSDKExecutor(Executor):
 
                     elif isinstance(message, sdk.ResultMessage):
                         result_msg = cast(_ResultMessageObj, message)
-                        if not response_text and result_msg.result:
+                        claude_session_id = getattr(result_msg, "session_id", None)
+                        if getattr(result_msg, "is_error", None):
+                            # Harness-level failure (e.g. expired login). Surface
+                            # as an executor error rather than assistant content.
+                            failure_text = result_msg.result or "claude-sdk harness error"
+                            logger.error(
+                                "claude-sdk ResultMessage is_error=True for agent %r: %s",
+                                self._agent_name,
+                                failure_text,
+                            )
+                            terminal_error = failure_text
+                        elif not response_text and result_msg.result:
                             response_text = result_msg.result
                         raw_usage = getattr(result_msg, "usage", None)
                         if isinstance(raw_usage, dict) and raw_usage:
@@ -2366,20 +2874,45 @@ class ClaudeSDKExecutor(Executor):
                                 error_status in {401, 403}
                                 or retry_error == "authentication_failed"
                             ):
+                                if self._gateway_uses_databricks_profile:
+                                    auth_hint = "Check your selected ~/.databrickscfg profile."
+                                elif self._gateway:
+                                    auth_hint = (
+                                        "Check your provider's base URL and auth command "
+                                        "(ANTHROPIC_BASE_URL / gateway auth)."
+                                    )
+                                else:
+                                    auth_hint = (
+                                        "Check your Claude CLI login status "
+                                        "(`claude /status`) or API key configuration."
+                                    )
                                 terminal_error = (
                                     "Claude SDK provider authentication failed"
                                     f" ({retry_error}, status={error_status}). "
-                                    "Check your selected ~/.databrickscfg profile."
+                                    f"{auth_hint}"
                                 )
                                 break
 
                             if error_status == 404:
+                                if self._gateway:
+                                    endpoint_hint = (
+                                        "Check ANTHROPIC_BASE_URL / gateway endpoint "
+                                        "configuration."
+                                    )
+                                else:
+                                    endpoint_hint = "Check ANTHROPIC_BASE_URL configuration."
                                 terminal_error = (
                                     "Claude SDK provider endpoint was not found "
                                     f"({retry_error}, status={error_status}). "
-                                    "Check ANTHROPIC_BASE_URL / Databricks endpoint configuration."
+                                    f"{endpoint_hint}"
                                 )
                                 break
+                        elif getattr(system_msg, "hook_event_name", None) == "PreCompact":
+                            compaction_occurred = True
+                            logger.info("Claude SDK compaction detected (PreCompact hook)")
+                            from omnigent.inner.executor import CompactionStarted
+
+                            yield CompactionStarted()
                         else:
                             logger.info("Claude CLI system message: %s", data)
             finally:
@@ -2390,6 +2923,13 @@ class ClaudeSDKExecutor(Executor):
                 if aclose is not None:
                     await aclose()
 
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException, so a watchdog-cancelled turn
+            # skips the boundary below. Evict the wedged client (no crash
+            # mark) so the next turn rebuilds a fresh one and replays history
+            # instead of reusing it and re-tripping the watchdog (#2109).
+            self._evict_client_on_cancel(session_key)
+            raise
         except Exception as exc:  # noqa: BLE001 — top-level executor error boundary; records crash and surfaces to caller
             self._crashed_sessions[session_key] = str(exc)
             await self._close_live_client(session_key)
@@ -2417,11 +2957,35 @@ class ClaudeSDKExecutor(Executor):
             yield ExecutorError(message=terminal_error)
             return
 
+        # A turn can finish the stream without ever yielding a
+        # ``ResultMessage`` — the CLI can close the stream early, or the
+        # turn can be cut short before its final usage is reported. In
+        # that case ``turn_usage`` is None and the context-occupancy
+        # meter freezes at the previous successful turn's value, hiding
+        # real window fill exactly when a session is in trouble (#1533).
+        # We already observed the latest prompt size from ``message_start``
+        # (``last_call_usage``), so synthesize a usage dict from it and let
+        # ``TurnComplete`` carry it. ``context_tokens`` (window fill) is the
+        # meaningful field here; ``output_tokens`` is unknown on an
+        # incomplete turn, so report 0 rather than guess. The full
+        # ``ResultMessage`` path above still wins whenever it runs.
+        if turn_usage is None and last_call_usage is not None:
+            ctx_in = last_call_usage.get("input_tokens") or 0
+            ctx_cc = last_call_usage.get("cache_creation_input_tokens") or 0
+            ctx_cr = last_call_usage.get("cache_read_input_tokens") or 0
+            turn_usage = {
+                "input_tokens": ctx_in,
+                "output_tokens": 0,
+                "total_tokens": ctx_in,
+                "context_tokens": ctx_in + ctx_cc + ctx_cr,
+                "model": observed_model or model,
+            }
+
         # ── LLM_RESPONSE policy evaluation ───────────────────────
         # Evaluate after the stream completes but before TurnComplete
         # so a DENY prevents the response from being persisted.
         if _policy_eval is not None:
-            _resp_data: dict[str, Any] = {
+            _resp_data: _JsonObject = {
                 "model": model,
                 "text_preview": (response_text[:500] if response_text else ""),
                 "tool_calls_count": len(pending_tools),
@@ -2435,6 +2999,53 @@ class ClaudeSDKExecutor(Executor):
                 return
 
         _notify_usage_from_dict(model=model, usage=turn_usage)
+
+        if compaction_occurred and claude_session_id:
+            from omnigent.inner.executor import CompactionComplete
+
+            _compaction_tokens = 0
+            if turn_usage is not None:
+                _compaction_tokens = turn_usage.get("context_tokens", 0) or 0
+            # Read the post-compaction session messages so the runner
+            # can persist them for session resume in ephemeral
+            # environments where the CLI's own transcript is lost.
+            _compacted: list[_JsonObject] | None = None
+            try:
+                from claude_agent_sdk import get_session_messages
+
+                _msgs = get_session_messages(claude_session_id, directory=self._cwd)
+                _compacted = [
+                    {"type": "message", "role": m.type, "content": m.message.get("content", [])}
+                    for m in _msgs
+                    if isinstance(m.message, dict)
+                ]
+                if not _compacted:
+                    logger.warning(
+                        "Claude post-compaction read returned no messages "
+                        "(session=%s); resume will fall back to the synthetic "
+                        "summary instead of the harness's real compacted state.",
+                        claude_session_id,
+                    )
+            except Exception:  # noqa: BLE001
+                # WARNING, not DEBUG: a swallowed read here silently degrades
+                # EVERY later resume of this conversation. The runner persists a
+                # compaction item with no ``compacted_messages``, so resume
+                # replays the lossy synthetic-summary pair instead of the
+                # harness's real post-compaction context. Surface it.
+                logger.warning(
+                    "Failed to read Claude post-compaction session messages "
+                    "(session=%s); resume fidelity for this conversation will "
+                    "degrade to the synthetic summary.",
+                    claude_session_id,
+                    exc_info=True,
+                )
+            yield CompactionComplete(
+                summary="[Claude Code compaction — context was automatically compacted]",
+                token_count=_compaction_tokens,
+                model=observed_model or model,
+                compacted_messages=_compacted,
+            )
+
         yield TurnComplete(response=response_text, usage=turn_usage)
 
     @staticmethod
@@ -2442,7 +3053,7 @@ class ClaudeSDKExecutor(Executor):
         messages: list[Message],
         *,
         resume_session: bool,
-    ) -> str | list[dict[str, Any]]:
+    ) -> str | list[_JsonObject]:
         """
         Build the prompt for the SDK.
 
@@ -2467,7 +3078,7 @@ class ClaudeSDKExecutor(Executor):
             present in the latest user message.
         """
         if resume_session:
-            return ClaudeSDKExecutor._extract_latest_user_content(messages)
+            return ClaudeSDKExecutor._extract_trailing_user_content(messages)
 
         user_messages = [msg for msg in messages if msg.get("role") == "user"]
         if len(messages) <= 1 or len(user_messages) <= 1:
@@ -2480,34 +3091,41 @@ class ClaudeSDKExecutor(Executor):
         latest_content = ClaudeSDKExecutor._extract_latest_user_content(messages)
         prior = messages[:-1] if messages else []
 
-        lines = ["Conversation so far:"]
+        prior_blocks: list[_JsonObject] = [_text_block("Conversation so far:")]
         for msg in prior:
             role = str(msg.get("role", "user")).replace("_", " ")
             raw_content = msg.get("content")
-            if raw_content is None:
-                content = ""
-            elif isinstance(raw_content, str):
-                content = raw_content
+            rendered = [] if raw_content is None else _render_prior_content_blocks(raw_content)
+            if not rendered:
+                rendered = [_text_block("")]
+            # Label the message inline when it opens with text; an attachment
+            # that leads the message gets the label on its own line instead.
+            if rendered[0].get("type") == "text":
+                rendered[0] = _text_block(f"{role}: {rendered[0]['text']}")
             else:
-                content = json.dumps(raw_content, ensure_ascii=True)
-            lines.append(f"{role}: {content}")
-        lines.append("")
-        lines.append(
-            "Respond to the latest user message, using the conversation above as context."
+                rendered.insert(0, _text_block(f"{role}:"))
+            prior_blocks.extend(rendered)
+        prior_blocks.append(_text_block(""))
+        prior_blocks.append(
+            _text_block(
+                "Respond to the latest user message, using the conversation above as context."
+            )
         )
-        history_prefix = "\n".join(lines)
+        prior_blocks = _coalesce_text_blocks(prior_blocks)
 
         if isinstance(latest_content, list):
-            return [
-                {"type": "text", "text": history_prefix},
-                *latest_content,
-            ]
-        return f"{history_prefix}\n\nuser: {latest_content}"
+            return [*prior_blocks, *latest_content]
+        # Coalescing leaves an all-text history as the single opening block, so
+        # more than one block means an attachment survived and the prompt has
+        # to stay structured for its bytes to reach the model.
+        if len(prior_blocks) > 1:
+            return [*prior_blocks, _text_block(f"\nuser: {latest_content}")]
+        return f"{prior_blocks[0]['text']}\n\nuser: {latest_content}"
 
     @staticmethod
     def _extract_latest_user_content(
         messages: list[Message],
-    ) -> str | list[dict[str, Any]]:
+    ) -> str | list[_JsonObject]:
         """
         Extract the latest user message content for the SDK.
 
@@ -2532,3 +3150,75 @@ class ClaudeSDKExecutor(Executor):
                     return _to_anthropic_content_blocks(content)
                 return str(content)
         return ""
+
+    @staticmethod
+    def _extract_trailing_user_content(
+        messages: list[Message],
+    ) -> str | list[_JsonObject]:
+        """
+        Extract the trailing run of consecutive user messages for the SDK.
+
+        On a resumed SDK session the client already has all prior turns
+        cached, so only the *new* user input is sent. Normally that is a
+        single user message, but when the runner batches several buffered
+        steered messages into one continuation turn (see
+        ``_check_and_start_next_turn``), the tail of history holds more than
+        one brand-new user message the SDK has never seen. Sending only the
+        last (as :meth:`_extract_latest_user_content` does) silently drops
+        the earlier ones. This collects every user message after the last
+        non-user (assistant / tool) message and concatenates them so all
+        newly-buffered input reaches the model.
+
+        Text messages are joined with blank lines. If any message in the
+        trailing run carries multimodal content blocks, the whole run is
+        returned as a single list of Anthropic content blocks so the bytes
+        survive.
+
+        :param messages: Conversation history.
+        :returns: A string prompt, or a list of Anthropic content
+            block dicts when the trailing run is multimodal.
+        """
+        trailing: list[Message] = []
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                trailing.append(msg)
+            else:
+                break
+        trailing.reverse()
+        if not trailing:
+            return ""
+        if len(trailing) == 1:
+            return ClaudeSDKExecutor._extract_latest_user_content(trailing)
+
+        # Convert each trailing user message to Anthropic content blocks.
+        # If any block is non-text (image/document), keep the structured
+        # list so the bytes reach the model; otherwise join the text.
+        block_runs: list[list[_JsonObject]] = []
+        has_non_text = False
+        for msg in trailing:
+            content = msg.get("content")
+            if content is None:
+                block_runs.append([])
+            elif isinstance(content, str):
+                block_runs.append([_text_block(content)])
+            elif isinstance(content, list):
+                converted = _to_anthropic_content_blocks(content)
+                block_runs.append(converted)
+                if any(b.get("type") != "text" for b in converted):
+                    has_non_text = True
+            else:
+                block_runs.append([_text_block(str(content))])
+
+        if has_non_text:
+            merged: list[_JsonObject] = []
+            for run in block_runs:
+                merged.extend(run)
+            return merged
+
+        texts: list[str] = []
+        for run in block_runs:
+            for block in run:
+                text = block.get("text")
+                if block.get("type") == "text" and isinstance(text, str) and text:
+                    texts.append(text)
+        return "\n\n".join(texts)

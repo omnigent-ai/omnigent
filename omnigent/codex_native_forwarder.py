@@ -7,13 +7,24 @@ import contextlib
 import json
 import logging
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import httpx
 
-from omnigent._native_post_delivery import post_may_have_been_delivered
+from omnigent._native_forwarder_health import (
+    note_post_success as note_native_post_success,
+)
+from omnigent._native_forwarder_health import (
+    record_post_failure as record_native_post_failure,
+)
+from omnigent._native_post_delivery import (
+    RepostResult,
+    append_dead_letter,
+    post_may_have_been_delivered,
+    replay_dead_letters,
+)
 from omnigent.claude_native_bridge import url_component
 from omnigent.codex_native_app_server import (
     CodexAppServerClient,
@@ -22,12 +33,18 @@ from omnigent.codex_native_app_server import (
 )
 from omnigent.codex_native_bridge import (
     CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+    MCP_STARTUP_STARTING,
+    MCP_STARTUP_STATES,
     CodexNativeBridgeState,
     clear_active_turn_id_if_matches,
     codex_home_for_bridge_dir,
+    pending_mcp_servers,
     read_bridge_state,
     read_codex_config_model,
+    read_mcp_startup,
+    settle_pending_mcp_startup,
     update_active_turn_id,
+    update_mcp_server_startup,
     update_thread_id,
     write_bridge_state,
 )
@@ -38,6 +55,7 @@ from omnigent.codex_native_elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
@@ -58,8 +76,39 @@ _EMPTY_ROLLOUT_FRAGMENT = "is empty"
 _POST_MAX_ATTEMPTS = 3
 _POST_RETRY_DELAY_SECONDS = 0.1
 _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+# Startup dead-letter replay budget (#1579). Bounded so a large dead-letter file
+# or a slow/hung server cannot stall forwarder startup: each re-POST is a single
+# attempt (its natural retry is the next startup) with a short timeout (vs the
+# 30s live client default) so a hung server fails fast; at most
+# ``_REPLAY_MAX_RECORDS`` are sent and the whole drain is abandoned after
+# ``_REPLAY_DEADLINE_SECONDS``. Leftovers are deferred to a later startup.
+_REPLAY_MAX_RECORDS = 500
+_REPLAY_POST_TIMEOUT_SECONDS = 5.0
+_REPLAY_DEADLINE_SECONDS = 30.0
 _DELTA_FLUSH_INTERVAL_SECONDS = 0.05
 _DELTA_FLUSH_CHAR_THRESHOLD = 64
+# A worker cancelled at loop teardown can no longer resolve its queued markers, so an
+# unbounded wait parks the caller for good. Under the runner's 10s auto-forwarder cancel
+# budget so this resolves first.
+_DELTA_MARKER_TIMEOUT_SECONDS = 5.0
+_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE = "external_reasoning_effort_change"
+# Context-compaction progress edge. Publishes the same
+# ``response.compaction.in_progress`` / ``response.compaction.completed`` SSE
+# the AP-side compaction path emits, so the web UI shows its "Compacting
+# conversation…" spinner while Codex compacts. Payload: ``{"status": ...}``.
+_EXTERNAL_COMPACTION_STATUS_TYPE = "external_compaction_status"
+# Codex ThreadItem type for a context compaction, and the thread-level
+# notification Codex emits when compaction finishes. (Codex 5.1-Codex-Max+
+# auto-compacts mid-turn.) Sourced from the Codex app-server protocol enums;
+# handlers are harmless no-ops if a build spells these differently.
+_CODEX_COMPACTION_ITEM_TYPE = "contextCompaction"
+_CODEX_THREAD_COMPACTED_METHOD = "thread/compacted"
+# Transient reasoning (chain-of-thought) delta — the reasoning analogue of
+# ``external_output_text_delta``. Nothing is persisted; it publishes
+# ``response.reasoning_text.delta`` (preceded by ``response.reasoning.started``
+# when ``data.started`` is true) so the web UI paints a live reasoning block.
+_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE = "external_output_reasoning_delta"
+_EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE = "external_codex_collaboration_mode_change"
 # Per-attempt client budget for the elicitation long-poll, slightly above
 # the server-side wait (``_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S``) so
 # the server's own timeout (empty-body fail-ask) wins over a client cut.
@@ -73,6 +122,32 @@ _CODEX_ELICITATION_CONNECT_TIMEOUT_SECONDS = 30.0
 _CODEX_ELICITATION_RETRY_INITIAL_BACKOFF_SECONDS = 1.0
 _CODEX_ELICITATION_RETRY_MAX_BACKOFF_SECONDS = 30.0
 _CODEX_MCP_ELICITATION_REQUEST_METHOD = "mcpServer/elicitation/request"
+# Per-server MCP startup progress (issue #2058). Codex runs an MCP
+# startup round when a thread starts, but delivers the per-server
+# ``mcpServer/startupStatus/updated`` edges ONLY to the connection that
+# owns the thread (the TUI) — verified against codex 0.142.5 — so this
+# observer connection cannot passively mirror them. Instead the round is
+# SYNTHESIZED: at forwarder start the config-declared servers are
+# recorded as ``starting`` (true — codex boots them all at thread start)
+# in the bridge dir and posted to Omnigent as ``external_mcp_startup``; the
+# round is settled (unresolved entries dropped) when the first
+# model-produced item arrives or the thread goes idle after a turn —
+# codex defers turn EXECUTION until startup ends, so model output (and
+# the later idle edge) proves the round is over — or when the
+# config-derived startup window elapses. ``cancelled`` states are
+# recorded locally by the Stop path. The notification handler is kept as
+# a zero-cost path for any delivery codex broadens later (it fully
+# supersedes synthesis when edges do arrive).
+_CODEX_MCP_STARTUP_STATUS_METHOD = "mcpServer/startupStatus/updated"
+_CODEX_THREAD_STATUS_CHANGED_METHOD = "thread/status/changed"
+_EXTERNAL_MCP_STARTUP_TYPE = "external_mcp_startup"
+# Codex bounds each MCP server's spawn+handshake by its per-server
+# ``startup_timeout_sec`` (codex default 10s); the round cannot outlive
+# the slowest server's budget. The synthesis settle timer mirrors that
+# bound, with floor/grace/cap keeping a misconfigured value sane.
+_MCP_STARTUP_DEFAULT_TIMEOUT_SECONDS = 10.0
+_MCP_STARTUP_SETTLE_GRACE_SECONDS = 15.0
+_MCP_STARTUP_SETTLE_MAX_SECONDS = 240.0
 _CODEX_TOOL_REQUEST_USER_INPUT_METHOD = "item/tool/requestUserInput"
 _CODEX_COMMAND_EXECUTION_REQUEST_APPROVAL_METHOD = "item/commandExecution/requestApproval"
 _CODEX_FILE_CHANGE_REQUEST_APPROVAL_METHOD = "item/fileChange/requestApproval"
@@ -82,8 +157,12 @@ _CODEX_APPLY_PATCH_APPROVAL_METHOD = "applyPatchApproval"
 _CODEX_SERVER_REQUEST_RESOLVED_METHOD = "serverRequest/resolved"
 _EXTERNAL_SESSION_INTERRUPTED_TYPE = "external_session_interrupted"
 _EXTERNAL_ELICITATION_RESOLVED_TYPE = "external_elicitation_resolved"
-# Codex AgentControl collab-agent spawn event fields.
+# Sessions event carrying a Codex plan mapped to the todo-list schema so the
+# web TodoPanel renders it like Claude's TodoWrite output.
+_EXTERNAL_SESSION_TODOS_TYPE = "external_session_todos"
+# Codex AgentControl child-spawn event fields.
 _CODEX_COLLAB_AGENT_ITEM_TYPE = "collabAgentToolCall"
+_CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE = "subAgentActivity"
 _CODEX_COLLAB_SPAWN_TOOL = "spawnAgent"
 _CODEX_COLLAB_RUNNING_STATUSES = frozenset({"pendingInit", "running"})
 _CODEX_COLLAB_FAILED_STATUSES = frozenset({"errored", "notFound"})
@@ -112,6 +191,50 @@ _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
         _CODEX_APPLY_PATCH_APPROVAL_METHOD,
     }
 )
+
+# Turn-error surfacing. A failed Codex turn arrives as ``turn/completed``
+# (or ``turn/failed``) with ``turn.status == "failed"`` and a ``turn.error``
+# object ``{message, codexErrorInfo?, additionalDetails?}``; keying status off
+# the method alone mapped such turns to ``idle`` — a "silent success". The
+# forwarder inspects ``turn.status``/``turn.error``, forces ``failed``, and
+# surfaces the reason. As a fallback it also catches an ``error`` ThreadItem in
+# ``turn.items``: both shapes exist in the app-server type system and the wire
+# shape varies by version, so detecting either keeps the fix robust.
+#
+# ``codexErrorInfo`` is the app-server's structured classification (e.g.
+# ``unauthorized``, ``usage_limit_exceeded``); auth-class values get a re-auth
+# hint. httpStatusCode 401/403 is treated as auth too. Values are stored and
+# compared case-insensitively: the app-server enum serializes as lowercase
+# snake_case (``unauthorized``), but older/alternate spellings (``Unauthorized``)
+# are matched too.
+_CODEX_ERROR_ITEM_TYPE = "error"
+_CODEX_AUTH_ERROR_INFO = frozenset({"unauthorized"})
+_CODEX_AUTH_HTTP_STATUS = frozenset({401, 403})
+# Message-substring fallback for app-server versions that omit codexErrorInfo.
+# Surface-only, so recall is favored over precision: a false positive only
+# appends a re-auth hint to an already-failed turn.
+_CODEX_AUTH_ERROR_FRAGMENTS = (
+    "401",
+    "403",
+    "unauthorized",
+    "authentication",
+    "not logged in",
+    "not authenticated",
+    "log in",
+    "login",
+    "sign in",
+    "re-authenticate",
+    "reauthenticate",
+    "credentials",
+    "access token",
+    "token expired",
+    "expired token",
+    "session expired",
+    "api key",
+)
+_CODEX_ERROR_KIND_AUTH = "auth"
+_CODEX_ERROR_KIND_GENERIC = "generic"
+_CODEX_REAUTH_HINT = "Codex needs you to re-authenticate. Run `codex login` and retry."
 
 
 @dataclass
@@ -152,7 +275,7 @@ class _CodexToolCall:
 
     call_id: str
     name: str
-    arguments: dict[str, Any]
+    arguments: _JsonObject
     output: str
 
 
@@ -201,6 +324,22 @@ class _CodexForwarderState:
         the resume/startup model so the spawn default is not echoed back as
         a change; only a later in-TUI ``/model`` switch is mirrored. ``None``
         until seeded.
+    :param effort: Latest known Codex reasoning effort for this thread, e.g.
+        ``"medium"``. ``None`` means Codex is using its model/default effort.
+    :param posted_effort: Last reasoning effort already mirrored to Omnigent
+        via ``external_reasoning_effort_change``. ``None`` is a valid mirrored
+        value, so ``posted_effort_known`` tracks whether the baseline has been
+        seeded.
+    :param posted_effort_known: Whether ``posted_effort`` has been mirrored at
+        least once. Without this, the initial ``None`` default would be
+        indistinguishable from "not yet posted".
+    :param collaboration_mode: Latest known Codex collaboration mode kind, e.g.
+        ``"plan"`` or ``"default"``.
+    :param posted_collaboration_mode: Last collaboration mode kind already
+        mirrored to Omnigent via
+        ``external_codex_collaboration_mode_change``.
+    :param terminal_launch_args: Latest known Codex approval/sandbox launch args.
+    :param posted_terminal_launch_args: Last mirrored permission launch args.
     :param parent_session_id: Omnigent parent session id, e.g.
         ``"conv_parent"``. Set by ``supervise_forwarder`` so collab-agent
         helpers can register child sessions without extra parameter
@@ -239,10 +378,28 @@ class _CodexForwarderState:
     :param plan_thread_by_turn: Codex thread id keyed by plan turn id.
     :param prompted_plan_turns: Turn ids that already exposed the
         implementation prompt, either natively or through the Omnigent bridge.
+    :param turn_diff_by_turn: Latest aggregated working-tree unified diff
+        seen for a turn, keyed by turn id. Codex emits ``turn/diff/updated``
+        repeatedly as edits land; only the newest diff is kept and it is
+        flushed once at the terminal turn boundary (see
+        :func:`_handle_turn_diff_updated` / :func:`_flush_turn_diff`).
     """
 
     model: str | None = None
     posted_model: str | None = None
+    # The running thread's authoritative model, from a live
+    # ``thread/settings/updated``; beats a stale config.toml re-read.
+    settings_model: str | None = None
+    # The config.toml model as of the last _refresh_model_from_config read,
+    # so the refresh can tell an unchanged file from a rewritten one.
+    last_config_model: str | None = None
+    effort: str | None = None
+    posted_effort: str | None = None
+    posted_effort_known: bool = False
+    collaboration_mode: str | None = None
+    posted_collaboration_mode: str | None = None
+    terminal_launch_args: list[str] | None = None
+    posted_terminal_launch_args: list[str] | None = None
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
@@ -250,11 +407,34 @@ class _CodexForwarderState:
     subscribed_child_threads: set[str] = field(default_factory=set)
     synced_item_keys: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
+    posted_tool_calls: set[str] = field(default_factory=set)
     partial_text_by_turn: dict[str, list[_PartialTextBuffer]] = field(default_factory=dict)
     _anon_item_counters: dict[tuple[str, str], int] = field(default_factory=dict)
     completed_plan_text_by_turn: dict[str, str] = field(default_factory=dict)
     plan_thread_by_turn: dict[str, str] = field(default_factory=dict)
     prompted_plan_turns: set[str] = field(default_factory=set)
+    # Last context-compaction status mirrored to Omnigent
+    # (``"in_progress"`` / ``"completed"``), used to dedupe consecutive
+    # identical posts when Codex signals completion via both a
+    # ``contextCompaction`` item and a ``thread/compacted`` notification.
+    compaction_status_posted: str | None = None
+    # Whether the compaction item has already been persisted for the current
+    # compaction boundary.  Reset to ``False`` when a new ``"in_progress"``
+    # status is posted.
+    compaction_item_persisted: bool = False
+    # Codex reasoning item id whose live deltas are currently being mirrored.
+    # When a delta arrives for a different item, it opens a new reasoning
+    # block (``started=True`` → ``response.reasoning.started``). Reset at each
+    # ``turn/started`` so the next turn's first reasoning delta opens a fresh
+    # block. Reasoning is transient — it has no completed conversation item;
+    # the block finalizes when the turn's assistant message arrives.
+    reasoning_stream_item_id: str | None = None
+    turn_diff_by_turn: dict[str, str] = field(default_factory=dict)
+    # Whether model output has already settled the synthesized MCP startup
+    # round. The round is seeded once per forwarder connection (never on
+    # thread rotation), so a settled round stays settled and later items
+    # can skip re-reading the bridge file for the life of the session.
+    mcp_startup_settled: bool = False
 
     def note_resume_response(self, response: CodexMessage) -> None:
         """
@@ -267,6 +447,7 @@ class _CodexForwarderState:
         if not isinstance(result, dict):
             return
         self._note_model_fields(result)
+        self._note_approval_mode_fields(result)
         # Do NOT seed ``posted_model`` here. Omnigent must learn the session's
         # ACTUAL model — including the spawn default — because the cost-budget
         # gate resolves the model as ``conv.model_override or spec.llm.model``,
@@ -279,7 +460,7 @@ class _CodexForwarderState:
         # ``posted_model`` ``None`` makes the first ``_sync_model_change``
         # mirror the real model; the dedupe still suppresses re-posts after.
 
-    def note_thread_settings_updated(self, params: dict[str, Any]) -> None:
+    def note_thread_settings_updated(self, params: _JsonObject) -> None:
         """
         Record thread settings from a ``thread/settings/updated`` notification.
 
@@ -289,8 +470,18 @@ class _CodexForwarderState:
         settings = params.get("threadSettings")
         if isinstance(settings, dict):
             self._note_model_fields(settings)
+            self._note_effort_fields(settings)
+            self._note_collaboration_mode_fields(settings)
+            self._note_approval_mode_fields(settings)
+            # Live thread settings are the running process's truth: remember
+            # the model so a stale config.toml re-read at the next
+            # turn/started cannot roll the mirror back (see
+            # _refresh_model_from_config).
+            model = settings.get("model")
+            if isinstance(model, str) and model:
+                self.settings_model = model
 
-    def record_completed_plan(self, params: dict[str, Any]) -> None:
+    def record_completed_plan(self, params: _JsonObject) -> None:
         """
         Remember a completed Codex proposed-plan item for its terminal prompt.
 
@@ -445,6 +636,17 @@ class _CodexForwarderState:
         """
         return turn_id in self.posted_user_turns
 
+    def note_tool_call_posted(self, call_id: str) -> None:
+        """Record that a command's live function-call item was posted."""
+        self.posted_tool_calls.add(call_id)
+
+    def take_posted_tool_call(self, call_id: str) -> bool:
+        """Consume a function call posted before command completion."""
+        if call_id not in self.posted_tool_calls:
+            return False
+        self.posted_tool_calls.remove(call_id)
+        return True
+
     def record_partial_text_delta(
         self,
         *,
@@ -510,6 +712,34 @@ class _CodexForwarderState:
         """
         return self.partial_text_by_turn.pop(turn_id, [])
 
+    def note_turn_diff(self, turn_id: str, diff: str) -> None:
+        """
+        Record the latest aggregated working-tree diff for a turn.
+
+        Codex emits ``turn/diff/updated`` repeatedly as a turn's edits
+        accumulate, each carrying the full diff so far. Only the newest
+        diff is retained; an empty diff clears any stored value so a turn
+        whose edits were reverted does not flush a stale diff.
+
+        :param turn_id: Codex turn id, e.g. ``"turn_123"``.
+        :param diff: Aggregated unified diff for the turn so far.
+        :returns: None.
+        """
+        if diff:
+            self.turn_diff_by_turn[turn_id] = diff
+        else:
+            self.turn_diff_by_turn.pop(turn_id, None)
+
+    def consume_turn_diff(self, turn_id: str) -> str | None:
+        """
+        Remove and return the stored aggregated diff for one turn.
+
+        :param turn_id: Codex turn id, e.g. ``"turn_123"``.
+        :returns: The newest aggregated diff for the turn, or ``None`` when
+            none was recorded.
+        """
+        return self.turn_diff_by_turn.pop(turn_id, None)
+
     def claim_item_key(self, item_key: str) -> bool:
         """
         Claim a transcript item key for Omnigent posting.
@@ -562,7 +792,7 @@ class _CodexForwarderState:
         scope = (thread_id, turn_id)
         self._anon_item_counters[scope] = self._anon_item_counters.get(scope, 0) + 1
 
-    def _note_model_fields(self, payload: dict[str, Any]) -> None:
+    def _note_model_fields(self, payload: _JsonObject) -> None:
         """
         Record model from a Codex settings-like payload.
 
@@ -572,6 +802,208 @@ class _CodexForwarderState:
         model = payload.get("model")
         if isinstance(model, str) and model:
             self.model = model
+
+    def _note_effort_fields(self, payload: _JsonObject) -> None:
+        """
+        Record reasoning effort from a Codex settings-like payload.
+
+        App-server's public ``ThreadSettings`` wire field is ``effort``. The
+        other two names are accepted because upstream docs and lower-level
+        snapshots use ``reasoningEffort`` / ``reasoning_effort`` when referring
+        to the same concept.
+
+        :param payload: Settings payload with ``effort`` or an equivalent
+            reasoning-effort key, e.g. ``{"effort": "medium"}``.
+        :returns: None.
+        """
+        for key in ("effort", "reasoningEffort", "reasoning_effort"):
+            if key not in payload:
+                continue
+            effort = payload[key]
+            if effort is None or (isinstance(effort, str) and effort):
+                self.effort = effort
+            return
+
+    def _note_collaboration_mode_fields(self, payload: _JsonObject) -> None:
+        """
+        Record Codex collaboration mode from a settings-like payload.
+
+        :param payload: Settings payload with ``collaborationMode``, e.g.
+            ``{"collaborationMode": {"mode": "plan", "settings": {...}}}``.
+        :returns: None.
+        """
+        raw_mode = payload.get("collaborationMode")
+        if not isinstance(raw_mode, dict):
+            raw_mode = payload.get("collaboration_mode")
+        if not isinstance(raw_mode, dict):
+            return
+        mode = raw_mode.get("mode")
+        if isinstance(mode, str) and mode:
+            self.collaboration_mode = mode
+
+    def _note_approval_mode_fields(self, payload: _JsonObject) -> None:
+        """Record Codex approval/sandbox settings as launch args."""
+        args = _codex_terminal_launch_args_from_settings(payload)
+        if args is not None:
+            self.terminal_launch_args = args
+
+
+@dataclass(frozen=True)
+class _CodexTerminalError:
+    """
+    A turn-level failure surfaced from a Codex turn.
+
+    Produced by :func:`_terminal_error_from_turn` from ``turn.error`` or an
+    ``error`` ThreadItem. Forces the turn's Omnigent status to ``failed`` and
+    lets :func:`_post_turn_status_edge` surface the reason (and a re-auth hint
+    for auth-classified errors).
+
+    :param message: Human-readable error text, e.g.
+        ``"401 Unauthorized: ChatGPT login expired"``.
+    :param kind: Classification, either ``"auth"`` or ``"generic"``.
+    """
+
+    message: str
+    kind: str
+
+    @property
+    def is_auth(self) -> bool:
+        """:returns: ``True`` when the error was classified as auth-related."""
+        return self.kind == _CODEX_ERROR_KIND_AUTH
+
+
+def _classify_codex_error(error: _JsonObject, message: str) -> str:
+    """
+    Classify a Codex ``turn.error`` / ``error`` item as auth-related or generic.
+
+    Prefers the structured ``codexErrorInfo`` (an ``unauthorized`` variant,
+    case-insensitive, or an httpStatusCode of 401/403); falls back to substring
+    matching against :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions/shapes
+    that omit it.
+
+    :param error: The ``turn.error`` object.
+    :param message: Its already-extracted message text.
+    :returns: :data:`_CODEX_ERROR_KIND_AUTH` or
+        :data:`_CODEX_ERROR_KIND_GENERIC`.
+    """
+    info = error.get("codexErrorInfo")
+    variant: str | None = None
+    http_status: object = None
+    if isinstance(info, str):
+        variant = info
+    elif isinstance(info, dict):
+        variant = info.get("type") or info.get("kind") or info.get("variant")
+        http_status = info.get("httpStatusCode")
+    variant_is_auth = variant is not None and variant.lower() in _CODEX_AUTH_ERROR_INFO
+    if variant_is_auth or http_status in _CODEX_AUTH_HTTP_STATUS:
+        return _CODEX_ERROR_KIND_AUTH
+    lowered = message.lower()
+    if any(fragment in lowered for fragment in _CODEX_AUTH_ERROR_FRAGMENTS):
+        return _CODEX_ERROR_KIND_AUTH
+    return _CODEX_ERROR_KIND_GENERIC
+
+
+def _error_payload_message(payload: _JsonObject) -> str:
+    """
+    Extract a non-empty message from a Codex ``turn.error`` or ``error`` item.
+
+    Both shapes have surfaced the text under a few keys across app-server
+    versions; reads the first non-empty one, falling back to a stable string
+    so the surfaced error is never blank.
+
+    :param payload: A ``turn.error`` object or an ``error`` ThreadItem.
+    :returns: Non-empty error text.
+    """
+    for key in ("message", "error", "text", "detail"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "Codex turn ended with an unspecified error."
+
+
+def _codex_terminal_launch_args_from_settings(payload: _JsonObject) -> list[str] | None:
+    """Convert Codex thread settings into persisted terminal launch args."""
+    active_profile = payload.get("activePermissionProfile")
+    if active_profile is None:
+        active_profile = payload.get("active_permission_profile")
+    reviewer = payload.get("approvalsReviewer")
+    if reviewer is None:
+        reviewer = payload.get("approvals_reviewer")
+    approval_policy = payload.get("approvalPolicy")
+    if approval_policy is None:
+        approval_policy = payload.get("approval_policy")
+    if approval_policy not in {"never", "on-failure", "on-request", "untrusted"}:
+        return None
+
+    args: list[str] = []
+    if isinstance(active_profile, dict) and isinstance(active_profile.get("id"), str):
+        args.extend(
+            [
+                "-c",
+                f"default_permissions={json.dumps(active_profile['id'])}",
+                "-c",
+                f"approval_policy={json.dumps(approval_policy)}",
+            ]
+        )
+    else:
+        sandbox_policy = payload.get("sandboxPolicy")
+        if sandbox_policy is None:
+            sandbox_policy = payload.get("sandbox_policy")
+        if not isinstance(sandbox_policy, dict):
+            return None
+        sandbox_mode = sandbox_policy.get("type")
+        if sandbox_mode not in {"read-only", "workspace-write", "danger-full-access"}:
+            return None
+        if approval_policy != "on-request" or sandbox_mode != "workspace-write":
+            args.extend(["--sandbox", sandbox_mode, "--ask-for-approval", approval_policy])
+
+    if reviewer in {"user", "auto_review", "guardian_subagent"}:
+        args.extend(["-c", f"approvals_reviewer={json.dumps(reviewer)}"])
+    return args
+
+
+def _error_item_from_turn(turn: _JsonObject) -> _JsonObject | None:
+    """
+    Return the first ``error`` ThreadItem in ``turn.items``, if any.
+
+    :param turn: A Codex turn object.
+    :returns: The first item whose ``type`` is :data:`_CODEX_ERROR_ITEM_TYPE`,
+        or ``None``.
+    """
+    items = turn.get("items")
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == _CODEX_ERROR_ITEM_TYPE:
+            return item
+    return None
+
+
+def _terminal_error_from_turn(params: _JsonObject) -> _CodexTerminalError | None:
+    """
+    Return the turn-level failure carried by a Codex turn, if any.
+
+    Prefers ``turn.error`` (the protocol's ``TurnError`` on a failed turn) and
+    falls back to an ``error`` ThreadItem in ``turn.items`` — both shapes exist
+    in the app-server type system and the wire shape varies by version. Single
+    source of truth reused by the live terminal edge and the ``thread/resume``
+    parity path.
+
+    :param params: Codex turn params, e.g. a ``turn/completed`` payload or a
+        single ``thread/resume`` turn wrapped as ``{"turn": <turn>}``.
+    :returns: The classified terminal error, or ``None`` when the turn did not
+        fail.
+    """
+    turn = params.get("turn")
+    if not isinstance(turn, dict):
+        return None
+    payload = turn.get("error")
+    if not isinstance(payload, dict):
+        payload = _error_item_from_turn(turn)
+    if payload is None:
+        return None
+    message = _error_payload_message(payload)
+    return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
 
 
 @dataclass(frozen=True)
@@ -584,17 +1016,21 @@ class _CodexTurnStatusEdge:
         ``"turn_abc123"``.
     :param source: Lifecycle source that produced the edge, e.g.
         ``"turn/started"``.
+    :param error: Turn-level error forcing this edge to ``failed``,
+        or ``None`` for ordinary lifecycle edges. Surfaced as the status
+        output by :func:`_post_turn_status_edge`.
     """
 
     status: str
     turn_id: str | None
     source: str
+    error: _CodexTerminalError | None = None
 
 
 # Codex ``item/completed`` item types that represent a built-in tool call.
 # Each maps to a builder that extracts a normalized :class:`_CodexToolCall`.
 # ``_TOOL_ITEM_BUILDERS`` is populated after the builders are defined.
-_ToolItemBuilder = Callable[[str, dict[str, Any]], "_CodexToolCall | None"]
+_ToolItemBuilder = Callable[[str, _JsonObject], "_CodexToolCall | None"]
 
 
 @dataclass(frozen=True)
@@ -606,10 +1042,28 @@ class _DeltaChunk:
         ``"codex:thread_123:turn_123:agentMessage:item_agent"``, or
         ``None`` for generic unscoped deltas.
     :param delta: Text fragment, e.g. ``"hel"``.
+    :param tool_call_id: Codex command item id when this is a live
+        command-output chunk, otherwise ``None``.
     """
 
     message_id: str | None
     delta: str
+    tool_call_id: str | None = None
+
+
+def _resolve_marker(done: asyncio.Future[None]) -> None:
+    """
+    Complete a queue marker's future unless a cancelled caller already settled it.
+
+    An unguarded ``set_result`` on an already-cancelled future raises
+    ``InvalidStateError``, which kills the worker; ``_ensure_worker`` only replaces a
+    ``None`` task, so the dead one is never restarted and every later flush hangs.
+
+    :param done: Future the caller is waiting on.
+    :returns: None.
+    """
+    if not done.done():
+        done.set_result(None)
 
 
 @dataclass(frozen=True)
@@ -638,9 +1092,9 @@ class _DeltaFlushStop:
 
 class _OutputTextDeltaCoalescer:
     """
-    Coalesce high-frequency Codex text deltas before posting to AP.
+    Coalesce high-frequency Codex text and command-output deltas.
 
-    Codex can emit many tiny ``item/agentMessage/delta`` notifications.
+    Codex can emit many tiny text and command-output notifications.
     Posting each one through Omnigent as an awaited HTTP request makes the
     forwarder drain behind Codex. This worker keeps event ingestion
     cheap while preserving the order of flushed text relative to
@@ -696,18 +1150,30 @@ class _OutputTextDeltaCoalescer:
         self._ensure_worker()
         self._queue.put_nowait(_DeltaChunk(message_id=message_id, delta=delta))
 
+    async def append_tool_output(self, delta: str, *, call_id: str) -> None:
+        """Queue command output for coalesced delivery.
+
+        :param delta: Command stdout/stderr fragment, e.g. ``"collecting..."``.
+        :param call_id: Codex ``commandExecution`` item id.
+        :returns: None.
+        """
+        if not delta or not call_id:
+            return
+        self._ensure_worker()
+        self._queue.put_nowait(_DeltaChunk(message_id=None, delta=delta, tool_call_id=call_id))
+
     async def flush(self) -> None:
         """
         Flush all deltas queued before this call.
 
         :returns: None after all earlier deltas have been posted.
         """
-        if self._worker_task is None:
+        if self._worker_task is None or self._worker_task.done():
             return
         loop = asyncio.get_running_loop()
         done: asyncio.Future[None] = loop.create_future()
         self._queue.put_nowait(_DeltaFlushBarrier(done=done))
-        await done
+        await self._await_marker(done, "flush barrier")
 
     async def close(self) -> None:
         """
@@ -717,12 +1183,51 @@ class _OutputTextDeltaCoalescer:
         """
         if self._worker_task is None:
             return
+        # A worker that already stopped will never read the marker, so skip
+        # straight to reaping it rather than waiting out the bound.
+        if self._worker_task.done():
+            self._worker_task = None
+            return
         loop = asyncio.get_running_loop()
         done: asyncio.Future[None] = loop.create_future()
         self._queue.put_nowait(_DeltaFlushStop(done=done))
-        await done
-        await self._worker_task
+        await self._await_marker(done, "stop marker")
+        # Only reap a worker that has actually finished; awaiting a wedged one
+        # would reintroduce the unbounded wait this method exists to remove.
+        if self._worker_task.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._worker_task
         self._worker_task = None
+
+    async def _await_marker(self, done: asyncio.Future[None], marker: str) -> None:
+        """
+        Wait for the worker to resolve a queue marker.
+
+        Races the marker against the worker itself: a worker that stops will never
+        resolve it, and at loop teardown the cancellation order between the worker
+        and the caller is arbitrary, so waiting on the marker alone stalls for the
+        full bound on an ordinary shutdown.
+
+        :param done: Future the worker resolves for this marker.
+        :param marker: Marker name used in the timeout log.
+        :returns: None once resolved, once the worker stops, or once the bound elapses.
+        """
+        worker = self._worker_task
+        waiters: set[asyncio.Future[None] | asyncio.Task[None]] = {done}
+        if worker is not None:
+            waiters.add(worker)
+        await asyncio.wait(
+            waiters,
+            return_when=asyncio.FIRST_COMPLETED,
+            timeout=_DELTA_MARKER_TIMEOUT_SECONDS,
+        )
+        if not done.done() and (worker is None or not worker.done()):
+            _logger.warning(
+                "codex delta coalescer %s timed out after %.1fs (session=%s)",
+                marker,
+                _DELTA_MARKER_TIMEOUT_SECONDS,
+                self._session_id,
+            )
 
     def _ensure_worker(self) -> None:
         """
@@ -743,7 +1248,7 @@ class _OutputTextDeltaCoalescer:
         :returns: None after a stop marker is processed.
         """
         buffer: list[str] = []
-        buffer_message_id: str | None = None
+        buffer_chunk: _DeltaChunk | None = None
         buffered_chars = 0
         flush_deadline: float | None = None
         loop = asyncio.get_running_loop()
@@ -754,67 +1259,90 @@ class _OutputTextDeltaCoalescer:
             try:
                 item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
             except TimeoutError:
-                await self._flush_buffer(buffer, message_id=buffer_message_id)
+                await self._flush_buffer(buffer, chunk=buffer_chunk)
                 buffer = []
-                buffer_message_id = None
+                buffer_chunk = None
                 buffered_chars = 0
                 flush_deadline = None
                 continue
             if isinstance(item, _DeltaChunk):
-                if buffer and item.message_id != buffer_message_id:
-                    await self._flush_buffer(buffer, message_id=buffer_message_id)
+                if (
+                    buffer
+                    and buffer_chunk is not None
+                    and (
+                        item.message_id != buffer_chunk.message_id
+                        or item.tool_call_id != buffer_chunk.tool_call_id
+                    )
+                ):
+                    await self._flush_buffer(buffer, chunk=buffer_chunk)
                     buffer = []
-                    buffer_message_id = None
+                    buffer_chunk = None
                     buffered_chars = 0
                     flush_deadline = None
                 if not buffer:
                     flush_deadline = loop.time() + self._flush_interval_seconds
-                    buffer_message_id = item.message_id
+                    buffer_chunk = item
                 buffer.append(item.delta)
                 buffered_chars += len(item.delta)
                 if "\n" in item.delta or buffered_chars >= self._flush_char_threshold:
-                    await self._flush_buffer(buffer, message_id=buffer_message_id)
+                    await self._flush_buffer(buffer, chunk=buffer_chunk)
                     buffer = []
-                    buffer_message_id = None
+                    buffer_chunk = None
                     buffered_chars = 0
                     flush_deadline = None
                 continue
             if isinstance(item, _DeltaFlushBarrier):
-                await self._flush_buffer(buffer, message_id=buffer_message_id)
+                await self._flush_buffer(buffer, chunk=buffer_chunk)
                 buffer = []
-                buffer_message_id = None
+                buffer_chunk = None
                 buffered_chars = 0
                 flush_deadline = None
-                item.done.set_result(None)
+                _resolve_marker(item.done)
                 continue
-            await self._flush_buffer(buffer, message_id=buffer_message_id)
-            item.done.set_result(None)
+            await self._flush_buffer(buffer, chunk=buffer_chunk)
+            _resolve_marker(item.done)
             return
 
-    async def _flush_buffer(self, buffer: list[str], *, message_id: str | None) -> None:
+    async def _flush_buffer(
+        self,
+        buffer: list[str],
+        *,
+        chunk: _DeltaChunk | None,
+    ) -> None:
         """
         Post a non-empty coalesced delta buffer to AP.
 
         :param buffer: Buffered text fragments, e.g. ``["hel", "lo"]``.
-        :param message_id: Stable native message stream id for the
-            buffer, e.g. ``"codex:thread_123:turn_123:agentMessage:item"``.
+        :param chunk: First chunk in the buffer, which carries its stream ids.
         :returns: None.
         """
         if not buffer:
             return
+        assert chunk is not None
         delta = "".join(buffer)
+        if chunk.tool_call_id is not None:
+            try:
+                await _post_tool_output_delta(
+                    self._client,
+                    self._session_id,
+                    delta,
+                    call_id=chunk.tool_call_id,
+                )
+            except Exception:  # noqa: BLE001 - preserve the long-lived forwarder.
+                _logger.warning("Codex forwarder tool-output delta flush failed", exc_info=True)
+            return
         index: int | None = None
         final: bool | None = None
-        if message_id is not None:
-            index = self._next_index_by_message_id.get(message_id, 0)
-            self._next_index_by_message_id[message_id] = index + 1
+        if chunk.message_id is not None:
+            index = self._next_index_by_message_id.get(chunk.message_id, 0)
+            self._next_index_by_message_id[chunk.message_id] = index + 1
             final = False
         try:
             await _post_output_text_delta(
                 self._client,
                 self._session_id,
                 delta,
-                message_id=message_id,
+                message_id=chunk.message_id,
                 index=index,
                 final=final,
             )
@@ -861,7 +1389,7 @@ class _SessionUsageCoalescer:
         self._last_posted: dict[str, int] = {}
         self._model: str | None = model
 
-    def record(self, params: dict[str, Any], model: str | None = None) -> None:
+    def record(self, params: _JsonObject, model: str | None = None) -> None:
         """
         Record the latest usage values from one Codex notification.
 
@@ -902,7 +1430,7 @@ class _SessionUsageCoalescer:
         # changed-keys dedup, so it rides along even when only token
         # counts changed) — the server reprices cumulative tokens into
         # ``total_cost_usd`` per turn and needs the model each time.
-        payload: dict[str, Any] = dict(data)
+        payload: _JsonObject = dict(data)
         if self._model:
             payload["model"] = self._model
         response = await _post_session_event(
@@ -1019,7 +1547,7 @@ class _CodexElicitationTaskTracker:
         client: httpx.AsyncClient,
         *,
         session_id: str,
-        params: dict[str, Any],
+        params: _JsonObject,
     ) -> None:
         """
         Mark the hook wait resolved by Codex's explicit notification.
@@ -1046,7 +1574,7 @@ class _CodexElicitationTaskTracker:
         client: httpx.AsyncClient,
         *,
         session_id: str,
-        params: dict[str, Any],
+        params: _JsonObject,
     ) -> None:
         """
         Clear pending hook waits after Codex accepts a terminal turn.
@@ -1177,7 +1705,7 @@ class _CodexElicitationTaskTracker:
 def _pending_elicitation_matches_resolution(
     pending: _PendingCodexElicitation,
     *,
-    request_id: Any,
+    request_id: object,
     thread_id: str | None,
 ) -> bool:
     """
@@ -1271,16 +1799,33 @@ async def supervise_forwarder(
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
+    # Bind bridge dir so failed durable-event posts can be dead-lettered (#1120).
+    _dead_letter_dir.set(bridge_dir)
     if client is None:
         client = client_for_transport(app_server_url, client_name="omnigent-codex-forwarder")
         await client.connect()
-    async with httpx.AsyncClient(
-        base_url=base_url,
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(
+        base_url,
         headers=headers,
         auth=auth,
         timeout=httpx.Timeout(30.0),
         transport=ap_transport,
     ) as ap_client:
+        # Recover proven-undelivered dead-lettered forwards now that the
+        # server may be reachable again (host/server returned after an
+        # outage or restart). Runs before live forwarding begins, so no
+        # other writer races the dead-letter files (#1579).
+        await _replay_dead_letters_on_startup(ap_client, bridge_dir)
+        # Synthesize the thread's MCP startup round (see the comment on
+        # _CODEX_MCP_STARTUP_STATUS_METHOD): the fresh-launch forwarder
+        # starts right at thread creation, which is when codex boots its
+        # configured MCP servers. Skipped when the bridge already carries
+        # round state (forwarder reconnect mid-session).
+        mcp_settle_timer = await _seed_mcp_startup_round(
+            ap_client, session_id=session_id, bridge_dir=bridge_dir
+        )
         target = _ForwarderTarget(
             session_id=session_id,
             thread_id=thread_id,
@@ -1366,6 +1911,10 @@ async def supervise_forwarder(
                 except Exception:  # noqa: BLE001 - keep the long-lived mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
         finally:
+            if mcp_settle_timer is not None:
+                mcp_settle_timer.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await mcp_settle_timer
             await target.delta_coalescer.close()
             await target.usage_coalescer.close()
             await target.elicitation_tracker.close()
@@ -1473,8 +2022,12 @@ async def _create_thread_replacement_session(
     if not isinstance(agent_id, str) or not agent_id:
         raise RuntimeError(f"session {old_session_id!r} has no agent_id")
     runner_id = old.get("runner_id")
-    labels = old.get("labels") if isinstance(old.get("labels"), dict) else {}
-    labels = {str(key): str(value) for key, value in labels.items()}
+    labels_value = old.get("labels")
+    labels = (
+        {str(key): str(value) for key, value in labels_value.items()}
+        if isinstance(labels_value, dict)
+        else {}
+    )
     state = read_bridge_state(bridge_dir)
     if CODEX_NATIVE_BRIDGE_ID_LABEL_KEY not in labels:
         labels[CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = old_session_id
@@ -1545,7 +2098,7 @@ async def _create_thread_replacement_session(
     return new_session_id
 
 
-async def _fetch_session_snapshot(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
+async def _fetch_session_snapshot(client: httpx.AsyncClient, session_id: str) -> _JsonObject:
     """
     Fetch an Omnigent session snapshot for Codex session rotation.
 
@@ -1614,7 +2167,7 @@ async def _subscribe_until_ready(
     saw_not_ready = False
     while True:
         try:
-            params: dict[str, Any] = {"threadId": thread_id}
+            params: _JsonObject = {"threadId": thread_id}
             if not saw_not_ready:
                 params["excludeTurns"] = True
             response = await client.request("thread/resume", params)
@@ -1650,6 +2203,9 @@ async def _subscribe_until_ready(
             # response's model when config.toml has none.
             _refresh_model_from_config(bridge_dir, forwarder_state)
             await _sync_model_change(
+                ap_client, session_id=session_id, forwarder_state=forwarder_state
+            )
+            await _sync_codex_approval_mode_change(
                 ap_client, session_id=session_id, forwarder_state=forwarder_state
             )
         await _replay_resume_response(
@@ -1793,7 +2349,7 @@ async def _post_resume_terminal_status(
     session_id: str,
     bridge_dir: Path,
     thread_id: str | None,
-    turns: list[Any],
+    turns: list[object],
 ) -> None:
     """
     Publish a missing terminal status edge from ``thread/resume`` data.
@@ -1822,7 +2378,7 @@ async def _post_resume_terminal_status(
 def _resume_terminal_status_edge_for_latest_turn(
     bridge_dir: Path,
     thread_id: str,
-    turns: list[Any],
+    turns: list[object],
 ) -> _CodexTurnStatusEdge | None:
     """
     Return the Omnigent terminal status represented by the latest resume turn.
@@ -1849,23 +2405,35 @@ def _resume_terminal_status_edge_for_latest_turn(
         if status is None:
             return None
         update_active_turn_id(bridge_dir, None)
+        # Parity with the live path — surface ``turn.error`` (if any) that
+        # forced this resume turn to ``failed``.
+        error = _terminal_error_from_turn({"turn": turn})
         return _CodexTurnStatusEdge(
             status=status,
             turn_id=turn_id,
-            source="thread/resume",
+            source="thread/resume:turn-error" if error is not None else "thread/resume",
+            error=error,
         )
     return None
 
 
-def _omnigent_status_from_resume_turn(turn: dict[str, Any]) -> str | None:
+def _omnigent_status_from_resume_turn(turn: _JsonObject) -> str | None:
     """
     Convert an explicit Codex resume turn status to Omnigent session status.
+
+    Applies the same ``turn.error`` check as the live terminal path
+    (:func:`_terminal_turn_status_edge`) so a resumed turn that carried an
+    error maps to ``failed`` even if its recorded status is not — the
+    resume-path side of the "silent success" fix.
 
     :param turn: Codex resume turn object, e.g.
         ``{"id": "turn_123", "status": "completed"}``.
     :returns: Omnigent status literal for terminal turns, or ``None`` for active
         or unrecognized statuses.
     """
+    # A ``turn.error`` forces ``failed`` regardless of the recorded status.
+    if _terminal_error_from_turn({"turn": turn}) is not None:
+        return "failed"
     status = turn.get("status")
     if isinstance(status, dict):
         status = status.get("type") or status.get("status")
@@ -1922,12 +2490,60 @@ async def _handle_event(
                 _parent_thread_id_from_started_event(event),
             )
         return
+    if method == _CODEX_MCP_STARTUP_STATUS_METHOD:
+        # MCP startup is bridge-level state, surfaced on the parent
+        # session. The notification's ``threadId`` is nullable; a child
+        # thread's startup (different id) is not mirrored.
+        event_thread_id = _thread_id_from_params(params)
+        if (
+            event_thread_id is None
+            or expected_thread_id is None
+            or event_thread_id == expected_thread_id
+        ):
+            parent_session_id = (
+                forwarder_state.parent_session_id
+                if forwarder_state is not None and forwarder_state.parent_session_id is not None
+                else session_id
+            )
+            await _handle_mcp_startup_status(
+                client,
+                session_id=parent_session_id,
+                bridge_dir=bridge_dir,
+                params=params,
+            )
+        return
+    if _is_thread_idle_status_event(method, params) and _thread_id_from_params(params) in {
+        None,
+        expected_thread_id,
+    }:
+        # A completed turn proves MCP startup settled (codex defers turn
+        # execution until the round ends) — resolve the synthesized round.
+        # Not an exclusive handler: idle status also feeds the subscribe
+        # release below, so fall through.
+        await _settle_mcp_startup(
+            client, session_id=session_id, bridge_dir=bridge_dir, reason="thread went idle"
+        )
     # Resolve routing: parent thread, known child thread, or stale/ignored.
     route_session_id, is_child = _resolve_event_session(
         params, method, expected_thread_id, forwarder_state, fallback_session_id=session_id
     )
     if route_session_id is None:
         return
+    # First model-produced item settles the synthesized MCP startup round
+    # mid-turn — codex defers turn execution until the round ends, so
+    # assistant-side output proves startup is over before the idle edge.
+    # Guarded by the state flag so only that first item pays the
+    # bridge-file read; every later item in the session short-circuits.
+    if (
+        not is_child
+        and (forwarder_state is None or not forwarder_state.mcp_startup_settled)
+        and _is_model_output_item_event(method, params)
+    ):
+        await _settle_mcp_startup(
+            client, session_id=session_id, bridge_dir=bridge_dir, reason="model output observed"
+        )
+        if forwarder_state is not None:
+            forwarder_state.mcp_startup_settled = True
     # item/started: register collab-agent children early (before item/completed)
     # so live child events can be routed to the child session immediately.
     # Only meaningful for the parent thread; children don't spawn grandchildren here.
@@ -1935,6 +2551,13 @@ async def _handle_event(
         item = params.get("item")
         if isinstance(item, dict) and item.get("type") == _CODEX_COLLAB_AGENT_ITEM_TYPE:
             await _handle_collab_item(client, params, item, forwarder_state)
+        elif isinstance(item, dict) and item.get("type") == _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE:
+            await _handle_subagent_activity(client, params, item, forwarder_state)
+        elif isinstance(item, dict) and item.get("type") == _CODEX_COMPACTION_ITEM_TYPE:
+            # Compaction started mid-turn — show the spinner.
+            await _post_compaction_status(
+                client, route_session_id, "in_progress", forwarder_state=forwarder_state
+            )
         elif isinstance(item, dict) and item.get("type") == "agentMessage":
             # Post the turn's user message NOW — before the assistant's text
             # deltas start streaming. The live ``userMessage`` event can be
@@ -1948,6 +2571,10 @@ async def _handle_event(
             # ``item/completed`` guard below remains the backstop for the
             # resume-backfill path, which replays only ``item/completed``.
             await _ensure_user_message_posted(client, route_session_id, params, forwarder_state)
+        elif isinstance(item, dict) and item.get("type") == "commandExecution":
+            call_id = await _post_tool_call_item(client, route_session_id, params, item)
+            if call_id is not None:
+                forwarder_state.note_tool_call_posted(call_id)
         return
     if method == _CODEX_SERVER_REQUEST_RESOLVED_METHOD:
         # Resolve on the session the elicitation was published on (a child
@@ -1989,7 +2616,7 @@ async def _handle_event(
         bridge_dir=bridge_dir if not is_child else Path(),
         method=method,
         params=params,
-        usage_coalescer=child_coalescer if is_child else usage_coalescer,
+        usage_coalescer=(child_coalescer if child_coalescer is not None else usage_coalescer),
         delta_coalescer=delta_coalescer if not is_child else None,
         elicitation_tracker=elicitation_tracker,
         codex_client=codex_client,
@@ -2015,11 +2642,12 @@ async def _handle_event(
             params=params,
             delta_coalescer=delta_coalescer if not is_child else None,
             forwarder_state=forwarder_state,
+            bridge_dir=bridge_dir,
         )
 
 
 def _resolve_event_session(
-    params: dict[str, Any],
+    params: _JsonObject,
     method: str,
     expected_thread_id: str | None,
     forwarder_state: _CodexForwarderState | None,
@@ -2090,7 +2718,7 @@ def _resolve_event_session(
 
 
 def _event_targets_different_thread(
-    params: dict[str, Any],
+    params: _JsonObject,
     method: str,
     expected_thread_id: str | None,
 ) -> bool:
@@ -2172,26 +2800,39 @@ async def _maybe_handle_codex_request(
 
 def _refresh_model_from_config(bridge_dir: Path, forwarder_state: _CodexForwarderState) -> None:
     """
-    Update the forwarder's known model from this session's ``config.toml``.
+    Update the forwarder's known model from config.toml and thread settings.
 
-    Reads the source-of-truth model via the shared
-    :func:`~omnigent.codex_native_bridge.read_codex_config_model` (the
-    ``model`` key an in-TUI ``/model`` writes — see that function for why
-    config.toml is the source of truth and its caveats) and stores it on
-    ``forwarder_state.model`` so a following ``_sync_model_change`` mirrors
-    it to Omnigent as ``model_override``. This mirror is a fallback to the codex
-    hook, which stamps the live model onto the evaluation request at gate
-    time; the gate prefers the hook's value. No-op when the model can't be
-    determined, leaving the prior value.
+    Reads the ``model`` key an in-TUI ``/model`` writes via the shared
+    :func:`~omnigent.codex_native_bridge.read_codex_config_model` and stores
+    the freshest value on ``forwarder_state.model`` so a following
+    ``_sync_model_change`` mirrors it to Omnigent as ``model_override``. This
+    mirror is a fallback to the codex hook, which stamps the live model onto
+    the evaluation request at gate time; the gate prefers the hook's value.
+
+    Precedence: a config.toml value that CHANGED since the last read wins
+    (an in-TUI ``/model`` or the executor's mirror write — the freshest
+    signal). An unchanged config defers to the last live
+    ``thread/settings/updated`` model when one was seen: an
+    Omnigent-initiated ``thread/settings/update`` switches the running
+    thread without touching config.toml, so re-adopting the stale file
+    would revert a routed model one turn after it applied. No-op when
+    nothing is known, leaving the prior value.
 
     :param bridge_dir: The session's native-Codex bridge directory.
     :param forwarder_state: Mutable forwarder state whose ``model`` is
         updated in place.
     :returns: None.
     """
-    model = read_codex_config_model(bridge_dir)
-    if model:
-        forwarder_state.model = model
+    config_model = read_codex_config_model(bridge_dir)
+    config_changed = bool(config_model) and config_model != forwarder_state.last_config_model
+    if config_model:
+        forwarder_state.last_config_model = config_model
+    if config_changed:
+        forwarder_state.model = config_model
+    elif forwarder_state.settings_model:
+        forwarder_state.model = forwarder_state.settings_model
+    elif config_model:
+        forwarder_state.model = config_model
 
 
 async def _sync_model_change(
@@ -2236,13 +2877,93 @@ async def _sync_model_change(
         forwarder_state.posted_model = model
 
 
+async def _sync_reasoning_effort_change(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Mirror Codex's active reasoning effort to Omnigent session metadata.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param forwarder_state: Mutable forwarder state carrying the current
+        Codex effort and last-mirrored baseline.
+    :returns: None.
+    """
+    effort = forwarder_state.effort
+    if forwarder_state.posted_effort_known and effort == forwarder_state.posted_effort:
+        return
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
+        data={"reasoning_effort": effort},
+    )
+    _log_failed_session_event_post(_EXTERNAL_REASONING_EFFORT_CHANGE_TYPE, response)
+    if response is not None and response.status_code < 400:
+        forwarder_state.posted_effort = effort
+        forwarder_state.posted_effort_known = True
+
+
+async def _sync_codex_collaboration_mode_change(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Mirror Codex's active collaboration mode kind to Omnigent labels.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param forwarder_state: Mutable forwarder state carrying the current
+        Codex collaboration mode and last-mirrored baseline.
+    :returns: None.
+    """
+    mode = forwarder_state.collaboration_mode
+    if not mode or mode == forwarder_state.posted_collaboration_mode:
+        return
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
+        data={"mode": mode},
+    )
+    _log_failed_session_event_post(_EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE, response)
+    if response is not None and response.status_code < 400:
+        forwarder_state.posted_collaboration_mode = mode
+
+
+async def _sync_codex_approval_mode_change(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """Mirror Codex ``/permissions`` changes into session metadata."""
+    args = forwarder_state.terminal_launch_args
+    if args is None or args == forwarder_state.posted_terminal_launch_args:
+        return
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type="external_codex_approval_mode_change",
+        data={"terminal_launch_args": args},
+    )
+    _log_failed_session_event_post("external_codex_approval_mode_change", response)
+    if response is not None and response.status_code < 400:
+        forwarder_state.posted_terminal_launch_args = list(args)
+
+
 async def _maybe_handle_turn_event(
     client: httpx.AsyncClient,
     *,
     session_id: str,
     bridge_dir: Path,
     method: str,
-    params: dict[str, Any],
+    params: _JsonObject,
     usage_coalescer: _SessionUsageCoalescer,
     delta_coalescer: _OutputTextDeltaCoalescer | None,
     elicitation_tracker: _CodexElicitationTaskTracker,
@@ -2269,6 +2990,9 @@ async def _maybe_handle_turn_event(
             await delta_coalescer.flush()
         await _handle_turn_started(client, session_id, bridge_dir, params)
         if forwarder_state is not None:
+            # A new turn opens a fresh reasoning block: the next reasoning
+            # delta must emit ``response.reasoning.started`` again.
+            forwarder_state.reasoning_stream_item_id = None
             # An in-TUI ``/model`` switch writes config.toml (the cost-policy
             # source of truth) but emits no notification. Re-read it at turn
             # start so a switch made since the last turn lands ``model_override``
@@ -2305,11 +3029,41 @@ async def _maybe_handle_turn_event(
             await _sync_model_change(
                 client, session_id=session_id, forwarder_state=forwarder_state
             )
+            await _sync_reasoning_effort_change(
+                client, session_id=session_id, forwarder_state=forwarder_state
+            )
+            await _sync_codex_collaboration_mode_change(
+                client, session_id=session_id, forwarder_state=forwarder_state
+            )
+            await _sync_codex_approval_mode_change(
+                client, session_id=session_id, forwarder_state=forwarder_state
+            )
         return True
     if method == "turn/plan/updated":
         if delta_coalescer is not None:
             await delta_coalescer.flush()
         await _handle_turn_plan_updated(client, session_id, params)
+        return True
+    if method == _CODEX_THREAD_COMPACTED_METHOD:
+        # Codex finished compacting the thread's context window.
+        await _post_compaction_status(
+            client, session_id, "completed", forwarder_state=forwarder_state
+        )
+        if forwarder_state is None or not forwarder_state.compaction_item_persisted:
+            try:
+                await _persist_codex_compaction_item(
+                    client, session_id=session_id, bridge_dir=bridge_dir
+                )
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Failed to persist codex compaction item for %s", session_id, exc_info=True
+                )
+            else:
+                if forwarder_state is not None:
+                    forwarder_state.compaction_item_persisted = True
+        return True
+    if method == "turn/diff/updated":
+        _handle_turn_diff_updated(params, forwarder_state)
         return True
     return False
 
@@ -2320,12 +3074,12 @@ async def _maybe_handle_delta_event(
     session_id: str,
     bridge_dir: Path,
     method: str,
-    params: dict[str, Any],
+    params: _JsonObject,
     delta_coalescer: _OutputTextDeltaCoalescer | None,
     forwarder_state: _CodexForwarderState | None,
 ) -> bool:
     """
-    Handle Codex streaming text/plan delta events.
+    Handle Codex streaming delta events.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -2365,6 +3119,32 @@ async def _maybe_handle_delta_event(
             forwarder_state,
         )
         return True
+    if method == "item/commandExecution/outputDelta":
+        if delta_coalescer is None:
+            raise RuntimeError(
+                "Codex command-output delta handling requires a text-delta coalescer"
+            )
+        call_id = _item_id_from_delta_params(params)
+        delta = params.get("delta")
+        if not isinstance(call_id, str) or not call_id:
+            _logger.warning("Codex command output delta missing item id")
+            return True
+        if not isinstance(delta, str):
+            _logger.warning("Codex command output delta missing string delta: call_id=%s", call_id)
+            return True
+        turn_id = _turn_id_from_payload(params)
+        if not _is_active_turn_delta(bridge_dir, turn_id):
+            _logger.info("Codex forwarder ignored stale command output delta: turn_id=%s", turn_id)
+            return True
+        await delta_coalescer.append_tool_output(delta, call_id=call_id)
+        return True
+    if method in {"item/reasoning/textDelta", "item/reasoning/summaryTextDelta"}:
+        # Flush any buffered assistant text first so a reasoning delta never
+        # jumps ahead of earlier-streamed answer text in arrival order.
+        if delta_coalescer is not None:
+            await delta_coalescer.flush()
+        await _handle_reasoning_delta(client, session_id, params, forwarder_state)
+        return True
     return False
 
 
@@ -2372,9 +3152,10 @@ async def _handle_completed_event(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    params: dict[str, Any],
+    params: _JsonObject,
     delta_coalescer: _OutputTextDeltaCoalescer | None,
     forwarder_state: _CodexForwarderState | None,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Flush pending text and mirror one completed Codex item.
@@ -2392,7 +3173,9 @@ async def _handle_completed_event(
         await delta_coalescer.flush()
     if forwarder_state is not None:
         forwarder_state.record_completed_plan(params)
-    await _handle_completed_item(client, session_id, params, forwarder_state=forwarder_state)
+    await _handle_completed_item(
+        client, session_id, params, forwarder_state=forwarder_state, bridge_dir=bridge_dir
+    )
 
 
 async def _handle_terminal_turn_boundary(
@@ -2401,7 +3184,7 @@ async def _handle_terminal_turn_boundary(
     session_id: str,
     bridge_dir: Path,
     method: str,
-    params: dict[str, Any],
+    params: _JsonObject,
     usage_coalescer: _SessionUsageCoalescer,
     delta_coalescer: _OutputTextDeltaCoalescer | None,
     elicitation_tracker: _CodexElicitationTaskTracker,
@@ -2427,10 +3210,23 @@ async def _handle_terminal_turn_boundary(
     """
     if delta_coalescer is not None:
         await delta_coalescer.flush()
+    # Safety net: if a compaction was reported in progress but Codex never
+    # emitted a completion signal we recognize (e.g. a protocol-spelling
+    # drift), force the spinner closed at the turn boundary so it can't hang.
+    if forwarder_state is not None and forwarder_state.compaction_status_posted == "in_progress":
+        await _post_compaction_status(
+            client, session_id, "completed", forwarder_state=forwarder_state
+        )
     await _maybe_persist_interrupted_partial_text(
         client,
         session_id=session_id,
         method=method,
+        params=params,
+        forwarder_state=forwarder_state,
+    )
+    await _flush_turn_diff(
+        client,
+        session_id=session_id,
         params=params,
         forwarder_state=forwarder_state,
     )
@@ -2461,7 +3257,7 @@ async def _handle_terminal_turn_boundary(
 
 def _handle_usage_update(
     usage_coalescer: _SessionUsageCoalescer,
-    params: dict[str, Any],
+    params: _JsonObject,
     forwarder_state: _CodexForwarderState | None = None,
 ) -> None:
     """
@@ -2480,35 +3276,334 @@ def _handle_usage_update(
 async def _handle_turn_plan_updated(
     client: httpx.AsyncClient,
     session_id: str,
-    params: dict[str, Any],
+    params: _JsonObject,
 ) -> None:
     """
-    Mirror a Codex plan update as a visible assistant message.
+    Mirror a Codex plan update in the todo panel.
 
     Codex emits plan changes as app-server notifications rather than
-    ordinary assistant text. Omnigent web currently renders persisted message
-    items, not a dedicated plan item type, so the native bridge converts
-    the structured plan into a compact assistant message.
+    ordinary assistant text. The forwarder posts the structured plan as an
+    ``external_session_todos`` event so the web ``TodoPanel`` renders it like
+    Claude's todo list without duplicating it in the chat transcript.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param params: Codex ``turn/plan/updated`` params.
     :returns: None.
     """
-    text = _plan_text_from_update(params)
-    if not text:
+    todos = _plan_todos_from_update(params)
+    if todos is not None:
+        await _post_external_session_todos(
+            client,
+            session_id=session_id,
+            todos=todos,
+        )
+
+
+def _handle_turn_diff_updated(
+    params: _JsonObject,
+    forwarder_state: _CodexForwarderState | None,
+) -> None:
+    """
+    Record the latest aggregated working-tree diff for the active turn.
+
+    Codex emits ``turn/diff/updated`` repeatedly as a turn's edits land,
+    each carrying the full unified diff so far. Posting every update would
+    spam the transcript with a growing diff, so the forwarder only stashes
+    the newest diff here and flushes it once at the terminal turn boundary
+    (:func:`_flush_turn_diff`). A no-op without ``forwarder_state`` (child
+    threads / tests that bypass ``supervise_forwarder``).
+
+    :param params: Codex ``turn/diff/updated`` params, e.g.
+        ``{"threadId": "thread_1", "turnId": "turn_1", "diff": "--- a/x\\n..."}``.
+    :param forwarder_state: Optional mutable state holding per-turn diffs.
+    :returns: None.
+    """
+    if forwarder_state is None:
         return
-    await _post_external_item(
+    turn_id = _turn_id_from_payload(params)
+    if turn_id is None:
+        return
+    diff = params.get("diff")
+    forwarder_state.note_turn_diff(turn_id, diff if isinstance(diff, str) else "")
+
+
+async def _handle_mcp_startup_status(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    params: _JsonObject,
+) -> None:
+    """
+    Mirror one Codex MCP-server startup update.
+
+    Records the update into the bridge dir (the Stop path and turn-error
+    text read it) and republishes the full per-server map to Omnigent so the
+    web session shows startup progress. In practice codex delivers these
+    edges only to the thread-owning connection (see the comment on
+    :data:`_CODEX_MCP_STARTUP_STATUS_METHOD`); when they do arrive they
+    carry real terminal states and supersede the synthesized round.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory.
+    :param params: Codex ``mcpServer/startupStatus/updated`` params, e.g.
+        ``{"name": "safe", "status": "failed", "error": "..."}``.
+    :returns: None.
+    """
+    name = params.get("name")
+    status = params.get("status")
+    if not (
+        isinstance(name, str) and name and isinstance(status, str) and status in MCP_STARTUP_STATES
+    ):
+        _logger.info("Codex forwarder ignored malformed MCP startup update: %r", params)
+        return
+    error = params.get("error")
+    servers = update_mcp_server_startup(
+        bridge_dir,
+        name,
+        status,
+        error=error if isinstance(error, str) and error else None,
+    )
+    await _post_mcp_startup(client, session_id, servers)
+
+
+def _expected_mcp_servers_from_config(bridge_dir: Path) -> list[str]:
+    """
+    Read the enabled MCP server names from the session's Codex config.
+
+    The per-session ``config.toml`` (private ``CODEX_HOME``) is what the
+    app-server loads, so its ``[mcp_servers.*]`` tables are exactly the
+    servers codex boots at thread start — including the injected
+    ``omnigent`` relay server. Codex-internal servers that are not
+    config-declared (e.g. ``codex_apps``) are not visible here and are
+    simply absent from the synthesized round.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: Sorted enabled server names, e.g. ``["omnigent", "safe"]``.
+        Empty when the config is missing or unparsable.
+    """
+    import tomllib
+
+    config_path = codex_home_for_bridge_dir(bridge_dir) / "config.toml"
+    try:
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    servers = config.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return []
+    return sorted(
+        name
+        for name, table in servers.items()
+        if isinstance(name, str)
+        and name
+        and isinstance(table, dict)
+        and table.get("enabled") is not False
+    )
+
+
+def _mcp_startup_settle_timeout_seconds(bridge_dir: Path) -> float:
+    """
+    Derive the synthesized round's settle window from the session config.
+
+    Codex bounds each server's spawn+handshake by its per-server
+    ``startup_timeout_sec`` (default
+    :data:`_MCP_STARTUP_DEFAULT_TIMEOUT_SECONDS`), so the round cannot
+    outlive the slowest server's budget; a grace period absorbs spawn
+    overhead and the cap keeps a misconfigured budget from pinning the
+    band for many minutes.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: Settle timeout in seconds, e.g. ``135.0`` for a config whose
+        slowest server declares ``startup_timeout_sec = 120``.
+    """
+    import tomllib
+
+    slowest = _MCP_STARTUP_DEFAULT_TIMEOUT_SECONDS
+    config_path = codex_home_for_bridge_dir(bridge_dir) / "config.toml"
+    try:
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        config = {}
+    servers = config.get("mcp_servers")
+    if isinstance(servers, dict):
+        for table in servers.values():
+            # Same enabled filter as _expected_mcp_servers_from_config:
+            # codex never boots a disabled server, so its budget must not
+            # stretch the window for a round it is not part of.
+            if not isinstance(table, dict) or table.get("enabled") is False:
+                continue
+            timeout = table.get("startup_timeout_sec")
+            if isinstance(timeout, (int, float)) and timeout > slowest:
+                slowest = float(timeout)
+    return min(slowest + _MCP_STARTUP_SETTLE_GRACE_SECONDS, _MCP_STARTUP_SETTLE_MAX_SECONDS)
+
+
+def _arm_mcp_settle_timer(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+) -> asyncio.Task[None]:
+    """
+    Arm the bounded settle window for an in-flight MCP startup round.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: The settle-timer task.
+    """
+    timeout = _mcp_startup_settle_timeout_seconds(bridge_dir)
+
+    async def settle_after_window() -> None:
+        """Settle the synthesized round once the startup window elapses."""
+        await _sleep(timeout)
+        await _settle_mcp_startup(
+            client, session_id=session_id, bridge_dir=bridge_dir, reason="startup window elapsed"
+        )
+
+    return asyncio.create_task(settle_after_window(), name="codex-native-mcp-settle")
+
+
+async def _seed_mcp_startup_round(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+) -> asyncio.Task[None] | None:
+    """
+    Record the config-declared MCP servers as ``starting`` and post them.
+
+    Seeds once per app-server launch: ``clear_bridge_state`` wipes the
+    recorded map before each launch, and an existing map means a
+    forwarder reconnect mid-session — reseeding then would flash a false
+    "starting" band for servers that finished booting long ago. A
+    reconnect that finds the round still pending does re-arm the settle
+    window, though: the previous forwarder's timer died with it, and
+    without a replacement a missed idle edge would leave the band stuck
+    on "starting" for the rest of the session.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: The armed settle-timer task, or ``None`` when the recorded
+        round has already settled.
+    """
+    existing = read_mcp_startup(bridge_dir)
+    if existing:
+        if not pending_mcp_servers(existing):
+            return None
+        _logger.info("Codex MCP startup round still pending after reconnect; re-arming settle")
+        return _arm_mcp_settle_timer(client, session_id=session_id, bridge_dir=bridge_dir)
+    expected = _expected_mcp_servers_from_config(bridge_dir)
+    if not expected:
+        return None
+    servers: dict[str, dict[str, str | None]] = {}
+    for name in expected:
+        servers = update_mcp_server_startup(bridge_dir, name, MCP_STARTUP_STARTING)
+    _logger.info("Codex MCP startup round synthesized: %s", ", ".join(expected))
+    await _post_mcp_startup(client, session_id, servers)
+    return _arm_mcp_settle_timer(client, session_id=session_id, bridge_dir=bridge_dir)
+
+
+async def _settle_mcp_startup(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    reason: str,
+) -> None:
+    """
+    Settle the synthesized MCP startup round, if any of it is unresolved.
+
+    Drops still-``starting`` entries from the bridge map (their real
+    terminal states are only ever delivered to the thread-owning
+    connection) and posts the settled map so the web band clears.
+    Locally-recorded terminal states — ``cancelled`` from a Stop — are
+    preserved. Idempotent: a fully settled map is left untouched.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory.
+    :param reason: Settle trigger for logs, e.g. ``"thread went idle"``.
+    :returns: None.
+    """
+    servers, changed = settle_pending_mcp_startup(bridge_dir)
+    if not changed:
+        return
+    _logger.info("Codex MCP startup round settled (%s)", reason)
+    await _post_mcp_startup(client, session_id, servers)
+
+
+def _is_thread_idle_status_event(method: str, params: _JsonObject) -> bool:
+    """
+    Return whether an event reports the thread going idle.
+
+    Codex defers turn execution until MCP startup settles, so a thread
+    reaching ``idle`` after a turn proves the startup round is over. This
+    is one of the few notifications codex broadcasts to non-owning
+    connections, making it the natural live settle signal for the
+    synthesized round.
+
+    :param method: Codex method value, e.g. ``"thread/status/changed"``.
+    :param params: Codex notification params.
+    :returns: ``True`` for an idle ``thread/status/changed``.
+    """
+    if method != _CODEX_THREAD_STATUS_CHANGED_METHOD:
+        return False
+    status = params.get("status")
+    return isinstance(status, dict) and status.get("type") == "idle"
+
+
+def _is_model_output_item_event(method: str, params: _JsonObject) -> bool:
+    """
+    Return whether an event carries a model-produced turn item.
+
+    The mid-turn settle signal for the synthesized MCP startup round:
+    codex defers turn execution until the round ends, so an
+    assistant-side item proves the round is over while the turn is still
+    running — the idle edge only fires after it. The turn's
+    ``userMessage`` item is excluded: like the thread-active edge, it
+    materializes when a turn is merely ACCEPTED, which happens
+    mid-startup.
+
+    :param method: Codex method value, e.g. ``"item/started"``.
+    :param params: Codex notification params.
+    :returns: ``True`` for an ``item/started`` / ``item/completed``
+        carrying a non-``userMessage`` item.
+    """
+    if method not in {"item/started", "item/completed"}:
+        return False
+    item = params.get("item")
+    if not isinstance(item, dict):
+        return False
+    item_type = item.get("type")
+    return isinstance(item_type, str) and item_type != "userMessage"
+
+
+async def _post_mcp_startup(
+    client: httpx.AsyncClient,
+    session_id: str,
+    servers: dict[str, dict[str, str | None]],
+) -> None:
+    """
+    Post the current per-MCP-server startup map to Omnigent.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param servers: Full startup map, e.g.
+        ``{"safe": {"status": "starting", "error": None}}``.
+    :returns: None.
+    """
+    response = await _post_session_event(
         client,
         session_id,
-        item_type="message",
-        item_data={
-            "role": "assistant",
-            "agent": _AGENT_NAME,
-            "content": [{"type": "output_text", "text": text}],
-        },
-        response_id=_response_id(params),
+        event_type=_EXTERNAL_MCP_STARTUP_TYPE,
+        data={"servers": servers},
     )
+    _log_failed_session_event_post(_EXTERNAL_MCP_STARTUP_TYPE, response)
 
 
 def _is_codex_elicitation_request(event: CodexMessage) -> bool:
@@ -2551,6 +3646,9 @@ async def _handle_codex_elicitation_request(
     :returns: None.
     """
     request_id = event.get("id")
+    # JSON-RPC notifications have no response channel for an elicitation result.
+    if not isinstance(request_id, (int, str)):
+        return
     result = await _codex_elicitation_hook_result(
         client,
         session_id,
@@ -2566,7 +3664,7 @@ async def _codex_elicitation_hook_result(
     session_id: str,
     *,
     event: CodexMessage,
-) -> dict[str, Any] | None:
+) -> _JsonObject | None:
     """
     POST a Codex-shaped elicitation request and parse its result body.
 
@@ -2731,7 +3829,7 @@ def _note_native_plan_implementation_prompt(
         forwarder_state.mark_prompted(turn_id)
 
 
-def _is_plan_implementation_request_user_input(params: dict[str, Any]) -> bool:
+def _is_plan_implementation_request_user_input(params: _JsonObject) -> bool:
     """
     Return whether ``requestUserInput`` is the Plan implementation picker.
 
@@ -2757,7 +3855,7 @@ async def _maybe_handle_plan_implementation_prompt(
     *,
     session_id: str,
     bridge_dir: Path,
-    params: dict[str, Any],
+    params: _JsonObject,
     forwarder_state: _CodexForwarderState,
 ) -> None:
     """
@@ -2854,7 +3952,7 @@ def _plan_implementation_request_event(thread_id: str, turn_id: str) -> CodexMes
     }
 
 
-def _selected_plan_implementation_answer(result: dict[str, Any] | None) -> str | None:
+def _selected_plan_implementation_answer(result: _JsonObject | None) -> str | None:
     """
     Extract the selected Plan prompt label from a Codex hook result.
 
@@ -2906,7 +4004,9 @@ async def _start_plan_implementation_turn(
             "collaborationMode": collaboration_mode,
         },
     )
-    turn_id = response.get("result", {}).get("turn", {}).get("id")
+    result = response.get("result")
+    turn = result.get("turn") if isinstance(result, dict) else None
+    turn_id = turn.get("id") if isinstance(turn, dict) else None
     if isinstance(turn_id, str) and turn_id:
         update_active_turn_id(bridge_dir, turn_id)
 
@@ -2936,7 +4036,9 @@ async def _start_clear_context_plan_implementation_turn(
         "thread/start",
         {"model": forwarder_state.model, "sessionStartSource": "clear"},
     )
-    thread_id = thread_response.get("result", {}).get("thread", {}).get("id")
+    result = thread_response.get("result")
+    thread = result.get("thread") if isinstance(result, dict) else None
+    thread_id = thread.get("id") if isinstance(thread, dict) else None
     if not isinstance(thread_id, str) or not thread_id:
         _logger.warning("Codex clear-context plan implementation skipped: new thread id missing")
         return
@@ -2953,7 +4055,7 @@ async def _start_clear_context_plan_implementation_turn(
 
 def _default_collaboration_mode(
     forwarder_state: _CodexForwarderState,
-) -> dict[str, Any] | None:
+) -> _JsonObject | None:
     """
     Build Codex's Default collaboration mode for ``turn/start``.
 
@@ -2980,7 +4082,7 @@ async def _handle_turn_started(
     client: httpx.AsyncClient,
     session_id: str,
     bridge_dir: Path,
-    params: dict[str, Any],
+    params: _JsonObject,
 ) -> None:
     """
     Forward a Codex terminal turn start event.
@@ -2997,7 +4099,7 @@ async def _handle_turn_started(
 
 def _turn_started_status_edge(
     bridge_dir: Path,
-    params: dict[str, Any],
+    params: _JsonObject,
 ) -> _CodexTurnStatusEdge:
     """
     Record a Codex turn start and return the Omnigent running edge.
@@ -3021,7 +4123,7 @@ async def _handle_terminal_turn_event(
     session_id: str,
     bridge_dir: Path,
     method: str,
-    params: dict[str, Any],
+    params: _JsonObject,
 ) -> bool:
     """
     Forward a terminal-observed Codex turn completion/failure event.
@@ -3050,7 +4152,7 @@ async def _handle_terminal_turn_event(
 def _terminal_turn_status_edge(
     bridge_dir: Path,
     method: str,
-    params: dict[str, Any],
+    params: _JsonObject,
 ) -> _CodexTurnStatusEdge | None:
     """
     Return the terminal Omnigent edge for a Codex terminal turn event.
@@ -3071,6 +4173,41 @@ def _terminal_turn_status_edge(
         source = f"{method}:recovered"
     else:
         source = method
+    # A failed turn carries ``turn.error`` (or an ``error`` item) even when
+    # Codex reports it via ``turn/completed`` ("silent success"). Force
+    # ``failed`` and attach the error so the reason is surfaced downstream.
+    error = _terminal_error_from_turn(params)
+    if error is not None:
+        _logger.info(
+            "Codex forwarder forcing failed status from turn.error: turn_id=%s method=%s kind=%s",
+            terminal_turn_id,
+            method,
+            error.kind,
+        )
+        return _CodexTurnStatusEdge(
+            status="failed",
+            turn_id=terminal_turn_id,
+            source=f"{source}:turn-error",
+            error=error,
+        )
+    if _turn_status_is_failed(params):
+        _logger.info(
+            "Codex forwarder forcing failed status from turn.status: turn_id=%s method=%s",
+            terminal_turn_id,
+            method,
+        )
+        return _CodexTurnStatusEdge(
+            status="failed",
+            turn_id=terminal_turn_id,
+            source=f"{source}:turn-failed",
+        )
+    if method == "turn/completed" and _turn_items_are_empty(params):
+        _logger.warning(
+            "Codex forwarder observed an empty turn (zero items): "
+            "turn_id=%s method=%s; mapping to idle",
+            terminal_turn_id,
+            method,
+        )
     return _CodexTurnStatusEdge(
         status="idle" if method == "turn/completed" else "failed",
         turn_id=terminal_turn_id,
@@ -3078,7 +4215,45 @@ def _terminal_turn_status_edge(
     )
 
 
-def _terminal_turn_id_from_params(params: dict[str, Any]) -> str | None:
+def _turn_status_is_failed(params: _JsonObject) -> bool:
+    """
+    Report whether a Codex turn recorded a ``failed`` status.
+
+    Catches a failure that lacks a populated ``turn.error`` object, so a
+    ``turn/completed`` whose ``turn.status`` is ``failed`` still maps to
+    ``failed`` rather than ``idle``.
+
+    :param params: Codex turn event params.
+    :returns: ``True`` when ``params['turn']['status']`` resolves to ``failed``.
+    """
+    turn = params.get("turn")
+    if not isinstance(turn, dict):
+        return False
+    status = turn.get("status")
+    if isinstance(status, dict):
+        status = status.get("type") or status.get("status")
+    return status in {"failed", "errored"}
+
+
+def _turn_items_are_empty(params: _JsonObject) -> bool:
+    """
+    Report whether a Codex turn explicitly carried zero items.
+
+    Only an explicitly present but empty ``items`` list counts as "empty":
+    a missing ``items`` key (e.g. a legacy ``turnId``-only terminal
+    notification) is unknown, not empty, and must not trip the WARN.
+
+    :param params: Codex turn event params.
+    :returns: ``True`` when ``params['turn']['items']`` is a zero-length list.
+    """
+    turn = params.get("turn")
+    if not isinstance(turn, dict):
+        return False
+    items = turn.get("items")
+    return isinstance(items, list) and len(items) == 0
+
+
+def _terminal_turn_id_from_params(params: _JsonObject) -> str | None:
     """
     Extract the terminal turn id from Codex turn-boundary params.
 
@@ -3091,7 +4266,7 @@ def _terminal_turn_id_from_params(params: dict[str, Any]) -> str | None:
 
 def _terminal_turn_boundary_matches_idle_bridge(
     bridge_dir: Path,
-    params: dict[str, Any],
+    params: _JsonObject,
     terminal_turn_id: str | None,
 ) -> bool:
     """
@@ -3119,8 +4294,8 @@ def _terminal_turn_boundary_matches_idle_bridge(
 
 
 def _claim_completed_item(
-    params: dict[str, Any],
-    item: dict[str, Any],
+    params: _JsonObject,
+    item: _JsonObject,
     forwarder_state: _CodexForwarderState | None,
 ) -> bool:
     """
@@ -3157,9 +4332,10 @@ def _claim_completed_item(
 async def _handle_completed_item(
     client: httpx.AsyncClient,
     session_id: str,
-    params: dict[str, Any],
+    params: _JsonObject,
     *,
     forwarder_state: _CodexForwarderState | None = None,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Forward one Codex completed item event when it maps to Omnigent history.
@@ -3190,11 +4366,37 @@ async def _handle_completed_item(
         turn_id,
         item_type,
     )
-    # Collab-agent items register child sessions; they do not append transcript
-    # records and must not go through the dedup gate.
+    # Child-spawn items register sessions; they do not append transcript records
+    # and must not go through the dedup gate.
+    # Completed spawns may run on child routes so nested children attach to the
+    # root parent, matching ``collabAgentToolCall`` behavior.
     if item_type == _CODEX_COLLAB_AGENT_ITEM_TYPE:
         if forwarder_state is not None:
             await _handle_collab_item(client, params, item, forwarder_state)
+        return
+    if item_type == _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE:
+        if forwarder_state is not None:
+            await _handle_subagent_activity(client, params, item, forwarder_state)
+        return
+    # A context-compaction item is a status edge, not transcript history:
+    # clear the compaction spinner. Handled before the dedup gate (it never
+    # appends an item).
+    if item_type == _CODEX_COMPACTION_ITEM_TYPE:
+        await _post_compaction_status(
+            client, session_id, "completed", forwarder_state=forwarder_state
+        )
+        if forwarder_state is None or not forwarder_state.compaction_item_persisted:
+            try:
+                await _persist_codex_compaction_item(
+                    client, session_id=session_id, bridge_dir=bridge_dir
+                )
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Failed to persist codex compaction item for %s", session_id, exc_info=True
+                )
+            else:
+                if forwarder_state is not None:
+                    forwarder_state.compaction_item_persisted = True
         return
     if not _claim_completed_item(params, item, forwarder_state):
         return
@@ -3221,8 +4423,17 @@ async def _handle_completed_item(
     if item_type == "plan":
         await _post_plan_item(client, session_id, params, item)
         return
+    if item_type in _REVIEW_MODE_ITEM_TYPES:
+        await _post_review_mode_marker(client, session_id, params, item)
+        return
     if item_type in _TOOL_ITEM_TYPES:
-        await _post_tool_item(client, session_id, params, item)
+        await _post_tool_item(
+            client,
+            session_id,
+            params,
+            item,
+            forwarder_state=forwarder_state,
+        )
 
 
 async def _maybe_persist_interrupted_partial_text(
@@ -3230,7 +4441,7 @@ async def _maybe_persist_interrupted_partial_text(
     *,
     session_id: str,
     method: str,
-    params: dict[str, Any],
+    params: _JsonObject,
     forwarder_state: _CodexForwarderState | None,
 ) -> None:
     """
@@ -3276,7 +4487,7 @@ async def _maybe_persist_interrupted_partial_text(
 
 
 def _claim_partial_text_buffer(
-    params: dict[str, Any],
+    params: _JsonObject,
     turn_id: str,
     buffer: _PartialTextBuffer,
     forwarder_state: _CodexForwarderState,
@@ -3299,7 +4510,7 @@ def _claim_partial_text_buffer(
 async def _post_interrupted_partial_agent_message(
     client: httpx.AsyncClient,
     session_id: str,
-    params: dict[str, Any],
+    params: _JsonObject,
     text: str,
 ) -> None:
     """
@@ -3325,10 +4536,70 @@ async def _post_interrupted_partial_agent_message(
     )
 
 
+async def _flush_turn_diff(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    params: _JsonObject,
+    forwarder_state: _CodexForwarderState | None,
+) -> None:
+    """
+    Post the turn's aggregated working-tree diff as a single tool card.
+
+    Codex streams ``turn/diff/updated`` during a turn; the forwarder keeps
+    only the newest diff (:meth:`_CodexForwarderState.note_turn_diff`) and
+    flushes it once here, at the terminal turn boundary, so the transcript
+    is not spammed with a growing diff on every edit. The aggregated diff is
+    mirrored as a ``turn_diff`` ``function_call`` / ``function_call_output``
+    pair — the same rail as the per-edit ``apply_patch`` cards — so it reads
+    as a distinct end-of-turn summary and also captures edits made outside
+    ``fileChange`` items (e.g. via shell ``sed``/redirects). Live-only:
+    resume backfill replays ``item/completed`` records, not this
+    notification, so a resumed session relies on the per-edit ``fileChange``
+    cards instead. Idempotent — the stored diff is consumed on flush, so a
+    second terminal boundary for the same turn is a no-op.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param params: Codex terminal turn-boundary params.
+    :param forwarder_state: Mutable forwarder state holding the stored diff.
+    :returns: None.
+    """
+    if forwarder_state is None:
+        return
+    turn_id = _terminal_turn_id_from_params(params)
+    if turn_id is None:
+        return
+    diff = forwarder_state.consume_turn_diff(turn_id)
+    if not diff:
+        return
+    response_id = _response_id(_params_with_turn_id(params, turn_id))
+    call_id = f"codex_turn_diff_{turn_id}"
+    await _post_external_item(
+        client,
+        session_id,
+        item_type="function_call",
+        item_data={
+            "agent": _AGENT_NAME,
+            "name": "turn_diff",
+            "arguments": "{}",
+            "call_id": call_id,
+        },
+        response_id=response_id,
+    )
+    await _post_external_item(
+        client,
+        session_id,
+        item_type="function_call_output",
+        item_data={"call_id": call_id, "output": diff},
+        response_id=response_id,
+    )
+
+
 async def _handle_collab_item(
     client: httpx.AsyncClient,
-    params: dict[str, Any],
-    item: dict[str, Any],
+    params: _JsonObject,
+    item: _JsonObject,
     forwarder_state: _CodexForwarderState,
 ) -> None:
     """
@@ -3363,6 +4634,31 @@ async def _handle_collab_item(
     await _post_collab_agent_statuses(client, item=item, forwarder_state=forwarder_state)
 
 
+async def _handle_subagent_activity(
+    client: httpx.AsyncClient,
+    params: _JsonObject,
+    item: _JsonObject,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """Register a child announced by Codex's native activity item."""
+    if item.get("kind") != "started":
+        return
+    child_thread_id = item.get("agentThreadId")
+    if not isinstance(child_thread_id, str) or not child_thread_id:
+        return
+    parent_session_id = _parent_session_id_from_forwarder_state(forwarder_state)
+    if parent_session_id is None:
+        return
+    await _ensure_child_session(
+        client,
+        parent_session_id=parent_session_id,
+        parent_thread_id=_thread_id_from_params(params),
+        child_thread_id=child_thread_id,
+        item=item,
+        forwarder_state=forwarder_state,
+    )
+
+
 def _parent_session_id_from_forwarder_state(
     forwarder_state: _CodexForwarderState,
 ) -> str | None:
@@ -3385,7 +4681,7 @@ async def _ensure_child_session(
     parent_session_id: str,
     parent_thread_id: str | None,
     child_thread_id: str,
-    item: dict[str, Any],
+    item: _JsonObject,
     forwarder_state: _CodexForwarderState,
 ) -> None:
     """
@@ -3398,7 +4694,7 @@ async def _ensure_child_session(
     :param parent_session_id: Parent Omnigent session id, e.g. ``"conv_parent"``.
     :param parent_thread_id: Parent Codex thread id, or ``None``.
     :param child_thread_id: Codex child thread id, e.g. ``"thread_child"``.
-    :param item: Codex ``collabAgentToolCall`` item with spawn metadata.
+    :param item: Codex child-spawn item.
     :param forwarder_state: Mutable state for child-thread mappings.
     :returns: None.
     """
@@ -3433,7 +4729,7 @@ async def _register_child_session(
     parent_session_id: str,
     parent_thread_id: str | None,
     child_thread_id: str,
-    item: dict[str, Any],
+    item: _JsonObject,
 ) -> str | None:
     """
     POST ``external_codex_subagent_start`` and return the child session id.
@@ -3442,10 +4738,10 @@ async def _register_child_session(
     :param parent_session_id: Parent Omnigent session id, e.g. ``"conv_parent"``.
     :param parent_thread_id: Parent Codex thread id, or ``None``.
     :param child_thread_id: Codex child thread id, e.g. ``"thread_child"``.
-    :param item: Codex ``collabAgentToolCall`` item.
+    :param item: Codex child-spawn item.
     :returns: Omnigent child session id, or ``None`` on failure.
     """
-    data: dict[str, Any] = {"thread_id": child_thread_id}
+    data: _JsonObject = {"thread_id": child_thread_id}
     if parent_thread_id is not None:
         data["parent_thread_id"] = parent_thread_id
     tool_call_id = item.get("id")
@@ -3610,8 +4906,8 @@ async def _apply_child_resume(
 
 def _codex_child_name_data(
     child_thread_id: str,
-    thread: dict[str, Any],
-) -> dict[str, Any]:
+    thread: _JsonObject,
+) -> _JsonObject:
     """
     Build the name-metadata payload for a Codex child upsert.
 
@@ -3620,7 +4916,7 @@ def _codex_child_name_data(
     :returns: Data dict with at least ``thread_id``; name fields added when
         present on the thread object.
     """
-    data: dict[str, Any] = {"thread_id": child_thread_id}
+    data: _JsonObject = {"thread_id": child_thread_id}
     agent_nickname = thread.get("agentNickname")
     if isinstance(agent_nickname, str) and agent_nickname:
         data["agent_nickname"] = agent_nickname
@@ -3672,7 +4968,7 @@ async def _upsert_child_name_from_resume(
     _log_failed_session_event_post(_EXTERNAL_CODEX_SUBAGENT_START_TYPE, response_obj)
 
 
-def _thread_spawn_source(thread: dict[str, Any]) -> dict[str, Any] | None:
+def _thread_spawn_source(thread: _JsonObject) -> _JsonObject | None:
     """
     Return the ``thread_spawn`` source metadata from a Codex thread object.
 
@@ -3693,7 +4989,7 @@ def _thread_spawn_source(thread: dict[str, Any]) -> dict[str, Any] | None:
 async def _post_collab_agent_statuses(
     client: httpx.AsyncClient,
     *,
-    item: dict[str, Any],
+    item: _JsonObject,
     forwarder_state: _CodexForwarderState,
 ) -> None:
     """
@@ -3719,7 +5015,7 @@ async def _post_collab_agent_statuses(
             await _post_status(client, child_session_id, ap_status)
 
 
-def _omnigent_status_from_collab_state(state: dict[str, Any]) -> str | None:
+def _omnigent_status_from_collab_state(state: _JsonObject) -> str | None:
     """
     Convert a Codex collab-agent state dict to an Omnigent session status.
 
@@ -3738,7 +5034,7 @@ def _omnigent_status_from_collab_state(state: dict[str, Any]) -> str | None:
     return None
 
 
-def _collab_receiver_thread_ids(item: dict[str, Any]) -> list[str]:
+def _collab_receiver_thread_ids(item: _JsonObject) -> list[str]:
     """
     Extract receiver thread ids from a Codex collab-agent item.
 
@@ -3758,8 +5054,8 @@ def _collab_receiver_thread_ids(item: dict[str, Any]) -> list[str]:
 
 
 def _collab_parent_thread_id(
-    params: dict[str, Any],
-    item: dict[str, Any],
+    params: _JsonObject,
+    item: _JsonObject,
 ) -> str | None:
     """
     Return the Codex parent thread id for a collab-agent spawn.
@@ -3778,7 +5074,7 @@ async def _handle_agent_message_delta(
     client: httpx.AsyncClient,
     session_id: str,
     bridge_dir: Path,
-    params: dict[str, Any],
+    params: _JsonObject,
     delta_coalescer: _OutputTextDeltaCoalescer,
     forwarder_state: _CodexForwarderState | None,
 ) -> None:
@@ -3846,7 +5142,7 @@ async def _handle_plan_delta(
     client: httpx.AsyncClient,
     session_id: str,
     bridge_dir: Path,
-    params: dict[str, Any],
+    params: _JsonObject,
     delta_coalescer: _OutputTextDeltaCoalescer,
     forwarder_state: _CodexForwarderState | None,
 ) -> None:
@@ -3912,7 +5208,7 @@ async def _handle_plan_delta(
 async def _ensure_user_message_posted(
     client: httpx.AsyncClient,
     session_id: str,
-    params: dict[str, Any],
+    params: _JsonObject,
     forwarder_state: _CodexForwarderState | None,
 ) -> None:
     """
@@ -3963,7 +5259,7 @@ async def _ensure_user_message_posted(
     user_item = _find_turn_user_message(response, turn_id)
     if user_item is None:
         return
-    recovered_params: dict[str, Any] = {
+    recovered_params: _JsonObject = {
         "threadId": thread_id,
         "turnId": turn_id,
         "item": user_item,
@@ -3974,7 +5270,7 @@ async def _ensure_user_message_posted(
     forwarder_state.note_user_message_posted(turn_id)
 
 
-def _find_turn_user_message(response: CodexMessage, turn_id: str) -> dict[str, Any] | None:
+def _find_turn_user_message(response: CodexMessage, turn_id: str) -> _JsonObject | None:
     """
     Locate a turn's ``userMessage`` item in a ``thread/resume`` response.
 
@@ -4008,8 +5304,8 @@ def _find_turn_user_message(response: CodexMessage, turn_id: str) -> dict[str, A
 async def _post_user_message(
     client: httpx.AsyncClient,
     session_id: str,
-    params: dict[str, Any],
-    item: dict[str, Any],
+    params: _JsonObject,
+    item: _JsonObject,
 ) -> None:
     """
     Persist a Codex user message observed from the TUI.
@@ -4033,8 +5329,8 @@ async def _post_user_message(
         return
     # Text-only / text+image post the text; image-only posts empty content and
     # relies on the server-side pending fold to supply the image block.
-    content: list[dict[str, Any]] = [{"type": "input_text", "text": text}] if text else []
-    item_data: dict[str, Any] = {
+    content: list[_JsonObject] = [{"type": "input_text", "text": text}] if text else []
+    item_data: _JsonObject = {
         "role": "user",
         "content": content,
     }
@@ -4057,8 +5353,8 @@ async def _post_user_message(
 async def _post_agent_message(
     client: httpx.AsyncClient,
     session_id: str,
-    params: dict[str, Any],
-    item: dict[str, Any],
+    params: _JsonObject,
+    item: _JsonObject,
 ) -> None:
     """
     Persist a Codex assistant message observed from the TUI/app-server.
@@ -4085,11 +5381,46 @@ async def _post_agent_message(
     )
 
 
+async def _post_tool_call_item(
+    client: httpx.AsyncClient,
+    session_id: str,
+    params: _JsonObject,
+    item: _JsonObject,
+) -> str | None:
+    """Persist the function-call half of a Codex built-in tool item."""
+    tool_call = _codex_tool_call_from_item(item)
+    if tool_call is None:
+        return None
+    arguments_text = _json_string(tool_call.arguments)
+    if arguments_text is None:
+        _logger.warning(
+            "Codex tool call arguments are not JSON serializable: call_id=%s tool=%s",
+            tool_call.call_id,
+            tool_call.name,
+        )
+        return None
+    await _post_external_item(
+        client,
+        session_id,
+        item_type="function_call",
+        item_data={
+            "agent": _AGENT_NAME,
+            "name": tool_call.name,
+            "arguments": arguments_text,
+            "call_id": tool_call.call_id,
+        },
+        response_id=_response_id(params),
+    )
+    return tool_call.call_id
+
+
 async def _post_tool_item(
     client: httpx.AsyncClient,
     session_id: str,
-    params: dict[str, Any],
-    item: dict[str, Any],
+    params: _JsonObject,
+    item: _JsonObject,
+    *,
+    forwarder_state: _CodexForwarderState | None,
 ) -> None:
     """
     Mirror one completed Codex built-in tool call into Omnigent history.
@@ -4107,31 +5438,15 @@ async def _post_tool_item(
         ``{"type": "commandExecution", "id": "call_abc",
         "command": "/bin/zsh -lc 'pwd'", "aggregatedOutput": "/repo\n",
         "exitCode": 0}``.
+    :param forwarder_state: Optional state tracking calls posted at item start.
     :returns: None.
     """
     tool_call = _codex_tool_call_from_item(item)
     if tool_call is None:
         return
-    arguments_text = _json_string(tool_call.arguments)
-    if arguments_text is None:
-        _logger.warning(
-            "Codex tool call arguments are not JSON serializable: call_id=%s tool=%s",
-            tool_call.call_id,
-            tool_call.name,
-        )
-        return
-    await _post_external_item(
-        client,
-        session_id,
-        item_type="function_call",
-        item_data={
-            "agent": _AGENT_NAME,
-            "name": tool_call.name,
-            "arguments": arguments_text,
-            "call_id": tool_call.call_id,
-        },
-        response_id=_response_id(params),
-    )
+    if forwarder_state is None or not forwarder_state.take_posted_tool_call(tool_call.call_id):
+        if await _post_tool_call_item(client, session_id, params, item) is None:
+            return
     await _post_external_item(
         client,
         session_id,
@@ -4144,8 +5459,8 @@ async def _post_tool_item(
 async def _post_plan_item(
     client: httpx.AsyncClient,
     session_id: str,
-    params: dict[str, Any],
-    item: dict[str, Any],
+    params: _JsonObject,
+    item: _JsonObject,
 ) -> None:
     """
     Persist one completed Codex plan item as assistant text.
@@ -4172,7 +5487,52 @@ async def _post_plan_item(
     )
 
 
-def _codex_tool_call_from_item(item: dict[str, Any]) -> _CodexToolCall | None:
+async def _post_review_mode_marker(
+    client: httpx.AsyncClient,
+    session_id: str,
+    params: _JsonObject,
+    item: _JsonObject,
+) -> None:
+    """
+    Mirror a Codex review-mode enter/exit transition into Omnigent history.
+
+    Codex ``/review`` brackets a turn with ``enteredReviewMode`` /
+    ``exitedReviewMode`` thread items. The web UI has no dedicated review
+    affordance, and a review transition is session *state*, not user input —
+    so it is surfaced as a short assistant-message marker. A user-role
+    ``[System: …]`` note was rejected here because a non-meta user item drains
+    the pending-input FIFO server-side, which would swallow the web user's next
+    real message.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param params: Codex ``item/completed`` params.
+    :param item: Codex ``enteredReviewMode`` / ``exitedReviewMode`` item,
+        e.g. ``{"type": "enteredReviewMode", "id": "rev_1",
+        "review": "review the auth changes"}``.
+    :returns: None.
+    """
+    entered = item.get("type") == "enteredReviewMode"
+    header = "Entered review mode" if entered else "Exited review mode"
+    review = item.get("review")
+    if isinstance(review, str) and review.strip():
+        text = f"{header}: {review.strip()}"
+    else:
+        text = header
+    await _post_external_item(
+        client,
+        session_id,
+        item_type="message",
+        item_data={
+            "role": "assistant",
+            "agent": _AGENT_NAME,
+            "content": [{"type": "output_text", "text": text}],
+        },
+        response_id=_response_id(params),
+    )
+
+
+def _codex_tool_call_from_item(item: _JsonObject) -> _CodexToolCall | None:
     """
     Translate a completed Codex tool item into a normalized tool call.
 
@@ -4192,7 +5552,41 @@ def _codex_tool_call_from_item(item: dict[str, Any]) -> _CodexToolCall | None:
     return builder(call_id, item)
 
 
-def _command_execution_tool_call(call_id: str, item: dict[str, Any]) -> _CodexToolCall | None:
+# Codex runs each model-issued shell command inside its OWN bwrap command
+# sandbox. In a hardened container that disallows unprivileged user namespaces,
+# that sandbox cannot start and every command hard-fails with this raw bwrap
+# error, with no hint at how to recover. Detect the marker and append actionable
+# guidance so a top-level session degrades with direction instead of an opaque
+# failure. The codex
+# ``--approval-mode`` presets do NOT disable this sandbox — only the "Full
+# access" preset's ``danger-full-access`` (or a config ``sandbox_mode``) does.
+_CODEX_SANDBOX_NAMESPACE_ERROR_MARKER = "No permissions to create new namespace"
+_CODEX_SANDBOX_BYPASS_GUIDANCE = (
+    "Omnigent: Codex's command sandbox could not start because this container "
+    "disallows unprivileged user namespaces, so the command did not run. To run "
+    'shell commands here, start a new Codex session with the "Full access" '
+    "approval preset (New chat → Advanced settings), or set "
+    'sandbox_mode = "danger-full-access" in ~/.codex/config.toml on the runner.'
+)
+
+
+def _augment_sandbox_namespace_error(output_text: str) -> str:
+    """Append recovery guidance when a Codex shell command failed because its
+    own command sandbox could not start (no unprivileged user namespaces).
+
+    Returns *output_text* unchanged when the bwrap-namespace marker is absent,
+    so ordinary command output is never altered. See issue #657.
+
+    :param output_text: Aggregated command output, any exit-code suffix already
+        appended, e.g. ``"bwrap: No permissions ...\\n[exit code: 1]"``.
+    :returns: The output with a trailing guidance paragraph, or unchanged.
+    """
+    if _CODEX_SANDBOX_NAMESPACE_ERROR_MARKER not in output_text:
+        return output_text
+    return f"{output_text}\n\n{_CODEX_SANDBOX_BYPASS_GUIDANCE}"
+
+
+def _command_execution_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | None:
     """
     Build a tool call from a Codex ``commandExecution`` item.
 
@@ -4207,7 +5601,7 @@ def _command_execution_tool_call(call_id: str, item: dict[str, Any]) -> _CodexTo
     if not isinstance(command, str) or not command:
         _logger.warning("Codex commandExecution missing command: call_id=%s", call_id)
         return None
-    arguments: dict[str, Any] = {"command": command}
+    arguments: _JsonObject = {"command": command}
     cwd = item.get("cwd")
     if isinstance(cwd, str) and cwd:
         arguments["cwd"] = cwd
@@ -4223,10 +5617,13 @@ def _command_execution_tool_call(call_id: str, item: dict[str, Any]) -> _CodexTo
     if isinstance(exit_code, int) and exit_code != 0:
         suffix = f"[exit code: {exit_code}]"
         output_text = f"{output_text}\n{suffix}" if output_text else suffix
+    # Turn codex's opaque "sandbox can't start" bwrap failure into actionable
+    # recovery guidance; a no-op for any other output.
+    output_text = _augment_sandbox_namespace_error(output_text)
     return _CodexToolCall(call_id=call_id, name="shell", arguments=arguments, output=output_text)
 
 
-def _file_change_tool_call(call_id: str, item: dict[str, Any]) -> _CodexToolCall | None:
+def _file_change_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | None:
     """
     Build a tool call from a Codex ``fileChange`` item.
 
@@ -4259,7 +5656,7 @@ def _file_change_tool_call(call_id: str, item: dict[str, Any]) -> _CodexToolCall
     )
 
 
-def _web_search_tool_call(call_id: str, item: dict[str, Any]) -> _CodexToolCall | None:
+def _web_search_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | None:
     """
     Build a tool call from a Codex ``webSearch`` item.
 
@@ -4289,6 +5686,71 @@ def _web_search_tool_call(call_id: str, item: dict[str, Any]) -> _CodexToolCall 
     )
 
 
+def _image_view_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | None:
+    """
+    Build a tool call from a Codex ``imageView`` item.
+
+    Codex emits an ``imageView`` item when the model opens a local image
+    (e.g. a screenshot on disk) to look at it. The only datum is the
+    absolute path, so it becomes both the argument and the mirrored
+    output — the web UI cannot read a runner-local path, so the path is
+    the faithful record of which image was viewed.
+
+    :param call_id: Codex item id, e.g. ``"img_abc"``.
+    :param item: Codex ``imageView`` item, e.g.
+        ``{"type": "imageView", "id": "img_abc", "path": "/repo/shot.png"}``.
+    :returns: Normalized tool call, or ``None`` when the path is missing.
+    """
+    path = item.get("path")
+    if not isinstance(path, str) or not path:
+        _logger.warning("Codex imageView missing path: call_id=%s", call_id)
+        return None
+    return _CodexToolCall(
+        call_id=call_id,
+        name="view_image",
+        arguments={"path": path},
+        output=path,
+    )
+
+
+def _image_generation_tool_call(call_id: str, item: _JsonObject) -> _CodexToolCall | None:
+    """
+    Build a tool call from a Codex ``imageGeneration`` item.
+
+    Codex emits an ``imageGeneration`` item when the model generates an
+    image. The raw ``result`` payload (base64 image bytes) is deliberately
+    NOT mirrored — the web UI has no assistant-side image rendering and a
+    multi-megabyte base64 string would only bloat the transcript. Instead
+    the card carries the human-meaningful metadata: the revised prompt as
+    the argument and the status plus on-disk save path as the output.
+
+    :param call_id: Codex item id, e.g. ``"imggen_abc"``.
+    :param item: Codex ``imageGeneration`` item, e.g.
+        ``{"type": "imageGeneration", "id": "imggen_abc",
+        "status": "completed", "revisedPrompt": "a red bicycle",
+        "result": "<base64>", "savedPath": "/repo/out.png"}``.
+    :returns: Normalized tool call, or ``None`` when the status is missing.
+    """
+    status = item.get("status")
+    if not isinstance(status, str) or not status:
+        _logger.warning("Codex imageGeneration missing status: call_id=%s", call_id)
+        return None
+    arguments: _JsonObject = {}
+    revised_prompt = item.get("revisedPrompt")
+    if isinstance(revised_prompt, str) and revised_prompt:
+        arguments["revised_prompt"] = revised_prompt
+    output_lines = [f"status: {status}"]
+    saved_path = item.get("savedPath")
+    if isinstance(saved_path, str) and saved_path:
+        output_lines.append(f"saved to {saved_path}")
+    return _CodexToolCall(
+        call_id=call_id,
+        name="generate_image",
+        arguments=arguments,
+        output="\n".join(output_lines),
+    )
+
+
 # Codex built-in tool item types this forwarder mirrors into Omnigent history.
 # ``mcpToolCall`` is intentionally absent: its event shape has not been
 # verified, so it is logged-but-skipped rather than mirrored with guessed
@@ -4297,8 +5759,15 @@ _TOOL_ITEM_BUILDERS: dict[str, _ToolItemBuilder] = {
     "commandExecution": _command_execution_tool_call,
     "fileChange": _file_change_tool_call,
     "webSearch": _web_search_tool_call,
+    "imageView": _image_view_tool_call,
+    "imageGeneration": _image_generation_tool_call,
 }
 _TOOL_ITEM_TYPES = frozenset(_TOOL_ITEM_BUILDERS)
+
+# Codex ``/review`` enter/exit thread items. The web UI has no dedicated
+# review-mode affordance, so these are mirrored as a visible assistant-message
+# marker (see :func:`_post_review_mode_marker`).
+_REVIEW_MODE_ITEM_TYPES = frozenset({"enteredReviewMode", "exitedReviewMode"})
 
 
 async def _post_external_item(
@@ -4306,7 +5775,7 @@ async def _post_external_item(
     session_id: str,
     *,
     item_type: str,
-    item_data: dict[str, Any],
+    item_data: _JsonObject,
     response_id: str,
 ) -> None:
     """
@@ -4350,6 +5819,8 @@ async def _post_status(
     status: str,
     *,
     response_id: str | None = None,
+    output: str | None = None,
+    reauth_required: bool = False,
 ) -> None:
     """
     Publish a native Codex status edge.
@@ -4359,11 +5830,21 @@ async def _post_status(
     :param status: Session status, e.g. ``"running"``.
     :param response_id: Optional response id for this status edge,
         e.g. ``"codex_turn_abc123"``.
+    :param output: Optional human-readable reason carried with a terminal
+        edge, e.g. a Codex error message. The server forwards this as
+        the authoritative terminal output for a ``failed`` / ``idle`` edge.
+    :param reauth_required: When ``True``, mark a ``failed`` edge as caused by
+        an authentication error so the surface can prompt a re-auth.
+        Surface-only: no automatic ``codex login`` is triggered.
     :returns: None.
     """
-    data = {"status": status}
+    data: _JsonObject = {"status": status}
     if response_id is not None:
         data["response_id"] = response_id
+    if output is not None:
+        data["output"] = output
+    if reauth_required:
+        data["reauth_required"] = True
     response = await _post_session_event(
         client,
         session_id,
@@ -4381,6 +5862,11 @@ async def _post_turn_status_edge(
     """
     Publish one Codex turn lifecycle edge if a valid edge was derived.
 
+    When the edge carries a turn-level error, the error message is
+    surfaced as the terminal ``output`` so the failure reason is visible
+    rather than silently swallowed; an auth-classified error additionally
+    flags ``reauth_required`` and appends a re-auth hint to the output.
+
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param edge: Derived lifecycle edge, or ``None`` when no status should
@@ -4396,7 +5882,21 @@ async def _post_turn_status_edge(
         edge.status,
     )
     response_id = _response_id(_params_with_turn_id({}, edge.turn_id)) if edge.turn_id else None
-    await _post_status(client, session_id, edge.status, response_id=response_id)
+    output: str | None = None
+    reauth_required = False
+    if edge.error is not None:
+        output = edge.error.message
+        if edge.error.is_auth:
+            reauth_required = True
+            output = f"{output}\n\n{_CODEX_REAUTH_HINT}"
+    await _post_status(
+        client,
+        session_id,
+        edge.status,
+        response_id=response_id,
+        output=output,
+        reauth_required=reauth_required,
+    )
 
 
 async def _post_external_elicitation_resolved(
@@ -4424,6 +5924,35 @@ async def _post_external_elicitation_resolved(
     return response is not None and response.status_code < 400
 
 
+async def _post_external_session_todos(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    todos: list[_JsonObject],
+) -> None:
+    """
+    Post one ``external_session_todos`` event to the Sessions API.
+
+    Drives the web ``TodoPanel`` from a Codex plan update. The server caches
+    the list and broadcasts a ``session.todos`` SSE event, so the panel
+    replaces its contents with the full current plan.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param todos: Plan mapped to todo items, e.g.
+        ``[{"content": "Inspect", "status": "in_progress",
+        "activeForm": "Inspect"}]``.
+    :returns: None.
+    """
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_SESSION_TODOS_TYPE,
+        data={"todos": todos},
+    )
+    _log_failed_session_event_post(_EXTERNAL_SESSION_TODOS_TYPE, response)
+
+
 async def _post_output_text_delta(
     client: httpx.AsyncClient,
     session_id: str,
@@ -4447,7 +5976,7 @@ async def _post_output_text_delta(
         e.g. ``False``.
     :returns: None.
     """
-    data: dict[str, Any] = {"delta": delta}
+    data: _JsonObject = {"delta": delta}
     if message_id is not None:
         data["message_id"] = message_id
     if index is not None:
@@ -4461,6 +5990,246 @@ async def _post_output_text_delta(
         data=data,
     )
     _log_failed_session_event_post("external_output_text_delta", response)
+
+
+async def _post_tool_output_delta(
+    client: httpx.AsyncClient,
+    session_id: str,
+    delta: str,
+    *,
+    call_id: str,
+) -> None:
+    """Publish a transient Codex command-output delta.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id.
+    :param delta: Command stdout/stderr fragment.
+    :param call_id: Codex ``commandExecution`` item id.
+    :returns: None.
+    """
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type="external_tool_output_delta",
+        data={"call_id": call_id, "delta": delta},
+    )
+    _log_failed_session_event_post("external_tool_output_delta", response)
+
+
+async def _post_compaction_status(
+    client: httpx.AsyncClient,
+    session_id: str,
+    status: str,
+    *,
+    forwarder_state: _CodexForwarderState | None,
+) -> None:
+    """
+    Mirror a Codex context-compaction edge to Omnigent (#1255).
+
+    Publishes ``external_compaction_status`` so the web UI shows its
+    "Compacting conversation…" spinner while Codex compacts and clears it
+    when done — matching how claude-native brackets compaction. Consecutive
+    identical statuses are deduped because Codex may signal completion via
+    both a ``contextCompaction`` item and a ``thread/compacted``
+    notification.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param status: ``"in_progress"`` or ``"completed"``.
+    :param forwarder_state: Optional state carrying the dedupe baseline.
+    :returns: None.
+    """
+    if forwarder_state is not None and forwarder_state.compaction_status_posted == status:
+        return
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_COMPACTION_STATUS_TYPE,
+        data={"status": status},
+    )
+    _log_failed_session_event_post(_EXTERNAL_COMPACTION_STATUS_TYPE, response)
+    if forwarder_state is not None and response is not None and response.status_code < 400:
+        forwarder_state.compaction_status_posted = status
+        if status == "in_progress":
+            forwarder_state.compaction_item_persisted = False
+
+
+async def _persist_codex_compaction_item(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path | None = None,
+) -> None:
+    """Persist a compaction boundary item to the conversation store.
+
+    Codex appends a ``Compacted`` entry to the rollout JSONL after
+    compaction. That entry carries ``replacement_history`` — the
+    post-compaction context. When ``bridge_dir`` is available, we
+    read the latest ``Compacted`` entry from the rollout and use
+    its ``replacement_history`` as ``compacted_messages``.
+    """
+    resp = await client.get(
+        f"/v1/sessions/{session_id}/items",
+        params={"limit": 1, "order": "desc"},
+    )
+    resp.raise_for_status()
+    items = resp.json().get("data", [])
+    last_item_id = items[0]["id"] if items else f"compact_boundary_{session_id}"
+
+    compacted = None
+    if bridge_dir is not None:
+        try:
+            state = read_bridge_state(bridge_dir)
+            if state is not None:
+                codex_home = Path(state.codex_home)
+                thread_id = state.thread_id
+                rollout_files = sorted(
+                    codex_home.glob(f"sessions/**/*rollout-*{thread_id}.jsonl"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if rollout_files:
+                    compacted = _read_compacted_history(rollout_files[0])
+        except Exception:  # noqa: BLE001
+            _logger.debug(
+                "Failed to read codex rollout for compaction persist",
+                exc_info=True,
+            )
+
+    data: dict[str, object] = {
+        "summary": "[Codex compaction — context was compacted in the terminal]",
+        "last_item_id": last_item_id,
+        "model": "unknown",
+        "token_count": 0,
+    }
+    if compacted is not None:
+        if compacted.get("replacement_history"):
+            data["compacted_messages"] = compacted["replacement_history"]
+        if compacted.get("window_id") is not None:
+            data["window_id"] = compacted["window_id"]
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "compaction", "data": data},
+    )
+    resp.raise_for_status()
+
+
+def _read_compacted_history(rollout_path: Path) -> dict[str, object] | None:
+    """Read the last ``Compacted`` entry from a rollout JSONL.
+
+    Codex appends a ``{type: "compacted", payload: {replacement_history: [...],
+    window_id: N}}`` entry after compaction. Returns a dict with
+    ``replacement_history`` and ``window_id`` for persistence, or ``None``.
+
+    :param rollout_path: Path to the rollout JSONL.
+    :returns: Dict with ``replacement_history`` and ``window_id``, or ``None``.
+    """
+    last_compacted = None
+    with rollout_path.open() as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if entry.get("type") == "compacted":
+                last_compacted = entry
+    if last_compacted is None:
+        return None
+    payload = last_compacted.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    history = payload.get("replacement_history")
+    if not isinstance(history, list) or not history:
+        return None
+    # Store the full replacement_history — messages + compaction
+    # tokens. Although the messages duplicate pre-compaction items
+    # in the conversation store, they are needed for rollout
+    # reconstruction (e.g. sandbox recovery where the rollout file
+    # is lost).
+    return {
+        "replacement_history": [item for item in history if isinstance(item, dict)],
+        "window_id": payload.get("window_id"),
+    }
+
+
+async def _handle_reasoning_delta(
+    client: httpx.AsyncClient,
+    session_id: str,
+    params: _JsonObject,
+    forwarder_state: _CodexForwarderState | None,
+) -> None:
+    """
+    Forward one live Codex reasoning (chain-of-thought) delta to AP.
+
+    Codex emits ``item/reasoning/textDelta`` and
+    ``item/reasoning/summaryTextDelta`` while it thinks. Omnigent has no
+    completed reasoning conversation item — the reasoning block is
+    transient and is finalized when the turn's assistant message arrives —
+    so this only publishes a transient ``external_output_reasoning_delta``
+    so the web UI paints a live "thinking" block, matching the in-process
+    executor's wire shape (#1254). The first delta of a reasoning item
+    opens the block (``started=True`` → ``response.reasoning.started``).
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param params: Codex reasoning delta params, e.g.
+        ``{"turnId": "turn_123", "itemId": "item_r", "delta": "Let me"}``.
+    :param forwarder_state: Optional forwarder state tracking which
+        reasoning item is currently open (for the ``started`` edge).
+    :returns: None.
+    """
+    delta = params.get("delta")
+    if not isinstance(delta, str):
+        _logger.warning(
+            "Codex reasoning delta missing string delta: turn_id=%s",
+            _turn_id_from_payload(params),
+        )
+        return
+    item_id = _item_id_from_delta_params(params)
+    started = False
+    if forwarder_state is not None:
+        if item_id is not None:
+            started = forwarder_state.reasoning_stream_item_id != item_id
+            forwarder_state.reasoning_stream_item_id = item_id
+        else:
+            # Codex reasoning deltas normally carry an itemId; if one is
+            # missing, ``None`` on state means no block is open yet.
+            # ``""`` marks "open, id unknown" so later id-less deltas in the
+            # same block don't re-open it.
+            started = forwarder_state.reasoning_stream_item_id is None
+            forwarder_state.reasoning_stream_item_id = ""
+    # An empty, non-opening delta carries nothing to render.
+    if not delta and not started:
+        return
+    await _post_output_reasoning_delta(client, session_id, delta, started=started)
+
+
+async def _post_output_reasoning_delta(
+    client: httpx.AsyncClient,
+    session_id: str,
+    delta: str,
+    *,
+    started: bool,
+) -> None:
+    """
+    Publish a transient Codex reasoning delta.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param delta: Reasoning text fragment, e.g. ``"Let me think"``.
+    :param started: Whether this opens a new reasoning block; when
+        ``True`` the server precedes the delta with a single
+        ``response.reasoning.started`` SSE.
+    :returns: None.
+    """
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
+        data={"delta": delta, "started": started},
+    )
+    _log_failed_session_event_post(_EXTERNAL_OUTPUT_REASONING_DELTA_TYPE, response)
 
 
 async def _post_session_interrupted(
@@ -4478,7 +6247,7 @@ async def _post_session_interrupted(
         ``"codex_turn_abc123"``.
     :returns: None.
     """
-    data: dict[str, Any] = {}
+    data: _JsonObject = {}
     if response_id is not None:
         data["response_id"] = response_id
     response = await _post_session_event(
@@ -4490,7 +6259,7 @@ async def _post_session_interrupted(
     _log_failed_session_event_post(_EXTERNAL_SESSION_INTERRUPTED_TYPE, response)
 
 
-def _session_usage_data_from_params(params: dict[str, Any]) -> dict[str, int] | None:
+def _session_usage_data_from_params(params: _JsonObject) -> dict[str, int] | None:
     """
     Extract Omnigent session-usage fields from a Codex usage notification.
 
@@ -4508,20 +6277,19 @@ def _session_usage_data_from_params(params: dict[str, Any]) -> dict[str, int] | 
     total = token_usage.get("total")
     if not isinstance(total, dict):
         return None
-    context_tokens = total.get("inputTokens")
+    cumulative_input_tokens = total.get("inputTokens")
     context_window = total.get("contextWindow")
     output_tokens = total.get("outputTokens")
     cached_input_tokens = total.get("cachedInputTokens")
     data: dict[str, int] = {}
-    if isinstance(context_tokens, int) and context_tokens >= 0:
-        data["context_tokens"] = context_tokens
+    if isinstance(cumulative_input_tokens, int) and cumulative_input_tokens >= 0:
         # Codex's ``tokenUsage.total`` is CUMULATIVE across the whole thread
         # (the CLI subtracts prior totals to recover per-turn deltas), so
         # ``total.inputTokens`` / ``outputTokens`` are the session's cumulative
         # token counts. Forward them as the cumulative fields the server prices
         # into ``total_cost_usd`` (SET semantics) — codex-native produces no
         # ``response.completed``, so the Omnigent relay never accounts its cost.
-        data["cumulative_input_tokens"] = context_tokens
+        data["cumulative_input_tokens"] = cumulative_input_tokens
         # Codex's ``inputTokens`` is INCLUSIVE of cached tokens
         # (``non_cached_input = input_tokens - cached_input_tokens`` in
         # codex-rs ``protocol.rs``). Forward the cumulative cached count so the
@@ -4530,6 +6298,18 @@ def _session_usage_data_from_params(params: dict[str, Any]) -> dict[str, int] | 
         # cumulative (SET) semantics as ``cumulative_input_tokens``.
         if isinstance(cached_input_tokens, int) and cached_input_tokens >= 0:
             data["cumulative_cache_read_input_tokens"] = cached_input_tokens
+    # ``context_tokens`` drives the context-window ring in the web UI. It
+    # must reflect the CURRENT context occupancy (how much of the window
+    # the latest turn consumed), NOT the cumulative total across all turns.
+    # Codex's ``tokenUsage.last`` carries the per-turn breakdown; fall back
+    # to ``total.inputTokens`` only when ``last`` is unavailable (first
+    # frame before a turn completes).
+    last = token_usage.get("last")
+    last_input = last.get("inputTokens") if isinstance(last, dict) else None
+    if isinstance(last_input, int) and last_input >= 0:
+        data["context_tokens"] = last_input
+    elif isinstance(cumulative_input_tokens, int) and cumulative_input_tokens >= 0:
+        data["context_tokens"] = cumulative_input_tokens
     if isinstance(output_tokens, int) and output_tokens >= 0:
         data["cumulative_output_tokens"] = output_tokens
     if isinstance(context_window, int) and context_window > 0:
@@ -4539,13 +6319,236 @@ def _session_usage_data_from_params(params: dict[str, Any]) -> dict[str, int] | 
     return data
 
 
+@dataclass
+class _ForwardHealth:
+    """
+    Process-level health of Omnigent session-event forwarding (#1120).
+
+    Network failures (connect timeouts, 503s, resets) make
+    ``_post_session_event`` drop transcript/usage events after its bounded
+    retries, previously visible only as scattered per-item warnings. This
+    tracks consecutive permanent failures so a sustained outage escalates
+    to a single loud signal instead of staying effectively silent.
+
+    :param consecutive_failures: Permanent post failures since the last
+        success.
+    :param degraded_logged: Whether the degraded-sync edge has already
+        been logged for the current outage (so it logs once, not per item).
+    """
+
+    consecutive_failures: int = 0
+    degraded_logged: bool = False
+
+
+# After this many consecutive permanent forward failures, sync is treated as
+# degraded and escalated once to ERROR. Small enough to fire during a real
+# outage, large enough to ride out a transient blip the retries already cover.
+_FORWARD_DEGRADED_THRESHOLD = 5
+_forward_health = _ForwardHealth()
+
+# Bridge dir for dead-lettering undeliverable durable events; set per-forwarder (#1120).
+_dead_letter_dir: ContextVar[Path | None] = ContextVar("_codex_dead_letter_dir", default=None)
+
+# Durable event types worth dead-lettering (not ephemeral deltas).
+_DEAD_LETTER_EVENT_TYPES = frozenset({"external_conversation_item", "external_session_usage"})
+
+
+def _reset_forward_health() -> None:
+    """
+    Reset forward-health tracking (test seam / new forwarder lifetime).
+
+    :returns: None.
+    """
+    global _forward_health
+    _forward_health = _ForwardHealth()
+
+
+def _note_forward_success() -> None:
+    """
+    Record a successful forward, clearing any degraded-sync state.
+
+    :returns: None.
+    """
+    if _forward_health.degraded_logged:
+        _logger.info(
+            "codex-native forward sync recovered after %d consecutive failures",
+            _forward_health.consecutive_failures,
+        )
+    _forward_health.consecutive_failures = 0
+    _forward_health.degraded_logged = False
+
+
+def _note_forward_failure(event_type: str) -> None:
+    """
+    Record a permanent forward failure; escalate once when sync degrades.
+
+    :param event_type: Session event type that failed to post, e.g.
+        ``"external_conversation_item"``.
+    :returns: None.
+    """
+    _forward_health.consecutive_failures += 1
+    if (
+        _forward_health.consecutive_failures >= _FORWARD_DEGRADED_THRESHOLD
+        and not _forward_health.degraded_logged
+    ):
+        _logger.error(
+            "codex-native forward sync degraded: %d consecutive Omnigent "
+            "event-post failures; transcript/usage mirroring may be incomplete "
+            "(latest type=%s)",
+            _forward_health.consecutive_failures,
+            event_type,
+        )
+        _forward_health.degraded_logged = True
+
+
+async def _replay_dead_letters_on_startup(
+    ap_client: httpx.AsyncClient,
+    bridge_dir: Path,
+) -> None:
+    """
+    Re-POST proven-undelivered dead-lettered forwards on forwarder startup (#1579).
+
+    Best-effort recovery for the realistic case — the host/server returned after
+    an outage or a restart. Delegates to the shared
+    :func:`replay_dead_letters` drain, supplying a re-POST that routes each
+    record to its recorded session via :func:`_post_session_event_inner` (the
+    inner so a re-failure does not double dead-letter through the wrapper).
+    Never raises: a replay failure must not block live forwarding.
+
+    :param ap_client: HTTP client for Omnigent event posts.
+    :param bridge_dir: Native Codex bridge directory holding the dead-letter files.
+    :returns: None.
+    """
+
+    async def _repost(record: dict[str, object]) -> RepostResult:
+        session_id = record["session_id"]
+        event_type = record["event_type"]
+        payload = record["payload"]
+        assert isinstance(session_id, str)
+        assert isinstance(event_type, str)
+        assert isinstance(payload, dict)
+        result = await _post_session_event_inner(
+            ap_client,
+            session_id,
+            event_type=event_type,
+            data=payload,
+            max_attempts=1,
+            timeout=_REPLAY_POST_TIMEOUT_SECONDS,
+        )
+        response = result.response
+        if response is None:
+            return RepostResult(
+                delivered=False,
+                delivered_ambiguous=result.delivered_ambiguous,
+                http_status=None,
+            )
+        delivered = response.status_code < 400
+        return RepostResult(
+            delivered=delivered,
+            delivered_ambiguous=False,
+            http_status=None if delivered else response.status_code,
+        )
+
+    try:
+        await replay_dead_letters(
+            bridge_dir,
+            repost=_repost,
+            retryable_status_codes=_POST_RETRY_STATUS_CODES,
+            logger_name=__name__,
+            max_records=_REPLAY_MAX_RECORDS,
+            deadline_seconds=_REPLAY_DEADLINE_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 - replay must never block forwarder startup.
+        _logger.warning("Codex forwarder dead-letter replay failed", exc_info=True)
+
+
+@dataclass(frozen=True)
+class _PostResult:
+    """
+    Classified outcome of one :func:`_post_session_event_inner` call (#1579).
+
+    Surfaces *why* a POST failed so the caller can dead-letter with the
+    structured classification replay needs — distinguishing the two ``None``
+    cases the inner used to conflate: an ambiguous-skip (the item may already
+    be committed) from a proven-undelivered transport failure after retries.
+
+    :param response: Final HTTP response, or ``None`` when no response was
+        seen (a transport failure, or an ambiguous conversation-item skip).
+    :param delivered_ambiguous: ``True`` when the POST was abandoned after an
+        ambiguous transport failure (request sent, response lost), so the item
+        may already be committed server-side — never safe to replay.
+    :param transport_error: Transport-error class name when a POST raised
+        without a response, e.g. ``"ConnectError"``; ``None`` when the server
+        responded.
+    """
+
+    response: httpx.Response | None
+    delivered_ambiguous: bool = False
+    transport_error: str | None = None
+
+
 async def _post_session_event(
     client: httpx.AsyncClient,
     session_id: str,
     *,
     event_type: str,
-    data: dict[str, Any],
+    data: _JsonObject,
 ) -> httpx.Response | None:
+    """
+    Post one Omnigent session event, tracking forward-sync health (#1120).
+
+    Thin wrapper over :func:`_post_session_event_inner` that classifies the
+    outcome — a sub-400 response is a success; ``None`` or a >=400 final
+    response is a permanent failure — and updates :data:`_forward_health`
+    so a sustained outage escalates to a single ERROR instead of silently
+    dropping events. On a durable-event failure it dead-letters the dropped
+    payload with the structured classification replay needs (#1579).
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param event_type: Session event type, e.g.
+        ``"external_conversation_item"``.
+    :param data: Event data payload, e.g. ``{"status": "running"}``.
+    :returns: The final HTTP response, or ``None`` (see
+        :func:`_post_session_event_inner`).
+    """
+    result = await _post_session_event_inner(client, session_id, event_type=event_type, data=data)
+    response = result.response
+    if response is not None and response.status_code < 400:
+        _note_forward_success()
+    else:
+        _note_forward_failure(event_type)
+        dl_dir = _dead_letter_dir.get()
+        if event_type in _DEAD_LETTER_EVENT_TYPES and dl_dir is not None:
+            http_status = response.status_code if response is not None else None
+            if response is not None:
+                reason = f"http {response.status_code}"
+            elif result.delivered_ambiguous:
+                reason = "ambiguous transport failure (may already be committed)"
+            else:
+                reason = "proven-undelivered transport failure after retries"
+            append_dead_letter(
+                dl_dir,
+                session_id=session_id,
+                event_type=event_type,
+                payload=data,
+                reason=reason,
+                delivered_ambiguous=result.delivered_ambiguous,
+                http_status=http_status,
+                transport_error=result.transport_error,
+            )
+    return response
+
+
+async def _post_session_event_inner(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    event_type: str,
+    data: _JsonObject,
+    max_attempts: int = _POST_MAX_ATTEMPTS,
+    timeout: float | None = None,
+) -> _PostResult:
     """
     Post one Omnigent session event with bounded transient retries.
 
@@ -4555,16 +6558,26 @@ async def _post_session_event(
         ``"external_conversation_item"``.
     :param data: Event data payload, e.g.
         ``{"status": "running"}``.
-    :returns: Final HTTP response, or ``None`` when all attempts raised
-        transport errors — or, for ``external_conversation_item``, after
-        a single ambiguous transport failure (the item may already be
-        committed server-side, so retrying risks a duplicate).
+    :param max_attempts: Maximum POST attempts before giving up, e.g. ``3``.
+        Startup dead-letter replay passes ``1`` — its natural retry cadence is
+        the next startup, so an in-call retry loop only adds latency (#1579).
+    :param timeout: Optional per-request timeout in seconds overriding the
+        client default, e.g. ``5.0``. Replay passes a short value so a hung
+        server fails fast instead of stalling startup on the 30s client default.
+    :returns: A :class:`_PostResult` carrying the final response, or — when no
+        response was seen — whether the POST was abandoned after an ambiguous
+        transport failure (``external_conversation_item`` only; the item may
+        already be committed, so retrying risks a duplicate) versus a
+        proven-undelivered transport failure after all retries.
     """
     url = f"/v1/sessions/{url_component(session_id)}/events"
     payload = {"type": event_type, "data": data}
-    for attempt in range(1, _POST_MAX_ATTEMPTS + 1):
+    for attempt in range(1, max_attempts + 1):
         try:
-            response = await client.post(url, json=payload)
+            if timeout is None:
+                response = await client.post(url, json=payload)
+            else:
+                response = await client.post(url, json=payload, timeout=timeout)
         except httpx.HTTPError as exc:
             # Conversation items persist with a random primary key and no
             # server-side dedup, so an ambiguous failure (request sent,
@@ -4580,58 +6593,75 @@ async def _post_session_event(
                     event_type,
                     exc,
                 )
-                return None
-            if _is_final_post_attempt(attempt):
-                _log_post_transport_failure(event_type, exc)
-                return None
+                return _PostResult(
+                    response=None,
+                    delivered_ambiguous=True,
+                    transport_error=type(exc).__name__,
+                )
+            if _is_final_post_attempt(attempt, max_attempts):
+                _log_post_transport_failure(event_type, exc, max_attempts)
+                return _PostResult(response=None, transport_error=type(exc).__name__)
             await _sleep(_post_retry_delay(attempt))
             continue
-        if _post_response_is_final(response, attempt):
-            return response
+        # An HTTP response (no transport error) proves the server is reachable,
+        # so clear any stale connectivity-failure record — otherwise a recovered
+        # connection could have an old failure misattributed to a later,
+        # unrelated idle-watchdog stall.
+        note_native_post_success()
+        if _post_response_is_final(response, attempt, max_attempts):
+            return _PostResult(response=response)
         await _sleep(_post_retry_delay(attempt))
-    return None
+    return _PostResult(response=None)
 
 
-def _post_response_is_final(response: httpx.Response, attempt: int) -> bool:
+def _post_response_is_final(response: httpx.Response, attempt: int, max_attempts: int) -> bool:
     """
     Return whether a session-event POST response should stop retries.
 
     :param response: HTTP response from AP.
     :param attempt: One-based attempt number, e.g. ``1``.
+    :param max_attempts: Maximum POST attempts allowed, e.g. ``3``.
     :returns: ``True`` when the caller should return ``response``.
     """
     if response.status_code < 400:
         return True
     if not _should_retry_post_status(response.status_code):
         return True
-    return _is_final_post_attempt(attempt)
+    return _is_final_post_attempt(attempt, max_attempts)
 
 
-def _is_final_post_attempt(attempt: int) -> bool:
+def _is_final_post_attempt(attempt: int, max_attempts: int) -> bool:
     """
     Return whether an Omnigent event POST attempt is the final try.
 
     :param attempt: One-based attempt number, e.g. ``3``.
+    :param max_attempts: Maximum POST attempts allowed, e.g. ``3``.
     :returns: ``True`` when no further retry is allowed.
     """
-    return attempt >= _POST_MAX_ATTEMPTS
+    return attempt >= max_attempts
 
 
-def _log_post_transport_failure(event_type: str, exc: httpx.HTTPError) -> None:
+def _log_post_transport_failure(event_type: str, exc: httpx.HTTPError, max_attempts: int) -> None:
     """
     Log an exhausted Omnigent session-event transport failure.
 
     :param event_type: Session event type, e.g.
         ``"external_conversation_item"``.
     :param exc: Final transport error.
+    :param max_attempts: Number of attempts that were made, e.g. ``3``.
     :returns: None.
     """
     _logger.warning(
         "failed to post Codex session event after retries: type=%s attempts=%s error=%r",
         event_type,
-        _POST_MAX_ATTEMPTS,
+        max_attempts,
         exc,
     )
+    # Surface this connectivity failure to the harness idle-turn watchdog: if
+    # the turn stalls because events can't reach the server, the watchdog
+    # attaches this cause to the failure reason instead of a generic
+    # "wedged LLM" message.
+    record_native_post_failure(event_type, exc)
 
 
 def _log_failed_session_event_post(
@@ -4692,7 +6722,7 @@ def _turn_id_from_payload(payload: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _turn_status_from_params(params: dict[str, Any]) -> str | None:
+def _turn_status_from_params(params: _JsonObject) -> str | None:
     """
     Extract a Codex turn status from terminal notification params.
 
@@ -4722,7 +6752,7 @@ def _turn_status_is_interrupted(status: str | None) -> bool:
     return normalized in {"interrupted", "cancelled", "canceled"}
 
 
-def _params_with_turn_id(params: dict[str, Any], turn_id: str) -> dict[str, Any]:
+def _params_with_turn_id(params: _JsonObject, turn_id: str) -> _JsonObject:
     """
     Return params with a top-level ``turnId`` for Omnigent response ids.
 
@@ -4835,7 +6865,7 @@ async def wait_for_thread_started(
     raise RuntimeError("Codex app-server event stream ended before thread startup.")
 
 
-def _thread_id_from_params(params: dict[str, Any]) -> str | None:
+def _thread_id_from_params(params: _JsonObject) -> str | None:
     """
     Extract the thread id carried by a Codex notification params object.
 
@@ -4870,7 +6900,7 @@ def _is_active_turn_delta(bridge_dir: Path, turn_id: str | None) -> bool:
     return state is not None and state.active_turn_id == turn_id
 
 
-def _item_id_from_delta_params(params: dict[str, Any]) -> str | None:
+def _item_id_from_delta_params(params: _JsonObject) -> str | None:
     """
     Extract a Codex item id from a streaming delta notification.
 
@@ -4882,7 +6912,7 @@ def _item_id_from_delta_params(params: dict[str, Any]) -> str | None:
     return item_id if isinstance(item_id, str) and item_id else None
 
 
-def _streaming_message_id(params: dict[str, Any], item_type: str) -> str | None:
+def _streaming_message_id(params: _JsonObject, item_type: str) -> str | None:
     """
     Build a stable Omnigent live-delta stream id for a Codex item.
 
@@ -4947,7 +6977,7 @@ def _record_partial_text_delta(
 
 def _try_recover_active_turn_from_delta(
     bridge_dir: Path,
-    params: dict[str, Any],
+    params: _JsonObject,
     turn_id: str | None,
 ) -> bool:
     """
@@ -4979,7 +7009,7 @@ def _try_recover_active_turn_from_delta(
 
 def _delta_recovery_status_edge(
     bridge_dir: Path,
-    params: dict[str, Any],
+    params: _JsonObject,
     turn_id: str | None,
 ) -> _CodexTurnStatusEdge | None:
     """
@@ -5001,7 +7031,7 @@ def _delta_recovery_status_edge(
     )
 
 
-def _user_message_text(item: dict[str, Any]) -> str:
+def _user_message_text(item: _JsonObject) -> str:
     """
     Convert a Codex ``userMessage`` item into plain text.
 
@@ -5021,7 +7051,7 @@ def _user_message_text(item: dict[str, Any]) -> str:
     return "\n\n".join(parts)
 
 
-def _user_message_has_file_content(item: dict[str, Any]) -> bool:
+def _user_message_has_file_content(item: _JsonObject) -> bool:
     """
     Return whether a Codex ``userMessage`` carries a non-text block.
 
@@ -5051,7 +7081,7 @@ def _is_codex_skill_wrapper(text: str) -> bool:
     return stripped.startswith("<skill>") and stripped.endswith("</skill>")
 
 
-def _json_string(value: dict[str, Any]) -> str | None:
+def _json_string(value: _JsonObject) -> str | None:
     """
     Serialize a dict for OpenAI-compatible function call arguments.
 
@@ -5065,52 +7095,53 @@ def _json_string(value: dict[str, Any]) -> str | None:
         return None
 
 
-def _plan_text_from_update(params: dict[str, Any]) -> str | None:
+def _plan_todos_from_update(params: _JsonObject) -> list[_JsonObject] | None:
     """
-    Render a Codex ``turn/plan/updated`` payload as Markdown text.
+    Map a Codex ``turn/plan/updated`` payload to the todo-list schema.
+
+    Produces items shaped like Claude's ``TodoWrite`` output so the web
+    ``TodoPanel`` can render Codex plans through the same pipeline. Codex
+    steps have no gerund ``activeForm``, so the step text is reused there.
 
     :param params: Codex plan update params.
-    :returns: Markdown plan text, or ``None`` when no valid plan steps
-        are present.
+    :returns: List of ``{"content", "status", "activeForm"}`` items, or
+        ``None`` when no valid plan steps are present.
     """
     plan = params.get("plan")
     if not isinstance(plan, list) or not plan:
         return None
-    lines: list[str] = []
-    explanation = params.get("explanation")
-    if isinstance(explanation, str) and explanation:
-        lines.append(explanation)
-        lines.append("")
-    lines.append("Plan:")
+    todos: list[_JsonObject] = []
     for entry in plan:
         if not isinstance(entry, dict):
             continue
         step = entry.get("step")
         if not isinstance(step, str) or not step:
             continue
-        status = entry.get("status")
-        marker = _plan_status_marker(status)
-        lines.append(f"{marker} {step}")
-    if len(lines) == 1 or (len(lines) == 3 and lines[-1] == "Plan:"):
-        return None
-    return "\n".join(lines)
+        todos.append(
+            {
+                "content": step,
+                "status": _plan_todo_status(entry.get("status")),
+                "activeForm": step,
+            }
+        )
+    return todos or None
 
 
-def _plan_status_marker(status: Any) -> str:
+def _plan_todo_status(status: object) -> str:
     """
-    Return a readable Markdown marker for a Codex plan step status.
+    Normalize a Codex plan step status to the todo-list vocabulary.
 
     :param status: Codex step status value.
-    :returns: Markdown list marker.
+    :returns: One of ``"pending"``, ``"in_progress"``, ``"completed"``.
     """
     if status == "completed":
-        return "- [x]"
+        return "completed"
     if status in {"inProgress", "in_progress"}:
-        return "- [~]"
-    return "- [ ]"
+        return "in_progress"
+    return "pending"
 
 
-def _response_id(params: dict[str, Any]) -> str:
+def _response_id(params: _JsonObject) -> str:
     """
     Build a stable Omnigent response id for a Codex notification.
 
@@ -5123,7 +7154,7 @@ def _response_id(params: dict[str, Any]) -> str:
     return "codex_native"
 
 
-def _source_id(params: dict[str, Any], item: dict[str, Any]) -> str:
+def _source_id(params: _JsonObject, item: _JsonObject) -> str:
     """
     Build a stable per-record label for one Codex item.
 
@@ -5143,8 +7174,8 @@ def _source_id(params: dict[str, Any], item: dict[str, Any]) -> str:
 
 
 def _completed_item_key(
-    params: dict[str, Any],
-    item: dict[str, Any],
+    params: _JsonObject,
+    item: _JsonObject,
     forwarder_state: _CodexForwarderState,
 ) -> tuple[str, bool]:
     """

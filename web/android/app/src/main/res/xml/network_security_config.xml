@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Release default: HTTPS only (mirrors iOS App Transport Security defaults).
+  Debug builds additionally permit cleartext to localhost / emulator loopback /
+  private LAN ranges for local development, matching the iOS shell's debug-only
+  NSAllowsArbitraryLoadsInWebContent. The debug overlay lives in
+  app/src/debug/res/xml/network_security_config.xml.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

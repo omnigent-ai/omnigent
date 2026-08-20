@@ -30,11 +30,9 @@ real ``$HOME`` — it cannot be relocated into CI. Set
 ``OMNIGENT_E2E_CLAUDE_NATIVE=1`` (with ``claude`` installed + logged
 in) to run::
 
-    OMNIGENT_E2E_CLAUDE_NATIVE=1 \
-    .venv/bin/python -m pytest tests/e2e/test_host_claude_native_fork_e2e.py \
-        --profile oss \
-        --llm-api-key "$(databricks auth token -p oss \
-            | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')" \
+    OMNIGENT_E2E_CLAUDE_NATIVE=1 \\
+    .venv/bin/python -m pytest tests/e2e/test_host_claude_native_fork_e2e.py \\
+        --llm-api-key "mock-key" \\
         -v
 """
 
@@ -55,7 +53,9 @@ import pytest
 
 from tests.e2e.conftest import (
     _CLAUDE_CODER_DIR,
+    configure_mock_llm,
     create_runner_bound_session,
+    reset_mock_llm,
     send_user_message_to_session,
     upload_agent,
 )
@@ -446,7 +446,7 @@ def test_fork_sdk_source_into_native_builds_history(
     http_client: httpx.Client,
     tmp_path: Path,
     live_runner_id: str,
-    databricks_workspace_host: str | None,
+    mock_llm_server_url: str,
 ) -> None:
     """
     A claude-SDK source forked into claude-native recalls source history.
@@ -460,28 +460,38 @@ def test_fork_sdk_source_into_native_builds_history(
     native clone can't recall the source's code word.
 
     The SDK source runs on the SERVER's runner (``live_runner_id``) — which
-    holds the ``--profile`` gateway creds — while the native clone runs on
+    is wired to the mock LLM server — while the native clone runs on
     the host daemon (Claude CLI OAuth); the fork is independent of both.
 
     :param live_server: The test server URL.
     :param http_client: HTTP client pointed at the test server.
     :param tmp_path: Per-test temp dir.
     :param live_runner_id: The server fixture's runner id (runs the SDK
-        source turn).
-    :param databricks_workspace_host: Workspace host from ``--profile``
-        (``None`` for the api.openai.com path) — gates the bundle's model
-        rewrite.
+        source turn against the mock LLM).
+    :param mock_llm_server_url: Mock LLM server base URL (no ``/v1`` suffix).
     :returns: None.
     """
     workspace = tmp_path / "sdk_to_native_ws"
     workspace.mkdir()
     marker = f"FORKWORD_{uuid.uuid4().hex[:6].upper()}"
 
+    mock_model = "mock-claude-coder-sdk"
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": f"ACK — code word recorded: {marker}"},
+            {"text": marker},
+        ],
+        key=mock_model,
+    )
+
     # Register the claude-coder (claude-sdk, anthropic) agent as the SOURCE.
+    # No model rewrite needed — we use the mock model key directly.
     sdk_agent_name = upload_agent(
         http_client,
         _CLAUDE_CODER_DIR,
-        rewrite_model_for_databricks=databricks_workspace_host is not None,
+        rewrite_model_for_databricks=False,
     )
 
     # Only the native CLONE shows Claude's folder-trust dialog; the
