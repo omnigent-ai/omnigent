@@ -329,6 +329,19 @@ def _connection_refused(exc: BaseException) -> bool:
 _RECONNECT_BASE_S = 0.5
 _RECONNECT_CAP_S = 10.0
 _RECONNECT_JITTER = 0.5
+# Recycle close-code matching is anchored on word boundaries: bare substring
+# matching misread Windows errno 11001 ("getaddrinfo failed") as WebSocket
+# close code 1001 "going away", classifying a sustained DNS outage as an
+# ingress recycle and reconnecting at the 0.5s prompt cadence indefinitely
+# (#5072).
+_RECYCLE_EXPLICIT_RE = re.compile(r"\b(?:1012|1001)\b|service restart|going away")
+_RECYCLE_INGRESS_RE = re.compile(r"\b(?:no close frame|502)\b")
+# Consecutive never-connected recycle-classified failures before the prompt
+# cadence gives way to the normal backoff ladder. An ingress cycle is brief
+# and self-healing (well under 10 attempts); a sustained 502/DNS outage is
+# not, and hammering a dead endpoint twice a second forever is its own
+# incident (#5072).
+_RECYCLE_PROMPT_MAX_STREAK = 10
 # Fresh hosts get a short auth-retry window for Databricks OAuth refreshes.
 # Established hosts retry auth failures indefinitely to preserve sessions.
 _MAX_CONSECUTIVE_AUTH_ERRORS = 3
@@ -847,6 +860,7 @@ class HostProcess:
         # Consecutive connections that were accepted but died without a single
         # inbound frame; reset by any received frame or a rejected upgrade.
         # Past a bound the reconnect loop escalates instead of fast-recycling.
+        self._recycle_streak = 0
         self._silent_connect_streak = 0
         # Per-connection markers feeding the silent-connect streak.
         self._conn_upgrade_accepted = False
@@ -2758,10 +2772,8 @@ class HostProcess:
                     # genuinely persistent failure surfaces instead of a silent
                     # tight loop).
                     reason = str(exc).lower()
-                    explicit_recycle = any(
-                        t in reason for t in ("1012", "service restart", "1001", "going away")
-                    )
-                    ingress_recycle = any(t in reason for t in ("no close frame", "502"))
+                    explicit_recycle = _RECYCLE_EXPLICIT_RE.search(reason) is not None
+                    ingress_recycle = _RECYCLE_INGRESS_RE.search(reason) is not None
                     # A silent-connect streak overrides the recycle fast path:
                     # prompt reconnects are for endpoints that answer.
                     silent_churn = self._silent_connect_streak >= _SILENT_CONNECT_ESCALATE_ATTEMPTS
@@ -2773,13 +2785,19 @@ class HostProcess:
                     # outside the silent-churn gate so wake never takes the slow path.
                     woke = self._woke_from_suspend
                     self._woke_from_suspend = False
-                    recycle = woke or (
-                        (
-                            explicit_recycle
-                            or (ingress_recycle and not _url_is_loopback(self._server_url))
-                        )
-                        and not silent_churn
-                    )
+                    classified_recycle = (
+                        explicit_recycle
+                        or (ingress_recycle and not _url_is_loopback(self._server_url))
+                    ) and not silent_churn
+                    if classified_recycle:
+                        self._recycle_streak += 1
+                        if self._recycle_streak > _RECYCLE_PROMPT_MAX_STREAK:
+                            # A recycle is a brief, self-healing event; a
+                            # sustained run of them is an outage. Fall back to
+                            # the backoff ladder so a dead endpoint is probed
+                            # gently instead of twice a second forever (#5072).
+                            classified_recycle = False
+                    recycle = woke or classified_recycle
                     wait_s = _RECONNECT_BASE_S if recycle else backoff
                     _logger.warning(
                         "Host tunnel disconnected: %s. Reconnecting in %.1fs%s",
@@ -2936,6 +2954,9 @@ class HostProcess:
         self._auth_retry_streak = 0
         self._refused_streak = 0
         self._conn_upgrade_accepted = True
+        # A completed upgrade proves the endpoint healthy — the next drop's
+        # prompt reconnect is wanted again (#5072).
+        self._recycle_streak = 0
         try:
             await self._serve_frames(ws)
         finally:
