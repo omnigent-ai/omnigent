@@ -74,6 +74,8 @@ from typing import Final
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, WebSocketException
 from starlette import status
+from websockets.exceptions import ProtocolError
+from websockets.frames import Close
 
 from omnigent.debug_logging import debug_event
 from omnigent.errors import OmnigentError
@@ -98,6 +100,17 @@ _logger = logging.getLogger(__name__)
 _WS_CLOSE_TERMINAL_NOT_FOUND: Final[int] = WS_CLOSE_TERMINAL_NOT_FOUND
 _WS_CLOSE_INTERNAL_ERROR: Final[int] = WS_CLOSE_INTERNAL_ERROR
 _WS_CLOSE_WRONG_REPLICA: Final[int] = WS_CLOSE_WRONG_REPLICA
+
+
+def _safe_browser_close_code(code: int | None) -> int:
+    """Return a sendable WebSocket close code for the browser connection."""
+    if code is None:
+        return _WS_CLOSE_INTERNAL_ERROR
+    try:
+        Close(code, "").check()
+    except ProtocolError:
+        return _WS_CLOSE_INTERNAL_ERROR
+    return code
 
 
 def create_terminal_attach_router(
@@ -215,11 +228,7 @@ def create_terminal_attach_router(
                     async with runner_cm as runner_ws:
                         await _shuttle_ws_frames(websocket, runner_ws)
             except _RunnerWSClosed as closed:
-                code = (
-                    closed.code
-                    if closed.code and closed.code >= 1000
-                    else _WS_CLOSE_INTERNAL_ERROR
-                )
+                code = _safe_browser_close_code(closed.code)
                 with contextlib.suppress(RuntimeError):
                     await websocket.close(
                         code=code,
