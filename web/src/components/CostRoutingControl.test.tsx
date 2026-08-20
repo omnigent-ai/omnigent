@@ -2,6 +2,7 @@ import { cleanup } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   AUTO_HARNESS_LABEL_KEY,
+  formatModelDisplayName,
   isCostRoutingSession,
   isSubagentRoutingSession,
   shortModelName,
@@ -121,7 +122,9 @@ describe("shortModelName", () => {
     expect(shortModelName("databricks-gpt-5-4-mini")).toBe("gpt-5-4-mini");
   });
 
-  it("passes unrecognized ids through unchanged (fallback to the id)", () => {
+  it("formats Codex's dotted spelling without changing router short names", () => {
+    expect(formatModelDisplayName("gpt-5-6-luna")).toBe("gpt-5.6-luna");
+    expect(shortModelName("gpt-5-6-luna")).toBe("gpt-5-6-luna");
     expect(shortModelName("gpt-5.4")).toBe("gpt-5.4");
   });
 });

@@ -58,6 +58,7 @@ from omnigent.model_override import (
     validate_model_override,
 )
 from omnigent.native_coding_agents import public_agent_name
+from omnigent.reasoning_effort import EFFORT_VALUES, validate_effort
 from omnigent.runtime import pending_elicitations
 from omnigent.session_lifecycle import (
     CLOSED_LABEL_KEY,
@@ -1183,6 +1184,17 @@ def _subagent_model_from_args(args: _JsonObject) -> str | None:
     return validate_model_override(raw_model)
 
 
+def _subagent_reasoning_effort_from_args(args: _JsonObject) -> str | None:
+    """Extract and validate per-dispatch reasoning effort."""
+    raw_message = args.get("args")
+    if not isinstance(raw_message, dict):
+        return None
+    raw_effort = raw_message.get("reasoning_effort")
+    if raw_effort is None:
+        return None
+    return validate_effort(raw_effort, "sys_session_send", EFFORT_VALUES)
+
+
 def _subagent_file_ids_from_args(args: _JsonObject) -> list[str]:
     """
     Extract the optional ``file_ids`` from ``sys_session_send`` args.
@@ -1650,6 +1662,11 @@ async def _execute_subagent_tool(
         return f"Error: sys_session_send invalid 'model': {exc}"
 
     try:
+        reasoning_effort = _subagent_reasoning_effort_from_args(args)
+    except ValueError as exc:
+        return f"Error: sys_session_send invalid 'reasoning_effort': {exc}"
+
+    try:
         file_ids = _subagent_file_ids_from_args(args)
     except ValueError as exc:
         return f"Error: sys_session_send invalid 'file_ids': {exc}"
@@ -1681,6 +1698,14 @@ async def _execute_subagent_tool(
                 "Error: sys_session_send 'model' applies only when a "
                 "sub-agent session is first created; it cannot change an "
                 "existing session. Re-send without 'model' to continue "
+                f"session {target_session_id!r}."
+            )
+        if reasoning_effort is not None:
+            return (
+                "Error: sys_session_send 'reasoning_effort' applies only "
+                "when a sub-agent session is first created; it cannot "
+                "change an existing session. Re-send without "
+                "'reasoning_effort' to continue "
                 f"session {target_session_id!r}."
             )
         if file_ids:
@@ -1786,6 +1811,15 @@ async def _execute_subagent_tool(
                 f"{child_session_id}. Re-send without 'model' to continue "
                 "it, or sys_session_close it first to spawn a fresh "
                 "session on the requested model."
+            )
+        if reasoning_effort is not None:
+            return (
+                f"Error: sys_session_send 'reasoning_effort' applies only when a "
+                f"sub-agent session is first created; {sub_agent_name!r} "
+                f"title {session_name!r} already exists as "
+                f"{child_session_id}. Re-send without 'reasoning_effort' to "
+                "continue it, or sys_session_close it first to spawn a fresh "
+                "session with the requested effort."
             )
         if file_ids:
             return (
@@ -1954,6 +1988,8 @@ async def _execute_subagent_tool(
                 agent_spec=agent_spec,
                 harness=child_harness,
             )
+        if reasoning_effort is not None:
+            create_body["reasoning_effort"] = reasoning_effort
         resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
         if resp.status_code >= 400:
             return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
@@ -2278,15 +2314,16 @@ def _build_session_create_body(
     title: object,
     message: object,
     model: object = None,
+    reasoning_effort: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
 
     ``parent_session_id`` is hard-forced to ``conversation_id`` — this is
     what makes the write child-only (an orchestrator cannot create a
-    top-level or sibling session). A non-empty ``title``, ``message``, and
-    ``model`` are included when provided; the message becomes the child's
-    first queued user turn via ``initial_items``.
+    top-level or sibling session). A non-empty ``title``, ``message``,
+    ``model``, and ``reasoning_effort`` are included when provided; the
+    message becomes the child's first queued user turn via ``initial_items``.
 
     :param agent_id: The existing agent to launch, e.g. ``"ag_abc123"``.
     :param conversation_id: The caller's session id — the forced parent.
@@ -2296,6 +2333,7 @@ def _build_session_create_body(
         non-empty string.
     :param model: Optional model override, e.g. ``"databricks-glm-5-2"``;
         written as ``model_override`` on the session.
+    :param reasoning_effort: Optional reasoning-effort override for the child.
     :returns: The JSON request body.
     """
     body: _JsonObject = {
@@ -2306,6 +2344,8 @@ def _build_session_create_body(
         body["title"] = title
     if isinstance(model, str) and model:
         body["model_override"] = model
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        body["reasoning_effort"] = reasoning_effort
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -2460,6 +2500,7 @@ async def _execute_session_create(
         args.get("title"),
         args.get("message"),
         model=args.get("model"),
+        reasoning_effort=args.get("reasoning_effort"),
     )
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
@@ -2626,6 +2667,12 @@ async def _upload_config_bundle(
     title = args.get("title")
     if isinstance(title, str) and title:
         metadata["title"] = title
+    model = args.get("model")
+    if isinstance(model, str) and model:
+        metadata["model_override"] = model
+    reasoning_effort = args.get("reasoning_effort")
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        metadata["reasoning_effort"] = reasoning_effort
     try:
         resp = await server_client.post(
             "/v1/sessions",

@@ -430,8 +430,9 @@ describe("formatModelEffortStatusLabel", () => {
   it("leaves unknown model ids raw", () => {
     expect(formatModelEffortStatusLabel("gpt-5.5", "xhigh")).toBe("gpt-5.5 xHigh");
     expect(formatModelEffortStatusLabel("databricks-gpt-5-5", "xhigh")).toBe(
-      "databricks-gpt-5-5 xHigh",
+      "databricks-gpt-5.5 xHigh",
     );
+    expect(formatModelEffortStatusLabel("gpt-5-6-luna", null)).toBe("gpt-5.6-luna");
   });
 
   it("omits missing pieces", () => {

@@ -51,6 +51,7 @@ _HISTORY_MAX_TAIL = 50
 # the DB's ``(parent_conversation_id, title)`` unique slot. API display
 # paths strip this marker and expose ``omnigent.closed=true`` instead.
 _CLOSED_TITLE_INFIX = CLOSED_TITLE_INFIX
+_REASONING_EFFORT_VALUES = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 
 class SysSessionSendTool(Tool):
@@ -91,10 +92,9 @@ class SysSessionSendTool(Tool):
     - ``sub_agent_busy`` — the existing session has a non-terminal
       task already running. Wait for completion (it auto-delivers
       via the drain) or cancel before sending again.
-    - ``model`` rejections — the optional ``args.model`` override is
-      create-time-only and only valid for harnesses with model
-      plumbing; sends that pass it to an existing session, an
-      unplumbed harness, or with a malformed id return an error.
+    - ``model`` / ``reasoning_effort`` rejections — these optional
+      overrides are create-time-only; sends that pass either value to
+      an existing session or with a malformed value return an error.
 
     There is no ``name_already_exists`` error in this merged tool
     — a pre-existing ``(agent, title)`` is the expected case
@@ -285,7 +285,8 @@ def _build_sys_session_send_schema(
             "The user-input message to send to the sub-agent. The sub-agent "
             "treats this as the first user turn in its conversation. Pass a "
             "plain string for the normal contract, or pass "
-            "{input, purpose, model, harness, cost_budget} when a spec-level "
+            "{input, purpose, model, harness, reasoning_effort, cost_budget} "
+            "when a spec-level "
             "policy requires explicit dispatch metadata, a per-dispatch model "
             "override, an allowlisted harness override, or a per-subagent "
             "cost budget."
@@ -295,7 +296,8 @@ def _build_sys_session_send_schema(
             "The user-input message to send to the sub-agent. The sub-agent "
             "treats this as the first user turn in its conversation. Pass a "
             "plain string for the normal contract, or pass "
-            "{input, purpose, model, cost_budget} when a spec-level policy "
+            "{input, purpose, model, reasoning_effort, cost_budget} when a "
+            "spec-level policy "
             "requires explicit dispatch metadata, a per-dispatch model "
             "override, or a per-subagent cost budget."
         )
@@ -352,6 +354,15 @@ def _build_sys_session_send_schema(
                                             "Applies only when this send "
                                             "CREATES the sub-agent session; "
                                             "omitted = the harness default."
+                                        ),
+                                    },
+                                    "reasoning_effort": {
+                                        "type": "string",
+                                        "enum": _REASONING_EFFORT_VALUES,
+                                        "description": (
+                                            "Optional reasoning effort for the child session. "
+                                            "Applies only when this send creates the session; "
+                                            "omitted = inherited parent or agent default."
                                         ),
                                     },
                                     "file_ids": {
@@ -932,6 +943,11 @@ class SysSessionCreateTool(Tool):
                                 "model at session creation; omit to use the "
                                 "agent's default."
                             ),
+                        },
+                        "reasoning_effort": {
+                            "type": "string",
+                            "enum": _REASONING_EFFORT_VALUES,
+                            "description": "Optional reasoning effort for the child session.",
                         },
                     },
                     # Only the always-optional fields are listed in

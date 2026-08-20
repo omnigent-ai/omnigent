@@ -3111,7 +3111,8 @@ async def test_sys_session_send_model_lands_in_child_create_body(
     model: str,
 ) -> None:
     """
-    A per-dispatch ``model`` reaches the child create as ``model_override``.
+    Per-dispatch ``model`` and ``reasoning_effort`` reach the child create
+    as session overrides.
 
     The server persists ``model_override`` on the child row, where the
     native launch paths read it as ``--model`` and the SDK harness path
@@ -3160,6 +3161,7 @@ async def test_sys_session_send_model_lands_in_child_create_body(
                         "args": {
                             "input": "fix the auth bug",
                             "model": model,
+                            "reasoning_effort": "high",
                         },
                     }
                 ),
@@ -3178,6 +3180,7 @@ async def test_sys_session_send_model_lands_in_child_create_body(
     # server persists and the harness launch consumes.
     assert len(create_bodies) == 1, "fresh named send must create exactly one child"
     assert create_bodies[0]["model_override"] == model
+    assert create_bodies[0]["reasoning_effort"] == "high"
     assert create_bodies[0]["sub_agent_name"] == "worker"
 
 
@@ -6541,7 +6544,13 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         output = await execute_tool(
             tool_name="sys_session_create",
             arguments=json.dumps(
-                {"config_path": "helper.yaml", "title": "auth", "message": "start"}
+                {
+                    "config_path": "helper.yaml",
+                    "title": "auth",
+                    "message": "start",
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "high",
+                }
             ),
             server_client=server_client,
             conversation_id="conv_caller",
@@ -6554,7 +6563,12 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         f"expected exactly one create POST, got {len(create_requests)}"
     )
     parts = _parse_multipart_create(create_requests[0])
-    assert parts["metadata"] == {"parent_session_id": "conv_caller", "title": "auth"}
+    assert parts["metadata"] == {
+        "parent_session_id": "conv_caller",
+        "title": "auth",
+        "model_override": "gpt-5.6-luna",
+        "reasoning_effort": "high",
+    }
 
     # The uploaded bundle is a gzipped tar holding the authored config
     # verbatim — proves the local file traversed materialize → tar.

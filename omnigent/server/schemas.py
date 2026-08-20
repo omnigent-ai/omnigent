@@ -797,6 +797,9 @@ class ChildSessionSummary(BaseModel):
         child's ``model_override`` — the field intelligent routing writes
         when it picks a model for a spawned child. ``None`` when the child
         inherits the parent/spec model.
+    :param model_override: Explicit model pinned for this child, including
+        a model selected directly by the caller rather than by Smart Routing.
+        ``None`` when the child inherits the parent/spec model.
     :param routing_decision_id: Identifier of the routing decision that
         produced :attr:`routed_model`, mirroring
         ``RoutingDecisionData.decision_id``. Read from the child's
@@ -824,6 +827,8 @@ class ChildSessionSummary(BaseModel):
     last_message_preview: str | None = None
     pending_elicitations_count: int = 0
     routed_model: str | None = None
+    model_override: str | None = None
+    reasoning_effort: str | None = None
     routing_decision_id: str | None = None
 
 
@@ -1517,6 +1522,7 @@ class SessionCreateMetadata(BaseModel):
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
+    model_override: str | None = None
     host_id: str | None = None
     workspace: str | None = None
     terminal_launch_args: list[str] | None = None

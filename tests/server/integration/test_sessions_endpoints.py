@@ -8904,3 +8904,30 @@ async def test_message_forward_rejection_surfaces_failed_with_reason(
         assert "harness_spawn_failed" in last_error["message"], last_error
     finally:
         await fake_runner.aclose()
+
+
+@pytest.mark.asyncio
+async def test_child_session_inherits_parent_reasoning_effort(
+    client: httpx.AsyncClient,
+) -> None:
+    """A child without an explicit effort inherits its parent's setting."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"], title="reasoning-parent")
+    parent_id = parent["id"]
+
+    updated = await client.patch(
+        f"/v1/sessions/{parent_id}",
+        json={"reasoning_effort": "high"},
+    )
+    assert updated.status_code == 200, updated.text
+
+    child = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent_id,
+            "title": "reasoning-child",
+        },
+    )
+    assert child.status_code == 201, child.text
+    assert child.json()["reasoning_effort"] == "high"

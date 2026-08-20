@@ -63,6 +63,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
+from omnigent.model_override import validate_model_override
 from omnigent.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
@@ -7686,10 +7687,20 @@ def _parse_session_create_metadata(metadata: str) -> SessionCreateMetadata:
             "session metadata",
             EFFORT_VALUES,
         )
+        model_override = (
+            validate_model_override(parsed.model_override)
+            if parsed.model_override is not None
+            else None
+        )
         # Bounds-check the native-terminal args; raises ValueError
         # (wrapped below) on a malformed or oversized list.
         _validate_terminal_launch_args(parsed.terminal_launch_args)
-        return parsed.model_copy(update={"reasoning_effort": reasoning_effort})
+        return parsed.model_copy(
+            update={
+                "reasoning_effort": reasoning_effort,
+                "model_override": model_override,
+            }
+        )
     except (ValidationError, ValueError) as exc:
         raise OmnigentError(
             f"invalid session metadata: {exc}",
@@ -8392,6 +8403,7 @@ def _persist_stored_session_bundle(
             title=metadata.title,
             labels=metadata.labels,
             reasoning_effort=metadata.reasoning_effort,
+            model_override=metadata.model_override,
             workspace=metadata.workspace,
             terminal_launch_args=metadata.terminal_launch_args,
             parent_conversation_id=metadata.parent_session_id,
@@ -8782,6 +8794,8 @@ def _child_session_summary_from_conversation(
         # two fields contradict each other. The decision is joined through a
         # conversation label rather than a new column.
         routed_model=conv.model_override if routing_decision_id is not None else None,
+        model_override=conv.model_override,
+        reasoning_effort=conv.reasoning_effort,
         routing_decision_id=routing_decision_id,
     )
 

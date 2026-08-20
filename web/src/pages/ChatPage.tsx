@@ -168,7 +168,11 @@ import {
   type WorkspaceFile,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
-import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
+import {
+  formatModelDisplayName,
+  isCostRoutingSession,
+  isSubagentRoutingSession,
+} from "@/components/CostRoutingControl";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import {
   Dialog,
@@ -1337,6 +1341,8 @@ export function ChatPage() {
       costRoutingEligible={costRoutingEligible}
       subagentRoutingEligible={subagentRoutingEligible}
       subAgentLabel={subAgentLabel}
+      sessionModel={activeSession?.modelOverride ?? activeSession?.llmModel ?? null}
+      sessionReasoningEffort={activeSession?.reasoningEffort ?? null}
       wrapperLabel={capabilitySource.labels[WRAPPER_LABEL_KEY] ?? null}
     />
   );
@@ -1593,6 +1599,10 @@ interface MainAgentSurfaceProps {
    * ``subAgentComposerLabel``.
    */
   subAgentLabel: string | null;
+  /** Effective model from the active session snapshot, including read-only children. */
+  sessionModel: string | null;
+  /** Persisted reasoning effort from the active session snapshot. */
+  sessionReasoningEffort: string | null;
   /** The session's ``omnigent.wrapper`` label; see ``ComposerProps``. */
   wrapperLabel: string | null;
 }
@@ -1725,6 +1735,8 @@ function MainAgentSurface({
   costRoutingEligible,
   subagentRoutingEligible,
   subAgentLabel,
+  sessionModel,
+  sessionReasoningEffort,
   wrapperLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
@@ -2263,6 +2275,8 @@ function MainAgentSurface({
             costRoutingEligible={costRoutingEligible}
             subagentRoutingEligible={subagentRoutingEligible}
             subAgentLabel={subAgentLabel}
+            sessionModel={sessionModel}
+            sessionReasoningEffort={sessionReasoningEffort}
             wrapperLabel={wrapperLabel}
           />
 
@@ -4071,6 +4085,10 @@ interface ComposerProps {
    * tray above the card. See ``subAgentComposerLabel``.
    */
   subAgentLabel?: string | null;
+  /** Effective model from the active session snapshot, used for child status. */
+  sessionModel?: string | null;
+  /** Persisted reasoning effort from the active session snapshot, used for child status. */
+  sessionReasoningEffort?: string | null;
   /**
    * The session's ``omnigent.wrapper`` label, or ``null`` when it carries
    * none. Only the identity label reads it — to name the vendor running a
@@ -4208,10 +4226,12 @@ export function formatStatusModelLabel(
   if (!raw) return null;
   const lower = raw.toLowerCase();
   const codexOption = findNativeModelOption(codexModelOptions, raw);
-  if (codexOption) return codexOption.displayName ?? codexOption.id;
+  if (codexOption) {
+    return formatModelDisplayName(codexOption.displayName ?? codexOption.id);
+  }
   const known = CLAUDE_NATIVE_MODELS.find((m) => m.id === lower);
   if (known) return known.label;
-  return raw;
+  return formatModelDisplayName(raw);
 }
 
 function formatStatusEffortLabel(effort: string | null, raw = false): string | null {
@@ -4510,6 +4530,8 @@ export function Composer({
   costRoutingEligible = false,
   subagentRoutingEligible = false,
   subAgentLabel = null,
+  sessionModel = null,
+  sessionReasoningEffort = null,
   wrapperLabel = null,
 }: ComposerProps) {
   const [value, setValue] = useState("");
@@ -5737,6 +5759,9 @@ export function Composer({
                 modelPickerKind={modelPickerKind}
                 codexModelOptions={codexModelOptions}
                 costRoutingEligible={costRoutingEligible}
+                subAgentLabel={subAgentLabel}
+                sessionModel={sessionModel}
+                sessionReasoningEffort={sessionReasoningEffort}
                 harnessLabel={harnessLabel}
               />
               <ComposerConfigGear
@@ -6800,6 +6825,9 @@ function ComposerModelEffortLabel({
   modelPickerKind,
   codexModelOptions,
   costRoutingEligible,
+  subAgentLabel,
+  sessionModel,
+  sessionReasoningEffort,
   harnessLabel,
 }: {
   showModels: boolean;
@@ -6807,12 +6835,22 @@ function ComposerModelEffortLabel({
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
+  subAgentLabel: string | null;
+  sessionModel: string | null;
+  sessionReasoningEffort: string | null;
   harnessLabel: string | null;
 }) {
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
+  const isSubAgentSession = subAgentLabel !== null;
+  const childModelLabel = isSubAgentSession
+    ? formatStatusModelLabel(sessionModel, codexModelOptions)
+    : null;
+  const childEffortLabel = isSubAgentSession
+    ? formatStatusEffortLabel(sessionReasoningEffort, modelPickerKind === "codex")
+    : null;
   // Routing picks the model + effort per turn, so the label reads
   // "Smart Routing" with no pinned model/effort — matching the tooltip.
   if (routingOn) {
@@ -6826,13 +6864,14 @@ function ComposerModelEffortLabel({
     );
   }
   const effortLabel =
-    showEffort && selectedEffort
+    childEffortLabel ??
+    (showEffort && selectedEffort
       ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
-      : null;
+      : null);
   // SDK/bundle sessions (no native picker) still surface their resolved model
   // in the label even though the gear modal has no Model dropdown for them —
   // showModels gates only the modal control, not this read-out.
-  const model = showModels || modelPickerKind === null ? modelLabel : null;
+  const model = childModelLabel ?? (showModels || modelPickerKind === null ? modelLabel : null);
   // SDK/bundle agents (e.g. Polly) that resolve no model/effort fall back to
   // the harness identity ("Polly (Pi)") so the slot isn't empty. Scoped to
   // SDK/bundle (modelPickerKind === null): native wrappers keep an empty label

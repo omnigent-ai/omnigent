@@ -7697,6 +7697,14 @@ async def _create_session_from_existing_agent(
     # The persisted override reaches a native CLI as a ``--model`` argv
     # element at terminal launch, so reject shell-/flag-shaped values
     # before any row or worktree exists.
+    inherited_reasoning_effort = body.reasoning_effort
+    if body.parent_session_id is not None and inherited_reasoning_effort is None:
+        parent_for_effort = await asyncio.to_thread(
+            conversation_store.get_conversation, body.parent_session_id
+        )
+        if parent_for_effort is not None:
+            inherited_reasoning_effort = parent_for_effort.reasoning_effort
+
     model_override, reasoning_effort = validate_session_model_metadata(
         # Native Smart Routing bakes the routed model into the terminal launch;
         # the client sends none of its own on that path. A fixed-harness routed
@@ -7706,7 +7714,7 @@ async def _create_session_from_existing_agent(
             if _native_smart_routing
             else _fixed_routed_model or body.model_override
         ),
-        reasoning_effort=body.reasoning_effort,
+        reasoning_effort=inherited_reasoning_effort,
     )
 
     # Validated before any row exists so a bad value never creates an
