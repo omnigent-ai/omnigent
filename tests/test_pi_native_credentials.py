@@ -249,11 +249,73 @@ def test_provider_launch_returns_env_and_args(tmp_path: Path) -> None:
         auth_header=False,
     )
     agent_dir = tmp_path / "pi-agent"
-    env, args = creds.pi_native_provider_launch(agent_dir, provider)
+    env, args, _warning = creds.pi_native_provider_launch(agent_dir, provider)
 
     assert env == {creds.PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
     assert args == ["--provider", "omnigent", "--model", "claude-sonnet-4-6"]
     assert (agent_dir / "models.json").exists()
+
+
+def test_provider_launch_passes_reasoning_effort_as_thinking(tmp_path: Path) -> None:
+    """A session effort becomes ``--thinking <level>`` on the primary provider."""
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+    )
+
+    _env, args, warning = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider, "high")
+
+    assert args[-2:] == ["--thinking", "high"]
+    assert warning is None
+
+
+@pytest.mark.parametrize(
+    ("effort", "expected"),
+    [("none", ["--thinking", "off"]), ("default", []), (None, [])],
+)
+def test_provider_launch_effort_edge_values(
+    tmp_path: Path, effort: str | None, expected: list[str]
+) -> None:
+    """``none`` becomes pi's ``off``; a clear value omits the flag entirely."""
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+    )
+
+    _env, args, warning = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider, effort)
+
+    assert args[4:] == expected
+    assert warning is None
+
+
+def test_provider_launch_gateway_routed_model_keeps_thinking_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The gateway-routed pin wins over the user's effort, with a warning.
+
+    Those models' ``reasoning_tokens`` break pi's completions handler so text
+    never surfaces; honouring the effort would reintroduce that.
+    """
+    provider = _databricks_provider_without_catalog(monkeypatch, "databricks-glm-5-2")
+    monkeypatch.setattr(
+        "omnigent.inner.pi_settings.prepare_managed_pi_agent_dir",
+        lambda *_args, **_kwargs: None,
+    )
+
+    _env, args, warning = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider, "high")
+
+    assert args.count("--thinking") == 1
+    assert args[-2:] == ["--thinking", "off"]
+    assert warning is not None
+    assert "databricks-glm-5-2" in warning
 
 
 def test_pi_native_provider_launch_namespaced_model_uses_qualified_arg(
@@ -278,7 +340,7 @@ def test_pi_native_provider_launch_namespaced_model_uses_qualified_arg(
         auth_header=False,
     )
     agent_dir = tmp_path / "pi-agent"
-    _env, args = creds.pi_native_provider_launch(agent_dir, provider)
+    _env, args, _warning = creds.pi_native_provider_launch(agent_dir, provider)
 
     assert args == ["--provider", "omnigent", "--model", "omnigent/moonshotai/kimi-k2.5"]
 
@@ -1469,7 +1531,7 @@ def test_uncataloged_model_launch_arg_matches_rendered_provider(
         lambda *_args, **_kwargs: None,
     )
 
-    _env, args = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider)
+    _env, args, _warning = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider)
 
     assert args == [
         "--provider",

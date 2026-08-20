@@ -32,6 +32,64 @@ ANTIGRAVITY_EFFORTS = GEMINI_EFFORTS
 # exactly these levels (``copilot.session.ReasoningEffort`` literal); per-model
 # support is gated by the Copilot backend (``list_models()``).
 COPILOT_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+# pi's ``--thinking`` ladder is ``off|minimal|low|medium|high|xhigh|max``. Its
+# ``off`` is omnigent's ``none`` — ``off`` is reserved here as a
+# clear-to-default sentinel — so :func:`to_pi_thinking_level` translates.
+PI_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+
+#: pi's spelling of "no thinking", i.e. canonical ``none``.
+PI_THINKING_OFF = "off"
+
+
+def to_pi_thinking_level(effort: str) -> str:
+    """Translate a canonical effort to pi's ``--thinking`` / RPC level.
+
+    Only ``none`` differs between the two ladders (pi calls it ``off``);
+    every other value is spelled identically.
+
+    :param effort: A canonical effort from :data:`PI_EFFORTS`.
+    :returns: The ``ThinkingLevel`` string pi accepts.
+    """
+    return PI_THINKING_OFF if effort == "none" else effort
+
+
+#: pi's ladder ascending, in pi's spelling. Index distance here is what
+#: "nearest supported level" means.
+PI_THINKING_LADDER: tuple[str, ...] = (
+    PI_THINKING_OFF,
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
+
+
+def nearest_pi_thinking_level(level: str, available: Iterable[str]) -> str | None:
+    """Clamp a pi thinking *level* to the nearest one the model supports.
+
+    pi reports a per-model ladder via the ``get_available_thinking_levels``
+    RPC; a model that doesn't offer the requested rung must not 400 the turn,
+    so pick the closest offered rung instead. Ties resolve downward, spending
+    fewer tokens than asked for rather than more.
+
+    :param level: The requested level in pi's spelling (see
+        :func:`to_pi_thinking_level`).
+    :param available: Levels pi reports for the current model.
+    :returns: The level to send, or ``None`` when *available* is empty (pi
+        reported nothing usable, so the caller should leave the level alone).
+    """
+    offered = [value for value in PI_THINKING_LADDER if value in set(available)]
+    if not offered:
+        return None
+    if level in offered:
+        return level
+    if level not in PI_THINKING_LADDER:
+        return None
+    target = PI_THINKING_LADDER.index(level)
+    # Ascending order + stable min(): an equidistant pair resolves downward.
+    return min(offered, key=lambda value: abs(PI_THINKING_LADDER.index(value) - target))
 
 
 def format_supported(values: Iterable[str]) -> str:
