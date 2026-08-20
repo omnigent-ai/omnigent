@@ -19,6 +19,7 @@ import {
   computeIsWorking,
   computeShowsWorking,
   containsMarkdownTable,
+  deliverInitialPrompt,
   dispatchInitialPrompt,
   isCostRoutingEligible,
   isSubagentRoutingEligible,
@@ -1384,9 +1385,9 @@ describe("dispatchInitialPrompt", () => {
   // agent receives literal "/review-pr 123" text and the skill never runs
   // (the original bug).
   it("posts a matched skill invocation as a slash_command, not a plain message", () => {
-    const send = vi.fn().mockResolvedValue(undefined);
-    const sendSlashCommand = vi.fn().mockResolvedValue(undefined);
-    dispatchInitialPrompt(
+    const send = vi.fn().mockResolvedValue(true);
+    const sendSlashCommand = vi.fn().mockResolvedValue(true);
+    void dispatchInitialPrompt(
       {
         text: "/review-pr 123 focus on auth",
         skill: { name: "review-pr", args: "123 focus on auth" },
@@ -1398,16 +1399,21 @@ describe("dispatchInitialPrompt", () => {
     // Name (no leading slash) + raw args reach the slash_command path —
     // the exact values the server's skill lookup and the runner's
     // SKILL.md resolution key off.
-    expect(sendSlashCommand).toHaveBeenCalledWith("review-pr", "123 focus on auth", "ag_abc123");
+    expect(sendSlashCommand).toHaveBeenCalledWith(
+      "review-pr",
+      "123 focus on auth",
+      "ag_abc123",
+      undefined,
+    );
     // The plain path must NOT also fire — a double-send would deliver the
     // literal "/name" text alongside the skill invocation.
     expect(send).not.toHaveBeenCalled();
   });
 
   it("posts plain text (no matched skill) as a regular message", () => {
-    const send = vi.fn().mockResolvedValue(undefined);
-    const sendSlashCommand = vi.fn().mockResolvedValue(undefined);
-    dispatchInitialPrompt(
+    const send = vi.fn().mockResolvedValue(true);
+    const sendSlashCommand = vi.fn().mockResolvedValue(true);
+    void dispatchInitialPrompt(
       { text: "read the README", skill: null },
       "ag_abc123",
       send,
@@ -1415,15 +1421,15 @@ describe("dispatchInitialPrompt", () => {
     );
     // Full text verbatim, no files. This is also the path for native
     // terminal sessions and unknown "/typo" commands (skill stays null).
-    expect(send).toHaveBeenCalledWith("read the README", "ag_abc123", []);
+    expect(send).toHaveBeenCalledWith("read the README", "ag_abc123", [], undefined);
     expect(sendSlashCommand).not.toHaveBeenCalled();
   });
 
   it("carries landing attachments through the plain-message path", () => {
-    const send = vi.fn().mockResolvedValue(undefined);
-    const sendSlashCommand = vi.fn().mockResolvedValue(undefined);
+    const send = vi.fn().mockResolvedValue(true);
+    const sendSlashCommand = vi.fn().mockResolvedValue(true);
     const file = new File(["x"], "diagram.png", { type: "image/png" });
-    dispatchInitialPrompt(
+    void dispatchInitialPrompt(
       { text: "what is this?", skill: null, files: [file] },
       "ag_abc123",
       send,
@@ -1431,7 +1437,146 @@ describe("dispatchInitialPrompt", () => {
     );
     // The exact File objects picked on the landing screen reach send() —
     // an empty array here means first-message attachments silently vanish.
-    expect(send).toHaveBeenCalledWith("what is this?", "ag_abc123", [file]);
+    expect(send).toHaveBeenCalledWith("what is this?", "ag_abc123", [file], undefined);
+  });
+});
+
+// Durability of the landing composer's first message. The failure this
+// covers is a session created in a burst whose runner takes 30s+ to
+// register: the POST 503s past the server's own hold, and before this the
+// single attempt was the only one — the typed text vanished into an
+// idle-looking session with no user message at all.
+describe("deliverInitialPrompt", () => {
+  const prompt = { text: "read the README", skill: null };
+  // Instant "sleeps" so the backoff schedule doesn't slow the suite; the
+  // ordering the loop depends on is preserved.
+  const sleep = (): Promise<void> => Promise.resolve();
+
+  it("keeps retrying while the runner is offline and delivers exactly once", async () => {
+    // Four consecutive 503s (a ~30s+ runner start), then the runner
+    // registers and the POST settles.
+    const send = vi
+      .fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(true);
+    const sendSlashCommand = vi.fn().mockResolvedValue(true);
+
+    const outcome = await deliverInitialPrompt({
+      prompt,
+      agentId: "ag_abc123",
+      send,
+      sendSlashCommand,
+      retryDelaysMs: [1, 1, 1, 1, 1, 1],
+      sleep,
+    });
+
+    expect(outcome).toBe("delivered");
+    // Five attempts, one success — and crucially no attempt after it.
+    expect(send).toHaveBeenCalledTimes(5);
+  });
+
+  it("stops the instant an attempt settles, so a retry can't duplicate it", async () => {
+    // The retry loop is strictly sequential: the next attempt only starts
+    // after the previous resolved as NOT settled. A late success therefore
+    // has nothing to race — two user messages would be worse than the bug.
+    const send = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+    const sendSlashCommand = vi.fn().mockResolvedValue(true);
+
+    await deliverInitialPrompt({
+      prompt,
+      agentId: "ag_abc123",
+      send,
+      sendSlashCommand,
+      retryDelaysMs: [1, 1, 1],
+      sleep,
+    });
+
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it("suppresses the failure block on every attempt but the last", async () => {
+    // Intermediate failures are silent (the retry is about to resolve
+    // them); the final attempt lets the store paint the error so the user
+    // never ends up on a silent, empty composer.
+    const send = vi.fn().mockResolvedValue(false);
+    const sendSlashCommand = vi.fn().mockResolvedValue(false);
+
+    const outcome = await deliverInitialPrompt({
+      prompt,
+      agentId: "ag_abc123",
+      send,
+      sendSlashCommand,
+      retryDelaysMs: [1, 1],
+      sleep,
+    });
+
+    expect(outcome).toBe("failed");
+    const retryFlags = send.mock.calls.map(
+      (call) => (call[3] as { retryPending: boolean }).retryPending,
+    );
+    expect(retryFlags).toEqual([true, true, false]);
+  });
+
+  it("makes the first attempt immediately, adding no latency to a fast start", async () => {
+    // The common case (~6s runner start, absorbed by the server's hold)
+    // must behave exactly as before: one attempt, no backoff wait.
+    const send = vi.fn().mockResolvedValue(true);
+    const sendSlashCommand = vi.fn().mockResolvedValue(true);
+    const sleepSpy = vi.fn().mockResolvedValue(undefined);
+
+    const outcome = await deliverInitialPrompt({
+      prompt,
+      agentId: "ag_abc123",
+      send,
+      sendSlashCommand,
+      sleep: sleepSpy,
+    });
+
+    expect(outcome).toBe("delivered");
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(sleepSpy).not.toHaveBeenCalled();
+  });
+
+  it("reports cancellation without delivering when the user leaves mid-backoff", async () => {
+    // Cancellation is honoured only BETWEEN attempts — an in-flight
+    // dispatch must report its outcome first, or the caller couldn't tell
+    // "nothing landed" from "it landed after we stopped watching".
+    const send = vi.fn().mockResolvedValue(false);
+    const sendSlashCommand = vi.fn().mockResolvedValue(false);
+
+    const outcome = await deliverInitialPrompt({
+      prompt,
+      agentId: "ag_abc123",
+      send,
+      sendSlashCommand,
+      retryDelaysMs: [1, 1, 1],
+      sleep,
+      isCancelled: () => true,
+    });
+
+    expect(outcome).toBe("cancelled");
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a skill invocation on the slash_command path too", async () => {
+    const send = vi.fn().mockResolvedValue(true);
+    const sendSlashCommand = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+
+    const outcome = await deliverInitialPrompt({
+      prompt: { text: "/review-pr 123", skill: { name: "review-pr", args: "123" } },
+      agentId: "ag_abc123",
+      send,
+      sendSlashCommand,
+      retryDelaysMs: [1, 1],
+      sleep,
+    });
+
+    expect(outcome).toBe("delivered");
+    expect(sendSlashCommand).toHaveBeenCalledTimes(2);
+    expect(send).not.toHaveBeenCalled();
   });
 });
 
